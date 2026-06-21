@@ -1903,13 +1903,34 @@ fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), 
     Ok((limit as usize, offset))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BackfillIdempotencyStatus {
+    InProgress,
+    Accepted,
+}
+
+const fn default_backfill_idempotency_status() -> BackfillIdempotencyStatus {
+    BackfillIdempotencyStatus::Accepted
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackfillIdempotencyRecord {
     idempotency_key: String,
     backfill_id: String,
     accepted_event_id: String,
     accepted_at: DateTime<Utc>,
     fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input: Option<BackfillCreateInput>,
+    #[serde(default = "default_backfill_idempotency_status")]
+    status: BackfillIdempotencyStatus,
+}
+
+#[derive(Debug)]
+struct BackfillIdempotencyRecordWithVersion {
+    record: BackfillIdempotencyRecord,
+    version: String,
 }
 
 #[derive(Serialize)]
@@ -1958,6 +1979,7 @@ struct LegacyBackfillFingerprintPayload {
     max_concurrent_runs: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackfillCreateInput {
     asset_selection: Vec<String>,
     code_version: Option<String>,
@@ -2010,10 +2032,71 @@ fn compute_legacy_backfill_fingerprint(
     Ok(Some(hex::encode(hash)))
 }
 
-async fn load_backfill_idempotency_record(
+fn backfill_fingerprint_matches(
+    record: &BackfillIdempotencyRecord,
+    fingerprint: &str,
+    compatibility_fingerprints: &[String],
+) -> bool {
+    record.fingerprint == fingerprint
+        || compatibility_fingerprints
+            .iter()
+            .any(|value| value == &record.fingerprint)
+}
+
+fn backfill_response_from_record(record: &BackfillIdempotencyRecord) -> CreateBackfillResponse {
+    CreateBackfillResponse {
+        backfill_id: record.backfill_id.clone(),
+        accepted_event_id: record.accepted_event_id.clone(),
+        accepted_at: record.accepted_at,
+    }
+}
+
+async fn backfill_record_is_visible(
+    storage: &ScopedStorage,
+    record: &BackfillIdempotencyRecord,
+) -> Result<bool, ApiError> {
+    let compactor = MicroCompactor::new(storage.clone());
+    let (_manifest, fold_state) = compactor.load_state().await.map_err(|e| {
+        ApiError::internal(format!(
+            "failed to verify backfill idempotency visibility: {e}"
+        ))
+    })?;
+    Ok(fold_state
+        .backfills
+        .get(&record.backfill_id)
+        .is_some_and(|row| row.row_version == record.accepted_event_id))
+}
+
+fn backfill_created_event_from_record(
+    ctx: &RequestContext,
+    workspace_id: &str,
+    input: BackfillCreateInput,
+    record: &BackfillIdempotencyRecord,
+) -> OrchestrationEvent {
+    let mut event = OrchestrationEvent::new(
+        &ctx.tenant,
+        workspace_id,
+        OrchestrationEventData::BackfillCreated {
+            backfill_id: record.backfill_id.clone(),
+            client_request_id: record.idempotency_key.clone(),
+            asset_selection: input.asset_selection,
+            code_version: input.code_version,
+            partition_selector: input.partition_selector,
+            total_partitions: input.total_partitions,
+            chunk_size: input.chunk_size,
+            max_concurrent_runs: input.max_concurrent_runs,
+            parent_backfill_id: None,
+        },
+    );
+    event.event_id.clone_from(&record.accepted_event_id);
+    event.timestamp = record.accepted_at;
+    event
+}
+
+async fn load_backfill_idempotency_record_with_version(
     storage: &ScopedStorage,
     idempotency_key: &str,
-) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
+) -> Result<Option<BackfillIdempotencyRecordWithVersion>, ApiError> {
     let path = backfill_idempotency_path(idempotency_key);
     match storage.get_raw(&path).await {
         Ok(bytes) => {
@@ -2021,7 +2104,20 @@ async fn load_backfill_idempotency_record(
                 serde_json::from_slice(&bytes).map_err(|e| {
                     ApiError::internal(format!("failed to parse backfill idempotency record: {e}"))
                 })?;
-            Ok(Some(record))
+            let metadata = storage.head_raw(&path).await.map_err(|e| {
+                ApiError::internal(format!("failed to read backfill idempotency metadata: {e}"))
+            })?;
+            let version = metadata
+                .ok_or_else(|| {
+                    ApiError::internal(
+                        "backfill idempotency record disappeared after read".to_string(),
+                    )
+                })?
+                .version;
+            Ok(Some(BackfillIdempotencyRecordWithVersion {
+                record,
+                version,
+            }))
         }
         Err(CoreError::NotFound(_) | CoreError::ResourceNotFound { .. }) => Ok(None),
         Err(err) => Err(ApiError::internal(format!(
@@ -2030,9 +2126,21 @@ async fn load_backfill_idempotency_record(
     }
 }
 
-async fn store_backfill_idempotency_record(
+async fn load_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    idempotency_key: &str,
+) -> Result<Option<BackfillIdempotencyRecord>, ApiError> {
+    Ok(
+        load_backfill_idempotency_record_with_version(storage, idempotency_key)
+            .await?
+            .map(|entry| entry.record),
+    )
+}
+
+async fn write_backfill_idempotency_record(
     storage: &ScopedStorage,
     record: &BackfillIdempotencyRecord,
+    precondition: WritePrecondition,
 ) -> Result<WriteResult, ApiError> {
     let record_json = serde_json::to_string(record).map_err(|e| {
         ApiError::internal(format!(
@@ -2040,16 +2148,20 @@ async fn store_backfill_idempotency_record(
         ))
     })?;
     let record_path = backfill_idempotency_path(&record.idempotency_key);
-    let result = storage
-        .put_raw(
-            &record_path,
-            Bytes::from(record_json),
-            WritePrecondition::DoesNotExist,
-        )
+    storage
+        .put_raw(&record_path, Bytes::from(record_json), precondition)
         .await
         .map_err(|e| {
             ApiError::internal(format!("failed to store backfill idempotency record: {e}"))
-        })?;
+        })
+}
+
+async fn store_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    record: &BackfillIdempotencyRecord,
+) -> Result<WriteResult, ApiError> {
+    let result =
+        write_backfill_idempotency_record(storage, record, WritePrecondition::DoesNotExist).await?;
 
     if matches!(result, WriteResult::PreconditionFailed { .. }) {
         tracing::warn!(
@@ -2060,6 +2172,41 @@ async fn store_backfill_idempotency_record(
     }
 
     Ok(result)
+}
+
+async fn finalize_backfill_idempotency_record(
+    storage: &ScopedStorage,
+    record: &BackfillIdempotencyRecord,
+    expected_version: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut accepted = record.clone();
+    accepted.status = BackfillIdempotencyStatus::Accepted;
+    let precondition = expected_version.map_or(WritePrecondition::None, |version| {
+        WritePrecondition::MatchesVersion(version.to_string())
+    });
+    let result = write_backfill_idempotency_record(storage, &accepted, precondition).await?;
+    match result {
+        WriteResult::Success { .. } => Ok(()),
+        WriteResult::PreconditionFailed { .. } => {
+            let Some(existing) =
+                load_backfill_idempotency_record(storage, &accepted.idempotency_key).await?
+            else {
+                return Err(ApiError::conflict(
+                    "backfill idempotency claim changed before finalization",
+                ));
+            };
+            if existing.status == BackfillIdempotencyStatus::Accepted
+                && existing.fingerprint == accepted.fingerprint
+                && existing.backfill_id == accepted.backfill_id
+                && existing.accepted_event_id == accepted.accepted_event_id
+            {
+                return Ok(());
+            }
+            Err(ApiError::conflict(
+                "backfill idempotency claim changed before finalization",
+            ))
+        }
+    }
 }
 
 fn parse_partition_bound_date(raw: &str) -> Result<NaiveDate, ApiError> {
@@ -2193,22 +2340,29 @@ async fn resolve_backfill_idempotency(
     fingerprint: &str,
     compatibility_fingerprints: &[String],
 ) -> Result<Option<CreateBackfillResponse>, ApiError> {
-    if let Some(existing) = load_backfill_idempotency_record(storage, idempotency_key).await? {
-        if existing.fingerprint == fingerprint
-            || compatibility_fingerprints
-                .iter()
-                .any(|value| value == &existing.fingerprint)
+    if let Some(existing) =
+        load_backfill_idempotency_record_with_version(storage, idempotency_key).await?
+    {
+        if !backfill_fingerprint_matches(&existing.record, fingerprint, compatibility_fingerprints)
         {
-            return Ok(Some(CreateBackfillResponse {
-                backfill_id: existing.backfill_id,
-                accepted_event_id: existing.accepted_event_id,
-                accepted_at: existing.accepted_at,
-            }));
+            return Err(ApiError::conflict(
+                "idempotency key already used for a different backfill",
+            ));
         }
 
-        return Err(ApiError::conflict(
-            "idempotency key already used for a different backfill",
-        ));
+        if existing.record.status == BackfillIdempotencyStatus::Accepted {
+            return Ok(Some(backfill_response_from_record(&existing.record)));
+        }
+
+        if backfill_record_is_visible(storage, &existing.record).await? {
+            finalize_backfill_idempotency_record(
+                storage,
+                &existing.record,
+                Some(&existing.version),
+            )
+            .await?;
+            return Ok(Some(backfill_response_from_record(&existing.record)));
+        }
     }
 
     Ok(None)
@@ -2230,9 +2384,9 @@ async fn append_backfill_created_event(
         OrchestrationEventData::BackfillCreated {
             backfill_id: backfill_id.clone(),
             client_request_id: idempotency_key.to_string(),
-            asset_selection: input.asset_selection,
-            code_version: input.code_version,
-            partition_selector: input.partition_selector,
+            asset_selection: input.asset_selection.clone(),
+            code_version: input.code_version.clone(),
+            partition_selector: input.partition_selector.clone(),
             total_partitions: input.total_partitions,
             chunk_size: input.chunk_size,
             max_concurrent_runs: input.max_concurrent_runs,
@@ -2243,6 +2397,57 @@ async fn append_backfill_created_event(
     let accepted_event_id = event.event_id.clone();
     let accepted_at = event.timestamp;
 
+    let record = BackfillIdempotencyRecord {
+        idempotency_key: idempotency_key.to_string(),
+        backfill_id: backfill_id.clone(),
+        accepted_event_id: accepted_event_id.clone(),
+        accepted_at,
+        fingerprint,
+        input: Some(input.clone()),
+        status: BackfillIdempotencyStatus::InProgress,
+    };
+
+    let store_result = store_backfill_idempotency_record(storage, &record).await?;
+    let (event, record, record_version) = match store_result {
+        WriteResult::Success { version } => (event, record, Some(version)),
+        WriteResult::PreconditionFailed { .. } => {
+            let Some(existing) =
+                load_backfill_idempotency_record_with_version(storage, idempotency_key).await?
+            else {
+                return Err(ApiError::conflict(
+                    "idempotency key was claimed concurrently; retry request",
+                ));
+            };
+            if !backfill_fingerprint_matches(&existing.record, &record.fingerprint, &[]) {
+                return Err(ApiError::conflict(
+                    "idempotency key already used for a different backfill",
+                ));
+            }
+            if existing.record.status == BackfillIdempotencyStatus::Accepted {
+                return Ok(backfill_response_from_record(&existing.record));
+            }
+            if backfill_record_is_visible(storage, &existing.record).await? {
+                finalize_backfill_idempotency_record(
+                    storage,
+                    &existing.record,
+                    Some(&existing.version),
+                )
+                .await?;
+                return Ok(backfill_response_from_record(&existing.record));
+            }
+            (
+                backfill_created_event_from_record(
+                    ctx,
+                    workspace_id,
+                    existing.record.input.clone().unwrap_or(input),
+                    &existing.record,
+                ),
+                existing.record,
+                Some(existing.version),
+            )
+        }
+    };
+
     append_event_and_compact(
         &state.config,
         storage.clone(),
@@ -2251,31 +2456,9 @@ async fn append_backfill_created_event(
     )
     .await?;
 
-    let record = BackfillIdempotencyRecord {
-        idempotency_key: idempotency_key.to_string(),
-        backfill_id: backfill_id.clone(),
-        accepted_event_id: accepted_event_id.clone(),
-        accepted_at,
-        fingerprint,
-    };
+    finalize_backfill_idempotency_record(storage, &record, record_version.as_deref()).await?;
 
-    let store_result = store_backfill_idempotency_record(storage, &record).await?;
-    if matches!(store_result, WriteResult::PreconditionFailed { .. }) {
-        if let Some(existing) =
-            resolve_backfill_idempotency(storage, idempotency_key, &record.fingerprint, &[]).await?
-        {
-            return Ok(existing);
-        }
-        return Err(ApiError::conflict(
-            "idempotency key was claimed concurrently; retry request",
-        ));
-    }
-
-    Ok(CreateBackfillResponse {
-        backfill_id,
-        accepted_event_id,
-        accepted_at,
-    })
+    Ok(backfill_response_from_record(&record))
 }
 
 fn user_id_for_events(ctx: &RequestContext) -> String {
@@ -6173,11 +6356,135 @@ mod tests {
     use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
+    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend};
     use arco_flow::orchestration::LedgerWriter;
     use axum::http::StatusCode;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::Duration;
     use serde_json::json;
+    use std::ops::Range;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration as StdDuration;
+
+    struct FailLedgerPutsBackend {
+        inner: MemoryBackend,
+        fail_ledger_puts: AtomicBool,
+    }
+
+    impl FailLedgerPutsBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                fail_ledger_puts: AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_ledger_puts(&self, fail: bool) {
+            self.fail_ledger_puts.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    async fn seed_latest_manifest_code_version(
+        storage: &ScopedStorage,
+        ctx: &RequestContext,
+        code_version: &str,
+    ) -> Result<()> {
+        let manifest_id = Ulid::new().to_string();
+        let stored_manifest = StoredManifest {
+            manifest_id: manifest_id.clone(),
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            manifest_version: "1.0".to_string(),
+            code_version_id: code_version.to_string(),
+            fingerprint: format!("fp-{code_version}"),
+            git: GitContext::default(),
+            assets: vec![AssetEntry {
+                key: AssetKey {
+                    namespace: "analytics".to_string(),
+                    name: "daily".to_string(),
+                },
+                id: "01HQXYZ123".to_string(),
+                description: String::new(),
+                owners: vec![],
+                tags: serde_json::Value::Null,
+                partitioning: serde_json::Value::Null,
+                dependencies: vec![],
+                code: serde_json::Value::Null,
+                checks: vec![],
+                execution: serde_json::Value::Null,
+                resources: serde_json::Value::Null,
+                io: serde_json::Value::Null,
+                transform_fingerprint: String::new(),
+            }],
+            schedules: vec![],
+            deployed_at: Utc::now(),
+            deployed_by: "test".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+
+        storage
+            .put_raw(
+                &crate::paths::manifest_path(&manifest_id),
+                Bytes::from(serde_json::to_vec(&stored_manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                MANIFEST_LATEST_INDEX_PATH,
+                Bytes::from(serde_json::to_vec(&LatestManifestIndex {
+                    latest_manifest_id: manifest_id,
+                    deployed_at: stored_manifest.deployed_at,
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailLedgerPutsBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if self.fail_ledger_puts.load(Ordering::SeqCst)
+                && (path.contains("/ledger/orchestration/")
+                    || path.starts_with("ledger/orchestration/"))
+            {
+                return Err(CoreError::storage(format!(
+                    "injected orchestration ledger put failure for {path}"
+                )));
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: StdDuration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     fn hash_trigger_fingerprint_payload(
         request: &TriggerRunRequest,
@@ -6788,6 +7095,7 @@ mod tests {
             output_visibility_state: visibility_state,
             published_at: Some(Utc::now()),
             publish_error: publish_error.map(ToString::to_string),
+            retry_not_before: None,
             delta_table: Some("analytics.daily".to_string()),
             delta_version: Some(7),
             delta_partition: Some("date=2026-03-24".to_string()),
@@ -7237,6 +7545,8 @@ mod tests {
             accepted_event_id: "evt_legacy_existing".to_string(),
             accepted_at,
             fingerprint: legacy_fingerprint,
+            input: None,
+            status: BackfillIdempotencyStatus::Accepted,
         };
 
         let backend = state.storage_backend().map_err(|err| anyhow!("{err:?}"))?;
@@ -7395,6 +7705,8 @@ mod tests {
             accepted_event_id: "evt_existing".to_string(),
             accepted_at,
             fingerprint: fingerprint.clone(),
+            input: None,
+            status: BackfillIdempotencyStatus::Accepted,
         };
         store_backfill_idempotency_record(&storage, &existing_record)
             .await
@@ -7415,6 +7727,95 @@ mod tests {
         assert_eq!(replay.backfill_id, "bf_existing");
         assert_eq!(replay.accepted_event_id, "evt_existing");
         assert_eq!(replay.accepted_at, accepted_at);
+
+        let compactor = MicroCompactor::new(storage);
+        let (_manifest, state) = compactor
+            .load_state()
+            .await
+            .map_err(|err| anyhow!("{err:?}"))?;
+        assert!(
+            state.backfills.is_empty(),
+            "the losing idempotency claimant must not append a distinct BackfillCreated event"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_backfill_retries_after_idempotency_claim_without_visible_event()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let backend = Arc::new(FailLedgerPutsBackend::new());
+        let storage_backend: Arc<dyn StorageBackend> = backend.clone();
+        let state = Arc::new(AppState::new(config, storage_backend));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_claim_failure_01".to_string(),
+            idempotency_key: None,
+        };
+
+        let request = CreateBackfillRequest {
+            asset_selection: vec!["analytics.daily".to_string()],
+            partition_selector: PartitionSelectorRequest::Range {
+                start: "2025-01-01".to_string(),
+                end: "2025-01-03".to_string(),
+            },
+            client_request_id: Some("bf_claim_failure_001".to_string()),
+            chunk_size: Some(2),
+            max_concurrent_runs: Some(1),
+        };
+
+        let storage = ctx
+            .scoped_storage(state.storage_backend().map_err(|err| anyhow!("{err:?}"))?)
+            .map_err(|err| anyhow!("{err:?}"))?;
+        seed_latest_manifest_code_version(&storage, &ctx, "code-v1").await?;
+
+        backend.set_fail_ledger_puts(true);
+        let first = create_backfill(
+            State(Arc::clone(&state)),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request.clone()),
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "initial request must fail when the ledger append is rejected"
+        );
+
+        seed_latest_manifest_code_version(&storage, &ctx, "code-v2").await?;
+        backend.set_fail_ledger_puts(false);
+        let replay = create_backfill(
+            State(Arc::clone(&state)),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?;
+
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(replay.into_body(), 64 * 1024).await?;
+        let payload: CreateBackfillResponse = serde_json::from_slice(&body)?;
+
+        let compactor = MicroCompactor::new(storage);
+        let (_manifest, state) = compactor
+            .load_state()
+            .await
+            .map_err(|err| anyhow!("{err:?}"))?;
+        assert!(
+            state.backfills.contains_key(&payload.backfill_id),
+            "successful replay must make the claimed BackfillCreated event visible"
+        );
+        let row = state
+            .backfills
+            .get(&payload.backfill_id)
+            .expect("visible backfill");
+        assert_eq!(row.code_version.as_deref(), Some("code-v1"));
         Ok(())
     }
 

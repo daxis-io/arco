@@ -161,7 +161,6 @@ async fn apply_catalog_ddl_repairs_missing_catalog_tx_record_from_visible_idempo
         1,
     ));
     let spy = Arc::new(SpyBackend::new(inner));
-    spy.set_fail_on_list(true);
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
 
@@ -194,6 +193,8 @@ async fn apply_catalog_ddl_repairs_missing_catalog_tx_record_from_visible_idempo
         "req-cat-repair-tx-02",
         "repair-catalog-tx",
     );
+    spy.clear_ops();
+    spy.set_fail_on_list(true);
     let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router,
         "/api/v1/transactions/applyCatalogDdl",
@@ -226,7 +227,6 @@ async fn apply_catalog_ddl_repairs_missing_visible_idempotency_from_catalog_tx_r
         1,
     ));
     let spy = Arc::new(SpyBackend::new(inner));
-    spy.set_fail_on_list(true);
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
 
@@ -263,6 +263,8 @@ async fn apply_catalog_ddl_repairs_missing_visible_idempotency_from_catalog_tx_r
         "req-cat-repair-idem-02",
         "repair-catalog-idem",
     );
+    spy.clear_ops();
+    spy.set_fail_on_list(true);
     let (_status, response): (_, ApplyCatalogDdlResponse) = post_protobuf(
         router,
         "/api/v1/transactions/applyCatalogDdl",

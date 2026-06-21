@@ -1,5 +1,6 @@
 //! Orchestration compaction helpers (sync or remote).
 
+use arco_core::control_plane_transactions::ControlPlaneDurableAppend;
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::{ScopedStorage, VisibilityStatus};
 use arco_flow::compaction_client::compact_orchestration_events_fenced;
@@ -53,6 +54,29 @@ pub struct OrchestrationCommitOutcome {
     pub repair_pending: bool,
 }
 
+/// Failure mode from append-plus-compact orchestration writes.
+#[derive(Debug)]
+pub enum OrchestrationCommitError {
+    /// The operation failed before any event was durably appended.
+    Definite(ApiError),
+    /// Events were durably appended, but compaction visibility could not be confirmed.
+    AmbiguousAfterAppend {
+        /// API error returned to the caller.
+        error: ApiError,
+        /// Durable append metadata that can be used to repair visibility.
+        durable_append: ControlPlaneDurableAppend,
+    },
+}
+
+impl OrchestrationCommitError {
+    /// Converts the classified failure back into the API error returned to callers.
+    pub fn into_api_error(self) -> ApiError {
+        match self {
+            Self::Definite(error) | Self::AmbiguousAfterAppend { error, .. } => error,
+        }
+    }
+}
+
 /// Appends orchestration events and compacts them with the same fencing token.
 ///
 /// This is the PI-1 API write helper for routes that must ensure the append and
@@ -70,7 +94,8 @@ pub async fn append_events_and_compact(
 ) -> Result<Vec<String>, ApiError> {
     Ok(
         append_events_and_compact_with_result(config, storage, events, request_id)
-            .await?
+            .await
+            .map_err(OrchestrationCommitError::into_api_error)?
             .event_paths,
     )
 }
@@ -86,10 +111,90 @@ pub async fn append_events_and_compact_with_result(
     storage: ScopedStorage,
     events: Vec<OrchestrationEvent>,
     request_id: Option<&str>,
-) -> Result<OrchestrationCommitOutcome, ApiError> {
+) -> Result<OrchestrationCommitOutcome, OrchestrationCommitError> {
     if events.is_empty() {
-        return Err(ApiError::bad_request(
+        return Err(OrchestrationCommitError::Definite(ApiError::bad_request(
             "orchestration batch must include at least one event",
+        )));
+    }
+
+    let lock_path = orchestration_compaction_lock_path();
+    let lock = DistributedLock::new(storage.backend().clone(), lock_path);
+    let guard = lock.acquire(DEFAULT_LOCK_TTL, 10).await.map_err(|e| {
+        OrchestrationCommitError::Definite(ApiError::conflict(format!(
+            "failed to acquire orchestration compaction lock: {e}"
+        )))
+    })?;
+    let fencing_token = guard.fencing_token().sequence();
+
+    let outcome = async {
+        let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
+        let durable_append = ControlPlaneDurableAppend {
+            event_paths: event_paths.clone(),
+            lock_path: lock_path.to_string(),
+            fencing_token,
+        };
+        let ledger = LedgerWriter::new(storage.clone());
+        ledger.append_all(events).await.map_err(|e| {
+            OrchestrationCommitError::Definite(ApiError::internal(format!(
+                "failed to append orchestration events: {e}"
+            )))
+        })?;
+
+        let publish_result = compact_orchestration_events_with_fencing(
+            config,
+            storage.clone(),
+            event_paths.clone(),
+            fencing_token,
+            lock_path,
+            request_id,
+        )
+        .await
+        .map_err(|error| OrchestrationCommitError::AmbiguousAfterAppend {
+            error,
+            durable_append: durable_append.clone(),
+        })?;
+
+        Ok::<_, OrchestrationCommitError>((event_paths, publish_result))
+    }
+    .await;
+
+    if let Err(error) = guard.release().await {
+        tracing::warn!(
+            error = %error,
+            "failed to release orchestration compaction lock after compaction; relying on TTL cleanup"
+        );
+    }
+
+    let (event_paths, publish_result) = outcome?;
+
+    Ok(OrchestrationCommitOutcome {
+        event_paths,
+        lock_path: lock_path.to_string(),
+        fencing_token,
+        manifest_id: publish_result.manifest_id,
+        manifest_revision: publish_result.manifest_revision,
+        pointer_version: publish_result.pointer_version,
+        delta_id: publish_result.delta_id,
+        events_processed: publish_result.events_processed,
+        repair_pending: publish_result.repair_pending,
+    })
+}
+
+/// Compacts already-appended orchestration event paths and returns commit metadata.
+///
+/// # Errors
+///
+/// Returns an error if lock acquisition, compaction, or visibility validation fails.
+pub async fn compact_event_paths_with_result(
+    config: &Config,
+    storage: ScopedStorage,
+    event_paths: Vec<String>,
+    request_id: Option<&str>,
+) -> Result<OrchestrationCommitOutcome, ApiError> {
+    if event_paths.is_empty() {
+        return Err(ApiError::bad_request(
+            "orchestration repair must include at least one event path",
         ));
     }
 
@@ -102,35 +207,24 @@ pub async fn append_events_and_compact_with_result(
     })?;
     let fencing_token = guard.fencing_token().sequence();
 
-    let outcome = async {
-        let event_paths: Vec<String> = events.iter().map(LedgerWriter::event_path).collect();
-        let ledger = LedgerWriter::new(storage.clone());
-        ledger.append_all(events).await.map_err(|e| {
-            ApiError::internal(format!("failed to append orchestration events: {e}"))
-        })?;
-
-        let publish_result = compact_orchestration_events_with_fencing(
-            config,
-            storage.clone(),
-            event_paths.clone(),
-            fencing_token,
-            lock_path,
-            request_id,
-        )
-        .await?;
-
-        Ok::<_, ApiError>((event_paths, publish_result))
-    }
+    let publish_result = compact_orchestration_events_with_fencing(
+        config,
+        storage,
+        event_paths.clone(),
+        fencing_token,
+        lock_path,
+        request_id,
+    )
     .await;
 
     if let Err(error) = guard.release().await {
         tracing::warn!(
             error = %error,
-            "failed to release orchestration compaction lock after compaction; relying on TTL cleanup"
+            "failed to release orchestration compaction lock after repair compaction; relying on TTL cleanup"
         );
     }
 
-    let (event_paths, publish_result) = outcome?;
+    let publish_result = publish_result?;
 
     Ok(OrchestrationCommitOutcome {
         event_paths,
@@ -270,6 +364,13 @@ impl CompactingLedgerWriter {
 impl OrchestrationLedgerWriter for CompactingLedgerWriter {
     async fn write_event(&self, event: &OrchestrationEvent) -> Result<(), String> {
         append_event_and_compact(&self.config, self.storage.clone(), event.clone(), None)
+            .await
+            .map_err(|e| format!("{e:?}"))
+            .map(|_| ())
+    }
+
+    async fn write_events(&self, events: Vec<OrchestrationEvent>) -> Result<(), String> {
+        append_events_and_compact(&self.config, self.storage.clone(), events, None)
             .await
             .map_err(|e| format!("{e:?}"))
             .map(|_| ())

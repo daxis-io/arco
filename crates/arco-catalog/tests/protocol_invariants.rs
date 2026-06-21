@@ -17,8 +17,9 @@ use arco_catalog::parquet_util::{
 };
 use arco_catalog::writer::{CatalogTransactionCommit, SchemaPatch};
 use arco_catalog::{
-    CatalogReader, CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest,
-    RegisterTableRequest, TablePatch, Tier1Compactor, Tier1Writer, WriteOptions,
+    CatalogIdempotencyMarker, CatalogOperation, CatalogReader, CatalogWriter, ColumnDefinition,
+    DEFAULT_STALE_TIMEOUT, IdempotencyStatus, RegisterTableInSchemaRequest, RegisterTableRequest,
+    TablePatch, Tier1Compactor, Tier1Writer, WriteOptions, canonical_request_hash,
 };
 use arco_core::control_plane_transactions::{
     ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxStatus,
@@ -26,9 +27,10 @@ use arco_core::control_plane_transactions::{
 };
 use arco_core::lock::LockInfo;
 use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::storage_keys::StateKey;
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use scripted_backend::{PreconditionMatcher, ScriptedBackend, ScriptedEffect, ScriptedRule};
 use spy_backend::{SpyBackend, SpyOp};
 
@@ -79,13 +81,9 @@ async fn assert_visible_commit(storage: &ScopedStorage, commit: &CatalogTransact
         "transaction helper must report the held fencing token"
     );
 
-    let commits_path = CatalogPaths::snapshot_file(
-        CatalogDomain::Catalog,
-        manifest.snapshot_version,
-        "commits.parquet",
-    );
+    let commits_path = StateKey::snapshot_file_in_dir(&manifest.snapshot_path, "commits.parquet");
     let commit_bytes = storage
-        .get_raw(&commits_path)
+        .get_raw(commits_path.as_ref())
         .await
         .expect("catalog commits snapshot bytes");
     let commit_rows = read_commits(&commit_bytes).expect("parse catalog commits snapshot");
@@ -178,6 +176,7 @@ async fn seed_root_token_for_catalog(
         fencing_token: 1,
         prepared_at: visible_at,
         visible_at: Some(visible_at),
+        durable_append: None,
         result: Some(RootTxReceipt {
             tx_id: tx_id.to_string(),
             root_commit_id: "01JROOTTOKENCOMMIT0000000001".to_string(),
@@ -205,6 +204,65 @@ async fn seed_root_token_for_catalog(
         )
         .await
         .expect("write root tx record");
+}
+
+async fn load_idempotency_marker(
+    storage: &ScopedStorage,
+    operation: CatalogOperation,
+    key: &str,
+) -> CatalogIdempotencyMarker {
+    let key_hash = CatalogIdempotencyMarker::hash_key(key);
+    let path = CatalogIdempotencyMarker::storage_path(operation, &key_hash);
+    let bytes = storage
+        .get_raw(&path)
+        .await
+        .expect("idempotency marker bytes");
+    serde_json::from_slice(&bytes).expect("parse idempotency marker")
+}
+
+async fn seed_stale_create_catalog_marker(
+    storage: &ScopedStorage,
+    key: &str,
+    name: &str,
+    description: Option<&str>,
+) {
+    seed_stale_create_catalog_marker_with_reserved_entity(storage, key, name, description, None)
+        .await;
+}
+
+async fn seed_stale_create_catalog_marker_with_reserved_entity(
+    storage: &ScopedStorage,
+    key: &str,
+    name: &str,
+    description: Option<&str>,
+    entity_id: Option<&str>,
+) {
+    let request_hash = canonical_request_hash(&serde_json::json!({
+        "name": name,
+        "description": description,
+        "properties": Option::<BTreeMap<String, String>>::None,
+        "storage_root": Option::<String>::None,
+        "if_match": Option::<u64>::None,
+    }))
+    .expect("canonical request hash");
+    let mut marker = CatalogIdempotencyMarker::new_in_progress(
+        key.to_string(),
+        CatalogOperation::CreateCatalog,
+        request_hash,
+    );
+    if let Some(entity_id) = entity_id {
+        marker.entity_id = Some(entity_id.to_string());
+        marker.entity_name = Some(name.to_string());
+    }
+    marker.started_at = Utc::now() - DEFAULT_STALE_TIMEOUT - ChronoDuration::seconds(1);
+    storage
+        .put_raw(
+            &marker.path(),
+            Bytes::from(serde_json::to_vec(&marker).expect("serialize idempotency marker")),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("write stale idempotency marker");
 }
 
 async fn seed_legacy_default_namespace_snapshot(
@@ -1410,13 +1468,9 @@ async fn catalog_reader_fails_closed_when_visible_catalog_snapshot_file_is_missi
         .expect("create visible catalog");
 
     let (_pointer, manifest, _pointer_version) = current_catalog_pointer(&storage).await;
-    let catalogs_path = CatalogPaths::snapshot_file(
-        CatalogDomain::Catalog,
-        manifest.snapshot_version,
-        "catalogs.parquet",
-    );
+    let catalogs_path = StateKey::snapshot_file_in_dir(&manifest.snapshot_path, "catalogs.parquet");
     storage
-        .delete(&catalogs_path)
+        .delete(catalogs_path.as_ref())
         .await
         .expect("delete visible catalogs snapshot file");
 
@@ -1666,6 +1720,142 @@ async fn catalog_transaction_helper_returns_commit_when_lock_release_fails_after
         .expect("read namespace")
         .expect("namespace published despite release failure");
     assert_eq!(schema.name, "release_failure");
+}
+
+#[tokio::test]
+async fn transient_catalog_publish_conflict_keeps_idempotency_marker_retryable() {
+    let backend = Arc::new(ScriptedBackend::new());
+    let storage = scoped_storage(backend.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    backend.add_rule(ScriptedRule::put(
+        format!(
+            "tenant={TENANT}/workspace={WORKSPACE}/{}",
+            CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog)
+        ),
+        PreconditionMatcher::MatchesVersion,
+        5,
+        ScriptedEffect::PreconditionFailed {
+            current_version: "injected-pointer-conflict".to_string(),
+        },
+    ));
+
+    let key = "018f0f87-8e78-7c21-8e91-5370f332bb65";
+    let error = writer
+        .create_catalog(
+            "transient_publish_conflict",
+            Some("transient publish conflict"),
+            WriteOptions::with_idempotency(key),
+        )
+        .await
+        .expect_err("transient publish conflict must fail the current attempt");
+    assert!(
+        matches!(error, arco_catalog::CatalogError::CasFailed { .. }),
+        "unexpected transient publish error: {error:?}"
+    );
+
+    let marker = load_idempotency_marker(&storage, CatalogOperation::CreateCatalog, key).await;
+    assert_eq!(marker.status, IdempotencyStatus::InProgress);
+    assert_eq!(marker.error_http_status, None);
+    assert_eq!(marker.error_message, None);
+    assert!(marker.entity_id.is_some());
+    assert_eq!(
+        marker.entity_name.as_deref(),
+        Some("transient_publish_conflict")
+    );
+
+    let retry = writer
+        .create_catalog(
+            "transient_publish_conflict",
+            Some("transient publish conflict"),
+            WriteOptions::with_idempotency(key),
+        )
+        .await
+        .expect_err("fresh in-progress marker should not replay a cached failure");
+    assert!(
+        retry.to_string().contains("still in progress"),
+        "unexpected retry error: {retry}"
+    );
+}
+
+#[tokio::test]
+async fn stale_create_catalog_marker_does_not_recover_unowned_visible_catalog() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let name = "stale_marker_visible_catalog";
+    let description = Some("visible before idempotency marker finalized");
+    let catalog = writer
+        .create_catalog(name, description, WriteOptions::default())
+        .await
+        .expect("seed visible catalog");
+
+    let key = "018f0f87-8e78-7c21-8e91-5370f332bb66";
+    seed_stale_create_catalog_marker(&storage, key, name, description).await;
+
+    let error = writer
+        .create_catalog(name, description, WriteOptions::with_idempotency(key))
+        .await
+        .expect_err("stale marker must not recover a catalog created without this idempotency key");
+    assert!(
+        matches!(error, arco_catalog::CatalogError::AlreadyExists { .. }),
+        "unexpected stale marker error: {error:?}"
+    );
+
+    let marker = load_idempotency_marker(&storage, CatalogOperation::CreateCatalog, key).await;
+    assert_ne!(marker.status, IdempotencyStatus::Committed);
+    assert_ne!(marker.entity_id.as_deref(), Some(catalog.id.as_str()));
+    assert_ne!(marker.entity_name.as_deref(), Some(name));
+
+    let replayed_error = writer
+        .create_catalog(name, description, WriteOptions::with_idempotency(key))
+        .await
+        .expect_err("finalized marker must not replay an unrelated visible catalog");
+    assert!(
+        replayed_error
+            .to_string()
+            .contains("already exists: catalog stale_marker_visible_catalog"),
+        "unexpected replay error: {replayed_error}"
+    );
+}
+
+#[tokio::test]
+async fn stale_create_catalog_marker_with_reserved_visible_catalog_recovers_committed_success() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = scoped_storage(backend);
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+
+    let name = "reserved_stale_marker_visible_catalog";
+    let description = Some("visible before idempotency marker finalized");
+    let catalog = writer
+        .create_catalog(name, description, WriteOptions::default())
+        .await
+        .expect("seed visible catalog");
+
+    let key = "018f0f87-8e78-7c21-8e91-5370f332bb67";
+    seed_stale_create_catalog_marker_with_reserved_entity(
+        &storage,
+        key,
+        name,
+        description,
+        Some(&catalog.id),
+    )
+    .await;
+
+    let recovered = writer
+        .create_catalog(name, description, WriteOptions::with_idempotency(key))
+        .await
+        .expect("stale marker with reserved visible identity should recover");
+    assert_eq!(recovered.id, catalog.id);
+    assert_eq!(recovered.name, catalog.name);
+
+    let marker = load_idempotency_marker(&storage, CatalogOperation::CreateCatalog, key).await;
+    assert_eq!(marker.status, IdempotencyStatus::Committed);
+    assert_eq!(marker.entity_id.as_deref(), Some(catalog.id.as_str()));
+    assert_eq!(marker.entity_name.as_deref(), Some(name));
 }
 
 #[tokio::test]

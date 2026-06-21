@@ -1124,6 +1124,9 @@ impl OrchestrationEventEnvelope {
             orchestration_event_envelope::Event::TaskFinished(event) => {
                 validate_task_finished_event(event)?;
             }
+            orchestration_event_envelope::Event::TaskCompletionRecorded(event) => {
+                validate_task_completion_recorded_event(event)?;
+            }
             orchestration_event_envelope::Event::DispatchRequested(event) => {
                 validate_dispatch_requested_event(event)?;
             }
@@ -1463,6 +1466,63 @@ fn validate_task_finished_event(
     )?;
     validate_event_optional_string("task_finished", "asset_key", event.asset_key.as_ref())?;
     validate_event_optional_string("task_finished", "code_version", event.code_version.as_ref())
+}
+
+fn validate_task_completion_recorded_event(
+    event: &TaskCompletionRecorded,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_string("task_completion_recorded", "run_id", &event.run_id)?;
+    validate_event_string("task_completion_recorded", "task_key", &event.task_key)?;
+    validate_event_nonzero_u32("task_completion_recorded", "attempt", event.attempt)?;
+    validate_event_string("task_completion_recorded", "attempt_id", &event.attempt_id)?;
+    validate_event_string("task_completion_recorded", "worker_id", &event.worker_id)?;
+    validate_event_enum(
+        "task_completion_recorded",
+        "outcome",
+        event.outcome,
+        &TaskOutcome::Unspecified,
+    )?;
+    validate_task_error("task_completion_recorded", "error", event.error.as_ref())?;
+    validate_event_optional_string(
+        "task_completion_recorded",
+        "cancelled_during_phase",
+        event.cancelled_during_phase.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "task_completion_recorded",
+        "asset_key",
+        event.asset_key.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "task_completion_recorded",
+        "code_version",
+        event.code_version.as_ref(),
+    )?;
+    if let Some(update) = event.output_visibility.as_ref() {
+        validate_task_output_visibility_update(update)?;
+    }
+    Ok(())
+}
+
+fn validate_task_output_visibility_update(
+    update: &TaskOutputVisibilityUpdate,
+) -> Result<(), OrchestrationEventContractError> {
+    validate_event_enum(
+        "task_completion_recorded",
+        "output_visibility.visibility_state",
+        update.visibility_state,
+        &OutputVisibilityState::Unspecified,
+    )?;
+    validate_event_timestamp(
+        "task_completion_recorded",
+        "output_visibility.published_at",
+        update.published_at.as_ref(),
+    )?;
+    validate_event_optional_string(
+        "task_completion_recorded",
+        "output_visibility.publish_error",
+        update.publish_error.as_ref(),
+    )
 }
 
 fn validate_task_output_visibility_changed_event(

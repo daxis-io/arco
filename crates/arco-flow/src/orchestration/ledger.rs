@@ -31,6 +31,12 @@ pub trait OrchestrationLedgerWriter: Send + Sync {
         &self,
         event: &OrchestrationEvent,
     ) -> impl Future<Output = std::result::Result<(), String>> + Send;
+
+    /// Writes a caller-visible batch of related events to the ledger.
+    fn write_events(
+        &self,
+        events: Vec<OrchestrationEvent>,
+    ) -> impl Future<Output = std::result::Result<(), String>> + Send;
 }
 
 /// Writes orchestration events to the ledger (append-only JSON files).
@@ -155,6 +161,13 @@ impl LedgerWriter {
 impl OrchestrationLedgerWriter for LedgerWriter {
     async fn write_event(&self, event: &OrchestrationEvent) -> std::result::Result<(), String> {
         self.append(event.clone()).await.map_err(|e| format!("{e}"))
+    }
+
+    async fn write_events(
+        &self,
+        events: Vec<OrchestrationEvent>,
+    ) -> std::result::Result<(), String> {
+        self.append_all(events).await.map_err(|e| format!("{e}"))
     }
 }
 

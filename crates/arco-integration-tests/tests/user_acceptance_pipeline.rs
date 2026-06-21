@@ -438,6 +438,30 @@ impl OrchestrationLedgerWriter for CompactingLedger {
             Ok(())
         }
     }
+
+    fn write_events(
+        &self,
+        events: Vec<OrchestrationEvent>,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let writer = self.clone();
+        async move {
+            let paths = events
+                .iter()
+                .map(LedgerWriter::event_path)
+                .collect::<Vec<_>>();
+            writer
+                .ledger
+                .append_all(events)
+                .await
+                .map_err(|err| err.to_string())?;
+            writer
+                .compactor
+                .compact_events(paths)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Clone)]

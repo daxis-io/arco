@@ -11,7 +11,7 @@ use ulid::Ulid;
 use arco_core::lock::DistributedLock;
 use arco_core::publish::Publisher;
 use arco_core::storage::{StorageBackend, WriteResult};
-use arco_core::storage_keys::ManifestKey;
+use arco_core::storage_keys::{ManifestKey, StateKey};
 use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, ControlPlaneScope,
@@ -391,10 +391,7 @@ impl Tier1Compactor {
                 });
             }
             let events_processed = unapplied_event_paths.len();
-            let last_event_id = unapplied_event_paths
-                .last()
-                .and_then(|path| event_id_from_path(path))
-                .map(str::to_string);
+            let last_event_id = max_event_id_from_paths(&unapplied_event_paths);
 
             let mut state = tier1_state::load_catalog_state(&self.storage, &manifest.snapshot_path)
                 .await
@@ -438,10 +435,16 @@ impl Tier1Compactor {
                 commit_metadata,
             )?);
 
-            let mut snapshot =
-                tier1_snapshot::write_catalog_snapshot(&self.storage, next_version, &state)
-                    .await
-                    .map_err(map_processing_error)?;
+            let snapshot_dir =
+                StateKey::snapshot_attempt_dir(CatalogDomain::Catalog, next_version, &manifest_id);
+            let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
+                &self.storage,
+                next_version,
+                snapshot_dir.as_ref(),
+                &state,
+            )
+            .await
+            .map_err(map_processing_error)?;
             snapshot.published_at = next_commit.published_at;
 
             manifest.snapshot_version = snapshot.version;
@@ -557,11 +560,7 @@ impl Tier1Compactor {
         fencing_token: u64,
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let events_processed = event_paths.len();
-        let last_event_id = event_paths
-            .last()
-            .and_then(|path| path.rsplit('/').next())
-            .and_then(|name| name.strip_suffix(".json"))
-            .map(str::to_string);
+        let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
@@ -611,12 +610,23 @@ impl Tier1Compactor {
             }
 
             let next_version = manifest.snapshot_version + 1;
-            let snapshot =
-                tier1_snapshot::write_lineage_snapshot(&self.storage, next_version, &state)
-                    .await
-                    .map_err(map_processing_error)?;
-
             let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
+            let manifest_id = next_available_manifest_id(
+                &self.storage,
+                CatalogDomain::Lineage,
+                &prev_manifest.manifest_id,
+            )
+            .await?;
+            let snapshot_dir =
+                StateKey::snapshot_attempt_dir(CatalogDomain::Lineage, next_version, &manifest_id);
+            let snapshot = tier1_snapshot::write_lineage_snapshot_in_dir(
+                &self.storage,
+                next_version,
+                snapshot_dir.as_ref(),
+                &state,
+            )
+            .await
+            .map_err(map_processing_error)?;
 
             manifest.snapshot_version = snapshot.version;
             manifest.edges_path.clone_from(&snapshot.path);
@@ -629,12 +639,7 @@ impl Tier1Compactor {
             manifest.previous_manifest_path = Some(previous_manifest_path.clone());
             manifest.writer_session_id = Some(issuer.resource().to_string());
             manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_available_manifest_id(
-                &self.storage,
-                CatalogDomain::Lineage,
-                &prev_manifest.manifest_id,
-            )
-            .await?;
+            manifest.manifest_id = manifest_id;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
@@ -741,11 +746,7 @@ impl Tier1Compactor {
         fencing_token: u64,
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let events_processed = event_paths.len();
-        let last_event_id = event_paths
-            .last()
-            .and_then(|path| path.rsplit('/').next())
-            .and_then(|name| name.strip_suffix(".json"))
-            .map(str::to_string);
+        let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
 
         for attempt in 1..=self.cas_max_retries {
@@ -804,12 +805,23 @@ impl Tier1Compactor {
             let search_state = build_search_state(&catalog_state);
 
             let next_version = manifest.snapshot_version + 1;
-            let snapshot =
-                tier1_snapshot::write_search_snapshot(&self.storage, next_version, &search_state)
-                    .await
-                    .map_err(map_processing_error)?;
-
             let commit_ulid = next_commit_ulid(prev_manifest.commit_ulid.as_deref())?;
+            let manifest_id = next_available_manifest_id(
+                &self.storage,
+                CatalogDomain::Search,
+                &prev_manifest.manifest_id,
+            )
+            .await?;
+            let snapshot_dir =
+                StateKey::snapshot_attempt_dir(CatalogDomain::Search, next_version, &manifest_id);
+            let snapshot = tier1_snapshot::write_search_snapshot_in_dir(
+                &self.storage,
+                next_version,
+                snapshot_dir.as_ref(),
+                &search_state,
+            )
+            .await
+            .map_err(map_processing_error)?;
 
             manifest.snapshot_version = snapshot.version;
             manifest.base_path.clone_from(&snapshot.path);
@@ -822,12 +834,7 @@ impl Tier1Compactor {
             manifest.previous_manifest_path = Some(previous_manifest_path.clone());
             manifest.writer_session_id = Some(issuer.resource().to_string());
             manifest.watermark_event_id.clone_from(&last_event_id);
-            manifest.manifest_id = next_available_manifest_id(
-                &self.storage,
-                CatalogDomain::Search,
-                &prev_manifest.manifest_id,
-            )
-            .await?;
+            manifest.manifest_id = manifest_id;
 
             manifest
                 .validate_succession(&prev_manifest, &prev_raw_hash)
@@ -965,6 +972,14 @@ fn event_id_from_path(path: &str) -> Option<&str> {
     path.rsplit('/')
         .next()
         .and_then(|name| name.strip_suffix(".json"))
+}
+
+fn max_event_id_from_paths(event_paths: &[String]) -> Option<String> {
+    event_paths
+        .iter()
+        .filter_map(|path| event_id_from_path(path))
+        .max()
+        .map(str::to_string)
 }
 
 fn unapplied_event_paths_after_watermark(
@@ -2016,16 +2031,151 @@ mod tests {
         assert_eq!(pointer.manifest_id, search_manifest.manifest_id);
         assert!(pointer.manifest_path.contains("manifests/search/"));
 
-        let postings_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Search,
-            result.snapshot_version,
-            "token_postings.parquet",
-        );
-        let postings_bytes = storage.get_raw(&postings_path).await.expect("postings");
+        let postings_path =
+            StateKey::snapshot_file_in_dir(&search_manifest.base_path, "token_postings.parquet");
+        let postings_bytes = storage
+            .get_raw(postings_path.as_ref())
+            .await
+            .expect("postings");
         let postings =
             crate::parquet_util::read_search_postings(&postings_bytes).expect("read postings");
         assert!(!postings.is_empty());
 
+        guard.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn sync_compact_catalog_preserves_unpublished_next_version_orphans() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("initialize");
+
+        let guard = writer
+            .acquire_lock(Duration::from_secs(30), 1)
+            .await
+            .expect("lock");
+        let event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord {
+                id: "ns-1".to_string(),
+                catalog_id: None,
+                name: "sales".to_string(),
+                description: Some("Sales".to_string()),
+                storage_root: None,
+                properties_json: None,
+                created_at: Utc::now().timestamp_millis(),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+        };
+        let event_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &event, "test")
+            .await
+            .expect("append event");
+        let orphan_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "catalogs.parquet");
+        storage
+            .put_raw(
+                &orphan_path,
+                Bytes::from_static(b"crash orphan from unpublished attempt"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write orphan");
+
+        let compactor = Tier1Compactor::new(storage.clone());
+        let result = compactor
+            .sync_compact(
+                "catalog",
+                vec![CatalogPaths::ledger_event(
+                    CatalogDomain::Catalog,
+                    &event_id.to_string(),
+                )],
+                guard.fencing_token().sequence(),
+            )
+            .await
+            .expect("sync compact");
+
+        assert_eq!(result.snapshot_version, 1);
+        let manifest = writer.read_manifest().await.expect("manifest");
+        assert_eq!(manifest.catalog.snapshot_version, 1);
+        assert_ne!(
+            manifest.catalog.snapshot_path,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+            "new compaction attempts must write to attempt-unique snapshot paths"
+        );
+        storage
+            .get_raw(&orphan_path)
+            .await
+            .expect("stale next-version orphan must not be deleted by a later lock holder");
+        guard.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn sync_compact_catalog_watermark_uses_max_processed_event_id() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("initialize");
+
+        let guard = writer
+            .acquire_lock(Duration::from_secs(30), 1)
+            .await
+            .expect("lock");
+        let first_event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord {
+                id: "ns-1".to_string(),
+                catalog_id: None,
+                name: "sales".to_string(),
+                description: Some("Sales".to_string()),
+                storage_root: None,
+                properties_json: None,
+                created_at: Utc::now().timestamp_millis(),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+        };
+        let first_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &first_event, "test")
+            .await
+            .expect("append first event");
+        let second_event = CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord {
+                id: "ns-2".to_string(),
+                catalog_id: None,
+                name: "support".to_string(),
+                description: Some("Support".to_string()),
+                storage_root: None,
+                properties_json: None,
+                created_at: Utc::now().timestamp_millis(),
+                updated_at: Utc::now().timestamp_millis(),
+            },
+        };
+        let second_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &second_event, "test")
+            .await
+            .expect("append second event");
+        let mut event_ids = [first_id.to_string(), second_id.to_string()];
+        event_ids.sort();
+        let max_event_id = event_ids[1].clone();
+
+        let compactor = Tier1Compactor::new(storage.clone());
+        compactor
+            .sync_compact(
+                "catalog",
+                vec![
+                    CatalogPaths::ledger_event(CatalogDomain::Catalog, &event_ids[1]),
+                    CatalogPaths::ledger_event(CatalogDomain::Catalog, &event_ids[0]),
+                ],
+                guard.fencing_token().sequence(),
+            )
+            .await
+            .expect("sync compact");
+
+        let manifest = writer.read_manifest().await.expect("manifest");
+        assert_eq!(
+            manifest.catalog.watermark_event_id.as_deref(),
+            Some(max_event_id.as_str()),
+            "watermark must be the max processed event ID, not the last input path"
+        );
         guard.release().await.expect("release");
     }
 }

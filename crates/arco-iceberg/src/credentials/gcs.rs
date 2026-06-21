@@ -1,17 +1,9 @@
-//! GCS credential provider for `OAuth2` token vending.
+//! GCS credential provider for storage access delegation.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use gcp_auth::TokenProvider;
-use tracing::{debug, instrument, warn};
-
-struct TokenWithExpiry {
-    value: String,
-    expires_at: DateTime<Utc>,
-}
+use tracing::{instrument, warn};
 
 use crate::error::{IcebergError, IcebergResult};
 use crate::metrics::{record_credential_vending, record_credential_vending_duration};
@@ -19,8 +11,6 @@ use crate::state::{CredentialProvider, CredentialRequest};
 use crate::types::StorageCredential;
 
 use super::{DEFAULT_CREDENTIAL_TTL, clamp_ttl};
-
-const GCS_SCOPES: &[&str] = &["https://www.googleapis.com/auth/devstorage.read_write"];
 
 /// Configuration for GCS credential vending.
 #[derive(Debug, Clone)]
@@ -49,7 +39,6 @@ impl GcsCredentialConfig {
 /// GCS credential provider using Google Cloud authentication.
 pub struct GcsCredentialProvider {
     config: GcsCredentialConfig,
-    token_provider: Arc<dyn TokenProvider>,
 }
 
 impl std::fmt::Debug for GcsCredentialProvider {
@@ -65,45 +54,21 @@ impl GcsCredentialProvider {
     ///
     /// # Errors
     ///
-    /// Returns an error if GCP authentication cannot be initialized.
+    /// This constructor is infallible today. It keeps a result return type so a
+    /// future downscoped-token implementation can surface provider setup
+    /// failures without changing the public API.
+    #[allow(clippy::unused_async)]
     pub async fn new(config: GcsCredentialConfig) -> IcebergResult<Self> {
-        let token_provider = gcp_auth::provider()
-            .await
-            .map_err(|e| IcebergError::Internal {
-                message: format!("failed to initialize GCP authentication: {e}"),
-            })?;
-
-        Ok(Self {
-            config,
-            token_provider,
-        })
+        Ok(Self { config })
     }
 
     /// Creates a GCS credential provider with default configuration.
     ///
     /// # Errors
     ///
-    /// Returns an error if GCP authentication cannot be initialized.
+    /// See [`Self::new`].
     pub async fn from_environment() -> IcebergResult<Self> {
         Self::new(GcsCredentialConfig::default()).await
-    }
-
-    #[instrument(skip(self), level = "debug")]
-    async fn fetch_token(&self) -> IcebergResult<TokenWithExpiry> {
-        debug!("fetching GCS OAuth2 token");
-
-        let token =
-            self.token_provider
-                .token(GCS_SCOPES)
-                .await
-                .map_err(|e| IcebergError::Internal {
-                    message: format!("failed to get GCS token: {e}"),
-                })?;
-
-        Ok(TokenWithExpiry {
-            value: token.as_str().to_string(),
-            expires_at: token.expires_at(),
-        })
     }
 
     /// Normalizes a GCS table location into a prefix for credential scoping.
@@ -188,52 +153,39 @@ impl CredentialProvider for GcsCredentialProvider {
             return Ok(vec![]);
         }
 
-        let token = match self.fetch_token().await {
-            Ok(t) => t,
-            Err(e) => {
-                record_credential_vending("gcs", "error");
-                record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
-                return Err(e);
-            }
+        let Some(prefix) = Self::extract_gcs_prefix(&location) else {
+            warn!(location = %location, "credential vending requested for invalid GCS location");
+            record_credential_vending("gcs", "invalid_gcs_location");
+            record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
+            return Err(IcebergError::BadRequest {
+                message: "invalid GCS table location for credential vending".to_string(),
+                error_type: "BadRequestException",
+            });
         };
 
-        let now = Utc::now();
-        if token.expires_at <= now {
-            warn!(
-                "GCS token already expired (expires_at={}, now={}), refusing to vend",
-                token.expires_at, now
-            );
-            record_credential_vending("gcs", "error_expired_token");
-            record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
-            return Err(IcebergError::ServiceUnavailable {
-                message: "credential provider returned expired token".to_string(),
-                retry_after_seconds: Some(5),
-            });
-        }
-
-        let ttl_seconds = i64::try_from(self.config.ttl.as_secs()).unwrap_or(3600);
-        let configured_expiry = now + chrono::Duration::seconds(ttl_seconds);
-        let expires_at = configured_expiry.min(token.expires_at);
-        let expires_at_str = expires_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-
-        let prefix = Self::extract_gcs_prefix(&location).unwrap_or(location);
-
-        debug!(prefix = %prefix, expires_at = %expires_at_str, "vending GCS credentials");
-
-        record_credential_vending("gcs", "success");
+        warn!(
+            prefix = %prefix,
+            table = %request.table.ident.name,
+            ttl_secs = self.config.ttl.as_secs(),
+            "GCS credential vending denied because downscoped credentials are not implemented"
+        );
+        record_credential_vending("gcs", "denied_downscoped_unimplemented");
         record_credential_vending_duration("gcs", start.elapsed().as_secs_f64());
-
-        Ok(vec![StorageCredential::gcs(
-            prefix,
-            token.value,
-            expires_at_str,
-        )])
+        Err(IcebergError::ServiceUnavailable {
+            message:
+                "GCS credential vending requires downscoped credentials; raw platform OAuth tokens are disabled"
+                    .to_string(),
+            retry_after_seconds: None,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::state::TableInfo;
+    use crate::types::{AccessDelegation, TableIdent};
 
     #[test]
     fn test_extract_gcs_prefix_with_nested_path() {
@@ -345,5 +297,28 @@ mod tests {
 
         let config = GcsCredentialConfig::default().with_ttl(Duration::from_secs(7200));
         assert_eq!(config.ttl, super::super::MAX_CREDENTIAL_TTL);
+    }
+
+    #[tokio::test]
+    async fn gcs_vending_fails_closed_before_minting_raw_platform_token() {
+        let provider = GcsCredentialProvider {
+            config: GcsCredentialConfig::default(),
+        };
+        let request = CredentialRequest {
+            table: TableInfo {
+                ident: TableIdent::simple("db", "orders"),
+                table_id: "table-123".to_string(),
+                location: Some("gs://shared-bucket/tenant=t1/workspace=w1/orders/".to_string()),
+            },
+            delegation: AccessDelegation::VendedCredentials,
+        };
+
+        let err = provider.vended_credentials(request).await.unwrap_err();
+
+        assert!(matches!(err, IcebergError::ServiceUnavailable { .. }));
+        assert!(
+            err.to_string().contains("downscoped"),
+            "error should explain why GCS credential vending is denied: {err}"
+        );
     }
 }

@@ -305,6 +305,95 @@ async fn test_commit_table_idempotent_replay_returns_cached_response() {
 }
 
 #[tokio::test]
+async fn test_stale_marker_takeover_uses_fresh_metadata_location_when_orphan_exists() {
+    let fixture = Fixture::new().await;
+    let service = CommitService::new(Arc::clone(&fixture.storage));
+
+    let request = commit_request(303);
+    let request_value = serde_json::to_value(&request).expect("serialize request");
+    let request_hash = canonical_request_hash(&request_value).expect("request hash");
+    let idempotency_key = Uuid::now_v7().to_string();
+    let key_hash = IdempotencyMarker::hash_key(&idempotency_key);
+    let stale_metadata_location = format!(
+        "{}/metadata/1-{}.metadata.json",
+        fixture.table_location, key_hash
+    );
+
+    let mut stale_marker = IdempotencyMarker::new_in_progress(
+        idempotency_key.clone(),
+        fixture.table_uuid,
+        request_hash.clone(),
+        fixture.metadata_location.clone(),
+        stale_metadata_location.clone(),
+    );
+    stale_marker.started_at = chrono::Utc::now() - chrono::Duration::minutes(20);
+    let marker_path =
+        IdempotencyMarker::storage_path(&fixture.table_uuid, &stale_marker.idempotency_key_hash);
+    fixture
+        .storage
+        .put(
+            &marker_path,
+            Bytes::from(serde_json::to_vec(&stale_marker).expect("serialize marker")),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("put stale marker");
+
+    let orphan_metadata_path = format!(
+        "warehouse/{}/metadata/1-{}.metadata.json",
+        fixture.table, key_hash
+    );
+    fixture
+        .storage
+        .put(
+            &orphan_metadata_path,
+            Bytes::from_static(b"{\"orphaned\":\"metadata-before-pointer-cas\"}"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("put orphan metadata");
+
+    let response = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request,
+            request_hash,
+            idempotency_key.clone(),
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await
+        .expect("stale takeover should commit with a fresh metadata location");
+
+    assert_ne!(response.metadata_location, stale_metadata_location);
+    assert!(
+        response.metadata_location.starts_with(&format!(
+            "{}/metadata/1-{key_hash}-",
+            fixture.table_location
+        )),
+        "takeover metadata location should remain tied to the idempotency key"
+    );
+
+    let idempotency_store = IdempotencyStoreImpl::new(Arc::clone(&fixture.storage));
+    let (marker, _) = idempotency_store
+        .load(&fixture.table_uuid, &key_hash)
+        .await
+        .expect("load marker")
+        .expect("marker exists");
+    assert_eq!(marker.status, IdempotencyStatus::Committed);
+    assert_eq!(
+        marker.response_metadata_location.as_deref(),
+        Some(response.metadata_location.as_str())
+    );
+}
+
+#[tokio::test]
 async fn test_transactions_commit_single_table_returns_204() {
     let backend = Arc::new(TracingMemoryBackend::new());
     let tenant = "acme".to_string();

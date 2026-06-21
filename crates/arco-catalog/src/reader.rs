@@ -679,11 +679,7 @@ impl CatalogReader {
             return Ok(LineageGraph::default());
         }
 
-        let edges_path = CatalogPaths::snapshot_file(
-            CatalogDomain::Lineage,
-            manifest.snapshot_version,
-            "lineage_edges.parquet",
-        );
+        let edges_path = join_snapshot_path(&manifest.edges_path, "lineage_edges.parquet");
 
         let bytes = self.storage.get_raw(&edges_path).await?;
         let records = parquet_util::read_lineage_edges(&bytes)?;
@@ -1639,6 +1635,7 @@ mod tests {
             fencing_token: 1,
             prepared_at: visible_at,
             visible_at: Some(visible_at),
+            durable_append: None,
             result: Some(RootTxReceipt {
                 tx_id: tx_id.to_string(),
                 root_commit_id: "01JROOTREADCOMMIT0000000001".to_string(),
@@ -1806,6 +1803,7 @@ mod tests {
             fencing_token: 1,
             prepared_at: visible_at,
             visible_at: Some(visible_at),
+            durable_append: None,
             result: Some(RootTxReceipt {
                 tx_id: tx_id.to_string(),
                 root_commit_id: "01JROOTPINNEDVIEWCOMMIT0001".to_string(),

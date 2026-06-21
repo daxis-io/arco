@@ -18,7 +18,8 @@ use super::types::{
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
 use crate::orchestration::OrchestrationLedgerWriter;
 use crate::orchestration::events::{
-    OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, TaskOutcome,
+    OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, OutputVisibilityUpdate,
+    TaskOutcome,
 };
 
 /// Context for callback handlers.
@@ -680,13 +681,26 @@ where
         None => None,
     };
 
-    // Emit TaskFinished event
+    // Emit one durable completion fact. Output visibility, when present, is
+    // bound to the completion so object-store batch partial writes cannot make
+    // a completed task visible without its publication state.
     let finished_at = completed_at.unwrap_or_else(Utc::now);
+    let output_visibility = if outcome == TaskOutcome::Succeeded {
+        visibility_update.map(|(visibility_state, published_at, publish_error)| {
+            OutputVisibilityUpdate {
+                visibility_state: map_output_visibility_state(visibility_state),
+                published_at,
+                publish_error,
+            }
+        })
+    } else {
+        None
+    };
 
     let mut event = OrchestrationEvent::new(
         &ctx.tenant_id,
         &ctx.workspace_id,
-        OrchestrationEventData::TaskFinished {
+        OrchestrationEventData::TaskCompletionRecorded {
             run_id: state.run_id.clone(),
             task_key: state.task_key.clone(),
             attempt,
@@ -703,41 +717,17 @@ where
             asset_key: state.asset_key.clone(),
             partition_key: state.partition_key.clone(),
             code_version: state.code_version.clone(),
+            output_visibility,
         },
     );
     event.timestamp = finished_at;
+    let events = vec![event];
 
-    if let Err(e) = ctx.ledger.write_event(&event).await {
+    if let Err(e) = ctx.ledger.write_events(events).await {
         return finish_callback(
             "task_completed",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
         );
-    }
-
-    if outcome == TaskOutcome::Succeeded {
-        if let Some((visibility_state, published_at, publish_error)) = visibility_update {
-            let mut visibility_event = OrchestrationEvent::new(
-                &ctx.tenant_id,
-                &ctx.workspace_id,
-                OrchestrationEventData::TaskOutputVisibilityChanged {
-                    run_id: state.run_id.clone(),
-                    task_key: state.task_key.clone(),
-                    attempt,
-                    attempt_id: state.attempt_id.clone(),
-                    visibility_state: map_output_visibility_state(visibility_state),
-                    published_at,
-                    publish_error,
-                },
-            );
-            visibility_event.timestamp = published_at.unwrap_or(finished_at);
-
-            if let Err(e) = ctx.ledger.write_event(&visibility_event).await {
-                return finish_callback(
-                    "task_completed",
-                    CallbackResult::InternalError(format!("Failed to write event: {e}")),
-                );
-            }
-        }
     }
 
     // Determine final state string
@@ -767,11 +757,44 @@ mod tests {
     #[derive(Default)]
     struct MockLedger {
         events: Mutex<Vec<OrchestrationEvent>>,
+        fail_after_writes: Mutex<Option<usize>>,
+    }
+
+    impl MockLedger {
+        fn fail_after_writes(writes: usize) -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                fail_after_writes: Mutex::new(Some(writes)),
+            }
+        }
     }
 
     impl OrchestrationLedgerWriter for MockLedger {
         async fn write_event(&self, event: &OrchestrationEvent) -> Result<(), String> {
-            self.events.lock().unwrap().push(event.clone());
+            let mut events = self.events.lock().unwrap();
+            if self
+                .fail_after_writes
+                .lock()
+                .unwrap()
+                .is_some_and(|limit| events.len() >= limit)
+            {
+                return Err("injected ledger write failure".to_string());
+            }
+            events.push(event.clone());
+            Ok(())
+        }
+
+        async fn write_events(&self, batch: Vec<OrchestrationEvent>) -> Result<(), String> {
+            let mut events = self.events.lock().unwrap();
+            if self
+                .fail_after_writes
+                .lock()
+                .unwrap()
+                .is_some_and(|limit| events.len() + batch.len() > limit)
+            {
+                return Err("injected ledger write failure".to_string());
+            }
+            events.extend(batch);
             Ok(())
         }
     }
@@ -1553,8 +1576,8 @@ mod tests {
         // Verify event was written
         let events = ledger.events.lock().unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "TaskFinished");
-        if let OrchestrationEventData::TaskFinished {
+        assert_eq!(events[0].event_type, "TaskCompletionRecorded");
+        if let OrchestrationEventData::TaskCompletionRecorded {
             asset_key,
             partition_key,
             code_version,
@@ -1571,7 +1594,7 @@ mod tests {
             assert_eq!(output.delta_version, Some(17));
             assert_eq!(output.delta_partition.as_deref(), Some("2025-01-15"));
         } else {
-            panic!("Expected TaskFinished event");
+            panic!("Expected TaskCompletionRecorded event");
         }
     }
 
@@ -1633,19 +1656,171 @@ mod tests {
         }
 
         let events = ledger.events.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "TaskFinished");
-        assert_eq!(events[1].event_type, "TaskOutputVisibilityChanged");
-        if let OrchestrationEventData::TaskOutputVisibilityChanged {
-            visibility_state,
-            published_at: emitted_published_at,
-            ..
-        } = &events[1].data
+        assert_eq!(
+            events.len(),
+            1,
+            "task completion and output visibility must be one durable event"
+        );
+        assert_eq!(events[0].event_type, "TaskCompletionRecorded");
+        if let OrchestrationEventData::TaskCompletionRecorded {
+            output_visibility, ..
+        } = &events[0].data
         {
+            let output_visibility = output_visibility
+                .as_ref()
+                .expect("expected output visibility");
+            let OutputVisibilityUpdate {
+                visibility_state,
+                published_at: emitted_published_at,
+                ..
+            } = output_visibility;
             assert_eq!(*visibility_state, OutputVisibilityState::Pending);
             assert_eq!(*emitted_published_at, Some(published_at));
         } else {
-            panic!("Expected TaskOutputVisibilityChanged event");
+            panic!("Expected TaskCompletionRecorded event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_completed_emits_legacy_compatible_completion_without_visibility() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskCompletedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            outcome: WorkerOutcome::Succeeded,
+            completed_at: Some(Utc::now()),
+            output: Some(super::super::types::TaskOutput {
+                materialization_id: Some("mat-123".to_string()),
+                row_count: Some(1000),
+                byte_size: Some(1024),
+                output_path: None,
+                delta_table: Some("analytics.daily".to_string()),
+                delta_version: Some(17),
+                delta_partition: Some("2025-01-15".to_string()),
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+        };
+
+        let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
+        assert!(matches!(result, CallbackResult::Ok(_)));
+
+        let events = ledger.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        if let OrchestrationEventData::TaskCompletionRecorded {
+            output_visibility,
+            code_version,
+            ..
+        } = &events[0].data
+        {
+            assert!(output_visibility.is_none());
+            assert_eq!(code_version.as_deref(), Some("v1.2.3"));
+        } else {
+            panic!("Expected TaskCompletionRecorded event");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_task_completed_writes_completion_and_visibility_as_single_event() {
+        let ledger = Arc::new(MockLedger::fail_after_writes(1));
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: Some("analytics.daily".to_string()),
+                partition_key: Some("2025-01-15".to_string()),
+                code_version: Some("v1.2.3".to_string()),
+                cancel_requested: false,
+            },
+        );
+
+        let published_at = Utc::now();
+        let request = TaskCompletedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            outcome: WorkerOutcome::Succeeded,
+            completed_at: Some(Utc::now()),
+            output: Some(super::super::types::TaskOutput {
+                materialization_id: Some("mat-123".to_string()),
+                row_count: Some(1000),
+                byte_size: Some(1024),
+                output_path: None,
+                delta_table: Some("analytics.daily".to_string()),
+                delta_version: Some(17),
+                delta_partition: Some("2025-01-15".to_string()),
+                output_visibility_state: Some(TaskOutputVisibilityState::Pending),
+                published_at: Some(published_at),
+                publish_error: None,
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+        };
+
+        let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
+        match result {
+            CallbackResult::Ok(response) => {
+                assert!(response.acknowledged);
+                assert_eq!(response.final_state, "SUCCEEDED");
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+
+        let events = ledger.events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "completion and visibility must fit in one durable ledger write"
+        );
+        if let OrchestrationEventData::TaskCompletionRecorded {
+            output_visibility, ..
+        } = &events[0].data
+        {
+            let output_visibility = output_visibility.as_ref().expect("expected visibility");
+            assert_eq!(
+                output_visibility.visibility_state,
+                OutputVisibilityState::Pending
+            );
+            assert_eq!(output_visibility.published_at, Some(published_at));
+        } else {
+            panic!("Expected TaskCompletionRecorded event");
         }
     }
 

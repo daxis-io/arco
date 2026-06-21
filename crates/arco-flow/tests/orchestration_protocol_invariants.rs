@@ -116,6 +116,7 @@ async fn seed_root_token_for_orchestration(
         fencing_token: 1,
         prepared_at: visible_at,
         visible_at: Some(visible_at),
+        durable_append: None,
         result: Some(RootTxReceipt {
             tx_id: tx_id.to_string(),
             root_commit_id: "01JFLOWROOTTOKENCOMMIT00000001".to_string(),

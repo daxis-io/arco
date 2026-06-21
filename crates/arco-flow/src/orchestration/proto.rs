@@ -35,8 +35,8 @@ use crate::orchestration::compactor::fold::{
 };
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, OutputVisibilityState,
-    PartitionSelector, RunRequest, SensorEvalStatus, SourceRef, TaskDef, TaskOutcome, TickStatus,
-    TimerType, TriggerInfo, TriggerSource,
+    OutputVisibilityUpdate, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef, TaskDef,
+    TaskOutcome, TickStatus, TimerType, TriggerInfo, TriggerSource,
 };
 use crate::run::{Run, RunState as LegacyRunState, TriggerType};
 use crate::task::{
@@ -424,6 +424,47 @@ fn event_data_to_proto(
             partition_key: string_to_proto_partition_key(partition_key.as_deref())?,
             code_version: code_version.clone(),
         }),
+        OrchestrationEventData::TaskCompletionRecorded {
+            run_id,
+            task_key,
+            attempt,
+            attempt_id,
+            worker_id,
+            outcome,
+            materialization_id,
+            error_message,
+            output,
+            error,
+            metrics,
+            cancelled_during_phase,
+            asset_key,
+            partition_key,
+            code_version,
+            output_visibility,
+            ..
+        } => orchestration_event_envelope::Event::TaskCompletionRecorded(
+            proto::TaskCompletionRecorded {
+                run_id: run_id.clone(),
+                task_key: task_key.clone(),
+                attempt: *attempt,
+                attempt_id: attempt_id.clone(),
+                worker_id: worker_id.clone(),
+                outcome: task_outcome_to_proto(*outcome) as i32,
+                callback_output: task_finished_output_to_proto(
+                    materialization_id.as_deref(),
+                    output.as_ref(),
+                ),
+                error: task_finished_error_to_proto(error_message.as_deref(), error.as_ref()),
+                metrics: metrics.as_ref().map(callback_metrics_to_proto),
+                cancelled_during_phase: cancelled_during_phase.clone(),
+                asset_key: asset_key.clone(),
+                partition_key: string_to_proto_partition_key(partition_key.as_deref())?,
+                code_version: code_version.clone(),
+                output_visibility: output_visibility
+                    .as_ref()
+                    .map(output_visibility_update_to_proto),
+            },
+        ),
         OrchestrationEventData::TaskOutputVisibilityChanged {
             run_id,
             task_key,
@@ -747,6 +788,38 @@ fn proto_event_to_runtime(
                 asset_key: event.asset_key.clone(),
                 partition_key: proto_partition_key_to_string(event.partition_key.as_ref())?,
                 code_version: event.code_version.clone(),
+            }
+        }
+        orchestration_event_envelope::Event::TaskCompletionRecorded(event) => {
+            let output = event
+                .callback_output
+                .as_ref()
+                .map(callback_output_from_proto);
+            let (error_message, error) = task_finished_error_from_proto(event.error.as_ref())?;
+            OrchestrationEventData::TaskCompletionRecorded {
+                run_id: event.run_id.clone(),
+                task_key: event.task_key.clone(),
+                attempt: event.attempt,
+                attempt_id: event.attempt_id.clone(),
+                worker_id: event.worker_id.clone(),
+                outcome: proto_task_outcome_to_runtime(event.outcome)?,
+                materialization_id: output
+                    .as_ref()
+                    .and_then(|value| value.materialization_id.clone()),
+                error_message,
+                output,
+                error,
+                metrics: event.metrics.as_ref().map(callback_metrics_from_proto),
+                cancelled_during_phase: event.cancelled_during_phase.clone(),
+                partial_progress_json: None,
+                asset_key: event.asset_key.clone(),
+                partition_key: proto_partition_key_to_string(event.partition_key.as_ref())?,
+                code_version: event.code_version.clone(),
+                output_visibility: event
+                    .output_visibility
+                    .as_ref()
+                    .map(output_visibility_update_from_proto)
+                    .transpose()?,
             }
         }
         orchestration_event_envelope::Event::TaskOutputVisibilityChanged(event) => {
@@ -1161,6 +1234,35 @@ fn proto_output_visibility_state_to_runtime(
         proto::OutputVisibilityState::Visible => Ok(OutputVisibilityState::Visible),
         proto::OutputVisibilityState::Failed => Ok(OutputVisibilityState::Failed),
     }
+}
+
+fn output_visibility_update_to_proto(
+    update: &OutputVisibilityUpdate,
+) -> proto::TaskOutputVisibilityUpdate {
+    proto::TaskOutputVisibilityUpdate {
+        visibility_state: output_visibility_state_to_proto(update.visibility_state) as i32,
+        published_at: update.published_at.map(chrono_to_protobuf),
+        publish_error: update.publish_error.clone(),
+    }
+}
+
+fn output_visibility_update_from_proto(
+    update: &proto::TaskOutputVisibilityUpdate,
+) -> Result<OutputVisibilityUpdate, OrchestrationProtoError> {
+    Ok(OutputVisibilityUpdate {
+        visibility_state: proto_output_visibility_state_to_runtime(update.visibility_state)?,
+        published_at: update
+            .published_at
+            .as_ref()
+            .map(|value| {
+                protobuf_to_chrono(
+                    Some(value),
+                    "task_completion_recorded.output_visibility.published_at",
+                )
+            })
+            .transpose()?,
+        publish_error: update.publish_error.clone(),
+    })
 }
 
 fn timer_type_to_proto(timer_type: TimerType) -> proto::TimerType {

@@ -311,14 +311,32 @@ impl Tier1Writer {
     /// Returns an error if serialization or storage fails.
     pub async fn append_ledger_event<T: CatalogEventPayload + serde::Serialize + Sync>(
         &self,
-        _guard: &LockGuard<dyn StorageBackend>,
+        guard: &LockGuard<dyn StorageBackend>,
         domain: CatalogDomain,
         payload: &T,
         source: &str,
     ) -> Result<EventId> {
-        let event_id = EventId::generate();
-        let key = LedgerKey::event(domain, &event_id.to_string());
+        self.append_ledger_event_after(guard, domain, payload, source, None)
+            .await
+    }
 
+    /// Append a ledger event that must sort after a previous same-lock event.
+    ///
+    /// Multi-event mutations compact by lexicographic event ID. Threading the
+    /// previously allocated ID through the batch keeps event application order
+    /// deterministic even when the visible manifest watermark has not advanced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or storage fails.
+    pub async fn append_ledger_event_after<T: CatalogEventPayload + serde::Serialize + Sync>(
+        &self,
+        _guard: &LockGuard<dyn StorageBackend>,
+        domain: CatalogDomain,
+        payload: &T,
+        source: &str,
+        previous_event_id: Option<EventId>,
+    ) -> Result<EventId> {
         let idempotency_key =
             CatalogEvent::<()>::generate_idempotency_key(T::EVENT_TYPE, T::EVENT_VERSION, payload)
                 .map_err(|e| CatalogError::Serialization {
@@ -328,7 +346,7 @@ impl Tier1Writer {
         let envelope = CatalogEvent {
             event_type: T::EVENT_TYPE.to_string(),
             event_version: T::EVENT_VERSION,
-            idempotency_key,
+            idempotency_key: idempotency_key.clone(),
             occurred_at: Utc::now(),
             source: source.to_string(),
             trace_id: None,
@@ -347,15 +365,80 @@ impl Tier1Writer {
                 message: format!("failed to serialize event: {e}"),
             })?;
 
-        // Use DoesNotExist for append-only semantics
-        match self.storage.put_ledger(&key, Bytes::from(json)).await? {
-            WriteResult::Success { .. } => Ok(event_id),
-            WriteResult::PreconditionFailed { .. } => {
-                // Event already exists - this is fine for idempotency
-                tracing::debug!(event_id = %event_id, "duplicate ledger event (already exists)");
-                Ok(event_id)
+        let watermark = self.current_watermark_event_id(domain).await?;
+        let floor = match (watermark, previous_event_id) {
+            (Some(watermark), Some(previous_event_id)) => Some(watermark.max(previous_event_id)),
+            (Some(watermark), None) => Some(watermark),
+            (None, Some(previous_event_id)) => Some(previous_event_id),
+            (None, None) => None,
+        };
+        let mut event_id = EventId::generate_after(floor).map_err(CatalogError::from)?;
+        for _ in 0..1024 {
+            let key = LedgerKey::event(domain, &event_id.to_string());
+            match self
+                .storage
+                .put_ledger(&key, Bytes::from(json.clone()))
+                .await?
+            {
+                WriteResult::Success { .. } => return Ok(event_id),
+                WriteResult::PreconditionFailed { .. } => {
+                    if self
+                        .existing_ledger_event_matches(
+                            key.as_ref(),
+                            T::EVENT_TYPE,
+                            T::EVENT_VERSION,
+                            &idempotency_key,
+                        )
+                        .await?
+                    {
+                        tracing::debug!(
+                            event_id = %event_id,
+                            "duplicate ledger event matches idempotency key"
+                        );
+                        return Ok(event_id);
+                    }
+                    event_id =
+                        EventId::generate_after(Some(event_id)).map_err(CatalogError::from)?;
+                }
             }
         }
+
+        Err(CatalogError::InvariantViolation {
+            message: "failed to allocate unique ledger event ID after collision retries"
+                .to_string(),
+        })
+    }
+
+    async fn existing_ledger_event_matches(
+        &self,
+        path: &str,
+        event_type: &str,
+        event_version: u32,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        let bytes = self.storage.get_raw(path).await?;
+        let existing: CatalogEvent<serde_json::Value> =
+            serde_json::from_slice(&bytes).map_err(|e| CatalogError::Serialization {
+                message: format!("failed to parse existing ledger event at {path}: {e}"),
+            })?;
+        Ok(existing.event_type == event_type
+            && existing.event_version == event_version
+            && existing.idempotency_key == idempotency_key)
+    }
+
+    async fn current_watermark_event_id(&self, domain: CatalogDomain) -> Result<Option<EventId>> {
+        let manifest = self.read_manifest().await?;
+        let watermark = match domain {
+            CatalogDomain::Catalog => manifest.catalog.watermark_event_id,
+            CatalogDomain::Lineage => manifest.lineage.watermark_event_id,
+            CatalogDomain::Search => manifest.search.watermark_event_id,
+            CatalogDomain::Executions => None,
+        };
+        watermark
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(CatalogError::from)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -975,6 +1058,181 @@ mod tests {
         writer.initialize().await?;
         writer.initialize().await?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_ledger_event_advances_past_catalog_watermark() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let watermark: EventId =
+            "7ZZZZZZZZZ0000000000000000"
+                .parse()
+                .map_err(|e| CatalogError::Validation {
+                    message: format!("parse watermark: {e}"),
+                })?;
+        let pointer_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest_pointer(
+                CatalogDomain::Catalog,
+            ))
+            .await?;
+        let pointer: DomainManifestPointer = parse_json(&pointer_bytes)?;
+        let mut manifest: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&pointer.manifest_path).await?)?;
+        manifest.watermark_event_id = Some(watermark.to_string());
+        storage
+            .put_raw(
+                &pointer.manifest_path,
+                json_bytes(&manifest)?,
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let guard = writer.acquire_lock(Duration::from_secs(30), 1).await?;
+        let event = crate::tier1_events::CatalogDdlEvent::NamespaceCreated {
+            namespace: crate::parquet_util::NamespaceRecord {
+                id: "ns-1".to_string(),
+                catalog_id: None,
+                name: "sales".to_string(),
+                description: None,
+                created_at: 1,
+                updated_at: 1,
+                properties_json: None,
+                storage_root: None,
+            },
+        };
+
+        let event_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &event, "test")
+            .await?;
+        guard.release().await.map_err(CatalogError::from)?;
+
+        assert!(
+            event_id > watermark,
+            "appended event ID must sort after the visible catalog watermark"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_ledger_event_allocates_distinct_ids_when_watermark_is_in_future() -> Result<()>
+    {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let watermark: EventId =
+            "7ZZZZZZZZZ0000000000000000"
+                .parse()
+                .map_err(|e| CatalogError::Validation {
+                    message: format!("parse watermark: {e}"),
+                })?;
+        let pointer_bytes = storage
+            .get_raw(&CatalogPaths::domain_manifest_pointer(
+                CatalogDomain::Catalog,
+            ))
+            .await?;
+        let pointer: DomainManifestPointer = parse_json(&pointer_bytes)?;
+        let mut manifest: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&pointer.manifest_path).await?)?;
+        manifest.watermark_event_id = Some(watermark.to_string());
+        storage
+            .put_raw(
+                &pointer.manifest_path,
+                json_bytes(&manifest)?,
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let guard = writer.acquire_lock(Duration::from_secs(30), 1).await?;
+        let first = crate::tier1_events::CatalogDdlEvent::NamespaceCreated {
+            namespace: crate::parquet_util::NamespaceRecord {
+                id: "ns-1".to_string(),
+                catalog_id: None,
+                name: "sales".to_string(),
+                description: None,
+                created_at: 1,
+                updated_at: 1,
+                properties_json: None,
+                storage_root: None,
+            },
+        };
+        let second = crate::tier1_events::CatalogDdlEvent::NamespaceCreated {
+            namespace: crate::parquet_util::NamespaceRecord {
+                id: "ns-2".to_string(),
+                catalog_id: None,
+                name: "support".to_string(),
+                description: None,
+                created_at: 2,
+                updated_at: 2,
+                properties_json: None,
+                storage_root: None,
+            },
+        };
+
+        let first_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &first, "test")
+            .await?;
+        let second_id = writer
+            .append_ledger_event(&guard, CatalogDomain::Catalog, &second, "test")
+            .await?;
+        guard.release().await.map_err(CatalogError::from)?;
+
+        assert!(
+            second_id > first_id,
+            "same-lock events must receive strictly increasing ledger IDs"
+        );
+        let ledger_files = storage.list("ledger/catalog/").await?;
+        assert_eq!(ledger_files.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_ledger_event_after_advances_past_previous_same_lock_event() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+
+        let previous_event_id: EventId =
+            "7ZZZZZZZZZ0000000000000000"
+                .parse()
+                .map_err(|e| CatalogError::Validation {
+                    message: format!("parse previous event id: {e}"),
+                })?;
+        let event = crate::tier1_events::CatalogDdlEvent::NamespaceCreated {
+            namespace: crate::parquet_util::NamespaceRecord {
+                id: "ns-ordered".to_string(),
+                catalog_id: None,
+                name: "ordered".to_string(),
+                description: None,
+                created_at: 1,
+                updated_at: 1,
+                properties_json: None,
+                storage_root: None,
+            },
+        };
+
+        let guard = writer.acquire_lock(Duration::from_secs(30), 1).await?;
+        let event_id = writer
+            .append_ledger_event_after(
+                &guard,
+                CatalogDomain::Catalog,
+                &event,
+                "test",
+                Some(previous_event_id),
+            )
+            .await?;
+        guard.release().await.map_err(CatalogError::from)?;
+
+        assert!(
+            event_id > previous_event_id,
+            "same-lock event ID must sort after the previous generated event ID"
+        );
         Ok(())
     }
 

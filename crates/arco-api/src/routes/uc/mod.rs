@@ -235,6 +235,11 @@ pub(crate) async fn create_catalog(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::StaleReserved { .. } => {
+            return Err(ApiError::conflict(
+                "request with Idempotency-Key is still in progress",
+            ));
+        }
         IdempotencyCheck::Replay { entity_name, .. } => {
             let reader = CatalogReader::new(storage);
             let catalog = reader
@@ -431,6 +436,11 @@ pub(crate) async fn create_schema(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::StaleReserved { .. } => {
+            return Err(ApiError::conflict(
+                "request with Idempotency-Key is still in progress",
+            ));
+        }
         IdempotencyCheck::Replay { entity_name, .. } => {
             let reader = CatalogReader::new(storage);
             let schema = reader

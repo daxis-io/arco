@@ -32,7 +32,6 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
         1,
     ));
     let spy = Arc::new(SpyBackend::new(inner));
-    spy.set_fail_on_list(true);
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
 
@@ -67,6 +66,8 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
         "repair-root-tx",
         "run-root-repair-tx-01",
     );
+    spy.clear_ops();
+    spy.set_fail_on_list(true);
     let (_status, response): (_, CommitRootTransactionResponse) = post_protobuf(
         router,
         "/api/v1/transactions/commitRootTransaction",
@@ -99,7 +100,6 @@ async fn replay_repairs_missing_visible_idempotency_from_root_tx_record_without_
         1,
     ));
     let spy = Arc::new(SpyBackend::new(inner));
-    spy.set_fail_on_list(true);
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
 
@@ -137,6 +137,8 @@ async fn replay_repairs_missing_visible_idempotency_from_root_tx_record_without_
         "repair-root-idem",
         "run-root-repair-idem-01",
     );
+    spy.clear_ops();
+    spy.set_fail_on_list(true);
     let (_status, response): (_, CommitRootTransactionResponse) = post_protobuf(
         router,
         "/api/v1/transactions/commitRootTransaction",

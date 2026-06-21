@@ -47,6 +47,7 @@ fn base_task_row(state: FoldTaskState) -> TaskRow {
         output_visibility_state: None,
         published_at: None,
         publish_error: None,
+        retry_not_before: None,
         delta_table: None,
         delta_version: None,
         delta_partition: None,

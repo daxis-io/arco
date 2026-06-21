@@ -9,14 +9,14 @@ Arco implements the [Apache Iceberg REST Catalog API](https://iceberg.apache.org
 - Namespace CRUD operations
 - Table CRUD operations (create, register, drop)
 - Table commits with CAS-based concurrency control
-- Credential vending via `X-Iceberg-Access-Delegation` header
+- Credential vending negotiation via `X-Iceberg-Access-Delegation` header
 - Idempotent operations with `Idempotency-Key` header
 
 ## Compatibility Matrix
 
 | Engine | Version | Status | Notes |
 |--------|---------|--------|-------|
-| Apache Spark | 3.4+ | Tested | Full support with credential vending |
+| Apache Spark | 3.4+ | Tested | Full support without storage credential vending |
 | Trino | 440+ | Tested | Full support |
 | DuckDB | 0.9+ | Partial | Read-only; no credential vending support |
 | PyIceberg | 0.5+ | Tested | Full support |
@@ -34,7 +34,7 @@ spark.sql.catalog.arco.credential=<oauth-token>
 spark.sql.catalog.arco.header.X-Tenant-Id=<tenant-id>
 spark.sql.catalog.arco.header.X-Workspace-Id=<workspace-id>
 
-# Enable credential vending (recommended for GCS/S3)
+# Request credential vending when downscoped provider credentials are available
 spark.sql.catalog.arco.header.X-Iceberg-Access-Delegation=vended-credentials
 ```
 
@@ -103,27 +103,28 @@ table = catalog.load_table("my_namespace.my_table")
 ### Credential Vending
 
 - Credentials are valid for up to 1 hour (configurable)
-- Only GCS credential vending is currently implemented
+- GCS credential vending is currently fail-closed until downscoped credentials are implemented
 - S3 and Azure credential vending are planned
 
 #### Security Considerations
 
 Credential vending provides storage access tokens to query engines. Understanding the security model is critical for production deployments:
 
-**Current Implementation (GCS OAuth2 Tokens)**
+**Current Implementation (GCS Downscoped Credentials Required)**
 
-Arco vends OAuth2 access tokens with `devstorage.read_write` scope. The security of vended credentials depends entirely on your IAM configuration:
+Arco does not vend raw platform OAuth2 access tokens. GCS credential vending returns a service-unavailable error until enforceable downscoped credentials are implemented for the requested table prefix.
 
-1. **Per-Tenant Service Accounts (Recommended)**: Deploy Arco with a per-tenant GCP service account that only has access to that tenant's storage prefix. This provides strong isolation without additional token scoping.
+1. **Downscoped Tokens (Required)**: GCP Credential Access Boundaries must constrain tokens to the exact governed bucket/prefix and operation mode before Arco can return GCS credentials.
 
-2. **Shared Service Account with IAM Conditions**: Use IAM Conditions to restrict the service account's access to specific bucket prefixes based on request attributes.
+2. **Per-Tenant Service Accounts**: Per-tenant GCP service accounts or IAM Conditions can reduce blast radius for Arco itself, but they are not a substitute for downscoped credentials in the vending path.
 
-3. **Downscoped Tokens (Future)**: GCP Credential Access Boundaries can constrain tokens to specific buckets/prefixes. This is planned for a future release to provide defense-in-depth.
+3. **Shared Service Account with IAM Conditions**: A shared service account must still be paired with enforceable per-request credential scoping before vending is enabled.
 
 **Production Checklist**
 
+- [ ] Keep credential vending disabled until downscoped provider credentials are available
 - [ ] Verify the Arco service account can ONLY access intended storage prefixes
-- [ ] Use separate service accounts per tenant (or configure IAM Conditions)
+- [ ] Use separate service accounts per tenant or configure IAM Conditions as defense in depth
 - [ ] Enable audit logging for storage access
 - [ ] Set credential TTL to minimum acceptable value
 - [ ] Monitor `iceberg_credential_vending_*` metrics for anomalies
@@ -131,8 +132,8 @@ Arco vends OAuth2 access tokens with `devstorage.read_write` scope. The security
 **What Credential Vending Does NOT Provide**
 
 - Table-level authorization (any authenticated request in a tenant/workspace can request credentials)
-- Token audience restriction (tokens work for any GCS operation the SA permits)
-- Automatic prefix isolation (the SA's IAM permissions define the boundary)
+- Raw platform OAuth2 token vending
+- Automatic prefix isolation without downscoped provider credentials
 
 #### Enabling Credential Vending
 
@@ -140,7 +141,7 @@ Credential vending is disabled by default. To enable:
 
 1. Build with GCP feature: `cargo build --features gcp`
 2. Set environment variable: `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING=true`
-3. Ensure GCP authentication is configured (metadata server, `GOOGLE_APPLICATION_CREDENTIALS`, etc.)
+3. Configure a downscoped credential implementation before returning provider credentials to clients
 
 ### Namespace Separator
 

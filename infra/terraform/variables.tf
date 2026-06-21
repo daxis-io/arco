@@ -368,6 +368,12 @@ variable "tenant_secret_name" {
   default     = "arco-tenant-secret"
 }
 
+variable "flow_worker_dispatch_secret_name" {
+  description = "Secret Manager secret name containing the shared worker dispatch secret"
+  type        = string
+  default     = "arco-flow-worker-dispatch-secret"
+}
+
 # ============================================================================
 # Networking
 # ============================================================================

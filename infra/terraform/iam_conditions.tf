@@ -168,6 +168,38 @@ resource "google_storage_bucket_iam_member" "flow_worker_write_warehouse" {
   }
 }
 
+resource "google_storage_bucket_iam_member" "flow_timer_ingest_write_ledger" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.flow_timer_ingest[0].email}"
+
+  condition {
+    title       = "FlowTimerIngestWriteLedger"
+    description = "Gate 5: Flow timer ingest can create orchestration ledger events"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.ledger_object_prefix}")
+    EOT
+  }
+}
+
+resource "google_storage_bucket_iam_member" "flow_timer_ingest_manage_locks" {
+  count  = local.flow_services_enabled ? 1 : 0
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.flow_timer_ingest[0].email}"
+
+  condition {
+    title       = "FlowTimerIngestManageLocks"
+    description = "Gate 5: Flow timer ingest can manage orchestration compaction locks"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.locks_object_prefix}")
+    EOT
+  }
+}
+
 # ============================================================================
 # Compactor Fast-Path Service Account (Patch 9)
 # ============================================================================
@@ -275,7 +307,7 @@ resource "google_storage_bucket_iam_member" "compactor_fastpath_read_objects" {
 # ledger-only list scope here. We therefore grant list at the bucket level to
 # the dedicated anti-entropy service account only.
 #
-# Permissions: bucket list + read all
+# Permissions: bucket list + read all + prefix-scoped cursor writes
 
 # Anti-entropy can list bucket objects to discover missed notifications.
 resource "google_storage_bucket_iam_member" "compactor_antientropy_list_bucket" {
@@ -296,4 +328,13 @@ resource "google_storage_bucket_iam_member" "compactor_antientropy_write_cursor"
   bucket = google_storage_bucket.catalog.name
   role   = google_project_iam_custom_role.storage_object_writer_no_list.name
   member = "serviceAccount:${google_service_account.compactor_antientropy.email}"
+
+  condition {
+    title       = "CompactorAntiEntropyWriteCursor"
+    description = "Gate 5: Anti-entropy can update state/anti_entropy cursor"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.anti_entropy_state_prefix}")
+    EOT
+  }
 }

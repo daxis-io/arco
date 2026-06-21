@@ -20,6 +20,7 @@ use arco_core::{
 use arco_flow::dispatch::cloud_tasks::{
     CloudTasksConfig, CloudTasksDispatcher, resolve_target_audience,
 };
+use arco_flow::dispatch::worker_auth::worker_dispatch_headers;
 use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
@@ -40,6 +41,7 @@ struct AppState {
     ledger: LedgerWriter,
     orch_compactor_url: Option<String>,
     cloud_tasks: Arc<CloudTasksDispatcher>,
+    worker_dispatch_headers: std::collections::HashMap<String, String>,
     dispatch_target_url: String,
     dispatch_target_audience: String,
     callback_base_url: String,
@@ -236,7 +238,7 @@ async fn run_handler(
                 body.as_bytes(),
                 options,
                 Some(state.dispatch_target_audience.as_str()),
-                None,
+                Some(state.worker_dispatch_headers.clone()),
             )
             .await;
 
@@ -580,6 +582,8 @@ async fn main() -> Result<()> {
     let service_account_email = optional_env("ARCO_FLOW_SERVICE_ACCOUNT_EMAIL");
     let task_timeout_secs = task_timeout_seconds_from_env()?;
     let task_token_config = task_token_config_from_env(task_timeout_secs)?;
+    let worker_dispatch_headers =
+        worker_dispatch_headers(&required_env("ARCO_FLOW_WORKER_DISPATCH_SECRET")?)?;
     let port = resolve_port()?;
     let dispatch_target_audience = resolve_target_audience(
         dispatch_target_audience_env.as_deref(),
@@ -621,6 +625,7 @@ async fn main() -> Result<()> {
         ledger: LedgerWriter::new(storage),
         orch_compactor_url,
         cloud_tasks: Arc::new(cloud_tasks),
+        worker_dispatch_headers,
         dispatch_target_url,
         dispatch_target_audience,
         callback_base_url,

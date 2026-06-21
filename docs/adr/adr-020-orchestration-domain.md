@@ -93,6 +93,17 @@ Derived state changes (`TaskBecameReady`, `TaskSkipped`, `RunCompleted`) are
 not emitted as ledger events. The event envelope intentionally excludes
 projection-only events to prevent accidental ledger writes.
 
+### Durable Event Version-Skew Rule
+
+Older readers and compactors must tolerate unknown durable event `data.type`
+tags and fold them as no-ops so a newer writer cannot wedge compaction.
+
+New event kinds that change visible state must follow a reader-first rollout:
+deploy readers, compactors, and projections that understand the tag before any
+writer emits it as a required state transition. Writer-before-reader rollout is
+allowed only for diagnostic or otherwise non-critical events where older readers
+can safely ignore the fold semantics.
+
 ### Execution Model
 
 Controllers are pure, stateless reconcilers. They are executed by an external

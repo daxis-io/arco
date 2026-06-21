@@ -581,6 +581,19 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
         value = local.api_service_url
       }
 
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_WORKER_DISPATCH_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.flow_worker_dispatch_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       env {
         name  = "ARCO_FLOW_TIMER_QUEUE"
         value = var.flow_timer_queue_name
@@ -752,6 +765,19 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
         value = local.api_service_url
       }
 
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_WORKER_DISPATCH_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.flow_worker_dispatch_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
+      }
+
       env {
         name  = "ARCO_FLOW_SERVICE_ACCOUNT_EMAIL"
         value = google_service_account.flow_task_invoker.email
@@ -886,6 +912,19 @@ resource "google_cloud_run_v2_service" "flow_worker" {
       env {
         name  = "ARCO_FLOW_DEBUG"
         value = var.environment == "dev" ? "1" : "0"
+      }
+
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_WORKER_DISPATCH_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.flow_worker_dispatch_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
     }
   }

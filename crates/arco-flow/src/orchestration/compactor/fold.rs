@@ -1693,6 +1693,14 @@ impl FoldState {
                     &event.event_id,
                 );
             }
+            OrchestrationEventData::Unknown => {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    event_version = event.event_version,
+                    "skipping unknown orchestration event data tag"
+                );
+            }
         }
     }
 

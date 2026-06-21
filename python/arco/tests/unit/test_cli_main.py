@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import inspect
 
 from typer.testing import CliRunner
 
@@ -73,3 +74,11 @@ class TestCLIMain:
 
         assert result.exit_code == 0
         assert "--watch" in _plain_output(result)
+
+    def test_worker_defaults_to_loopback_bind(self) -> None:
+        """worker command defaults to loopback instead of all interfaces."""
+        from arco_flow.cli.main import worker
+
+        signature = inspect.signature(worker)
+
+        assert signature.parameters["host"].default == "127.0.0.1"

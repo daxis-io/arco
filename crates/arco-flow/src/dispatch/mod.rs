@@ -15,6 +15,7 @@
 
 pub mod cloud_tasks;
 pub mod memory;
+pub mod worker_auth;
 
 pub use cloud_tasks::CloudTasksDispatcher;
 pub use memory::InMemoryTaskQueue;

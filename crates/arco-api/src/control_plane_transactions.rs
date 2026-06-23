@@ -29,10 +29,10 @@ use arco_catalog::{
 use arco_core::ScopedStorage;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
-    CatalogTxReceipt, CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxDomain,
-    ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord, ControlPlaneTxStatus,
-    DomainCommit, OrchestrationTxReceipt, OrchestrationTxRecord, RootTxManifest,
-    RootTxManifestDomain, RootTxReceipt, RootTxRecord,
+    CatalogTxReceipt, CatalogTxRecord, ControlPlaneDurableAppend, ControlPlaneIdempotencyRecord,
+    ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths, ControlPlaneTxRecord,
+    ControlPlaneTxStatus, DomainCommit, OrchestrationTxReceipt, OrchestrationTxRecord,
+    RootTxManifest, RootTxManifestDomain, RootTxReceipt, RootTxRecord,
 };
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::storage::WritePrecondition;
@@ -59,7 +59,10 @@ use arco_proto::arco::orchestration::v1::OrchestrationEventEnvelope;
 
 use crate::context::RequestContext;
 use crate::error::ApiError;
-use crate::orchestration_compaction::append_events_and_compact_with_result;
+use crate::orchestration_compaction::{
+    OrchestrationCommitError, OrchestrationCommitOutcome, append_events_and_compact_with_result,
+    compact_event_paths_with_result,
+};
 use crate::server::AppState;
 
 /// Service entry point for transaction commit and lookup operations.
@@ -229,7 +232,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 repair_pending: record.repair_pending,
             });
         }
-        if let IdempotencyClaim::ExistingInProgress { tx_id } = &claim {
+        if let Some(tx_id) = match &claim {
+            IdempotencyClaim::ExistingInProgress { tx_id } => Some(tx_id),
+            IdempotencyClaim::ExistingRepairPending(record) => Some(&record.tx_id),
+            _ => None,
+        } {
             return Err(ApiError::conflict(format!(
                 "transaction is already prepared for idempotency key '{}'; poll GetRootTransaction for tx_id '{}'",
                 meta.idempotency_key, tx_id
@@ -251,6 +258,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             fencing_token: 0,
             prepared_at,
             visible_at: None,
+            durable_append: None,
             result: None,
         };
         self.store_prepared(ControlPlaneTxDomain::Root, &prepared)
@@ -497,7 +505,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 repair_pending: record.repair_pending,
             });
         }
-        if let IdempotencyClaim::ExistingInProgress { tx_id } = &claim {
+        if let Some(tx_id) = match &claim {
+            IdempotencyClaim::ExistingInProgress { tx_id } => Some(tx_id),
+            IdempotencyClaim::ExistingRepairPending(record) => Some(&record.tx_id),
+            _ => None,
+        } {
             return Err(ApiError::conflict(format!(
                 "transaction is already prepared for idempotency key '{}'; poll GetCatalogTransaction for tx_id '{}'",
                 meta.idempotency_key, tx_id
@@ -518,6 +530,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             fencing_token: 0,
             prepared_at,
             visible_at: None,
+            durable_append: None,
             result: None,
         };
         self.store_prepared(ControlPlaneTxDomain::Catalog, &prepared)
@@ -611,6 +624,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
                 repair_pending: record.repair_pending,
             });
         }
+        if let IdempotencyClaim::ExistingRepairPending(existing) = &claim {
+            return self
+                .repair_prepared_orchestration_batch(meta, idempotency_path.as_str(), existing)
+                .await;
+        }
         if let IdempotencyClaim::ExistingInProgress { tx_id } = &claim {
             return Err(ApiError::conflict(format!(
                 "transaction is already prepared for idempotency key '{}'; poll GetOrchestrationTransaction for tx_id '{}'",
@@ -632,6 +650,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             fencing_token: 0,
             prepared_at,
             visible_at: None,
+            durable_append: None,
             result: None,
         };
         self.store_prepared(ControlPlaneTxDomain::Orchestration, &prepared)
@@ -646,17 +665,108 @@ impl<'a> ControlPlaneTransactionService<'a> {
         .await
         {
             Ok(commit) => commit,
-            Err(error) => {
+            Err(OrchestrationCommitError::Definite(error)) => {
                 self.abort_transaction(ControlPlaneTxDomain::Orchestration, &tx_id)
                     .await;
                 return Err(error);
             }
+            Err(OrchestrationCommitError::AmbiguousAfterAppend {
+                error,
+                durable_append,
+            }) => {
+                if let Err(mark_error) = self
+                    .mark_prepared_repair_pending::<OrchestrationTxReceipt>(
+                        ControlPlaneTxDomain::Orchestration,
+                        &tx_id,
+                        Some(durable_append),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = ?mark_error,
+                        tx_id,
+                        "failed to mark ambiguous orchestration transaction repair_pending"
+                    );
+                }
+                return Err(error);
+            }
         };
 
+        self.finalize_orchestration_commit(&tx_id, idempotency_path.as_str(), commit)
+            .await
+    }
+
+    async fn repair_prepared_orchestration_batch(
+        &self,
+        meta: &ResolvedRequestMetadata,
+        idempotency_path: &str,
+        existing: &ControlPlaneIdempotencyRecord,
+    ) -> Result<TxExecutionOutcome<OrchestrationTxReceipt>, ApiError> {
+        let stored = self
+            .load_json_required::<OrchestrationTxRecord>(&ControlPlaneTxPaths::record(
+                ControlPlaneTxDomain::Orchestration,
+                existing.tx_id.as_str(),
+            ))
+            .await?
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "repair-pending orchestration transaction record missing: {}",
+                    existing.tx_id
+                ))
+            })?;
+        if stored.status != ControlPlaneTxStatus::Prepared || !stored.repair_pending {
+            return Err(ApiError::conflict(format!(
+                "orchestration transaction '{}' is no longer repair pending",
+                existing.tx_id
+            )));
+        }
+        if stored.request_hash != existing.request_hash
+            || stored.idempotency_key != existing.idempotency_key
+            || existing.idempotency_key != meta.idempotency_key
+        {
+            return Err(ApiError::conflict(
+                "repair-pending orchestration transaction ownership mismatch",
+            ));
+        }
+        let durable_append = stored.durable_append.as_ref().ok_or_else(|| {
+            ApiError::conflict(format!(
+                "repair-pending orchestration transaction '{}' is missing durable append metadata",
+                existing.tx_id
+            ))
+        })?;
+        if durable_append.event_paths.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "repair-pending orchestration transaction '{}' has no event paths to repair",
+                existing.tx_id
+            )));
+        }
+
+        let commit = match compact_event_paths_with_result(
+            &self.state.config,
+            self.storage.clone(),
+            durable_append.event_paths.clone(),
+            Some(meta.request_id.as_str()),
+        )
+        .await
+        {
+            Ok(commit) => commit,
+            Err(error) => return Err(error),
+        };
+
+        self.finalize_orchestration_commit(existing.tx_id.as_str(), idempotency_path, commit)
+            .await
+    }
+
+    async fn finalize_orchestration_commit(
+        &self,
+        tx_id: &str,
+        idempotency_path: &str,
+        commit: OrchestrationCommitOutcome,
+    ) -> Result<TxExecutionOutcome<OrchestrationTxReceipt>, ApiError> {
         let visible_at = Utc::now();
         let commit_id = Ulid::new().to_string();
         let receipt = OrchestrationTxReceipt {
-            tx_id: tx_id.clone(),
+            tx_id: tx_id.to_string(),
             commit_id: commit_id.clone(),
             manifest_id: commit.manifest_id.clone(),
             revision_ulid: commit.manifest_revision,
@@ -695,13 +805,11 @@ impl<'a> ControlPlaneTransactionService<'a> {
             }
         }
 
-        // The commit receipt is immutable audit state. If finalize fails after this point,
-        // retries repair the visible tx/idempotency records around the stored receipt.
         if let Err(error) = self
             .finalize_visible(
                 ControlPlaneTxDomain::Orchestration,
-                &tx_id,
-                idempotency_path.as_str(),
+                tx_id,
+                idempotency_path,
                 commit.lock_path,
                 commit.fencing_token,
                 repair_pending,
@@ -806,6 +914,13 @@ impl<'a> ControlPlaneTransactionService<'a> {
                             )
                         })?;
                     if existing.value.request_hash != request_hash {
+                        if matches!(
+                            self.classify_existing_idempotency(domain, &existing.value)
+                                .await?,
+                            ExistingClaimDisposition::RepairPending
+                        ) {
+                            return Ok(IdempotencyClaim::ExistingRepairPending(existing.value));
+                        }
                         return Err(ApiError::conflict(
                             "Idempotency-Key already used with different request body",
                         ));
@@ -821,6 +936,9 @@ impl<'a> ControlPlaneTransactionService<'a> {
                             return Ok(IdempotencyClaim::ExistingInProgress {
                                 tx_id: existing.value.tx_id,
                             });
+                        }
+                        ExistingClaimDisposition::RepairPending => {
+                            return Ok(IdempotencyClaim::ExistingRepairPending(existing.value));
                         }
                         ExistingClaimDisposition::Retryable => {
                             let replacement = ControlPlaneIdempotencyRecord {
@@ -903,6 +1021,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
         record.fencing_token = fencing_token;
         record.repair_pending = repair_pending;
         record.visible_at = Some(visible_at);
+        record.durable_append = None;
         record.result = Some(result.clone());
 
         self.persist_visible_record_and_idempotency(
@@ -946,6 +1065,44 @@ impl<'a> ControlPlaneTransactionService<'a> {
             WritePrecondition::MatchesVersion(stored.version),
         )
         .await
+    }
+
+    async fn mark_prepared_repair_pending<TResult>(
+        &self,
+        domain: ControlPlaneTxDomain,
+        tx_id: &str,
+        durable_append: Option<ControlPlaneDurableAppend>,
+    ) -> Result<(), ApiError>
+    where
+        TResult: Serialize + DeserializeOwned + Clone,
+    {
+        let path = ControlPlaneTxPaths::record(domain, tx_id);
+        let stored = self
+            .load_json_with_version_required::<ControlPlaneTxRecord<TResult>>(&path)
+            .await?
+            .ok_or_else(|| ApiError::internal(format!("transaction record not found: {tx_id}")))?;
+        let mut record = stored.value;
+        if record.status != ControlPlaneTxStatus::Prepared {
+            return Ok(());
+        }
+        if record.repair_pending && (durable_append.is_none() || record.durable_append.is_some()) {
+            return Ok(());
+        }
+
+        record.repair_pending = true;
+        if durable_append.is_some() {
+            record.durable_append = durable_append;
+        }
+        match self
+            .write_json(
+                &path,
+                &record,
+                WritePrecondition::MatchesVersion(stored.version),
+            )
+            .await?
+        {
+            WriteOutcome::Written | WriteOutcome::PreconditionFailed => Ok(()),
+        }
     }
 
     async fn persist_visible_record_and_idempotency<TResult>(
@@ -1155,6 +1312,9 @@ impl<'a> ControlPlaneTransactionService<'a> {
             Some(record) => match record.status {
                 ControlPlaneTxStatus::Visible => return Ok(ExistingClaimDisposition::Visible),
                 ControlPlaneTxStatus::Aborted => true,
+                ControlPlaneTxStatus::Prepared if record.repair_pending => {
+                    return Ok(ExistingClaimDisposition::RepairPending);
+                }
                 ControlPlaneTxStatus::Prepared => record.prepared_at + stale_timeout <= now,
             },
             None => existing.created_at + stale_timeout <= now,
@@ -1837,12 +1997,15 @@ enum IdempotencyClaim {
     Fresh(ControlPlaneIdempotencyRecord),
     ExistingVisible(ControlPlaneIdempotencyRecord),
     ExistingInProgress { tx_id: String },
+    ExistingRepairPending(ControlPlaneIdempotencyRecord),
 }
 
 impl IdempotencyClaim {
     fn tx_id(&self) -> &str {
         match self {
-            Self::Fresh(record) | Self::ExistingVisible(record) => record.tx_id.as_str(),
+            Self::Fresh(record)
+            | Self::ExistingVisible(record)
+            | Self::ExistingRepairPending(record) => record.tx_id.as_str(),
             Self::ExistingInProgress { tx_id } => tx_id.as_str(),
         }
     }
@@ -1864,6 +2027,7 @@ struct VersionedValue<T> {
 enum ExistingClaimDisposition {
     Visible,
     InProgress,
+    RepairPending,
     Retryable,
 }
 
@@ -1871,6 +2035,8 @@ enum ExistingClaimDisposition {
 #[serde(rename_all = "camelCase")]
 struct TxRecordLifecycle {
     status: ControlPlaneTxStatus,
+    #[serde(default)]
+    repair_pending: bool,
     prepared_at: DateTime<Utc>,
 }
 

@@ -152,9 +152,24 @@ pub struct ControlPlaneTxRecord<TResult> {
     /// When the transaction became visible, if it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visible_at: Option<DateTime<Utc>>,
+    /// Durable append metadata for prepared records that need repair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_append: Option<ControlPlaneDurableAppend>,
     /// Domain-specific result payload once visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<TResult>,
+}
+
+/// Durable append metadata recorded before visibility can be confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlPlaneDurableAppend {
+    /// Event object paths appended for this transaction.
+    pub event_paths: Vec<String>,
+    /// Lock path used by the append attempt.
+    pub lock_path: String,
+    /// Fencing token held by the append attempt.
+    pub fencing_token: u64,
 }
 
 /// Catalog transaction success receipt.

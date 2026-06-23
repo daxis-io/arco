@@ -94,6 +94,7 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("output_visibility_state", DataType::Utf8, true),
         Field::new("published_at", DataType::Int64, true),
         Field::new("publish_error", DataType::Utf8, true),
+        Field::new("retry_not_before", DataType::Int64, true),
         Field::new("delta_table", DataType::Utf8, true),
         Field::new("delta_version", DataType::Int64, true),
         Field::new("delta_partition", DataType::Utf8, true),
@@ -702,6 +703,11 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             .map(|r| r.publish_error.as_deref())
             .collect::<Vec<_>>(),
     );
+    let retry_not_before = Int64Array::from(
+        rows.iter()
+            .map(|r| r.retry_not_before.map(|t| t.timestamp_millis()))
+            .collect::<Vec<_>>(),
+    );
     let delta_tables = StringArray::from(
         rows.iter()
             .map(|r| r.delta_table.as_deref())
@@ -748,6 +754,7 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(output_visibility_states),
             Arc::new(published_at),
             Arc::new(publish_errors),
+            Arc::new(retry_not_before),
             Arc::new(delta_tables),
             Arc::new(delta_versions),
             Arc::new(delta_partitions),
@@ -2337,6 +2344,7 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let output_visibility_state = col_string_opt(&batch, "output_visibility_state");
         let published_at = col_i64_opt(&batch, "published_at");
         let publish_error = col_string_opt(&batch, "publish_error");
+        let retry_not_before = col_i64_opt(&batch, "retry_not_before");
         let delta_table = col_string_opt(&batch, "delta_table");
         let delta_version = col_i64_opt(&batch, "delta_version");
         let delta_partition = col_string_opt(&batch, "delta_partition");
@@ -2430,6 +2438,13 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                         None
                     } else {
                         Some(col.value(row).to_string())
+                    }
+                }),
+                retry_not_before: retry_not_before.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(millis_to_datetime(col.value(row)))
                     }
                 }),
                 delta_table: delta_table.as_ref().and_then(|col| {
@@ -3941,6 +3956,7 @@ mod tests {
             output_visibility_state: Some(OutputVisibilityState::Pending),
             published_at: None,
             publish_error: None,
+            retry_not_before: None,
             delta_table: Some("analytics.extract".to_string()),
             delta_version: Some(9),
             delta_partition: Some("date=2025-01-15".to_string()),
@@ -4038,6 +4054,7 @@ mod tests {
                 output_visibility_state: Some(OutputVisibilityState::Visible),
                 published_at: Some(published_at),
                 publish_error: None,
+                retry_not_before: None,
                 delta_table: Some("analytics.visible".to_string()),
                 delta_version: Some(42),
                 delta_partition: Some("date=2026-03-24".to_string()),
@@ -4066,6 +4083,7 @@ mod tests {
                 output_visibility_state: Some(OutputVisibilityState::Failed),
                 published_at: None,
                 publish_error: Some("publisher exhausted retries".to_string()),
+                retry_not_before: None,
                 delta_table: Some("analytics.failed".to_string()),
                 delta_version: Some(7),
                 delta_partition: Some("date=2026-03-24".to_string()),
@@ -4483,6 +4501,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
@@ -4524,6 +4543,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("UNKNOWN_VISIBILITY")])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),

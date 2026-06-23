@@ -5,7 +5,7 @@
 //!
 //! ## Supported Providers
 //!
-//! - **GCS**: `OAuth2` tokens via metadata server or service account keys
+//! - **GCS**: fail-closed until downscoped provider credentials are implemented
 //! - **S3**: (future) STS temporary credentials
 //! - **Azure**: (future) SAS tokens
 //!

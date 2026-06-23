@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::ScopedStorage;
 
 use crate::error::{CatalogError, Result};
 use crate::manifest::CatalogDomainManifest;
@@ -56,14 +56,10 @@ impl CatalogReadModel {
         }
 
         let version = manifest.snapshot_version;
-        let catalogs_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
-        let namespaces_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-        let tables_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-        let columns_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
+        let catalogs_path = join_snapshot_path(&manifest.snapshot_path, "catalogs.parquet");
+        let namespaces_path = join_snapshot_path(&manifest.snapshot_path, "namespaces.parquet");
+        let tables_path = join_snapshot_path(&manifest.snapshot_path, "tables.parquet");
+        let columns_path = join_snapshot_path(&manifest.snapshot_path, "columns.parquet");
 
         let (catalog_bytes, namespace_bytes, table_bytes, column_bytes) = tokio::try_join!(
             storage.get_raw(&catalogs_path),
@@ -297,4 +293,8 @@ impl CatalogReadModel {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+fn join_snapshot_path(dir: &str, file: &str) -> String {
+    format!("{}/{file}", dir.trim_end_matches('/'))
 }

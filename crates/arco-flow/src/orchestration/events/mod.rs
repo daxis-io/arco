@@ -359,6 +359,55 @@ pub enum OrchestrationEventData {
         code_version: Option<String>,
     },
 
+    /// Task completion and optional output visibility recorded as one durable fact.
+    TaskCompletionRecorded {
+        /// Run identifier.
+        run_id: String,
+        /// Task name within run.
+        task_key: String,
+        /// Attempt number.
+        attempt: u32,
+        /// Attempt identifier - must match active attempt for state update.
+        attempt_id: String,
+        /// Worker identifier.
+        worker_id: String,
+        /// Task outcome.
+        outcome: TaskOutcome,
+        /// Materialization ID if succeeded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        materialization_id: Option<String>,
+        /// Error message if failed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+        /// Worker callback output payload.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<CallbackTaskOutput>,
+        /// Worker callback error payload.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<CallbackTaskError>,
+        /// Worker callback metrics payload.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics: Option<CallbackTaskMetrics>,
+        /// Phase when cancellation occurred (if CANCELLED).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancelled_during_phase: Option<String>,
+        /// Partial progress payload for cancellation, serialized once at the callback boundary.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_progress_json: Option<String>,
+        /// Asset key if this task materialized an asset partition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        asset_key: Option<String>,
+        /// Partition key if this task materialized a partition.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partition_key: Option<String>,
+        /// Code version (e.g., git SHA) used for this materialization.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code_version: Option<String>,
+        /// Visibility update bound to this completion, when applicable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_visibility: Option<OutputVisibilityUpdate>,
+    },
+
     /// Output visibility changed for a task's successful execution.
     TaskOutputVisibilityChanged {
         /// Run identifier.
@@ -646,6 +695,7 @@ impl OrchestrationEventData {
             Self::TaskStarted { .. } => "TaskStarted",
             Self::TaskHeartbeat { .. } => "TaskHeartbeat",
             Self::TaskFinished { .. } => "TaskFinished",
+            Self::TaskCompletionRecorded { .. } => "TaskCompletionRecorded",
             Self::TaskOutputVisibilityChanged { .. } => "TaskOutputVisibilityChanged",
             Self::DispatchRequested { .. } => "DispatchRequested",
             Self::TimerRequested { .. } => "TimerRequested",
@@ -697,6 +747,12 @@ impl OrchestrationEventData {
                 heartbeat_at.as_ref(),
             ),
             Self::TaskFinished {
+                run_id,
+                task_key,
+                attempt,
+                ..
+            }
+            | Self::TaskCompletionRecorded {
                 run_id,
                 task_key,
                 attempt,
@@ -867,6 +923,7 @@ impl OrchestrationEventData {
             | Self::TaskStarted { run_id, .. }
             | Self::TaskHeartbeat { run_id, .. }
             | Self::TaskFinished { run_id, .. }
+            | Self::TaskCompletionRecorded { run_id, .. }
             | Self::TaskOutputVisibilityChanged { run_id, .. }
             | Self::DispatchRequested { run_id, .. } => Some(run_id),
 
@@ -977,6 +1034,19 @@ impl OutputVisibilityState {
             Self::Failed => "failed",
         }
     }
+}
+
+/// Output visibility payload carried by composite task completion events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputVisibilityUpdate {
+    /// Latest output visibility state.
+    pub visibility_state: OutputVisibilityState,
+    /// When output became visible, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<DateTime<Utc>>,
+    /// Publish failure details, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_error: Option<String>,
 }
 
 /// Task completion outcome.

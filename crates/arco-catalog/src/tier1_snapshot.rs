@@ -25,18 +25,31 @@ pub async fn write_catalog_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     state: &CatalogState,
 ) -> Result<SnapshotInfo> {
     let snapshot_dir = StateKey::snapshot_dir(CatalogDomain::Catalog, version);
+    write_catalog_snapshot_in_dir(storage, version, snapshot_dir.as_ref(), state).await
+}
 
+/// Writes a catalog snapshot to a caller-selected snapshot directory.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization or storage writes fail.
+pub async fn write_catalog_snapshot_in_dir<S: ReadStore + StatePutStore + ?Sized>(
+    storage: &S,
+    version: u64,
+    snapshot_dir: &str,
+    state: &CatalogState,
+) -> Result<SnapshotInfo> {
     let catalogs_bytes = parquet_util::write_catalogs(&state.catalogs)?;
     let namespaces_bytes = parquet_util::write_namespaces(&state.namespaces)?;
     let tables_bytes = parquet_util::write_tables(&state.tables)?;
     let columns_bytes = parquet_util::write_columns(&state.columns)?;
     let commits_bytes = parquet_util::write_commits(&state.commits)?;
 
-    let catalogs_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
-    let ns_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-    let tables_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-    let cols_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
-    let commits_key = StateKey::snapshot_file(CatalogDomain::Catalog, version, "commits.parquet");
+    let catalogs_key = StateKey::snapshot_file_in_dir(snapshot_dir, "catalogs.parquet");
+    let ns_key = StateKey::snapshot_file_in_dir(snapshot_dir, "namespaces.parquet");
+    let tables_key = StateKey::snapshot_file_in_dir(snapshot_dir, "tables.parquet");
+    let cols_key = StateKey::snapshot_file_in_dir(snapshot_dir, "columns.parquet");
+    let commits_key = StateKey::snapshot_file_in_dir(snapshot_dir, "commits.parquet");
 
     put_state_if_absent(storage, &catalogs_key, catalogs_bytes.clone()).await?;
     put_state_if_absent(storage, &ns_key, namespaces_bytes.clone()).await?;
@@ -44,7 +57,7 @@ pub async fn write_catalog_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     put_state_if_absent(storage, &cols_key, columns_bytes.clone()).await?;
     put_state_if_absent(storage, &commits_key, commits_bytes.clone()).await?;
 
-    let mut info = SnapshotInfo::new(version, snapshot_dir.as_ref().to_string());
+    let mut info = SnapshotInfo::new(version, ensure_dir(snapshot_dir));
     info.add_file(SnapshotFile {
         path: "catalogs.parquet".to_string(),
         checksum_sha256: sha256_hex(&catalogs_bytes),
@@ -95,12 +108,26 @@ pub async fn write_lineage_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     state: &LineageState,
 ) -> Result<SnapshotInfo> {
     let snapshot_dir = StateKey::snapshot_dir(CatalogDomain::Lineage, version);
+    write_lineage_snapshot_in_dir(storage, version, snapshot_dir.as_ref(), state).await
+}
+
+/// Writes a lineage snapshot to a caller-selected snapshot directory.
+///
+/// # Errors
+///
+/// Returns an error if Parquet serialization or storage writes fail.
+pub async fn write_lineage_snapshot_in_dir<S: ReadStore + StatePutStore + ?Sized>(
+    storage: &S,
+    version: u64,
+    snapshot_dir: &str,
+    state: &LineageState,
+) -> Result<SnapshotInfo> {
     let bytes = parquet_util::write_lineage_edges(&state.edges)?;
-    let key = StateKey::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
+    let key = StateKey::snapshot_file_in_dir(snapshot_dir, "lineage_edges.parquet");
 
     put_state_if_absent(storage, &key, bytes.clone()).await?;
 
-    let mut info = SnapshotInfo::new(version, snapshot_dir.as_ref().to_string());
+    let mut info = SnapshotInfo::new(version, ensure_dir(snapshot_dir));
     info.add_file(SnapshotFile {
         path: "lineage_edges.parquet".to_string(),
         checksum_sha256: sha256_hex(&bytes),
@@ -122,12 +149,25 @@ pub async fn write_search_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     state: &SearchState,
 ) -> Result<SnapshotInfo> {
     let snapshot_dir = StateKey::snapshot_dir(CatalogDomain::Search, version);
+    write_search_snapshot_in_dir(storage, version, snapshot_dir.as_ref(), state).await
+}
+
+/// Writes a search snapshot to a caller-selected snapshot directory.
+///
+/// # Errors
+/// Returns an error if serialization or storage write fails.
+pub async fn write_search_snapshot_in_dir<S: ReadStore + StatePutStore + ?Sized>(
+    storage: &S,
+    version: u64,
+    snapshot_dir: &str,
+    state: &SearchState,
+) -> Result<SnapshotInfo> {
     let bytes = parquet_util::write_search_postings(&state.postings)?;
-    let key = StateKey::snapshot_file(CatalogDomain::Search, version, "token_postings.parquet");
+    let key = StateKey::snapshot_file_in_dir(snapshot_dir, "token_postings.parquet");
 
     put_state_if_absent(storage, &key, bytes.clone()).await?;
 
-    let mut info = SnapshotInfo::new(version, snapshot_dir.as_ref().to_string());
+    let mut info = SnapshotInfo::new(version, ensure_dir(snapshot_dir));
     info.add_file(SnapshotFile {
         path: "token_postings.parquet".to_string(),
         checksum_sha256: sha256_hex(&bytes),
@@ -137,6 +177,10 @@ pub async fn write_search_snapshot<S: ReadStore + StatePutStore + ?Sized>(
     });
 
     Ok(info)
+}
+
+fn ensure_dir(snapshot_dir: &str) -> String {
+    format!("{}/", snapshot_dir.trim_end_matches('/'))
 }
 
 /// Builds snapshot metadata for an already-written metastore projection set.

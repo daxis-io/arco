@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use axum::routing::post;
+use axum::{Json, Router};
 use bytes::Bytes;
 use prost::Message;
 use tower::ServiceExt;
@@ -19,11 +21,12 @@ use arco_core::control_plane_transactions::{
     ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest,
     RootTxReceipt,
 };
+use arco_core::orchestration_compaction::OrchestrationCompactRequest;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 use arco_core::{ControlPlaneTxDomain, ControlPlaneTxKind};
-use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration::compactor::{CompactionVisibility, MicroCompactor};
 use arco_proto::arco::catalog::v1::{
     CatalogControlPlaneScope, CatalogDdlOperation, CatalogObjectLifecycleState, ColumnDefinition,
     GrantMutation, MetastoreMutation, StorageCredential, TableFormat, UpdateTableOp,
@@ -116,6 +119,56 @@ async fn load_catalog_ledger_event_source(
     let envelope: CatalogEvent<serde_json::Value> =
         serde_json::from_slice(bytes.as_ref()).context("decode catalog ledger event")?;
     Ok(envelope.source)
+}
+
+async fn spawn_compacts_then_errors_server(backend: Arc<dyn StorageBackend>) -> String {
+    let storage = scoped_storage(backend);
+    let app = Router::new().route(
+        "/compact",
+        post(move |Json(request): Json<OrchestrationCompactRequest>| {
+            let storage = storage.clone();
+            async move {
+                let result = MicroCompactor::new(storage)
+                    .compact_events_fenced(
+                        request.event_paths,
+                        request.fencing_token,
+                        &request.lock_path,
+                    )
+                    .await;
+                match result {
+                    Ok(result) if result.visibility_status == CompactionVisibility::Visible => {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "compactor response lost after visible publish"
+                            })),
+                        )
+                    }
+                    Ok(result) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("test compactor did not publish visibly: {:?}", result.visibility_status)
+                        })),
+                    ),
+                    Err(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": format!("test compactor failed before injected response loss: {error}")
+                        })),
+                    ),
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ambiguous compactor server");
+    let addr = listener.local_addr().expect("ambiguous compactor addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
 }
 
 #[tokio::test]
@@ -1076,6 +1129,179 @@ async fn commit_orchestration_batch_replays_same_idempotency_key_and_rejects_has
     .await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error["code"], "CONFLICT");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_marks_ambiguous_remote_compaction_repair_pending() -> Result<()>
+{
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let url = spawn_compacts_then_errors_server(backend.clone()).await;
+    let mut config = arco_api::config::Config {
+        orchestration_compactor_url: Some(url),
+        ..arco_api::config::Config::default()
+    };
+    config.idempotency_stale_timeout_secs = 0;
+    let router = test_router_with_config_backend(config, backend.clone());
+
+    let request = orchestration_request(
+        "idem-orch-ambiguous-01",
+        "req-orch-ambiguous-01",
+        "run-orch-ambiguous-01",
+    );
+    let (status, error) = post_error_json(
+        router.clone(),
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &request,
+        "idem-orch-ambiguous-01",
+        "req-orch-ambiguous-01",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error["code"], "INTERNAL");
+
+    let idempotency = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Orchestration,
+        "idem-orch-ambiguous-01",
+    )
+    .await?;
+    let record = load_orchestration_tx_record(backend.clone(), &idempotency.tx_id).await?;
+    assert_eq!(record.status, ControlPlaneTxStatus::Prepared);
+    assert!(record.repair_pending);
+    assert!(record.visible_at.is_none());
+    assert!(record.result.is_none());
+    assert!(idempotency.visible_at.is_none());
+    assert!(idempotency.tx_record.is_none());
+
+    let compactor = MicroCompactor::new(scoped_storage(backend.clone()));
+    let (_manifest, state) = compactor.load_state().await?;
+    assert!(state.runs.contains_key("run-orch-ambiguous-01"));
+
+    let repair_router = test_router_with_config_backend(
+        arco_api::config::Config {
+            idempotency_stale_timeout_secs: 0,
+            ..arco_api::config::Config::default()
+        },
+        backend.clone(),
+    );
+    let replay = orchestration_request(
+        "idem-orch-ambiguous-01",
+        "req-orch-ambiguous-02",
+        "run-orch-ambiguous-01",
+    );
+    let (_replay_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        repair_router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-ambiguous-01",
+        "req-orch-ambiguous-02",
+    )
+    .await?;
+    assert!(!replay_response.repair_pending);
+    let replay_receipt = replay_response.receipt.expect("repair receipt");
+    assert_eq!(replay_receipt.tx_id, idempotency.tx_id);
+    assert_eq!(replay_receipt.events_processed, 1);
+
+    let after_retry = load_idempotency_record(
+        backend,
+        ControlPlaneTxDomain::Orchestration,
+        "idem-orch-ambiguous-01",
+    )
+    .await?;
+    assert_eq!(after_retry.tx_id, idempotency.tx_id);
+    assert!(after_retry.visible_at.is_some());
+    assert!(after_retry.tx_record.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_orchestration_batch_repairs_ambiguous_append_from_stored_event_paths() -> Result<()>
+{
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let url = spawn_compacts_then_errors_server(backend.clone()).await;
+    let mut config = arco_api::config::Config {
+        orchestration_compactor_url: Some(url),
+        ..arco_api::config::Config::default()
+    };
+    config.idempotency_stale_timeout_secs = 0;
+    let router = test_router_with_config_backend(config, backend.clone());
+
+    let request = orchestration_request_with_event_id(
+        "idem-orch-ambiguous-stored-paths",
+        "req-orch-ambiguous-stored-paths-01",
+        "run-orch-ambiguous-stored-paths",
+        "01JTXORCHSTOREDPATHS00000001",
+    );
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &request,
+        "idem-orch-ambiguous-stored-paths",
+        "req-orch-ambiguous-stored-paths-01",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error["code"], "INTERNAL");
+
+    let idempotency = load_idempotency_record(
+        backend.clone(),
+        ControlPlaneTxDomain::Orchestration,
+        "idem-orch-ambiguous-stored-paths",
+    )
+    .await?;
+    let record = load_orchestration_tx_record(backend.clone(), &idempotency.tx_id).await?;
+    assert_eq!(record.status, ControlPlaneTxStatus::Prepared);
+    assert!(record.repair_pending);
+    let durable_append = record
+        .durable_append
+        .as_ref()
+        .expect("repair-pending record should retain appended event paths");
+    assert_eq!(durable_append.event_paths.len(), 1);
+    assert!(
+        durable_append.event_paths[0].ends_with("01JTXORCHSTOREDPATHS00000001.json"),
+        "repair must use the original appended event path, got {}",
+        durable_append.event_paths[0]
+    );
+
+    let repair_router = test_router_with_config_backend(
+        arco_api::config::Config {
+            idempotency_stale_timeout_secs: 0,
+            ..arco_api::config::Config::default()
+        },
+        backend.clone(),
+    );
+    let replay = orchestration_request_with_event_id(
+        "idem-orch-ambiguous-stored-paths",
+        "req-orch-ambiguous-stored-paths-02",
+        "run-orch-ambiguous-stored-paths",
+        "01JTXORCHSTOREDPATHS00000002",
+    );
+    let (_replay_status, replay_response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        repair_router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &replay,
+        "idem-orch-ambiguous-stored-paths",
+        "req-orch-ambiguous-stored-paths-02",
+    )
+    .await?;
+
+    assert!(!replay_response.repair_pending);
+    let replay_receipt = replay_response.receipt.expect("repair receipt");
+    assert_eq!(replay_receipt.tx_id, idempotency.tx_id);
+    assert_eq!(replay_receipt.events_processed, 1);
+
+    let after_retry = load_idempotency_record(
+        backend,
+        ControlPlaneTxDomain::Orchestration,
+        "idem-orch-ambiguous-stored-paths",
+    )
+    .await?;
+    assert_eq!(after_retry.tx_id, idempotency.tx_id);
+    assert!(after_retry.visible_at.is_some());
+    assert!(after_retry.tx_record.is_some());
 
     Ok(())
 }

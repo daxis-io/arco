@@ -24,6 +24,7 @@ use bytes::Bytes;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
+use arco_core::storage_keys::StateKey;
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 
 use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer, RootManifest};
@@ -418,11 +419,9 @@ async fn tier1_retry_keeps_visible_commit_projection_in_sync() {
         .expect("catalog manifest bytes");
     let manifest: CatalogDomainManifest =
         serde_json::from_slice(&manifest_bytes).expect("parse catalog manifest");
+    let commits_path = StateKey::snapshot_file_in_dir(&manifest.snapshot_path, "commits.parquet");
     let commits_bytes = storage
-        .get_raw(&format!(
-            "snapshots/catalog/v{}/commits.parquet",
-            manifest.snapshot_version
-        ))
+        .get_raw(commits_path.as_ref())
         .await
         .expect("catalog commits bytes");
     let commit_rows = arco_catalog::parquet_util::read_commits(&commits_bytes)

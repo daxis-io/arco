@@ -262,6 +262,33 @@ impl EventId {
         Self(Ulid::new())
     }
 
+    /// Generates an event ID that sorts after the provided watermark.
+    ///
+    /// This protects ledger producers that publish against a persisted
+    /// lexicographic watermark from local clock skew or same-millisecond ULID
+    /// randomness that would otherwise generate an ID below the visible
+    /// watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the watermark cannot be incremented.
+    pub fn generate_after(watermark: Option<Self>) -> Result<Self> {
+        let candidate = Self::generate();
+        let Some(watermark) = watermark else {
+            return Ok(candidate);
+        };
+        if candidate > watermark {
+            return Ok(candidate);
+        }
+        watermark
+            .as_ulid()
+            .increment()
+            .map(Self)
+            .ok_or_else(|| Error::InvalidId {
+                message: "event ID watermark overflowed while generating successor".to_string(),
+            })
+    }
+
     /// Creates an event ID from a raw ULID.
     #[must_use]
     pub const fn from_ulid(ulid: Ulid) -> Self {
@@ -374,6 +401,19 @@ mod tests {
         let s = id.to_string();
         let parsed: EventId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
+    }
+
+    #[test]
+    fn event_id_generation_can_advance_past_watermark() -> Result<()> {
+        let watermark: EventId = "7ZZZZZZZZZ0000000000000000".parse()?;
+
+        let next = EventId::generate_after(Some(watermark))?;
+
+        assert!(
+            next > watermark,
+            "new ledger event IDs must sort after the published watermark"
+        );
         Ok(())
     }
 }

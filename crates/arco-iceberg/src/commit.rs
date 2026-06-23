@@ -322,11 +322,18 @@ impl<S: StorageBackend> CommitService<S> {
 
                         if existing.is_stale(self.in_progress_timeout) {
                             // Attempt takeover by CAS-updating the marker.
+                            let event_id = ulid::Ulid::new();
+                            let metadata_location = build_takeover_metadata_location(
+                                &base_metadata.location,
+                                base_metadata.last_sequence_number + 1,
+                                &idempotency_key_hash,
+                                &event_id,
+                            )?;
                             marker = IdempotencyMarker {
                                 started_at: Utc::now(),
-                                event_id: ulid::Ulid::new(),
+                                event_id,
                                 base_metadata_location: pointer.current_metadata_location.clone(),
-                                metadata_location: new_metadata_location.clone(),
+                                metadata_location,
                                 ..existing
                             };
 
@@ -734,6 +741,23 @@ fn build_metadata_location(
     }
     Ok(format!(
         "{base}/metadata/{sequence_number}-{idempotency_key_hash}.metadata.json"
+    ))
+}
+
+fn build_takeover_metadata_location(
+    table_location: &str,
+    sequence_number: i64,
+    idempotency_key_hash: &str,
+    event_id: &ulid::Ulid,
+) -> IcebergResult<String> {
+    let base = table_location.trim_end_matches('/');
+    if base.is_empty() {
+        return Err(IcebergError::Internal {
+            message: "Table location is empty".to_string(),
+        });
+    }
+    Ok(format!(
+        "{base}/metadata/{sequence_number}-{idempotency_key_hash}-{event_id}.metadata.json"
     ))
 }
 

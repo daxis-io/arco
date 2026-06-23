@@ -439,6 +439,8 @@ fn parse_iso8601_duration(value: &str) -> Option<Duration> {
 pub enum InProgressAction {
     /// Safe to delete - pointer moved past this marker.
     SafeToDelete,
+    /// Pointer references this marker's metadata - finalize as committed.
+    FinalizeCommitted,
     /// Pointer still references this marker's metadata - mark as failed first.
     MarkFailedThenDelete,
     /// Pointer not found - treat as orphan and delete.
@@ -468,8 +470,8 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
     /// Determines the action to take for an in-progress marker.
     ///
     /// Per design doc Section 9.2:
-    /// - If effective metadata location != `marker.metadata_location`, safe to delete
-    /// - Otherwise, mark as Failed before deleting
+    /// - If effective metadata location == `marker.metadata_location`, finalize as committed
+    /// - Otherwise, safe to delete
     ///
     /// # Errors
     ///
@@ -493,7 +495,7 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
                 let effective = resolve_effective_metadata_location(&pointer, &tx_store).await?;
 
                 if effective.metadata_location == marker.metadata_location {
-                    Ok(InProgressAction::MarkFailedThenDelete)
+                    Ok(InProgressAction::FinalizeCommitted)
                 } else {
                     Ok(InProgressAction::SafeToDelete)
                 }
@@ -520,6 +522,9 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
                     Ok(InProgressAction::SafeToDelete | InProgressAction::PointerNotFound) => {
                         self.delete_marker(&entry.path).await
                     }
+                    Ok(InProgressAction::FinalizeCommitted) => {
+                        self.finalize_committed_marker(entry).await
+                    }
                     Ok(InProgressAction::MarkFailedThenDelete) => {
                         self.mark_failed_then_delete(entry).await
                     }
@@ -545,6 +550,31 @@ impl<S: StorageBackend, P: PointerStore> IdempotencyGarbageCollector<S, P> {
             }
             Err(e) => {
                 tracing::warn!(path = %path, error = %e, "Failed to delete marker");
+                CleanupOutcome::failed()
+            }
+        }
+    }
+
+    async fn finalize_committed_marker(&self, entry: &MarkerListEntry) -> CleanupOutcome {
+        let committed_marker = entry
+            .marker
+            .clone()
+            .finalize_committed(entry.marker.metadata_location.clone());
+
+        match self
+            .idempotency_store
+            .finalize(&committed_marker, &entry.version)
+            .await
+        {
+            Ok(FinalizeResult::Success { .. } | FinalizeResult::Conflict { .. }) => {
+                CleanupOutcome::skipped()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %entry.path,
+                    error = %e,
+                    "Failed to finalize in-progress marker as committed"
+                );
                 CleanupOutcome::failed()
             }
         }
@@ -2176,7 +2206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_in_progress_action_mark_failed() {
+    async fn test_check_in_progress_action_finalize_committed() {
         let storage = Arc::new(MemoryBackend::new());
         let table_uuid = Uuid::new_v4();
 
@@ -2197,7 +2227,7 @@ mod tests {
         let gc = IdempotencyGarbageCollector::new(storage, pointer_store);
         let action = gc.check_in_progress_action(&marker).await.expect("check");
 
-        assert_eq!(action, InProgressAction::MarkFailedThenDelete);
+        assert_eq!(action, InProgressAction::FinalizeCommitted);
     }
 
     #[tokio::test]
@@ -2243,7 +2273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clean_in_progress_marker_marks_failed_then_deletes() {
+    async fn test_clean_in_progress_marker_finalizes_committed_when_pointer_matches() {
         let storage = Arc::new(MemoryBackend::new());
         let table_uuid = Uuid::new_v4();
 
@@ -2278,11 +2308,17 @@ mod tests {
         let gc = IdempotencyGarbageCollector::new(Arc::clone(&storage), pointer_store);
         let result = gc.clean_table(&table_uuid).await.expect("clean_table");
 
-        assert_eq!(result.deleted, 1);
-        assert_eq!(result.skipped, 0);
+        assert_eq!(result.deleted, 0);
+        assert_eq!(result.skipped, 1);
         assert_eq!(result.failed, 0);
-        assert_eq!(result.marked_failed, 1);
-        assert!(storage.head(&path).await.expect("head").is_none());
+        assert_eq!(result.marked_failed, 0);
+        let bytes = storage.get(&path).await.expect("marker retained");
+        let marker: IdempotencyMarker = serde_json::from_slice(&bytes).expect("committed marker");
+        assert_eq!(marker.status, IdempotencyStatus::Committed);
+        assert_eq!(
+            marker.response_metadata_location.as_deref(),
+            Some("same_metadata.json")
+        );
     }
 
     // ========================================================================

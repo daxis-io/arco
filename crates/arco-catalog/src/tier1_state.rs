@@ -1,6 +1,6 @@
 //! Helpers for loading Tier-1 snapshot state.
 
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::ScopedStorage;
 
 use crate::error::Result;
 use crate::parquet_util;
@@ -18,30 +18,15 @@ pub async fn load_catalog_state(
     storage: &ScopedStorage,
     snapshot_path: &str,
 ) -> Result<CatalogState> {
-    if snapshot_path.is_empty() || snapshot_path.contains("/v0/") {
+    if is_empty_snapshot(snapshot_path) {
         return Ok(CatalogState::empty());
     }
 
-    let version = snapshot_path
-        .split("/v")
-        .last()
-        .and_then(|s| s.trim_end_matches('/').parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if version == 0 {
-        return Ok(CatalogState::empty());
-    }
-
-    let ns_path =
-        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "namespaces.parquet");
-    let tables_path =
-        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-    let columns_path =
-        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "columns.parquet");
-    let catalogs_path =
-        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "catalogs.parquet");
-    let commits_path =
-        CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "commits.parquet");
+    let ns_path = snapshot_file_path(snapshot_path, "namespaces.parquet");
+    let tables_path = snapshot_file_path(snapshot_path, "tables.parquet");
+    let columns_path = snapshot_file_path(snapshot_path, "columns.parquet");
+    let catalogs_path = snapshot_file_path(snapshot_path, "catalogs.parquet");
+    let commits_path = snapshot_file_path(snapshot_path, "commits.parquet");
 
     let catalogs = match storage.get_raw(&catalogs_path).await {
         Ok(bytes) => parquet_util::read_catalogs(&bytes)?,
@@ -95,22 +80,11 @@ pub async fn load_catalog_state(
 ///
 /// Returns an error if Parquet decoding fails.
 pub async fn load_lineage_state(storage: &ScopedStorage, edges_path: &str) -> Result<LineageState> {
-    if edges_path.is_empty() || edges_path.contains("/v0/") {
+    if is_empty_snapshot(edges_path) {
         return Ok(LineageState::empty());
     }
 
-    let version = edges_path
-        .split("/v")
-        .last()
-        .and_then(|s| s.trim_end_matches('/').parse::<u64>().ok())
-        .unwrap_or(0);
-
-    if version == 0 {
-        return Ok(LineageState::empty());
-    }
-
-    let path =
-        CatalogPaths::snapshot_file(CatalogDomain::Lineage, version, "lineage_edges.parquet");
+    let path = snapshot_file_path(edges_path, "lineage_edges.parquet");
     let edges = match storage.get_raw(&path).await {
         Ok(bytes) => parquet_util::read_lineage_edges(&bytes)?,
         Err(arco_core::Error::NotFound(_) | arco_core::Error::ResourceNotFound { .. }) => {
@@ -120,4 +94,12 @@ pub async fn load_lineage_state(storage: &ScopedStorage, edges_path: &str) -> Re
     };
 
     Ok(LineageState { edges })
+}
+
+fn is_empty_snapshot(snapshot_path: &str) -> bool {
+    snapshot_path.is_empty() || snapshot_path.split('/').any(|segment| segment == "v0")
+}
+
+fn snapshot_file_path(snapshot_path: &str, filename: &str) -> String {
+    format!("{}/{filename}", snapshot_path.trim_end_matches('/'))
 }

@@ -11,7 +11,9 @@
 //! The sweeper emits repair actions that are then executed by the dispatcher:
 //!
 //! - **`CreateDispatchOutbox`**: Task is READY but has no outbox entry
+//! - **`CreateDispatchOutbox`**: Task is in `RETRY_WAIT` past its retry deadline
 //! - **`RedispatchStuckTask`**: Task is DISPATCHED but hasn't started for too long
+//! - **`FailStaleRunningTask`**: Task is RUNNING past heartbeat timeout plus grace
 //!
 //! ## Watermark Freshness Guard
 //!
@@ -53,6 +55,19 @@ pub enum Repair {
         attempt: u32,
         /// Original dispatch ID.
         original_dispatch_id: String,
+        /// Reason the repair was triggered.
+        reason: String,
+    },
+    /// Fail a stale RUNNING task so the fold can retry or terminally fail it.
+    FailStaleRunningTask {
+        /// Run ID.
+        run_id: String,
+        /// Task key.
+        task_key: String,
+        /// Current attempt number.
+        attempt: u32,
+        /// Current attempt ID.
+        attempt_id: String,
         /// Reason the repair was triggered.
         reason: String,
     },
@@ -194,6 +209,13 @@ impl AntiEntropySweeper {
                 .ready_at
                 .is_some_and(|ready_at| now - ready_at > self.ready_timeout),
             TaskState::Dispatched => true, // Will check dispatch age
+            TaskState::RetryWait => {
+                task.attempt < task.max_attempts
+                    && task
+                        .retry_not_before
+                        .is_some_and(|deadline| now >= deadline)
+            }
+            TaskState::Running => Self::running_task_is_stale(task, now),
             _ => false,
         }
     }
@@ -209,6 +231,8 @@ impl AntiEntropySweeper {
         match task.state {
             TaskState::Ready => self.check_ready_task(task, dispatched_tasks, now),
             TaskState::Dispatched => self.check_dispatched_task(task, outbox, now),
+            TaskState::RetryWait => Self::check_retry_wait_task(task, dispatched_tasks, now),
+            TaskState::Running => Self::check_running_task(task, now),
             _ => None,
         }
     }
@@ -291,6 +315,53 @@ impl AntiEntropySweeper {
             ),
         })
     }
+
+    fn check_retry_wait_task(
+        task: &TaskRow,
+        dispatched_tasks: &HashSet<(String, String, u32)>,
+        now: DateTime<Utc>,
+    ) -> Option<Repair> {
+        if task.attempt >= task.max_attempts {
+            return None;
+        }
+        if task.retry_not_before.is_none_or(|deadline| now < deadline) {
+            return None;
+        }
+        let next_attempt = task.attempt + 1;
+        let key = (task.run_id.clone(), task.task_key.clone(), next_attempt);
+        if dispatched_tasks.contains(&key) {
+            return None;
+        }
+        Some(Repair::CreateDispatchOutbox {
+            run_id: task.run_id.clone(),
+            task_key: task.task_key.clone(),
+            attempt: next_attempt,
+            reason: "retry_wait_bootstrap".to_string(),
+        })
+    }
+
+    fn check_running_task(task: &TaskRow, now: DateTime<Utc>) -> Option<Repair> {
+        if !Self::running_task_is_stale(task, now) {
+            return None;
+        }
+        let attempt_id = task.attempt_id.clone()?;
+        Some(Repair::FailStaleRunningTask {
+            run_id: task.run_id.clone(),
+            task_key: task.task_key.clone(),
+            attempt: task.attempt,
+            attempt_id,
+            reason: "heartbeat_timeout_anti_entropy".to_string(),
+        })
+    }
+
+    fn running_task_is_stale(task: &TaskRow, now: DateTime<Utc>) -> bool {
+        let Some(reference_time) = task.last_heartbeat_at.or(task.started_at) else {
+            return false;
+        };
+        let timeout = Duration::seconds(i64::from(task.heartbeat_timeout_sec));
+        let grace = Duration::seconds(30);
+        now - reference_time > timeout + grace
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +392,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            retry_not_before: None,
             delta_table: None,
             delta_version: None,
             delta_partition: None,
@@ -579,6 +651,104 @@ mod tests {
                 assert_eq!(reason, "dispatch_failed");
             }
             _ => panic!("Expected RedispatchStuckTask repair"),
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_bootstraps_retry_wait_tasks() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = Some(now);
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert_eq!(repairs.len(), 1);
+        match &repairs[0] {
+            Repair::CreateDispatchOutbox {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
+                assert_eq!(task_key, "extract");
+                assert_eq!(*attempt, 2);
+                assert_eq!(reason, "retry_wait_bootstrap");
+            }
+            _ => panic!("Expected CreateDispatchOutbox repair"),
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_does_not_bootstrap_retry_wait_before_deadline() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = Some(now + Duration::minutes(5));
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert!(
+            repairs.is_empty(),
+            "anti-entropy must preserve retry backoff deadlines"
+        );
+    }
+
+    #[test]
+    fn test_anti_entropy_bootstraps_retry_wait_after_deadline() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = Some(now - Duration::seconds(1));
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert_eq!(repairs.len(), 1);
+        assert!(matches!(
+            repairs[0],
+            Repair::CreateDispatchOutbox { attempt: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn test_anti_entropy_fails_stale_running_tasks() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::Running, None);
+        task.attempt = 1;
+        task.last_heartbeat_at = Some(now - Duration::minutes(3));
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert_eq!(repairs.len(), 1);
+        match &repairs[0] {
+            Repair::FailStaleRunningTask {
+                task_key,
+                attempt,
+                attempt_id,
+                reason,
+                ..
+            } => {
+                assert_eq!(task_key, "extract");
+                assert_eq!(*attempt, 1);
+                assert_eq!(attempt_id, "01HQ123ATT");
+                assert!(reason.contains("heartbeat_timeout"));
+            }
+            _ => panic!("Expected FailStaleRunningTask repair"),
         }
     }
 

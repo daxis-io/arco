@@ -348,15 +348,14 @@ impl Reconciler {
             failed_count: 0,
         };
 
-        let protected_paths: HashSet<String> =
+        let (visible_snapshot_version, protected_paths): (u64, HashSet<String>) =
             if let Some(domain) = Self::parse_domain(&report.domain) {
-                self.load_expected_paths(domain)
-                    .await?
-                    .map_or_else(HashSet::new, |(_, expected, _)| {
-                        expected.into_iter().collect()
-                    })
+                self.load_expected_paths(domain).await?.map_or_else(
+                    || (report.manifest_snapshot_version, HashSet::new()),
+                    |(version, expected, _)| (version, expected.into_iter().collect()),
+                )
             } else {
-                HashSet::new()
+                (report.manifest_snapshot_version, HashSet::new())
             };
 
         for issue in &report.issues {
@@ -383,6 +382,25 @@ impl Reconciler {
                             path = %issue.path,
                             domain = %report.domain,
                             "skipping repair delete for currently referenced snapshot path"
+                        );
+                        result.skipped_count += 1;
+                        if let Some(domain) = Self::parse_domain(&report.domain) {
+                            crate::metrics::record_reconciler_repair(
+                                domain,
+                                issue.issue_type.as_str(),
+                                "skipped",
+                            );
+                        }
+                        continue;
+                    }
+                    if Self::extract_snapshot_version(&issue.path)
+                        .is_some_and(|version| version > visible_snapshot_version)
+                    {
+                        tracing::warn!(
+                            path = %issue.path,
+                            domain = %report.domain,
+                            visible_snapshot_version,
+                            "skipping repair delete for snapshot version newer than visible manifest"
                         );
                         result.skipped_count += 1;
                         if let Some(domain) = Self::parse_domain(&report.domain) {
@@ -1097,6 +1115,97 @@ mod tests {
             .get_raw(&protected_file)
             .await
             .expect("protected file must remain");
+    }
+
+    #[tokio::test]
+    async fn repair_skips_snapshot_versions_newer_than_visible_manifest() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let mut pointed_snapshot = crate::manifest::SnapshotInfo::new(
+            2,
+            CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+        );
+        pointed_snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "22".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+        let pointed = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(2),
+            epoch: 2,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000001.json".to_string()),
+            writer_session_id: Some("pointer-session".to_string()),
+            snapshot_version: 2,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2),
+            snapshot: Some(pointed_snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(2),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        write_json(
+            &storage,
+            &pointed_manifest_path,
+            &pointed,
+            WritePrecondition::DoesNotExist,
+        )
+        .await;
+        write_json(
+            &storage,
+            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            &DomainManifestPointer {
+                manifest_id: "00000000000000000002".to_string(),
+                manifest_path: pointed_manifest_path,
+                epoch: 2,
+                parent_pointer_hash: None,
+                updated_at: Utc::now(),
+            },
+            WritePrecondition::DoesNotExist,
+        )
+        .await;
+
+        let in_flight_file =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 3, "tables.parquet");
+        storage
+            .put_raw(
+                &in_flight_file,
+                Bytes::from_static(b"in-flight snapshot bytes"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write in-flight file");
+        let report = ReconciliationReport {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            checked_at: Utc::now(),
+            manifest_snapshot_version: 2,
+            manifest_snapshot_count: 1,
+            storage_snapshot_count: 2,
+            ledger_event_count: 0,
+            issues: vec![ReconciliationIssue {
+                issue_type: IssueType::OrphanedSnapshot,
+                path: in_flight_file.clone(),
+                description: "newer snapshot file from an in-flight commit".to_string(),
+                severity: Severity::Warning,
+                repairable: true,
+            }],
+        };
+
+        let reconciler = Reconciler::new(storage.clone());
+        let result = reconciler.repair(&report).await.expect("repair");
+
+        assert_eq!(result.repaired_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        storage
+            .get_raw(&in_flight_file)
+            .await
+            .expect("newer snapshot file must remain");
     }
 
     #[tokio::test]

@@ -425,6 +425,9 @@ pub struct TaskRow {
     /// Publish failure, if output failed to become visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_error: Option<String>,
+    /// Earliest time anti-entropy may bootstrap the next retry attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_before: Option<DateTime<Utc>>,
     /// Delta table identifier from execution output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_table: Option<String>,
@@ -1394,6 +1397,65 @@ impl FoldState {
                     );
                 }
             }
+            OrchestrationEventData::TaskCompletionRecorded {
+                run_id,
+                task_key,
+                attempt,
+                attempt_id,
+                outcome,
+                materialization_id,
+                error_message,
+                output,
+                asset_key,
+                partition_key,
+                code_version,
+                output_visibility,
+                ..
+            } => {
+                let completion_applied = self.fold_task_finished(
+                    run_id,
+                    task_key,
+                    *attempt,
+                    attempt_id,
+                    *outcome,
+                    materialization_id.as_deref(),
+                    error_message.clone(),
+                    output.as_ref(),
+                    asset_key.as_deref(),
+                    partition_key.as_deref(),
+                    code_version.as_deref(),
+                    &event.event_id,
+                    event.timestamp,
+                    &event.tenant_id,
+                    &event.workspace_id,
+                );
+                let visibility_applied = if completion_applied && *outcome == TaskOutcome::Succeeded
+                {
+                    output_visibility.as_ref().is_some_and(|update| {
+                        self.fold_task_output_visibility_changed(
+                            run_id,
+                            task_key,
+                            *attempt,
+                            attempt_id,
+                            update.visibility_state,
+                            update.published_at,
+                            update.publish_error.as_deref(),
+                            &event.event_id,
+                            event.timestamp,
+                        )
+                    })
+                } else {
+                    false
+                };
+                if completion_applied || visibility_applied {
+                    self.refresh_catalog_run_index_for_run(
+                        &event.tenant_id,
+                        &event.workspace_id,
+                        run_id,
+                        event.timestamp,
+                    );
+                }
+            }
             OrchestrationEventData::TaskOutputVisibilityChanged {
                 run_id,
                 task_key,
@@ -1873,6 +1935,7 @@ impl FoldState {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                retry_not_before: None,
                 delta_table: None,
                 delta_version: None,
                 delta_partition: None,
@@ -2039,9 +2102,13 @@ impl FoldState {
             match outcome {
                 TaskOutcome::Succeeded => {
                     task.error_message = None;
+                    task.retry_not_before = None;
                 }
                 TaskOutcome::Failed | TaskOutcome::Skipped | TaskOutcome::Cancelled => {
                     task.error_message = error_message;
+                    if new_state != TaskState::RetryWait {
+                        task.retry_not_before = None;
+                    }
                 }
             }
 
@@ -2266,6 +2333,7 @@ impl FoldState {
                     task.state = TaskState::Dispatched;
                     task.attempt = attempt;
                     task.attempt_id = Some(desired_attempt_id.to_string());
+                    task.retry_not_before = None;
                     task.row_version = event_id.to_string();
                     task_changed = true;
                 }
@@ -2366,6 +2434,9 @@ impl FoldState {
                 existing.attempt = attempt;
             }
             // Don't update row_version or cloud_task_id - the existing row has newer state
+            if map_timer_type(timer_type) == TimerType::Retry {
+                self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
+            }
             return;
         }
 
@@ -2384,6 +2455,30 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        if map_timer_type(timer_type) == TimerType::Retry {
+            self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
+        }
+    }
+
+    fn set_retry_not_before(
+        &mut self,
+        run_id: Option<&str>,
+        task_key: Option<&str>,
+        attempt: Option<u32>,
+        fire_at: DateTime<Utc>,
+        event_id: &str,
+    ) {
+        let (Some(run_id), Some(task_key), Some(attempt)) = (run_id, task_key, attempt) else {
+            return;
+        };
+        let key = (run_id.to_string(), task_key.to_string());
+        let Some(task) = self.tasks.get_mut(&key) else {
+            return;
+        };
+        if task.state == TaskState::RetryWait && task.attempt == attempt {
+            task.retry_not_before = Some(fire_at);
+            task.row_version = event_id.to_string();
+        }
     }
 
     fn fold_timer_enqueued(
@@ -3669,8 +3764,8 @@ pub fn merge_backfill_chunk_rows(rows: Vec<BackfillChunkRow>) -> Option<Backfill
 mod tests {
     use super::*;
     use crate::orchestration::events::{
-        OrchestrationEventData, OutputVisibilityState, SourceRef, TimerType as EventTimerType,
-        TriggerInfo, TriggerSource,
+        OrchestrationEventData, OutputVisibilityState, OutputVisibilityUpdate, SourceRef,
+        TimerType as EventTimerType, TriggerInfo, TriggerSource,
     };
     use ulid::Ulid;
 
@@ -4452,6 +4547,72 @@ mod tests {
     }
 
     #[test]
+    fn test_task_completion_recorded_applies_completion_and_visibility_atomically() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        let published_at = Utc::now();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+
+        state.fold_event(&make_event(
+            OrchestrationEventData::TaskCompletionRecorded {
+                run_id: "run1".into(),
+                task_key: "analytics.daily".into(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                worker_id: "worker-1".into(),
+                outcome: TaskOutcome::Succeeded,
+                materialization_id: Some("mat_01".into()),
+                error_message: None,
+                output: None,
+                error: None,
+                metrics: None,
+                cancelled_during_phase: None,
+                partial_progress_json: None,
+                asset_key: Some("analytics.daily".into()),
+                partition_key: Some("2026-03-24".into()),
+                code_version: Some("code-v1".into()),
+                output_visibility: Some(OutputVisibilityUpdate {
+                    visibility_state: OutputVisibilityState::Visible,
+                    published_at: Some(published_at),
+                    publish_error: None,
+                }),
+            },
+        ));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .unwrap();
+        assert_eq!(task.state, TaskState::Succeeded);
+        assert_eq!(task.materialization_id.as_deref(), Some("mat_01"));
+        assert_eq!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(task.published_at, Some(published_at));
+        assert!(task.publish_error.is_none());
+    }
+
+    #[test]
     fn test_output_visibility_event_does_not_regress_visible_task_back_to_pending() {
         let mut state = FoldState::new();
         let attempt_id = Ulid::new().to_string();
@@ -4595,6 +4756,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            retry_not_before: None,
             delta_table: None,
             delta_version: None,
             delta_partition: None,

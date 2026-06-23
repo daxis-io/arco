@@ -356,6 +356,11 @@ pub(crate) async fn create_catalog(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::StaleReserved { .. } => {
+            return Err(ApiError::conflict(
+                "request with Idempotency-Key is still in progress",
+            ));
+        }
         IdempotencyCheck::Replay {
             entity_id,
             entity_name,
@@ -618,6 +623,11 @@ pub(crate) async fn create_schema(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::StaleReserved { .. } => {
+            return Err(ApiError::conflict(
+                "request with Idempotency-Key is still in progress",
+            ));
+        }
         IdempotencyCheck::Replay {
             entity_id,
             entity_name,
@@ -847,6 +857,11 @@ pub(crate) async fn register_table_in_schema(
     let (marker, marker_version) = match idempotency_check {
         IdempotencyCheck::NoKey => (None, None),
         IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
+        IdempotencyCheck::StaleReserved { .. } => {
+            return Err(ApiError::conflict(
+                "request with Idempotency-Key is still in progress",
+            ));
+        }
         IdempotencyCheck::Replay {
             entity_id,
             entity_name,

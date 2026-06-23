@@ -316,6 +316,7 @@ fn test_anti_entropy_recovers_orphaned_tasks() -> Result<()> {
         output_visibility_state: None,
         published_at: None,
         publish_error: None,
+        retry_not_before: None,
         delta_table: None,
         delta_version: None,
         delta_partition: None,

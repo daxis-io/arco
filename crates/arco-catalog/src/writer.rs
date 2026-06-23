@@ -710,6 +710,13 @@ impl CatalogWriter {
         Self::idempotency_request_failed(409, "request with Idempotency-Key is still in progress")
     }
 
+    fn should_cache_idempotency_failure(err: &CatalogError) -> bool {
+        match err {
+            CatalogError::CasFailed { .. } | CatalogError::PreconditionFailed { .. } => false,
+            _ => err.http_status_code().is_some(),
+        }
+    }
+
     async fn finalize_idempotency_success(
         &self,
         marker: CatalogIdempotencyMarker,
@@ -741,6 +748,10 @@ impl CatalogWriter {
         version: ObjectVersion,
         err: &CatalogError,
     ) -> Result<()> {
+        if !Self::should_cache_idempotency_failure(err) {
+            return Ok(());
+        }
+
         let Some(http_status) = err.http_status_code() else {
             return Ok(());
         };
@@ -761,6 +772,177 @@ impl CatalogWriter {
                 })
             }
         }
+    }
+
+    fn reserved_idempotency_entity(marker: &CatalogIdempotencyMarker) -> Result<(&str, &str)> {
+        match (&marker.entity_id, &marker.entity_name) {
+            (Some(entity_id), Some(entity_name)) => Ok((entity_id.as_str(), entity_name.as_str())),
+            _ => Err(CatalogError::InvariantViolation {
+                message: "stale idempotency marker missing reserved entity proof".to_string(),
+            }),
+        }
+    }
+
+    async fn reserve_idempotency_entity(
+        &self,
+        marker: CatalogIdempotencyMarker,
+        version: ObjectVersion,
+        entity_id: &str,
+        entity_name: &str,
+    ) -> Result<(CatalogIdempotencyMarker, ObjectVersion)> {
+        match (&marker.entity_id, &marker.entity_name) {
+            (Some(existing_id), Some(existing_name))
+                if existing_id == entity_id && existing_name == entity_name =>
+            {
+                Ok((marker, version))
+            }
+            (None, None) => {
+                let reserved =
+                    marker.reserve_entity(entity_id.to_string(), entity_name.to_string());
+                match self
+                    .idempotency_store()
+                    .finalize(&reserved, &version)
+                    .await?
+                {
+                    crate::idempotency::FinalizeResult::Success { version } => {
+                        Ok((reserved, version))
+                    }
+                    crate::idempotency::FinalizeResult::Conflict { current_version } => {
+                        Err(CatalogError::InvariantViolation {
+                            message: format!(
+                                "idempotency marker reservation conflict: {}",
+                                current_version.as_str()
+                            ),
+                        })
+                    }
+                }
+            }
+            _ => Err(CatalogError::InvariantViolation {
+                message: "idempotency marker reserved entity proof mismatch".to_string(),
+            }),
+        }
+    }
+
+    async fn refresh_stale_reserved_idempotency(
+        &self,
+        marker: CatalogIdempotencyMarker,
+        version: ObjectVersion,
+    ) -> Result<(CatalogIdempotencyMarker, ObjectVersion)> {
+        Self::reserved_idempotency_entity(&marker)?;
+        match self.idempotency_store().takeover(&marker, &version).await? {
+            crate::idempotency::TakeoverResult::Success { marker, version } => {
+                Ok((marker, version))
+            }
+            crate::idempotency::TakeoverResult::RaceDetected { current_marker, .. } => {
+                match current_marker.status {
+                    crate::idempotency::IdempotencyStatus::InProgress => {
+                        Err(Self::idempotency_in_progress_error())
+                    }
+                    crate::idempotency::IdempotencyStatus::Committed => {
+                        Err(CatalogError::InvariantViolation {
+                            message:
+                                "idempotency marker finalized during stale reservation recovery"
+                                    .to_string(),
+                        })
+                    }
+                    crate::idempotency::IdempotencyStatus::Failed => {
+                        Err(Self::idempotency_request_failed(
+                            current_marker.error_http_status.unwrap_or(409),
+                            current_marker.error_message.clone().unwrap_or_else(|| {
+                                "previous idempotent request failed".to_string()
+                            }),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recover_reserved_catalog(
+        &self,
+        marker: &CatalogIdempotencyMarker,
+        version: &ObjectVersion,
+    ) -> Result<Option<Catalog>> {
+        let (reserved_id, reserved_name) = Self::reserved_idempotency_entity(marker)?;
+        let Some(catalog) =
+            crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
+                .get_catalog(reserved_name)
+                .await?
+        else {
+            return Ok(None);
+        };
+        if catalog.id != reserved_id {
+            return Err(CatalogError::AlreadyExists {
+                entity: "catalog".into(),
+                name: reserved_name.to_string(),
+            });
+        }
+        self.finalize_idempotency_success(
+            marker.clone(),
+            version.clone(),
+            &catalog.id,
+            &catalog.name,
+        )
+        .await?;
+        Ok(Some(catalog))
+    }
+
+    async fn recover_reserved_schema(
+        &self,
+        catalog: &str,
+        marker: &CatalogIdempotencyMarker,
+        version: &ObjectVersion,
+    ) -> Result<Option<Schema>> {
+        let (reserved_id, reserved_name) = Self::reserved_idempotency_entity(marker)?;
+        let schema =
+            crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
+                .list_schemas(catalog)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.name == reserved_name);
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
+        if schema.id != reserved_id {
+            return Err(CatalogError::AlreadyExists {
+                entity: "namespace".into(),
+                name: reserved_name.to_string(),
+            });
+        }
+        self.finalize_idempotency_success(
+            marker.clone(),
+            version.clone(),
+            &schema.id,
+            &schema.name,
+        )
+        .await?;
+        Ok(Some(schema))
+    }
+
+    async fn recover_reserved_table(
+        &self,
+        catalog: &str,
+        schema: &str,
+        marker: &CatalogIdempotencyMarker,
+        version: &ObjectVersion,
+    ) -> Result<Option<Table>> {
+        let (reserved_id, reserved_name) = Self::reserved_idempotency_entity(marker)?;
+        let Some(table) =
+            crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
+                .get_table_in_schema(catalog, schema, reserved_name)
+                .await?
+        else {
+            return Ok(None);
+        };
+        if table.id != reserved_id {
+            return Err(CatalogError::AlreadyExists {
+                entity: "table".into(),
+                name: format!("{catalog}.{schema}.{reserved_name}"),
+            });
+        }
+        self.finalize_idempotency_success(marker.clone(), version.clone(), &table.id, &table.name)
+            .await?;
+        Ok(Some(table))
     }
 
     async fn replay_catalog_by_name(&self, name: &str) -> Result<Catalog> {
@@ -1018,7 +1200,7 @@ impl CatalogWriter {
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
-        let idempotency = match check_idempotency(
+        let mut idempotency = match check_idempotency(
             &idempotency_store,
             opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::CreateCatalog,
@@ -1029,6 +1211,15 @@ impl CatalogWriter {
         {
             IdempotencyCheck::NoKey => None,
             IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::StaleReserved { marker, version } => {
+                if let Some(catalog) = self.recover_reserved_catalog(&marker, &version).await? {
+                    return Ok(catalog);
+                }
+                Some(
+                    self.refresh_stale_reserved_idempotency(*marker, version)
+                        .await?,
+                )
+            }
             IdempotencyCheck::Replay { entity_name, .. } => {
                 return self.replay_catalog_by_name(&entity_name).await;
             }
@@ -1041,7 +1232,16 @@ impl CatalogWriter {
                 return Err(Self::idempotency_in_progress_error());
             }
         };
-
+        let catalog_id = idempotency
+            .as_ref()
+            .and_then(|(marker, _)| marker.entity_id.clone())
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        if let Some((marker, version)) = idempotency.take() {
+            idempotency = Some(
+                self.reserve_idempotency_entity(marker, version, &catalog_id, name)
+                    .await?,
+            );
+        }
         let result = async {
             // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
             if let Some(expected) = &opts.if_match {
@@ -1059,7 +1259,7 @@ impl CatalogWriter {
 
             let now = Utc::now().timestamp_millis();
             let catalog = Catalog {
-                id: Uuid::now_v7().to_string(),
+                id: catalog_id.clone(),
                 name: name.to_string(),
                 description: description.map(String::from),
                 properties,
@@ -1519,6 +1719,7 @@ impl CatalogWriter {
         }
 
         let mut event_ids = Vec::with_capacity(tables.len() + namespaces.len() + 1);
+        let mut previous_event_id = None;
         for table in tables {
             let event = CatalogDdlEvent::TableDropped {
                 table_id: table.id,
@@ -1527,13 +1728,15 @@ impl CatalogWriter {
             };
             let event_id = self
                 .tier1
-                .append_ledger_event(
+                .append_ledger_event_after(
                     &guard,
                     CatalogDomain::Catalog,
                     &event,
                     opts.actor.as_deref().unwrap_or("api"),
+                    previous_event_id,
                 )
                 .await?;
+            previous_event_id = Some(event_id);
             event_ids.push(event_id.to_string());
         }
 
@@ -1544,13 +1747,15 @@ impl CatalogWriter {
             };
             let event_id = self
                 .tier1
-                .append_ledger_event(
+                .append_ledger_event_after(
                     &guard,
                     CatalogDomain::Catalog,
                     &event,
                     opts.actor.as_deref().unwrap_or("api"),
+                    previous_event_id,
                 )
                 .await?;
+            previous_event_id = Some(event_id);
             event_ids.push(event_id.to_string());
         }
 
@@ -1560,11 +1765,12 @@ impl CatalogWriter {
         };
         let event_id = self
             .tier1
-            .append_ledger_event(
+            .append_ledger_event_after(
                 &guard,
                 CatalogDomain::Catalog,
                 &event,
                 opts.actor.as_deref().unwrap_or("api"),
+                previous_event_id,
             )
             .await?;
         event_ids.push(event_id.to_string());
@@ -1632,7 +1838,7 @@ impl CatalogWriter {
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
-        let idempotency = match check_idempotency(
+        let mut idempotency = match check_idempotency(
             &idempotency_store,
             opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::CreateSchema,
@@ -1643,6 +1849,18 @@ impl CatalogWriter {
         {
             IdempotencyCheck::NoKey => None,
             IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::StaleReserved { marker, version } => {
+                if let Some(schema) = self
+                    .recover_reserved_schema(catalog, &marker, &version)
+                    .await?
+                {
+                    return Ok(schema);
+                }
+                Some(
+                    self.refresh_stale_reserved_idempotency(*marker, version)
+                        .await?,
+                )
+            }
             IdempotencyCheck::Replay { entity_name, .. } => {
                 return self.replay_schema_by_name(catalog, &entity_name).await;
             }
@@ -1655,7 +1873,16 @@ impl CatalogWriter {
                 return Err(Self::idempotency_in_progress_error());
             }
         };
-
+        let schema_id = idempotency
+            .as_ref()
+            .and_then(|(marker, _)| marker.entity_id.clone())
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        if let Some((marker, version)) = idempotency.take() {
+            idempotency = Some(
+                self.reserve_idempotency_entity(marker, version, &schema_id, schema)
+                    .await?,
+            );
+        }
         let result = async {
             // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
             if let Some(expected) = &opts.if_match {
@@ -1723,7 +1950,7 @@ impl CatalogWriter {
 
             let now = Utc::now().timestamp_millis();
             let namespace = Namespace {
-                id: Uuid::now_v7().to_string(),
+                id: schema_id.clone(),
                 catalog_id: Some(catalog_record.id.clone()),
                 name: schema.to_string(),
                 description: description.map(String::from),
@@ -2439,6 +2666,7 @@ impl CatalogWriter {
         }
 
         let mut event_ids = Vec::with_capacity(tables.len() + 1);
+        let mut previous_event_id = None;
         for table in tables {
             let event = CatalogDdlEvent::TableDropped {
                 table_id: table.id,
@@ -2447,13 +2675,15 @@ impl CatalogWriter {
             };
             let event_id = self
                 .tier1
-                .append_ledger_event(
+                .append_ledger_event_after(
                     &guard,
                     CatalogDomain::Catalog,
                     &event,
                     opts.actor.as_deref().unwrap_or("api"),
+                    previous_event_id,
                 )
                 .await?;
+            previous_event_id = Some(event_id);
             event_ids.push(event_id.to_string());
         }
 
@@ -2463,11 +2693,12 @@ impl CatalogWriter {
         };
         let event_id = self
             .tier1
-            .append_ledger_event(
+            .append_ledger_event_after(
                 &guard,
                 CatalogDomain::Catalog,
                 &event,
                 opts.actor.as_deref().unwrap_or("api"),
+                previous_event_id,
             )
             .await?;
         event_ids.push(event_id.to_string());
@@ -3062,7 +3293,7 @@ impl CatalogWriter {
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
-        let idempotency = match check_idempotency(
+        let mut idempotency = match check_idempotency(
             &idempotency_store,
             opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
             CatalogOperation::RegisterTableInSchema,
@@ -3073,6 +3304,18 @@ impl CatalogWriter {
         {
             IdempotencyCheck::NoKey => None,
             IdempotencyCheck::Proceed { marker, version } => Some((marker, version)),
+            IdempotencyCheck::StaleReserved { marker, version } => {
+                if let Some(table) = self
+                    .recover_reserved_table(catalog, schema, &marker, &version)
+                    .await?
+                {
+                    return Ok(table);
+                }
+                Some(
+                    self.refresh_stale_reserved_idempotency(*marker, version)
+                        .await?,
+                )
+            }
             IdempotencyCheck::Replay { entity_name, .. } => {
                 return self
                     .replay_table_by_name(catalog, schema, &entity_name)
@@ -3087,7 +3330,16 @@ impl CatalogWriter {
                 return Err(Self::idempotency_in_progress_error());
             }
         };
-
+        let table_id = idempotency
+            .as_ref()
+            .and_then(|(marker, _)| marker.entity_id.clone())
+            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        if let Some((marker, version)) = idempotency.take() {
+            idempotency = Some(
+                self.reserve_idempotency_entity(marker, version, &table_id, &req.name)
+                    .await?,
+            );
+        }
         let result = async {
             // Fast optimistic locking check. Revalidated under the Tier-1 lock before writing.
             if let Some(expected) = &opts.if_match {
@@ -3186,7 +3438,6 @@ impl CatalogWriter {
             }
 
             let now = Utc::now().timestamp_millis();
-            let table_id = Uuid::now_v7().to_string();
             let table_format = normalize_new_table_format(req.format.as_deref())?;
             let table_format_kind =
                 TableFormat::parse(&table_format).map_err(CatalogError::from)?;

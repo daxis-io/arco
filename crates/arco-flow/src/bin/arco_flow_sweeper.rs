@@ -28,7 +28,7 @@ use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
 use arco_flow::orchestration::controllers::{AntiEntropySweeper, Repair};
-use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskOutcome};
 use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_flow::orchestration::ids::{cloud_task_id, deterministic_attempt_id};
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
@@ -279,6 +279,38 @@ async fn run_handler(
                         });
                     }
                 }
+            }
+            Repair::FailStaleRunningTask {
+                run_id,
+                task_key,
+                attempt,
+                attempt_id,
+                reason,
+            } => {
+                events.push(OrchestrationEvent::new(
+                    state.tenant_id.clone(),
+                    state.workspace_id.clone(),
+                    OrchestrationEventData::TaskFinished {
+                        run_id,
+                        task_key,
+                        attempt,
+                        attempt_id,
+                        worker_id: "anti-entropy".to_string(),
+                        outcome: TaskOutcome::Failed,
+                        materialization_id: None,
+                        error_message: Some(reason),
+                        output: None,
+                        error: None,
+                        metrics: None,
+                        cancelled_during_phase: None,
+                        partial_progress_json: None,
+                        asset_key: None,
+                        partition_key: None,
+                        code_version: None,
+                    },
+                ));
+
+                repairs_created += 1;
             }
             Repair::SkippedDueToLag { .. } => {
                 skipped_due_to_lag += 1;

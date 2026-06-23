@@ -162,11 +162,11 @@ pub struct CatalogIdempotencyMarker {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 
-    /// Entity ID created by this operation (`namespace_id` or `table_id`).
+    /// Entity ID created or reserved by this operation (`namespace_id` or `table_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_id: Option<String>,
 
-    /// Entity name created by this operation.
+    /// Entity name created or reserved by this operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entity_name: Option<String>,
 }
@@ -230,6 +230,32 @@ impl CatalogIdempotencyMarker {
         self.entity_id = Some(entity_id);
         self.entity_name = Some(entity_name);
         self
+    }
+
+    /// Records the entity identity reserved for this in-progress request.
+    #[must_use]
+    pub fn reserve_entity(mut self, entity_id: String, entity_name: String) -> Self {
+        self.entity_id = Some(entity_id);
+        self.entity_name = Some(entity_name);
+        self
+    }
+
+    fn reserve_entity_options(
+        mut self,
+        entity_id: Option<String>,
+        entity_name: Option<String>,
+    ) -> Self {
+        self.entity_id = entity_id;
+        self.entity_name = entity_name;
+        self
+    }
+
+    /// Returns whether this in-progress marker has durable entity ownership proof.
+    #[must_use]
+    pub fn has_reserved_entity(&self) -> bool {
+        self.status == IdempotencyStatus::InProgress
+            && self.entity_id.is_some()
+            && self.entity_name.is_some()
     }
 
     /// Finalizes the marker as failed.
@@ -566,6 +592,10 @@ impl<S: StorageBackend> IdempotencyStore for IdempotencyStoreImpl<S> {
             stale_marker.idempotency_key.clone(),
             stale_marker.operation,
             stale_marker.request_hash.clone(),
+        )
+        .reserve_entity_options(
+            stale_marker.entity_id.clone(),
+            stale_marker.entity_name.clone(),
         );
 
         let path = refreshed.path();
@@ -639,6 +669,13 @@ pub enum IdempotencyCheck {
         /// When the in-progress request started (for Retry-After calculation).
         started_at: DateTime<Utc>,
     },
+    /// Previous request is stale and carries reserved entity ownership proof.
+    StaleReserved {
+        /// Stale marker to repair or refresh.
+        marker: Box<CatalogIdempotencyMarker>,
+        /// Version of the stale marker for CAS repair.
+        version: ObjectVersion,
+    },
 }
 
 /// Checks idempotency for a catalog DDL request.
@@ -687,6 +724,13 @@ pub async fn check_idempotency<S: StorageBackend>(
             match existing.status {
                 IdempotencyStatus::InProgress => {
                     if existing.is_stale(stale_timeout) {
+                        if existing.has_reserved_entity() {
+                            record_idempotency_check(op_str, "stale_reserved");
+                            return Ok(IdempotencyCheck::StaleReserved {
+                                marker: existing,
+                                version: existing_version,
+                            });
+                        }
                         tracing::warn!(
                             idempotency_key = %key,
                             operation = ?operation,

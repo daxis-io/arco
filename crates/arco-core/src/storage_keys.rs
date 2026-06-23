@@ -132,6 +132,21 @@ impl StateKey {
         Self(format!("snapshots/{}/v{version}/", domain.as_str()))
     }
 
+    /// Creates a key for an attempt-unique Tier-1 snapshot directory.
+    #[must_use]
+    pub fn snapshot_attempt_dir(domain: CatalogDomain, version: u64, attempt_id: &str) -> Self {
+        Self(format!(
+            "snapshots/{}/v{version}/attempts/{attempt_id}/",
+            domain.as_str()
+        ))
+    }
+
+    /// Creates a snapshot file key under an existing snapshot directory.
+    #[must_use]
+    pub fn snapshot_file_in_dir(snapshot_dir: &str, filename: &str) -> Self {
+        Self(format!("{}/{filename}", snapshot_dir.trim_end_matches('/')))
+    }
+
     /// Creates a key for a Tier-2 compacted state file.
     #[must_use]
     pub fn state_snapshot(domain: CatalogDomain, version: u64, ulid: &str) -> Self {

@@ -20,6 +20,10 @@ resource "google_cloud_run_v2_service" "flow_timer_ingest" {
   project  = var.project_id
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_timer_ingest"
+  })
+
   template {
     service_account = google_service_account.flow_timer_ingest[0].email
 
@@ -80,6 +84,10 @@ resource "google_cloud_run_v2_service" "flow_automation_reconciler" {
   location = var.region
   project  = var.project_id
   ingress  = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_automation_reconciler"
+  })
 
   template {
     service_account = google_service_account.flow_controller.email

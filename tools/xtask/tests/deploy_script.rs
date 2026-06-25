@@ -323,7 +323,7 @@ fn deploy_dry_run_fails_when_existing_no_list_writer_role_is_missing_from_state(
 }
 
 #[test]
-fn deploy_validates_internal_cloud_run_services_without_local_proxy() {
+fn deploy_validates_internal_cloud_run_services_with_local_proxy() {
     let harness = DeployHarness::with_internal_cloud_run_services().expect("create deploy harness");
 
     let output = Command::new(repo_root().join("scripts/deploy.sh"))
@@ -354,6 +354,11 @@ fn deploy_validates_internal_cloud_run_services_without_local_proxy() {
         )
         .env("FLOW_WORKER_IMAGE", "example.com/arco-flow-worker:test")
         .env("API_CODE_VERSION", "test-code-version")
+        .env("ARCO_DEPLOY_OWNER", "test-owner")
+        .env(
+            "ARCO_DEPLOY_LOCK_DIR",
+            harness.log_path().with_extension("lock"),
+        )
         .env("TF_VAR_flow_tenant_id", "tenant-dev")
         .env("TF_VAR_flow_workspace_id", "workspace-dev")
         .env("API_HEALTH_TIMEOUT", "10")
@@ -366,21 +371,21 @@ fn deploy_validates_internal_cloud_run_services_without_local_proxy() {
 
     assert!(
         output.status.success(),
-        "deploy should validate internal-only services without local proxy:\n{output_text}"
+        "deploy should validate internal-only services through the local proxy path:\n{output_text}"
     );
 
     let log = harness.read_log().expect("read tool log");
     assert!(
-        log.contains("gcloud logging read"),
-        "internal compactor health should use Cloud Logging evidence; log:\n{log}"
+        log.contains("gcloud run services proxy"),
+        "internal-only services should use the Cloud Run proxy instead of public ingress; log:\n{log}"
     );
     assert!(
-        !log.contains("gcloud run services proxy"),
-        "internal-only services are not reachable through local gcloud proxy; log:\n{log}"
+        log.contains("curl "),
+        "proxy health checks should use local curl against the authenticated proxy; log:\n{log}"
     );
     assert!(
-        !log.contains("curl "),
-        "internal-only service health should not fall back to local curl; log:\n{log}"
+        !log.contains("gcloud logging read"),
+        "proxy health should not fall back to Cloud Logging as deployed readiness evidence; log:\n{log}"
     );
     assert!(
         log.contains("-target=google_cloud_run_v2_service.compactor")
@@ -434,12 +439,28 @@ impl DeployHarness {
         write_stub(
             &bin_dir,
             "curl",
-            "printf 'curl %s\\n' \"$*\" >> \"$ARCO_TEST_LOG\"\n",
+            r#"printf 'curl %s\n' "$*" >> "$ARCO_TEST_LOG"
+for arg in "$@"; do
+  if [[ "$arg" == "%{http_code}" ]]; then
+    printf '200'
+    exit 0
+  fi
+done
+printf '{"ready":true,"healthy":true,"successful_compactions":1,"last_successful_compaction":"2026-06-01T07:12:21Z"}\n'
+"#,
         )?;
         write_stub(
             &bin_dir,
             "jq",
-            "printf 'jq %s\\n' \"$*\" >> \"$ARCO_TEST_LOG\"\n",
+            r#"printf 'jq %s\n' "$*" >> "$ARCO_TEST_LOG"
+case "$*" in
+*'.ready // false'*) printf 'true\n' ;;
+*'.healthy // false'*) printf 'true\n' ;;
+*'.successful_compactions // 0'*) printf '1\n' ;;
+*'.last_successful_compaction // "unknown"'*) printf '2026-06-01T07:12:21Z\n' ;;
+*) printf '\n' ;;
+esac
+"#,
         )?;
 
         Ok(Self {
@@ -472,16 +493,27 @@ fn gcloud_stub_body(existing_cloud_run_service: Option<&str>) -> String {
     format!(
         r#"printf 'gcloud %s\n' "$*" >> "$ARCO_TEST_LOG"
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "run services describe" ]]; then
-  [[ "${{4:-}}" == "{existing_cloud_run_service}" ]]
-  exit $?
+  if [[ "${{4:-}}" == "{existing_cloud_run_service}" ]]; then
+    printf '%s\n' "${{4:-}}"
+    exit 0
+  fi
+  echo "NOT_FOUND" >&2
+  exit 1
 fi
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "run jobs describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${{1:-}} ${{2:-}}" == "iam service-accounts" && "${{3:-}}" == "describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "iam roles describe" ]]; then
+  echo "NOT_FOUND" >&2
+  exit 1
+fi
+if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "storage buckets describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 "#
@@ -492,17 +524,28 @@ fn gcloud_stub_body_with_project_role(existing_role_id: &str) -> String {
     format!(
         r#"printf 'gcloud %s\n' "$*" >> "$ARCO_TEST_LOG"
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "run services describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "run jobs describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${{1:-}} ${{2:-}}" == "iam service-accounts" && "${{3:-}}" == "describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "iam roles describe" ]]; then
-  [[ "${{4:-}}" == "{existing_role_id}" ]]
-  exit $?
+  if [[ "${{4:-}}" == "{existing_role_id}" ]]; then
+    printf '%s\n' "projects/arco-testing-20260320/roles/{existing_role_id}"
+    exit 0
+  fi
+  echo "NOT_FOUND" >&2
+  exit 1
+fi
+if [[ "${{1:-}} ${{2:-}} ${{3:-}}" == "storage buckets describe" ]]; then
+  echo "NOT_FOUND" >&2
+  exit 1
 fi
 "#
     )
@@ -512,12 +555,22 @@ fn terraform_stateful_stub_body() -> String {
     r#"printf 'terraform %s\n' "$*" >> "$ARCO_TEST_LOG"
 if [[ "${1:-} ${2:-}" == "state list" ]]; then
   printf '%s\n' \
+    "google_storage_bucket.catalog" \
     "google_cloud_run_v2_service.api" \
     "google_cloud_run_v2_service.compactor" \
     "google_cloud_run_v2_service.flow_compactor" \
     "google_cloud_run_v2_job.compactor_antientropy" \
+    "google_service_account.api" \
+    "google_service_account.compactor" \
+    "google_service_account.compactor_antientropy" \
+    "google_service_account.invoker" \
+    "google_service_account.flow_controller" \
+    "google_service_account.flow_task_invoker" \
+    "google_project_iam_custom_role.storage_object_reader_no_list" \
     "google_project_iam_custom_role.storage_object_lister" \
+    "google_project_iam_custom_role.storage_object_writer_no_list" \
     "google_service_account.flow_timer_ingest[0]" \
+    "google_service_account.flow_worker[0]" \
     "google_cloud_run_v2_service.flow_dispatcher[0]" \
     "google_cloud_run_v2_service.flow_sweeper[0]" \
     "google_cloud_run_v2_service.flow_timer_ingest[0]" \
@@ -538,8 +591,11 @@ if [[ "${1:-} ${2:-} ${3:-}" == "run services describe" ]]; then
     esac
   done
   case "$format" in
-  "value(metadata.name)")
+    "value(metadata.name)")
     printf '%s\n' "$service"
+    ;;
+  "value(metadata.labels.arco_deploy_owner)")
+    printf '\n'
     ;;
   "value(metadata.annotations.\"run.googleapis.com/ingress-status\")")
     printf '%s\n' "internal"
@@ -558,12 +614,19 @@ if [[ "${1:-} ${2:-}" == "logging read" ]]; then
   exit 0
 fi
 if [[ "${1:-} ${2:-} ${3:-}" == "run jobs describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${1:-} ${2:-}" == "iam service-accounts" && "${3:-}" == "describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 if [[ "${1:-} ${2:-} ${3:-}" == "iam roles describe" ]]; then
+  echo "NOT_FOUND" >&2
+  exit 1
+fi
+if [[ "${1:-} ${2:-} ${3:-}" == "storage buckets describe" ]]; then
+  echo "NOT_FOUND" >&2
   exit 1
 fi
 "#

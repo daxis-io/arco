@@ -52,7 +52,12 @@ data "google_project" "current" {
 locals {
   # Prefer explicit configuration to allow `terraform plan` with example tfvars files
   # (no cloud auth / API calls). If unset, auto-discover from the project.
-  project_number = var.project_number != "" ? var.project_number : tostring(data.google_project.current[0].number)
+  project_number      = var.project_number != "" ? var.project_number : tostring(data.google_project.current[0].number)
+  deploy_owner_labels = var.deploy_owner != "" ? { arco_deploy_owner = var.deploy_owner } : {}
+  cloud_run_labels = merge({
+    environment = var.environment
+    service     = "arco"
+  }, local.deploy_owner_labels)
 }
 
 # ============================================================================

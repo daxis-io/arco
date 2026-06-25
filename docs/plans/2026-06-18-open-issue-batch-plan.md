@@ -150,6 +150,15 @@ gh issue list --repo daxis-io/arco --state open --limit 300 --json number,title,
 - `/version` or equivalent provenance proves the deployed code under test.
 - A fresh `deployed_api_worker_*.json` artifact passes validation and is tied to the expected tenant/workspace and revision.
 
+**Temporary live-validation override:** For follow-up Batch 4 implementation
+sessions where `gcloud` or local Cloud SDK credentials are unavailable, a human
+may explicitly waive the live deployed validation step. The executor may still
+complete repo-owned Batch 4 fixes, local tests, dry-run helpers, docs, and
+paste-ready issue comments. The executor must label the affected issue statuses
+as `live-validation-overridden`, record that live proof was not collected, and
+must not claim a deployed UAT pass or close live-proof issues based on local
+evidence alone.
+
 ## Batch 5: Iceberg, UC, And External Compatibility
 
 **Issues:** #214, #269, #270, #271, #276, #277, #278, #283, #297.

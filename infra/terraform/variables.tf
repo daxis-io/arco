@@ -50,6 +50,23 @@ variable "api_code_version" {
   default     = ""
 }
 
+variable "api_git_sha" {
+  description = "Git SHA for Arco API build provenance exposed by /version"
+  type        = string
+  default     = ""
+}
+
+variable "deploy_owner" {
+  description = "Optional label-safe deployment owner marker stamped on Cloud Run services during managed deploys."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.deploy_owner == "" || can(regex("^[a-z0-9]([-a-z0-9_]{0,61}[a-z0-9])?$", var.deploy_owner))
+    error_message = "deploy_owner must be empty or a GCP label-safe value: lowercase letters, digits, '-' or '_', 1-63 chars, starting and ending with a letter or digit."
+  }
+}
+
 variable "compactor_image" {
   description = "Container image for Arco Compactor service"
   type        = string
@@ -59,6 +76,17 @@ variable "flow_compactor_image" {
   description = "Container image for Arco Flow compactor service"
   type        = string
   default     = ""
+}
+
+variable "flow_compactor_ingress" {
+  description = "Ingress mode for the Arco Flow compactor service. Use all only for bounded UAT/debug windows with IAM invoker protection."
+  type        = string
+  default     = "internal"
+
+  validation {
+    condition     = contains(["internal", "all"], var.flow_compactor_ingress)
+    error_message = "flow_compactor_ingress must be one of: internal, all."
+  }
 }
 
 variable "flow_automation_reconciler_image" {

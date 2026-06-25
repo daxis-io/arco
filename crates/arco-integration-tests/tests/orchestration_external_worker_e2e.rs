@@ -191,6 +191,7 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
         task_id: &str,
         run_id: &str,
         attempt: u32,
+        attempt_id: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let config = self.config.clone();
@@ -198,6 +199,7 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
         let workspace_id = self.workspace_id.clone();
         let task_id = task_id.to_string();
         let run_id = run_id.to_string();
+        let attempt_id = attempt_id.to_string();
         let token = token.to_string();
 
         async move {
@@ -211,15 +213,14 @@ impl TaskTokenValidator for CoreTaskTokenValidator {
             if claims.workspace_id != workspace_id {
                 return Err("workspace_mismatch".to_string());
             }
-            if let Some(claim_run_id) = claims.run_id.as_deref() {
-                if claim_run_id != run_id {
-                    return Err("run_id_mismatch".to_string());
-                }
+            if claims.run_id.as_deref() != Some(run_id.as_str()) {
+                return Err("run_id_mismatch".to_string());
             }
-            if let Some(claim_attempt) = claims.attempt {
-                if claim_attempt != attempt {
-                    return Err("attempt_mismatch".to_string());
-                }
+            if claims.attempt != Some(attempt) {
+                return Err("attempt_mismatch".to_string());
+            }
+            if claims.attempt_id.as_deref() != Some(attempt_id.as_str()) {
+                return Err("attempt_id_mismatch".to_string());
             }
             Ok(())
         }
@@ -358,6 +359,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
         "workspace",
         run_id,
         attempt,
+        attempt_id.clone(),
         Utc::now(),
     )
     .expect("mint token");

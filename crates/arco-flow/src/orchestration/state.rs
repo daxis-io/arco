@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::{ScopedStorage, VisibilityStatus};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -225,7 +226,10 @@ pub struct RunListPage {
 pub struct RunListQuery {
     /// Maximum number of runs to return.
     pub limit: usize,
-    /// Numeric offset cursor returned by prior pages.
+    /// Opaque cursor returned by prior pages.
+    ///
+    /// Legacy numeric offset cursors are accepted as input for compatibility,
+    /// but newly emitted cursors are keyset cursors.
     pub cursor: Option<String>,
     /// Optional public state filter.
     pub state: Option<RunStateView>,
@@ -239,6 +243,18 @@ impl Default for RunListQuery {
             state: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RunListKeysetCursor {
+    triggered_at: DateTime<Utc>,
+    run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedRunListCursor {
+    Keyset(RunListKeysetCursor),
+    LegacyOffset(usize),
 }
 
 /// Full task read model built from the compacted projection.
@@ -531,11 +547,11 @@ impl OrchestrationStateService {
             });
         }
         if let Some(cursor) = &query.cursor {
-            cursor
-                .parse::<usize>()
-                .map_err(|_| StateServiceError::InvalidRunListCursor {
+            decode_run_list_cursor(cursor).map_err(|()| {
+                StateServiceError::InvalidRunListCursor {
                     cursor: cursor.clone(),
-                })?;
+                }
+            })?;
         }
         Ok(())
     }
@@ -677,6 +693,10 @@ pub fn run_detail_from_state(state: &FoldState, run_id: &str) -> Option<RunDetai
 #[must_use]
 pub fn list_runs_from_state(state: &FoldState, query: &RunListQuery) -> RunListPage {
     let tasks_by_run = build_tasks_by_run(state);
+    let decoded_cursor = query
+        .cursor
+        .as_deref()
+        .and_then(|cursor| decode_run_list_cursor(cursor).ok());
     let mut runs = state
         .runs
         .values()
@@ -688,6 +708,10 @@ pub fn list_runs_from_state(state: &FoldState, query: &RunListQuery) -> RunListP
         })
         .collect::<Vec<_>>();
 
+    if let Some(DecodedRunListCursor::Keyset(cursor)) = decoded_cursor.as_ref() {
+        runs.retain(|run| run_sorts_after_cursor(run, cursor));
+    }
+
     runs.sort_by(|left, right| {
         right
             .triggered_at
@@ -695,11 +719,10 @@ pub fn list_runs_from_state(state: &FoldState, query: &RunListQuery) -> RunListP
             .then_with(|| left.run_id.cmp(&right.run_id))
     });
 
-    let offset = query
-        .cursor
-        .as_deref()
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .unwrap_or(0);
+    let offset = match decoded_cursor {
+        Some(DecodedRunListCursor::LegacyOffset(offset)) => offset,
+        Some(DecodedRunListCursor::Keyset(_)) | None => 0,
+    };
     let limit = if query.limit == 0 {
         DEFAULT_RUN_LIST_LIMIT
     } else {
@@ -718,8 +741,36 @@ pub fn list_runs_from_state(state: &FoldState, query: &RunListQuery) -> RunListP
 
     RunListPage {
         runs: items,
-        next_cursor: (end < runs.len()).then(|| end.to_string()),
+        next_cursor: (end < runs.len()).then(|| {
+            page.last()
+                .map_or_else(|| end.to_string(), |run| encode_run_list_cursor(run))
+        }),
     }
+}
+
+fn decode_run_list_cursor(cursor: &str) -> Result<DecodedRunListCursor, ()> {
+    if let Ok(offset) = cursor.parse::<usize>() {
+        return Ok(DecodedRunListCursor::LegacyOffset(offset));
+    }
+
+    let decoded = URL_SAFE_NO_PAD.decode(cursor.as_bytes()).map_err(|_| ())?;
+    let keyset = serde_json::from_slice::<RunListKeysetCursor>(&decoded).map_err(|_| ())?;
+    Ok(DecodedRunListCursor::Keyset(keyset))
+}
+
+fn encode_run_list_cursor(run: &RunRow) -> String {
+    let cursor = RunListKeysetCursor {
+        triggered_at: run.triggered_at,
+        run_id: run.run_id.clone(),
+    };
+    #[allow(clippy::expect_used)]
+    let encoded = serde_json::to_vec(&cursor).expect("run list cursor serialization is infallible");
+    URL_SAFE_NO_PAD.encode(encoded)
+}
+
+fn run_sorts_after_cursor(run: &RunRow, cursor: &RunListKeysetCursor) -> bool {
+    run.triggered_at < cursor.triggered_at
+        || (run.triggered_at == cursor.triggered_at && run.run_id > cursor.run_id)
 }
 
 /// Looks up a task detail by run identifier and task key.
@@ -1264,6 +1315,52 @@ mod tests {
                 ("run-new", RunStateView::Running, None),
                 ("run-output-pending", RunStateView::Running, None),
             ]
+        );
+    }
+
+    #[test]
+    fn run_list_cursor_is_stable_when_newer_runs_are_inserted_between_pages() {
+        let mut state = FoldState::new();
+        state.runs.insert(
+            "run-old".to_string(),
+            run_row("run-old", FoldRunState::Triggered, 0, 1_000, None, false),
+        );
+        state.runs.insert(
+            "run-mid".to_string(),
+            run_row("run-mid", FoldRunState::Running, 1, 2_000, None, false),
+        );
+        state.runs.insert(
+            "run-new".to_string(),
+            run_row("run-new", FoldRunState::Running, 1, 3_000, None, false),
+        );
+
+        let first_page = list_runs_from_state(
+            &state,
+            &RunListQuery {
+                limit: 1,
+                cursor: None,
+                state: None,
+            },
+        );
+        assert_eq!(first_page.runs[0].run_id, "run-new");
+
+        state.runs.insert(
+            "run-later".to_string(),
+            run_row("run-later", FoldRunState::Running, 1, 4_000, None, false),
+        );
+
+        let second_page = list_runs_from_state(
+            &state,
+            &RunListQuery {
+                limit: 1,
+                cursor: first_page.next_cursor,
+                state: None,
+            },
+        );
+
+        assert_eq!(
+            second_page.runs[0].run_id, "run-mid",
+            "cursor should resume after the previous page's last row, not after a shifted offset"
         );
     }
 
@@ -2320,7 +2417,7 @@ mod tests {
         idempotency_key: &str,
         timestamp_offset_seconds: i64,
     ) -> OrchestrationEvent {
-        OrchestrationEvent::new_with_timestamp_and_idempotency_key(
+        let mut event = OrchestrationEvent::new_with_timestamp_and_idempotency_key(
             storage.tenant_id(),
             storage.workspace_id(),
             OrchestrationEventData::TaskFinished {
@@ -2344,7 +2441,9 @@ mod tests {
             },
             idempotency_key,
             ts(10_000 + timestamp_offset_seconds),
-        )
+        );
+        event.event_id = test_event_id(timestamp_offset_seconds, &event.idempotency_key);
+        event
     }
 
     fn task_output_visibility_event(
@@ -2393,12 +2492,21 @@ mod tests {
         data: OrchestrationEventData,
         timestamp_offset_seconds: i64,
     ) -> OrchestrationEvent {
-        OrchestrationEvent::new_with_timestamp(
+        let mut event = OrchestrationEvent::new_with_timestamp(
             storage.tenant_id(),
             storage.workspace_id(),
             data,
             ts(10_000 + timestamp_offset_seconds),
-        )
+        );
+        event.event_id = test_event_id(timestamp_offset_seconds, &event.idempotency_key);
+        event
+    }
+
+    fn test_event_id(timestamp_offset_seconds: i64, discriminator: &str) -> String {
+        let suffix = discriminator.bytes().fold(0_u64, |acc, byte| {
+            acc.wrapping_mul(131).wrapping_add(u64::from(byte))
+        }) % 1_000_000_000_000;
+        format!("01KSTATE{timestamp_offset_seconds:06}{suffix:012}")
     }
 
     fn task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {

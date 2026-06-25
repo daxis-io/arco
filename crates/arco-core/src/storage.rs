@@ -27,7 +27,10 @@ use object_store::signer::Signer as ObjectStoreSigner;
 use object_store::{DynObjectStore, PutMode, PutOptions, UpdateVersion};
 use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicI64, Ordering},
+};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -319,6 +322,28 @@ fn map_object_store_error(err: object_store::Error) -> Error {
     }
 }
 
+fn is_object_store_write_precondition_failure(
+    precondition: &WritePrecondition,
+    err: &object_store::Error,
+) -> bool {
+    match precondition {
+        WritePrecondition::None => false,
+        WritePrecondition::DoesNotExist => matches!(
+            err,
+            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
+        ),
+        WritePrecondition::MatchesVersion(_) => match err {
+            object_store::Error::Precondition { .. } | object_store::Error::NotFound { .. } => true,
+            object_store::Error::Generic { source, .. } => {
+                let message = source.to_string();
+                message.contains("ETag required for conditional update")
+                    || message.contains("MissingETag")
+            }
+            _ => false,
+        },
+    }
+}
+
 fn object_store_meta_to_meta(meta: object_store::ObjectMeta) -> ObjectMeta {
     let version = VersionToken::from_parts(meta.e_tag.clone(), meta.version.clone()).encode();
     ObjectMeta {
@@ -388,10 +413,10 @@ impl StorageBackend for ObjectStoreBackend {
         precondition: WritePrecondition,
     ) -> Result<WriteResult> {
         let location = ObjectStorePath::from(path);
-        let opts = match precondition {
+        let opts = match &precondition {
             WritePrecondition::DoesNotExist => PutOptions::from(PutMode::Create),
             WritePrecondition::MatchesVersion(token) => {
-                let token = VersionToken::decode(&token);
+                let token = VersionToken::decode(token);
                 PutOptions::from(PutMode::Update(token.to_update_version()))
             }
             WritePrecondition::None => PutOptions::default(),
@@ -402,10 +427,7 @@ impl StorageBackend for ObjectStoreBackend {
                 let version = VersionToken::from_parts(result.e_tag, result.version).encode();
                 Ok(WriteResult::Success { version })
             }
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => {
+            Err(e) if is_object_store_write_precondition_failure(&precondition, &e) => {
                 let current = self.head(path).await?;
                 let current_version = current.map_or_else(String::new, |m| m.version);
                 Ok(WriteResult::PreconditionFailed { current_version })
@@ -466,6 +488,7 @@ impl StorageBackend for ObjectStoreBackend {
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
     objects: Arc<RwLock<HashMap<String, StoredObject>>>,
+    next_version: Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -538,16 +561,16 @@ impl StorageBackend for MemoryBackend {
                 }
             }
             WritePrecondition::MatchesVersion(expected) => {
-                let expected_num: i64 = expected.parse().unwrap_or(-1);
+                let expected_num = expected.parse::<i64>().ok();
                 match current {
-                    Some(obj) if obj.version != expected_num => {
+                    Some(obj) if Some(obj.version) != expected_num => {
                         return Ok(WriteResult::PreconditionFailed {
                             current_version: obj.version.to_string(),
                         });
                     }
                     None => {
                         return Ok(WriteResult::PreconditionFailed {
-                            current_version: "0".to_string(),
+                            current_version: String::new(),
                         });
                     }
                     _ => {}
@@ -556,7 +579,7 @@ impl StorageBackend for MemoryBackend {
             WritePrecondition::None => {}
         }
 
-        let new_version = current.map_or(1, |o| o.version + 1);
+        let new_version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         objects.insert(
             path.to_string(),
             StoredObject {

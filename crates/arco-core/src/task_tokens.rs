@@ -163,6 +163,9 @@ pub struct TaskTokenClaims {
     /// Optional orchestration attempt number for dispatch-attempt-scoped tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
+    /// Optional dispatch attempt identifier for dispatch-attempt-scoped tokens.
+    #[serde(default, alias = "attempt_id", skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
     /// Expiry (unix timestamp seconds).
     pub exp: usize,
     /// Not-before (unix timestamp seconds).
@@ -193,6 +196,7 @@ fn timestamp_to_usize(value: i64, field: &str) -> Result<usize> {
         .map_err(|_| Error::InvalidInput(format!("{field} timestamp out of range")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mint_task_token_with_scope(
     config: &TaskTokenConfig,
     task_id: String,
@@ -200,6 +204,7 @@ fn mint_task_token_with_scope(
     workspace_id: String,
     run_id: Option<String>,
     attempt: Option<u32>,
+    attempt_id: Option<String>,
     now: DateTime<Utc>,
 ) -> Result<MintedTaskToken> {
     config.validate()?;
@@ -211,6 +216,7 @@ fn mint_task_token_with_scope(
         workspace_id,
         run_id,
         attempt,
+        attempt_id,
         exp: timestamp_to_usize(expires_at.timestamp(), "exp")?,
         nbf: Some(timestamp_to_usize(now.timestamp(), "nbf")?),
         iat: Some(timestamp_to_usize(now.timestamp(), "iat")?),
@@ -247,6 +253,7 @@ pub fn mint_task_token(
         workspace_id.into(),
         None,
         None,
+        None,
         now,
     )
 }
@@ -260,6 +267,7 @@ pub fn mint_task_token(
 /// # Errors
 ///
 /// Returns an error when configuration is invalid or signing fails.
+#[allow(clippy::too_many_arguments)]
 pub fn mint_task_token_for_attempt(
     config: &TaskTokenConfig,
     task_id: impl Into<String>,
@@ -267,6 +275,7 @@ pub fn mint_task_token_for_attempt(
     workspace_id: impl Into<String>,
     run_id: impl Into<String>,
     attempt: u32,
+    attempt_id: impl Into<String>,
     now: DateTime<Utc>,
 ) -> Result<MintedTaskToken> {
     mint_task_token_with_scope(
@@ -276,6 +285,7 @@ pub fn mint_task_token_for_attempt(
         workspace_id.into(),
         Some(run_id.into()),
         Some(attempt),
+        Some(attempt_id.into()),
         now,
     )
 }
@@ -350,6 +360,7 @@ mod tests {
             "workspace-1",
             "run-1",
             2,
+            "attempt-2",
             now,
         )
         .expect("mint");
@@ -361,6 +372,7 @@ mod tests {
         assert_eq!(claims.workspace_id, "workspace-1");
         assert_eq!(claims.run_id.as_deref(), Some("run-1"));
         assert_eq!(claims.attempt, Some(2));
+        assert_eq!(claims.attempt_id.as_deref(), Some("attempt-2"));
         assert!(minted.expires_at > now);
     }
 
@@ -380,6 +392,7 @@ mod tests {
 
         assert_eq!(claims.run_id, None);
         assert_eq!(claims.attempt, None);
+        assert_eq!(claims.attempt_id, None);
     }
 
     #[test]

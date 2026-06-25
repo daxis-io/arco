@@ -18,6 +18,7 @@
 //! - `POST   /tasks/{task_id}/heartbeat` - Worker heartbeat
 //! - `POST   /tasks/{task_id}/completed` - Worker finished execution
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -28,8 +29,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use chrono::{DateTime, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
@@ -1884,23 +1886,113 @@ fn compute_rerun_request_fingerprint(
     Ok(hex::encode(hash))
 }
 
-fn parse_pagination(limit: u32, cursor: Option<&str>) -> Result<(usize, usize), ApiError> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecodedListCursor {
+    Start,
+    LegacyOffset(usize),
+    Key(ListCursorKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ListCursorKey(Vec<String>);
+
+impl ListCursorKey {
+    fn single(value: impl Into<String>) -> Self {
+        Self(vec![value.into()])
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EncodedListCursor {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keys: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorSort {
+    Asc,
+    Desc,
+}
+
+fn parse_pagination(
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<(usize, DecodedListCursor), ApiError> {
     if limit == 0 || limit > MAX_LIST_LIMIT {
         return Err(ApiError::bad_request(format!(
             "limit must be between 1 and {MAX_LIST_LIMIT}"
         )));
     }
 
-    let offset = cursor
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|_| ApiError::bad_request("invalid cursor"))
-        })
-        .transpose()?
-        .unwrap_or(0);
+    let cursor = match cursor {
+        Some(value) => decode_list_cursor(value)?,
+        None => DecodedListCursor::Start,
+    };
 
-    Ok((limit as usize, offset))
+    Ok((limit as usize, cursor))
+}
+
+fn decode_list_cursor(cursor: &str) -> Result<DecodedListCursor, ApiError> {
+    if let Ok(offset) = cursor.parse::<usize>() {
+        return Ok(DecodedListCursor::LegacyOffset(offset));
+    }
+
+    let decoded = URL_SAFE_NO_PAD
+        .decode(cursor.as_bytes())
+        .map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    let cursor: EncodedListCursor =
+        serde_json::from_slice(&decoded).map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    match (cursor.keys, cursor.key) {
+        (Some(keys), _) if !keys.is_empty() => Ok(DecodedListCursor::Key(ListCursorKey(keys))),
+        (None, Some(key)) => Ok(DecodedListCursor::Key(ListCursorKey::single(key))),
+        _ => Err(ApiError::bad_request("invalid cursor")),
+    }
+}
+
+fn encode_list_cursor(key: ListCursorKey) -> Result<String, ApiError> {
+    let cursor = EncodedListCursor {
+        key: None,
+        keys: Some(key.0),
+    };
+    let encoded = serde_json::to_vec(&cursor)
+        .map_err(|e| ApiError::internal(format!("failed to serialize list cursor: {e}")))?;
+    Ok(URL_SAFE_NO_PAD.encode(encoded))
+}
+
+fn cursor_key(parts: impl IntoIterator<Item = String>) -> ListCursorKey {
+    ListCursorKey(parts.into_iter().collect())
+}
+
+fn time_cursor_key(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn number_cursor_key(value: impl std::fmt::Display) -> String {
+    format!("{value:020}")
+}
+
+fn compare_cursor_keys(
+    left: &ListCursorKey,
+    right: &ListCursorKey,
+    sort: &[CursorSort],
+) -> Result<Ordering, ApiError> {
+    if left.0.len() != sort.len() || right.0.len() != sort.len() {
+        return Err(ApiError::bad_request("invalid cursor"));
+    }
+
+    for ((left_part, right_part), direction) in left.0.iter().zip(&right.0).zip(sort) {
+        let ordering = match direction {
+            CursorSort::Asc => left_part.cmp(right_part),
+            CursorSort::Desc => right_part.cmp(left_part),
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+
+    Ok(Ordering::Equal)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3999,15 +4091,38 @@ fn map_partition_status(row: &PartitionStatusRow) -> PartitionStatusApiResponse 
     }
 }
 
-fn paginate<T: Clone>(items: &[T], limit: usize, offset: usize) -> (Vec<T>, Option<String>) {
+fn paginate<T: Clone>(
+    items: &[T],
+    limit: usize,
+    cursor: &DecodedListCursor,
+    key: impl Fn(&T) -> ListCursorKey,
+    sort: &[CursorSort],
+) -> Result<(Vec<T>, Option<String>), ApiError> {
+    let offset = match cursor {
+        DecodedListCursor::Start => 0,
+        DecodedListCursor::LegacyOffset(offset) => *offset,
+        DecodedListCursor::Key(cursor_key) => {
+            let mut offset = items.len();
+            for (position, item) in items.iter().enumerate() {
+                if compare_cursor_keys(&key(item), cursor_key, sort)? == Ordering::Greater {
+                    offset = position;
+                    break;
+                }
+            }
+            offset
+        }
+    };
+
     let end = (offset + limit).min(items.len());
     let page = items.get(offset..end).unwrap_or_default().to_vec();
     let next_cursor = if end < items.len() {
-        Some(end.to_string())
+        page.last()
+            .map(|item| encode_list_cursor(key(item)))
+            .transpose()?
     } else {
         None
     };
-    (page, next_cursor)
+    Ok((page, next_cursor))
 }
 
 fn filter_ticks_by_status(
@@ -5166,16 +5281,6 @@ pub(crate) async fn list_runs(
             "limit must be between 1 and {MAX_LIST_LIMIT}"
         )));
     }
-    query
-        .cursor
-        .as_deref()
-        .map(|cursor| {
-            cursor
-                .parse::<usize>()
-                .map_err(|_| ApiError::bad_request("invalid cursor"))
-        })
-        .transpose()?;
-
     let service = state_service_for_request(&ctx, &state)?;
     let page = service
         .list_runs(flow_state::RunListQuery {
@@ -5402,7 +5507,7 @@ pub(crate) async fn list_schedules(
     AxumQuery(query): AxumQuery<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -5418,7 +5523,13 @@ pub(crate) async fn list_schedules(
         .collect();
     schedules.sort_by(|a, b| a.schedule_id.cmp(&b.schedule_id));
 
-    let (page, next_cursor) = paginate(&schedules, limit, offset);
+    let (page, next_cursor) = paginate(
+        &schedules,
+        limit,
+        &cursor,
+        |schedule| ListCursorKey::single(schedule.schedule_id.clone()),
+        &[CursorSort::Asc],
+    )?;
 
     Ok(Json(ListSchedulesResponse {
         schedules: page,
@@ -5711,7 +5822,7 @@ pub(crate) async fn list_schedule_ticks(
     AxumQuery(query): AxumQuery<ListTicksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -5730,7 +5841,13 @@ pub(crate) async fn list_schedule_ticks(
             .then_with(|| b.tick_id.cmp(&a.tick_id))
     });
 
-    let (page, next_cursor) = paginate(&ticks, limit, offset);
+    let (page, next_cursor) = paginate(
+        &ticks,
+        limit,
+        &cursor,
+        |tick| cursor_key([time_cursor_key(tick.scheduled_for), tick.tick_id.clone()]),
+        &[CursorSort::Desc, CursorSort::Desc],
+    )?;
 
     Ok(Json(ListScheduleTicksResponse {
         ticks: page,
@@ -5764,7 +5881,7 @@ pub(crate) async fn list_sensors(
     AxumQuery(query): AxumQuery<ListQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -5777,7 +5894,13 @@ pub(crate) async fn list_sensors(
         .collect();
     sensors.sort_by(|a, b| a.sensor_id.cmp(&b.sensor_id));
 
-    let (page, next_cursor) = paginate(&sensors, limit, offset);
+    let (page, next_cursor) = paginate(
+        &sensors,
+        limit,
+        &cursor,
+        |sensor| ListCursorKey::single(sensor.sensor_id.clone()),
+        &[CursorSort::Asc],
+    )?;
 
     Ok(Json(ListSensorsResponse {
         sensors: page,
@@ -5842,7 +5965,7 @@ pub(crate) async fn list_sensor_evals(
     AxumQuery(query): AxumQuery<ListSensorEvalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -5856,9 +5979,19 @@ pub(crate) async fn list_sensor_evals(
         .collect();
     filter_sensor_evals_by_status(&mut evals, query.status);
     filter_sensor_evals_by_time_range(&mut evals, query.since, query.until);
-    evals.sort_by(|a, b| b.evaluated_at.cmp(&a.evaluated_at));
+    evals.sort_by(|a, b| {
+        b.evaluated_at
+            .cmp(&a.evaluated_at)
+            .then_with(|| a.eval_id.cmp(&b.eval_id))
+    });
 
-    let (page, next_cursor) = paginate(&evals, limit, offset);
+    let (page, next_cursor) = paginate(
+        &evals,
+        limit,
+        &cursor,
+        |eval| cursor_key([time_cursor_key(eval.evaluated_at), eval.eval_id.clone()]),
+        &[CursorSort::Desc, CursorSort::Asc],
+    )?;
 
     Ok(Json(ListSensorEvalsResponse {
         evals: page,
@@ -6007,7 +6140,7 @@ pub(crate) async fn list_backfills(
     AxumQuery(query): AxumQuery<ListBackfillsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -6030,9 +6163,24 @@ pub(crate) async fn list_backfills(
         backfills.retain(|b| b.state == state_filter);
     }
 
-    backfills.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    backfills.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.backfill_id.cmp(&b.backfill_id))
+    });
 
-    let (page, next_cursor) = paginate(&backfills, limit, offset);
+    let (page, next_cursor) = paginate(
+        &backfills,
+        limit,
+        &cursor,
+        |backfill| {
+            cursor_key([
+                time_cursor_key(backfill.created_at),
+                backfill.backfill_id.clone(),
+            ])
+        },
+        &[CursorSort::Desc, CursorSort::Asc],
+    )?;
 
     Ok(Json(ListBackfillsResponse {
         backfills: page,
@@ -6102,7 +6250,7 @@ pub(crate) async fn list_backfill_chunks(
     AxumQuery(query): AxumQuery<ListChunksQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -6126,9 +6274,19 @@ pub(crate) async fn list_backfill_chunks(
         chunks.retain(|c| c.state as u8 == state_filter as u8);
     }
 
-    chunks.sort_by(|a, b| a.chunk_index.cmp(&b.chunk_index));
+    chunks.sort_by(|a, b| {
+        a.chunk_index
+            .cmp(&b.chunk_index)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
 
-    let (page, next_cursor) = paginate(&chunks, limit, offset);
+    let (page, next_cursor) = paginate(
+        &chunks,
+        limit,
+        &cursor,
+        |chunk| cursor_key([number_cursor_key(chunk.chunk_index), chunk.chunk_id.clone()]),
+        &[CursorSort::Asc, CursorSort::Asc],
+    )?;
 
     Ok(Json(ListBackfillChunksResponse {
         chunks: page,
@@ -6164,7 +6322,7 @@ pub(crate) async fn list_partitions(
     AxumQuery(query): AxumQuery<ListPartitionsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
-    let (limit, offset) = parse_pagination(
+    let (limit, cursor) = parse_pagination(
         query.limit.unwrap_or(DEFAULT_LIMIT),
         query.cursor.as_deref(),
     )?;
@@ -6193,7 +6351,13 @@ pub(crate) async fn list_partitions(
             .then_with(|| a.partition_key.cmp(&b.partition_key))
     });
 
-    let (page, next_cursor) = paginate(&partitions, limit, offset);
+    let (page, next_cursor) = paginate(
+        &partitions,
+        limit,
+        &cursor,
+        |partition| cursor_key([partition.asset_key.clone(), partition.partition_key.clone()]),
+        &[CursorSort::Asc, CursorSort::Asc],
+    )?;
 
     Ok(Json(ListPartitionsResponse {
         partitions: page,
@@ -7351,9 +7515,128 @@ mod tests {
 
     #[test]
     fn test_parse_pagination_parses_cursor() {
-        let (limit, offset) = parse_pagination(5, Some("10")).expect("parse");
+        let (limit, cursor) = parse_pagination(5, Some("10")).expect("parse");
         assert_eq!(limit, 5);
-        assert_eq!(offset, 10);
+        assert_eq!(cursor, DecodedListCursor::LegacyOffset(10));
+    }
+
+    #[test]
+    fn test_paginate_emits_opaque_keyset_cursor() {
+        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (page, next_cursor) = paginate(
+            &items,
+            2,
+            &DecodedListCursor::Start,
+            |item| ListCursorKey::single(item.clone()),
+            &[CursorSort::Asc],
+        )
+        .expect("paginate");
+
+        assert_eq!(page, vec!["a".to_string(), "b".to_string()]);
+        let next_cursor = next_cursor.expect("next cursor");
+        assert_ne!(next_cursor, "2");
+
+        let decoded = decode_list_cursor(&next_cursor).expect("decode");
+        assert_eq!(decoded, DecodedListCursor::Key(ListCursorKey::single("b")));
+
+        let (second_page, second_cursor) = paginate(
+            &items,
+            2,
+            &decoded,
+            |item| ListCursorKey::single(item.clone()),
+            &[CursorSort::Asc],
+        )
+        .expect("resume");
+        assert_eq!(second_page, vec!["c".to_string()]);
+        assert_eq!(second_cursor, None);
+    }
+
+    #[test]
+    fn test_paginate_keyset_cursor_resumes_after_anchor_disappears() {
+        let items = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let (_, next_cursor) = paginate(
+            &items,
+            2,
+            &DecodedListCursor::Start,
+            |item| ListCursorKey::single(item.clone()),
+            &[CursorSort::Asc],
+        )
+        .expect("paginate");
+        let decoded = decode_list_cursor(&next_cursor.expect("next cursor")).expect("decode");
+
+        let items_after_anchor_delete = vec!["a".to_string(), "c".to_string()];
+        let (second_page, second_cursor) = paginate(
+            &items_after_anchor_delete,
+            2,
+            &decoded,
+            |item| ListCursorKey::single(item.clone()),
+            &[CursorSort::Asc],
+        )
+        .expect("resume after missing anchor");
+
+        assert_eq!(second_page, vec!["c".to_string()]);
+        assert_eq!(second_cursor, None);
+    }
+
+    #[test]
+    fn test_paginate_keyset_cursor_uses_descending_sort_tuple() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Item {
+            sort_time: &'static str,
+            id: &'static str,
+        }
+
+        let items = vec![
+            Item {
+                sort_time: "2026-06-24T12:00:00.000000000Z",
+                id: "newest",
+            },
+            Item {
+                sort_time: "2026-06-24T11:00:00.000000000Z",
+                id: "middle",
+            },
+            Item {
+                sort_time: "2026-06-24T10:00:00.000000000Z",
+                id: "oldest",
+            },
+        ];
+        let (_, next_cursor) = paginate(
+            &items,
+            2,
+            &DecodedListCursor::Start,
+            |item| cursor_key([item.sort_time.to_string(), item.id.to_string()]),
+            &[CursorSort::Desc, CursorSort::Asc],
+        )
+        .expect("paginate");
+        let decoded = decode_list_cursor(&next_cursor.expect("next cursor")).expect("decode");
+
+        let items_after_anchor_delete = vec![
+            Item {
+                sort_time: "2026-06-24T12:00:00.000000000Z",
+                id: "newest",
+            },
+            Item {
+                sort_time: "2026-06-24T10:00:00.000000000Z",
+                id: "oldest",
+            },
+        ];
+        let (second_page, second_cursor) = paginate(
+            &items_after_anchor_delete,
+            2,
+            &decoded,
+            |item| cursor_key([item.sort_time.to_string(), item.id.to_string()]),
+            &[CursorSort::Desc, CursorSort::Asc],
+        )
+        .expect("resume after missing descending anchor");
+
+        assert_eq!(
+            second_page,
+            vec![Item {
+                sort_time: "2026-06-24T10:00:00.000000000Z",
+                id: "oldest",
+            }]
+        );
+        assert_eq!(second_cursor, None);
     }
 
     #[test]

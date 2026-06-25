@@ -1,16 +1,14 @@
 name: Nightly Chaos Tests
 
 on:
-  schedule:
-    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       chaos_seed:
-        description: 'Seed for deterministic chaos (leave empty for random)'
+        description: 'Seed for deterministic chaos (reserved for future suites)'
         required: false
         type: string
       chaos_duration_minutes:
-        description: 'Duration of chaos test in minutes'
+        description: 'Duration for future chaos suites'
         required: false
         default: '30'
         type: string
@@ -18,153 +16,33 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
-  disabled-placeholder:
-    name: Disabled placeholder
+  deterministic-orchestration:
+    name: Deterministic orchestration coverage
     runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
     steps:
-      - name: Report disabled state
-        run: echo "Nightly chaos jobs are intentionally disabled until the backing suites are re-enabled."
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-  simulation:
-    name: Simulation Tests
-    if: false
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        scenario:
-          - name: flaky-network
-            seed: 12345
-          - name: contended-storage
-            seed: 67890
-          - name: chaos
-            seed: 11111
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
-      - name: Run simulation (${{ matrix.scenario.name }})
-        env:
-          ARCO_SIM_SEED: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.chaos_seed || matrix.scenario.seed }}
-          ARCO_SIM_SCENARIO: ${{ matrix.scenario.name }}
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+
+      - name: Run deterministic orchestration coverage
+        run: cargo test -p arco-flow --test orchestration_correctness_tests
+
+      - name: Report chaos status
         run: |
-          cargo test --package arco-test-utils \
-            --features simulation \
-            --test simulation_scenarios \
-            -- --ignored --nocapture
-
-  stress:
-    name: Stress Tests
-    if: false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-        with:
-          toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-
-      - name: Run stress tests
-        env:
-          ARCO_STRESS_DURATION_SECS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.chaos_duration_minutes && format('{0}', fromJSON(github.event.inputs.chaos_duration_minutes) * 60) || '1800' }}
-        run: |
-          cargo test --package arco-integration-tests \
-            --features stress \
-            -- --ignored --test-threads=1 --nocapture
-
-  contention:
-    name: Contention Tests
-    if: false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-        with:
-          toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-
-      - name: Run concurrent writer tests
-        run: |
-          cargo test --package arco-catalog \
-            --features contention-tests \
-            -- --ignored concurrent_ --test-threads=1
-
-  proptest:
-    name: Property-Based Tests (Extended)
-    if: false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-        with:
-          toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-
-      - name: Run extended property tests
-        env:
-          PROPTEST_CASES: 10000
-        run: |
-          cargo test --workspace \
-            --features proptest-extended \
-            -- proptest_ --nocapture
-
-  fencing:
-    name: Fencing Token Tests
-    if: false
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-        with:
-          toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-
-      - name: Run fencing token tests
-        run: |
-          cargo test --package arco-catalog \
-            --features fencing-tests \
-            -- stale_holder --nocapture
-
-  anti-entropy:
-    name: Anti-Entropy Convergence
-    if: false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
-        with:
-          toolchain: 1.88
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-
-      - name: Run anti-entropy tests
-        run: |
-          cargo test --package arco-compactor \
-            --features convergence-tests \
-            -- anti_entropy --ignored --nocapture
-
-  notify-failure:
-    name: Notify on Failure
-    if: false
-    runs-on: ubuntu-24.04
-    needs: [simulation, stress, contention, proptest, fencing, anti-entropy]
-    steps:
-      - name: Create failure summary
-        run: |
-          echo "## Nightly Chaos Test Failure" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "One or more chaos tests failed. Please investigate." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Run ID:** ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Nightly chaos status"
+            echo ""
+            echo "This workflow is manual-only and runs the deterministic multi-instance and clock-skew orchestration coverage."
+            echo "Full randomized chaos remains opt-in until stable backing suites and Cargo features exist."
+          } >> "$GITHUB_STEP_SUMMARY"

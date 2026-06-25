@@ -39,7 +39,8 @@ pub use backfill_events::{BackfillState, ChunkState, PartitionSelector};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use ulid::Ulid;
+use std::sync::{Mutex, OnceLock};
+use ulid::{Generator, Ulid};
 
 use crate::orchestration::callbacks::{
     TaskError as CallbackTaskError, TaskMetrics as CallbackTaskMetrics,
@@ -130,7 +131,7 @@ impl OrchestrationEvent {
     ) -> Self {
         let tenant = tenant_id.into();
         let workspace = workspace_id.into();
-        let event_id = Ulid::new().to_string();
+        let event_id = next_event_id();
         let event_type = data.event_type().to_string();
         let idempotency_key = data.idempotency_key();
         let correlation_id = data.run_id().map(ToString::to_string);
@@ -161,7 +162,7 @@ impl OrchestrationEvent {
     ) -> Self {
         let tenant = tenant_id.into();
         let workspace = workspace_id.into();
-        let event_id = Ulid::new().to_string();
+        let event_id = next_event_id();
         let event_type = data.event_type().to_string();
         let correlation_id = data.run_id().map(ToString::to_string);
 
@@ -220,6 +221,21 @@ impl OrchestrationEvent {
         self.causation_id = Some(causation_id.into());
         self
     }
+}
+
+fn next_event_id() -> String {
+    static GENERATOR: OnceLock<Mutex<Generator>> = OnceLock::new();
+
+    let generator = GENERATOR.get_or_init(|| Mutex::new(Generator::new()));
+    let mut generator = match generator.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    generator
+        .generate()
+        .unwrap_or_else(|_| Ulid::new())
+        .to_string()
 }
 
 /// Orchestration event payload types.
@@ -1116,6 +1132,38 @@ mod tests {
         assert_eq!(event.event_version, 1);
         assert_eq!(event.tenant_id, "tenant-abc");
         assert_eq!(event.workspace_id, "workspace-prod");
+    }
+
+    #[test]
+    fn generated_event_ids_are_monotonic_for_bursts() {
+        let events = (0..256)
+            .map(|index| {
+                OrchestrationEvent::new(
+                    "tenant-abc",
+                    "workspace-prod",
+                    OrchestrationEventData::RunTriggered {
+                        run_id: format!("run{index}"),
+                        plan_id: format!("plan{index}"),
+                        trigger: TriggerInfo::Manual {
+                            user_id: "user@example.com".into(),
+                        },
+                        root_assets: vec!["asset1".into()],
+                        run_key: None,
+                        labels: HashMap::new(),
+                        code_version: None,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for pair in events.windows(2) {
+            assert!(
+                pair[0].event_id < pair[1].event_id,
+                "event IDs must preserve generation order for replay: {} !< {}",
+                pair[0].event_id,
+                pair[1].event_id
+            );
+        }
     }
 
     #[test]

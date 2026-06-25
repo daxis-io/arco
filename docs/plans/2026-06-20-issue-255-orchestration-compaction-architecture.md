@@ -15,6 +15,23 @@ The scaling risk remains:
 - `MicroCompactor` loads base plus L0 state and diffs full state for small event batches.
 - Retention currently prunes `sensor_evals` and `idempotency_keys`; runs, tasks, timers, dependency satisfaction, and dispatch outbox rows are not pruned.
 
+## Batch 0-3 Baseline And Guard
+
+The Batch 0-3 closure work keeps #255 scoped to investigation evidence and a deterministic regression guard. It does not implement the broader heartbeat fast path, fold-state cache, or retention cleanup slices below.
+
+Confirmed local evidence:
+
+- `crates/arco-api/src/routes/tasks.rs` builds task callback dependencies with `CompactingLedgerWriter`, so started, heartbeat, and completed callbacks share the append-and-compact writer.
+- `crates/arco-api/src/orchestration_compaction.rs` acquires `locks/orchestration.compaction.lock.json` and requires visible compaction for append-and-compact callback writes.
+- `crates/arco-flow/src/orchestration/compactor/service.rs` loads current base plus L0 folded state, folds the callback batch, writes only the state delta, and publishes through the manifest pointer.
+- Retention in the compactor remains limited to `sensor_evals` and `idempotency_keys`; run, task, timer, dependency, and dispatch outbox retention belong to Slice 5.
+
+Regression guard:
+
+- `cargo test -p arco-flow --lib callback_compaction_delta_rows_stay_bounded_with_existing_history`
+
+The guard seeds 32 historical runs and tasks, then compacts heartbeat and completion callbacks for one task. The first history delta must contain at least 96 folded rows; the heartbeat callback delta must stay within a 3-row budget (`tasks`, `catalog_run_index`, and `idempotency_keys`), and the completion callback delta must stay within a 4-row budget (`runs`, `tasks`, `catalog_run_index`, and `idempotency_keys`). That gives #255 a reproducible local amplification baseline without changing the compaction architecture in this batch.
+
 ## Invariants To Preserve
 
 - Ledger events remain the durable source of truth.

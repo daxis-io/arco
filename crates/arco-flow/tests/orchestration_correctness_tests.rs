@@ -21,7 +21,7 @@ use arco_flow::orchestration::compactor::fold::{FoldState, TaskRow, TaskState};
 use arco_flow::orchestration::compactor::manifest::OrchestrationManifest;
 use arco_flow::orchestration::compactor::{CompactionVisibility, MicroCompactor};
 use arco_flow::orchestration::controllers::{
-    AntiEntropySweeper, DispatcherController, ReadyDispatchController,
+    AntiEntropySweeper, DispatcherController, ReadyDispatchAction, ReadyDispatchController,
 };
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, SourceRef, TaskDef, TaskOutcome, TriggerInfo,
@@ -224,6 +224,76 @@ fn test_controller_determinism_ready_dispatch() -> Result<()> {
     let actions2 = controller.reconcile(&manifest, &state);
 
     assert_eq!(actions1, actions2);
+    Ok(())
+}
+
+#[test]
+fn test_two_ready_dispatch_instances_converge_on_single_outbox_entry() -> Result<()> {
+    let run_id = "run-ready-ha";
+    let plan_id = "plan-ready-ha";
+    let tasks = vec![default_task_def("extract", vec![])];
+
+    let mut state = FoldState::new();
+    state.fold_event(&run_triggered_event(run_id, plan_id));
+    state.fold_event(&plan_created_event(run_id, plan_id, tasks));
+
+    let manifest = fresh_manifest();
+    let instance_a = ReadyDispatchController::with_defaults();
+    let instance_b = ReadyDispatchController::with_defaults();
+
+    let actions_a = instance_a.reconcile(&manifest, &state);
+    let actions_b = instance_b.reconcile(&manifest, &state);
+    assert_eq!(actions_a, actions_b);
+
+    let ReadyDispatchAction::EmitDispatchRequested { dispatch_id, .. } = &actions_a[0] else {
+        panic!("expected dispatch request from first controller instance");
+    };
+
+    let event_data = actions_a[0]
+        .clone()
+        .into_event_data()
+        .expect("dispatch event data");
+    let mut event_a = OrchestrationEvent::new("tenant", "workspace", event_data.clone());
+    event_a.event_id = "01K00000000000000000000001".to_string();
+    let mut event_b = OrchestrationEvent::new("tenant", "workspace", event_data);
+    event_b.event_id = "01K00000000000000000000002".to_string();
+
+    state.fold_event(&event_a);
+    state.fold_event(&event_b);
+
+    assert_eq!(state.dispatch_outbox.len(), 1);
+    assert!(state.dispatch_outbox.contains_key(dispatch_id));
+    assert!(
+        instance_a
+            .reconcile(&manifest, &state)
+            .iter()
+            .all(|action| !matches!(action, ReadyDispatchAction::EmitDispatchRequested { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_fold_uses_event_id_order_when_producer_timestamps_are_skewed() -> Result<()> {
+    let run_id = "run-clock-skew";
+    let plan_id = "plan-clock-skew";
+    let now = Utc::now();
+
+    let mut run = run_triggered_event(run_id, plan_id);
+    run.event_id = "01K00000000000000000000001".to_string();
+    run.timestamp = now + Duration::minutes(5);
+
+    let mut plan = plan_created_event(run_id, plan_id, vec![default_task_def("extract", vec![])]);
+    plan.event_id = "01K00000000000000000000002".to_string();
+    plan.timestamp = now - Duration::minutes(5);
+
+    let state = fold_events_sorted(vec![plan, run]);
+    let row = state.runs.get(run_id).expect("run row");
+    assert_eq!(row.tasks_total, 1);
+    assert!(
+        state
+            .tasks
+            .contains_key(&(run_id.to_string(), "extract".to_string()))
+    );
     Ok(())
 }
 

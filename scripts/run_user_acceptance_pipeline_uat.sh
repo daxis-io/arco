@@ -114,7 +114,7 @@ print_status() {
 run_deterministic() {
   run_cmd cargo test -p arco-api test_parse_partition_selector
   run_cmd cargo test -p arco-api --test system_tables_api query_exposes_system_orchestration_runs_when_state_is_only_in_l0
-  run_cmd cargo test -p arco-flow event_priority_orders_run_triggered_before_plan_created
+  run_cmd cargo test -p arco-flow --test orchestration_rebuild_dr rebuild_orders_replay_by_event_id_when_event_timestamps_are_skewed
   run_cmd cargo test -p arco-api test_trigger_run_reemits_when_reservation_exists
   run_cmd cargo test -p arco-flow test_handle_task_completed_failure
   run_cmd cargo test -p arco-integration-tests --test orchestration_external_worker_e2e

@@ -66,6 +66,30 @@
 #![deny(missing_docs)]
 #![deny(rust_2018_idioms)]
 #![warn(clippy::pedantic)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::case_sensitive_file_extension_comparisons,
+        clippy::clone_on_copy,
+        clippy::doc_markdown,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::needless_collect,
+        clippy::panic,
+        clippy::range_plus_one,
+        clippy::redundant_closure_for_method_calls,
+        clippy::significant_drop_tightening,
+        clippy::similar_names,
+        clippy::single_match_else,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::unreadable_literal,
+        clippy::unused_async,
+        clippy::unwrap_used,
+        clippy::used_underscore_binding,
+        clippy::wildcard_enum_match_arm
+    )
+)]
 
 // Internal modules - not exposed in public API.
 pub(crate) mod dag;

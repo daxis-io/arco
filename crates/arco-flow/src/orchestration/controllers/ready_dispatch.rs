@@ -209,20 +209,12 @@ impl ReadyDispatchController {
         if let Some(existing) = state.dispatch_outbox.get(&dispatch_id) {
             // Check the status of existing dispatch
             match existing.status {
-                DispatchStatus::Pending | DispatchStatus::Created | DispatchStatus::Acked => {
+                DispatchStatus::Pending | DispatchStatus::Created => {
                     // Already has an active dispatch - skip
                     return Some(ReadyDispatchAction::Skip {
                         run_id: task.run_id.clone(),
                         task_key: task.task_key.clone(),
                         reason: format!("existing_dispatch:{:?}", existing.status),
-                    });
-                }
-                DispatchStatus::Failed => {
-                    // Previous dispatch failed - will be handled by anti-entropy sweeper
-                    return Some(ReadyDispatchAction::Skip {
-                        run_id: task.run_id.clone(),
-                        task_key: task.task_key.clone(),
-                        reason: "dispatch_failed_anti_entropy".to_string(),
                     });
                 }
             }

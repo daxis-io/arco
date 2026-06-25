@@ -15,7 +15,7 @@ use proptest::prelude::*;
 use tokio_test::block_on;
 
 use arco_core::{AssetId, FlowPaths, MemoryBackend, ScopedStorage, TaskId, WritePrecondition};
-use arco_flow::orchestration::compactor::MicroCompactor;
+use arco_flow::orchestration::compactor::{FoldState, MicroCompactor};
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
 };
@@ -163,7 +163,7 @@ fn orchestration_invariant_events() -> Vec<OrchestrationEvent> {
     vec![run_triggered, plan_created, task_started, task_finished]
 }
 
-async fn compact_signature_for_path_order(path_order: &[usize]) -> (usize, usize, usize, usize) {
+async fn compact_state_for_path_order(path_order: &[usize]) -> FoldState {
     let events = orchestration_invariant_events();
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
@@ -196,15 +196,10 @@ async fn compact_signature_for_path_order(path_order: &[usize]) -> (usize, usize
         .load_state()
         .await
         .expect("load state");
-    (
-        state.runs.len(),
-        state.tasks.len(),
-        state.dep_satisfaction.len(),
-        state.idempotency_keys.len(),
-    )
+    state
 }
 
-async fn crash_replay_signature(split_index: usize) -> (usize, usize, usize, usize) {
+async fn crash_replay_state(split_index: usize) -> FoldState {
     let events = orchestration_invariant_events();
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
@@ -243,12 +238,7 @@ async fn crash_replay_signature(split_index: usize) -> (usize, usize, usize, usi
         .load_state()
         .await
         .expect("load state");
-    (
-        state.runs.len(),
-        state.tasks.len(),
-        state.dep_satisfaction.len(),
-        state.idempotency_keys.len(),
-    )
+    state
 }
 
 proptest! {
@@ -568,17 +558,17 @@ proptest! {
         }
 
         let canonical_order = vec![0, 1, 2, 3];
-        let canonical = block_on(compact_signature_for_path_order(&canonical_order));
-        let replayed = block_on(compact_signature_for_path_order(&replay_order));
+        let canonical = block_on(compact_state_for_path_order(&canonical_order));
+        let replayed = block_on(compact_state_for_path_order(&replay_order));
 
-        prop_assert_eq!(canonical, replayed);
+        prop_assert_eq!(&canonical, &replayed);
     }
 
     #[test]
     fn compaction_crash_replay_converges_to_single_pass_state(split_index in 0usize..4) {
-        let canonical = block_on(compact_signature_for_path_order(&[0, 1, 2, 3]));
-        let recovered = block_on(crash_replay_signature(split_index));
+        let canonical = block_on(compact_state_for_path_order(&[0, 1, 2, 3]));
+        let recovered = block_on(crash_replay_state(split_index));
 
-        prop_assert_eq!(canonical, recovered);
+        prop_assert_eq!(&canonical, &recovered);
     }
 }

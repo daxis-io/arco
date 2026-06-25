@@ -11,6 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use serde::Serialize;
+use ulid::Ulid;
 
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{ObjectStoreBackend, StorageBackend};
@@ -192,6 +193,7 @@ async fn run_handler(
                     state.workspace_id.clone(),
                     run_id.clone(),
                     attempt,
+                    attempt_id.clone(),
                     Utc::now(),
                 )
                 .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
@@ -218,7 +220,15 @@ async fn run_handler(
                     .to_json()
                     .map_err(|e| Error::serialization(format!("dispatch envelope error: {e}")))?;
 
-                let cloud_id = cloud_task_id("d", &original_dispatch_id);
+                let repair_epoch = outbox_by_id
+                    .get(&original_dispatch_id)
+                    .map_or("missing_dispatch_outbox", |row| row.row_version.as_str());
+                let repair_attempt_id = Ulid::new().to_string();
+                let cloud_id = redispatch_cloud_task_id(
+                    &original_dispatch_id,
+                    repair_epoch,
+                    &repair_attempt_id,
+                );
                 let options = EnqueueOptions::new();
 
                 let result = state
@@ -414,6 +424,17 @@ fn validate_task_timeout_seconds(timeout: u64) -> Result<u64> {
     Ok(timeout)
 }
 
+fn redispatch_cloud_task_id(
+    original_dispatch_id: &str,
+    repair_epoch: &str,
+    repair_attempt_id: &str,
+) -> String {
+    cloud_task_id(
+        "d",
+        &format!("{original_dispatch_id}:repair:{repair_epoch}:{repair_attempt_id}"),
+    )
+}
+
 fn resolve_port() -> Result<u16> {
     if let Ok(port) = std::env::var("PORT") {
         return port
@@ -575,5 +596,23 @@ mod tests {
     fn validate_task_timeout_seconds_rejects_zero() {
         let err = validate_task_timeout_seconds(0).expect_err("zero timeout must fail");
         assert!(matches!(err, Error::Configuration { .. }));
+    }
+
+    #[test]
+    fn redispatch_cloud_task_id_is_repair_scoped() {
+        let original_dispatch_id = "dispatch:run1:extract:1";
+        let original_cloud_id = cloud_task_id("d", original_dispatch_id);
+
+        let repair_cloud_id =
+            redispatch_cloud_task_id(original_dispatch_id, "outbox-v1", "repair-evt-1");
+        let retry_repair_cloud_id =
+            redispatch_cloud_task_id(original_dispatch_id, "outbox-v1", "repair-evt-2");
+        let later_repair_cloud_id =
+            redispatch_cloud_task_id(original_dispatch_id, "outbox-v2", "repair-evt-3");
+
+        assert_ne!(repair_cloud_id, original_cloud_id);
+        assert_ne!(retry_repair_cloud_id, repair_cloud_id);
+        assert_ne!(later_repair_cloud_id, original_cloud_id);
+        assert_ne!(later_repair_cloud_id, repair_cloud_id);
     }
 }

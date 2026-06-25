@@ -333,6 +333,103 @@ async fn repeated_replay_returns_same_version_and_path() {
 }
 
 #[tokio::test]
+async fn replay_allows_recreated_staging_version_for_same_payload_only() {
+    let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), TENANT, WORKSPACE)
+        .expect("scoped storage");
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+    let payload = Bytes::from_static(b"{\"commitInfo\":{\"ts\":4}}\n");
+
+    let staged = coordinator
+        .stage_commit_payload(payload.clone())
+        .await
+        .expect("stage payload");
+    let idempotency_key = Uuid::now_v7().to_string();
+    let request = CommitDeltaRequest {
+        read_version: -1,
+        staged_path: staged.staged_path.clone(),
+        staged_version: staged.staged_version.clone(),
+        idempotency_key: idempotency_key.clone(),
+    };
+
+    let first = coordinator
+        .commit(request, Utc::now())
+        .await
+        .expect("first commit");
+    assert_eq!(first.version, 0);
+
+    storage
+        .delete(&staged.staged_path)
+        .await
+        .expect("delete staged payload");
+    let recreated = storage
+        .put_raw(
+            &staged.staged_path,
+            payload,
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("recreate staged payload");
+    let WriteResult::Success {
+        version: recreated_version,
+    } = recreated
+    else {
+        panic!("recreated staged payload should be written");
+    };
+    assert_ne!(recreated_version, staged.staged_version);
+
+    let replay = coordinator
+        .commit(
+            CommitDeltaRequest {
+                read_version: -1,
+                staged_path: staged.staged_path.clone(),
+                staged_version: recreated_version,
+                idempotency_key: idempotency_key.clone(),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("same payload replay should ignore incidental staging version");
+    assert_eq!(replay.version, first.version);
+    assert_eq!(replay.delta_log_path, first.delta_log_path);
+
+    storage
+        .delete(&staged.staged_path)
+        .await
+        .expect("delete recreated staged payload");
+    let changed = storage
+        .put_raw(
+            &staged.staged_path,
+            Bytes::from_static(b"{\"commitInfo\":{\"ts\":5}}\n"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("write changed staged payload");
+    let WriteResult::Success {
+        version: changed_version,
+    } = changed
+    else {
+        panic!("changed staged payload should be written");
+    };
+
+    let changed_replay = coordinator
+        .commit(
+            CommitDeltaRequest {
+                read_version: -1,
+                staged_path: staged.staged_path,
+                staged_version: changed_version,
+                idempotency_key,
+            },
+            Utc::now(),
+        )
+        .await;
+    assert!(
+        changed_replay.is_err(),
+        "same key with changed payload must remain a conflict"
+    );
+}
+
+#[tokio::test]
 async fn recover_retry_replays_after_transient_idempotency_write_failure() {
     let backend = Arc::new(FailOnceBackend::new());
     let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");

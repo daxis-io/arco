@@ -3625,17 +3625,13 @@ fn dispatch_status_to_str(status: DispatchStatus) -> &'static str {
     match status {
         DispatchStatus::Pending => "PENDING",
         DispatchStatus::Created => "CREATED",
-        DispatchStatus::Acked => "ACKED",
-        DispatchStatus::Failed => "FAILED",
     }
 }
 
 fn str_to_dispatch_status(s: &str) -> Result<DispatchStatus> {
     match s {
         "PENDING" => Ok(DispatchStatus::Pending),
-        "CREATED" => Ok(DispatchStatus::Created),
-        "ACKED" => Ok(DispatchStatus::Acked),
-        "FAILED" => Ok(DispatchStatus::Failed),
+        "CREATED" | "ACKED" | "FAILED" => Ok(DispatchStatus::Created),
         _ => Err(Error::parquet(format!("unknown dispatch status '{s}'"))),
     }
 }

@@ -830,21 +830,20 @@ mod tests {
         .await
         .expect("publish outcome");
 
-        assert_eq!(
-            outcome,
-            SnapshotPointerPublishOutcome::Visible {
-                pointer_version: "1".to_string(),
-                repair_pending: true,
-            }
-        );
-        assert!(
-            storage
-                .head_raw(&pointer_path)
-                .await
-                .expect("pointer head")
-                .is_some(),
-            "pointer CAS must remain the commit point"
-        );
+        let SnapshotPointerPublishOutcome::Visible {
+            pointer_version,
+            repair_pending,
+        } = outcome
+        else {
+            panic!("pointer publish should be visible, got {outcome:?}");
+        };
+        assert!(repair_pending);
+        let pointer_head = storage
+            .head_raw(&pointer_path)
+            .await
+            .expect("pointer head")
+            .expect("pointer CAS must remain the commit point");
+        assert_eq!(pointer_head.version, pointer_version);
         assert!(
             matches!(storage.get_raw(&legacy_path).await, Err(Error::NotFound(_))),
             "legacy mirror failure should be repairable, not fatal"

@@ -190,14 +190,6 @@ impl DispatcherController {
                 dispatch_id: row.dispatch_id.clone(),
                 reason: "already_created".to_string(),
             },
-            DispatchStatus::Acked => DispatchAction::Skip {
-                dispatch_id: row.dispatch_id.clone(),
-                reason: "already_acked".to_string(),
-            },
-            DispatchStatus::Failed => DispatchAction::Skip {
-                dispatch_id: row.dispatch_id.clone(),
-                reason: "previously_failed".to_string(),
-            },
         }
     }
 
@@ -295,27 +287,6 @@ mod tests {
             } => {
                 assert_eq!(dispatch_id, "dispatch:run1:extract:1");
                 assert_eq!(reason, "already_created");
-            }
-            _ => panic!("Expected Skip action"),
-        }
-    }
-
-    #[test]
-    fn test_dispatcher_skips_acked() {
-        let dispatcher = DispatcherController::with_defaults();
-        let manifest = fresh_manifest();
-
-        let outbox_rows = vec![make_outbox_row(
-            "dispatch:run1:extract:1",
-            DispatchStatus::Acked,
-        )];
-
-        let actions = dispatcher.reconcile(&manifest, &outbox_rows);
-
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            DispatchAction::Skip { reason, .. } => {
-                assert_eq!(reason, "already_acked");
             }
             _ => panic!("Expected Skip action"),
         }

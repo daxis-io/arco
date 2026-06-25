@@ -107,6 +107,7 @@ pub trait TaskTokenValidator: Send + Sync {
         task_id: &str,
         run_id: &str,
         attempt: u32,
+        attempt_id: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send;
 }
@@ -159,14 +160,26 @@ where
 {
     let canonical_task_id = callback_task_id(&state.run_id, &state.task_key);
     let canonical_result = validator
-        .validate_task_token(&canonical_task_id, &state.run_id, attempt, task_token)
+        .validate_task_token(
+            &canonical_task_id,
+            &state.run_id,
+            attempt,
+            &state.attempt_id,
+            task_token,
+        )
         .await;
 
     match canonical_result {
         Ok(()) => None,
         Err(reason) if reason == "task_id_mismatch" && path_task_id != canonical_task_id => {
             match validator
-                .validate_task_token(path_task_id, &state.run_id, attempt, task_token)
+                .validate_task_token(
+                    path_task_id,
+                    &state.run_id,
+                    attempt,
+                    &state.attempt_id,
+                    task_token,
+                )
                 .await
             {
                 Ok(()) => None,
@@ -817,6 +830,7 @@ mod tests {
             _task_id: &str,
             _run_id: &str,
             _attempt: u32,
+            _attempt_id: &str,
             _token: &str,
         ) -> Result<(), String> {
             if self.allow {
@@ -847,6 +861,7 @@ mod tests {
             task_id: &str,
             _run_id: &str,
             _attempt: u32,
+            _attempt_id: &str,
             _token: &str,
         ) -> Result<(), String> {
             self.seen_task_ids.lock().unwrap().push(task_id.to_string());

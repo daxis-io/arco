@@ -172,12 +172,7 @@ impl AntiEntropySweeper {
             // Build set of tasks with active dispatches
             let dispatched_tasks: HashSet<(String, String, u32)> = outbox
                 .iter()
-                .filter(|o| {
-                    matches!(
-                        o.status,
-                        DispatchStatus::Pending | DispatchStatus::Created | DispatchStatus::Acked
-                    )
-                })
+                .filter(|o| matches!(o.status, DispatchStatus::Pending | DispatchStatus::Created))
                 .map(|o| (o.run_id.clone(), o.task_key.clone(), o.attempt))
                 .collect();
 
@@ -287,16 +282,6 @@ impl AntiEntropySweeper {
                 reason: "missing_dispatch_outbox".to_string(),
             });
         };
-
-        if dispatch.status == DispatchStatus::Failed {
-            return Some(Repair::RedispatchStuckTask {
-                run_id: task.run_id.clone(),
-                task_key: task.task_key.clone(),
-                attempt: task.attempt,
-                original_dispatch_id: dispatch.dispatch_id.clone(),
-                reason: "dispatch_failed".to_string(),
-            });
-        }
 
         // Check if dispatch has been pending/created for too long
         if now - dispatch.created_at <= self.dispatch_timeout {
@@ -529,31 +514,6 @@ mod tests {
     }
 
     #[test]
-    fn test_anti_entropy_skips_tasks_with_acked_dispatch() {
-        let now = Utc::now();
-        let sweeper = AntiEntropySweeper::with_defaults();
-        let watermarks = fresh_watermarks(now);
-
-        let tasks = vec![make_task_row(
-            "extract",
-            TaskState::Ready,
-            Some(now - Duration::minutes(10)),
-        )];
-
-        let outbox = vec![make_outbox_row(
-            "extract",
-            1,
-            DispatchStatus::Acked,
-            now - Duration::minutes(5),
-        )];
-
-        let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
-
-        // Should not create repair - there's already an acked dispatch
-        assert!(repairs.is_empty());
-    }
-
-    #[test]
     fn test_anti_entropy_recovers_stuck_dispatched_tasks() {
         let now = Utc::now();
         let sweeper = AntiEntropySweeper::with_defaults();
@@ -616,41 +576,6 @@ mod tests {
                 assert_eq!(reason, "missing_dispatch_outbox");
             }
             _ => panic!("Expected CreateDispatchOutbox repair"),
-        }
-    }
-
-    #[test]
-    fn test_anti_entropy_redispatches_failed_outbox() {
-        let now = Utc::now();
-        let sweeper = AntiEntropySweeper::with_defaults();
-        let watermarks = fresh_watermarks(now);
-
-        let mut task = make_task_row("extract", TaskState::Dispatched, None);
-        task.attempt = 1;
-
-        let tasks = vec![task];
-        let outbox = vec![make_outbox_row(
-            "extract",
-            1,
-            DispatchStatus::Failed,
-            now - Duration::seconds(5),
-        )];
-
-        let repairs = sweeper.scan(&watermarks, &tasks, &outbox, now);
-
-        assert_eq!(repairs.len(), 1);
-        match &repairs[0] {
-            Repair::RedispatchStuckTask {
-                task_key,
-                attempt,
-                reason,
-                ..
-            } => {
-                assert_eq!(task_key, "extract");
-                assert_eq!(*attempt, 1);
-                assert_eq!(reason, "dispatch_failed");
-            }
-            _ => panic!("Expected RedispatchStuckTask repair"),
         }
     }
 

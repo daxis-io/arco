@@ -256,6 +256,43 @@ async fn rebuild_from_ledger_manifest_reproduces_equivalent_projection_state() -
 }
 
 #[tokio::test]
+async fn rebuild_orders_replay_by_event_id_when_event_timestamps_are_skewed() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, TENANT, WORKSPACE)?;
+    let compactor = MicroCompactor::new(storage.clone());
+
+    let run_id = "run-dr-skewed-order";
+    let plan_id = "plan-dr-skewed-order";
+
+    let mut run_triggered = run_triggered("01J1DRREBUILD00000000000031", run_id, plan_id);
+    run_triggered.timestamp = Utc.with_ymd_and_hms(2026, 2, 21, 12, 0, 10).unwrap();
+
+    let mut plan_created = plan_created("01J1DRREBUILD00000000000032", run_id, plan_id);
+    plan_created.timestamp = Utc.with_ymd_and_hms(2026, 2, 21, 12, 0, 0).unwrap();
+
+    let run_path = write_event(&storage, &run_triggered).await?;
+    let plan_path = write_event(&storage, &plan_created).await?;
+
+    compactor
+        .rebuild_from_ledger_manifest(LedgerRebuildManifest {
+            event_paths: vec![plan_path, run_path],
+        })
+        .await?;
+
+    let (_, state) = compactor.load_state().await?;
+    let run = state
+        .runs
+        .get(run_id)
+        .expect("rebuild should create run row");
+    assert_eq!(
+        run.tasks_total, 1,
+        "rebuild must use event_id order, not skewed wall-clock timestamps"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn rebuild_accepts_legacy_task_finished_json_with_internal_partial_progress_blob()
 -> Result<()> {
     let baseline_backend = Arc::new(MemoryBackend::new());
@@ -411,10 +448,10 @@ async fn rebuild_remains_correct_with_stale_watermark_and_without_ledger_listing
         Some("01J1DRREBUILD00000000000013")
     );
     assert!(
-        state_after
+        !state_after
             .idempotency_keys
             .contains_key(&third_event.idempotency_key),
-        "rebuild should process post-watermark events even when watermark timestamp is stale"
+        "rejected stale-attempt events must not consume idempotency keys"
     );
 
     Ok(())

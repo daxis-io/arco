@@ -95,11 +95,13 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
         task_id: &str,
         run_id: &str,
         attempt: u32,
+        attempt_id: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let validator = self.clone();
         let task_id = task_id.to_string();
         let run_id = run_id.to_string();
+        let attempt_id = attempt_id.to_string();
         let token = token.to_string();
 
         async move {
@@ -123,15 +125,17 @@ impl TaskTokenValidator for JwtTaskTokenValidator {
             if claims.workspace_id != validator.workspace {
                 return Err("workspace_mismatch".to_string());
             }
-            if let Some(claim_run_id) = claims.run_id.as_deref() {
-                if claim_run_id != run_id {
-                    return Err("run_id_mismatch".to_string());
-                }
+            if claims.run_id.is_none() || claims.attempt.is_none() || claims.attempt_id.is_none() {
+                return Err("missing_scope_claims".to_string());
             }
-            if let Some(claim_attempt) = claims.attempt {
-                if claim_attempt != attempt {
-                    return Err("attempt_mismatch".to_string());
-                }
+            if claims.run_id.as_deref() != Some(run_id.as_str()) {
+                return Err("run_id_mismatch".to_string());
+            }
+            if claims.attempt != Some(attempt) {
+                return Err("attempt_mismatch".to_string());
+            }
+            if claims.attempt_id.as_deref() != Some(attempt_id.as_str()) {
+                return Err("attempt_id_mismatch".to_string());
             }
 
             Ok(())
@@ -941,6 +945,19 @@ mod tests {
             "taskId": task_id,
             "tenantId": tenant_id,
             "workspaceId": workspace_id,
+            "runId": "run-1",
+            "attempt": 1,
+            "attemptId": "att-1",
+            "exp": exp
+        })
+    }
+
+    fn unscoped_task_token_claims(task_id: &str, tenant_id: &str, workspace_id: &str) -> Value {
+        let exp = (Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
+        serde_json::json!({
+            "taskId": task_id,
+            "tenantId": tenant_id,
+            "workspaceId": workspace_id,
             "exp": exp
         })
     }
@@ -1008,6 +1025,9 @@ mod tests {
             "taskId": "task-123",
             "tenantId": "tenant-1",
             "workspaceId": "workspace-1",
+            "runId": "run-1",
+            "attempt": 1,
+            "attemptId": "att-1",
             "exp": exp
         });
         let token = jsonwebtoken::encode(
@@ -1017,8 +1037,9 @@ mod tests {
         )
         .expect("token");
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-1", 1, "att-1", &token),
+        );
         assert!(result.is_ok());
     }
 
@@ -1039,6 +1060,9 @@ mod tests {
             "taskId": "task-123",
             "tenantId": "tenant-1",
             "workspaceId": "workspace-1",
+            "runId": "run-1",
+            "attempt": 1,
+            "attemptId": "att-1",
             "exp": exp
         });
         let token = jsonwebtoken::encode(
@@ -1048,8 +1072,9 @@ mod tests {
         )
         .expect("token");
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-999", "run-1", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-999", "run-1", 1, "att-1", &token),
+        );
         assert!(result.is_err());
     }
 
@@ -1062,10 +1087,12 @@ mod tests {
         let mut claims = task_token_claims("task-123", "tenant-1", "workspace-1");
         claims["runId"] = serde_json::json!("run-1");
         claims["attempt"] = serde_json::json!(1);
+        claims["attemptId"] = serde_json::json!("att-1");
         let token = encode_task_token_claims(claims);
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-2", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-2", 1, "att-1", &token),
+        );
 
         assert_eq!(result.expect_err("must reject"), "run_id_mismatch");
     }
@@ -1079,12 +1106,31 @@ mod tests {
         let mut claims = task_token_claims("task-123", "tenant-1", "workspace-1");
         claims["runId"] = serde_json::json!("run-1");
         claims["attempt"] = serde_json::json!(2);
+        claims["attemptId"] = serde_json::json!("att-1");
         let token = encode_task_token_claims(claims);
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-1", 1, "att-1", &token),
+        );
 
         assert_eq!(result.expect_err("must reject"), "attempt_mismatch");
+    }
+
+    #[test]
+    fn test_jwt_task_token_validator_rejects_attempt_id_mismatch() {
+        let config = test_task_token_config();
+        let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
+            .expect("validator");
+
+        let mut claims = task_token_claims("task-123", "tenant-1", "workspace-1");
+        claims["attemptId"] = serde_json::json!("att-2");
+        let token = encode_task_token_claims(claims);
+
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-1", 1, "att-1", &token),
+        );
+
+        assert_eq!(result.expect_err("must reject"), "attempt_id_mismatch");
     }
 
     #[test]
@@ -1092,11 +1138,15 @@ mod tests {
         let config = test_task_token_config();
         let validator = JwtTaskTokenValidator::new(&config, "tenant-2", "workspace-1", false)
             .expect("validator");
-        let token =
-            encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
+        let token = encode_task_token_claims(unscoped_task_token_claims(
+            "task-123",
+            "tenant-1",
+            "workspace-1",
+        ));
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-1", 1, "att-1", &token),
+        );
 
         assert_eq!(result.expect_err("must reject"), "tenant_mismatch");
     }
@@ -1109,24 +1159,29 @@ mod tests {
         let token =
             encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-1", 1, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-1", 1, "att-1", &token),
+        );
 
         assert_eq!(result.expect_err("must reject"), "workspace_mismatch");
     }
 
     #[test]
-    fn test_jwt_task_token_validator_accepts_legacy_token_without_scope_claims() {
+    fn test_jwt_task_token_validator_rejects_legacy_token_without_scope_claims() {
         let config = test_task_token_config();
         let validator = JwtTaskTokenValidator::new(&config, "tenant-1", "workspace-1", false)
             .expect("validator");
-        let token =
-            encode_task_token_claims(task_token_claims("task-123", "tenant-1", "workspace-1"));
+        let token = encode_task_token_claims(unscoped_task_token_claims(
+            "task-123",
+            "tenant-1",
+            "workspace-1",
+        ));
 
-        let result =
-            tokio_test::block_on(validator.validate_task_token("task-123", "run-2", 9, &token));
+        let result = tokio_test::block_on(
+            validator.validate_task_token("task-123", "run-2", 9, "att-9", &token),
+        );
 
-        assert!(result.is_ok());
+        assert_eq!(result.expect_err("must reject"), "missing_scope_claims");
     }
 
     #[tokio::test]
@@ -1187,6 +1242,7 @@ mod tests {
                 workspace_id: "workspace-1".to_string(),
                 run_id: None,
                 attempt: None,
+                attempt_id: None,
                 exp: 2_000_000_000,
                 nbf: None,
                 iat: None,

@@ -190,33 +190,33 @@ fn backlog_snapshot_counts_only_actionable_dispatch_and_timer_rows() {
         },
     );
     state.dispatch_outbox.insert(
-        "dispatch:acked".to_string(),
+        "dispatch:created".to_string(),
         DispatchOutboxRow {
             run_id: "run-1".to_string(),
             task_key: "task_b".to_string(),
             attempt: 1,
-            dispatch_id: "dispatch:acked".to_string(),
-            cloud_task_id: Some("cloud-acked".to_string()),
-            status: DispatchStatus::Acked,
+            dispatch_id: "dispatch:created".to_string(),
+            cloud_task_id: Some("cloud-created".to_string()),
+            status: DispatchStatus::Created,
             attempt_id: "attempt-2".to_string(),
             worker_queue: "default-queue".to_string(),
             created_at: Utc::now(),
-            row_version: "evt_acked".to_string(),
+            row_version: "evt_created".to_string(),
         },
     );
     state.dispatch_outbox.insert(
-        "dispatch:failed".to_string(),
+        "dispatch:created-no-cloud-id".to_string(),
         DispatchOutboxRow {
             run_id: "run-1".to_string(),
             task_key: "task_c".to_string(),
             attempt: 1,
-            dispatch_id: "dispatch:failed".to_string(),
+            dispatch_id: "dispatch:created-no-cloud-id".to_string(),
             cloud_task_id: None,
-            status: DispatchStatus::Failed,
+            status: DispatchStatus::Created,
             attempt_id: "attempt-3".to_string(),
             worker_queue: "default-queue".to_string(),
             created_at: Utc::now(),
-            row_version: "evt_failed".to_string(),
+            row_version: "evt_created_no_cloud_id".to_string(),
         },
     );
 

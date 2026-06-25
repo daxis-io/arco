@@ -200,6 +200,7 @@ async fn run_handler(
             state.workspace_id.clone(),
             run_id.clone(),
             *attempt,
+            attempt_id.clone(),
             Utc::now(),
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;

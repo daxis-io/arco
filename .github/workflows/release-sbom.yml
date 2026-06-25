@@ -59,11 +59,13 @@ jobs:
             exit 1
           fi
 
-          echo "TAG_COMMIT_SHA=${TAG_COMMIT_SHA}" >> "${GITHUB_ENV}"
-          echo "SBOM_SPDX_FILE=arco-${RELEASE_TAG}.spdx.json" >> "${GITHUB_ENV}"
-          echo "SBOM_CYCLONEDX_FILE=arco-${RELEASE_TAG}.cyclonedx.json" >> "${GITHUB_ENV}"
-          echo "SBOM_SHA256_FILE=arco-${RELEASE_TAG}.sbom.sha256" >> "${GITHUB_ENV}"
-          echo "EVIDENCE_ARCHIVE=arco-${RELEASE_TAG}.release-evidence.tgz" >> "${GITHUB_ENV}"
+          {
+            echo "TAG_COMMIT_SHA=${TAG_COMMIT_SHA}"
+            echo "SBOM_SPDX_FILE=arco-${RELEASE_TAG}.spdx.json"
+            echo "SBOM_CYCLONEDX_FILE=arco-${RELEASE_TAG}.cyclonedx.json"
+            echo "SBOM_SHA256_FILE=arco-${RELEASE_TAG}.sbom.sha256"
+            echo "EVIDENCE_ARCHIVE=arco-${RELEASE_TAG}.release-evidence.tgz"
+          } >> "${GITHUB_ENV}"
 
       - name: Wait for release-tag CI success
         env:
@@ -160,7 +162,6 @@ jobs:
       - name: Validate annotated signed release tag
         run: |
           git cat-file -e "${RELEASE_TAG}^{tag}"
-          TAG_OBJECT_SHA="$(git rev-parse "${RELEASE_TAG}^{tag}")"
           git cat-file -p "${RELEASE_TAG}^{tag}" > "arco-${RELEASE_TAG}.tag-object.txt"
 
           if ! rg -q '^-----BEGIN (PGP|SSH) SIGNATURE-----$' "arco-${RELEASE_TAG}.tag-object.txt"; then

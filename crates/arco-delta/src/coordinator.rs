@@ -93,20 +93,53 @@ impl DeltaCommitCoordinator {
         validate_uuidv7(&req.idempotency_key)?;
         self.validate_staged_path(&req.staged_path)?;
 
-        let request_hash = request_hash(req)?;
+        let legacy_hash = legacy_request_hash(req)?;
         if let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? {
-            if record.request_hash != request_hash {
-                return Err(DeltaError::conflict(
-                    "Idempotency-Key already used with different request body".to_string(),
-                ));
+            if record.request_hash == legacy_hash {
+                return Ok(Some(response_from_idempotency_record(record)));
             }
-            return Ok(Some(CommitDeltaResponse {
-                version: record.version,
-                delta_log_path: record.delta_log_path,
-            }));
+
+            let payload = self
+                .read_staged_payload(&req.staged_path, &req.staged_version)
+                .await?;
+            let request_hash = request_hash(req, &payload)?;
+            if record.request_hash == request_hash {
+                return Ok(Some(response_from_idempotency_record(record)));
+            }
+
+            return Err(DeltaError::conflict(
+                "Idempotency-Key already used with different request body".to_string(),
+            ));
         }
 
         Ok(None)
+    }
+
+    async fn replay_committed_with_hashes(
+        &self,
+        idempotency_key: &str,
+        request_hashes: &[String],
+    ) -> Result<Option<CommitDeltaResponse>> {
+        let Some(record) = self.read_idempotency_record(idempotency_key).await? else {
+            return Ok(None);
+        };
+
+        if request_hashes.contains(&record.request_hash) {
+            return Ok(Some(response_from_idempotency_record(record)));
+        }
+
+        Err(DeltaError::conflict(
+            "Idempotency-Key already used with different request body".to_string(),
+        ))
+    }
+
+    async fn read_validated_staged_payload(&self, req: &CommitDeltaRequest) -> Result<Bytes> {
+        validate_uuidv7(&req.idempotency_key)?;
+        self.validate_staged_path(&req.staged_path)?;
+        let payload = self
+            .read_staged_payload(&req.staged_path, &req.staged_version)
+            .await?;
+        Ok(payload)
     }
 
     /// Stages a Delta commit payload (server-side upload).
@@ -159,13 +192,22 @@ impl DeltaCommitCoordinator {
         req: CommitDeltaRequest,
         now: DateTime<Utc>,
     ) -> Result<CommitDeltaResponse> {
-        if let Some(response) = self.replay_committed(&req).await? {
+        let payload = self.read_validated_staged_payload(&req).await?;
+        let request_hash = request_hash(&req, &payload)?;
+        let legacy_hash = legacy_request_hash(&req)?;
+
+        if let Some(response) = self
+            .replay_committed_with_hashes(
+                &req.idempotency_key,
+                &[request_hash.clone(), legacy_hash],
+            )
+            .await?
+        {
             self.finalize_replayed_commit(&req.idempotency_key, response.version)
                 .await?;
             return Ok(response);
         }
 
-        let request_hash = request_hash(&req)?;
         if let Some(recovered) = self.recover_inflight(now).await? {
             if recovered.commit_id == req.idempotency_key {
                 if recovered.request_hash != request_hash {
@@ -177,10 +219,6 @@ impl DeltaCommitCoordinator {
             }
         }
         let reserved = self.reserve_or_resume_inflight(&req, now).await?;
-
-        let payload = self
-            .read_staged_payload(&req.staged_path, &req.staged_version)
-            .await?;
 
         let delta_log_path = self.paths.delta_log_json(reserved.version)?;
 
@@ -305,12 +343,18 @@ impl DeltaCommitCoordinator {
                 let read_version = inflight
                     .read_version
                     .unwrap_or_else(|| inflight.version.saturating_sub(1));
-                let recovered_request_hash = request_hash(&CommitDeltaRequest {
-                    read_version,
-                    staged_path: inflight.staged_path.clone(),
-                    staged_version: inflight.staged_version.clone(),
-                    idempotency_key: inflight.commit_id.clone(),
-                })?;
+                let payload = self
+                    .read_staged_payload(&inflight.staged_path, &inflight.staged_version)
+                    .await?;
+                let recovered_request_hash = request_hash(
+                    &CommitDeltaRequest {
+                        read_version,
+                        staged_path: inflight.staged_path.clone(),
+                        staged_version: inflight.staged_version.clone(),
+                        idempotency_key: inflight.commit_id.clone(),
+                    },
+                    &payload,
+                )?;
 
                 let response = CommitDeltaResponse {
                     version: inflight.version,
@@ -609,14 +653,39 @@ struct DeltaCommitIdempotencyRecord {
     committed_at_ms: i64,
 }
 
-fn request_hash(req: &CommitDeltaRequest) -> Result<String> {
+fn request_hash(req: &CommitDeltaRequest, staged_payload: &[u8]) -> Result<String> {
+    let staged_payload_sha256 = sha256_hex(staged_payload);
+    let value = serde_json::json!({
+        "idempotency_key": &req.idempotency_key,
+        "read_version": req.read_version,
+        "staged_path": &req.staged_path,
+        "staged_payload_sha256": staged_payload_sha256,
+    });
+    let value = serde_json::to_value(value).map_err(|e| {
+        DeltaError::serialization(format!("failed to serialize commit request: {e}"))
+    })?;
+    canonical_hash_value(&value)
+}
+
+fn legacy_request_hash(req: &CommitDeltaRequest) -> Result<String> {
     let value = serde_json::to_value(req).map_err(|e| {
         DeltaError::serialization(format!("failed to serialize commit request: {e}"))
     })?;
+    canonical_hash_value(&value)
+}
+
+fn canonical_hash_value(value: &serde_json::Value) -> Result<String> {
     let canonical = serde_jcs::to_string(&value).map_err(|e| {
         DeltaError::serialization(format!("failed to canonicalize commit request: {e}"))
     })?;
     Ok(sha256_hex(canonical.as_bytes()))
+}
+
+fn response_from_idempotency_record(record: DeltaCommitIdempotencyRecord) -> CommitDeltaResponse {
+    CommitDeltaResponse {
+        version: record.version,
+        delta_log_path: record.delta_log_path,
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {

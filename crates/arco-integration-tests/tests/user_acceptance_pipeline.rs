@@ -245,6 +245,7 @@ impl UatHarness {
             WORKSPACE,
             run_id,
             attempt,
+            attempt_id,
             Utc::now(),
         )?;
         let callback_ctx = CallbackContext::new(
@@ -475,11 +476,13 @@ impl TaskTokenValidator for UatTokenValidator {
         task_id: &str,
         run_id: &str,
         attempt: u32,
+        attempt_id: &str,
         token: &str,
     ) -> impl Future<Output = Result<(), String>> + Send {
         let config = self.config.clone();
         let task_id = task_id.to_string();
         let run_id = run_id.to_string();
+        let attempt_id = attempt_id.to_string();
         let token = token.to_string();
         async move {
             let claims =
@@ -492,6 +495,9 @@ impl TaskTokenValidator for UatTokenValidator {
             }
             if claims.attempt != Some(attempt) {
                 return Err("attempt_mismatch".to_string());
+            }
+            if claims.attempt_id.as_deref() != Some(attempt_id.as_str()) {
+                return Err("attempt_id_mismatch".to_string());
             }
             Ok(())
         }

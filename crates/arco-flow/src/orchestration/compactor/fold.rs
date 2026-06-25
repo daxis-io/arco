@@ -154,10 +154,6 @@ pub enum DispatchStatus {
     Pending,
     /// Cloud Task has been created.
     Created,
-    /// Worker has acknowledged the dispatch.
-    Acked,
-    /// Dispatch failed (Cloud Tasks API error).
-    Failed,
 }
 
 /// Dispatch outbox row (dual-identifier pattern per ADR-021).
@@ -1142,7 +1138,7 @@ impl IdempotencyKeyRow {
 /// Fold state accumulator.
 ///
 /// Holds the current state being built from events.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FoldState {
     /// Run rows keyed by `run_id`.
     pub runs: HashMap<String, RunRow>,
@@ -1271,8 +1267,7 @@ impl FoldState {
             return;
         }
 
-        self.record_idempotency_key(event);
-
+        let applied: bool;
         match &event.data {
             OrchestrationEventData::RunTriggered {
                 run_id,
@@ -1282,7 +1277,7 @@ impl FoldState {
                 code_version,
                 ..
             } => {
-                if self.fold_run_triggered(
+                let changed = self.fold_run_triggered(
                     run_id,
                     plan_id,
                     run_key.clone(),
@@ -1290,7 +1285,9 @@ impl FoldState {
                     code_version.clone(),
                     &event.event_id,
                     event.timestamp,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1300,7 +1297,10 @@ impl FoldState {
                 }
             }
             OrchestrationEventData::PlanCreated { run_id, tasks, .. } => {
-                if self.fold_plan_created(run_id, tasks, &event.event_id, event.timestamp) {
+                let changed =
+                    self.fold_plan_created(run_id, tasks, &event.event_id, event.timestamp);
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1316,14 +1316,16 @@ impl FoldState {
                 attempt_id,
                 ..
             } => {
-                if self.fold_task_started(
+                let changed = self.fold_task_started(
                     run_id,
                     task_key,
                     *attempt,
                     attempt_id,
                     event.timestamp,
                     &event.event_id,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1342,14 +1344,16 @@ impl FoldState {
             } => {
                 // heartbeat_at is optional; use event timestamp as fallback
                 let ts = heartbeat_at.unwrap_or(event.timestamp);
-                if self.fold_task_heartbeat(
+                let changed = self.fold_task_heartbeat(
                     run_id,
                     task_key,
                     *attempt,
                     attempt_id,
                     ts,
                     &event.event_id,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1372,7 +1376,7 @@ impl FoldState {
                 code_version,
                 ..
             } => {
-                if self.fold_task_finished(
+                let changed = self.fold_task_finished(
                     run_id,
                     task_key,
                     *attempt,
@@ -1388,7 +1392,9 @@ impl FoldState {
                     event.timestamp,
                     &event.tenant_id,
                     &event.workspace_id,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1447,6 +1453,7 @@ impl FoldState {
                 } else {
                     false
                 };
+                applied = completion_applied || visibility_applied;
                 if completion_applied || visibility_applied {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
@@ -1465,7 +1472,7 @@ impl FoldState {
                 published_at,
                 publish_error,
             } => {
-                if self.fold_task_output_visibility_changed(
+                let changed = self.fold_task_output_visibility_changed(
                     run_id,
                     task_key,
                     *attempt,
@@ -1475,7 +1482,9 @@ impl FoldState {
                     publish_error.as_deref(),
                     &event.event_id,
                     event.timestamp,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1492,7 +1501,7 @@ impl FoldState {
                 worker_queue,
                 dispatch_id,
             } => {
-                if self.fold_dispatch_requested(
+                let changed = self.fold_dispatch_requested(
                     run_id,
                     task_key,
                     *attempt,
@@ -1501,7 +1510,9 @@ impl FoldState {
                     dispatch_id,
                     &event.event_id,
                     event.timestamp,
-                ) {
+                );
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1517,7 +1528,7 @@ impl FoldState {
                 attempt,
                 cloud_task_id,
             } => {
-                self.fold_dispatch_enqueued(
+                applied = self.fold_dispatch_enqueued(
                     dispatch_id,
                     run_id.as_deref(),
                     task_key.as_deref(),
@@ -1535,7 +1546,7 @@ impl FoldState {
                 attempt,
                 fire_at,
             } => {
-                self.fold_timer_requested(
+                applied = self.fold_timer_requested(
                     timer_id,
                     *timer_type,
                     run_id.as_deref(),
@@ -1552,7 +1563,7 @@ impl FoldState {
                 attempt,
                 cloud_task_id,
             } => {
-                self.fold_timer_enqueued(
+                applied = self.fold_timer_enqueued(
                     timer_id,
                     run_id.as_deref(),
                     task_key.as_deref(),
@@ -1568,7 +1579,7 @@ impl FoldState {
                 task_key,
                 attempt,
             } => {
-                self.fold_timer_fired(
+                applied = self.fold_timer_fired(
                     timer_id,
                     *timer_type,
                     run_id.as_deref(),
@@ -1578,7 +1589,10 @@ impl FoldState {
                 );
             }
             OrchestrationEventData::RunCancelRequested { run_id, .. } => {
-                if self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp) {
+                let changed =
+                    self.fold_run_cancel_requested(run_id, &event.event_id, event.timestamp);
+                applied = changed;
+                if changed {
                     self.refresh_catalog_run_index_for_run(
                         &event.tenant_id,
                         &event.workspace_id,
@@ -1599,7 +1613,7 @@ impl FoldState {
                 max_catchup_ticks,
                 enabled,
             } => {
-                self.fold_schedule_definition_upserted(
+                applied = self.fold_schedule_definition_upserted(
                     &event.tenant_id,
                     &event.workspace_id,
                     schedule_id,
@@ -1626,7 +1640,7 @@ impl FoldState {
                 run_key,
                 request_fingerprint,
             } => {
-                self.fold_schedule_ticked(
+                applied = self.fold_schedule_ticked(
                     &event.tenant_id,
                     &event.workspace_id,
                     schedule_id,
@@ -1653,7 +1667,7 @@ impl FoldState {
                 run_requests,
                 status,
             } => {
-                self.fold_sensor_evaluated(
+                applied = self.fold_sensor_evaluated(
                     &event.tenant_id,
                     &event.workspace_id,
                     sensor_id,
@@ -1679,8 +1693,10 @@ impl FoldState {
                 labels,
                 code_version,
             } => {
-                if !self.should_drop_run_requested_for_stale_sensor_eval(trigger_source_ref) {
-                    self.fold_run_requested(
+                if self.should_drop_run_requested_for_stale_sensor_eval(trigger_source_ref) {
+                    applied = false;
+                } else {
+                    applied = self.fold_run_requested(
                         &event.tenant_id,
                         &event.workspace_id,
                         run_key,
@@ -1706,7 +1722,7 @@ impl FoldState {
                 max_concurrent_runs,
                 parent_backfill_id,
             } => {
-                self.fold_backfill_created(
+                applied = self.fold_backfill_created(
                     &event.tenant_id,
                     &event.workspace_id,
                     backfill_id,
@@ -1729,7 +1745,7 @@ impl FoldState {
                 run_key,
                 request_fingerprint: _,
             } => {
-                self.fold_backfill_chunk_planned(
+                applied = self.fold_backfill_chunk_planned(
                     &event.tenant_id,
                     &event.workspace_id,
                     backfill_id,
@@ -1747,7 +1763,7 @@ impl FoldState {
                 state_version,
                 changed_by: _,
             } => {
-                self.fold_backfill_state_changed(
+                applied = self.fold_backfill_state_changed(
                     backfill_id,
                     *from_state,
                     *to_state,
@@ -1756,6 +1772,7 @@ impl FoldState {
                 );
             }
             OrchestrationEventData::Unknown => {
+                applied = false;
                 tracing::warn!(
                     event_id = %event.event_id,
                     event_type = %event.event_type,
@@ -1763,6 +1780,10 @@ impl FoldState {
                     "skipping unknown orchestration event data tag"
                 );
             }
+        }
+
+        if applied {
+            self.record_idempotency_key(event);
         }
     }
 
@@ -1840,24 +1861,65 @@ impl FoldState {
         if self.runs.contains_key(run_id) {
             return false;
         }
+        let mut tasks_total = 0_u32;
+        let mut tasks_completed = 0_u32;
+        let mut tasks_succeeded = 0_u32;
+        let mut tasks_failed = 0_u32;
+        let mut tasks_skipped = 0_u32;
+        let mut tasks_cancelled = 0_u32;
+        let mut completed_at: Option<DateTime<Utc>> = None;
+
+        for task in self.tasks.values().filter(|task| task.run_id == run_id) {
+            tasks_total = tasks_total.saturating_add(1);
+            if task.state.is_terminal() {
+                tasks_completed = tasks_completed.saturating_add(1);
+                match task.state {
+                    TaskState::Succeeded => tasks_succeeded = tasks_succeeded.saturating_add(1),
+                    TaskState::Failed => tasks_failed = tasks_failed.saturating_add(1),
+                    TaskState::Skipped => tasks_skipped = tasks_skipped.saturating_add(1),
+                    TaskState::Cancelled => tasks_cancelled = tasks_cancelled.saturating_add(1),
+                    _ => {}
+                }
+                completed_at = match (completed_at, task.completed_at) {
+                    (Some(current), Some(candidate)) => Some(current.max(candidate)),
+                    (None, Some(candidate)) => Some(candidate),
+                    (current, None) => current,
+                };
+            }
+        }
+
+        let state = if tasks_total == 0 {
+            RunState::Triggered
+        } else if tasks_completed == tasks_total {
+            if tasks_cancelled > 0 {
+                RunState::Cancelled
+            } else if tasks_failed > 0 {
+                RunState::Failed
+            } else {
+                RunState::Succeeded
+            }
+        } else {
+            RunState::Running
+        };
+
         self.runs.insert(
             run_id.to_string(),
             RunRow {
                 run_id: run_id.to_string(),
                 plan_id: plan_id.to_string(),
-                state: RunState::Triggered,
+                state,
                 run_key,
                 labels,
                 code_version,
                 cancel_requested: false,
-                tasks_total: 0,
-                tasks_completed: 0,
-                tasks_succeeded: 0,
-                tasks_failed: 0,
-                tasks_skipped: 0,
-                tasks_cancelled: 0,
+                tasks_total,
+                tasks_completed,
+                tasks_succeeded,
+                tasks_failed,
+                tasks_skipped,
+                tasks_cancelled,
                 triggered_at: timestamp,
-                completed_at: None,
+                completed_at: state.is_terminal().then_some(completed_at).flatten(),
                 row_version: event_id.to_string(),
             },
         );
@@ -1999,6 +2061,7 @@ impl FoldState {
                 task.attempt_id = Some(attempt_id.to_string());
                 task.started_at = Some(timestamp);
                 task.row_version = event_id.to_string();
+                self.prune_dispatch_outbox_row(run_id, task_key, attempt);
                 return true;
             }
         }
@@ -2031,6 +2094,7 @@ impl FoldState {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     fn fold_task_finished(
         &mut self,
         run_id: &str,
@@ -2118,9 +2182,10 @@ impl FoldState {
 
                 task.materialization_id
                     .clone_from(&metadata.materialization_id);
-                task.output_visibility_state = None;
-                task.published_at = None;
-                task.publish_error = None;
+                if task.output_visibility_state.is_none() {
+                    task.published_at = None;
+                    task.publish_error = None;
+                }
                 task.delta_table.clone_from(&metadata.delta_table);
                 task.delta_version = metadata.delta_version;
                 task.delta_partition.clone_from(&metadata.delta_partition);
@@ -2302,16 +2367,24 @@ impl FoldState {
         let mut outbox_attempt_id: Option<String> = None;
         let mut outbox_exists = false;
         let mut task_changed = false;
+        let mut outbox_changed = false;
+
+        if self.dispatch_attempt_consumed(run_id, task_key, attempt) {
+            self.prune_dispatch_outbox_row(run_id, task_key, attempt);
+            return false;
+        }
 
         if let Some(existing) = self.dispatch_outbox.get_mut(dispatch_id) {
             outbox_exists = true;
             if existing.attempt_id.is_empty() {
                 existing.attempt_id = attempt_id.to_string();
+                outbox_changed = true;
             }
             if existing.worker_queue.is_empty()
                 || (existing.worker_queue == "default-queue" && worker_queue != "default-queue")
             {
                 existing.worker_queue = worker_queue.to_string();
+                outbox_changed = true;
             }
             outbox_attempt_id = Some(existing.attempt_id.clone());
         }
@@ -2344,7 +2417,7 @@ impl FoldState {
             // Row already exists (e.g., DispatchEnqueued arrived first out-of-order)
             // Fill in missing critical fields regardless of event ordering
             // Don't update row_version or status - the existing row has newer state
-            return task_changed;
+            return task_changed || outbox_changed;
         }
 
         self.dispatch_outbox.insert(
@@ -2362,7 +2435,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
-        task_changed
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2375,15 +2448,23 @@ impl FoldState {
         cloud_task_id: &str,
         event_id: &str,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> bool {
+        if let (Some(run_id), Some(task_key), Some(attempt)) = (run_id, task_key, attempt) {
+            if self.dispatch_attempt_consumed(run_id, task_key, attempt) {
+                self.prune_dispatch_outbox_row(run_id, task_key, attempt);
+                return false;
+            }
+        }
+
         if let Some(existing) = self.dispatch_outbox.get_mut(dispatch_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
             existing.status = DispatchStatus::Created;
             existing.cloud_task_id = Some(cloud_task_id.to_string());
+            existing.created_at = timestamp;
             existing.row_version = event_id.to_string();
-            return;
+            return true;
         }
 
         // Handle out-of-order event: create row if it doesn't exist
@@ -2404,7 +2485,25 @@ impl FoldState {
                     row_version: event_id.to_string(),
                 },
             );
+            return true;
         }
+        false
+    }
+
+    fn dispatch_attempt_consumed(&self, run_id: &str, task_key: &str, attempt: u32) -> bool {
+        self.tasks
+            .get(&(run_id.to_string(), task_key.to_string()))
+            .is_some_and(|task| {
+                task.attempt > attempt
+                    || (task.attempt == attempt
+                        && (matches!(task.state, TaskState::Running | TaskState::RetryWait)
+                            || task.state.is_terminal()))
+            })
+    }
+
+    fn prune_dispatch_outbox_row(&mut self, run_id: &str, task_key: &str, attempt: u32) -> bool {
+        let dispatch_id = DispatchOutboxRow::dispatch_id(run_id, task_key, attempt);
+        self.dispatch_outbox.remove(&dispatch_id).is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2417,27 +2516,31 @@ impl FoldState {
         attempt: Option<u32>,
         fire_at: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         if let Some(existing) = self.timers.get_mut(timer_id) {
             // Row already exists (e.g., TimerEnqueued arrived first out-of-order)
             // Fill in the authoritative fire_at from TimerRequested
             // The existing row may have a fire_at derived from parsing timer_id,
             // but TimerRequested has the canonical value
+            let mut changed = existing.fire_at != fire_at;
             existing.fire_at = fire_at;
             if existing.run_id.is_none() {
                 existing.run_id = run_id.map(ToString::to_string);
+                changed |= existing.run_id.is_some();
             }
             if existing.task_key.is_none() {
                 existing.task_key = task_key.map(ToString::to_string);
+                changed |= existing.task_key.is_some();
             }
             if existing.attempt.is_none() {
                 existing.attempt = attempt;
+                changed |= existing.attempt.is_some();
             }
             // Don't update row_version or cloud_task_id - the existing row has newer state
             if map_timer_type(timer_type) == TimerType::Retry {
-                self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
+                changed |= self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
             }
-            return;
+            return changed;
         }
 
         self.timers.insert(
@@ -2455,9 +2558,11 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        let mut changed = true;
         if map_timer_type(timer_type) == TimerType::Retry {
-            self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
+            changed |= self.set_retry_not_before(run_id, task_key, attempt, fire_at, event_id);
         }
+        changed
     }
 
     fn set_retry_not_before(
@@ -2467,18 +2572,20 @@ impl FoldState {
         attempt: Option<u32>,
         fire_at: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         let (Some(run_id), Some(task_key), Some(attempt)) = (run_id, task_key, attempt) else {
-            return;
+            return false;
         };
         let key = (run_id.to_string(), task_key.to_string());
         let Some(task) = self.tasks.get_mut(&key) else {
-            return;
+            return false;
         };
         if task.state == TaskState::RetryWait && task.attempt == attempt {
             task.retry_not_before = Some(fire_at);
             task.row_version = event_id.to_string();
+            return true;
         }
+        false
     }
 
     fn fold_timer_enqueued(
@@ -2489,14 +2596,14 @@ impl FoldState {
         attempt: Option<u32>,
         cloud_task_id: &str,
         event_id: &str,
-    ) {
+    ) -> bool {
         if let Some(existing) = self.timers.get_mut(timer_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
             existing.cloud_task_id = Some(cloud_task_id.to_string());
             existing.row_version = event_id.to_string();
-            return;
+            return true;
         }
 
         // Handle out-of-order event: create row if it doesn't exist
@@ -2531,7 +2638,9 @@ impl FoldState {
                     row_version: event_id.to_string(),
                 },
             );
+            return true;
         }
+        false
     }
 
     fn fold_timer_fired(
@@ -2542,14 +2651,14 @@ impl FoldState {
         task_key: Option<&str>,
         attempt: Option<u32>,
         event_id: &str,
-    ) {
+    ) -> bool {
         if let Some(existing) = self.timers.get_mut(timer_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
             existing.state = TimerState::Fired;
             existing.row_version = event_id.to_string();
-            return;
+            return true;
         }
 
         if let Some(parsed) = TimerRow::parse_timer_id(timer_id) {
@@ -2580,7 +2689,9 @@ impl FoldState {
                     row_version: event_id.to_string(),
                 },
             );
+            return true;
         }
+        false
     }
 
     // ========================================================================
@@ -2602,7 +2713,7 @@ impl FoldState {
         enabled: bool,
         timestamp: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         let created_at = self
             .schedule_definitions
             .get(schedule_id)
@@ -2610,7 +2721,7 @@ impl FoldState {
 
         if let Some(existing) = self.schedule_definitions.get(schedule_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
         }
 
@@ -2631,6 +2742,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        true
     }
 
     /// Folds a `ScheduleTicked` event into state.
@@ -2656,7 +2768,8 @@ impl FoldState {
         run_key: Option<String>,
         request_fingerprint: Option<String>,
         event_id: &str,
-    ) {
+    ) -> bool {
+        let mut changed = false;
         // Update schedule state
         let state = self
             .schedule_state
@@ -2677,6 +2790,7 @@ impl FoldState {
             state.last_tick_id = Some(tick_id.to_string());
             state.last_run_key.clone_from(&run_key);
             state.row_version = event_id.to_string();
+            changed = true;
         }
 
         // Create or update tick history row
@@ -2684,7 +2798,7 @@ impl FoldState {
         if let Some(existing) = self.schedule_ticks.get(tick_id) {
             // Duplicate event - only update if newer event_id
             if event_id <= existing.row_version.as_str() {
-                return;
+                return changed;
             }
         }
 
@@ -2710,6 +2824,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        true
     }
 
     /// Fold a `SensorEvaluated` event.
@@ -2738,7 +2853,7 @@ impl FoldState {
         status: &SensorEvalStatus,
         timestamp: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         let new_state = || SensorStateRow {
             tenant_id: tenant_id.to_string(),
             workspace_id: workspace_id.to_string(),
@@ -2770,7 +2885,7 @@ impl FoldState {
             status.clone()
         };
 
-        self.upsert_sensor_eval(SensorEvalRow {
+        let mut changed = self.upsert_sensor_eval(SensorEvalRow {
             tenant_id: tenant_id.to_string(),
             workspace_id: workspace_id.to_string(),
             eval_id: eval_id.to_string(),
@@ -2792,7 +2907,7 @@ impl FoldState {
                 metrics_labels::STATUS => "skipped_stale".to_string(),
             )
             .increment(1);
-            return;
+            return changed;
         }
 
         let state = self
@@ -2802,7 +2917,7 @@ impl FoldState {
 
         // Only update if this event is newer (idempotency)
         if event_id <= state.row_version.as_str() {
-            return;
+            return changed;
         }
 
         // Update sensor state
@@ -2810,6 +2925,7 @@ impl FoldState {
         state.last_evaluation_at = Some(timestamp);
         state.last_eval_id = Some(eval_id.to_string());
         state.row_version = event_id.to_string();
+        changed = true;
 
         // Increment state_version for CAS (poll sensors)
         state.state_version += 1;
@@ -2817,15 +2933,17 @@ impl FoldState {
         // NOTE: Per P0-1, fold does NOT emit RunRequested events.
         // The controller already emitted SensorEvaluated + RunRequested(s) atomically.
         // fold_run_requested handles each RunRequested event separately.
+        changed
     }
 
-    fn upsert_sensor_eval(&mut self, row: SensorEvalRow) {
+    fn upsert_sensor_eval(&mut self, row: SensorEvalRow) -> bool {
         if let Some(existing) = self.sensor_evals.get(row.eval_id.as_str()) {
             if row.row_version <= existing.row_version {
-                return;
+                return false;
             }
         }
         self.sensor_evals.insert(row.eval_id.clone(), row);
+        true
     }
 
     // ========================================================================
@@ -2855,7 +2973,7 @@ impl FoldState {
         code_version: Option<String>,
         timestamp: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         // Check if run_key already exists
         if let Some(existing) = self.run_key_index.get(run_key) {
             // Check for fingerprint conflict
@@ -2874,9 +2992,10 @@ impl FoldState {
                         detected_at: timestamp,
                     },
                 );
+                return true;
             }
             // Same fingerprint = idempotent, skip
-            return;
+            return true;
         }
 
         // Generate deterministic run_id using HMAC
@@ -2899,6 +3018,7 @@ impl FoldState {
 
         // Correlate back to source (schedule tick, sensor eval, or backfill chunk)
         self.correlate_run_to_source(run_key, &run_id, trigger_source_ref);
+        true
     }
 
     /// Correlates a `run_id` back to its trigger source.
@@ -2946,13 +3066,13 @@ impl FoldState {
         parent_backfill_id: Option<&String>,
         timestamp: DateTime<Utc>,
         event_id: &str,
-    ) {
+    ) -> bool {
         if let Some(existing) = self.backfills.get(backfill_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
             // Do not overwrite existing backfills with the same ID.
-            return;
+            return false;
         }
 
         let mut planned_chunks = 0_u32;
@@ -2989,6 +3109,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3002,7 +3123,7 @@ impl FoldState {
         partition_keys: &[String],
         run_key: &str,
         event_id: &str,
-    ) {
+    ) -> bool {
         let existing_run_id = self
             .backfill_chunks
             .get(chunk_id)
@@ -3010,7 +3131,7 @@ impl FoldState {
 
         if let Some(existing) = self.backfill_chunks.get(chunk_id) {
             if event_id <= existing.row_version.as_str() {
-                return;
+                return false;
             }
         }
 
@@ -3029,6 +3150,7 @@ impl FoldState {
                 row_version: event_id.to_string(),
             },
         );
+        let mut changed = true;
 
         if let Some(backfill) = self.backfills.get_mut(backfill_id) {
             let mut next_index = backfill.planned_chunks;
@@ -3044,8 +3166,10 @@ impl FoldState {
             if next_index != backfill.planned_chunks {
                 backfill.planned_chunks = next_index;
                 backfill.row_version = event_id.to_string();
+                changed = true;
             }
         }
+        changed
     }
 
     fn fold_backfill_state_changed(
@@ -3055,31 +3179,32 @@ impl FoldState {
         to_state: BackfillState,
         state_version: u32,
         event_id: &str,
-    ) {
+    ) -> bool {
         let Some(backfill) = self.backfills.get_mut(backfill_id) else {
-            return;
+            return false;
         };
 
         if event_id <= backfill.row_version.as_str() {
-            return;
+            return false;
         }
 
         if backfill.state != from_state {
-            return;
+            return false;
         }
 
         if !BackfillState::is_valid_transition(backfill.state, to_state) {
-            return;
+            return false;
         }
 
         let expected_version = backfill.state_version.saturating_add(1);
         if state_version != expected_version {
-            return;
+            return false;
         }
 
         backfill.state = to_state;
         backfill.state_version = state_version;
         backfill.row_version = event_id.to_string();
+        true
     }
 
     // ========================================================================
@@ -4030,6 +4155,46 @@ mod tests {
             "transform".into(),
             "load".into()
         )));
+    }
+
+    #[test]
+    fn test_run_triggered_after_plan_created_recovers_task_totals() {
+        let mut state = FoldState::new();
+        let attempt_id = "att-1";
+
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
+            }],
+        ));
+        state.fold_event(&run_triggered_event("run1"));
+
+        let run = state.runs.get("run1").expect("run should exist");
+        assert_eq!(run.tasks_total, 1);
+        assert_eq!(run.state, RunState::Running);
+
+        state.fold_event(&dispatch_requested_event("run1", "extract", 1, attempt_id));
+        state.fold_event(&task_started_event("run1", "extract", 1, attempt_id));
+        state.fold_event(&task_finished_event(
+            "run1",
+            "extract",
+            1,
+            attempt_id,
+            TaskOutcome::Succeeded,
+        ));
+
+        let run = state.runs.get("run1").expect("run should exist");
+        assert_eq!(run.tasks_total, 1);
+        assert_eq!(run.tasks_completed, 1);
+        assert_eq!(run.tasks_succeeded, 1);
+        assert_eq!(run.state, RunState::Succeeded);
     }
 
     #[test]
@@ -5008,6 +5173,45 @@ mod tests {
     }
 
     #[test]
+    fn test_task_started_prunes_consumed_dispatch_outbox_row() {
+        let mut state = FoldState::new();
+        let dispatch_id = DispatchOutboxRow::dispatch_id("run1", "extract", 1);
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
+            }],
+        ));
+        state.fold_event(&dispatch_requested_event(
+            "run1",
+            "extract",
+            1,
+            "01HQ123ATT",
+        ));
+        state.fold_event(&dispatch_enqueued_event(&dispatch_id));
+
+        assert!(
+            state.dispatch_outbox.contains_key(&dispatch_id),
+            "dispatch row should remain until the worker starts the matching attempt"
+        );
+
+        state.fold_event(&task_started_event("run1", "extract", 1, "01HQ123ATT"));
+
+        assert!(
+            !state.dispatch_outbox.contains_key(&dispatch_id),
+            "matching TaskStarted should prune the consumed dispatch outbox row"
+        );
+    }
+
+    #[test]
     fn test_duplicate_dispatch_requested_does_not_override_attempt_id() {
         let mut state = FoldState::new();
 
@@ -5678,6 +5882,69 @@ mod tests {
         )
     }
 
+    fn schedule_definition_upserted_event(
+        schedule_id: &str,
+        cron_expression: &str,
+        code_version: Option<&str>,
+        event_id: &str,
+    ) -> OrchestrationEvent {
+        OrchestrationEvent::new_with_event_id(
+            "tenant-abc",
+            "workspace-prod",
+            OrchestrationEventData::ScheduleDefinitionUpserted {
+                schedule_id: schedule_id.to_string(),
+                cron_expression: cron_expression.to_string(),
+                timezone: "UTC".to_string(),
+                catchup_window_minutes: 0,
+                asset_selection: vec!["analytics.summary".into()],
+                code_version: code_version.map(ToString::to_string),
+                max_catchup_ticks: 1,
+                enabled: true,
+            },
+            event_id,
+        )
+    }
+
+    #[test]
+    fn test_stale_schedule_definition_upsert_does_not_consume_idempotency_key() {
+        let mut state = FoldState::new();
+
+        let current = schedule_definition_upserted_event(
+            "daily-etl",
+            "0 0 * * *",
+            Some("sha-a"),
+            "evt_sched_02_current",
+        );
+        state.fold_event(&current);
+
+        let stale_event = schedule_definition_upserted_event(
+            "daily-etl",
+            "0 6 * * *",
+            Some("sha-b"),
+            "evt_sched_01_stale",
+        );
+        let retry_key = stale_event.idempotency_key.clone();
+        state.fold_event(&stale_event);
+        assert!(
+            !state.idempotency_keys.contains_key(&retry_key),
+            "stale projection no-ops must not consume the stable idempotency key"
+        );
+
+        let retry = schedule_definition_upserted_event(
+            "daily-etl",
+            "0 6 * * *",
+            Some("sha-b"),
+            "evt_sched_03_retry",
+        );
+        assert_eq!(retry.idempotency_key, retry_key);
+        state.fold_event(&retry);
+
+        let row = state.schedule_definitions.get("daily-etl").unwrap();
+        assert_eq!(row.cron_expression, "0 6 * * *");
+        assert_eq!(row.code_version.as_deref(), Some("sha-b"));
+        assert_eq!(row.row_version, "evt_sched_03_retry");
+    }
+
     #[test]
     fn test_fold_schedule_ticked_updates_state_and_creates_tick_row() {
         let mut state = FoldState::new();
@@ -5996,6 +6263,58 @@ mod tests {
             .expect("backfill should exist");
         assert_eq!(backfill.state, BackfillState::Running);
         assert_eq!(backfill.state_version, 1);
+    }
+
+    #[test]
+    fn test_rejected_backfill_state_changed_does_not_consume_idempotency_key() {
+        let mut state = FoldState::new();
+
+        state.fold_event(&backfill_created_event("bf_005"));
+        let mut rejected = backfill_state_changed_event(
+            "bf_005",
+            BackfillState::Paused,
+            BackfillState::Succeeded,
+            2,
+        );
+        rejected.event_id = "evt_bf_005_03_rejected".to_string();
+        let rejected_key = rejected.idempotency_key.clone();
+        state.fold_event(&rejected);
+
+        let backfill = state
+            .backfills
+            .get("bf_005")
+            .expect("backfill should exist");
+        assert_eq!(backfill.state, BackfillState::Running);
+        assert_eq!(backfill.state_version, 1);
+        assert!(
+            !state.idempotency_keys.contains_key(&rejected_key),
+            "rejected transition must not poison the shared idempotency key"
+        );
+
+        let mut accepted = backfill_state_changed_event(
+            "bf_005",
+            BackfillState::Running,
+            BackfillState::Succeeded,
+            2,
+        );
+        accepted.event_id = "evt_bf_005_04_accepted".to_string();
+        assert_eq!(accepted.idempotency_key, rejected_key);
+        state.fold_event(&accepted);
+
+        let backfill = state
+            .backfills
+            .get("bf_005")
+            .expect("backfill should exist");
+        assert_eq!(backfill.state, BackfillState::Succeeded);
+        assert_eq!(backfill.state_version, 2);
+        assert_eq!(
+            state
+                .idempotency_keys
+                .get(&rejected_key)
+                .expect("accepted event should record idempotency")
+                .event_id,
+            "evt_bf_005_04_accepted"
+        );
     }
 
     // ========================================================================

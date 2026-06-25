@@ -11,7 +11,6 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use ulid::Ulid;
@@ -27,7 +26,7 @@ use metrics::{counter, gauge, histogram};
 
 use crate::error::{Error, Result};
 use crate::metrics::{labels as metric_labels, names as metric_names};
-use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
+use crate::orchestration::events::OrchestrationEvent;
 use crate::paths::{
     orchestration_base_snapshot_dir, orchestration_compaction_lock_path, orchestration_l0_dir,
     orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path,
@@ -515,20 +514,9 @@ impl MicroCompactor {
                 events.push((path.clone(), event));
             }
 
-            // Sort by timestamp with a stable ordering for atomic batches.
-            events.sort_by(|a, b| {
-                let a_event = &a.1;
-                let b_event = &b.1;
-                let ordering = a_event.timestamp.cmp(&b_event.timestamp);
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-                let ordering = event_priority(&a_event.data).cmp(&event_priority(&b_event.data));
-                if ordering != Ordering::Equal {
-                    return ordering;
-                }
-                a_event.event_id.cmp(&b_event.event_id)
-            });
+            // Ledger event IDs are the replay order. Producer clocks can skew, so
+            // timestamps are only event metadata and must not affect fold order.
+            events.sort_by(|a, b| a.1.event_id.cmp(&b.1.event_id));
 
             // Fold events into state
             for (_, event) in &events {
@@ -2044,26 +2032,13 @@ fn record_compaction_publish_retry(
     .increment(1);
 }
 
-fn event_priority(data: &OrchestrationEventData) -> u8 {
-    match data {
-        // Fold trigger evaluations before emitted RunRequested events at the same timestamp.
-        OrchestrationEventData::ScheduleTicked { .. }
-        | OrchestrationEventData::SensorEvaluated { .. }
-        | OrchestrationEventData::BackfillChunkPlanned { .. } => 0,
-        OrchestrationEventData::RunRequested { .. } => 1,
-        OrchestrationEventData::RunTriggered { .. } => 2,
-        OrchestrationEventData::PlanCreated { .. } => 3,
-        _ => 4,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::orchestration::compactor::fold::{DispatchOutboxRow, TimerRow};
     use crate::orchestration::events::{
         OrchestrationEventData, PartitionSelector, RunRequest, SensorEvalStatus, SourceRef,
-        TaskDef, TickStatus, TimerType, TriggerInfo, TriggerSource,
+        TaskDef, TaskOutcome, TickStatus, TimerType, TriggerInfo, TriggerSource,
     };
     use crate::paths::{orchestration_compaction_lock_path, orchestration_event_path};
     use arco_core::{
@@ -2107,11 +2082,8 @@ mod tests {
         })
     }
 
-    // Use deterministic event IDs to avoid parallel test flakiness.
-    // Event IDs are ordered to match the expected sort order (by timestamp, then priority).
-    // RunTriggered has priority 1, PlanCreated has priority 2, so PlanCreated sorts last.
-    // The event_ids are ordered so that PlanCreated (sorted last) has the larger event_id,
-    // which is what the compact_orders_watermarks_by_event_id test expects.
+    // Use deterministic event IDs to avoid parallel test flakiness and to make
+    // replay order explicit.
     fn make_run_triggered_event() -> OrchestrationEvent {
         OrchestrationEvent::new_with_event_id(
             "tenant",
@@ -2245,25 +2217,72 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
-        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
+        write_events(storage, "2025-01-15", vec![event1, event2]).await
+    }
 
-        storage
-            .put_raw(
-                &path1,
-                Bytes::from(serde_json::to_string(&event1).expect("serialize")),
-                WritePrecondition::None,
-            )
-            .await?;
-        storage
-            .put_raw(
-                &path2,
-                Bytes::from(serde_json::to_string(&event2).expect("serialize")),
-                WritePrecondition::None,
-            )
-            .await?;
+    async fn write_events(
+        storage: &ScopedStorage,
+        date: &str,
+        events: Vec<OrchestrationEvent>,
+    ) -> Result<Vec<String>> {
+        let mut paths = Vec::with_capacity(events.len());
 
-        Ok(vec![path1, path2])
+        for event in events {
+            let path = orchestration_event_path(date, &event.event_id);
+            storage
+                .put_raw(
+                    &path,
+                    Bytes::from(serde_json::to_string(&event).expect("serialize")),
+                    WritePrecondition::None,
+                )
+                .await?;
+            paths.push(path);
+        }
+
+        Ok(paths)
+    }
+
+    fn make_history_run_events(index: usize) -> Vec<OrchestrationEvent> {
+        let run_id = format!("run_{index:03}");
+        let plan_id = format!("plan_{index:03}");
+        let task_key = format!("extract_{index:03}");
+
+        vec![
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::RunTriggered {
+                    run_id: run_id.clone(),
+                    plan_id: plan_id.clone(),
+                    trigger: TriggerInfo::Manual {
+                        user_id: "user@example.com".to_string(),
+                    },
+                    root_assets: vec![format!("analytics.{task_key}")],
+                    run_key: None,
+                    labels: HashMap::new(),
+                    code_version: None,
+                },
+                format!("evt_{index:03}_01_run_triggered"),
+            ),
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::PlanCreated {
+                    run_id,
+                    plan_id,
+                    tasks: vec![TaskDef {
+                        key: task_key.clone(),
+                        depends_on: vec![],
+                        asset_key: Some(format!("analytics.{task_key}")),
+                        partition_key: None,
+                        max_attempts: 3,
+                        heartbeat_timeout_sec: 300,
+                        requires_visible_output: false,
+                    }],
+                },
+                format!("evt_{index:03}_02_plan_created"),
+            ),
+        ]
     }
 
     #[derive(Debug)]
@@ -3216,6 +3235,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_compaction_delta_rows_stay_bounded_with_existing_history() -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let mut history = Vec::new();
+        for index in 0..32 {
+            history.extend(make_history_run_events(index));
+        }
+        let history_paths = write_events(&storage, "2025-01-15", history).await?;
+        compactor.compact_events(history_paths).await?;
+
+        let history_manifest = load_current_manifest(&storage).await?;
+        let history_delta = history_manifest.l0_deltas.last().expect("history delta");
+        assert_eq!(history_delta.event_range.event_count, 64);
+        assert!(
+            history_delta.row_counts.total() >= 96,
+            "history seed should create a non-trivial folded state baseline"
+        );
+
+        let run_id = "run_000";
+        let task_key = "extract_000";
+        let attempt_id = "attempt_000";
+        let started = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::TaskStarted {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt: 1,
+                attempt_id: attempt_id.to_string(),
+                worker_id: "worker-01".to_string(),
+            },
+            "evt_callback_001_started",
+        );
+        let started_paths = write_events(&storage, "2025-01-15", vec![started]).await?;
+        compactor.compact_events(started_paths).await?;
+
+        let heartbeat = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::TaskHeartbeat {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt: 1,
+                attempt_id: attempt_id.to_string(),
+                worker_id: "worker-01".to_string(),
+                heartbeat_at: Some(Utc::now()),
+                progress_pct: Some(25),
+                message: Some("measured heartbeat".to_string()),
+            },
+            "evt_callback_002_heartbeat",
+        );
+        let heartbeat_paths = write_events(&storage, "2025-01-15", vec![heartbeat]).await?;
+        compactor.compact_events(heartbeat_paths).await?;
+
+        let heartbeat_manifest = load_current_manifest(&storage).await?;
+        let heartbeat_delta = heartbeat_manifest
+            .l0_deltas
+            .last()
+            .expect("heartbeat delta");
+        assert_eq!(heartbeat_delta.event_range.event_count, 1);
+        assert_eq!(heartbeat_delta.row_counts.tasks, 1);
+        assert_eq!(heartbeat_delta.row_counts.catalog_run_index, 1);
+        assert_eq!(heartbeat_delta.row_counts.idempotency_keys, 1);
+        assert!(
+            heartbeat_delta.row_counts.total() <= 3,
+            "heartbeat callback delta row budget regressed: {:?}",
+            heartbeat_delta.row_counts
+        );
+
+        let finished = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::TaskFinished {
+                run_id: run_id.to_string(),
+                task_key: task_key.to_string(),
+                attempt: 1,
+                attempt_id: attempt_id.to_string(),
+                worker_id: "worker-01".to_string(),
+                outcome: TaskOutcome::Succeeded,
+                materialization_id: Some("mat-000".to_string()),
+                error_message: None,
+                output: None,
+                error: None,
+                metrics: None,
+                cancelled_during_phase: None,
+                partial_progress_json: None,
+                asset_key: Some("analytics.extract_000".to_string()),
+                partition_key: None,
+                code_version: None,
+            },
+            "evt_callback_003_finished",
+        );
+        let finished_paths = write_events(&storage, "2025-01-15", vec![finished]).await?;
+        compactor.compact_events(finished_paths).await?;
+
+        let finished_manifest = load_current_manifest(&storage).await?;
+        let finished_delta = finished_manifest.l0_deltas.last().expect("finished delta");
+        assert_eq!(finished_delta.event_range.event_count, 1);
+        assert_eq!(finished_delta.row_counts.runs, 1);
+        assert_eq!(finished_delta.row_counts.tasks, 1);
+        assert_eq!(finished_delta.row_counts.catalog_run_index, 1);
+        assert_eq!(finished_delta.row_counts.idempotency_keys, 1);
+        assert!(
+            finished_delta.row_counts.total() <= 4,
+            "completion callback delta row budget regressed: {:?}",
+            finished_delta.row_counts
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compact_persists_out_of_order_dispatch_fields() -> Result<()> {
         let (compactor, storage) = create_test_compactor().await?;
 
@@ -3401,13 +3532,13 @@ mod tests {
         let base_outcome = persisted_a
             .publish_manifest(&base, None, None, None, None, None, None)
             .await?;
-        assert_eq!(
-            base_outcome,
-            PublishOutcome::Visible {
-                pointer_version: "1".to_string(),
-                repair_pending: false
-            }
-        );
+        let PublishOutcome::Visible {
+            pointer_version: base_pointer_version,
+            repair_pending: false,
+        } = base_outcome
+        else {
+            panic!("base publish should be visible: {base_outcome:?}");
+        };
 
         let (stale_manifest, stale_version, stale_pointer, stale_pointer_bytes) =
             persisted_a.read_manifest_with_version().await?;
@@ -3429,13 +3560,14 @@ mod tests {
                 None,
             )
             .await?;
-        assert_eq!(
-            winner_outcome,
-            PublishOutcome::Visible {
-                pointer_version: "2".to_string(),
-                repair_pending: false
-            }
-        );
+        let PublishOutcome::Visible {
+            pointer_version: winner_pointer_version,
+            repair_pending: false,
+        } = winner_outcome
+        else {
+            panic!("winner publish should be visible: {winner_outcome:?}");
+        };
+        assert_ne!(winner_pointer_version, base_pointer_version);
 
         let mut stale = OrchestrationManifest::new("01HQXYZ212REV");
         stale.manifest_id = "00000000000000000002".to_string();
@@ -3520,43 +3652,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn event_priority_orders_trigger_before_run_requested() {
-        let tick = OrchestrationEventData::ScheduleTicked {
-            schedule_id: "sched-01".to_string(),
-            scheduled_for: Utc::now(),
-            tick_id: "sched-01:1".to_string(),
-            definition_version: "v1".to_string(),
-            asset_selection: vec!["asset.a".to_string()],
-            partition_selection: None,
-            status: TickStatus::Triggered,
-            run_key: Some("sched:1".to_string()),
-            request_fingerprint: Some("fp-1".to_string()),
-        };
-        let run_requested = OrchestrationEventData::RunRequested {
-            run_key: "sched:1".to_string(),
-            request_fingerprint: "fp-1".to_string(),
-            asset_selection: vec!["asset.a".to_string()],
-            partition_selection: None,
-            trigger_source_ref: SourceRef::Schedule {
-                schedule_id: "sched-01".to_string(),
-                tick_id: "sched-01:1".to_string(),
-            },
-            labels: HashMap::new(),
-            code_version: None,
-        };
-
-        assert!(event_priority(&tick) < event_priority(&run_requested));
-    }
-
-    #[test]
-    fn event_priority_orders_run_triggered_before_plan_created() {
-        let run_triggered = make_run_triggered_event();
-        let plan_created = make_plan_created_event();
-
-        assert!(event_priority(&run_triggered.data) < event_priority(&plan_created.data));
     }
 
     #[test]

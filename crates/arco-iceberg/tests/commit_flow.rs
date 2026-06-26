@@ -747,7 +747,7 @@ impl SingleTableHttpFixture {
                         "action": "set-snapshot-ref",
                         "ref-name": "main",
                         "type": "branch",
-                        "snapshot-id": 303
+                        "snapshot-id": snapshot_id
                     }
                 ]
             }]

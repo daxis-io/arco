@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{FromRequestParts, State};
-use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -40,6 +40,8 @@ use crate::rate_limit::{RateLimitResult, RateLimitState};
 use arco_catalog::SyncCompactor;
 use arco_core::Result;
 use arco_core::audit::AuditEmitter;
+
+const PUBLIC_PROTOCOL_RATE_LIMIT_TENANT: &str = "__public__";
 
 // ============================================================================
 // Health and Ready Responses
@@ -346,6 +348,20 @@ async fn iceberg_auth_middleware(
     next: Next,
 ) -> Response {
     if iceberg_public_path(req.uri().path()) {
+        let resource = req.uri().path().to_string();
+        let request_id = crate::context::request_id_from_headers(req.headers())
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        if let Some(response) = iceberg_rate_limit_response_for_tenant(
+            &state,
+            PUBLIC_PROTOCOL_RATE_LIMIT_TENANT,
+            &resource,
+            &request_id,
+        )
+        .await
+        {
+            return response;
+        }
+
         return next.run(req).await;
     }
 
@@ -399,6 +415,20 @@ async fn unity_catalog_auth_middleware(
     next: Next,
 ) -> Response {
     if unity_catalog_public_path(req.uri().path()) {
+        let resource = req.uri().path().to_string();
+        let request_id = crate::context::request_id_from_headers(req.headers())
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        if let Some(response) = unity_catalog_rate_limit_response_for_tenant(
+            &state,
+            PUBLIC_PROTOCOL_RATE_LIMIT_TENANT,
+            &resource,
+            &request_id,
+        )
+        .await
+        {
+            return response;
+        }
+
         return next.run(req).await;
     }
 
@@ -518,7 +548,16 @@ async fn iceberg_rate_limit_response(
     ctx: &RequestContext,
     path: &str,
 ) -> Option<Response> {
-    match state.rate_limit().check_default(&ctx.tenant).await {
+    iceberg_rate_limit_response_for_tenant(state, &ctx.tenant, path, &ctx.request_id).await
+}
+
+async fn iceberg_rate_limit_response_for_tenant(
+    state: &AppState,
+    tenant: &str,
+    path: &str,
+    request_id: &str,
+) -> Option<Response> {
+    match state.rate_limit().check_default(tenant).await {
         RateLimitResult::Allowed { .. } => None,
         RateLimitResult::Limited {
             limit,
@@ -526,9 +565,9 @@ async fn iceberg_rate_limit_response(
         } => {
             record_protocol_rate_limit_hit(
                 "iceberg",
-                &ctx.tenant,
+                tenant,
                 path,
-                &ctx.request_id,
+                request_id,
                 limit,
                 retry_after_secs,
             );
@@ -548,7 +587,16 @@ async fn unity_catalog_rate_limit_response(
     ctx: &RequestContext,
     path: &str,
 ) -> Option<Response> {
-    match state.rate_limit().check_default(&ctx.tenant).await {
+    unity_catalog_rate_limit_response_for_tenant(state, &ctx.tenant, path, &ctx.request_id).await
+}
+
+async fn unity_catalog_rate_limit_response_for_tenant(
+    state: &AppState,
+    tenant: &str,
+    path: &str,
+    request_id: &str,
+) -> Option<Response> {
+    match state.rate_limit().check_default(tenant).await {
         RateLimitResult::Allowed { .. } => None,
         RateLimitResult::Limited {
             limit,
@@ -556,9 +604,9 @@ async fn unity_catalog_rate_limit_response(
         } => {
             record_protocol_rate_limit_hit(
                 "unity_catalog",
-                &ctx.tenant,
+                tenant,
                 path,
-                &ctx.request_id,
+                request_id,
                 limit,
                 retry_after_secs,
             );
@@ -598,7 +646,7 @@ fn rate_limit_message(limit: u32, retry_after_secs: u64) -> String {
     )
 }
 
-fn insert_retry_after(headers: &mut axum::http::HeaderMap, retry_after_secs: u64) {
+fn insert_retry_after(headers: &mut HeaderMap, retry_after_secs: u64) {
     if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
         headers.insert(header::RETRY_AFTER, value);
     }
@@ -1622,6 +1670,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_iceberg_routes_share_rate_limit_bucket_when_tenant_header_rotates() -> Result<()>
+    {
+        for path in ["/iceberg/v1/config", "/iceberg/openapi.json"] {
+            let mut builder = ServerBuilder::new();
+            builder.config.rate_limit.default_requests_per_minute = 1;
+            builder.config.rate_limit.burst_size = 1;
+            let server = builder.debug(true).iceberg_enabled(true).build();
+            let router = server.test_router();
+
+            for (tenant, expected) in [
+                ("acme", StatusCode::OK),
+                ("bravo", StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header("X-Tenant-Id", tenant)
+                            .header("X-Workspace-Id", "analytics")
+                            .body(Body::empty())
+                            .context("build request")?,
+                    )
+                    .await
+                    .map_err(|err| match err {})?;
+
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "public Iceberg requests should share a rate-limit bucket even when X-Tenant-Id rotates to {tenant} for {path}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_iceberg_routes_without_tenant_share_rate_limit_bucket() -> Result<()> {
+        for path in ["/iceberg/v1/config", "/iceberg/openapi.json"] {
+            let mut builder = ServerBuilder::new();
+            builder.config.rate_limit.default_requests_per_minute = 1;
+            builder.config.rate_limit.burst_size = 1;
+            let server = builder.debug(true).iceberg_enabled(true).build();
+            let router = server.test_router();
+
+            for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .body(Body::empty())
+                            .context("build request")?,
+                    )
+                    .await
+                    .map_err(|err| match err {})?;
+
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "public Iceberg requests without tenant headers should share a rate-limit bucket for {path}",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unity_catalog_routes_are_rate_limited_per_tenant() -> Result<()> {
         let mut builder = ServerBuilder::new();
         builder.config.unity_catalog.enabled = true;
@@ -1652,6 +1768,72 @@ mod tests {
                 response.status(),
                 expected,
                 "tenant {tenant} should have an independent UC rate-limit bucket",
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_unity_catalog_routes_share_rate_limit_bucket_when_tenant_header_rotates()
+    -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.unity_catalog.enabled = true;
+        builder.config.rate_limit.default_requests_per_minute = 1;
+        builder.config.rate_limit.burst_size = 1;
+        let server = builder.debug(true).build();
+        let router = server.test_router();
+
+        for (tenant, expected) in [
+            ("acme", StatusCode::OK),
+            ("bravo", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/2.1/unity-catalog/openapi.json")
+                        .header("X-Tenant-Id", tenant)
+                        .header("X-Workspace-Id", "analytics")
+                        .body(Body::empty())
+                        .context("build request")?,
+                )
+                .await
+                .map_err(|err| match err {})?;
+
+            assert_eq!(
+                response.status(),
+                expected,
+                "public UC requests should share a rate-limit bucket even when X-Tenant-Id rotates to {tenant}",
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_unity_catalog_routes_without_tenant_share_rate_limit_bucket() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.unity_catalog.enabled = true;
+        builder.config.rate_limit.default_requests_per_minute = 1;
+        builder.config.rate_limit.burst_size = 1;
+        let server = builder.debug(true).build();
+        let router = server.test_router();
+
+        for expected in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/2.1/unity-catalog/openapi.json")
+                        .body(Body::empty())
+                        .context("build request")?,
+                )
+                .await
+                .map_err(|err| match err {})?;
+
+            assert_eq!(
+                response.status(),
+                expected,
+                "public UC requests without tenant headers should share a rate-limit bucket",
             );
         }
         Ok(())

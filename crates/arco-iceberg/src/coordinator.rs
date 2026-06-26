@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
-use crate::commit::validate_requirements;
+use crate::commit::{prune_snapshot_log_after_snapshot_removal, validate_requirements};
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::IdempotencyMarker;
 use crate::pointer::{
@@ -829,6 +829,7 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
         TableUpdate::RemoveSnapshots { snapshot_ids } => {
             let ids: HashSet<i64> = snapshot_ids.iter().copied().collect();
             metadata.snapshots.retain(|s| !ids.contains(&s.snapshot_id));
+            prune_snapshot_log_after_snapshot_removal(metadata);
             metadata.refs.retain(|_, r| !ids.contains(&r.snapshot_id));
             if metadata
                 .current_snapshot_id

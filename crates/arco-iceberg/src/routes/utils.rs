@@ -1,6 +1,7 @@
 //! Shared helpers for Iceberg REST routes.
 
 use crate::error::{IcebergError, IcebergResult};
+use crate::idempotency::IdempotencyMarker;
 use crate::state::IcebergConfig;
 use crate::types::NamespaceIdent;
 
@@ -51,6 +52,14 @@ pub fn join_namespace(ident: &[String], separator: &str) -> IcebergResult<String
 /// Checks if a table format string indicates an Iceberg table.
 pub fn is_iceberg_table(format: Option<&str>) -> bool {
     format.is_some_and(|f| f.eq_ignore_ascii_case("iceberg"))
+}
+
+/// Returns a valid commit idempotency key, generating one for clients that omit the optional header.
+pub fn commit_idempotency_key(key: Option<String>) -> IcebergResult<String> {
+    let key = key.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    IdempotencyMarker::validate_uuidv7(&key)
+        .map_err(|err| IcebergError::invalid_idempotency_key(err.to_string()))?;
+    Ok(key)
 }
 
 /// Applies page token and size to a vector of items.

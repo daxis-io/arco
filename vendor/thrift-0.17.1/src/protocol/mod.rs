@@ -86,6 +86,33 @@ macro_rules! set_readable_bytes {
     };
 }
 
+/// Matches upstream Thrift's default `TConfiguration::DEFAULT_STRING_LIMIT`.
+pub(crate) const DEFAULT_MAX_STRING_SIZE: usize = 100 * 1024 * 1024;
+
+pub(crate) fn check_byte_array_size(size: i32) -> crate::Result<usize> {
+    if size < 0 {
+        return Err(crate::Error::Protocol(ProtocolError::new(
+            ProtocolErrorKind::NegativeSize,
+            format!("Negative byte array size: {size}"),
+        )));
+    }
+    let size = size as usize;
+    check_byte_array_size_usize(size)?;
+    Ok(size)
+}
+
+pub(crate) fn check_byte_array_size_usize(size: usize) -> crate::Result<()> {
+    if size > DEFAULT_MAX_STRING_SIZE {
+        return Err(crate::Error::Protocol(ProtocolError::new(
+            ProtocolErrorKind::SizeLimit,
+            format!(
+                "Byte array size {size} exceeds maximum allowed size of {DEFAULT_MAX_STRING_SIZE}"
+            ),
+        )));
+    }
+    Ok(())
+}
+
 mod binary;
 mod compact;
 mod multiplexed;

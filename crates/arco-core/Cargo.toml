@@ -16,11 +16,13 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["jwt-aws-lc"]
 full = ["gcp", "aws", "azure"]
 gcp = []
 aws = []
 azure = []
+jwt-aws-lc = ["jsonwebtoken/aws_lc_rs", "jsonwebtoken/use_pem"]
+jwt-rust-crypto = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 test-utils = ["dep:proptest", "dep:tempfile"]
 sync-compaction = []
 
@@ -58,7 +60,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }

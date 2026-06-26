@@ -5,6 +5,7 @@
 
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_catalog::{ColumnDefinition, RegisterTableInSchemaRequest};
+use arco_core::IcebergPaths;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Extension, Path, Query, State};
@@ -13,6 +14,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 use crate::context::UnityCatalogRequestContext;
 use crate::error::{UnityCatalogError, UnityCatalogErrorResponse, UnityCatalogResult};
@@ -499,7 +501,7 @@ pub(crate) async fn delete_table(
     );
 
     let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    writer
+    let commit = writer
         .drop_table_in_schema_transaction(
             &catalog_name,
             &schema_name,
@@ -508,6 +510,25 @@ pub(crate) async fn delete_table(
         )
         .await
         .map_err(common::map_catalog_error)?;
+
+    if let Some(dropped_table) = commit
+        .dropped_table
+        .filter(|table| is_iceberg_table(table.format.as_deref()))
+    {
+        if let Ok(uuid) = Uuid::parse_str(&dropped_table.table_id) {
+            let pointer_path = IcebergPaths::pointer_path(&uuid);
+            let storage = common::scoped_storage(&state, &ctx)?;
+            if let Err(err) = storage.delete(&pointer_path).await {
+                tracing::warn!(
+                    error = %err,
+                    path = %pointer_path,
+                    table_uuid = %uuid,
+                    "Failed to delete Iceberg pointer file during UC table drop"
+                );
+            }
+        }
+    }
+
     Ok((StatusCode::OK, Json(json!({}))))
 }
 
@@ -558,4 +579,105 @@ fn parse_table_full_name(full_name: &str) -> UnityCatalogResult<(String, String,
     let schema_name = preview::require_identifier(Some(schema_name.to_string()), "schema_name")?;
     let table_name = preview::require_identifier(Some(table_name.to_string()), "name")?;
     Ok((catalog_name, schema_name, table_name))
+}
+
+fn is_iceberg_table(format: Option<&str>) -> bool {
+    format.is_some_and(|value| value.eq_ignore_ascii_case("iceberg"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Arc;
+
+    use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{CatalogWriter, Tier1Compactor};
+    use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
+    use arco_core::{IcebergPaths, ScopedStorage};
+    use axum::body::Body;
+    use axum::http::Request;
+    use bytes::Bytes;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::router::unity_catalog_router;
+
+    #[tokio::test]
+    async fn delete_iceberg_table_removes_pointer() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage_backend: Arc<dyn StorageBackend> = backend.clone();
+        let scoped_storage =
+            ScopedStorage::new(storage_backend.clone(), "acme", "analytics").expect("scope");
+        let compactor = Arc::new(Tier1Compactor::new(scoped_storage.clone()));
+        let writer = CatalogWriter::new(scoped_storage.clone()).with_sync_compactor(compactor);
+
+        writer.initialize().await.expect("initialize");
+        writer
+            .create_catalog("main", None, WriteOptions::default())
+            .await
+            .expect("create catalog");
+        writer
+            .create_schema("main", "sales", None, WriteOptions::default())
+            .await
+            .expect("create schema");
+        let table = writer
+            .register_table_in_schema(
+                "main",
+                "sales",
+                RegisterTableInSchemaRequest {
+                    name: "orders".to_string(),
+                    description: None,
+                    location: Some("gs://bucket/warehouse/sales/orders".to_string()),
+                    format: Some("iceberg".to_string()),
+                    table_type: None,
+                    properties: None,
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let table_uuid = Uuid::parse_str(&table.id).expect("table uuid");
+        let pointer_path = IcebergPaths::pointer_path(&table_uuid);
+        scoped_storage
+            .put(
+                &pointer_path,
+                Bytes::from_static(b"{\"current-metadata-location\":\"metadata.json\"}"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put pointer");
+        assert!(
+            scoped_storage
+                .head_raw(&pointer_path)
+                .await
+                .expect("head pointer")
+                .is_some()
+        );
+
+        let app = unity_catalog_router(UnityCatalogState::new(storage_backend));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/tables/main.sales.orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            scoped_storage
+                .head_raw(&pointer_path)
+                .await
+                .expect("head pointer after delete")
+                .is_none()
+        );
+    }
 }

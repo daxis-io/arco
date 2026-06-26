@@ -15,8 +15,13 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["jwt-aws-lc"]
+jwt-aws-lc = ["arco-core/jwt-aws-lc"]
+jwt-rust-crypto = ["arco-core/jwt-rust-crypto"]
+
 [dependencies]
-arco-core = { path = "../arco-core" }
+arco-core = { path = "../arco-core", default-features = false }
 
 async-trait = { workspace = true }
 bytes = { workspace = true }

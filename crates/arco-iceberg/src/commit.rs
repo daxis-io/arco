@@ -357,11 +357,19 @@ impl<S: StorageBackend> CommitService<S> {
             }
 
             // Step 5: Validate update requirements
-            validate_requirements(&base_metadata, &request.requirements)?;
+            if let Err(err) = validate_requirements(&base_metadata, &request.requirements) {
+                self.finalize_failed_marker(&idempotency_store, &marker, &marker_version, &err)
+                    .await?;
+                return Err(err.into());
+            }
 
             // Step 6: Compute new metadata state
             let mut new_metadata = base_metadata.clone();
-            apply_updates(&mut new_metadata, &request.updates)?;
+            if let Err(err) = apply_updates(&mut new_metadata, &request.updates) {
+                self.finalize_failed_marker(&idempotency_store, &marker, &marker_version, &err)
+                    .await?;
+                return Err(err.into());
+            }
             finalize_metadata(
                 &mut new_metadata,
                 &base_metadata,
@@ -896,6 +904,7 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             metadata
                 .snapshots
                 .retain(|snap| !ids.contains(&snap.snapshot_id));
+            prune_snapshot_log_after_snapshot_removal(metadata);
             metadata.refs.retain(|_, r| !ids.contains(&r.snapshot_id));
             if metadata
                 .current_snapshot_id
@@ -923,6 +932,25 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
     }
 
     Ok(())
+}
+
+pub(crate) fn prune_snapshot_log_after_snapshot_removal(metadata: &mut TableMetadata) {
+    let retained_snapshot_ids: HashSet<_> = metadata
+        .snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
+    let mut pruned_snapshot_log = Vec::with_capacity(metadata.snapshot_log.len());
+
+    for entry in &metadata.snapshot_log {
+        if retained_snapshot_ids.contains(&entry.snapshot_id) {
+            pruned_snapshot_log.push(entry.clone());
+        } else {
+            pruned_snapshot_log.clear();
+        }
+    }
+
+    metadata.snapshot_log = pruned_snapshot_log;
 }
 
 fn finalize_metadata(

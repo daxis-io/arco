@@ -82,6 +82,15 @@ pub enum IcebergError {
         retry_after_seconds: Option<u32>,
     },
 
+    /// Too many requests (429) - rate limit exceeded.
+    #[error("Too many requests: {message}")]
+    TooManyRequests {
+        /// Human-readable error message.
+        message: String,
+        /// Suggested retry delay in seconds.
+        retry_after_seconds: Option<u64>,
+    },
+
     /// Internal server error (500) - Unexpected failure.
     #[error("Internal error: {message}")]
     Internal {
@@ -176,6 +185,7 @@ impl IcebergError {
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::UnprocessableEntity { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -192,6 +202,7 @@ impl IcebergError {
             Self::Forbidden { .. } => "ForbiddenException",
             Self::UnprocessableEntity { .. } => "UnprocessableEntityException",
             Self::ServiceUnavailable { .. } => "ServiceUnavailableException",
+            Self::TooManyRequests { .. } => "TooManyRequestsException",
             Self::Internal { .. } => "InternalServerException",
         }
     }
@@ -208,10 +219,14 @@ impl IcebergError {
             | Self::Conflict { message, .. }
             | Self::UnprocessableEntity { message }
             | Self::ServiceUnavailable { message, .. }
+            | Self::TooManyRequests { message, .. }
             | Self::Internal { message } => message,
         }
     }
 }
+
+const PUBLIC_STORAGE_UNAVAILABLE_MESSAGE: &str = "Service temporarily unavailable";
+const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
 
 /// Iceberg REST Catalog error response format.
 ///
@@ -308,13 +323,21 @@ impl From<CatalogError> for IcebergError {
                 406 | 501 => Self::UnsupportedOperation { message },
                 _ => Self::Internal { message },
             },
-            CatalogError::Storage { message } => Self::ServiceUnavailable {
-                message,
-                retry_after_seconds: None,
-            },
+            CatalogError::Storage { message } => {
+                tracing::warn!(internal_error = %message, "redacted Iceberg storage error");
+                Self::ServiceUnavailable {
+                    message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
+                    retry_after_seconds: None,
+                }
+            }
             CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
-            | CatalogError::InvariantViolation { message } => Self::Internal { message },
+            | CatalogError::InvariantViolation { message } => {
+                tracing::warn!(internal_error = %message, "redacted Iceberg internal error");
+                Self::Internal {
+                    message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+                }
+            }
             CatalogError::UnsupportedOperation { message } => {
                 Self::UnsupportedOperation { message }
             }
@@ -331,6 +354,15 @@ impl IntoResponse for IcebergError {
 
         // Add Retry-After header for 503 responses
         if let Self::ServiceUnavailable {
+            retry_after_seconds: Some(seconds),
+            ..
+        } = &self
+        {
+            if let Ok(value) = seconds.to_string().parse() {
+                response.headers_mut().insert("Retry-After", value);
+            }
+        }
+        if let Self::TooManyRequests {
             retry_after_seconds: Some(seconds),
             ..
         } = &self
@@ -378,6 +410,21 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialization failed");
         assert!(json.contains("NoSuchTableException"));
         assert!(json.contains("404"));
+    }
+
+    #[test]
+    fn storage_errors_do_not_expose_internal_details() {
+        let err = IcebergError::from(CatalogError::Storage {
+            message: "gcs bucket prod-secret path tenant=acme/workspace=analytics/token"
+                .to_string(),
+        });
+
+        let body = IcebergErrorResponse::from(&err);
+
+        assert_eq!(err.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.error.message, "Service temporarily unavailable");
+        assert!(!body.error.message.contains("prod-secret"));
+        assert!(!body.error.message.contains("tenant=acme"));
     }
 
     #[test]

@@ -31,7 +31,9 @@ use crate::coordinator::{
 use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::pointer::{PointerStoreImpl, UpdateSource};
-use crate::routes::utils::{ensure_prefix, is_iceberg_table, join_namespace};
+use crate::routes::utils::{
+    commit_idempotency_key, ensure_prefix, is_iceberg_table, join_namespace,
+};
 use crate::state::{IcebergConfig, IcebergState};
 use crate::types::{CommitTransactionRequest, RenameTableRequest};
 
@@ -236,16 +238,7 @@ async fn commit_transaction(
         });
     }
 
-    let idempotency_key = ctx
-        .idempotency_key
-        .clone()
-        .ok_or_else(|| IcebergError::BadRequest {
-            message: "Missing Idempotency-Key header".to_string(),
-            error_type: "BadRequestException",
-        })?;
-
-    IdempotencyMarker::validate_uuidv7(&idempotency_key)
-        .map_err(|err| IcebergError::invalid_idempotency_key(err.to_string()))?;
+    let idempotency_key = commit_idempotency_key(ctx.idempotency_key.clone())?;
 
     let separator = state.config.namespace_separator_decoded();
     let namespace_name = join_namespace(&identifier.namespace, &separator)?;

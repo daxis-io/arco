@@ -509,6 +509,17 @@ pub struct CatalogTransactionCommit {
     pub fencing_token: u64,
     /// Whether repairable post-commit side effects are still outstanding.
     pub repair_pending: bool,
+    /// Table identity removed by this transaction, when the transaction dropped a table.
+    pub dropped_table: Option<DroppedTableIdentity>,
+}
+
+/// Identity of a table removed by a catalog DDL transaction.
+#[derive(Debug, Clone)]
+pub struct DroppedTableIdentity {
+    /// UUID string of the table removed under the catalog lock.
+    pub table_id: String,
+    /// Lakehouse table format of the removed table.
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,6 +1044,7 @@ impl CatalogWriter {
             lock_path: CatalogPaths::domain_lock(CatalogDomain::Catalog),
             fencing_token,
             repair_pending: response.repair_pending,
+            dropped_table: None,
         });
 
         if let Err(error) = guard.release().await {
@@ -4544,7 +4556,8 @@ impl CatalogWriter {
         let state =
             tier1_state::load_catalog_state(&self.storage, &manifest.catalog.snapshot_path).await?;
 
-        let (namespace_id, table_id, default_catalog_repair_pending) = if catalog == "default" {
+        let (namespace_id, dropped_table, default_catalog_repair_pending) = if catalog == "default"
+        {
             let namespace = match Self::find_default_namespace(&state, schema) {
                 Some(namespace) => namespace,
                 None => {
@@ -4556,12 +4569,12 @@ impl CatalogWriter {
                 }
             };
             let namespace_id = namespace.id.clone();
-            let table_id = match state
+            let table = match state
                 .tables
                 .iter()
                 .find(|table| table.namespace_id == namespace_id && table.name == name)
             {
-                Some(table) => table.id.clone(),
+                Some(table) => table,
                 None => {
                     guard.release().await?;
                     return Err(CatalogError::NotFound {
@@ -4570,12 +4583,16 @@ impl CatalogWriter {
                     });
                 }
             };
+            let dropped_table = DroppedTableIdentity {
+                table_id: table.id.clone(),
+                format: table.format.clone(),
+            };
 
             match self
                 .ensure_default_catalog_locked_with_result(&guard, &state, compactor, &opts)
                 .await
             {
-                Ok(outcome) => (namespace_id, table_id, outcome.repair_pending),
+                Ok(outcome) => (namespace_id, dropped_table, outcome.repair_pending),
                 Err(err) => {
                     guard.release().await?;
                     return Err(err);
@@ -4608,12 +4625,12 @@ impl CatalogWriter {
             };
             let namespace_id = namespace.id.clone();
 
-            let table_id = match state
+            let table = match state
                 .tables
                 .iter()
                 .find(|table| table.namespace_id == namespace_id && table.name == name)
             {
-                Some(table) => table.id.clone(),
+                Some(table) => table,
                 None => {
                     guard.release().await?;
                     return Err(CatalogError::NotFound {
@@ -4622,12 +4639,16 @@ impl CatalogWriter {
                     });
                 }
             };
+            let dropped_table = DroppedTableIdentity {
+                table_id: table.id.clone(),
+                format: table.format.clone(),
+            };
 
-            (namespace_id, table_id, false)
+            (namespace_id, dropped_table, false)
         };
 
         let event = CatalogDdlEvent::TableDropped {
-            table_id,
+            table_id: dropped_table.table_id.clone(),
             namespace_id,
             table_name: name.to_string(),
         };
@@ -4656,6 +4677,7 @@ impl CatalogWriter {
         .await
         .map(|mut commit| {
             commit.repair_pending |= default_catalog_repair_pending;
+            commit.dropped_table = Some(dropped_table);
             commit
         })
     }
@@ -6267,6 +6289,46 @@ mod tests {
 
         assert_eq!(renamed.name, "new_name");
         assert_eq!(renamed.description, Some("Test table".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_transaction_reports_locked_table_identity() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_namespace("default", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let table = writer
+            .register_table(
+                RegisterTableRequest {
+                    namespace: "default".to_string(),
+                    name: "events".to_string(),
+                    description: None,
+                    location: Some("s3://bucket/events".to_string()),
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let commit = writer
+            .drop_table_in_schema_transaction(
+                "default",
+                "default",
+                "events",
+                WriteOptions::default(),
+            )
+            .await
+            .expect("drop table transaction");
+
+        let dropped = commit.dropped_table.expect("dropped table identity");
+        assert_eq!(dropped.table_id, table.id);
+        assert_eq!(dropped.format.as_deref(), Some("iceberg"));
     }
 
     #[tokio::test]

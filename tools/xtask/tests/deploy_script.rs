@@ -395,6 +395,25 @@ fn deploy_validates_internal_cloud_run_services_with_local_proxy() {
     );
 }
 
+#[test]
+fn deploy_proxy_return_traps_capture_concrete_pid() {
+    let deploy_sh =
+        fs::read_to_string(repo_root().join("scripts/deploy.sh")).expect("read deploy.sh");
+
+    assert!(
+        !deploy_sh.contains(r#"trap 'stop_run_proxy "$pid"' RETURN"#),
+        "RETURN traps must not reference local pid variables after the health function returns"
+    );
+    assert!(
+        deploy_sh.contains(r#"trap "stop_run_proxy '${pid}'; trap - RETURN" RETURN"#),
+        "RETURN traps should capture the concrete proxy pid and clear themselves after cleanup"
+    );
+    assert!(
+        deploy_sh.contains(r#"local pid="${1:-}""#),
+        "proxy cleanup should tolerate missing arguments under set -u"
+    );
+}
+
 struct DeployHarness {
     _tempdir: TempDir,
     bin_dir: PathBuf,

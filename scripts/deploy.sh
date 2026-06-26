@@ -718,7 +718,7 @@ start_run_proxy() {
 }
 
 stop_run_proxy() {
-  local pid="$1"
+  local pid="${1:-}"
   if [[ -n "${pid}" ]]; then
     kill "$pid" >/dev/null 2>&1 || true
     wait "$pid" >/dev/null 2>&1 || true
@@ -733,7 +733,7 @@ wait_for_compactor_health() {
   log "Waiting for compactor health via proxy (timeout: ${COMPACTOR_HEALTH_TIMEOUT}s)..."
 
   pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
+  trap "stop_run_proxy '${pid}'; trap - RETURN" RETURN
 
   local elapsed=0
   while [[ "$elapsed" -lt "$COMPACTOR_HEALTH_TIMEOUT" ]]; do
@@ -768,7 +768,7 @@ wait_for_flow_compactor_health() {
   log "Waiting for flow compactor health via proxy (timeout: ${FLOW_COMPACTOR_HEALTH_TIMEOUT}s)..."
 
   pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
+  trap "stop_run_proxy '${pid}'; trap - RETURN" RETURN
 
   local elapsed=0
   while [[ "$elapsed" -lt "$FLOW_COMPACTOR_HEALTH_TIMEOUT" ]]; do
@@ -796,7 +796,7 @@ wait_for_api_health() {
   log "Waiting for API health via proxy (timeout: ${API_HEALTH_TIMEOUT}s)..."
 
   pid="$(start_run_proxy "$service_name" "$local_port")"
-  trap 'stop_run_proxy "$pid"' RETURN
+  trap "stop_run_proxy '${pid}'; trap - RETURN" RETURN
 
   local elapsed=0
   while [[ "$elapsed" -lt "$API_HEALTH_TIMEOUT" ]]; do

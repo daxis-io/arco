@@ -42,6 +42,7 @@ jobs:
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
+            -var="api_git_sha=abc123" \
             -var="compactor_image=example.com/arco-compactor:test" \
             -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
             -var="compactor_tenant_id=test-tenant" \
@@ -83,6 +84,7 @@ jobs:
             -var="region=us-central1" \
             -var="environment=dev" \
             -var="api_image=example.com/arco-api:test" \
+            -var="api_git_sha=abc123" \
             -var="compactor_image=example.com/arco-compactor:test" \
             -var="flow_compactor_image=example.com/arco-flow-compactor:test" \
             -var="flow_automation_reconciler_image=example.com/arco-flow-automation-reconciler:test" \
@@ -126,6 +128,8 @@ jobs:
 
             (env_names("api") | index("ARCO_COMPACTOR_URL")) and
             (env_names("api") | index("ARCO_ORCH_COMPACTOR_URL")) and
+            ((env_values("api").ARCO_API_IMAGE // "") == "example.com/arco-api:test") and
+            ((env_values("api").ARCO_GIT_SHA // "") == "abc123") and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE")) and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS")) and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE")) and

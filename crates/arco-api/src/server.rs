@@ -53,6 +53,28 @@ pub struct HealthResponse {
     pub status: String,
 }
 
+/// Build and deployment provenance response.
+#[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
+pub struct VersionResponse {
+    /// API service name.
+    pub service: String,
+    /// Cargo package version for the running API binary.
+    #[serde(rename = "packageVersion")]
+    pub package_version: String,
+    /// Deployment or source code version configured for run stamping.
+    #[serde(rename = "codeVersion")]
+    pub code_version: String,
+    /// Git SHA supplied by the deployment environment.
+    #[serde(rename = "gitSha")]
+    pub git_sha: String,
+    /// Container image reference supplied by the deployment environment.
+    pub image: String,
+    /// Cloud Run revision supplied by the deployment environment.
+    #[serde(rename = "cloudRunRevision")]
+    pub cloud_run_revision: String,
+}
+
 /// Readiness check response.
 #[derive(Debug, Serialize)]
 #[cfg_attr(test, derive(serde::Deserialize))]
@@ -234,6 +256,44 @@ impl AppState {
 async fn health() -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".to_string(),
+    })
+}
+
+/// Version endpoint handler.
+///
+/// Returns safe deployment provenance for live UAT and operator debugging.
+async fn version(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(version_response(&state.config))
+}
+
+fn version_response(config: &Config) -> VersionResponse {
+    VersionResponse {
+        service: first_env(["ARCO_SERVICE_NAME", "K_SERVICE"]).unwrap_or_else(|| "arco-api".into()),
+        package_version: env!("CARGO_PKG_VERSION").to_string(),
+        code_version: config
+            .code_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        git_sha: first_env(["ARCO_GIT_SHA", "GIT_SHA", "COMMIT_SHA"])
+            .unwrap_or_else(|| "unknown".to_string()),
+        image: first_env(["ARCO_API_IMAGE", "ARCO_IMAGE"]).unwrap_or_else(|| "unknown".to_string()),
+        cloud_run_revision: first_env(["K_REVISION", "ARCO_CLOUD_RUN_REVISION"])
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+fn first_env<const N: usize>(names: [&str; N]) -> Option<String> {
+    first_nonempty_env_value(names.iter().filter_map(|name| std::env::var(name).ok()))
+}
+
+fn first_nonempty_env_value<I, S>(values: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    values.into_iter().find_map(|value| {
+        let value = value.as_ref().trim();
+        (!value.is_empty()).then(|| value.to_string())
     })
 }
 
@@ -554,6 +614,7 @@ impl Server {
         let mut router = Router::new()
             // Health, ready, and metrics endpoints (no auth required)
             .route("/health", get(health))
+            .route("/version", get(version))
             .route("/ready", get(ready))
             .route("/metrics", metrics_handler)
             // API routes (auth via RequestContext extractor)
@@ -1277,6 +1338,44 @@ mod tests {
         let health: HealthResponse = serde_json::from_slice(&body).context("parse JSON body")?;
         assert_eq!(health.status, "ok");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_version_endpoint_reports_build_provenance() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.code_version = Some("uat-code-version".to_string());
+        let server = builder.build();
+        let router = server.test_router();
+
+        let request = Request::builder()
+            .uri("/version")
+            .body(Body::empty())
+            .context("build request")?;
+
+        let response = router.oneshot(request).await.map_err(|err| match err {})?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .context("read response body")?;
+        let version: serde_json::Value =
+            serde_json::from_slice(&body).context("parse JSON body")?;
+
+        assert_eq!(version["service"], "arco-api");
+        assert_eq!(version["packageVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(version["codeVersion"], "uat-code-version");
+        assert_eq!(version["gitSha"], "unknown");
+        assert_eq!(version["image"], "unknown");
+        assert_eq!(version["cloudRunRevision"], "unknown");
+        Ok(())
+    }
+
+    #[test]
+    fn test_first_env_value_skips_empty_before_fallback() {
+        let value = first_nonempty_env_value(["", "   ", "fallback"]);
+
+        assert_eq!(value.as_deref(), Some("fallback"));
     }
 
     #[tokio::test]

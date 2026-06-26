@@ -67,6 +67,44 @@ fn ci_runs_deterministic_user_acceptance_uat_gate() {
 }
 
 #[test]
+fn cloud_run_api_provenance_env_is_wired_for_live_uat() {
+    let variables = fs::read_to_string(repo_root().join("infra/terraform/variables.tf"))
+        .expect("read Terraform variables");
+    let cloud_run = fs::read_to_string(repo_root().join("infra/terraform/cloud_run.tf"))
+        .expect("read Cloud Run Terraform");
+    let deploy =
+        fs::read_to_string(repo_root().join("scripts/deploy.sh")).expect("read deploy script");
+    let terraform_validate =
+        fs::read_to_string(repo_root().join(".github/workflows/terraform-plan-validate.yml"))
+            .expect("read Terraform validation workflow");
+
+    assert!(
+        variables.contains("variable \"api_git_sha\""),
+        "Terraform should accept an explicit API git SHA for /version provenance"
+    );
+    assert!(
+        cloud_run.contains("name  = \"ARCO_GIT_SHA\"")
+            && cloud_run.contains("value = var.api_git_sha"),
+        "API Cloud Run service should expose ARCO_GIT_SHA to /version"
+    );
+    assert!(
+        cloud_run.contains("name  = \"ARCO_API_IMAGE\"")
+            && cloud_run.contains("value = var.api_image"),
+        "API Cloud Run service should expose ARCO_API_IMAGE to /version"
+    );
+    assert!(
+        deploy.contains("TF_VAR_api_git_sha"),
+        "deploy.sh should pass git SHA provenance into Terraform"
+    );
+    assert!(
+        terraform_validate.contains("-var=\"api_git_sha=abc123\"")
+            && terraform_validate.contains("ARCO_GIT_SHA")
+            && terraform_validate.contains("ARCO_API_IMAGE"),
+        "Terraform plan validation should assert API provenance env wiring"
+    );
+}
+
+#[test]
 fn ci_runs_proto_contract_checks() {
     let harness = ToolHarness::new().expect("create fake tool harness");
 

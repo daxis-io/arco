@@ -6531,6 +6531,13 @@
             },
             "description": "Assets to materialize."
           },
+          "codeVersion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Code version used to evaluate the run request."
+          },
           "partitionSelection": {
             "type": [
               "array",

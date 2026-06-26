@@ -24,6 +24,10 @@ resource "google_cloud_run_v2_service" "api" {
   # Don't route traffic until manually verified (compactor-first deployment)
   ingress = var.api_public ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
+  labels = merge(local.cloud_run_labels, {
+    component = "api"
+  })
+
   template {
     service_account = google_service_account.api.email
 
@@ -161,6 +165,16 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.api_code_version
       }
 
+      env {
+        name  = "ARCO_GIT_SHA"
+        value = var.api_git_sha
+      }
+
+      env {
+        name  = "ARCO_API_IMAGE"
+        value = var.api_image
+      }
+
       # JWT secret from Secret Manager (if configured)
       dynamic "env" {
         for_each = var.jwt_secret_name != "" ? [1] : []
@@ -202,6 +216,10 @@ resource "google_cloud_run_v2_service" "compactor" {
   project  = var.project_id
 
   ingress = var.compactor_ingress
+
+  labels = merge(local.cloud_run_labels, {
+    component = "compactor"
+  })
 
   template {
     service_account = google_service_account.compactor.email
@@ -349,8 +367,12 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
   location = var.region
   project  = var.project_id
 
-  # Internal-only service (invoked by other flow services)
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+  # Default internal-only; UAT can explicitly open ingress while IAM remains enforced.
+  ingress = var.flow_compactor_ingress == "all" ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_compactor"
+  })
 
   template {
     service_account = google_service_account.compactor.email
@@ -481,6 +503,10 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
   project  = var.project_id
 
   ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_dispatcher"
+  })
 
   template {
     service_account = google_service_account.flow_controller.email
@@ -666,6 +692,10 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
 
   ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
 
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_sweeper"
+  })
+
   template {
     service_account = google_service_account.flow_controller.email
 
@@ -834,6 +864,10 @@ resource "google_cloud_run_v2_service" "flow_worker" {
   project  = var.project_id
 
   ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
+
+  labels = merge(local.cloud_run_labels, {
+    component = "flow_worker"
+  })
 
   template {
     service_account = google_service_account.flow_worker[0].email

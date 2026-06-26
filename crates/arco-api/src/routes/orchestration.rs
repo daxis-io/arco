@@ -704,6 +704,9 @@ pub struct RunRequestResponse {
     /// Optional partition selection.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition_selection: Option<Vec<String>>,
+    /// Code version used to evaluate the run request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_version: Option<String>,
 }
 
 // ============================================================================
@@ -3810,6 +3813,7 @@ fn map_run_requests(run_requests: &[RunRequest]) -> Vec<RunRequestResponse> {
             request_fingerprint: req.request_fingerprint.clone(),
             asset_selection: req.asset_selection.clone(),
             partition_selection: req.partition_selection.clone(),
+            code_version: req.code_version.clone(),
         })
         .collect()
 }

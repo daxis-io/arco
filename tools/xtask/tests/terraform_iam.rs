@@ -77,6 +77,37 @@ fn flow_worker_dispatch_secret_is_wired_to_producers_and_worker() {
     assert!(worker.contains("secret_key_ref"));
 }
 
+#[test]
+fn api_service_account_can_invoke_sync_compactors() {
+    let terraform = terraform_iam_text();
+
+    let catalog_compactor = resource_block(
+        &terraform,
+        "google_cloud_run_v2_service_iam_member",
+        "api_compactor_invoker",
+    )
+    .expect("API service account should invoke catalog compactor");
+    assert!(catalog_compactor.contains("name     = google_cloud_run_v2_service.compactor.name"));
+    assert!(catalog_compactor.contains("role     = \"roles/run.invoker\""));
+    assert!(
+        catalog_compactor
+            .contains("member   = \"serviceAccount:${google_service_account.api.email}\"")
+    );
+
+    let flow_compactor = resource_block(
+        &terraform,
+        "google_cloud_run_v2_service_iam_member",
+        "api_flow_compactor_invoker",
+    )
+    .expect("API service account should invoke flow compactor");
+    assert!(flow_compactor.contains("name     = google_cloud_run_v2_service.flow_compactor.name"));
+    assert!(flow_compactor.contains("role     = \"roles/run.invoker\""));
+    assert!(
+        flow_compactor
+            .contains("member   = \"serviceAccount:${google_service_account.api.email}\"")
+    );
+}
+
 fn terraform_iam_text() -> String {
     terraform_text(["iam.tf", "iam_conditions.tf"])
 }

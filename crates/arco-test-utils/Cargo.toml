@@ -12,11 +12,7 @@ jwt-aws-lc = [
     "arco-catalog/jwt-aws-lc",
     "arco-flow/jwt-aws-lc",
 ]
-jwt-rust-crypto = [
-    "arco-core/jwt-rust-crypto",
-    "arco-catalog/jwt-rust-crypto",
-    "arco-flow/jwt-rust-crypto",
-]
+jwt-rust-crypto = ["jwt-aws-lc"]
 
 [dependencies]
 arco-core = { path = "../arco-core", default-features = false }

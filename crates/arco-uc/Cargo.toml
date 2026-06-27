@@ -22,11 +22,7 @@ gcp = ["arco-core/gcp", "arco-catalog/gcp", "dep:gcp_auth"]
 aws = ["arco-core/aws", "arco-catalog/aws"]
 azure = ["arco-core/azure", "arco-catalog/azure"]
 jwt-aws-lc = ["arco-core/jwt-aws-lc", "arco-catalog/jwt-aws-lc", "arco-delta/jwt-aws-lc"]
-jwt-rust-crypto = [
-    "arco-core/jwt-rust-crypto",
-    "arco-catalog/jwt-rust-crypto",
-    "arco-delta/jwt-rust-crypto",
-]
+jwt-rust-crypto = ["jwt-aws-lc"]
 
 [dependencies]
 arco-core = { path = "../arco-core", default-features = false }

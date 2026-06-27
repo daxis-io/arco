@@ -24,11 +24,9 @@ gcp = ["arco-core/gcp", "http-client", "dep:gcp_auth", "dep:rustls"]
 aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 jwt-aws-lc = ["arco-core/jwt-aws-lc", "jsonwebtoken/aws_lc_rs", "jsonwebtoken/use_pem"]
-jwt-rust-crypto = [
-    "arco-core/jwt-rust-crypto",
-    "jsonwebtoken/rust_crypto",
-    "jsonwebtoken/use_pem",
-]
+# Compatibility alias. Arco standardizes on AWS-LC so all-features builds keep a
+# single jsonwebtoken provider and avoid the RustCrypto RSA advisory.
+jwt-rust-crypto = ["jwt-aws-lc"]
 test-utils = ["arco-core/test-utils", "http-client", "dep:proptest", "dep:tempfile"]
 
 [dependencies]

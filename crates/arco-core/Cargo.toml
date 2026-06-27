@@ -22,7 +22,9 @@ gcp = []
 aws = []
 azure = []
 jwt-aws-lc = ["jsonwebtoken/aws_lc_rs", "jsonwebtoken/use_pem"]
-jwt-rust-crypto = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
+# Compatibility alias. Arco standardizes on AWS-LC so all-features builds keep a
+# single jsonwebtoken provider and avoid the RustCrypto RSA advisory.
+jwt-rust-crypto = ["jwt-aws-lc"]
 test-utils = ["dep:proptest", "dep:tempfile"]
 sync-compaction = []
 

@@ -28,14 +28,7 @@ jwt-aws-lc = [
     "arco-flow/jwt-aws-lc",
     "arco-iceberg/jwt-aws-lc",
 ]
-jwt-rust-crypto = [
-    "arco-api/jwt-rust-crypto",
-    "arco-core/jwt-rust-crypto",
-    "arco-catalog/jwt-rust-crypto",
-    "arco-delta/jwt-rust-crypto",
-    "arco-flow/jwt-rust-crypto",
-    "arco-iceberg/jwt-rust-crypto",
-]
+jwt-rust-crypto = ["jwt-aws-lc"]
 
 [dependencies]
 arco-api = { path = "../arco-api", default-features = false }

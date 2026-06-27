@@ -436,7 +436,7 @@ async fn ordinary_catalog_reads_never_list_storage() {
 
 fn op_get_head_or_range_path(op: &SpyOp) -> Option<&str> {
     match op {
-        SpyOp::Get { path } | SpyOp::Head { path } | SpyOp::GetRange { path, .. } => Some(path),
+        SpyOp::Get { path, .. } | SpyOp::Head { path } | SpyOp::GetRange { path, .. } => Some(path),
         SpyOp::Put { .. } | SpyOp::Delete { .. } | SpyOp::List { .. } | SpyOp::SignedUrl { .. } => {
             None
         }
@@ -452,6 +452,257 @@ fn is_catalog_domain_read_path(path: &str) -> bool {
         || path.ends_with("manifests/catalog.manifest.json")
         || path.contains("manifests/catalog/")
         || path.contains("snapshots/catalog/")
+}
+
+#[derive(Debug, Clone, Default)]
+struct StorageIoStats {
+    get_count: usize,
+    get_bytes: usize,
+    get_range_count: usize,
+    get_range_bytes: usize,
+    head_count: usize,
+    put_count: usize,
+    put_bytes: usize,
+    parquet_get_count: usize,
+    parquet_get_bytes: usize,
+}
+
+impl StorageIoStats {
+    fn from_ops(ops: &[SpyOp]) -> Self {
+        let mut stats = Self::default();
+        for op in ops {
+            match op {
+                SpyOp::Get { path, byte_len } => {
+                    stats.get_count += 1;
+                    stats.get_bytes += byte_len;
+                    if is_parquet_read_path(path) {
+                        stats.parquet_get_count += 1;
+                        stats.parquet_get_bytes += byte_len;
+                    }
+                }
+                SpyOp::GetRange { byte_len, .. } => {
+                    stats.get_range_count += 1;
+                    stats.get_range_bytes += byte_len;
+                }
+                SpyOp::Head { .. } => {
+                    stats.head_count += 1;
+                }
+                SpyOp::Put { byte_len, .. } => {
+                    stats.put_count += 1;
+                    stats.put_bytes += byte_len;
+                }
+                SpyOp::Delete { .. } | SpyOp::List { .. } | SpyOp::SignedUrl { .. } => {}
+            }
+        }
+        stats
+    }
+}
+
+#[derive(Debug)]
+struct DdlWriteAmplificationSample {
+    ddl_number: usize,
+    put_count: usize,
+    put_bytes: usize,
+    catalog_snapshot_put_count: usize,
+    catalog_snapshot_put_bytes: usize,
+    commits_put_bytes: usize,
+}
+
+fn catalog_snapshot_put_bytes(ops: &[SpyOp]) -> (usize, usize, usize) {
+    let mut put_count = 0;
+    let mut total_bytes = 0;
+    let mut commits_bytes = 0;
+    for op in ops {
+        if let SpyOp::Put { path, byte_len, .. } = op {
+            if path.contains("snapshots/catalog/") && path.ends_with(".parquet") {
+                put_count += 1;
+                total_bytes += byte_len;
+                if path.ends_with("commits.parquet") {
+                    commits_bytes += byte_len;
+                }
+            }
+        }
+    }
+    (put_count, total_bytes, commits_bytes)
+}
+
+#[tokio::test]
+async fn catalog_read_amplification_current_baseline() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage.clone());
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_catalog("default", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    writer
+        .create_schema("default", "analytics", None, WriteOptions::default())
+        .await
+        .expect("create schema");
+    writer
+        .register_table_in_schema(
+            "default",
+            "analytics",
+            RegisterTableInSchemaRequest {
+                name: "events".to_string(),
+                description: None,
+                location: None,
+                format: Some("delta".to_string()),
+                table_type: None,
+                properties: None,
+                columns: vec![test_column("event_id")],
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("register table");
+
+    let reader = CatalogReader::new(storage.clone());
+    spy.clear_ops();
+    let cold = reader
+        .get_table_in_schema("default", "analytics", "events")
+        .await
+        .expect("cold get table");
+    assert!(cold.is_some());
+    let cold_stats = StorageIoStats::from_ops(&spy.ops());
+    eprintln!(
+        "batch7 #279 cold_get_table_in_schema: get_count={} get_bytes={} parquet_get_count={} parquet_get_bytes={} get_range_count={} get_range_bytes={} head_count={}",
+        cold_stats.get_count,
+        cold_stats.get_bytes,
+        cold_stats.parquet_get_count,
+        cold_stats.parquet_get_bytes,
+        cold_stats.get_range_count,
+        cold_stats.get_range_bytes,
+        cold_stats.head_count
+    );
+    assert_eq!(
+        cold_stats.parquet_get_count, 4,
+        "fresh catalog reads should load only the four catalog read-model Parquet files"
+    );
+    assert!(
+        cold_stats.get_count <= 6,
+        "fresh catalog reads should stay within pointer + manifest + four snapshot GETs: {cold_stats:?}"
+    );
+
+    spy.clear_ops();
+    let hot = reader
+        .get_table_in_schema("default", "analytics", "events")
+        .await
+        .expect("hot get table");
+    assert!(hot.is_some());
+    let hot_stats = StorageIoStats::from_ops(&spy.ops());
+    eprintln!(
+        "batch7 #279 hot_same_reader_get_table_in_schema: get_count={} get_bytes={} parquet_get_count={} parquet_get_bytes={} get_range_count={} get_range_bytes={} head_count={}",
+        hot_stats.get_count,
+        hot_stats.get_bytes,
+        hot_stats.parquet_get_count,
+        hot_stats.parquet_get_bytes,
+        hot_stats.get_range_count,
+        hot_stats.get_range_bytes,
+        hot_stats.head_count
+    );
+    assert_eq!(
+        hot_stats.parquet_get_count, 0,
+        "same-process hot catalog reads must not redownload snapshot Parquet"
+    );
+    assert!(
+        hot_stats.get_count <= 2,
+        "same-process hot catalog reads should only revalidate pointer and manifest: {hot_stats:?}"
+    );
+
+    let fresh_reader = CatalogReader::new(storage);
+    spy.clear_ops();
+    let fresh = fresh_reader
+        .get_table_in_schema("default", "analytics", "events")
+        .await
+        .expect("fresh reader get table");
+    assert!(fresh.is_some());
+    let fresh_stats = StorageIoStats::from_ops(&spy.ops());
+    eprintln!(
+        "batch7 #279 fresh_reader_get_table_in_schema: get_count={} get_bytes={} parquet_get_count={} parquet_get_bytes={} get_range_count={} get_range_bytes={} head_count={}",
+        fresh_stats.get_count,
+        fresh_stats.get_bytes,
+        fresh_stats.parquet_get_count,
+        fresh_stats.parquet_get_bytes,
+        fresh_stats.get_range_count,
+        fresh_stats.get_range_bytes,
+        fresh_stats.head_count
+    );
+    assert_eq!(
+        fresh_stats.parquet_get_count, 4,
+        "new CatalogReader instances should make the cold-read cost explicit"
+    );
+}
+
+#[tokio::test]
+async fn tier1_catalog_write_amplification_current_baseline() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let spy = Arc::new(SpyBackend::new(inner));
+    let storage = scoped_storage(spy.clone());
+    let writer = catalog_writer(storage);
+    writer.initialize().await.expect("initialize");
+
+    let mut samples = Vec::new();
+    for ddl_number in 1..=12 {
+        spy.clear_ops();
+        writer
+            .create_namespace(
+                &format!("batch7_namespace_{ddl_number:02}"),
+                None,
+                WriteOptions::default(),
+            )
+            .await
+            .expect("create namespace");
+        let ops = spy.ops();
+        let stats = StorageIoStats::from_ops(&ops);
+        let (catalog_snapshot_put_count, catalog_snapshot_put_bytes, commits_put_bytes) =
+            catalog_snapshot_put_bytes(&ops);
+        samples.push(DdlWriteAmplificationSample {
+            ddl_number,
+            put_count: stats.put_count,
+            put_bytes: stats.put_bytes,
+            catalog_snapshot_put_count,
+            catalog_snapshot_put_bytes,
+            commits_put_bytes,
+        });
+    }
+
+    eprintln!("batch7 #280 tier1 DDL write amplification samples: {samples:?}");
+    let first = samples.first().expect("first sample");
+    let last = samples.last().expect("last sample");
+    assert!(
+        samples
+            .iter()
+            .skip(1)
+            .all(|sample| sample.catalog_snapshot_put_count == 5),
+        "steady-state catalog DDLs should make the five-file snapshot rewrite explicit: {samples:?}"
+    );
+    assert!(
+        first.catalog_snapshot_put_count >= 5,
+        "the first measured DDL may include bootstrap/default-catalog work, but must include the full snapshot rewrite: {first:?}"
+    );
+    assert_eq!(first.ddl_number, 1);
+    assert_eq!(last.ddl_number, 12);
+    assert!(
+        samples.iter().all(
+            |sample| sample.put_count >= sample.catalog_snapshot_put_count
+                && sample.put_bytes >= sample.catalog_snapshot_put_bytes
+        ),
+        "snapshot rewrites should be part of the total DDL write budget: {samples:?}"
+    );
+    let steady_state_first = samples
+        .get(1)
+        .expect("second sample establishes steady-state DDL baseline");
+    assert!(
+        last.catalog_snapshot_put_bytes > steady_state_first.catalog_snapshot_put_bytes,
+        "catalog snapshot write bytes should make history growth visible: steady_state_first={steady_state_first:?} last={last:?}"
+    );
+    assert!(
+        last.commits_put_bytes > steady_state_first.commits_put_bytes,
+        "commits.parquet should make unbounded commit-history growth visible: steady_state_first={steady_state_first:?} last={last:?}"
+    );
 }
 
 #[tokio::test]

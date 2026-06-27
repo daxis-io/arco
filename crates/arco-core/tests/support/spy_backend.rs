@@ -14,14 +14,17 @@ use bytes::Bytes;
 pub enum SpyOp {
     Get {
         path: String,
+        byte_len: usize,
     },
     GetRange {
         path: String,
         start: u64,
         end: u64,
+        byte_len: usize,
     },
     Put {
         path: String,
+        byte_len: usize,
         precondition: WritePrecondition,
     },
     Delete {
@@ -99,29 +102,67 @@ impl SpyBackend {
 #[async_trait]
 impl StorageBackend for SpyBackend {
     async fn get(&self, path: &str) -> Result<Bytes> {
-        self.record(SpyOp::Get {
-            path: path.to_string(),
-        });
         if self.should_fail_get(path) {
+            self.record(SpyOp::Get {
+                path: path.to_string(),
+                byte_len: 0,
+            });
             return Err(Error::storage(format!(
                 "unexpected get() call for path '{path}'"
             )));
         }
-        self.inner.get(path).await
+        match self.inner.get(path).await {
+            Ok(bytes) => {
+                self.record(SpyOp::Get {
+                    path: path.to_string(),
+                    byte_len: bytes.len(),
+                });
+                Ok(bytes)
+            }
+            Err(err) => {
+                self.record(SpyOp::Get {
+                    path: path.to_string(),
+                    byte_len: 0,
+                });
+                Err(err)
+            }
+        }
     }
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
-        self.record(SpyOp::GetRange {
-            path: path.to_string(),
-            start: range.start,
-            end: range.end,
-        });
         if self.should_fail_get(path) {
+            self.record(SpyOp::GetRange {
+                path: path.to_string(),
+                start: range.start,
+                end: range.end,
+                byte_len: 0,
+            });
             return Err(Error::storage(format!(
                 "unexpected get_range() call for path '{path}'"
             )));
         }
-        self.inner.get_range(path, range).await
+        let start = range.start;
+        let end = range.end;
+        match self.inner.get_range(path, range).await {
+            Ok(bytes) => {
+                self.record(SpyOp::GetRange {
+                    path: path.to_string(),
+                    start,
+                    end,
+                    byte_len: bytes.len(),
+                });
+                Ok(bytes)
+            }
+            Err(err) => {
+                self.record(SpyOp::GetRange {
+                    path: path.to_string(),
+                    start,
+                    end,
+                    byte_len: 0,
+                });
+                Err(err)
+            }
+        }
     }
 
     async fn put(
@@ -132,6 +173,7 @@ impl StorageBackend for SpyBackend {
     ) -> Result<WriteResult> {
         self.record(SpyOp::Put {
             path: path.to_string(),
+            byte_len: data.len(),
             precondition: precondition.clone(),
         });
         self.inner.put(path, data, precondition).await

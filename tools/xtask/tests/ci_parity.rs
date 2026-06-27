@@ -56,6 +56,21 @@ fn ci_parity_command_is_registered_and_passes_static_checks() {
 }
 
 #[test]
+fn flow_boundary_check_is_registered_and_passes_current_allowlist() {
+    let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
+        .arg("flow-boundary-check")
+        .current_dir(repo_root())
+        .output()
+        .expect("run xtask flow-boundary-check");
+    let output_text = command_output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "xtask flow-boundary-check should pin API-to-flow contract boundary exceptions:\n{output_text}"
+    );
+}
+
+#[test]
 fn ci_runs_deterministic_user_acceptance_uat_gate() {
     let ci =
         fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");

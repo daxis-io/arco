@@ -81,6 +81,8 @@ enum Commands {
     },
     /// Enforce engine dependency and query-read boundaries.
     EngineBoundaryCheck,
+    /// Enforce API-to-flow contract boundary drift guards.
+    FlowBoundaryCheck,
     ParityMatrixCheck,
     /// Generate endpoint inventory from vendored Unity Catalog OSS OpenAPI fixture
     UcOpenapiInventory,
@@ -101,6 +103,7 @@ fn main() -> Result<()> {
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
         Commands::EngineBoundaryCheck => run_engine_boundary_check(),
+        Commands::FlowBoundaryCheck => run_flow_boundary_check(),
         Commands::VerifyIntegrity {
             verbose,
             dry_run,
@@ -302,6 +305,7 @@ fn run_ci() -> Result<()> {
     run_doctor()?;
     run_adr_check()?;
     run_engine_boundary_check()?;
+    run_flow_boundary_check()?;
     run_parity_matrix_check()?;
     run_repo_hygiene_check()?;
     run_cmd("buf", &["lint", "proto/"])?;
@@ -1172,6 +1176,96 @@ fn run_engine_boundary_check() -> Result<()> {
 
     println!("Engine boundaries look good!");
     Ok(())
+}
+
+fn run_flow_boundary_check() -> Result<()> {
+    println!("Validating API-to-flow contract boundaries...\n");
+
+    let allowed_compactor_imports: HashMap<&str, &str> = HashMap::from([
+        (
+            "crates/arco-api/src/orchestration_compaction.rs",
+            "API-owned append-and-compact composition still delegates to the flow compactor",
+        ),
+        (
+            "crates/arco-api/src/routes/manifests.rs",
+            "manifest route still reads compacted flow state while the contracts-only manifest projection is pending",
+        ),
+        (
+            "crates/arco-api/src/routes/orchestration.rs",
+            "legacy orchestration route still maps compacted flow rows to API responses",
+        ),
+        (
+            "crates/arco-api/src/routes/tasks.rs",
+            "worker callback routes still validate task tokens against compacted task rows",
+        ),
+        (
+            "crates/arco-api/src/system_tables.rs",
+            "system-table projection still materializes flow-owned rows directly",
+        ),
+    ]);
+
+    let mut errors = Vec::new();
+    let mut observed_allowed = HashSet::new();
+    for entry in walkdir::WalkDir::new("crates/arco-api/src") {
+        let entry = entry.context("walk crates/arco-api/src")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let path_string = normalize_path(path);
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        for (line_index, line) in text.lines().enumerate() {
+            if !line.contains("arco_flow::orchestration::compactor") {
+                continue;
+            }
+            if allowed_compactor_imports.contains_key(path_string.as_str()) {
+                observed_allowed.insert(path_string.clone());
+                continue;
+            }
+            errors.push(format!(
+                "{}:{}: direct imports from `arco_flow::orchestration::compactor` must go through a flow-owned contract/state service",
+                path_string,
+                line_index + 1
+            ));
+        }
+    }
+
+    for path in allowed_compactor_imports.keys() {
+        if !observed_allowed.contains(*path) {
+            errors.push(format!(
+                "{path}: obsolete flow compactor boundary exception; remove it from `flow-boundary-check`"
+            ));
+        }
+    }
+
+    if !errors.is_empty() {
+        println!("Flow boundary errors:");
+        for err in &errors {
+            println!("  - {err}");
+        }
+        println!("\nCurrent allowed exceptions:");
+        for (path, reason) in &allowed_compactor_imports {
+            println!("  - {path}: {reason}");
+        }
+        anyhow::bail!("flow-boundary-check failed with {} error(s)", errors.len());
+    }
+
+    println!(
+        "Flow boundary check passed with {} documented compactor exception(s).",
+        allowed_compactor_imports.len()
+    );
+    Ok(())
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn collect_dependency_tables(manifest: &toml::Value) -> Vec<(String, &toml::value::Table)> {

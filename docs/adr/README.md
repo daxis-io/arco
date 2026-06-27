@@ -26,9 +26,9 @@ Each ADR follows this structure:
 | [011](adr-011-partition-identity.md) | Canonical partition identity | Accepted |
 | [012](adr-012-asset-key-format.md) | AssetKey canonical string format | Accepted |
 | [013](adr-013-id-wire-formats.md) | ID type wire formats | Accepted |
-| [014](adr-014-leader-election.md) | Leader election strategy | Accepted |
+| [014](adr-014-leader-election.md) | Leader election strategy | Superseded |
 | [015](adr-015-postgres-store.md) | Postgres orchestration store | Superseded |
-| [016](adr-016-tenant-quotas.md) | Tenant quotas and fairness | Accepted |
+| [016](adr-016-tenant-quotas.md) | Tenant quotas and fairness | Deprecated |
 | [017](adr-017-cloud-tasks-dispatcher.md) | Cloud Tasks dispatcher | Accepted |
 | [018](adr-018-tier1-write-path.md) | Tier-1 write path architecture | Accepted |
 | [019](adr-019-existence-privacy.md) | Existence privacy | Accepted |

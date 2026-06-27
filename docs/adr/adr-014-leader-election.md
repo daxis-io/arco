@@ -1,7 +1,12 @@
 # ADR-014: Leader Election Strategy
 
 ## Status
-Accepted
+Superseded
+
+Superseded for shipped orchestration runtime behavior by ADR-020, ADR-024, and
+ADR-041. The `arco-flow::leader` module remains public compatibility and
+test/development surface, but current production automation binaries do not wire
+the scheduler-era `LeaderElector` trait into their runtime path.
 
 ## Context
 Arco's scheduler needs leader election to ensure:

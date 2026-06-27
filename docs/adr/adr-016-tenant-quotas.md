@@ -1,7 +1,14 @@
 # ADR-016: Tenant Quotas and Fairness
 
 ## Status
-Accepted
+Deprecated
+
+Deprecated for shipped orchestration runtime behavior. The `arco-flow::quota`
+module and DRR scheduler helper remain public compatibility and
+test/development surface, but current production automation binaries do not wire
+the scheduler-era `QuotaManager` path into dispatch enforcement. ADR-020,
+ADR-024, and ADR-041 define the current file-native orchestration runtime; they
+do not define replacement tenant-quota semantics.
 
 ## Context
 Multi-tenant orchestration requires:

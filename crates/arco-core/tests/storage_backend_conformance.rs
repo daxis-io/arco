@@ -3,6 +3,8 @@
 
 #[path = "support/barrier_backend.rs"]
 mod barrier_backend;
+#[path = "support/spy_backend.rs"]
+mod spy_backend;
 
 use std::fmt;
 use std::io;
@@ -22,6 +24,7 @@ use object_store::{
     DynObjectStore, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
     PutMultipartOpts, PutOptions, PutPayload, PutResult,
 };
+use spy_backend::{SpyBackend, SpyOp};
 use ulid::Ulid;
 
 #[derive(Debug, Default)]
@@ -426,6 +429,46 @@ async fn object_store_backend_preserves_non_cas_not_found_write_errors() {
     assert!(
         unconditional.is_err(),
         "unconditional write NotFound must remain an operational error, got {unconditional:?}"
+    );
+}
+
+#[tokio::test]
+async fn spy_backend_records_failed_get_attempts() {
+    let spy = SpyBackend::new(Arc::new(MemoryBackend::new()));
+
+    let result = spy.get("missing/object.json").await;
+
+    assert!(result.is_err(), "missing object read should fail");
+    let ops = spy.ops();
+    assert!(
+        matches!(
+            ops.as_slice(),
+            [SpyOp::Get { path, byte_len }]
+                if path == "missing/object.json" && *byte_len == 0
+        ),
+        "spy should record failed get attempts with zero bytes: {ops:?}"
+    );
+}
+
+#[tokio::test]
+async fn spy_backend_records_failed_get_range_attempts() {
+    let spy = SpyBackend::new(Arc::new(MemoryBackend::new()));
+
+    let result = spy.get_range("missing/object.json", 2..7).await;
+
+    assert!(result.is_err(), "missing range read should fail");
+    let ops = spy.ops();
+    assert!(
+        matches!(
+            ops.as_slice(),
+            [SpyOp::GetRange {
+                path,
+                start: 2,
+                end: 7,
+                byte_len
+            }] if path == "missing/object.json" && *byte_len == 0
+        ),
+        "spy should record failed get_range attempts with zero bytes: {ops:?}"
     );
 }
 

@@ -44,6 +44,40 @@ Catalog product state follows Arco's existing immutable publication model.
     repair, migration, or anti-entropy tools, but it is not the request-time
     correctness source for managed control-plane operations.
 
+## Replay And Watermark Protocols
+
+Current implementations deliberately share the immutable publication boundary,
+but they do not yet share one replay cursor implementation.
+
+| Surface | Replay input | Ordering key | Watermark/freshness rule | Late or out-of-order event behavior |
+|---|---|---|---|---|
+| Tier-1 catalog sync compaction | Explicit event paths supplied by the lock holder | Path-derived event ID; watermark records the max processed event ID | `CatalogDomainManifest.watermark_event_id` advances to the max accepted event ID | Catalog events at or below the current watermark are skipped; lineage/search sync compaction currently accepts the explicit paths and records the max input event ID |
+| Tier-2 executions compaction | Listed ledger paths or explicit paths | Ledger path/event ID, with optional envelope sequence for record replacement | `ExecutionsManifest.watermark_event_id` advances to the max processed event ID | Listed compaction detects newly-modified files at or below the watermark and applies the configured `LateEventPolicy`; explicit compaction can skip, log, quarantine, or process late paths depending on policy |
+| Orchestration flow compaction | Explicit orchestration event paths, or a rebuild manifest filtered by watermarks | `OrchestrationEvent.event_id`; producer timestamps are metadata only | `last_committed_event_id` advances to the highest processed event ID; `last_visible_event_id` and `events_processed_through` advance only in visible durability mode | Explicit older event IDs may still fold into state and publish a delta; the committed watermark does not regress |
+| Metastore projection publication | Metastore events replayed by sequence into projection files | Numeric event sequence | Published projection manifest records both `ledger_watermark_sequence` and `ledger_watermark` event ID; enforcement reads require an exact match with the latest ledger watermark | Candidate publications older than the visible projection are rejected; same-sequence publications must be content-identical |
+
+Shared invariants:
+
+- Published projections are immutable artifacts selected by a CAS-protected
+  pointer or manifest update.
+- A visible response must identify a replay cut that readers can observe without
+  scanning raw ledgers.
+- Watermarks are freshness boundaries, not authorization bypasses. Enforcement
+  routes fail closed when the required projection is missing, stale, corrupt, or
+  unsupported.
+- Replay order must be deterministic inside a surface. Cross-surface
+  consolidation is future work unless a code change proves equivalent behavior
+  for the surface being migrated.
+
+Non-goals for the current implementation:
+
+- Do not replace explicit Tier-1 sync compaction with object-store listing on
+  the request path.
+- Do not assume flow's committed/visible watermark split applies to catalog DDL
+  without a migration plan and tests.
+- Do not use the metastore sequence watermark as a generic replacement for
+  path/event-ID watermarks outside the metastore projection kernel.
+
 ## Read-After-Write
 
 For synchronous mutation APIs, a successful visible response means the mutation

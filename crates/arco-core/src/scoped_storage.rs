@@ -221,9 +221,9 @@ impl ScopedStorage {
     // These methods use old domain naming conventions (core, execution, governance).
     // Use the canonical methods below (manifest, lock, snapshot_dir, etc.) instead.
     //
-    // Deprecation timeline:
+    // Compatibility timeline:
     // - v0.1.x: Deprecated with warnings
-    // - v0.2.x: Removed
+    // - v0.2.x: Retained for source compatibility; do not use in new code
     // =========================================================================
 
     /// Path to the root catalog manifest.

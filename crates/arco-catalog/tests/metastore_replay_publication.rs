@@ -677,7 +677,7 @@ async fn storage_governance_projection_cache_reuses_hot_state() -> Result<()> {
         .filter(|op| {
             matches!(
                 op,
-                SpyOp::Get { path } if path.ends_with("storage_governance.parquet")
+                SpyOp::Get { path, .. } if path.ends_with("storage_governance.parquet")
             )
         })
         .collect::<Vec<_>>();
@@ -716,7 +716,7 @@ async fn storage_governance_projection_cache_hot_hit_does_not_read_ledger_events
                 prefix.ends_with("ledger/metastore/")
                     || prefix.ends_with("ledger/metastore-sequences/")
             }
-            SpyOp::Get { path } => path.contains("/ledger/metastore/"),
+            SpyOp::Get { path, .. } => path.contains("/ledger/metastore/"),
             _ => false,
         })
         .collect::<Vec<_>>();

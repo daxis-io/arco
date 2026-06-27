@@ -4248,7 +4248,7 @@ pub(crate) async fn trigger_run(
 
     let mut request = request;
     if request.run_key.is_none() {
-        request.run_key = ctx.idempotency_key.clone();
+        request.run_key.clone_from(&ctx.idempotency_key);
     }
 
     validate_trigger_run_request_limits(&request)?;

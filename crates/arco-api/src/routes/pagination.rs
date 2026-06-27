@@ -10,7 +10,7 @@ const MAX_LIMIT: usize = 500;
 
 /// Query parameters for existing catalog-style list endpoints.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct ListPageQuery {
+pub struct ListPageQuery {
     /// Maximum number of items to return.
     pub limit: Option<usize>,
     /// Opaque cursor returned by the previous page.
@@ -22,7 +22,7 @@ struct ListCursor {
     key: String,
 }
 
-pub(crate) fn page_by_key<T>(
+pub(super) fn page_by_key<T>(
     mut items: Vec<T>,
     query: &ListPageQuery,
     key: impl Fn(&T) -> &str,
@@ -37,7 +37,10 @@ pub(crate) fn page_by_key<T>(
     });
     let end = start.saturating_add(limit).min(items.len());
     let next_cursor = if end < items.len() && end > start {
-        Some(encode_cursor(key(&items[end - 1]))?)
+        items
+            .get(end - 1)
+            .map(|item| encode_cursor(key(item)))
+            .transpose()?
     } else {
         None
     };

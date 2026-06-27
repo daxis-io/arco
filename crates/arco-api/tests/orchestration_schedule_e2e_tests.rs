@@ -533,6 +533,72 @@ async fn schedule_crud_enable_disable_roundtrips_and_appears_in_list() -> Result
 }
 
 #[tokio::test]
+async fn schedule_upsert_rejects_same_idempotency_key_with_different_payload() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let router = test_router(backend.clone());
+
+    let schedule_id = "daily-users";
+    let path = format!("/api/v1/workspaces/test-workspace/schedules/{schedule_id}");
+    let idempotency_key = "idem-schedule-upsert-conflict-001";
+
+    let create_body = serde_json::json!({
+        "cronExpression": "0 0 * * *",
+        "timezone": "UTC",
+        "catchupWindowMinutes": 60,
+        "maxCatchupTicks": 3,
+        "assetSelection": ["analytics/users"],
+        "enabled": true
+    });
+
+    let (status, created): (_, serde_json::Value) = helpers::put_json_with_headers(
+        router.clone(),
+        &path,
+        create_body,
+        &[("Idempotency-Key", idempotency_key)],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        created.get("cronExpression"),
+        Some(&serde_json::Value::String("0 0 * * *".to_string()))
+    );
+
+    let conflicting_body = serde_json::json!({
+        "cronExpression": "0 1 * * *",
+        "timezone": "UTC",
+        "catchupWindowMinutes": 60,
+        "maxCatchupTicks": 3,
+        "assetSelection": ["analytics/users"],
+        "enabled": true
+    });
+
+    let (status, conflict): (_, serde_json::Value) = helpers::put_json_with_headers(
+        router.clone(),
+        &path,
+        conflicting_body,
+        &[("Idempotency-Key", idempotency_key)],
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        conflict
+            .get("message")
+            .and_then(|value| value.as_str())
+            .is_some_and(|message| message.contains("different schedule mutation")),
+        "expected schedule idempotency conflict message, got {conflict:?}"
+    );
+
+    let (status, schedule): (_, serde_json::Value) = helpers::get_json(router, &path).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        schedule.get("cronExpression"),
+        Some(&serde_json::Value::String("0 0 * * *".to_string()))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn schedule_tick_detail_exposes_run_key_and_run_id_linkage() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let router = test_router(backend.clone());

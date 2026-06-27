@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -22,6 +22,7 @@ use utoipa::ToSchema;
 use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
+use crate::routes::pagination::{ListPageQuery, page_by_key};
 use crate::server::AppState;
 use arco_catalog::Tier1Compactor;
 use arco_catalog::idempotency::{
@@ -59,6 +60,9 @@ pub struct NamespaceResponse {
 pub struct ListNamespacesResponse {
     /// List of namespaces.
     pub namespaces: Vec<NamespaceResponse>,
+    /// Cursor for the next page, when more namespaces are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Creates namespace routes.
@@ -252,6 +256,10 @@ pub(crate) async fn create_namespace(
     get,
     path = "/api/v1/namespaces",
     tag = "namespaces",
+    params(
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 500, description = "Maximum number of namespaces to return (default 100, max 500)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous page")
+    ),
     responses(
         (status = 200, description = "Namespaces listed", body = ListNamespacesResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorBody),
@@ -264,6 +272,7 @@ pub(crate) async fn create_namespace(
 pub(crate) async fn list_namespaces(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
+    AxumQuery(query): AxumQuery<ListPageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -288,8 +297,12 @@ pub(crate) async fn list_namespaces(
             updated_at: format_timestamp(ns.updated_at),
         })
         .collect();
+    let (namespaces, next_cursor) = page_by_key(namespaces, &query, |namespace| &namespace.name)?;
 
-    Ok(Json(ListNamespacesResponse { namespaces }))
+    Ok(Json(ListNamespacesResponse {
+        namespaces,
+        next_cursor,
+    }))
 }
 
 /// Get a namespace by name.

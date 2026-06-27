@@ -296,6 +296,7 @@ impl From<CatalogError> for ApiError {
             | CatalogError::Parquet { message }
             | CatalogError::InvariantViolation { message } => Self::internal(message),
             CatalogError::UnsupportedOperation { message } => Self::not_acceptable(message),
+            error => Self::internal(error.to_string()),
         }
     }
 }
@@ -315,6 +316,7 @@ impl From<CoreError> for ApiError {
             CoreError::Storage { message, .. }
             | CoreError::Serialization { message }
             | CoreError::Internal { message } => Self::internal(message),
+            error => Self::internal(error.to_string()),
         }
     }
 }

@@ -232,6 +232,7 @@ impl From<arco_delta::DeltaError> for ApiError {
             arco_delta::DeltaError::NotFound { message } => Self::not_found(message),
             arco_delta::DeltaError::Storage(e) => Self::from(e),
             arco_delta::DeltaError::Serialization { message } => Self::internal(message),
+            error => Self::internal(error.to_string()),
         }
     }
 }

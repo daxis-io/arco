@@ -17,6 +17,7 @@ pub type IcebergResult<T> = Result<T, IcebergError>;
 /// Maps to HTTP status codes and Iceberg exception types as defined
 /// in the REST Catalog specification.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IcebergError {
     /// Bad request (400) - Invalid input.
     #[error("Bad request: {message}")]
@@ -340,6 +341,12 @@ impl From<CatalogError> for IcebergError {
             }
             CatalogError::UnsupportedOperation { message } => {
                 Self::UnsupportedOperation { message }
+            }
+            error => {
+                tracing::warn!(internal_error = %error, "redacted unknown Iceberg catalog error");
+                Self::Internal {
+                    message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+                }
             }
         }
     }

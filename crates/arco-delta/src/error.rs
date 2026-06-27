@@ -5,6 +5,7 @@ pub type Result<T> = std::result::Result<T, DeltaError>;
 
 /// Delta-specific errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DeltaError {
     /// Invalid input from a caller.
     #[error("bad request: {message}")]

@@ -10,6 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors that can occur in Arco operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// An invalid identifier was provided.
     #[error("invalid identifier: {message}")]
@@ -43,6 +44,9 @@ pub enum Error {
     },
 
     /// The requested resource was not found.
+    ///
+    /// Use this variant for typed domain resources where callers need both the
+    /// resource type and identifier in structured form.
     #[error("not found: {resource_type} with id {id}")]
     ResourceNotFound {
         /// The type of resource that was not found.
@@ -51,7 +55,10 @@ pub enum Error {
         id: String,
     },
 
-    /// A path or object was not found (simple variant for storage).
+    /// A path or object was not found.
+    ///
+    /// Use this variant for storage paths and untyped compatibility errors
+    /// where preserving the legacy message is the public contract.
     #[error("not found: {0}")]
     NotFound(String),
 

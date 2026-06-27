@@ -54,8 +54,14 @@ catalog state, not separate metastore implementations.
 
 ## List, Filter, And Sort
 
-- List APIs are paginated from first release with `page_size`, `page_token`,
-  deterministic ordering, and maximum page size.
+- List APIs are paginated from first release with documented limit and token
+  parameter names, deterministic ordering, and maximum page size.
+- Existing `/api/v1` catalog, namespace, table, and Delta route families use
+  `limit`, `cursor`, and `next_cursor` to preserve their snake_case JSON
+  compatibility contract.
+- New native route families should use `page_size`, `page_token`, and
+  `nextPageToken` unless a compatibility adapter must expose different
+  protocol-native names.
 - Filters and sorts use explicit allowlists. Raw SQL-like filter strings are
   not part of the native API contract.
 - List responses must not reveal hidden objects through counts, errors, timing,
@@ -156,7 +162,7 @@ Before a new public route is merged, reviewers should be able to identify:
 | Contract item | Required evidence |
 |---|---|
 | Stable identity | Object IDs are authorization keys and names resolve before enforcement |
-| Pagination | List endpoints have `page_size`, `page_token`, maximum size, and deterministic ordering |
+| Pagination | List endpoints have documented limit/token names, maximum size, and deterministic ordering |
 | Preconditions | Mutating retries and stale writes use idempotency keys, ETags, generations, or explicit protocol tokens |
 | Errors | Responses use stable codes, request IDs, retryability, and safe messages |
 | Visibility | Sensitive fields have ordinary, owner, and admin response tests |

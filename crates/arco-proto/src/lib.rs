@@ -75,6 +75,7 @@ pub use arco::controlplane::v1::*;
 pub use arco::orchestration::v1::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TaskOutputContractError {
     MissingMaterializationId,
     UnknownVisibilityState(i32),
@@ -124,6 +125,7 @@ impl std::fmt::Display for TaskOutputContractError {
 impl std::error::Error for TaskOutputContractError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlPlaneTransactionContractError {
     MissingCatalogDdl,
     MissingCatalogDdlOp,
@@ -143,6 +145,7 @@ pub enum ControlPlaneTransactionContractError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CatalogDdlContractError {
     EmptyField {
         message: &'static str,
@@ -157,6 +160,7 @@ pub enum CatalogDdlContractError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MetastoreMutationContractError {
     MissingOperation,
     MissingGrantOperation,
@@ -171,6 +175,7 @@ pub enum MetastoreMutationContractError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CatalogControlPlaneScopeContractError {
     EmptyTenantId,
     EmptyWorkspaceId,
@@ -322,6 +327,7 @@ impl std::fmt::Display for CatalogControlPlaneScopeContractError {
 impl std::error::Error for CatalogControlPlaneScopeContractError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OrchestrationEventContractError {
     EmptyEventId,
     MissingTimestamp,
@@ -388,6 +394,7 @@ impl std::fmt::Display for OrchestrationEventContractError {
 impl std::error::Error for OrchestrationEventContractError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WorkerCallbackContractError {
     AttemptMustBePositive,
     ProgressPctOutOfRange(u32),

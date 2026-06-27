@@ -542,7 +542,8 @@ async fn upsert_schedule_definitions(
     post,
     path = "/api/v1/workspaces/{workspace_id}/manifests",
     params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional idempotency key for manifest deployment retries")
     ),
     request_body = DeployManifestRequest,
     responses(

@@ -154,7 +154,7 @@ impl SyncCompactor for CompactorClient {
             .unwrap_or_else(|| String::from_utf8_lossy(&body).to_string());
 
         match status {
-            StatusCode::CONFLICT => Err(CatalogError::PreconditionFailed { message }),
+            StatusCode::CONFLICT => Err(CatalogError::CasFailed { message }),
             StatusCode::BAD_REQUEST => Err(CatalogError::Validation { message }),
             StatusCode::NOT_IMPLEMENTED => Err(CatalogError::InvariantViolation { message }),
             _ => Err(CatalogError::Storage {
@@ -297,16 +297,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_compact_maps_conflict_to_precondition_failed() {
+    async fn sync_compact_preserves_conflict_status_for_lock_races() {
         let base_url =
-            spawn_status_server(StatusCode::CONFLICT, json!({ "message": "stale" })).await;
+            spawn_status_server(StatusCode::CONFLICT, json!({ "message": "lock busy" })).await;
         let client = CompactorClient::new(base_url);
 
         let result = client.sync_compact(sample_request()).await;
-        assert!(matches!(
-            result,
-            Err(CatalogError::PreconditionFailed { .. })
-        ));
+        assert!(matches!(result, Err(CatalogError::CasFailed { .. })));
     }
 
     #[tokio::test]

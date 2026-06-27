@@ -756,7 +756,7 @@ pub struct ListSchedulesResponse {
 }
 
 /// Request body for creating/updating a schedule definition.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpsertScheduleRequest {
     /// Cron expression for the schedule.
@@ -3857,6 +3857,21 @@ fn schedule_definition_matches_request(
             == normalize_asset_selection(&request.asset_selection)
 }
 
+fn ensure_schedule_idempotency_key_unused(
+    fold_state: &FoldState,
+    idempotency_key: &str,
+) -> Result<(), ApiError> {
+    if fold_state.idempotency_keys.contains_key(idempotency_key) {
+        return Err(schedule_idempotency_conflict());
+    }
+
+    Ok(())
+}
+
+fn schedule_idempotency_conflict() -> ApiError {
+    ApiError::conflict("idempotency key already used for a different schedule mutation")
+}
+
 fn validate_schedule_upsert(
     schedule_id: &str,
     request: &UpsertScheduleRequest,
@@ -4193,7 +4208,8 @@ fn filter_sensor_evals_by_time_range(
     post,
     path = "/api/v1/workspaces/{workspace_id}/runs",
     params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional idempotency key used as runKey when the request body omits runKey")
     ),
     request_body = TriggerRunRequestOpenApi,
     responses(
@@ -4228,6 +4244,11 @@ pub(crate) async fn trigger_run(
     // Validate selection
     if request.selection.is_empty() {
         return Err(ApiError::bad_request("selection cannot be empty"));
+    }
+
+    let mut request = request;
+    if request.run_key.is_none() {
+        request.run_key.clone_from(&ctx.idempotency_key);
     }
 
     validate_trigger_run_request_limits(&request)?;
@@ -5574,6 +5595,26 @@ pub(crate) async fn get_schedule(
     Ok(Json(map_schedule(definition, schedule_state)))
 }
 
+/// Upsert a schedule definition.
+#[utoipa::path(
+    put,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional event idempotency discriminator for schedule mutation retries")
+    ),
+    request_body = UpsertScheduleRequest,
+    responses(
+        (status = 201, description = "Schedule created", body = ScheduleResponse),
+        (status = 200, description = "Schedule updated or existing equivalent schedule returned", body = ScheduleResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorBody),
+        (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
+        (status = 404, description = "Workspace not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
 pub(crate) async fn upsert_schedule(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
@@ -5586,6 +5627,7 @@ pub(crate) async fn upsert_schedule(
     let fold_state = load_orchestration_state(&ctx, &state).await?;
     let existing = fold_state.schedule_definitions.get(schedule_id.as_str());
     let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
+    let requested_schedule = request.clone();
 
     if let Some(existing) = existing {
         if schedule_definition_matches_request(existing, &request) {
@@ -5627,6 +5669,9 @@ pub(crate) async fn upsert_schedule(
         .clone()
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_def_api:{schedule_id}:{request_key}");
+    if ctx.idempotency_key.is_some() {
+        ensure_schedule_idempotency_key_unused(&fold_state, &event.idempotency_key)?;
+    }
 
     append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
@@ -5635,6 +5680,11 @@ pub(crate) async fn upsert_schedule(
         .schedule_definitions
         .get(schedule_id.as_str())
         .ok_or_else(|| ApiError::internal("schedule definition missing after upsert"))?;
+    if ctx.idempotency_key.is_some()
+        && !schedule_definition_matches_request(definition, &requested_schedule)
+    {
+        return Err(schedule_idempotency_conflict());
+    }
 
     let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
 
@@ -5647,11 +5697,29 @@ pub(crate) async fn upsert_schedule(
     Ok((status_code, Json(map_schedule(definition, schedule_state))))
 }
 
+/// Enable a schedule.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/enable",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional event idempotency discriminator for schedule mutation retries")
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Schedule enabled or already enabled", body = ScheduleResponse),
+        (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
+        (status = 404, description = "Schedule not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
 pub(crate) async fn enable_schedule(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, schedule_id)): Path<(String, String)>,
-    Json(_): Json<serde_json::Value>,
+    Json(_body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
 
@@ -5693,6 +5761,9 @@ pub(crate) async fn enable_schedule(
         .clone()
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_enable:{schedule_id}:{request_key}");
+    if ctx.idempotency_key.is_some() {
+        ensure_schedule_idempotency_key_unused(&fold_state, &event.idempotency_key)?;
+    }
 
     append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
@@ -5701,6 +5772,9 @@ pub(crate) async fn enable_schedule(
         .schedule_definitions
         .get(schedule_id.as_str())
         .ok_or_else(|| ApiError::internal("schedule definition missing after enable"))?;
+    if ctx.idempotency_key.is_some() && !definition.enabled {
+        return Err(schedule_idempotency_conflict());
+    }
 
     let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
 
@@ -5710,11 +5784,29 @@ pub(crate) async fn enable_schedule(
     ))
 }
 
+/// Disable a schedule.
+#[utoipa::path(
+    post,
+    path = "/api/v1/workspaces/{workspace_id}/schedules/{schedule_id}/disable",
+    params(
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("schedule_id" = String, Path, description = "Schedule ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional event idempotency discriminator for schedule mutation retries")
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Schedule disabled or already disabled", body = ScheduleResponse),
+        (status = 409, description = "Idempotency key conflict", body = ApiErrorBody),
+        (status = 404, description = "Schedule not found", body = ApiErrorBody),
+    ),
+    tag = "Orchestration",
+    security(("bearerAuth" = []))
+)]
 pub(crate) async fn disable_schedule(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Path((workspace_id, schedule_id)): Path<(String, String)>,
-    Json(_): Json<serde_json::Value>,
+    Json(_body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
 
@@ -5756,6 +5848,9 @@ pub(crate) async fn disable_schedule(
         .clone()
         .unwrap_or_else(|| event.event_id.clone());
     event.idempotency_key = format!("sched_disable:{schedule_id}:{request_key}");
+    if ctx.idempotency_key.is_some() {
+        ensure_schedule_idempotency_key_unused(&fold_state, &event.idempotency_key)?;
+    }
 
     append_event_and_compact(&state.config, storage, event, Some(ctx.request_id.as_str())).await?;
 
@@ -5764,6 +5859,9 @@ pub(crate) async fn disable_schedule(
         .schedule_definitions
         .get(schedule_id.as_str())
         .ok_or_else(|| ApiError::internal("schedule definition missing after disable"))?;
+    if ctx.idempotency_key.is_some() && definition.enabled {
+        return Err(schedule_idempotency_conflict());
+    }
 
     let schedule_state = fold_state.schedule_state.get(schedule_id.as_str());
 
@@ -6012,7 +6110,8 @@ pub(crate) async fn list_sensor_evals(
     post,
     path = "/api/v1/workspaces/{workspace_id}/backfills",
     params(
-        ("workspace_id" = String, Path, description = "Workspace ID")
+        ("workspace_id" = String, Path, description = "Workspace ID"),
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional idempotency key used when the request body omits clientRequestId")
     ),
     request_body = CreateBackfillRequest,
     responses(
@@ -8588,6 +8687,129 @@ mod tests {
         let stored_plan: OrchestrationEvent = serde_json::from_slice(&plan_bytes)?;
         assert_eq!(stored_plan.event_id, plan_event_id);
         assert_eq!(stored_plan.event_type, "PlanCreated");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_run_uses_idempotency_header_when_run_key_is_absent() -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_01".to_string(),
+            idempotency_key: Some("trigger-header-key-01".to_string()),
+        };
+
+        let backend = state.storage_backend()?;
+        let storage = ctx.scoped_storage(backend)?;
+        seed_latest_manifest_code_version(&storage, &ctx, "abc123").await?;
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/daily".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let first = trigger_run(
+            State(state.clone()),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request.clone()),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?
+        .into_response();
+        assert_eq!(first.status(), StatusCode::CREATED);
+
+        let first_body = axum::body::to_bytes(first.into_body(), 1024).await?;
+        let first_payload: TriggerRunResponse = serde_json::from_slice(&first_body)?;
+
+        let second = trigger_run(
+            State(state),
+            RequestContext {
+                request_id: "req_02".to_string(),
+                ..ctx
+            },
+            Path("workspace".to_string()),
+            Json(request),
+        )
+        .await
+        .map_err(|err| anyhow!("{err:?}"))?
+        .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let second_body = axum::body::to_bytes(second.into_body(), 1024).await?;
+        let second_payload: TriggerRunResponse = serde_json::from_slice(&second_body)?;
+
+        assert_eq!(second_payload.run_id, first_payload.run_id);
+        assert_eq!(second_payload.plan_id, first_payload.plan_id);
+        assert!(!second_payload.created);
+
+        let reservation = get_reservation(&storage, "trigger-header-key-01")
+            .await?
+            .expect("reservation stored under Idempotency-Key");
+        assert_eq!(reservation.run_id, first_payload.run_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_run_rejects_overlong_idempotency_header_when_run_key_is_absent()
+    -> Result<()> {
+        let mut config = crate::config::Config::default();
+        config.debug = true;
+        let state = Arc::new(AppState::with_memory_storage(config));
+        let overlong_key = "x".repeat(MAX_RUN_KEY_LEN + 1);
+
+        let ctx = RequestContext {
+            tenant: "tenant".to_string(),
+            workspace: "workspace".to_string(),
+            user_id: Some("user@example.com".to_string()),
+            groups: vec![],
+            request_id: "req_01".to_string(),
+            idempotency_key: Some(overlong_key.clone()),
+        };
+
+        let storage = ctx.scoped_storage(state.storage_backend()?)?;
+        seed_latest_manifest_code_version(&storage, &ctx, "abc123").await?;
+
+        let request = TriggerRunRequest {
+            selection: vec!["analytics/daily".to_string()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: None,
+            labels: HashMap::new(),
+        };
+
+        let result = trigger_run(
+            State(state.clone()),
+            ctx.clone(),
+            Path(ctx.workspace.clone()),
+            Json(request),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected overlong Idempotency-Key to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("runKey exceeds max length"));
+
+        let reservation = get_reservation(&storage, &overlong_key).await?;
+        assert!(reservation.is_none());
 
         Ok(())
     }

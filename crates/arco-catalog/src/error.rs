@@ -9,6 +9,7 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 
 /// Errors that can occur during catalog operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum CatalogError {
     /// Storage operation failed.
     #[error("storage error: {message}")]
@@ -150,6 +151,9 @@ impl From<arco_core::Error> for CatalogError {
                 Self::PreconditionFailed { message }
             }
             arco_core::Error::Internal { message } => Self::InvariantViolation { message },
+            error => Self::InvariantViolation {
+                message: error.to_string(),
+            },
         }
     }
 }

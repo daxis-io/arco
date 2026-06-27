@@ -17,6 +17,7 @@ pub type IcebergResult<T> = Result<T, IcebergError>;
 /// Maps to HTTP status codes and Iceberg exception types as defined
 /// in the REST Catalog specification.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IcebergError {
     /// Bad request (400) - Invalid input.
     #[error("Bad request: {message}")]
@@ -265,83 +266,113 @@ impl From<&IcebergError> for IcebergErrorResponse {
 impl From<CatalogError> for IcebergError {
     fn from(err: CatalogError) -> Self {
         match err {
-            CatalogError::NotFound { entity, name } => {
-                if entity == "namespace" {
-                    Self::namespace_not_found(&name)
-                } else if entity == "table" {
-                    Self::NotFound {
-                        message: format!("Table does not exist: {name}"),
-                        error_type: "NoSuchTableException",
-                    }
-                } else {
-                    Self::NotFound {
-                        message: format!("{entity} not found: {name}"),
-                        error_type: "NotFoundException",
-                    }
-                }
+            CatalogError::NotFound { entity, name } => map_catalog_not_found(&entity, &name),
+            CatalogError::AlreadyExists { entity, name } => {
+                map_catalog_already_exists(&entity, &name)
             }
-            CatalogError::AlreadyExists { entity, name } => Self::Conflict {
-                message: format!("{entity} already exists: {name}"),
-                error_type: "AlreadyExistsException",
-            },
-            CatalogError::Validation { message } => {
-                if message.contains("contains tables, cannot delete") {
-                    let ns_name = message
-                        .strip_prefix("namespace '")
-                        .and_then(|s| s.split('\'').next())
-                        .unwrap_or("unknown");
-                    Self::namespace_not_empty(ns_name)
-                } else {
-                    Self::BadRequest {
-                        message,
-                        error_type: "BadRequestException",
-                    }
-                }
-            }
+            CatalogError::Validation { message } => map_catalog_validation(message),
             CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
-                Self::Conflict {
-                    message,
-                    error_type: "CommitFailedException",
-                }
+                map_catalog_commit_conflict(message)
             }
             CatalogError::RequestFailed {
                 http_status,
                 message,
-            } => match http_status {
-                400 => Self::BadRequest {
-                    message,
-                    error_type: "BadRequestException",
-                },
-                404 => Self::NotFound {
-                    message,
-                    error_type: "NotFoundException",
-                },
-                409 | 412 => Self::Conflict {
-                    message,
-                    error_type: "CommitFailedException",
-                },
-                406 | 501 => Self::UnsupportedOperation { message },
-                _ => Self::Internal { message },
-            },
-            CatalogError::Storage { message } => {
-                tracing::warn!(internal_error = %message, "redacted Iceberg storage error");
-                Self::ServiceUnavailable {
-                    message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
-                    retry_after_seconds: None,
-                }
-            }
+            } => map_catalog_request_failed(http_status, message),
+            CatalogError::Storage { message } => map_catalog_storage(&message),
             CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
-            | CatalogError::InvariantViolation { message } => {
-                tracing::warn!(internal_error = %message, "redacted Iceberg internal error");
-                Self::Internal {
-                    message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
-                }
-            }
+            | CatalogError::InvariantViolation { message } => map_catalog_internal(&message),
             CatalogError::UnsupportedOperation { message } => {
                 Self::UnsupportedOperation { message }
             }
+            error => map_unknown_catalog_error(&error),
         }
+    }
+}
+
+fn map_catalog_not_found(entity: &str, name: &str) -> IcebergError {
+    if entity == "namespace" {
+        IcebergError::namespace_not_found(name)
+    } else if entity == "table" {
+        IcebergError::NotFound {
+            message: format!("Table does not exist: {name}"),
+            error_type: "NoSuchTableException",
+        }
+    } else {
+        IcebergError::NotFound {
+            message: format!("{entity} not found: {name}"),
+            error_type: "NotFoundException",
+        }
+    }
+}
+
+fn map_catalog_already_exists(entity: &str, name: &str) -> IcebergError {
+    IcebergError::Conflict {
+        message: format!("{entity} already exists: {name}"),
+        error_type: "AlreadyExistsException",
+    }
+}
+
+fn map_catalog_validation(message: String) -> IcebergError {
+    if message.contains("contains tables, cannot delete") {
+        let ns_name = message
+            .strip_prefix("namespace '")
+            .and_then(|s| s.split('\'').next())
+            .unwrap_or("unknown");
+        IcebergError::namespace_not_empty(ns_name)
+    } else {
+        IcebergError::BadRequest {
+            message,
+            error_type: "BadRequestException",
+        }
+    }
+}
+
+fn map_catalog_commit_conflict(message: String) -> IcebergError {
+    IcebergError::Conflict {
+        message,
+        error_type: "CommitFailedException",
+    }
+}
+
+fn map_catalog_request_failed(http_status: u16, message: String) -> IcebergError {
+    match http_status {
+        400 => IcebergError::BadRequest {
+            message,
+            error_type: "BadRequestException",
+        },
+        404 => IcebergError::NotFound {
+            message,
+            error_type: "NotFoundException",
+        },
+        409 | 412 => IcebergError::Conflict {
+            message,
+            error_type: "CommitFailedException",
+        },
+        406 | 501 => IcebergError::UnsupportedOperation { message },
+        _ => IcebergError::Internal { message },
+    }
+}
+
+fn map_catalog_storage(message: &str) -> IcebergError {
+    tracing::warn!(internal_error = %message, "redacted Iceberg storage error");
+    IcebergError::ServiceUnavailable {
+        message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
+        retry_after_seconds: None,
+    }
+}
+
+fn map_catalog_internal(message: &str) -> IcebergError {
+    tracing::warn!(internal_error = %message, "redacted Iceberg internal error");
+    IcebergError::Internal {
+        message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+    }
+}
+
+fn map_unknown_catalog_error(error: &CatalogError) -> IcebergError {
+    tracing::warn!(internal_error = %error, "redacted unknown Iceberg catalog error");
+    IcebergError::Internal {
+        message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
     }
 }
 

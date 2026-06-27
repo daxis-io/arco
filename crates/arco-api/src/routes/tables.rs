@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
+use crate::routes::pagination::{ListPageQuery, page_by_key};
 use crate::server::AppState;
 use arco_catalog::Tier1Compactor;
 use arco_catalog::idempotency::{
@@ -116,6 +117,9 @@ pub struct ColumnResponse {
 pub struct ListTablesResponse {
     /// List of tables.
     pub tables: Vec<TableResponse>,
+    /// Cursor for the next page, when more tables are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Creates table routes.
@@ -388,7 +392,9 @@ pub(crate) async fn register_table(
     path = "/api/v1/namespaces/{namespace}/tables",
     tag = "tables",
     params(
-        ("namespace" = String, Path, description = "Namespace name")
+        ("namespace" = String, Path, description = "Namespace name"),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 500, description = "Maximum number of tables to return (default 100, max 500)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous page")
     ),
     responses(
         (status = 200, description = "Tables listed", body = ListTablesResponse),
@@ -404,6 +410,7 @@ pub(crate) async fn list_tables(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    AxumQuery(query): AxumQuery<ListPageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -420,6 +427,7 @@ pub(crate) async fn list_tables(
         .list_tables(&namespace)
         .await
         .map_err(ApiError::from)?;
+    let (tables, next_cursor) = page_by_key(tables, &query, |table| &table.name)?;
 
     let mut responses = Vec::new();
     for table in tables {
@@ -450,7 +458,10 @@ pub(crate) async fn list_tables(
         });
     }
 
-    Ok(Json(ListTablesResponse { tables: responses }))
+    Ok(Json(ListTablesResponse {
+        tables: responses,
+        next_cursor,
+    }))
 }
 
 /// Get a table by name.

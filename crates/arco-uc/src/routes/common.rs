@@ -83,6 +83,12 @@ pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
                 message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
             }
         }
+        error => {
+            tracing::warn!(internal_error = %error, "redacted unknown UC catalog error");
+            UnityCatalogError::Internal {
+                message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+            }
+        }
     }
 }
 

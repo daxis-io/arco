@@ -23,6 +23,7 @@ pub struct UnityCatalogErrorResponse {
 
 /// UC facade error type.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum UnityCatalogError {
     /// Request was invalid.
     #[error("{message}")]

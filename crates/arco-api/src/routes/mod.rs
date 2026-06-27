@@ -7,6 +7,7 @@ pub mod lineage;
 pub mod manifests;
 pub mod namespaces;
 pub mod orchestration;
+pub(crate) mod pagination;
 pub mod query;
 pub mod query_data;
 pub mod tables;

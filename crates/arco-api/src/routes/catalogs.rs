@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -37,6 +37,7 @@ use arco_core::TableFormat;
 use super::tables::ColumnDefinition;
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::routes::pagination::{ListPageQuery, page_by_key};
 use crate::server::AppState;
 
 /// Request to create a catalog.
@@ -69,6 +70,9 @@ pub struct CatalogResponse {
 pub struct ListCatalogsResponse {
     /// List of catalogs.
     pub catalogs: Vec<CatalogResponse>,
+    /// Cursor for the next page, when more catalogs are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Request to create a schema in a catalog.
@@ -103,6 +107,9 @@ pub struct SchemaResponse {
 pub struct ListSchemasResponse {
     /// List of schemas.
     pub schemas: Vec<SchemaResponse>,
+    /// Cursor for the next page, when more schemas are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Request to register a table in a schema.
@@ -150,6 +157,9 @@ pub struct SchemaTableResponse {
 pub struct ListSchemaTablesResponse {
     /// List of tables.
     pub tables: Vec<SchemaTableResponse>,
+    /// Cursor for the next page, when more tables are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 /// Catalog inventory snapshot response for browser and UI discovery.
@@ -468,6 +478,10 @@ pub(crate) async fn create_catalog(
     get,
     path = "/api/v1/catalogs",
     tag = "catalogs",
+    params(
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 500, description = "Maximum number of catalogs to return (default 100, max 500)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous page")
+    ),
     responses(
         (status = 200, description = "Catalogs listed", body = ListCatalogsResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorBody),
@@ -480,6 +494,7 @@ pub(crate) async fn create_catalog(
 pub(crate) async fn list_catalogs(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
+    AxumQuery(query): AxumQuery<ListPageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -504,8 +519,12 @@ pub(crate) async fn list_catalogs(
             updated_at: format_timestamp(c.updated_at),
         })
         .collect();
+    let (catalogs, next_cursor) = page_by_key(catalogs, &query, |catalog| &catalog.name)?;
 
-    Ok(Json(ListCatalogsResponse { catalogs }))
+    Ok(Json(ListCatalogsResponse {
+        catalogs,
+        next_cursor,
+    }))
 }
 
 /// Get a catalog by name.
@@ -740,7 +759,9 @@ pub(crate) async fn create_schema(
     path = "/api/v1/catalogs/{catalog}/schemas",
     tag = "schemas",
     params(
-        ("catalog" = String, Path, description = "Catalog name")
+        ("catalog" = String, Path, description = "Catalog name"),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 500, description = "Maximum number of schemas to return (default 100, max 500)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous page")
     ),
     responses(
         (status = 200, description = "Schemas listed", body = ListSchemasResponse),
@@ -756,6 +777,7 @@ pub(crate) async fn list_schemas(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
     Path(catalog): Path<String>,
+    AxumQuery(query): AxumQuery<ListPageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -782,8 +804,12 @@ pub(crate) async fn list_schemas(
             updated_at: format_timestamp(ns.updated_at),
         })
         .collect();
+    let (schemas, next_cursor) = page_by_key(schemas, &query, |schema| &schema.name)?;
 
-    Ok(Json(ListSchemasResponse { schemas }))
+    Ok(Json(ListSchemasResponse {
+        schemas,
+        next_cursor,
+    }))
 }
 
 /// Register a table in a schema.
@@ -1005,7 +1031,9 @@ pub(crate) async fn register_table_in_schema(
     tag = "tables",
     params(
         ("catalog" = String, Path, description = "Catalog name"),
-        ("schema" = String, Path, description = "Schema name")
+        ("schema" = String, Path, description = "Schema name"),
+        ("limit" = Option<usize>, Query, minimum = 1, maximum = 500, description = "Maximum number of tables to return (default 100, max 500)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor returned by the previous page")
     ),
     responses(
         (status = 200, description = "Tables listed", body = ListSchemaTablesResponse),
@@ -1021,6 +1049,7 @@ pub(crate) async fn list_tables_in_schema(
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
     Path((catalog, schema)): Path<(String, String)>,
+    AxumQuery(query): AxumQuery<ListPageQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     tracing::debug!(
         tenant = %ctx.tenant,
@@ -1052,8 +1081,12 @@ pub(crate) async fn list_tables_in_schema(
             updated_at: format_timestamp(table.updated_at),
         });
     }
+    let (tables, next_cursor) = page_by_key(tables, &query, |table| &table.name)?;
 
-    Ok(Json(ListSchemaTablesResponse { tables }))
+    Ok(Json(ListSchemaTablesResponse {
+        tables,
+        next_cursor,
+    }))
 }
 
 /// Get a table by name in a schema.

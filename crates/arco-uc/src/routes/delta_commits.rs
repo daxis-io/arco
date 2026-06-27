@@ -280,6 +280,9 @@ fn map_delta_error(err: DeltaError) -> UnityCatalogError {
                 message: other.to_string(),
             },
         },
+        error => UnityCatalogError::Internal {
+            message: error.to_string(),
+        },
     }
 }
 

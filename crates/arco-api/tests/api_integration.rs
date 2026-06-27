@@ -278,6 +278,7 @@ mod namespaces {
     #[derive(Debug, Deserialize)]
     struct ListNamespacesResponse {
         namespaces: Vec<NamespaceResponse>,
+        next_cursor: Option<String>,
     }
 
     #[tokio::test]
@@ -328,6 +329,82 @@ mod namespaces {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_list_namespaces_is_bounded_and_cursor_paginated() -> Result<()> {
+        let router = test_router();
+
+        for name in ["alpha", "bravo", "charlie"] {
+            let (status, _): (_, NamespaceResponse) = helpers::post_json(
+                router.clone(),
+                "/api/v1/namespaces",
+                serde_json::json!({ "name": name }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, first): (_, ListNamespacesResponse) =
+            helpers::get_json(router.clone(), "/api/v1/namespaces?limit=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first
+                .namespaces
+                .iter()
+                .map(|namespace| namespace.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "bravo"]
+        );
+        let cursor = first.next_cursor.context("expected next page cursor")?;
+
+        let (status, second): (_, ListNamespacesResponse) = helpers::get_json(
+            router,
+            &format!("/api/v1/namespaces?limit=2&cursor={cursor}"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second
+                .namespaces
+                .iter()
+                .map(|namespace| namespace.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["charlie"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_namespaces_rejects_invalid_pagination_inputs() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, NamespaceResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for uri in [
+            "/api/v1/namespaces?limit=0",
+            "/api/v1/namespaces?limit=501",
+            "/api/v1/namespaces?cursor=%2A%2A%2A",
+            "/api/v1/namespaces?cursor=bnVsbA",
+        ] {
+            let request = helpers::make_request(Method::GET, uri, None)?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -359,6 +436,7 @@ mod tables {
     #[derive(Debug, Deserialize)]
     struct ListTablesResponse {
         tables: Vec<TableResponse>,
+        next_cursor: Option<String>,
     }
 
     #[tokio::test]
@@ -526,11 +604,90 @@ mod tables {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_list_tables_is_bounded_and_cursor_paginated() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/namespaces",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for name in ["accounts", "bookings", "customers"] {
+            let (status, _): (_, TableResponse) = helpers::post_json(
+                router.clone(),
+                "/api/v1/namespaces/sales/tables",
+                serde_json::json!({
+                    "name": name,
+                    "columns": []
+                }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, first): (_, ListTablesResponse) =
+            helpers::get_json(router.clone(), "/api/v1/namespaces/sales/tables?limit=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accounts", "bookings"]
+        );
+        let cursor = first.next_cursor.context("expected next page cursor")?;
+
+        let (status, second): (_, ListTablesResponse) = helpers::get_json(
+            router,
+            &format!("/api/v1/namespaces/sales/tables?limit=2&cursor={cursor}"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["customers"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        Ok(())
+    }
 }
 
 mod catalogs {
     use super::*;
     use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct CatalogResponse {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListCatalogsResponse {
+        catalogs: Vec<CatalogResponse>,
+        next_cursor: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SchemaResponse {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListSchemasResponse {
+        schemas: Vec<SchemaResponse>,
+        next_cursor: Option<String>,
+    }
 
     #[derive(Debug, Deserialize)]
     struct SchemaTableResponse {
@@ -540,6 +697,12 @@ mod catalogs {
         schema: String,
         name: String,
         format: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ListSchemaTablesResponse {
+        tables: Vec<SchemaTableResponse>,
+        next_cursor: Option<String>,
     }
 
     #[tokio::test]
@@ -668,6 +831,149 @@ mod catalogs {
             .await
             .map_err(|err| match err {})?;
         assert_eq!(traversal_location_resp.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_catalogs_is_bounded_and_cursor_paginated() -> Result<()> {
+        let router = test_router();
+
+        for name in ["analytics", "finance", "marketing"] {
+            let (status, _): (_, serde_json::Value) = helpers::post_json(
+                router.clone(),
+                "/api/v1/catalogs",
+                serde_json::json!({ "name": name }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, first): (_, ListCatalogsResponse) =
+            helpers::get_json(router.clone(), "/api/v1/catalogs?limit=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first
+                .catalogs
+                .iter()
+                .map(|catalog| catalog.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["analytics", "finance"]
+        );
+        let cursor = first.next_cursor.context("expected next page cursor")?;
+
+        let (status, second): (_, ListCatalogsResponse) =
+            helpers::get_json(router, &format!("/api/v1/catalogs?limit=2&cursor={cursor}")).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            second
+                .catalogs
+                .iter()
+                .map(|catalog| catalog.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["marketing"]
+        );
+        assert!(second.next_cursor.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_catalog_children_are_bounded_and_cursor_paginated() -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        for schema in ["core", "finance", "sales"] {
+            let (status, _): (_, serde_json::Value) = helpers::post_json(
+                router.clone(),
+                "/api/v1/catalogs/analytics/schemas",
+                serde_json::json!({ "name": schema }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, schemas): (_, ListSchemasResponse) =
+            helpers::get_json(router.clone(), "/api/v1/catalogs/analytics/schemas?limit=2").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            schemas
+                .schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["core", "finance"]
+        );
+        let schema_cursor = schemas.next_cursor.context("expected schema cursor")?;
+        let (status, schemas): (_, ListSchemasResponse) = helpers::get_json(
+            router.clone(),
+            &format!("/api/v1/catalogs/analytics/schemas?limit=2&cursor={schema_cursor}"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            schemas
+                .schemas
+                .iter()
+                .map(|schema| schema.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sales"]
+        );
+        assert!(schemas.next_cursor.is_none());
+
+        for name in ["accounts", "bookings", "customers"] {
+            let (status, _): (_, SchemaTableResponse) = helpers::post_json(
+                router.clone(),
+                "/api/v1/catalogs/analytics/schemas/sales/tables",
+                serde_json::json!({
+                    "name": name,
+                    "location": format!("warehouse/sales/{name}"),
+                    "columns": [],
+                }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+        }
+
+        let (status, tables): (_, ListSchemaTablesResponse) = helpers::get_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas/sales/tables?limit=2",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tables
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["accounts", "bookings"]
+        );
+        let table_cursor = tables.next_cursor.context("expected table cursor")?;
+        let (status, tables): (_, ListSchemaTablesResponse) = helpers::get_json(
+            router,
+            &format!(
+                "/api/v1/catalogs/analytics/schemas/sales/tables?limit=2&cursor={table_cursor}"
+            ),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            tables
+                .tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["customers"]
+        );
+        assert!(tables.next_cursor.is_none());
 
         Ok(())
     }

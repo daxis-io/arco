@@ -33,12 +33,13 @@ use crate::audit::{
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
-use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
+use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
 use crate::pointer_store::IcebergPointerStore;
 use crate::routes::utils::{
-    ensure_prefix, is_iceberg_table, join_namespace, paginate, parse_namespace,
+    commit_idempotency_key, ensure_prefix, is_iceberg_table, join_namespace, paginate,
+    parse_namespace,
 };
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
 use crate::transactions::TransactionStoreImpl;
@@ -621,7 +622,7 @@ async fn head_table(
         ("prefix" = String, Path, description = "Catalog prefix"),
         ("namespace" = String, Path, description = "Namespace name"),
         ("table" = String, Path, description = "Table name"),
-        ("Idempotency-Key" = String, Header, description = "Idempotency key for commit_table")
+        ("Idempotency-Key" = Option<String>, Header, description = "Optional idempotency key for commit_table")
     ),
     request_body = CommitTableRequest,
     responses(
@@ -687,16 +688,7 @@ async fn commit_table(
         });
     }
 
-    let idempotency_key = ctx
-        .idempotency_key
-        .clone()
-        .ok_or_else(|| IcebergError::BadRequest {
-            message: "Missing Idempotency-Key header".to_string(),
-            error_type: "BadRequestException",
-        })?;
-
-    IdempotencyMarker::validate_uuidv7(&idempotency_key)
-        .map_err(|err| IcebergError::invalid_idempotency_key(err.to_string()))?;
+    let idempotency_key = commit_idempotency_key(ctx.idempotency_key.clone())?;
 
     let separator = state.config.namespace_separator_decoded();
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
@@ -2091,6 +2083,80 @@ mod tests {
             commit_status,
             StatusCode::OK,
             "commit with assert-table-uuid should succeed: {commit_body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_table_then_commit_without_idempotency_key_succeeds() {
+        let state = build_state_with_table_crud_and_write_enabled();
+        seed_namespace_only(&state, "sales").await;
+
+        let create_body = serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "schema-id": 0,
+                "type": "struct",
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"}
+                ]
+            }
+        });
+
+        let create_resp = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&create_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(create_resp.status(), StatusCode::OK);
+        let create_body_bytes = axum::body::to_bytes(create_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let create_json: serde_json::Value =
+            serde_json::from_slice(&create_body_bytes).expect("json");
+        let table_uuid = create_json["metadata"]["table-uuid"]
+            .as_str()
+            .expect("table-uuid");
+
+        let commit_body = serde_json::json!({
+            "requirements": [
+                {"type": "assert-table-uuid", "uuid": table_uuid}
+            ],
+            "updates": []
+        });
+
+        let commit_resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(serde_json::to_string(&commit_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let commit_status = commit_resp.status();
+        let commit_body_bytes = axum::body::to_bytes(commit_resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let commit_body_str = String::from_utf8_lossy(&commit_body_bytes);
+
+        assert_eq!(
+            commit_status,
+            StatusCode::OK,
+            "commit without Idempotency-Key should succeed: {commit_body_str}"
         );
     }
 

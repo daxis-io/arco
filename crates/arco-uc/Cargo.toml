@@ -16,16 +16,18 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["jwt-aws-lc"]
 full = ["gcp", "aws", "azure"]
-gcp = ["arco-core/gcp", "dep:gcp_auth"]
-aws = ["arco-core/aws"]
-azure = ["arco-core/azure"]
+gcp = ["arco-core/gcp", "arco-catalog/gcp", "dep:gcp_auth"]
+aws = ["arco-core/aws", "arco-catalog/aws"]
+azure = ["arco-core/azure", "arco-catalog/azure"]
+jwt-aws-lc = ["arco-core/jwt-aws-lc", "arco-catalog/jwt-aws-lc", "arco-delta/jwt-aws-lc"]
+jwt-rust-crypto = ["jwt-aws-lc"]
 
 [dependencies]
-arco-core = { path = "../arco-core" }
-arco-catalog = { path = "../arco-catalog" }
-arco-delta = { path = "../arco-delta" }
+arco-core = { path = "../arco-core", default-features = false }
+arco-catalog = { path = "../arco-catalog", default-features = false }
+arco-delta = { path = "../arco-delta", default-features = false }
 
 # HTTP
 axum = { workspace = true }

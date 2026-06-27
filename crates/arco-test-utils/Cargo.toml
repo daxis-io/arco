@@ -5,10 +5,19 @@ edition = "2024"
 description = "Shared test utilities for Arco integration tests"
 publish = false
 
+[features]
+default = ["jwt-aws-lc"]
+jwt-aws-lc = [
+    "arco-core/jwt-aws-lc",
+    "arco-catalog/jwt-aws-lc",
+    "arco-flow/jwt-aws-lc",
+]
+jwt-rust-crypto = ["jwt-aws-lc"]
+
 [dependencies]
-arco-core = { path = "../arco-core" }
-arco-catalog = { path = "../arco-catalog" }
-arco-flow = { path = "../arco-flow" }
+arco-core = { path = "../arco-core", default-features = false }
+arco-catalog = { path = "../arco-catalog", default-features = false }
+arco-flow = { path = "../arco-flow", default-features = false }
 
 tokio = { workspace = true, features = ["full", "test-util"] }
 axum = { workspace = true }

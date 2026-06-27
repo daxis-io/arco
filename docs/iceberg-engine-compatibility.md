@@ -10,7 +10,13 @@ Arco implements the [Apache Iceberg REST Catalog API](https://iceberg.apache.org
 - Table CRUD operations (create, register, drop)
 - Table commits with CAS-based concurrency control
 - Credential vending negotiation via `X-Iceberg-Access-Delegation` header
-- Idempotent operations with `Idempotency-Key` header
+- Optional idempotent operations with `Idempotency-Key` header
+
+`Idempotency-Key` is optional for single-table Iceberg REST commits. When a
+client provides a UUIDv7 key, Arco uses it for durable retry replay. When a
+standard Iceberg REST client omits the header, Arco generates a server-side
+UUIDv7 for that request so the commit remains protocol-compatible, but client
+retry deduplication is not available for that missing-header request.
 
 ## Compatibility Matrix
 
@@ -97,7 +103,10 @@ table = catalog.load_table("my_namespace.my_table")
 ### All Engines
 
 - **Views**: View operations are not currently supported
-- **Transactions**: Multi-table transactions are not supported
+- **Transactions**: Single-table commits are supported by default. Multi-table
+  transactions are experimental and require both `allow_write` and
+  `allow_multi_table_transactions`; unlike single-table commits, multi-table
+  requests must provide a UUIDv7 `Idempotency-Key`.
 - **Branching**: Branch/tag operations are not exposed via REST API
 
 ### Credential Vending

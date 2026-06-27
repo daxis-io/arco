@@ -154,7 +154,8 @@ where
     }
 
     fn read_bytes(&mut self) -> crate::Result<Vec<u8>> {
-        let num_bytes = self.transport.read_i32::<BigEndian>()? as usize;
+        let num_bytes =
+            super::check_byte_array_size(self.transport.read_i32::<BigEndian>()?)?;
         let mut buf = vec![0u8; num_bytes];
         self.transport
             .read_exact(&mut buf)
@@ -924,6 +925,35 @@ mod tests {
 
         let received_bytes = assert_success!(i_prot.read_bytes());
         assert_eq!(&received_bytes, &bytes);
+    }
+
+    #[test]
+    fn read_bytes_rejects_negative_length() {
+        let (mut i_prot, _) = test_objects(true);
+        i_prot.transport.set_readable_bytes(&(-1_i32).to_be_bytes());
+
+        let err = i_prot.read_bytes().expect_err("negative length must fail");
+
+        match err {
+            crate::Error::Protocol(err) => assert_eq!(err.kind, crate::ProtocolErrorKind::NegativeSize),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_bytes_rejects_length_above_default_string_limit() {
+        let (mut i_prot, _) = test_objects(true);
+        let oversized = (100 * 1024 * 1024_i32) + 1;
+        i_prot.transport.set_readable_bytes(&oversized.to_be_bytes());
+
+        let err = i_prot
+            .read_bytes()
+            .expect_err("oversized byte array must fail before allocation");
+
+        match err {
+            crate::Error::Protocol(err) => assert_eq!(err.kind, crate::ProtocolErrorKind::SizeLimit),
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 
     fn test_objects(

@@ -262,6 +262,7 @@ where
 
     fn read_bytes(&mut self) -> crate::Result<Vec<u8>> {
         let len = self.read_varint32()?;
+        super::check_byte_array_size_usize(len as usize)?;
         let mut buf = vec![0u8; len as usize];
         self.transport
             .read_exact(&mut buf)
@@ -2910,6 +2911,36 @@ mod tests {
 
         let read_double = i_prot.read_double().unwrap();
         assert!(read_double - double < std::f64::EPSILON);
+    }
+
+    #[test]
+    fn read_bytes_rejects_length_above_default_string_limit() {
+        let (mut i_prot, _) = test_objects();
+        let oversized = (100 * 1024 * 1024_u32) + 1;
+        let encoded = encode_varint32(oversized);
+        i_prot.transport.set_readable_bytes(&encoded);
+
+        let err = i_prot
+            .read_bytes()
+            .expect_err("oversized byte array must fail before allocation");
+
+        match err {
+            crate::Error::Protocol(err) => assert_eq!(err.kind, crate::ProtocolErrorKind::SizeLimit),
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    fn encode_varint32(mut value: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            if value & !0x7F == 0 {
+                out.push(value as u8);
+                break;
+            }
+            out.push(((value & 0x7F) | 0x80) as u8);
+            value >>= 7;
+        }
+        out
     }
 
     #[test]

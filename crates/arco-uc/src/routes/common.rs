@@ -16,6 +16,9 @@ use axum::http::{Method, Uri};
 use crate::error::UnityCatalogError;
 use crate::state::UnityCatalogState;
 
+const PUBLIC_STORAGE_UNAVAILABLE_MESSAGE: &str = "Service temporarily unavailable";
+const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
 /// Returns a standardized UC `501` for known-but-unsupported operations.
 pub(crate) fn known_but_unsupported(
     method: &Method,
@@ -66,10 +69,20 @@ pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
         CatalogError::UnsupportedOperation { message } => UnityCatalogError::NotImplemented {
             message: format!("unsupported operation: {message}"),
         },
-        CatalogError::Storage { message }
-        | CatalogError::Serialization { message }
+        CatalogError::Storage { message } => {
+            tracing::warn!(internal_error = %message, "redacted UC storage error");
+            UnityCatalogError::ServiceUnavailable {
+                message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
+            }
+        }
+        CatalogError::Serialization { message }
         | CatalogError::Parquet { message }
-        | CatalogError::InvariantViolation { message } => UnityCatalogError::Internal { message },
+        | CatalogError::InvariantViolation { message } => {
+            tracing::warn!(internal_error = %message, "redacted UC internal error");
+            UnityCatalogError::Internal {
+                message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+            }
+        }
     }
 }
 
@@ -228,4 +241,27 @@ pub(crate) async fn initialized_catalog_writer(
         .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
     writer.initialize().await.map_err(map_catalog_error)?;
     Ok(writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_do_not_expose_internal_details() {
+        let err = map_catalog_error(CatalogError::Storage {
+            message: "gcs bucket prod-secret path tenant=acme/workspace=analytics/token"
+                .to_string(),
+        });
+
+        match err {
+            UnityCatalogError::ServiceUnavailable { message }
+            | UnityCatalogError::Internal { message } => {
+                assert_eq!(message, "Service temporarily unavailable");
+                assert!(!message.contains("prod-secret"));
+                assert!(!message.contains("tenant=acme"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

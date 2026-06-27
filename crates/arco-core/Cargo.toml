@@ -16,11 +16,15 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["jwt-aws-lc"]
 full = ["gcp", "aws", "azure"]
 gcp = []
 aws = []
 azure = []
+jwt-aws-lc = ["jsonwebtoken/aws_lc_rs", "jsonwebtoken/use_pem"]
+# Compatibility alias. Arco standardizes on AWS-LC so all-features builds keep a
+# single jsonwebtoken provider and avoid the RustCrypto RSA advisory.
+jwt-rust-crypto = ["jwt-aws-lc"]
 test-utils = ["dep:proptest", "dep:tempfile"]
 sync-compaction = []
 
@@ -58,7 +62,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false }
 
 # Optional test utilities
 proptest = { workspace = true, optional = true }

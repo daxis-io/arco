@@ -7,16 +7,19 @@ use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{CatalogWriter, Tier1Compactor};
 use arco_core::ScopedStorage;
 use arco_core::storage::{StorageBackend, WritePrecondition};
-use arco_iceberg::commit::CommitService;
+use arco_iceberg::commit::{CommitError, CommitService};
 use arco_iceberg::idempotency::{
     IdempotencyMarker, IdempotencyStatus, IdempotencyStore, IdempotencyStoreImpl,
     canonical_request_hash,
 };
 use arco_iceberg::pointer::{IcebergTablePointer, PointerStore, PointerStoreImpl, UpdateSource};
 use arco_iceberg::state::{IcebergConfig, IcebergState, Tier1CompactorFactory};
-use arco_iceberg::types::commit::{CommitTableRequest, SnapshotRefType, TableUpdate};
+use arco_iceberg::types::commit::{
+    CommitTableRequest, SnapshotRefType, TableUpdate, UpdateRequirement,
+};
 use arco_iceberg::types::{
-    CommitKey, PartitionSpec, Schema, SchemaField, Snapshot, SortOrder, TableMetadata, TableUuid,
+    CommitKey, PartitionSpec, Schema, SchemaField, Snapshot, SnapshotLogEntry, SnapshotRefMetadata,
+    SortOrder, TableMetadata, TableUuid,
 };
 use arco_test_utils::storage::TracingMemoryBackend;
 use axum::Router;
@@ -135,15 +138,7 @@ fn base_metadata(table_uuid: Uuid, location: String) -> TableMetadata {
 }
 
 fn commit_request(snapshot_id: i64) -> CommitTableRequest {
-    let snapshot = Snapshot {
-        snapshot_id,
-        parent_snapshot_id: None,
-        sequence_number: 1,
-        timestamp_ms: 1_700_000_010_000,
-        manifest_list: "s3://bucket/manifests/snap.avro".to_string(),
-        summary: HashMap::new(),
-        schema_id: Some(0),
-    };
+    let snapshot = snapshot(snapshot_id, None, 1);
 
     CommitTableRequest::builder()
         .add_update(TableUpdate::AddSnapshot { snapshot })
@@ -156,6 +151,18 @@ fn commit_request(snapshot_id: i64) -> CommitTableRequest {
             min_snapshots_to_keep: None,
         })
         .build()
+}
+
+fn snapshot(snapshot_id: i64, parent_snapshot_id: Option<i64>, sequence_number: i64) -> Snapshot {
+    Snapshot {
+        snapshot_id,
+        parent_snapshot_id,
+        sequence_number,
+        timestamp_ms: 1_700_000_010_000 + sequence_number,
+        manifest_list: format!("s3://bucket/manifests/snap-{snapshot_id}.avro"),
+        summary: HashMap::new(),
+        schema_id: Some(0),
+    }
 }
 
 #[tokio::test]
@@ -305,6 +312,217 @@ async fn test_commit_table_idempotent_replay_returns_cached_response() {
 }
 
 #[tokio::test]
+async fn test_single_table_requirement_conflict_marks_failed_and_replays_cached_failure() {
+    let fixture = Fixture::new().await;
+    let service = CommitService::new(Arc::clone(&fixture.storage));
+
+    let mut request = commit_request(303);
+    request
+        .requirements
+        .push(UpdateRequirement::AssertCurrentSchemaId {
+            current_schema_id: 42,
+        });
+    let request_value = serde_json::to_value(&request).expect("serialize request");
+    let request_hash = canonical_request_hash(&request_value).expect("request hash");
+    let idempotency_key = Uuid::now_v7().to_string();
+
+    let first_result = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request.clone(),
+            request_hash.clone(),
+            idempotency_key.clone(),
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await;
+
+    assert!(matches!(
+        first_result,
+        Err(CommitError::Iceberg(
+            arco_iceberg::error::IcebergError::Conflict { .. }
+        ))
+    ));
+
+    let key_hash = IdempotencyMarker::hash_key(&idempotency_key);
+    let idempotency_store = IdempotencyStoreImpl::new(Arc::clone(&fixture.storage));
+    let (marker, _) = idempotency_store
+        .load(&fixture.table_uuid, &key_hash)
+        .await
+        .expect("load failed marker")
+        .expect("marker exists");
+    assert_eq!(marker.status, IdempotencyStatus::Failed);
+    assert_eq!(
+        marker.error_http_status,
+        Some(StatusCode::CONFLICT.as_u16())
+    );
+    assert_eq!(marker.error_payload.as_ref().unwrap().error.code, 409);
+    assert_eq!(
+        marker.error_payload.as_ref().unwrap().error.error_type,
+        "CommitFailedException"
+    );
+
+    let retry_result = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request.clone(),
+            request_hash.clone(),
+            idempotency_key,
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await;
+
+    assert!(matches!(
+        retry_result,
+        Err(CommitError::CachedFailure { status: 409, .. })
+    ));
+
+    let different_key = Uuid::now_v7().to_string();
+    let different_key_result = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request,
+            request_hash,
+            different_key.clone(),
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await;
+
+    assert!(matches!(
+        different_key_result,
+        Err(CommitError::Iceberg(
+            arco_iceberg::error::IcebergError::Conflict { .. }
+        ))
+    ));
+
+    let different_key_hash = IdempotencyMarker::hash_key(&different_key);
+    let (different_marker, _) = idempotency_store
+        .load(&fixture.table_uuid, &different_key_hash)
+        .await
+        .expect("load different failed marker")
+        .expect("different marker exists");
+    assert_eq!(different_marker.status, IdempotencyStatus::Failed);
+
+    let (pointer, _) = PointerStoreImpl::new(Arc::clone(&fixture.storage))
+        .load(&fixture.table_uuid)
+        .await
+        .expect("load pointer")
+        .expect("pointer exists");
+    assert_eq!(pointer.current_metadata_location, fixture.metadata_location);
+}
+
+#[tokio::test]
+async fn test_remove_snapshots_prunes_snapshot_log_before_removed_entry() {
+    let fixture = Fixture::new().await;
+    let service = CommitService::new(Arc::clone(&fixture.storage));
+
+    let mut metadata = base_metadata(fixture.table_uuid, fixture.table_location.clone());
+    metadata.snapshots = vec![
+        snapshot(401, None, 1),
+        snapshot(402, Some(401), 2),
+        snapshot(403, Some(402), 3),
+    ];
+    metadata.snapshot_log = vec![
+        SnapshotLogEntry {
+            snapshot_id: 401,
+            timestamp_ms: 1_700_000_010_001,
+        },
+        SnapshotLogEntry {
+            snapshot_id: 402,
+            timestamp_ms: 1_700_000_010_002,
+        },
+        SnapshotLogEntry {
+            snapshot_id: 403,
+            timestamp_ms: 1_700_000_010_003,
+        },
+    ];
+    metadata.current_snapshot_id = Some(403);
+    metadata.refs.insert(
+        "main".to_string(),
+        SnapshotRefMetadata {
+            snapshot_id: 403,
+            ref_type: "branch".to_string(),
+        },
+    );
+    let metadata_path = format!("warehouse/{}/metadata/00000.metadata.json", fixture.table);
+    fixture
+        .storage
+        .put(
+            &metadata_path,
+            Bytes::from(serde_json::to_vec(&metadata).expect("serialize metadata")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("put metadata");
+
+    let request = CommitTableRequest::builder()
+        .add_update(TableUpdate::RemoveSnapshots {
+            snapshot_ids: vec![402],
+        })
+        .build();
+    let request_value = serde_json::to_value(&request).expect("serialize request");
+    let request_hash = canonical_request_hash(&request_value).expect("request hash");
+    let idempotency_key = Uuid::now_v7().to_string();
+
+    let response = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request,
+            request_hash,
+            idempotency_key,
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await
+        .expect("remove snapshots commit");
+
+    let updated: TableMetadata =
+        serde_json::from_value(response.metadata).expect("deserialize metadata response");
+    assert_eq!(
+        updated
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![401, 403]
+    );
+    assert_eq!(
+        updated
+            .snapshot_log
+            .iter()
+            .map(|entry| entry.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![403]
+    );
+}
+
+#[tokio::test]
 async fn test_stale_marker_takeover_uses_fresh_metadata_location_when_orphan_exists() {
     let fixture = Fixture::new().await;
     let service = CommitService::new(Arc::clone(&fixture.storage));
@@ -395,125 +613,173 @@ async fn test_stale_marker_takeover_uses_fresh_metadata_location_when_orphan_exi
 
 #[tokio::test]
 async fn test_transactions_commit_single_table_returns_204() {
-    let backend = Arc::new(TracingMemoryBackend::new());
-    let tenant = "acme".to_string();
-    let workspace = "analytics".to_string();
-    let table_name = "orders".to_string();
-
-    let storage_backend: Arc<dyn StorageBackend> = backend.clone();
-    let config = IcebergConfig {
-        allow_write: true,
-        ..Default::default()
-    };
-    let state = IcebergState::with_config(storage_backend.clone(), config)
-        .with_compactor_factory(Arc::new(Tier1CompactorFactory));
-
-    let catalog_storage =
-        ScopedStorage::new(storage_backend.clone(), tenant.clone(), workspace.clone())
-            .expect("scoped storage");
-    let compactor = Arc::new(Tier1Compactor::new(catalog_storage.clone()));
-    let writer = CatalogWriter::new(catalog_storage.clone()).with_sync_compactor(compactor);
-    writer.initialize().await.expect("init");
-    writer
-        .create_namespace("sales", None, WriteOptions::default())
-        .await
-        .expect("create namespace");
-
-    let table_location = format!("tenant={tenant}/workspace={workspace}/warehouse/{table_name}");
-
-    let table = writer
-        .register_table(
-            arco_catalog::RegisterTableRequest {
-                namespace: "sales".to_string(),
-                name: table_name.clone(),
-                description: None,
-                location: Some(table_location.clone()),
-                format: Some("iceberg".to_string()),
-                columns: vec![],
-            },
-            WriteOptions::default(),
-        )
-        .await
-        .expect("register table");
-
-    let table_uuid = Uuid::parse_str(&table.id).expect("parse table uuid");
-    let metadata_location = format!("{table_location}/metadata/00000.metadata.json");
-
-    let metadata = base_metadata(table_uuid, table_location.clone());
-    let metadata_path = format!("warehouse/{table_name}/metadata/00000.metadata.json");
-    let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize metadata");
-    catalog_storage
-        .put(
-            &metadata_path,
-            Bytes::from(metadata_bytes),
-            WritePrecondition::None,
-        )
-        .await
-        .expect("put metadata");
-
-    let pointer = IcebergTablePointer::new(table_uuid, metadata_location);
-    let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
-    let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize pointer");
-    catalog_storage
-        .put(
-            &pointer_path,
-            Bytes::from(pointer_bytes),
-            WritePrecondition::DoesNotExist,
-        )
-        .await
-        .expect("put pointer");
-
-    let app = Router::new()
-        .nest("/v1/:prefix", arco_iceberg::routes::catalog::routes())
-        .layer(axum::middleware::from_fn(
-            arco_iceberg::context::context_middleware,
-        ))
-        .with_state(state);
-
-    let snapshot = Snapshot {
-        snapshot_id: 303,
-        parent_snapshot_id: None,
-        sequence_number: 1,
-        timestamp_ms: 1_700_000_010_000,
-        manifest_list: "s3://bucket/manifests/snap.avro".to_string(),
-        summary: HashMap::new(),
-        schema_id: Some(0),
-    };
-
-    let req_body = serde_json::json!({
-        "table-changes": [{
-            "identifier": {"namespace": ["sales"], "name": table_name},
-            "requirements": [],
-            "updates": [
-                {"action": "add-snapshot", "snapshot": snapshot},
-                {
-                    "action": "set-snapshot-ref",
-                    "ref-name": "main",
-                    "type": "branch",
-                    "snapshot-id": 303
-                }
-            ]
-        }]
-    });
-
-    let idempotency_key = Uuid::now_v7().to_string();
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/arco/transactions/commit")
-                .header("X-Tenant-Id", &tenant)
-                .header("X-Workspace-Id", &workspace)
-                .header("Content-Type", "application/json")
-                .header("Idempotency-Key", &idempotency_key)
-                .body(Body::from(serde_json::to_string(&req_body).unwrap()))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let fixture = SingleTableHttpFixture::new().await;
+    let response = fixture
+        .send_commit(Some(Uuid::now_v7().to_string()), 303)
+        .await;
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn test_transactions_commit_single_table_without_idempotency_key_returns_204() {
+    let fixture = SingleTableHttpFixture::new().await;
+    let response = fixture.send_commit(None, 304).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "single-table transaction commit should accept a missing Idempotency-Key"
+    );
+}
+
+struct SingleTableHttpFixture {
+    app: Router,
+    tenant: String,
+    workspace: String,
+    table_name: String,
+}
+
+impl SingleTableHttpFixture {
+    async fn new() -> Self {
+        let backend = Arc::new(TracingMemoryBackend::new());
+        let tenant = "acme".to_string();
+        let workspace = "analytics".to_string();
+        let table_name = "orders".to_string();
+
+        let storage_backend: Arc<dyn StorageBackend> = backend.clone();
+        let config = IcebergConfig {
+            allow_write: true,
+            ..Default::default()
+        };
+        let state = IcebergState::with_config(storage_backend.clone(), config)
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory));
+
+        let catalog_storage =
+            ScopedStorage::new(storage_backend.clone(), tenant.clone(), workspace.clone())
+                .expect("scoped storage");
+        let compactor = Arc::new(Tier1Compactor::new(catalog_storage.clone()));
+        let writer = CatalogWriter::new(catalog_storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("init");
+        writer
+            .create_namespace("sales", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let table_location =
+            format!("tenant={tenant}/workspace={workspace}/warehouse/{table_name}");
+
+        let table = writer
+            .register_table(
+                arco_catalog::RegisterTableRequest {
+                    namespace: "sales".to_string(),
+                    name: table_name.clone(),
+                    description: None,
+                    location: Some(table_location.clone()),
+                    format: Some("iceberg".to_string()),
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await
+            .expect("register table");
+
+        let table_uuid = Uuid::parse_str(&table.id).expect("parse table uuid");
+        let metadata_location = format!("{table_location}/metadata/00000.metadata.json");
+
+        let metadata = base_metadata(table_uuid, table_location.clone());
+        let metadata_path = format!("warehouse/{table_name}/metadata/00000.metadata.json");
+        let metadata_bytes = serde_json::to_vec(&metadata).expect("serialize metadata");
+        catalog_storage
+            .put(
+                &metadata_path,
+                Bytes::from(metadata_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let pointer = IcebergTablePointer::new(table_uuid, metadata_location);
+        let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
+        let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize pointer");
+        catalog_storage
+            .put(
+                &pointer_path,
+                Bytes::from(pointer_bytes),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("put pointer");
+
+        let app = Router::new()
+            .nest("/v1/:prefix", arco_iceberg::routes::catalog::routes())
+            .layer(axum::middleware::from_fn(
+                arco_iceberg::context::context_middleware,
+            ))
+            .with_state(state);
+
+        Self {
+            app,
+            tenant,
+            workspace,
+            table_name,
+        }
+    }
+
+    fn request_body(&self, snapshot_id: i64) -> serde_json::Value {
+        let snapshot = Snapshot {
+            snapshot_id,
+            parent_snapshot_id: None,
+            sequence_number: 1,
+            timestamp_ms: 1_700_000_010_000,
+            manifest_list: "s3://bucket/manifests/snap.avro".to_string(),
+            summary: HashMap::new(),
+            schema_id: Some(0),
+        };
+
+        serde_json::json!({
+            "table-changes": [{
+                "identifier": {"namespace": ["sales"], "name": self.table_name},
+                "requirements": [],
+                "updates": [
+                    {"action": "add-snapshot", "snapshot": snapshot},
+                    {
+                        "action": "set-snapshot-ref",
+                        "ref-name": "main",
+                        "type": "branch",
+                        "snapshot-id": snapshot_id
+                    }
+                ]
+            }]
+        })
+    }
+
+    async fn send_commit(
+        self,
+        idempotency_key: Option<String>,
+        snapshot_id: i64,
+    ) -> Response<Body> {
+        let req_body = self.request_body(snapshot_id);
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/arco/transactions/commit")
+            .header("X-Tenant-Id", &self.tenant)
+            .header("X-Workspace-Id", &self.workspace)
+            .header("Content-Type", "application/json");
+
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
+
+        self.app
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_string(&req_body).unwrap()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
 }
 
 struct MultiTableHttpFixture {
@@ -642,18 +908,29 @@ impl MultiTableHttpFixture {
     }
 
     async fn send_commit(self) -> Response<Body> {
+        self.send_commit_with_idempotency_key(Some(Uuid::now_v7().to_string()))
+            .await
+    }
+
+    async fn send_commit_with_idempotency_key(
+        self,
+        idempotency_key: Option<String>,
+    ) -> Response<Body> {
         let req_body = self.multi_table_request_body();
-        let idempotency_key = Uuid::now_v7().to_string();
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/arco/transactions/commit")
+            .header("X-Tenant-Id", &self.tenant)
+            .header("X-Workspace-Id", &self.workspace)
+            .header("Content-Type", "application/json");
+
+        if let Some(key) = idempotency_key {
+            builder = builder.header("Idempotency-Key", key);
+        }
 
         self.app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/arco/transactions/commit")
-                    .header("X-Tenant-Id", &self.tenant)
-                    .header("X-Workspace-Id", &self.workspace)
-                    .header("Content-Type", "application/json")
-                    .header("Idempotency-Key", &idempotency_key)
+                builder
                     .body(Body::from(serde_json::to_string(&req_body).unwrap()))
                     .expect("request"),
             )
@@ -676,6 +953,23 @@ async fn test_transactions_commit_multi_table_returns_204() {
         response.status(),
         StatusCode::NO_CONTENT,
         "Multi-table transaction should return 204"
+    );
+}
+
+#[tokio::test]
+async fn test_transactions_commit_multi_table_without_idempotency_key_returns_400() {
+    let config = IcebergConfig {
+        allow_write: true,
+        allow_multi_table_transactions: true,
+        ..Default::default()
+    };
+    let fixture = MultiTableHttpFixture::new(config).await;
+    let response = fixture.send_commit_with_idempotency_key(None).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "multi-table transaction commit should require Idempotency-Key"
     );
 }
 
@@ -829,6 +1123,96 @@ mod multi_table_transactions {
         assert!(p2.current_metadata_location.contains(&tx_id));
         assert!(p1.pending.is_none());
         assert!(p2.pending.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tx_remove_snapshots_prunes_snapshot_log_before_removed_entry() {
+        let fixture = MultiTableFixture::new().await;
+        let storage = Arc::new(fixture.storage);
+        let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
+        let coordinator =
+            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+
+        let table_location = "tenant=acme/workspace=analytics/warehouse/orders";
+        let mut metadata = base_metadata(fixture.table1_uuid, table_location.to_string());
+        metadata.snapshots = vec![
+            snapshot(4101, None, 1),
+            snapshot(4102, Some(4101), 2),
+            snapshot(4103, Some(4102), 3),
+        ];
+        metadata.snapshot_log = vec![
+            SnapshotLogEntry {
+                snapshot_id: 4101,
+                timestamp_ms: 1_700_000_010_001,
+            },
+            SnapshotLogEntry {
+                snapshot_id: 4102,
+                timestamp_ms: 1_700_000_010_002,
+            },
+            SnapshotLogEntry {
+                snapshot_id: 4103,
+                timestamp_ms: 1_700_000_010_003,
+            },
+        ];
+        metadata.current_snapshot_id = Some(4103);
+        metadata.refs.insert(
+            "main".to_string(),
+            SnapshotRefMetadata {
+                snapshot_id: 4103,
+                ref_type: "branch".to_string(),
+            },
+        );
+        storage
+            .put(
+                "warehouse/orders/metadata/00000.metadata.json",
+                Bytes::from(serde_json::to_vec(&metadata).expect("serialize metadata")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("put metadata");
+
+        let request = CommitTableRequest::builder()
+            .add_update(TableUpdate::RemoveSnapshots {
+                snapshot_ids: vec![4102],
+            })
+            .build();
+        let inputs = vec![TableCommitInput {
+            table_uuid: fixture.table1_uuid,
+            namespace: "sales".to_string(),
+            table_name: "orders".to_string(),
+            request,
+        }];
+
+        let result = coordinator
+            .commit(
+                Uuid::now_v7().to_string(),
+                "remove_snapshot_log_gap".to_string(),
+                inputs,
+                UpdateSource::IcebergRest {
+                    client_info: None,
+                    principal: None,
+                },
+                &fixture.tenant,
+                &fixture.workspace,
+            )
+            .await
+            .expect("multi-table remove snapshots commit");
+        let metadata_location = &result.tables[0].metadata_location;
+        let storage_path = metadata_location
+            .strip_prefix("tenant=acme/workspace=analytics/")
+            .expect("metadata location is scoped");
+        let updated_bytes = storage.get(storage_path).await.expect("read metadata");
+        let updated: TableMetadata =
+            serde_json::from_slice(&updated_bytes).expect("deserialize metadata");
+
+        assert_eq!(
+            updated
+                .snapshot_log
+                .iter()
+                .map(|entry| entry.snapshot_id)
+                .collect::<Vec<_>>(),
+            vec![4103]
+        );
     }
 
     #[tokio::test]

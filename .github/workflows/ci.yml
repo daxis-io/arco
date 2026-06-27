@@ -86,6 +86,8 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo check --workspace --all-features
+      - run: cargo check -p arco-api --no-default-features --features full
+      - run: cargo check -p arco-api --no-default-features --features jwt-rust-crypto --tests
 
   fmt:
     name: Format
@@ -141,6 +143,11 @@ jobs:
           sudo mkdir -p /mnt/target
           sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - name: Test vendored thrift protocol guards
+        run: |
+          tmpdir="$(mktemp -d)"
+          cp -R vendor/thrift-0.17.1 "$tmpdir/thrift-0.17.1"
+          cargo test --manifest-path "$tmpdir/thrift-0.17.1/Cargo.toml" read_bytes_rejects -- --nocapture
       - run: cargo test -p arco-delta --all-features --test idempotency_replay -- --nocapture
       - run: cargo test -p arco-api --all-features --tests -- --skip parity_m1_ --skip parity_m2_ --skip parity_m3_
       - run: cargo test -p arco-api --all-features --test task_token_contract_tests

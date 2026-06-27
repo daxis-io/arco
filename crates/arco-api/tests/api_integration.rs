@@ -377,7 +377,7 @@ mod namespaces {
     }
 
     #[tokio::test]
-    async fn test_list_namespaces_rejects_invalid_limit_bounds() -> Result<()> {
+    async fn test_list_namespaces_rejects_invalid_pagination_inputs() -> Result<()> {
         let router = test_router();
 
         let (status, _): (_, NamespaceResponse) = helpers::post_json(
@@ -388,7 +388,12 @@ mod namespaces {
         .await?;
         assert_eq!(status, StatusCode::CREATED);
 
-        for uri in ["/api/v1/namespaces?limit=0", "/api/v1/namespaces?limit=501"] {
+        for uri in [
+            "/api/v1/namespaces?limit=0",
+            "/api/v1/namespaces?limit=501",
+            "/api/v1/namespaces?cursor=%2A%2A%2A",
+            "/api/v1/namespaces?cursor=bnVsbA",
+        ] {
             let request = helpers::make_request(Method::GET, uri, None)?;
             let response = router
                 .clone()

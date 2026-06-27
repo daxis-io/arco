@@ -125,7 +125,7 @@ cat >"${valid_dir}/deployed_api_worker_pipeline.json" <<'JSON'
   },
   "apiVersion": {
     "service": "arco-api",
-    "packageVersion": "0.2.0",
+    "packageVersion": "0.2.1",
     "codeVersion": "uat-api-code-version",
     "gitSha": "abc123",
     "image": "us-central1-docker.pkg.dev/example/arco-api:abc123",
@@ -624,7 +624,7 @@ cat >"${failure_artifact_dir}/deployed_api_worker_failure_pipeline.json" <<'JSON
   },
   "apiVersion": {
     "service": "arco-api",
-    "packageVersion": "0.2.0",
+    "packageVersion": "0.2.1",
     "codeVersion": "uat-api-code-version",
     "gitSha": "abc123",
     "image": "us-central1-docker.pkg.dev/example/arco-api:abc123",

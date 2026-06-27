@@ -67,10 +67,10 @@ def run_init(*, name: str, template: str) -> None:  # noqa: ARG001
         dedent(f'''
         [project]
         name = "{name}"
-        version = "0.2.0"
+        version = "0.2.1"
         requires-python = ">=3.11"
         dependencies = [
-            "arco-flow>=0.2.0",
+            "arco-flow>=0.2.1",
         ]
 
         [project.optional-dependencies]

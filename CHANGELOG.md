@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-27
+### Added
+- ADR-041 tiered object-storage orchestration event-log implementation, deterministic local pipeline UAT, and deployed-UAT readiness/provenance guardrails.
+- Batch 7 catalog I/O and Tier-1 write-amplification baselines, flow-boundary guardrails, and refreshed crate/architecture documentation.
+
+### Changed
+- Promoted workspace crates, Python packages, generated OpenAPI metadata, release notes, and release-prep validation to `0.2.1`.
+- Hardened orchestration dispatch, callback, retry, compaction, pagination, and unknown-event handling across API, flow, worker, and Python surfaces.
+- Strengthened public API contracts for enum policy, idempotency, JSON casing, pagination, OpenAPI coverage, and compactor lock-race behavior.
+
+### Fixed
+- Closed catalog and Iceberg correctness gaps around idempotency markers, stale-marker takeover, credential-vending scope, orphaned snapshot recovery, and public protocol compatibility.
+- Applied shared public-route rate limiting, internal-error redaction, thrift allocation bounds, and JWT feature-provider compatibility for Iceberg and Unity Catalog protocol surfaces.
+- Preserved deployed UAT as an explicit live-proof gate instead of claiming completion from local or readiness-only evidence.
+
 ## [0.2.0] - 2026-05-31
 ### Added
 - Catalog control-plane release surface covering scoped metastore mutations, catalog product APIs, Unity Catalog compatibility inventory, and system-table contracts.

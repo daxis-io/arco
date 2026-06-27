@@ -94,7 +94,7 @@ cat >"${strict_missing_cloud_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -252,7 +252,7 @@ cat >"${strict_ready_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -407,7 +407,7 @@ cat >"${target_mismatch_scheduler_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -905,7 +905,7 @@ cat >"${scheduler_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -1001,7 +1001,7 @@ cat >"${scheduler_target_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -1081,7 +1081,7 @@ printf 'called\n' >"${owner_curl_marker}"
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -1147,7 +1147,7 @@ printf 'called\n' >"${scope_curl_marker}"
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -1190,7 +1190,7 @@ cat >"${missing_owner_bin}/curl" <<'SH'
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",
@@ -1254,7 +1254,7 @@ fi
 cat <<'JSON'
 {
   "service": "arco-api-dev",
-  "packageVersion": "0.2.0",
+  "packageVersion": "0.2.1",
   "codeVersion": "uat-live",
   "gitSha": "abc123",
   "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",

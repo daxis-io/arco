@@ -500,7 +500,7 @@ fn deployed_failure_evidence_writer_preserves_partial_live_context_without_secre
     };
     let api_version = json!({
         "service": "arco-api-dev",
-        "packageVersion": "0.2.0",
+        "packageVersion": "0.2.1",
         "codeVersion": "uat-live",
         "gitSha": "abc123",
         "image": "us-central1-docker.pkg.dev/example/arco-api:uat-live",

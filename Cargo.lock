@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "arco-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arco-catalog",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "arco-catalog"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-core",
  "arco-proto",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "arco-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "arco-compactor"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arco-catalog",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "arco-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "arco-delta"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-core",
  "async-trait",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "arco-flow"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-core",
  "arco-proto",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "arco-iceberg"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "arco-integration-tests"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-api",
  "arco-catalog",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "arco-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-worker-contract",
  "chrono",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "arco-test-utils"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "arco-uc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "arco-worker-contract"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "chrono",
@@ -7184,7 +7184,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arco-catalog",

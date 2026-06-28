@@ -98,6 +98,7 @@ pub mod reader;
 pub mod reconciler;
 pub mod search_tombstone;
 mod state;
+pub mod state_store;
 pub mod storage_governance;
 pub mod sync_compactor;
 pub mod tier1_compactor;
@@ -130,6 +131,11 @@ pub use reconciler::{
     Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult, RepairScope,
 };
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
+pub use state_store::{
+    ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
+    CheckpointToken, CurrentStateStore, KeyRange, KvPair, PredicateInputSet, StateScope,
+    StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
+};
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};
 pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};

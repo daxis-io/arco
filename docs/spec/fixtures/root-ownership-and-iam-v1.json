@@ -1,0 +1,126 @@
+{
+  "schema_version": "arco.root-ownership-and-iam.v1",
+  "entries": [
+    {
+      "root": "control/catalog-root",
+      "root_kind": "control",
+      "mutation_visible": true,
+      "role": "api_control_writer",
+      "cas_authority": true,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": true,
+      "write_control_plane_state": true,
+      "write_table_protocol": false
+    },
+    {
+      "root": "control/catalog-root",
+      "root_kind": "control",
+      "mutation_visible": true,
+      "role": "projection_compactor",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "control/catalog-root",
+      "root_kind": "control",
+      "mutation_visible": true,
+      "role": "query_enforcement_service",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "control/catalog-root",
+      "root_kind": "control",
+      "mutation_visible": true,
+      "role": "table_engine",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "projection/catalog-system-tables",
+      "root_kind": "projection",
+      "mutation_visible": false,
+      "role": "projection_compactor",
+      "cas_authority": true,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "projection/catalog-system-tables",
+      "root_kind": "projection",
+      "mutation_visible": false,
+      "role": "api_control_writer",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "public-parquet/catalog-projection",
+      "root_kind": "public_parquet",
+      "mutation_visible": false,
+      "role": "projection_compactor",
+      "cas_authority": false,
+      "write_public_parquet": true,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "public-parquet/catalog-projection",
+      "root_kind": "public_parquet",
+      "mutation_visible": false,
+      "role": "api_control_writer",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "exports/workspace-snapshots",
+      "root_kind": "export",
+      "mutation_visible": false,
+      "role": "snapshot_export_service",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": false
+    },
+    {
+      "root": "tables/managed/table-data",
+      "root_kind": "table_data",
+      "mutation_visible": false,
+      "role": "table_engine",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": true
+    },
+    {
+      "root": "tables/external/table-data",
+      "root_kind": "table_data",
+      "mutation_visible": false,
+      "role": "external_engine",
+      "cas_authority": false,
+      "write_public_parquet": false,
+      "create_mutation_visible_state": false,
+      "write_control_plane_state": false,
+      "write_table_protocol": true
+    }
+  ]
+}

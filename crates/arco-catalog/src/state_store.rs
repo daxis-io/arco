@@ -326,32 +326,24 @@ impl StateScope {
 pub struct StateStoreCapabilities {
     /// Stable implementation identifier.
     implementation: &'static str,
-    /// Whether retained `StateToken` reads and issuance are supported.
-    retained_state_tokens: bool,
-    /// Whether retained checkpoints are supported.
-    checkpoints: bool,
-    /// Whether addressed historical reads through `read_at` are supported.
-    read_at: bool,
-    /// Whether write transactions are supported.
-    transactions: bool,
-    /// Whether range preconditions are supported.
-    range_preconditions: bool,
-    /// Whether semantic predicate input-set preconditions are supported.
-    predicate_preconditions: bool,
+    /// Bit mask of supported capabilities.
+    features: u8,
 }
 
 impl StateStoreCapabilities {
+    const RETAINED_STATE_TOKENS: u8 = 1 << 0;
+    const CHECKPOINTS: u8 = 1 << 1;
+    const READ_AT: u8 = 1 << 2;
+    const TRANSACTIONS: u8 = 1 << 3;
+    const RANGE_PRECONDITIONS: u8 = 1 << 4;
+    const PREDICATE_PRECONDITIONS: u8 = 1 << 5;
+
     /// Returns the explicit capabilities of the current-authority adapter.
     #[must_use]
     pub const fn arco_state_current() -> Self {
         Self {
             implementation: CurrentStateStore::IMPLEMENTATION,
-            retained_state_tokens: false,
-            checkpoints: false,
-            read_at: false,
-            transactions: false,
-            range_preconditions: false,
-            predicate_preconditions: false,
+            features: 0,
         }
     }
 
@@ -364,37 +356,37 @@ impl StateStoreCapabilities {
     /// Returns whether retained `StateToken` reads and issuance are supported.
     #[must_use]
     pub const fn retained_state_tokens(&self) -> bool {
-        self.retained_state_tokens
+        self.features & Self::RETAINED_STATE_TOKENS != 0
     }
 
     /// Returns whether retained checkpoints are supported.
     #[must_use]
     pub const fn checkpoints(&self) -> bool {
-        self.checkpoints
+        self.features & Self::CHECKPOINTS != 0
     }
 
     /// Returns whether addressed historical reads through `read_at` are supported.
     #[must_use]
     pub const fn read_at(&self) -> bool {
-        self.read_at
+        self.features & Self::READ_AT != 0
     }
 
     /// Returns whether write transactions are supported.
     #[must_use]
     pub const fn transactions(&self) -> bool {
-        self.transactions
+        self.features & Self::TRANSACTIONS != 0
     }
 
     /// Returns whether range preconditions are supported.
     #[must_use]
     pub const fn range_preconditions(&self) -> bool {
-        self.range_preconditions
+        self.features & Self::RANGE_PRECONDITIONS != 0
     }
 
     /// Returns whether semantic predicate input-set preconditions are supported.
     #[must_use]
     pub const fn predicate_preconditions(&self) -> bool {
-        self.predicate_preconditions
+        self.features & Self::PREDICATE_PRECONDITIONS != 0
     }
 }
 

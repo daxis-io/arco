@@ -11,6 +11,7 @@ use crate::error::{CatalogError, Result};
 
 pub mod control_mvp;
 pub mod model;
+pub mod promotion_gate;
 
 pub use control_mvp::{
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, ControlMvpTxn,

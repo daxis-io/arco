@@ -133,7 +133,8 @@ pub use reconciler::{
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore,
+    CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
+    ControlMvpTxn, CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore,
     ModelWrite, PredicateInputSet, StateScope, StateStoreCapabilities, StateToken, TxnOptions,
     VersionedValue,
 };

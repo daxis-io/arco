@@ -9,8 +9,12 @@ use bytes::Bytes;
 
 use crate::error::{CatalogError, Result};
 
+pub mod control_mvp;
 pub mod model;
 
+pub use control_mvp::{
+    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, ControlMvpTxn,
+};
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 
 /// Opaque retained authority token for a future state-store scope.
@@ -458,6 +462,13 @@ pub trait ArcoStateReader: Send + Sync {
     ///
     /// Returns an error when retained token reads are unsupported or invalid.
     async fn read_at(&self, token: StateToken) -> Result<Box<dyn ArcoStateReader>>;
+
+    /// Opens a retained reader at a checkpoint token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when checkpoint reads are unsupported or invalid.
+    async fn read_checkpoint(&self, token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>>;
 }
 
 /// Administrative state-store operations.
@@ -616,6 +627,12 @@ impl ArcoStateReader for CurrentStateStore {
     async fn read_at(&self, _token: StateToken) -> Result<Box<dyn ArcoStateReader>> {
         Err(unsupported("StateToken reads through arco-state-current"))
     }
+
+    async fn read_checkpoint(&self, _token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>> {
+        Err(unsupported(
+            "CheckpointToken reads through arco-state-current",
+        ))
+    }
 }
 
 #[async_trait]
@@ -673,5 +690,18 @@ mod tests {
         );
 
         assert_unsupported(CurrentStateStore::new().read_at(token).await, "read_at");
+    }
+
+    #[tokio::test]
+    async fn current_state_store_rejects_read_checkpoint_with_internal_token() {
+        let token = CheckpointToken {
+            scope: StateScope::new("tenant", "workspace", "catalog"),
+            checkpoint_id: "checkpoint-1".to_string(),
+        };
+
+        assert_unsupported(
+            CurrentStateStore::new().read_checkpoint(token).await,
+            "read_checkpoint",
+        );
     }
 }

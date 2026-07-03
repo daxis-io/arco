@@ -498,6 +498,10 @@ impl ArcoStateReader for ModelStateStore {
             records,
         )?))
     }
+
+    async fn read_checkpoint(&self, _token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>> {
+        Err(unsupported("model checkpoint reads"))
+    }
 }
 
 #[async_trait]

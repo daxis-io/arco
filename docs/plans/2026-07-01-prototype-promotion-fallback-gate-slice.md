@@ -7,6 +7,9 @@ state-store prototype has enough evidence to advance toward later service reads
 or low-risk writes. This slice does not promote the prototype, cut over traffic,
 or change production authority.
 
+Base: current `origin/main` plus the Phase 3A and Phase 3B commits in this
+PR-prep branch.
+
 ## Source Documents
 
 - Roadmap: `docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
@@ -16,6 +19,10 @@ or change production authority.
 - Original design doc: `docs/plans/2026-06-26-lineage-observation-projection-design.md`
 - Original design doc: `docs/plans/2026-06-27-planner-runtime-seam-hardening-design.md`
 - Current implementation authority: `docs/guide/src/reference/control-plane-scope.md`
+
+The broader roadmap/design-doc family is source context for this slice. This
+Phase 3-only PR does not add unrelated roadmap, Phase 4, Phase 5, or cutover
+planning files.
 
 The current production authority remains:
 

@@ -2,13 +2,14 @@
 
 **Status:** Phase 3A child plan.
 
-**Base:** `e64d19e docs: add phase 2 contract conformance slice`.
+**Base:** current `origin/main` for the Phase 3 PR-prep branch.
 
 ## Scope
 
-Add a deterministic in-crate reference state-store model under
-`arco-catalog::state_store`. The model exists to make the state-store contract
-observable and testable before any production authority changes.
+Add the narrow `arco-catalog::state_store` prototype seam and a deterministic
+in-crate reference model. The current-adapter surface stays capability-only and
+explicitly unsupported so the model can make the state-store contract observable
+and testable before any production authority changes.
 
 ## Owned Files
 
@@ -16,10 +17,13 @@ observable and testable before any production authority changes.
 - `crates/arco-catalog/src/state_store.rs`
 - `crates/arco-catalog/src/state_store/model.rs`
 - `crates/arco-catalog/src/lib.rs`
+- `crates/arco-catalog/tests/state_store_current_adapter.rs`
 - `crates/arco-catalog/tests/state_store_model.rs`
 
 ## Implementation Shape
 
+- Add the capability-only `CurrentStateStore` adapter for the current ledger plus
+  synchronous compactor authority.
 - Add `state_store::model` as a reference implementation module.
 - Add `ModelStateStore` implementing `ArcoStateReader`, `ArcoStateAdmin`, and
   `ArcoStateStore`.

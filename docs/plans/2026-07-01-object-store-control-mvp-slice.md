@@ -2,6 +2,9 @@
 
 Goal: validate the object-store authority path while the old ledger plus synchronous compactor path remains production authority.
 
+Base: current `origin/main` plus the Phase 3A deterministic state-store model
+commit in this PR-prep branch.
+
 This slice adds an internal `arco-state-control-mvp` backend inside `arco-catalog::state_store`. It writes immutable transaction objects and control manifests through existing object-store conditional-write primitives, publishes visibility only through pointer CAS, and serves `StateToken` plus minimal `CheckpointToken` reads by manifest-reachable replay.
 
 ## Scope

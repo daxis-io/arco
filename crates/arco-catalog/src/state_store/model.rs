@@ -1,7 +1,7 @@
 //! Deterministic reference model for the state-store seam.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -37,20 +37,13 @@ impl ModelStateStore {
     /// Returns committed records in deterministic commit order.
     #[must_use]
     pub fn committed_records(&self) -> Vec<ModelCommitRecord> {
-        self.inner
-            .lock()
-            .expect("model state mutex poisoned")
-            .log
-            .clone()
+        lock_model_state(&self.inner).log.clone()
     }
 
     /// Returns deterministic folded entries, including tombstoned keys.
     #[must_use]
     pub fn folded_entries(&self) -> Vec<(Vec<u8>, Option<Bytes>, u64)> {
-        self.inner
-            .lock()
-            .expect("model state mutex poisoned")
-            .folded_entries()
+        lock_model_state(&self.inner).folded_entries()
     }
 
     /// Returns deterministic transition explanations for committed records.
@@ -65,10 +58,7 @@ impl ModelStateStore {
     /// Returns a stable SHA-256-derived witness for a half-open key range.
     #[must_use]
     pub fn range_witness(&self, range: &KeyRange) -> u64 {
-        self.inner
-            .lock()
-            .expect("model state mutex poisoned")
-            .range_witness(range)
+        lock_model_state(&self.inner).range_witness(range)
     }
 
     /// Replays committed model records into a folded model store.
@@ -395,7 +385,9 @@ impl ModelState {
         }
         let digest = hasher.finalize();
         let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&digest[..8]);
+        for (target, source) in bytes.iter_mut().zip(digest.iter()) {
+            *target = *source;
+        }
         u64::from_be_bytes(bytes)
     }
 
@@ -433,7 +425,9 @@ impl ModelState {
 
         let digest = hasher.finalize();
         let mut bytes = [0_u8; 8];
-        bytes.copy_from_slice(&digest[..8]);
+        for (target, source) in bytes.iter_mut().zip(digest.iter()) {
+            *target = *source;
+        }
         u64::from_be_bytes(bytes)
     }
 }
@@ -441,7 +435,7 @@ impl ModelState {
 #[async_trait]
 impl ArcoStateReader for ModelStateStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        let inner = self.inner.lock().expect("model state mutex poisoned");
+        let inner = lock_model_state(&self.inner);
         Ok(inner
             .kv
             .get(key)
@@ -450,7 +444,7 @@ impl ArcoStateReader for ModelStateStore {
     }
 
     async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        let inner = self.inner.lock().expect("model state mutex poisoned");
+        let inner = lock_model_state(&self.inner);
         Ok(inner
             .kv
             .iter()
@@ -479,7 +473,7 @@ impl ArcoStateReader for ModelStateStore {
         }
 
         let records = {
-            let inner = self.inner.lock().expect("model state mutex poisoned");
+            let inner = lock_model_state(&self.inner);
             if token.logical_sequence() > inner.logical_sequence {
                 return Err(precondition_failed(
                     "StateToken is ahead of the current model sequence",
@@ -507,19 +501,11 @@ impl ArcoStateReader for ModelStateStore {
 #[async_trait]
 impl ArcoStateAdmin for ModelStateStore {
     fn capabilities(&self) -> StateStoreCapabilities {
-        StateStoreCapabilities {
-            implementation: Self::IMPLEMENTATION,
-            retained_state_tokens: true,
-            checkpoints: false,
-            read_at: true,
-            transactions: true,
-            range_preconditions: true,
-            predicate_preconditions: true,
-        }
+        StateStoreCapabilities::deterministic_model(Self::IMPLEMENTATION)
     }
 
     async fn current_state_token(&self) -> Result<StateToken> {
-        let inner = self.inner.lock().expect("model state mutex poisoned");
+        let inner = lock_model_state(&self.inner);
         Ok(self.token(inner.logical_sequence))
     }
 
@@ -558,7 +544,7 @@ impl ArcoStateTxn for ModelTxn {
             });
         }
 
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
+        let inner = lock_model_state(&self.store.inner);
         Ok(inner
             .kv
             .get(key)
@@ -568,7 +554,7 @@ impl ArcoStateTxn for ModelTxn {
 
     async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>> {
         let mut entries = {
-            let inner = self.store.inner.lock().expect("model state mutex poisoned");
+            let inner = lock_model_state(&self.store.inner);
             inner
                 .kv
                 .iter()
@@ -612,8 +598,10 @@ impl ArcoStateTxn for ModelTxn {
     }
 
     async fn assert_absent(&mut self, key: &[u8]) -> Result<()> {
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
-        let witness = inner.point_witness(key);
+        let witness = {
+            let inner = lock_model_state(&self.store.inner);
+            inner.point_witness(key)
+        };
         if matches!(witness, PointWitness::Present(_)) {
             return Err(precondition_failed(
                 "cannot assert absence for a present model key",
@@ -627,8 +615,11 @@ impl ArcoStateTxn for ModelTxn {
     }
 
     async fn assert_generation(&mut self, key: &[u8], generation: u64) -> Result<()> {
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
-        if inner.point_witness(key) != PointWitness::Present(generation) {
+        let current = {
+            let inner = lock_model_state(&self.store.inner);
+            inner.point_witness(key)
+        };
+        if current != PointWitness::Present(generation) {
             return Err(precondition_failed(
                 "cannot assert a model key generation that is not currently present",
             ));
@@ -641,11 +632,13 @@ impl ArcoStateTxn for ModelTxn {
     }
 
     async fn assert_range_empty(&mut self, range: KeyRange) -> Result<()> {
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
-        if inner.range_has_entries(&range) {
+        let (range_has_entries, witness) = {
+            let inner = lock_model_state(&self.store.inner);
+            (inner.range_has_entries(&range), inner.range_witness(&range))
+        };
+        if range_has_entries {
             return Err(precondition_failed("cannot assert a non-empty model range"));
         }
-        let witness = inner.range_witness(&range);
         self.preconditions
             .push(Precondition::RangeEmpty { range, witness });
         Ok(())
@@ -656,8 +649,11 @@ impl ArcoStateTxn for ModelTxn {
         range: KeyRange,
         observed_generation: u64,
     ) -> Result<()> {
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
-        if inner.range_witness(&range) != observed_generation {
+        let current = {
+            let inner = lock_model_state(&self.store.inner);
+            inner.range_witness(&range)
+        };
+        if current != observed_generation {
             return Err(precondition_failed(
                 "cannot assert a stale model range witness",
             ));
@@ -674,8 +670,10 @@ impl ArcoStateTxn for ModelTxn {
         keys: &[Vec<u8>],
         ranges: &[KeyRange],
     ) -> Result<PredicateInputSet> {
-        let inner = self.store.inner.lock().expect("model state mutex poisoned");
-        let witness = inner.predicate_witness(keys, ranges);
+        let witness = {
+            let inner = lock_model_state(&self.store.inner);
+            inner.predicate_witness(keys, ranges)
+        };
         Ok(PredicateInputSet::with_model_witness(
             keys.to_vec(),
             ranges.to_vec(),
@@ -687,12 +685,10 @@ impl ArcoStateTxn for ModelTxn {
         let witness = inputs
             .model_witness()
             .ok_or_else(|| precondition_failed("predicate input set has no model witness"))?;
-        let current = self
-            .store
-            .inner
-            .lock()
-            .expect("model state mutex poisoned")
-            .predicate_witness(inputs.point_keys(), inputs.ranges());
+        let current = {
+            let inner = lock_model_state(&self.store.inner);
+            inner.predicate_witness(inputs.point_keys(), inputs.ranges())
+        };
         if current != witness {
             return Err(precondition_failed("cannot assert stale predicate inputs"));
         }
@@ -702,58 +698,62 @@ impl ArcoStateTxn for ModelTxn {
     }
 
     async fn commit(self: Box<Self>) -> Result<StateToken> {
-        let mut inner = self.store.inner.lock().expect("model state mutex poisoned");
-        for precondition in &self.preconditions {
-            inner.validate_precondition(precondition)?;
-        }
-        let next_sequence = inner.logical_sequence + 1;
+        let store = self.store.clone();
+        let next_sequence = {
+            let mut inner = lock_model_state(&store.inner);
+            for precondition in &self.preconditions {
+                inner.validate_precondition(precondition)?;
+            }
+            let next_sequence = inner.logical_sequence + 1;
 
-        let mut writes = Vec::with_capacity(self.writes.len());
-        for (key, write) in self.writes {
-            match write {
-                StagedWrite::Put(bytes) => {
-                    inner.kv.insert(
-                        key.clone(),
-                        StoredValue {
-                            bytes: bytes.clone(),
+            let mut writes = Vec::with_capacity(self.writes.len());
+            for (key, write) in self.writes {
+                match write {
+                    StagedWrite::Put(bytes) => {
+                        inner.kv.insert(
+                            key.clone(),
+                            StoredValue {
+                                bytes: bytes.clone(),
+                                generation: next_sequence,
+                                tombstone: false,
+                            },
+                        );
+                        writes.push(ModelWrite {
+                            key,
                             generation: next_sequence,
-                            tombstone: false,
-                        },
-                    );
-                    writes.push(ModelWrite {
-                        key,
-                        generation: next_sequence,
-                        value: Some(bytes),
-                    });
-                }
-                StagedWrite::Delete => {
-                    inner.kv.insert(
-                        key.clone(),
-                        StoredValue {
-                            bytes: Bytes::new(),
+                            value: Some(bytes),
+                        });
+                    }
+                    StagedWrite::Delete => {
+                        inner.kv.insert(
+                            key.clone(),
+                            StoredValue {
+                                bytes: Bytes::new(),
+                                generation: next_sequence,
+                                tombstone: true,
+                            },
+                        );
+                        writes.push(ModelWrite {
+                            key,
                             generation: next_sequence,
-                            tombstone: true,
-                        },
-                    );
-                    writes.push(ModelWrite {
-                        key,
-                        generation: next_sequence,
-                        value: None,
-                    });
+                            value: None,
+                        });
+                    }
                 }
             }
-        }
 
-        inner.logical_sequence = next_sequence;
-        let logical_events = logical_events_for_writes(&writes);
-        inner.log.push(ModelCommitRecord {
-            sequence: next_sequence,
-            request_id: self.request_id,
-            logical_events,
-            writes,
-        });
+            inner.logical_sequence = next_sequence;
+            let logical_events = logical_events_for_writes(&writes);
+            inner.log.push(ModelCommitRecord {
+                sequence: next_sequence,
+                request_id: self.request_id,
+                logical_events,
+                writes,
+            });
+            next_sequence
+        };
 
-        Ok(self.store.token(next_sequence))
+        Ok(store.token(next_sequence))
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {
@@ -785,19 +785,25 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
     }
 }
 
+fn lock_model_state(inner: &Mutex<ModelState>) -> MutexGuard<'_, ModelState> {
+    inner.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn logical_events_for_writes(writes: &[ModelWrite]) -> Vec<String> {
     writes
         .iter()
         .map(|write| {
             let key = String::from_utf8_lossy(&write.key);
-            match &write.value {
-                Some(bytes) => format!(
-                    "put {key} generation={} bytes={}",
-                    write.generation,
-                    bytes.len()
-                ),
-                None => format!("delete {key} generation={}", write.generation),
-            }
+            write.value.as_ref().map_or_else(
+                || format!("delete {key} generation={}", write.generation),
+                |bytes| {
+                    format!(
+                        "put {key} generation={} bytes={}",
+                        write.generation,
+                        bytes.len()
+                    )
+                },
+            )
         })
         .collect()
 }

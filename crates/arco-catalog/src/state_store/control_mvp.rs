@@ -395,60 +395,6 @@ impl ControlMvpTxn {
         self.outbox.push(record);
     }
 
-    /// Reads a value inside the transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction state cannot be inspected.
-    pub async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
-        self.get_inner(key)
-    }
-
-    /// Scans key/value pairs by prefix inside the transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the transaction state cannot be inspected.
-    pub async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        self.scan_prefix_inner(prefix)
-    }
-
-    /// Stages a value write.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the write cannot be staged.
-    pub async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
-        self.put_inner(key, value)
-    }
-
-    /// Stages a value delete.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the delete cannot be staged.
-    pub async fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.delete_inner(key)
-    }
-
-    /// Asserts that a key is absent at commit time.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the key is present in the captured base state.
-    pub async fn assert_absent(&mut self, key: &[u8]) -> Result<()> {
-        self.assert_absent_inner(key)
-    }
-
-    /// Asserts that a key has the expected generation at commit time.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the captured base state does not match.
-    pub async fn assert_generation(&mut self, key: &[u8], generation: u64) -> Result<()> {
-        self.assert_generation_inner(key, generation)
-    }
-
     /// Commits the transaction and returns the resulting state token.
     ///
     /// # Errors
@@ -459,23 +405,22 @@ impl ControlMvpTxn {
         self.commit_inner().await
     }
 
-    fn get_inner(&self, key: &[u8]) -> Result<Option<VersionedValue>> {
+    fn get_inner(&self, key: &[u8]) -> Option<VersionedValue> {
         if let Some(write) = self.writes.get(key) {
-            return Ok(match write {
+            return match write {
                 StagedWrite::Put(bytes) => Some(VersionedValue::new(bytes.clone(), None)),
                 StagedWrite::Delete => None,
-            });
+            };
         }
-        Ok(self
-            .base
+        self.base
             .state
             .kv
             .get(key)
             .filter(|value| !value.tombstone)
-            .map(|value| VersionedValue::new(value.bytes.clone(), Some(value.generation))))
+            .map(|value| VersionedValue::new(value.bytes.clone(), Some(value.generation)))
     }
 
-    fn scan_prefix_inner(&self, prefix: &[u8]) -> Result<Vec<KvPair>> {
+    fn scan_prefix_inner(&self, prefix: &[u8]) -> Vec<KvPair> {
         let mut entries = self
             .base
             .state
@@ -503,20 +448,18 @@ impl ControlMvpTxn {
             }
         }
 
-        Ok(entries
+        entries
             .into_iter()
             .map(|(key, value)| KvPair::new(key, value))
-            .collect())
+            .collect()
     }
 
-    fn put_inner(&mut self, key: &[u8], value: Bytes) -> Result<()> {
+    fn put_inner(&mut self, key: &[u8], value: Bytes) {
         self.writes.insert(key.to_vec(), StagedWrite::Put(value));
-        Ok(())
     }
 
-    fn delete_inner(&mut self, key: &[u8]) -> Result<()> {
+    fn delete_inner(&mut self, key: &[u8]) {
         self.writes.insert(key.to_vec(), StagedWrite::Delete);
-        Ok(())
     }
 
     fn assert_absent_inner(&mut self, key: &[u8]) -> Result<()> {
@@ -683,15 +626,7 @@ impl ArcoStateReader for ControlMvpStateStore {
 #[async_trait]
 impl ArcoStateAdmin for ControlMvpStateStore {
     fn capabilities(&self) -> StateStoreCapabilities {
-        StateStoreCapabilities {
-            implementation: Self::IMPLEMENTATION,
-            retained_state_tokens: true,
-            checkpoints: true,
-            read_at: true,
-            transactions: true,
-            range_preconditions: true,
-            predicate_preconditions: true,
-        }
+        StateStoreCapabilities::control_mvp(Self::IMPLEMENTATION)
     }
 
     async fn current_state_token(&self) -> Result<StateToken> {
@@ -737,19 +672,21 @@ impl ArcoStateStore for ControlMvpStateStore {
 #[async_trait]
 impl ArcoStateTxn for ControlMvpTxn {
     async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
-        self.get_inner(key)
+        Ok(self.get_inner(key))
     }
 
     async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        self.scan_prefix_inner(prefix)
+        Ok(self.scan_prefix_inner(prefix))
     }
 
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
-        self.put_inner(key, value)
+        self.put_inner(key, value);
+        Ok(())
     }
 
     async fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.delete_inner(key)
+        self.delete_inner(key);
+        Ok(())
     }
 
     async fn assert_absent(&mut self, key: &[u8]) -> Result<()> {
@@ -1405,7 +1342,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 fn digest_u64(hasher: Sha256) -> u64 {
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
+    for (target, source) in bytes.iter_mut().zip(digest.iter()) {
+        *target = *source;
+    }
     u64::from_be_bytes(bytes)
 }
 

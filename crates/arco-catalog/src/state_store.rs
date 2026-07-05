@@ -368,18 +368,7 @@ impl StateScope {
 pub struct StateStoreCapabilities {
     /// Stable implementation identifier.
     implementation: &'static str,
-    /// Whether retained `StateToken` reads and issuance are supported.
-    retained_state_tokens: bool,
-    /// Whether retained checkpoints are supported.
-    checkpoints: bool,
-    /// Whether addressed historical reads through `read_at` are supported.
-    read_at: bool,
-    /// Whether write transactions are supported.
-    transactions: bool,
-    /// Whether range preconditions are supported.
-    range_preconditions: bool,
-    /// Whether semantic predicate input-set preconditions are supported.
-    predicate_preconditions: bool,
+    flags: StateStoreCapabilityFlags,
 }
 
 impl StateStoreCapabilities {
@@ -388,12 +377,30 @@ impl StateStoreCapabilities {
     pub const fn arco_state_current() -> Self {
         Self {
             implementation: CurrentStateStore::IMPLEMENTATION,
-            retained_state_tokens: false,
-            checkpoints: false,
-            read_at: false,
-            transactions: false,
-            range_preconditions: false,
-            predicate_preconditions: false,
+            flags: StateStoreCapabilityFlags::empty(),
+        }
+    }
+
+    pub(crate) const fn deterministic_model(implementation: &'static str) -> Self {
+        Self {
+            implementation,
+            flags: StateStoreCapabilityFlags::RETAINED_STATE_TOKENS
+                .union(StateStoreCapabilityFlags::READ_AT)
+                .union(StateStoreCapabilityFlags::TRANSACTIONS)
+                .union(StateStoreCapabilityFlags::RANGE_PRECONDITIONS)
+                .union(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS),
+        }
+    }
+
+    pub(crate) const fn control_mvp(implementation: &'static str) -> Self {
+        Self {
+            implementation,
+            flags: StateStoreCapabilityFlags::RETAINED_STATE_TOKENS
+                .union(StateStoreCapabilityFlags::CHECKPOINTS)
+                .union(StateStoreCapabilityFlags::READ_AT)
+                .union(StateStoreCapabilityFlags::TRANSACTIONS)
+                .union(StateStoreCapabilityFlags::RANGE_PRECONDITIONS)
+                .union(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS),
         }
     }
 
@@ -406,37 +413,64 @@ impl StateStoreCapabilities {
     /// Returns whether retained `StateToken` reads and issuance are supported.
     #[must_use]
     pub const fn retained_state_tokens(&self) -> bool {
-        self.retained_state_tokens
+        self.flags
+            .contains(StateStoreCapabilityFlags::RETAINED_STATE_TOKENS)
     }
 
     /// Returns whether retained checkpoints are supported.
     #[must_use]
     pub const fn checkpoints(&self) -> bool {
-        self.checkpoints
+        self.flags.contains(StateStoreCapabilityFlags::CHECKPOINTS)
     }
 
     /// Returns whether addressed historical reads through `read_at` are supported.
     #[must_use]
     pub const fn read_at(&self) -> bool {
-        self.read_at
+        self.flags.contains(StateStoreCapabilityFlags::READ_AT)
     }
 
     /// Returns whether write transactions are supported.
     #[must_use]
     pub const fn transactions(&self) -> bool {
-        self.transactions
+        self.flags.contains(StateStoreCapabilityFlags::TRANSACTIONS)
     }
 
     /// Returns whether range preconditions are supported.
     #[must_use]
     pub const fn range_preconditions(&self) -> bool {
-        self.range_preconditions
+        self.flags
+            .contains(StateStoreCapabilityFlags::RANGE_PRECONDITIONS)
     }
 
     /// Returns whether semantic predicate input-set preconditions are supported.
     #[must_use]
     pub const fn predicate_preconditions(&self) -> bool {
-        self.predicate_preconditions
+        self.flags
+            .contains(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateStoreCapabilityFlags(u8);
+
+impl StateStoreCapabilityFlags {
+    const RETAINED_STATE_TOKENS: Self = Self(1 << 0);
+    const CHECKPOINTS: Self = Self(1 << 1);
+    const READ_AT: Self = Self(1 << 2);
+    const TRANSACTIONS: Self = Self(1 << 3);
+    const RANGE_PRECONDITIONS: Self = Self(1 << 4);
+    const PREDICATE_PRECONDITIONS: Self = Self(1 << 5);
+
+    const fn empty() -> Self {
+        Self(0)
+    }
+
+    const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
     }
 }
 

@@ -20,7 +20,13 @@ yanked = "deny"
 # In cargo-deny 0.18+, all advisories are denied by default.
 # Use "workspace" to only fail on direct workspace dependencies.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # quick-xml is pulled through object_store 0.11.x and opendal 0.54.x.
+    # Both upstream constraints currently block quick-xml >=0.41.0 without a broad
+    # DataFusion/Iceberg/object-store dependency upgrade outside this Phase 3 PR.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 # All licenses not in 'allow' are denied by default (cargo-deny 0.18+)

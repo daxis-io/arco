@@ -66,6 +66,7 @@ the inspected implementation files as the executable source.
 Only these files may change:
 
 - `docs/plans/2026-07-06-phase-4b-internal-read-only-comparison-reads.md`
+- `crates/arco-catalog/src/reader.rs`
 - `crates/arco-catalog/src/state_store.rs`
 - `crates/arco-catalog/src/state_store/shadow_replay.rs`
 - `crates/arco-catalog/src/state_store/comparison_reads.rs`
@@ -75,6 +76,8 @@ Only these files may change:
 In:
 
 - Add crate-private `state_store::comparison_reads`.
+- Add a crate-private `CatalogReader` entry point for the internal comparison
+  read.
 - Add a read-only comparison adapter for the current catalog inventory
   descriptor.
 - Return `current` as the current-authority descriptor unchanged.
@@ -108,8 +111,8 @@ credential vending, mutation behavior, UC compatibility responses, or
 governance enforcement.
 
 The public `/catalog/inventory` route remains unchanged. Phase 4B adds only an
-internal adapter that can be exercised by crate-local tests and future internal
-callers.
+internal adapter and crate-private `CatalogReader` entry point that can be
+exercised by crate-local tests and future internal callers.
 
 ## Diagnostic Shape
 
@@ -145,6 +148,8 @@ Add focused crate-local tests for:
 - current descriptor/source identity mismatch surfaced as `stale_projection`
 - shadow backend read/compare failure surfaced as diagnostics only after current
   read success
+- crate-private `CatalogReader` comparison entry point returns the current
+  descriptor unchanged
 
 ## Verification
 
@@ -155,6 +160,7 @@ cargo fmt --check
 cargo test -p arco-catalog shadow
 cargo test -p arco-catalog projection
 cargo test -p arco-catalog comparison_reads
+cargo test -p arco-catalog internal_catalog_inventory_shadow_comparison_returns_current_descriptor
 cargo check -p arco-catalog
 git diff --check
 ```

@@ -46,6 +46,9 @@ use crate::manifest::{
 use crate::metrics;
 use crate::parquet_util;
 use crate::read_model::{CatalogReadModel, CatalogSnapshotIdentity};
+use crate::state_store::comparison_reads::{
+    CatalogInventoryComparisonRead, read_catalog_inventory_with_shadow_comparison,
+};
 use crate::write_options::SnapshotVersion;
 use crate::writer::{Catalog, Column, LineageEdge, Schema, Table};
 
@@ -800,6 +803,25 @@ impl CatalogReader {
         })
     }
 
+    /// Reads the current catalog snapshot descriptor and attaches internal
+    /// Phase 4B shadow comparison diagnostics.
+    ///
+    /// This is crate-private and does not alter public API responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the current-authority descriptor read fails.
+    #[allow(dead_code)]
+    pub(crate) async fn get_catalog_snapshot_descriptor_with_shadow_comparison(
+        &self,
+    ) -> Result<CatalogInventoryComparisonRead> {
+        read_catalog_inventory_with_shadow_comparison(
+            &self.storage,
+            self.get_catalog_snapshot_descriptor(),
+        )
+        .await
+    }
+
     // ========================================================================
     // Signed URL Minting (manifest-driven allowlist)
     // ========================================================================
@@ -1412,6 +1434,31 @@ mod tests {
                 CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet"),
                 CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "columns.parquet"),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_catalog_inventory_shadow_comparison_returns_current_descriptor() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await.expect("init");
+        let reader = CatalogReader::new(storage);
+
+        let current = reader
+            .get_catalog_snapshot_descriptor()
+            .await
+            .expect("current descriptor");
+        let compared = reader
+            .get_catalog_snapshot_descriptor_with_shadow_comparison()
+            .await
+            .expect("comparison descriptor");
+
+        assert_eq!(current.manifest_id, compared.current().manifest_id);
+        assert_eq!(
+            current.snapshot_version.as_u64(),
+            compared.current().snapshot_version.as_u64()
         );
     }
 

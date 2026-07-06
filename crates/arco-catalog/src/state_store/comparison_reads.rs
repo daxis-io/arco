@@ -1,5 +1,7 @@
 //! Phase 4B internal read-only comparison reads.
 
+// Phase 4B intentionally lands an internal pre-wiring surface before exposing
+// an operator route or public API. Crate-local tests exercise the path.
 #![allow(dead_code)]
 
 use std::future::Future;

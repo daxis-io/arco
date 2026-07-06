@@ -3,6 +3,8 @@
 //! This module imports the current published catalog snapshot into an isolated
 //! control-MVP scope and compares only the domains Phase 4A can honestly prove.
 
+// Phase 4A keeps shadow replay crate-private until later operator wiring.
+// Crate-local tests exercise the importer, report accessors, and diagnostics.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};

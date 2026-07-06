@@ -22,6 +22,7 @@ const KEY_PREFIX: &str = "shadow/catalog/";
 const OBJECT_PREFIX: &str = "shadow/catalog/object/";
 const INDEX_PREFIX: &str = "shadow/catalog/index/";
 const MANIFEST_WATERMARK_KEY: &str = "shadow/catalog/metadata/source-watermark";
+#[cfg(test)]
 const LEGACY_DEFAULT_CATALOG_PARENT: &str = "__legacy_default_catalog__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +271,20 @@ pub(crate) async fn load_current_catalog_shadow_source(
                 name: pointer_path.clone(),
             })?;
     let pointer_bytes = storage.get_raw(&pointer_path).await?;
+    let pointer_meta_after =
+        storage
+            .head_raw(&pointer_path)
+            .await?
+            .ok_or_else(|| CatalogError::PreconditionFailed {
+                message: format!(
+                    "catalog manifest pointer {pointer_path} disappeared while loading catalog shadow source"
+                ),
+            })?;
+    let pointer_version = stable_pointer_version(
+        &pointer_path,
+        &pointer_meta.version,
+        &pointer_meta_after.version,
+    )?;
     let pointer: DomainManifestPointer =
         serde_json::from_slice(&pointer_bytes).map_err(|err| CatalogError::Serialization {
             message: format!("parse catalog manifest pointer at {pointer_path}: {err}"),
@@ -296,7 +311,7 @@ pub(crate) async fn load_current_catalog_shadow_source(
     Ok(CatalogShadowSource {
         identity: CatalogShadowSourceIdentity {
             pointer_path,
-            pointer_version: pointer_meta.version,
+            pointer_version,
             pointer_manifest_id: pointer.manifest_id,
             pointer_manifest_path: pointer.manifest_path,
             pointer_hash: compute_manifest_hash(&pointer_bytes),
@@ -355,7 +370,11 @@ pub(crate) async fn compare_catalog_shadow(
         .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
         .collect::<BTreeMap<_, _>>();
 
-    let object_status = if rows_match_by(&expected.rows, &actual, is_object_key) {
+    let unknown_keys = unknown_shadow_keys(&actual);
+
+    let object_status = if !unknown_keys.is_empty() {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
+    } else if rows_match_by(&expected.rows, &actual, is_object_key) {
         ShadowComparisonStatus::Equivalent
     } else {
         ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
@@ -385,7 +404,14 @@ pub(crate) async fn compare_catalog_shadow(
             ShadowComparison {
                 domain: ShadowComparisonDomain::CatalogObjects,
                 status: object_status,
-                detail: comparison_detail(object_status, "catalog object records"),
+                detail: if unknown_keys.is_empty() {
+                    comparison_detail(object_status, "catalog object records")
+                } else {
+                    format!(
+                        "catalog object records diverged from current published state: unknown shadow row(s): {}",
+                        unknown_keys.join(", ")
+                    )
+                },
             },
             ShadowComparison {
                 domain: ShadowComparisonDomain::CatalogNameIndexes,
@@ -402,6 +428,18 @@ pub(crate) async fn compare_catalog_shadow(
                 detail: comparison_detail(watermark_status, "catalog manifest watermark metadata"),
             },
         ],
+    })
+}
+
+fn stable_pointer_version(pointer_path: &str, before: &str, after: &str) -> Result<String> {
+    if before == after {
+        return Ok(before.to_string());
+    }
+
+    Err(CatalogError::PreconditionFailed {
+        message: format!(
+            "catalog manifest pointer {pointer_path} changed while loading catalog shadow source: version before read was {before}, version after read was {after}"
+        ),
     })
 }
 
@@ -482,6 +520,7 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
         .iter()
         .map(|catalog| catalog.id.as_str())
         .collect::<BTreeSet<_>>();
+    let default_catalog_id = default_catalog_id(state);
     for namespace in &state.namespaces {
         insert_object(
             &mut rows,
@@ -489,19 +528,26 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             &namespace.id,
             namespace,
         )?;
-        if let Some(catalog_id) = namespace.catalog_id.as_deref()
-            && !catalog_ids.contains(catalog_id)
-        {
-            source_gaps.push(format!(
-                "schema {} references missing catalog {}",
-                namespace.id, catalog_id
-            ));
-            continue;
-        }
-        let parent_id = namespace
-            .catalog_id
-            .as_deref()
-            .unwrap_or(LEGACY_DEFAULT_CATALOG_PARENT);
+        let parent_id = match namespace.catalog_id.as_deref() {
+            Some(catalog_id) if catalog_ids.contains(catalog_id) => catalog_id,
+            Some(catalog_id) => {
+                source_gaps.push(format!(
+                    "schema {} references missing catalog {}",
+                    namespace.id, catalog_id
+                ));
+                continue;
+            }
+            None => match default_catalog_id {
+                Some(catalog_id) => catalog_id,
+                None => {
+                    source_gaps.push(format!(
+                        "schema {} has legacy/default catalog_id but no default catalog exists",
+                        namespace.id
+                    ));
+                    continue;
+                }
+            },
+        };
         insert_name_index(
             &mut rows,
             &mut source_gaps,
@@ -569,6 +615,14 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
     );
 
     Ok(ExpectedShadowRows { rows, source_gaps })
+}
+
+fn default_catalog_id(state: &CatalogState) -> Option<&str> {
+    state
+        .catalogs
+        .iter()
+        .find(|catalog| catalog.name == "default")
+        .map(|catalog| catalog.id.as_str())
 }
 
 fn insert_object<T: Serialize>(
@@ -645,6 +699,19 @@ fn is_manifest_watermark_key(key: &[u8]) -> bool {
     key == MANIFEST_WATERMARK_KEY.as_bytes()
 }
 
+fn unknown_shadow_keys(actual: &BTreeMap<Vec<u8>, Bytes>) -> Vec<String> {
+    actual
+        .keys()
+        .filter(|key| {
+            key.starts_with(KEY_PREFIX.as_bytes())
+                && !is_object_key(key)
+                && !is_name_index_key(key)
+                && !is_manifest_watermark_key(key)
+        })
+        .map(|key| String::from_utf8_lossy(key).into_owned())
+        .collect()
+}
+
 fn comparison_detail(status: ShadowComparisonStatus, domain: &str) -> String {
     match status {
         ShadowComparisonStatus::Equivalent => format!("{domain} are equivalent"),
@@ -705,10 +772,16 @@ fn deferred_domains() -> Vec<ShadowDeferredEntry> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
-    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
     use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+    use async_trait::async_trait;
     use chrono::Utc;
     use serde_json::json;
 
@@ -725,6 +798,78 @@ mod tests {
         let storage =
             ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
         (backend, storage)
+    }
+
+    struct PointerRaceBackend {
+        inner: Arc<MemoryBackend>,
+        pointer_path: String,
+        raced: AtomicBool,
+    }
+
+    impl PointerRaceBackend {
+        fn new(inner: Arc<MemoryBackend>, pointer_path: String) -> Self {
+            Self {
+                inner,
+                pointer_path,
+                raced: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for PointerRaceBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            let bytes = self.inner.get(path).await?;
+            if path.ends_with(&self.pointer_path) && !self.raced.swap(true, Ordering::SeqCst) {
+                self.inner
+                    .put(
+                        path,
+                        Bytes::from_static(
+                            br#"{"manifest_id":"changed","manifest_path":"manifests/catalog/changed.json","epoch":5,"parent_pointer_hash":null,"updated_at":"2026-07-06T00:00:00Z"}"#,
+                        ),
+                        WritePrecondition::None,
+                    )
+                    .await?;
+            }
+            Ok(bytes)
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
     }
 
     fn fixture_state() -> CatalogState {
@@ -849,11 +994,17 @@ mod tests {
         report: &ShadowReplayReport,
         domain: ShadowComparisonDomain,
     ) -> ShadowComparisonStatus {
+        comparison(report, domain).status()
+    }
+
+    fn comparison(
+        report: &ShadowReplayReport,
+        domain: ShadowComparisonDomain,
+    ) -> &ShadowComparison {
         report
             .comparisons()
             .iter()
             .find(|comparison| comparison.domain() == domain)
-            .map(ShadowComparison::status)
             .expect("comparison domain")
     }
 
@@ -995,6 +1146,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_source_fails_if_pointer_version_changes_while_reading() {
+        let (backend, storage) = storage();
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let raced_storage = ScopedStorage::new(
+            Arc::new(PointerRaceBackend::new(
+                backend,
+                CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            )),
+            "tenant",
+            "workspace",
+        )
+        .expect("raced scoped storage");
+
+        let err = load_current_catalog_shadow_source(&raced_storage)
+            .await
+            .expect_err("pointer version race must fail closed");
+
+        assert!(
+            matches!(err, CatalogError::PreconditionFailed { ref message } if message.contains("changed while loading catalog shadow source")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_default_schema_indexes_under_default_catalog_when_available() {
+        let (_backend, storage) = storage();
+        let mut state = fixture_state();
+        state.catalogs[0].id = "cat-default".to_string();
+        state.catalogs[0].name = "default".to_string();
+        state.namespaces[0].catalog_id = None;
+        publish_catalog_fixture(&storage, state).await;
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import shadow state");
+
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::CatalogNameIndexes).is_equivalent()
+        );
+        let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
+        assert!(
+            shadow
+                .get(&name_index_key(
+                    ShadowObjectKind::Schema,
+                    Some("cat-default"),
+                    "sales"
+                ))
+                .await
+                .expect("read default-catalog schema index")
+                .is_some()
+        );
+        assert!(
+            shadow
+                .get(&name_index_key(
+                    ShadowObjectKind::Schema,
+                    Some(LEGACY_DEFAULT_CATALOG_PARENT),
+                    "sales"
+                ))
+                .await
+                .expect("read synthetic legacy schema index")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_default_schema_without_default_catalog_is_current_state_gap() {
+        let (_backend, storage) = storage();
+        let mut state = fixture_state();
+        state.namespaces[0].catalog_id = None;
+        publish_catalog_fixture(&storage, state).await;
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import shadow state");
+
+        let name_indexes = comparison(&report, ShadowComparisonDomain::CatalogNameIndexes);
+        assert_eq!(
+            Some(ShadowDifferenceClass::CurrentStateGap),
+            name_indexes.status().difference_class()
+        );
+        assert!(
+            name_indexes
+                .detail()
+                .contains("legacy/default catalog_id but no default catalog exists"),
+            "unexpected detail: {}",
+            name_indexes.detail()
+        );
+    }
+
+    #[tokio::test]
     async fn missing_source_parent_inputs_are_classified_as_current_state_gap() {
         let (_backend, storage) = storage();
         let mut state = fixture_state();
@@ -1043,6 +1284,46 @@ mod tests {
         assert_eq!(
             Some(ShadowDifferenceClass::BugDivergentResult),
             comparison_status(&report, ShadowComparisonDomain::CatalogObjects).difference_class()
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_extra_shadow_keys_are_classified_as_bug_divergent_result() {
+        let (_backend, storage) = storage();
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let source = load_current_catalog_shadow_source(&storage)
+            .await
+            .expect("load current source");
+        let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
+        import_catalog_source_into_shadow(&shadow, &source)
+            .await
+            .expect("import shadow state");
+
+        let mut txn = shadow
+            .begin_txn(TxnOptions::default().with_request_id("unknown-shadow-key"))
+            .await
+            .expect("begin unknown-key transaction");
+        txn.put(
+            b"shadow/catalog/unknown/extra",
+            Bytes::from_static(br#"{"unknown":true}"#),
+        )
+        .await
+        .expect("write unknown shadow key");
+        txn.commit().await.expect("commit unknown-key transaction");
+
+        let report = compare_catalog_shadow(&shadow, &source)
+            .await
+            .expect("compare unknown-key shadow");
+        let catalog_objects = comparison(&report, ShadowComparisonDomain::CatalogObjects);
+
+        assert_eq!(
+            Some(ShadowDifferenceClass::BugDivergentResult),
+            catalog_objects.status().difference_class()
+        );
+        assert!(
+            catalog_objects.detail().contains("unknown shadow row"),
+            "unexpected detail: {}",
+            catalog_objects.detail()
         );
     }
 

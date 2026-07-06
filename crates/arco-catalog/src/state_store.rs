@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::error::{CatalogError, Result};
 
+pub(crate) mod comparison_reads;
 pub mod control_mvp;
 pub mod model;
 pub mod promotion_gate;

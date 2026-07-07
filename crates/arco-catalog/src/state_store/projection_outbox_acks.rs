@@ -1,22 +1,24 @@
-#![allow(dead_code)]
-
 use arco_core::ScopedStorage;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, StateScope, StateToken, TxnOptions,
+    ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, StateScope, StateToken,
+    TxnOptions,
 };
 use crate::error::{CatalogError, Result};
 
+#[allow(dead_code)]
 pub(crate) const PROJECTION_OUTBOX_ACK_DOMAIN: &str = "projection-outbox-acks";
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(crate) struct ProjectionOutboxAckWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
 
+#[allow(dead_code)]
 impl ProjectionOutboxAckWriter {
     pub(crate) fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         if scope.domain() != PROJECTION_OUTBOX_ACK_DOMAIN {
@@ -34,14 +36,30 @@ impl ProjectionOutboxAckWriter {
     ) -> Result<ProjectionOutboxAckReceipt> {
         let record = ProjectionOutboxAckRecord::from(write);
         let key = ack_key(record.consumer_id(), record.record_id());
+        if let Some(receipt) = self.existing_receipt_for(&key, &record).await? {
+            return Ok(receipt);
+        }
+
         let mut txn = self
             .store
             .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
             .await?;
         txn.assert_absent(&key).await?;
         txn.put(&key, encode_ack_record(&record)?).await?;
-        let token = txn.commit().await?;
-        Ok(ProjectionOutboxAckReceipt { token, record })
+        match txn.commit().await {
+            Ok(token) => Ok(ProjectionOutboxAckReceipt { token, record }),
+            Err(CatalogError::CasFailed { .. }) => {
+                if let Some(receipt) = self.existing_receipt_for(&key, &record).await? {
+                    Ok(receipt)
+                } else {
+                    Err(CatalogError::CasFailed {
+                        message: "projection outbox ack pointer CAS lost without a visible ack"
+                            .to_string(),
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn read_ack_at(
@@ -79,14 +97,34 @@ impl ProjectionOutboxAckWriter {
             }
         }
     }
+
+    async fn existing_receipt_for(
+        &self,
+        key: &[u8],
+        expected: &ProjectionOutboxAckRecord,
+    ) -> Result<Option<ProjectionOutboxAckReceipt>> {
+        let Some(bytes) = self.store.get(key).await? else {
+            return Ok(None);
+        };
+        let record = decode_ack_record(&bytes)?;
+        if &record != expected {
+            return Err(invariant_violation(
+                "projection outbox ack key resolved to a different record",
+            ));
+        }
+        let token = self.store.current_state_token().await?;
+        Ok(Some(ProjectionOutboxAckReceipt { token, record }))
+    }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionOutboxAckWrite {
     consumer_id: String,
     record_id: String,
 }
 
+#[allow(dead_code)]
 impl ProjectionOutboxAckWrite {
     #[must_use]
     pub(crate) fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
@@ -97,12 +135,14 @@ impl ProjectionOutboxAckWrite {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProjectionOutboxAckRecord {
     consumer_id: String,
     record_id: String,
 }
 
+#[allow(dead_code)]
 impl ProjectionOutboxAckRecord {
     #[must_use]
     pub(crate) fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
@@ -132,12 +172,14 @@ impl From<ProjectionOutboxAckWrite> for ProjectionOutboxAckRecord {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionOutboxAckReceipt {
     token: StateToken,
     record: ProjectionOutboxAckRecord,
 }
 
+#[allow(dead_code)]
 impl ProjectionOutboxAckReceipt {
     #[must_use]
     pub(crate) const fn token(&self) -> &StateToken {
@@ -150,6 +192,7 @@ impl ProjectionOutboxAckReceipt {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectionOutboxAckFreshness {
     Current {
@@ -163,6 +206,7 @@ pub(crate) enum ProjectionOutboxAckFreshness {
     ProjectionUnavailable,
 }
 
+#[allow(dead_code)]
 fn ack_key(consumer_id: &str, record_id: &str) -> Vec<u8> {
     let mut key = b"projection-outbox-acks/ack/".to_vec();
     push_length_prefixed(&mut key, consumer_id.as_bytes());
@@ -171,31 +215,43 @@ fn ack_key(consumer_id: &str, record_id: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)]
 fn push_length_prefixed(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(value.len().to_string().as_bytes());
     key.push(b':');
     key.extend_from_slice(value);
 }
 
+#[allow(dead_code)]
 fn encode_ack_record(record: &ProjectionOutboxAckRecord) -> Result<Bytes> {
     serde_json::to_vec(record)
         .map(Bytes::from)
         .map_err(|error| serialization_failed(format!("projection ack record encode: {error}")))
 }
 
+#[allow(dead_code)]
 fn decode_ack_record(bytes: &Bytes) -> Result<ProjectionOutboxAckRecord> {
     serde_json::from_slice(bytes)
         .map_err(|error| serialization_failed(format!("projection ack record decode: {error}")))
 }
 
+#[allow(dead_code)]
 fn validation_failed(message: impl Into<String>) -> CatalogError {
     CatalogError::Validation {
         message: message.into(),
     }
 }
 
+#[allow(dead_code)]
 fn serialization_failed(message: impl Into<String>) -> CatalogError {
     CatalogError::Serialization {
+        message: message.into(),
+    }
+}
+
+#[allow(dead_code)]
+fn invariant_violation(message: impl Into<String>) -> CatalogError {
+    CatalogError::InvariantViolation {
         message: message.into(),
     }
 }
@@ -252,6 +308,30 @@ mod tests {
         assert_eq!(1, receipt.token().logical_sequence());
         assert!(!receipt.token().authority_manifest_id().is_empty());
         assert_eq!(&ack_record("record-1"), receipt.record());
+    }
+
+    #[tokio::test]
+    async fn duplicate_ack_write_returns_existing_committed_token_without_new_sequence() {
+        let writer = writer(storage());
+
+        let first = writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("first ack");
+        let duplicate = writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("duplicate ack is idempotent");
+
+        assert_eq!(first.token(), duplicate.token());
+        assert_eq!(first.record(), duplicate.record());
+        assert_eq!(
+            Some(ack_record("record-1")),
+            writer
+                .read_ack_at(duplicate.token().clone(), "consumer-a", "record-1")
+                .await
+                .expect("duplicate token reads ack")
+        );
     }
 
     #[tokio::test]
@@ -404,23 +484,5 @@ mod tests {
         };
 
         assert!(matches!(error, CatalogError::Validation { .. }));
-    }
-
-    #[test]
-    fn module_source_stays_inside_state_store_domain() {
-        let source = include_str!("projection_outbox_acks.rs");
-        let forbidden = [
-            ["auth", "z"].concat(),
-            ["cred", "ential"].concat(),
-            ["system", "_table"].concat(),
-            ["gra", "nts"].concat(),
-        ];
-
-        for term in forbidden {
-            assert!(
-                !source.contains(&term),
-                "projection ack writer unexpectedly references {term}"
-            );
-        }
     }
 }

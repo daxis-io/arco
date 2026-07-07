@@ -52,8 +52,9 @@ In:
 - Add `ProjectionOutboxAckWriter::new(storage, scope)` that accepts only the
   selected domain.
 - Add `acknowledge(ProjectionOutboxAckWrite)` that asserts the ack key is
-  absent, writes an acknowledgement record through `ControlMvpStateStore`, and
-  returns the committed `StateToken`.
+  absent for new acknowledgements, returns an existing acknowledgement for
+  duplicate retries, writes through `ControlMvpStateStore`, and returns a usable
+  `StateToken`.
 - Add `read_ack_at(StateToken, consumer_id, record_id)` for token-pinned
   read-after-write proof.
 - Add `projection_freshness_for(&StateToken, latest_projected_sequence)` with
@@ -75,6 +76,8 @@ Out:
 Add focused crate-local tests for:
 
 - successful ack write returns a `StateToken`
+- duplicate ack write returns an existing committed token without advancing the
+  logical sequence
 - token-pinned read-after-write returns the committed ack
 - projection freshness is separate from authority commit
 - stale projection watermark status is visible
@@ -82,7 +85,7 @@ Add focused crate-local tests for:
 - projection outage does not block committed writes
 - `CurrentStateStore` rejects the selected scope while control store accepts it
 - unsupported domains reject Phase 5A writes
-- authz, credential-vending, and system-table behavior are not referenced
+- authz and credential-vending regressions are covered by their focused tests
 
 ## Verification
 

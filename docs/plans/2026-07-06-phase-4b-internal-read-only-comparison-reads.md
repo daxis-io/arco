@@ -110,9 +110,12 @@ read-only snapshot metadata and object-family row counts, not authorization,
 credential vending, mutation behavior, UC compatibility responses, or
 governance enforcement.
 
-The public `/catalog/inventory` route remains unchanged. Phase 4B adds only an
-internal adapter and crate-private `CatalogReader` entry point that can be
-exercised by crate-local tests and future internal callers.
+The public `/catalog/inventory` response remains unchanged. Phase 4B adds an
+internal adapter and crate-private `CatalogReader` entry point, plus an opt-in
+operator diagnostics hook controlled by `ARCO_CATALOG_SHADOW_COMPARE_READS`.
+When enabled, the existing current descriptor read emits structured shadow
+comparison diagnostics and still returns the current-authority descriptor body
+unchanged.
 
 ## Diagnostic Shape
 
@@ -150,6 +153,7 @@ Add focused crate-local tests for:
   read success
 - crate-private `CatalogReader` comparison entry point returns the current
   descriptor unchanged
+- `ARCO_CATALOG_SHADOW_COMPARE_READS` truthy parsing for operator opt-in
 
 ## Verification
 
@@ -177,6 +181,8 @@ does not touch API or control-plane route code.
 - Current synchronous compaction remains the write authority.
 - No writes are accepted through the shadow backend.
 - User-visible API behavior and response bodies do not change.
+- `ARCO_CATALOG_SHADOW_COMPARE_READS` only enables internal diagnostic emission;
+  it does not make shadow state authoritative.
 - Shadow state is not used for authorization, credential vending, mutation
   decisions, governance enforcement, or compatibility responses.
 - Phase 5 writable-domain work is not started.

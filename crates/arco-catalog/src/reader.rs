@@ -55,6 +55,8 @@ use crate::writer::{Catalog, Column, LineageEdge, Schema, Table};
 /// Replayed metastore state returned by future catalog product readers.
 pub type MetastoreProjectionState = crate::metastore::replay::MetastoreState;
 
+const SHADOW_COMPARE_READS_ENV: &str = "ARCO_CATALOG_SHADOW_COMPARE_READS";
+
 // ============================================================================
 // Freshness Metadata
 // ============================================================================
@@ -786,6 +788,18 @@ impl CatalogReader {
     ///
     /// Returns an error if the catalog manifest cannot be read.
     pub async fn get_catalog_snapshot_descriptor(&self) -> Result<CatalogSnapshotDescriptor> {
+        if catalog_shadow_comparison_reads_enabled() {
+            let read = self
+                .get_catalog_snapshot_descriptor_with_shadow_comparison()
+                .await?;
+            emit_catalog_shadow_comparison_diagnostic(&read);
+            return Ok(read.current().clone());
+        }
+
+        self.read_current_catalog_snapshot_descriptor().await
+    }
+
+    async fn read_current_catalog_snapshot_descriptor(&self) -> Result<CatalogSnapshotDescriptor> {
         let manifest = self.read_manifest().await?;
         let published_at = manifest
             .catalog
@@ -811,13 +825,12 @@ impl CatalogReader {
     /// # Errors
     ///
     /// Returns an error only when the current-authority descriptor read fails.
-    #[allow(dead_code)]
     pub(crate) async fn get_catalog_snapshot_descriptor_with_shadow_comparison(
         &self,
     ) -> Result<CatalogInventoryComparisonRead> {
         read_catalog_inventory_with_shadow_comparison(
             &self.storage,
-            self.get_catalog_snapshot_descriptor(),
+            self.read_current_catalog_snapshot_descriptor(),
         )
         .await
     }
@@ -1129,6 +1142,46 @@ fn parse_root_read_token(read_token: &str) -> Result<&str> {
         .ok_or_else(|| CatalogError::Validation {
             message: format!("invalid root read token '{read_token}'"),
         })
+}
+
+fn catalog_shadow_comparison_reads_enabled() -> bool {
+    catalog_shadow_comparison_reads_enabled_from_value(
+        std::env::var(SHADOW_COMPARE_READS_ENV).ok().as_deref(),
+    )
+}
+
+fn catalog_shadow_comparison_reads_enabled_from_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn emit_catalog_shadow_comparison_diagnostic(read: &CatalogInventoryComparisonRead) {
+    let current = read.current();
+    let diagnostic = read.diagnostic();
+    let details = diagnostic
+        .details()
+        .iter()
+        .map(|detail| {
+            format!(
+                "{}:{}:{}",
+                detail.domain(),
+                detail.status().as_str(),
+                detail.detail()
+            )
+        })
+        .collect::<Vec<_>>();
+    tracing::info!(
+        manifest_id = %current.manifest_id,
+        snapshot_version = current.snapshot_version.as_u64(),
+        shadow_comparison_status = diagnostic.status().as_str(),
+        shadow_comparison_details = ?details,
+        "catalog inventory shadow comparison diagnostic"
+    );
 }
 
 // ============================================================================
@@ -1460,6 +1513,25 @@ mod tests {
             current.snapshot_version.as_u64(),
             compared.current().snapshot_version.as_u64()
         );
+    }
+
+    #[test]
+    fn catalog_shadow_comparison_reads_flag_accepts_operator_truthy_values() {
+        for value in [
+            "1", "true", "TRUE", "tRuE", "yes", "YES", "YeS", "on", "ON", "oN",
+        ] {
+            assert!(
+                catalog_shadow_comparison_reads_enabled_from_value(Some(value)),
+                "expected {value:?} to enable comparison reads"
+            );
+        }
+
+        for value in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(
+                !catalog_shadow_comparison_reads_enabled_from_value(value),
+                "expected {value:?} to leave comparison reads disabled"
+            );
+        }
     }
 
     #[tokio::test]

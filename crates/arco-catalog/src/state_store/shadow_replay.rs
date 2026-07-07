@@ -3,10 +3,6 @@
 //! This module imports the current published catalog snapshot into an isolated
 //! control-MVP scope and compares only the domains Phase 4A can honestly prove.
 
-// Phase 4A keeps shadow replay crate-private until later operator wiring.
-// Crate-local tests exercise the importer, report accessors, and diagnostics.
-#![allow(dead_code)]
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
@@ -42,6 +38,7 @@ impl ShadowReplayReport {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn included_domains(&self) -> &[ShadowIncludedDomain] {
         &self.included_domains
     }
@@ -73,31 +70,6 @@ pub(crate) struct CatalogShadowSourceIdentity {
 
 impl CatalogShadowSourceIdentity {
     #[must_use]
-    pub(crate) fn pointer_path(&self) -> &str {
-        &self.pointer_path
-    }
-
-    #[must_use]
-    pub(crate) fn pointer_version(&self) -> &str {
-        &self.pointer_version
-    }
-
-    #[must_use]
-    pub(crate) fn pointer_manifest_id(&self) -> &str {
-        &self.pointer_manifest_id
-    }
-
-    #[must_use]
-    pub(crate) fn pointer_manifest_path(&self) -> &str {
-        &self.pointer_manifest_path
-    }
-
-    #[must_use]
-    pub(crate) fn pointer_hash(&self) -> &str {
-        &self.pointer_hash
-    }
-
-    #[must_use]
     pub(crate) fn manifest_id(&self) -> &str {
         &self.manifest_id
     }
@@ -105,21 +77,6 @@ impl CatalogShadowSourceIdentity {
     #[must_use]
     pub(crate) const fn snapshot_version(&self) -> u64 {
         self.snapshot_version
-    }
-
-    #[must_use]
-    pub(crate) fn snapshot_path(&self) -> &str {
-        &self.snapshot_path
-    }
-
-    #[must_use]
-    pub(crate) fn watermark_event_id(&self) -> Option<&str> {
-        self.watermark_event_id.as_deref()
-    }
-
-    #[must_use]
-    pub(crate) fn last_commit_id(&self) -> Option<&str> {
-        self.last_commit_id.as_deref()
     }
 }
 
@@ -182,11 +139,13 @@ pub(crate) enum ShadowComparisonStatus {
 
 impl ShadowComparisonStatus {
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn is_equivalent(self) -> bool {
         matches!(self, Self::Equivalent)
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn difference_class(self) -> Option<ShadowDifferenceClass> {
         match self {
             Self::Equivalent => None,
@@ -251,6 +210,12 @@ pub(crate) enum ShadowObjectKind {
     Column,
 }
 
+// Phase 4B comparison reads are intentionally no-write, so the Phase 4A shadow
+// importer remains an internal operator hook until a later route or job owns it.
+#[allow(
+    dead_code,
+    reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
+)]
 pub(crate) async fn import_current_catalog_shadow(
     storage: &ScopedStorage,
 ) -> Result<ShadowReplayReport> {
@@ -334,6 +299,10 @@ pub(crate) fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<Contr
     )
 }
 
+#[allow(
+    dead_code,
+    reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
+)]
 pub(crate) async fn import_catalog_source_into_shadow(
     store: &ControlMvpStateStore,
     source: &CatalogShadowSource,

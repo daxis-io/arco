@@ -24,7 +24,7 @@ const MANIFEST_WATERMARK_KEY: &str = "shadow/catalog/metadata/source-watermark";
 const LEGACY_DEFAULT_CATALOG_PARENT: &str = "__legacy_default_catalog__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShadowReplayReport {
+pub struct ShadowReplayReport {
     source: CatalogShadowSourceIdentity,
     included_domains: Vec<ShadowIncludedDomain>,
     deferred_domains: Vec<ShadowDeferredEntry>,
@@ -33,29 +33,29 @@ pub(crate) struct ShadowReplayReport {
 
 impl ShadowReplayReport {
     #[must_use]
-    pub(crate) fn source(&self) -> &CatalogShadowSourceIdentity {
+    pub fn source(&self) -> &CatalogShadowSourceIdentity {
         &self.source
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn included_domains(&self) -> &[ShadowIncludedDomain] {
+    pub fn included_domains(&self) -> &[ShadowIncludedDomain] {
         &self.included_domains
     }
 
     #[must_use]
-    pub(crate) fn deferred_domains(&self) -> &[ShadowDeferredEntry] {
+    pub fn deferred_domains(&self) -> &[ShadowDeferredEntry] {
         &self.deferred_domains
     }
 
     #[must_use]
-    pub(crate) fn comparisons(&self) -> &[ShadowComparison] {
+    pub fn comparisons(&self) -> &[ShadowComparison] {
         &self.comparisons
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct CatalogShadowSourceIdentity {
+pub struct CatalogShadowSourceIdentity {
     pointer_path: String,
     pointer_version: String,
     pointer_manifest_id: String,
@@ -70,43 +70,43 @@ pub(crate) struct CatalogShadowSourceIdentity {
 
 impl CatalogShadowSourceIdentity {
     #[must_use]
-    pub(crate) fn manifest_id(&self) -> &str {
+    pub fn manifest_id(&self) -> &str {
         &self.manifest_id
     }
 
     #[must_use]
-    pub(crate) const fn snapshot_version(&self) -> u64 {
+    pub const fn snapshot_version(&self) -> u64 {
         self.snapshot_version
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CatalogShadowSource {
+pub struct CatalogShadowSource {
     identity: CatalogShadowSourceIdentity,
     state: CatalogState,
 }
 
 impl CatalogShadowSource {
     #[must_use]
-    pub(crate) const fn identity(&self) -> &CatalogShadowSourceIdentity {
+    pub const fn identity(&self) -> &CatalogShadowSourceIdentity {
         &self.identity
     }
 
     #[must_use]
-    pub(crate) const fn state(&self) -> &CatalogState {
+    pub const fn state(&self) -> &CatalogState {
         &self.state
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ShadowIncludedDomain {
-    CatalogObjects,
-    CatalogNameIndexes,
-    CatalogManifestWatermark,
+pub enum ShadowIncludedDomain {
+    Objects,
+    NameIndexes,
+    ManifestWatermark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ShadowDeferredDomain {
+pub enum ShadowDeferredDomain {
     TableCurrentPointers,
     GrantsOwnership,
     StorageGovernanceEquivalence,
@@ -117,14 +117,14 @@ pub(crate) enum ShadowDeferredDomain {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ShadowComparisonDomain {
-    CatalogObjects,
-    CatalogNameIndexes,
-    CatalogManifestWatermark,
+pub enum ShadowComparisonDomain {
+    Objects,
+    NameIndexes,
+    ManifestWatermark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum ShadowDifferenceClass {
+pub enum ShadowDifferenceClass {
     CurrentStateGap,
     UnsupportedScope,
     StaleProjection,
@@ -132,7 +132,7 @@ pub(crate) enum ShadowDifferenceClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShadowComparisonStatus {
+pub enum ShadowComparisonStatus {
     Equivalent,
     Difference(ShadowDifferenceClass),
 }
@@ -140,13 +140,13 @@ pub(crate) enum ShadowComparisonStatus {
 impl ShadowComparisonStatus {
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn is_equivalent(self) -> bool {
+    pub const fn is_equivalent(self) -> bool {
         matches!(self, Self::Equivalent)
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn difference_class(self) -> Option<ShadowDifferenceClass> {
+    pub const fn difference_class(self) -> Option<ShadowDifferenceClass> {
         match self {
             Self::Equivalent => None,
             Self::Difference(class) => Some(class),
@@ -155,7 +155,7 @@ impl ShadowComparisonStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShadowComparison {
+pub struct ShadowComparison {
     domain: ShadowComparisonDomain,
     status: ShadowComparisonStatus,
     detail: String,
@@ -163,23 +163,23 @@ pub(crate) struct ShadowComparison {
 
 impl ShadowComparison {
     #[must_use]
-    pub(crate) const fn domain(&self) -> ShadowComparisonDomain {
+    pub const fn domain(&self) -> ShadowComparisonDomain {
         self.domain
     }
 
     #[must_use]
-    pub(crate) const fn status(&self) -> ShadowComparisonStatus {
+    pub const fn status(&self) -> ShadowComparisonStatus {
         self.status
     }
 
     #[must_use]
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShadowDeferredEntry {
+pub struct ShadowDeferredEntry {
     domain: ShadowDeferredDomain,
     status: ShadowComparisonStatus,
     reason: String,
@@ -187,23 +187,23 @@ pub(crate) struct ShadowDeferredEntry {
 
 impl ShadowDeferredEntry {
     #[must_use]
-    pub(crate) const fn domain(&self) -> ShadowDeferredDomain {
+    pub const fn domain(&self) -> ShadowDeferredDomain {
         self.domain
     }
 
     #[must_use]
-    pub(crate) const fn status(&self) -> ShadowComparisonStatus {
+    pub const fn status(&self) -> ShadowComparisonStatus {
         self.status
     }
 
     #[must_use]
-    pub(crate) fn reason(&self) -> &str {
+    pub fn reason(&self) -> &str {
         &self.reason
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ShadowObjectKind {
+pub enum ShadowObjectKind {
     Catalog,
     Schema,
     Table,
@@ -216,16 +216,14 @@ pub(crate) enum ShadowObjectKind {
     dead_code,
     reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
 )]
-pub(crate) async fn import_current_catalog_shadow(
-    storage: &ScopedStorage,
-) -> Result<ShadowReplayReport> {
+pub async fn import_current_catalog_shadow(storage: &ScopedStorage) -> Result<ShadowReplayReport> {
     let source = load_current_catalog_shadow_source(storage).await?;
     let shadow = open_catalog_shadow_store(storage)?;
     import_catalog_source_into_shadow(&shadow, &source).await?;
     compare_catalog_shadow(&shadow, &source).await
 }
 
-pub(crate) async fn load_current_catalog_shadow_source(
+pub async fn load_current_catalog_shadow_source(
     storage: &ScopedStorage,
 ) -> Result<CatalogShadowSource> {
     let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
@@ -292,7 +290,7 @@ pub(crate) async fn load_current_catalog_shadow_source(
     })
 }
 
-pub(crate) fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<ControlMvpStateStore> {
+pub fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<ControlMvpStateStore> {
     ControlMvpStateStore::new(
         storage.clone(),
         StateScope::new(storage.tenant_id(), storage.workspace_id(), SHADOW_DOMAIN),
@@ -303,7 +301,7 @@ pub(crate) fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<Contr
     dead_code,
     reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
 )]
-pub(crate) async fn import_catalog_source_into_shadow(
+pub async fn import_catalog_source_into_shadow(
     store: &ControlMvpStateStore,
     source: &CatalogShadowSource,
 ) -> Result<()> {
@@ -329,7 +327,7 @@ pub(crate) async fn import_catalog_source_into_shadow(
     Ok(())
 }
 
-pub(crate) async fn compare_catalog_shadow(
+pub async fn compare_catalog_shadow(
     store: &ControlMvpStateStore,
     source: &CatalogShadowSource,
 ) -> Result<ShadowReplayReport> {
@@ -366,14 +364,14 @@ pub(crate) async fn compare_catalog_shadow(
     Ok(ShadowReplayReport {
         source: source.identity().clone(),
         included_domains: vec![
-            ShadowIncludedDomain::CatalogObjects,
-            ShadowIncludedDomain::CatalogNameIndexes,
-            ShadowIncludedDomain::CatalogManifestWatermark,
+            ShadowIncludedDomain::Objects,
+            ShadowIncludedDomain::NameIndexes,
+            ShadowIncludedDomain::ManifestWatermark,
         ],
         deferred_domains: deferred_domains(),
         comparisons: vec![
             ShadowComparison {
-                domain: ShadowComparisonDomain::CatalogObjects,
+                domain: ShadowComparisonDomain::Objects,
                 status: object_status,
                 detail: if unknown_keys.is_empty() {
                     comparison_detail(object_status, "catalog object records")
@@ -385,7 +383,7 @@ pub(crate) async fn compare_catalog_shadow(
                 },
             },
             ShadowComparison {
-                domain: ShadowComparisonDomain::CatalogNameIndexes,
+                domain: ShadowComparisonDomain::NameIndexes,
                 status: name_index_status,
                 detail: if expected.source_gaps.is_empty() {
                     comparison_detail(name_index_status, "catalog normalized name indexes")
@@ -394,7 +392,7 @@ pub(crate) async fn compare_catalog_shadow(
                 },
             },
             ShadowComparison {
-                domain: ShadowComparisonDomain::CatalogManifestWatermark,
+                domain: ShadowComparisonDomain::ManifestWatermark,
                 status: watermark_status,
                 detail: comparison_detail(watermark_status, "catalog manifest watermark metadata"),
             },
@@ -473,11 +471,29 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
     let state = source.state();
     let manifest_id = source.identity().manifest_id();
 
+    insert_catalog_shadow_rows(&mut rows, &mut source_gaps, state, manifest_id)?;
+    insert_schema_shadow_rows(&mut rows, &mut source_gaps, state, manifest_id)?;
+    insert_table_shadow_rows(&mut rows, &mut source_gaps, state, manifest_id)?;
+    insert_column_shadow_rows(&mut rows, &mut source_gaps, state, manifest_id)?;
+    rows.insert(
+        manifest_watermark_key(),
+        encode_shadow_record(source.identity())?,
+    );
+
+    Ok(ExpectedShadowRows { rows, source_gaps })
+}
+
+fn insert_catalog_shadow_rows(
+    rows: &mut BTreeMap<Vec<u8>, Bytes>,
+    source_gaps: &mut Vec<String>,
+    state: &CatalogState,
+    manifest_id: &str,
+) -> Result<()> {
     for catalog in &state.catalogs {
-        insert_object(&mut rows, ShadowObjectKind::Catalog, &catalog.id, catalog)?;
+        insert_object(rows, ShadowObjectKind::Catalog, &catalog.id, catalog)?;
         insert_name_index(
-            &mut rows,
-            &mut source_gaps,
+            rows,
+            source_gaps,
             ShadowObjectKind::Catalog,
             None,
             &catalog.name,
@@ -485,7 +501,15 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             manifest_id,
         )?;
     }
+    Ok(())
+}
 
+fn insert_schema_shadow_rows(
+    rows: &mut BTreeMap<Vec<u8>, Bytes>,
+    source_gaps: &mut Vec<String>,
+    state: &CatalogState,
+    manifest_id: &str,
+) -> Result<()> {
     let catalog_ids = state
         .catalogs
         .iter()
@@ -493,12 +517,7 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
         .collect::<BTreeSet<_>>();
     let default_catalog_id = default_catalog_id(state);
     for namespace in &state.namespaces {
-        insert_object(
-            &mut rows,
-            ShadowObjectKind::Schema,
-            &namespace.id,
-            namespace,
-        )?;
+        insert_object(rows, ShadowObjectKind::Schema, &namespace.id, namespace)?;
         let parent_id = match namespace.catalog_id.as_deref() {
             Some(catalog_id) if catalog_ids.contains(catalog_id) => catalog_id,
             Some(catalog_id) => {
@@ -508,20 +527,21 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
                 ));
                 continue;
             }
-            None => match default_catalog_id {
-                Some(catalog_id) => catalog_id,
-                None => {
+            None => {
+                if let Some(catalog_id) = default_catalog_id {
+                    catalog_id
+                } else {
                     source_gaps.push(format!(
                         "schema {} has legacy/default catalog_id but no default catalog exists",
                         namespace.id
                     ));
                     continue;
                 }
-            },
+            }
         };
         insert_name_index(
-            &mut rows,
-            &mut source_gaps,
+            rows,
+            source_gaps,
             ShadowObjectKind::Schema,
             Some(parent_id),
             &namespace.name,
@@ -529,14 +549,22 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             manifest_id,
         )?;
     }
+    Ok(())
+}
 
+fn insert_table_shadow_rows(
+    rows: &mut BTreeMap<Vec<u8>, Bytes>,
+    source_gaps: &mut Vec<String>,
+    state: &CatalogState,
+    manifest_id: &str,
+) -> Result<()> {
     let namespace_ids = state
         .namespaces
         .iter()
         .map(|namespace| namespace.id.as_str())
         .collect::<BTreeSet<_>>();
     for table in &state.tables {
-        insert_object(&mut rows, ShadowObjectKind::Table, &table.id, table)?;
+        insert_object(rows, ShadowObjectKind::Table, &table.id, table)?;
         if !namespace_ids.contains(table.namespace_id.as_str()) {
             source_gaps.push(format!(
                 "table {} references missing schema {}",
@@ -545,8 +573,8 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             continue;
         }
         insert_name_index(
-            &mut rows,
-            &mut source_gaps,
+            rows,
+            source_gaps,
             ShadowObjectKind::Table,
             Some(&table.namespace_id),
             &table.name,
@@ -554,14 +582,22 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             manifest_id,
         )?;
     }
+    Ok(())
+}
 
+fn insert_column_shadow_rows(
+    rows: &mut BTreeMap<Vec<u8>, Bytes>,
+    source_gaps: &mut Vec<String>,
+    state: &CatalogState,
+    manifest_id: &str,
+) -> Result<()> {
     let table_ids = state
         .tables
         .iter()
         .map(|table| table.id.as_str())
         .collect::<BTreeSet<_>>();
     for column in &state.columns {
-        insert_object(&mut rows, ShadowObjectKind::Column, &column.id, column)?;
+        insert_object(rows, ShadowObjectKind::Column, &column.id, column)?;
         if !table_ids.contains(column.table_id.as_str()) {
             source_gaps.push(format!(
                 "column {} references missing table {}",
@@ -570,8 +606,8 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             continue;
         }
         insert_name_index(
-            &mut rows,
-            &mut source_gaps,
+            rows,
+            source_gaps,
             ShadowObjectKind::Column,
             Some(&column.table_id),
             &column.name,
@@ -579,13 +615,7 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
             manifest_id,
         )?;
     }
-
-    rows.insert(
-        manifest_watermark_key(),
-        encode_shadow_record(source.identity())?,
-    );
-
-    Ok(ExpectedShadowRows { rows, source_gaps })
+    Ok(())
 }
 
 fn default_catalog_id(state: &CatalogState) -> Option<&str> {
@@ -992,19 +1022,16 @@ mod tests {
         assert_eq!(&expected_source, report.source());
         assert_eq!(
             &[
-                ShadowIncludedDomain::CatalogObjects,
-                ShadowIncludedDomain::CatalogNameIndexes,
-                ShadowIncludedDomain::CatalogManifestWatermark,
+                ShadowIncludedDomain::Objects,
+                ShadowIncludedDomain::NameIndexes,
+                ShadowIncludedDomain::ManifestWatermark,
             ],
             report.included_domains()
         );
-        assert!(comparison_status(&report, ShadowComparisonDomain::CatalogObjects).is_equivalent());
+        assert!(comparison_status(&report, ShadowComparisonDomain::Objects).is_equivalent());
+        assert!(comparison_status(&report, ShadowComparisonDomain::NameIndexes).is_equivalent());
         assert!(
-            comparison_status(&report, ShadowComparisonDomain::CatalogNameIndexes).is_equivalent()
-        );
-        assert!(
-            comparison_status(&report, ShadowComparisonDomain::CatalogManifestWatermark)
-                .is_equivalent()
+            comparison_status(&report, ShadowComparisonDomain::ManifestWatermark).is_equivalent()
         );
 
         let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
@@ -1153,9 +1180,7 @@ mod tests {
             .await
             .expect("import shadow state");
 
-        assert!(
-            comparison_status(&report, ShadowComparisonDomain::CatalogNameIndexes).is_equivalent()
-        );
+        assert!(comparison_status(&report, ShadowComparisonDomain::NameIndexes).is_equivalent());
         let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
         assert!(
             shadow
@@ -1192,7 +1217,7 @@ mod tests {
             .await
             .expect("import shadow state");
 
-        let name_indexes = comparison(&report, ShadowComparisonDomain::CatalogNameIndexes);
+        let name_indexes = comparison(&report, ShadowComparisonDomain::NameIndexes);
         assert_eq!(
             Some(ShadowDifferenceClass::CurrentStateGap),
             name_indexes.status().difference_class()
@@ -1219,8 +1244,7 @@ mod tests {
 
         assert_eq!(
             Some(ShadowDifferenceClass::CurrentStateGap),
-            comparison_status(&report, ShadowComparisonDomain::CatalogNameIndexes)
-                .difference_class()
+            comparison_status(&report, ShadowComparisonDomain::NameIndexes).difference_class()
         );
     }
 
@@ -1254,7 +1278,7 @@ mod tests {
 
         assert_eq!(
             Some(ShadowDifferenceClass::BugDivergentResult),
-            comparison_status(&report, ShadowComparisonDomain::CatalogObjects).difference_class()
+            comparison_status(&report, ShadowComparisonDomain::Objects).difference_class()
         );
     }
 
@@ -1285,7 +1309,7 @@ mod tests {
         let report = compare_catalog_shadow(&shadow, &source)
             .await
             .expect("compare unknown-key shadow");
-        let catalog_objects = comparison(&report, ShadowComparisonDomain::CatalogObjects);
+        let catalog_objects = comparison(&report, ShadowComparisonDomain::Objects);
 
         assert_eq!(
             Some(ShadowDifferenceClass::BugDivergentResult),
@@ -1328,7 +1352,7 @@ mod tests {
 
         assert_eq!(
             Some(ShadowDifferenceClass::StaleProjection),
-            comparison_status(&report, ShadowComparisonDomain::CatalogManifestWatermark)
+            comparison_status(&report, ShadowComparisonDomain::ManifestWatermark)
                 .difference_class()
         );
     }

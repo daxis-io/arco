@@ -13,14 +13,13 @@ structured diagnostic status from the Phase 4A shadow backend.
 
 **Worktree:** `.worktrees/phase4b-internal-read-comparison`
 
-**Branch:** `codex/phase4b-internal-read-comparison`
+**Branch suffix:** `phase4b-internal-read-comparison`
 
 ## Phase 4A Evidence
 
 - Phase 4A worktree:
   `.worktrees/phase4a-shadow-replay`
-- Phase 4A branch:
-  `codex/phase4a-shadow-replay-projection-equivalence`
+- Phase 4A branch suffix: `phase4a-shadow-replay-projection-equivalence`
 - Phase 4A commits:
   - `743c6f6 Add Phase 4A catalog shadow replay`
   - `48822d0 Address Phase 4A shadow replay review feedback`

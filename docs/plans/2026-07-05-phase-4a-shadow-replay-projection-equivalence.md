@@ -22,11 +22,11 @@ manifest/snapshot helpers, crate-local unit tests, Cargo focused verification.
 
 ## Source Docs
 
-- `codex/arco-adr041-uat-docs:docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
-- `codex/arco-adr041-uat-docs:docs/plans/2026-06-25-arco-tier1-control-store-strategy.md`
-- `codex/arco-adr041-uat-docs:docs/plans/2026-06-26-arco-tier1-single-authority-combined-vision.md`
-- `codex/arco-adr041-uat-docs:docs/spec/projection-watermark-contract.md`
-- `codex/arco-adr041-uat-docs:docs/spec/state-token-and-checkpoint-contract.md`
+- `docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
+- `docs/plans/2026-06-25-arco-tier1-control-store-strategy.md`
+- `docs/plans/2026-06-26-arco-tier1-single-authority-combined-vision.md`
+- `docs/spec/projection-watermark-contract.md`
+- `docs/spec/state-token-and-checkpoint-contract.md`
 - `docs/guide/src/reference/control-plane-scope.md`
 
 ## Current-State Audit
@@ -34,7 +34,7 @@ manifest/snapshot helpers, crate-local unit tests, Cargo focused verification.
 - Root checkout observed before worktree creation: `main...origin/main [ahead 16, behind 11]` with tracked deletion `docs/plans/2026-06-27-state-store-seam-current-adapter-slice.md`; root was not modified.
 - `git fetch origin` left `origin/main` at `adccaa431b1436fd1f2b7c91a48ae60deb9d2387`.
 - Worktree: `.worktrees/phase4a-shadow-replay`
-- Branch: `codex/phase4a-shadow-replay-projection-equivalence`
+- Branch suffix: `phase4a-shadow-replay-projection-equivalence`
 - Base: `adccaa431b1436fd1f2b7c91a48ae60deb9d2387` (`Add Phase 3 state-store prototype gates (#316)`)
 - Phase 3 prerequisite baseline in this worktree:
   - `cargo test -p arco-catalog --test state_store_model`: 10 passed.

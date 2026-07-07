@@ -12,37 +12,37 @@ use crate::error::{CatalogError, Result};
 use crate::reader::CatalogSnapshotDescriptor;
 
 #[derive(Debug, Clone)]
-pub(crate) struct CatalogInventoryComparisonRead {
+pub struct CatalogInventoryComparisonRead {
     current: CatalogSnapshotDescriptor,
     diagnostic: CatalogInventoryComparisonDiagnostic,
 }
 
 impl CatalogInventoryComparisonRead {
     #[must_use]
-    pub(crate) const fn current(&self) -> &CatalogSnapshotDescriptor {
+    pub const fn current(&self) -> &CatalogSnapshotDescriptor {
         &self.current
     }
 
     #[must_use]
-    pub(crate) const fn diagnostic(&self) -> &CatalogInventoryComparisonDiagnostic {
+    pub const fn diagnostic(&self) -> &CatalogInventoryComparisonDiagnostic {
         &self.diagnostic
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CatalogInventoryComparisonDiagnostic {
+pub struct CatalogInventoryComparisonDiagnostic {
     status: CatalogInventoryComparisonStatus,
     details: Vec<CatalogInventoryComparisonDetail>,
 }
 
 impl CatalogInventoryComparisonDiagnostic {
     #[must_use]
-    pub(crate) const fn status(&self) -> CatalogInventoryComparisonStatus {
+    pub const fn status(&self) -> CatalogInventoryComparisonStatus {
         self.status
     }
 
     #[must_use]
-    pub(crate) fn details(&self) -> &[CatalogInventoryComparisonDetail] {
+    pub fn details(&self) -> &[CatalogInventoryComparisonDetail] {
         &self.details
     }
 
@@ -93,7 +93,7 @@ impl CatalogInventoryComparisonDiagnostic {
         Self { status, details }
     }
 
-    fn from_shadow_error(error: CatalogError) -> Self {
+    fn from_shadow_error(error: &CatalogError) -> Self {
         Self {
             status: CatalogInventoryComparisonStatus::BugDivergentResult,
             details: vec![CatalogInventoryComparisonDetail::new(
@@ -106,7 +106,7 @@ impl CatalogInventoryComparisonDiagnostic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum CatalogInventoryComparisonStatus {
+pub enum CatalogInventoryComparisonStatus {
     Equivalent,
     CurrentStateGap,
     UnsupportedScope,
@@ -116,7 +116,7 @@ pub(crate) enum CatalogInventoryComparisonStatus {
 
 impl CatalogInventoryComparisonStatus {
     #[must_use]
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Equivalent => "equivalent",
             Self::CurrentStateGap => "current_state_gap",
@@ -138,7 +138,7 @@ impl CatalogInventoryComparisonStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CatalogInventoryComparisonDetail {
+pub struct CatalogInventoryComparisonDetail {
     domain: &'static str,
     status: CatalogInventoryComparisonStatus,
     detail: String,
@@ -158,22 +158,22 @@ impl CatalogInventoryComparisonDetail {
     }
 
     #[must_use]
-    pub(crate) const fn domain(&self) -> &'static str {
+    pub const fn domain(&self) -> &'static str {
         self.domain
     }
 
     #[must_use]
-    pub(crate) const fn status(&self) -> CatalogInventoryComparisonStatus {
+    pub const fn status(&self) -> CatalogInventoryComparisonStatus {
         self.status
     }
 
     #[must_use]
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
-pub(crate) async fn read_catalog_inventory_with_shadow_comparison<F>(
+pub async fn read_catalog_inventory_with_shadow_comparison<F>(
     storage: &ScopedStorage,
     current_read: F,
 ) -> Result<CatalogInventoryComparisonRead>
@@ -183,7 +183,7 @@ where
     let current = current_read.await?;
     let diagnostic = catalog_inventory_shadow_diagnostic(storage, &current)
         .await
-        .unwrap_or_else(CatalogInventoryComparisonDiagnostic::from_shadow_error);
+        .unwrap_or_else(|error| CatalogInventoryComparisonDiagnostic::from_shadow_error(&error));
 
     Ok(CatalogInventoryComparisonRead {
         current,
@@ -223,9 +223,9 @@ fn status_from_shadow(status: ShadowComparisonStatus) -> CatalogInventoryCompari
 
 const fn comparison_domain_name(domain: ShadowComparisonDomain) -> &'static str {
     match domain {
-        ShadowComparisonDomain::CatalogObjects => "catalog_objects",
-        ShadowComparisonDomain::CatalogNameIndexes => "catalog_name_indexes",
-        ShadowComparisonDomain::CatalogManifestWatermark => "catalog_manifest_watermark",
+        ShadowComparisonDomain::Objects => "catalog_objects",
+        ShadowComparisonDomain::NameIndexes => "catalog_name_indexes",
+        ShadowComparisonDomain::ManifestWatermark => "catalog_manifest_watermark",
     }
 }
 

@@ -76,6 +76,30 @@ impl ProjectionOutboxAckWriter {
         decode_ack_record(&bytes).map(Some)
     }
 
+    pub(crate) async fn read_ack_at_status(
+        &self,
+        token: StateToken,
+        consumer_id: &str,
+        record_id: &str,
+    ) -> Result<ProjectionOutboxAckReadStatus> {
+        let key = ack_key(consumer_id, record_id);
+        let reader = match self.store.read_at(token.clone()).await {
+            Ok(reader) => reader,
+            Err(CatalogError::NotFound { .. }) => {
+                return Ok(ProjectionOutboxAckReadStatus::TokenUnavailable {
+                    manifest_id: token.authority_manifest_id().to_string(),
+                    logical_sequence: token.logical_sequence(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = reader.get(&key).await? else {
+            return Ok(ProjectionOutboxAckReadStatus::Available(None));
+        };
+        decode_ack_record(&bytes)
+            .map(|record| ProjectionOutboxAckReadStatus::Available(Some(record)))
+    }
+
     pub(crate) fn projection_freshness_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
@@ -95,6 +119,19 @@ impl ProjectionOutboxAckWriter {
                 committed_sequence,
                 latest_projected_sequence,
             }
+        }
+    }
+
+    pub(crate) fn projection_watermark_lag_for(
+        token: &StateToken,
+        latest_projected_sequence: Option<u64>,
+    ) -> ProjectionOutboxAckWatermarkLag {
+        let committed_sequence = token.logical_sequence();
+        ProjectionOutboxAckWatermarkLag {
+            committed_sequence,
+            latest_projected_sequence,
+            pending_sequences: latest_projected_sequence
+                .map(|projected| committed_sequence.saturating_sub(projected)),
         }
     }
 
@@ -194,6 +231,16 @@ impl ProjectionOutboxAckReceipt {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectionOutboxAckReadStatus {
+    Available(Option<ProjectionOutboxAckRecord>),
+    TokenUnavailable {
+        manifest_id: String,
+        logical_sequence: u64,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectionOutboxAckFreshness {
     Current {
         committed_sequence: u64,
@@ -204,6 +251,14 @@ pub(crate) enum ProjectionOutboxAckFreshness {
         latest_projected_sequence: u64,
     },
     ProjectionUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionOutboxAckWatermarkLag {
+    committed_sequence: u64,
+    latest_projected_sequence: Option<u64>,
+    pending_sequences: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -258,13 +313,20 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
     use arco_core::{MemoryBackend, ScopedStorage};
+    use async_trait::async_trait;
 
     use super::*;
     use crate::error::CatalogError;
-    use crate::state_store::{ArcoStateStore, CurrentStateStore, StateScope, TxnOptions};
+    use crate::state_store::{
+        ArcoStateStore, ControlMvpPaths, CurrentStateStore, StateScope, TxnOptions,
+    };
 
     fn ack_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PROJECTION_OUTBOX_ACK_DOMAIN)
@@ -273,6 +335,13 @@ mod tests {
     fn storage() -> ScopedStorage {
         ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
             .expect("scoped storage")
+    }
+
+    fn no_list_storage() -> (Arc<NoListBackend>, ScopedStorage) {
+        let backend = Arc::new(NoListBackend::new(Arc::new(MemoryBackend::new())));
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        (backend, storage)
     }
 
     fn writer(storage: ScopedStorage) -> ProjectionOutboxAckWriter {
@@ -371,6 +440,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_token_read_status_marks_missing_retained_manifest_unavailable() {
+        let storage = storage();
+        let writer = writer(storage.clone());
+
+        let receipt = writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("ack write");
+        let token = receipt.token().clone();
+        let manifest_id = token.authority_manifest_id().to_string();
+        let logical_sequence = token.logical_sequence();
+        let paths = ControlMvpPaths::new(PROJECTION_OUTBOX_ACK_DOMAIN);
+        storage
+            .delete(&paths.manifest_object(&manifest_id))
+            .await
+            .expect("expire retained manifest");
+
+        assert_eq!(
+            ProjectionOutboxAckReadStatus::TokenUnavailable {
+                manifest_id,
+                logical_sequence,
+            },
+            writer
+                .read_ack_at_status(token, "consumer-a", "record-1")
+                .await
+                .expect("token status")
+        );
+    }
+
+    #[tokio::test]
+    async fn warm_ack_write_and_token_point_read_do_not_call_object_store_listing() {
+        let (backend, storage) = no_list_storage();
+        let writer = writer(storage);
+
+        writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("seed ack");
+        let receipt = writer
+            .acknowledge(ack_write("record-2"))
+            .await
+            .expect("warm ack");
+
+        assert_eq!(
+            ProjectionOutboxAckReadStatus::Available(Some(ack_record("record-2"))),
+            writer
+                .read_ack_at_status(receipt.token().clone(), "consumer-a", "record-2")
+                .await
+                .expect("warm point read")
+        );
+        assert_eq!(0, backend.list_calls());
+    }
+
+    #[tokio::test]
+    async fn bounded_replay_is_manifest_reachable_without_request_time_listing() {
+        let (backend, storage) = no_list_storage();
+        let writer = writer(storage);
+
+        let first = writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("first ack");
+        let second = writer
+            .acknowledge(ack_write("record-2"))
+            .await
+            .expect("second ack");
+
+        assert_eq!(
+            ProjectionOutboxAckReadStatus::Available(Some(ack_record("record-1"))),
+            writer
+                .read_ack_at_status(first.token().clone(), "consumer-a", "record-1")
+                .await
+                .expect("first retained read")
+        );
+        assert_eq!(
+            ProjectionOutboxAckReadStatus::Available(None),
+            writer
+                .read_ack_at_status(first.token().clone(), "consumer-a", "record-2")
+                .await
+                .expect("first retained read excludes later ack")
+        );
+        assert_eq!(
+            ProjectionOutboxAckReadStatus::Available(Some(ack_record("record-2"))),
+            writer
+                .read_ack_at_status(second.token().clone(), "consumer-a", "record-2")
+                .await
+                .expect("second retained read")
+        );
+        assert_eq!(0, backend.list_calls());
+    }
+
+    #[tokio::test]
     async fn projection_freshness_is_diagnostic_only_after_authority_commit() {
         let writer = writer(storage());
 
@@ -407,6 +568,25 @@ mod tests {
                 latest_projected_sequence: 0,
             },
             ProjectionOutboxAckWriter::projection_freshness_for(receipt.token(), Some(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_watermark_lag_exposes_committed_and_projected_sequences() {
+        let writer = writer(storage());
+
+        let receipt = writer
+            .acknowledge(ack_write("record-1"))
+            .await
+            .expect("ack commit");
+
+        assert_eq!(
+            ProjectionOutboxAckWatermarkLag {
+                committed_sequence: receipt.token().logical_sequence(),
+                latest_projected_sequence: Some(0),
+                pending_sequences: Some(receipt.token().logical_sequence()),
+            },
+            ProjectionOutboxAckWriter::projection_watermark_lag_for(receipt.token(), Some(0))
         );
     }
 
@@ -449,6 +629,14 @@ mod tests {
             ProjectionOutboxAckWriter::projection_freshness_for(first.token(), None)
         );
         assert_eq!(
+            ProjectionOutboxAckWatermarkLag {
+                committed_sequence: first.token().logical_sequence(),
+                latest_projected_sequence: None,
+                pending_sequences: None,
+            },
+            ProjectionOutboxAckWriter::projection_watermark_lag_for(first.token(), None)
+        );
+        assert_eq!(
             Some(ack_record("record-2")),
             writer
                 .read_ack_at(second.token().clone(), "consumer-a", "record-2")
@@ -475,14 +663,83 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_domains_reject_phase5a_writes() {
-        let unsupported_scope = StateScope::new("tenant", "workspace", "catalog");
+    fn unsupported_domains_reject_phase5b_ack_writes() {
+        for domain in [
+            "catalog",
+            "grants",
+            "storage-governance",
+            "projection-checkpoints",
+            "projection-watermarks",
+            "synthetic-non-selected-domain",
+        ] {
+            let unsupported_scope = StateScope::new("tenant", "workspace", domain);
 
-        let error = match ProjectionOutboxAckWriter::new(storage(), unsupported_scope) {
-            Err(error) => error,
-            Ok(_) => panic!("unsupported scope must reject writer creation"),
-        };
+            let error = match ProjectionOutboxAckWriter::new(storage(), unsupported_scope) {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
+            };
 
-        assert!(matches!(error, CatalogError::Validation { .. }));
+            assert!(
+                matches!(error, CatalogError::Validation { .. }),
+                "unexpected error for {domain}: {error:?}"
+            );
+        }
+    }
+
+    struct NoListBackend {
+        inner: Arc<dyn StorageBackend>,
+        list_calls: AtomicUsize,
+    }
+
+    impl NoListBackend {
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
+            Self {
+                inner,
+                list_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn list_calls(&self) -> usize {
+            self.list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for NoListBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Err(arco_core::Error::storage(format!(
+                "list forbidden during projection outbox ack request path: {prefix}"
+            )))
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
     }
 }

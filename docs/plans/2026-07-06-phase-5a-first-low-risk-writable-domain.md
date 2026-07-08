@@ -22,11 +22,11 @@ current `origin/main`.
 
 **PR-prep worktree:** `.worktrees/phase5-low-risk-writable-domains`
 
-**PR-prep branch:** `codex/phase5-low-risk-writable-domains`
+**PR-prep branch:** `control-store-projection-outbox-acks`
 
 **Original implementation worktree:** `.worktrees/phase5a-projection-outbox-acks`
 
-**Original implementation branch:** `codex/phase5a-projection-outbox-acks`
+**Original implementation branch:** local projection outbox acknowledgement work branch
 
 ## Prerequisite Evidence
 

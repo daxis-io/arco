@@ -19,11 +19,11 @@ was rebuilt onto current `origin/main`.
 
 **PR-prep worktree:** `.worktrees/phase5-low-risk-writable-domains`
 
-**PR-prep branch:** `codex/phase5-low-risk-writable-domains`
+**PR-prep branch:** `control-store-projection-outbox-acks`
 
 **Original implementation worktree:** `.worktrees/phase5b-low-risk-writable-domain-hardening`
 
-**Original implementation branch:** `codex/phase5b-low-risk-writable-domain-hardening`
+**Original implementation branch:** local low-risk writable-domain hardening work branch
 
 ## Phase 5A Evidence
 

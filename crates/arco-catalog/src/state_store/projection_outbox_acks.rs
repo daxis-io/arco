@@ -9,18 +9,18 @@ use super::{
 use crate::error::{CatalogError, Result};
 
 #[allow(dead_code)]
-pub(crate) const PROJECTION_OUTBOX_ACK_DOMAIN: &str = "projection-outbox-acks";
+const PROJECTION_OUTBOX_ACK_DOMAIN: &str = "projection-outbox-acks";
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct ProjectionOutboxAckWriter {
+struct ProjectionOutboxAckWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
 
 #[allow(dead_code)]
 impl ProjectionOutboxAckWriter {
-    pub(crate) fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+    fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         if scope.domain() != PROJECTION_OUTBOX_ACK_DOMAIN {
             return Err(validation_failed(format!(
                 "projection outbox acknowledgements require domain {PROJECTION_OUTBOX_ACK_DOMAIN}"
@@ -30,7 +30,7 @@ impl ProjectionOutboxAckWriter {
         Ok(Self { store, scope })
     }
 
-    pub(crate) async fn acknowledge(
+    async fn acknowledge(
         &self,
         write: ProjectionOutboxAckWrite,
     ) -> Result<ProjectionOutboxAckReceipt> {
@@ -49,20 +49,21 @@ impl ProjectionOutboxAckWriter {
         match txn.commit().await {
             Ok(token) => Ok(ProjectionOutboxAckReceipt { token, record }),
             Err(CatalogError::CasFailed { .. }) => {
-                if let Some(receipt) = self.existing_receipt_for(&key, &record).await? {
-                    Ok(receipt)
-                } else {
-                    Err(CatalogError::CasFailed {
-                        message: "projection outbox ack pointer CAS lost without a visible ack"
-                            .to_string(),
-                    })
-                }
+                self.existing_receipt_for(&key, &record).await?.map_or_else(
+                    || {
+                        Err(CatalogError::CasFailed {
+                            message: "projection outbox ack pointer CAS lost without a visible ack"
+                                .to_string(),
+                        })
+                    },
+                    Ok,
+                )
             }
             Err(error) => Err(error),
         }
     }
 
-    pub(crate) async fn read_ack_at(
+    async fn read_ack_at(
         &self,
         token: StateToken,
         consumer_id: &str,
@@ -76,7 +77,7 @@ impl ProjectionOutboxAckWriter {
         decode_ack_record(&bytes).map(Some)
     }
 
-    pub(crate) async fn read_ack_at_status(
+    async fn read_ack_at_status(
         &self,
         token: StateToken,
         consumer_id: &str,
@@ -100,7 +101,7 @@ impl ProjectionOutboxAckWriter {
             .map(|record| ProjectionOutboxAckReadStatus::Available(Some(record)))
     }
 
-    pub(crate) fn projection_freshness_for(
+    fn projection_freshness_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> ProjectionOutboxAckFreshness {
@@ -122,7 +123,7 @@ impl ProjectionOutboxAckWriter {
         }
     }
 
-    pub(crate) fn projection_watermark_lag_for(
+    fn projection_watermark_lag_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> ProjectionOutboxAckWatermarkLag {
@@ -156,7 +157,7 @@ impl ProjectionOutboxAckWriter {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectionOutboxAckWrite {
+struct ProjectionOutboxAckWrite {
     consumer_id: String,
     record_id: String,
 }
@@ -164,7 +165,7 @@ pub(crate) struct ProjectionOutboxAckWrite {
 #[allow(dead_code)]
 impl ProjectionOutboxAckWrite {
     #[must_use]
-    pub(crate) fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
+    fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
         Self {
             consumer_id: consumer_id.into(),
             record_id: record_id.into(),
@@ -174,7 +175,7 @@ impl ProjectionOutboxAckWrite {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ProjectionOutboxAckRecord {
+struct ProjectionOutboxAckRecord {
     consumer_id: String,
     record_id: String,
 }
@@ -182,7 +183,7 @@ pub(crate) struct ProjectionOutboxAckRecord {
 #[allow(dead_code)]
 impl ProjectionOutboxAckRecord {
     #[must_use]
-    pub(crate) fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
+    fn new(consumer_id: impl Into<String>, record_id: impl Into<String>) -> Self {
         Self {
             consumer_id: consumer_id.into(),
             record_id: record_id.into(),
@@ -190,12 +191,12 @@ impl ProjectionOutboxAckRecord {
     }
 
     #[must_use]
-    pub(crate) fn consumer_id(&self) -> &str {
+    fn consumer_id(&self) -> &str {
         &self.consumer_id
     }
 
     #[must_use]
-    pub(crate) fn record_id(&self) -> &str {
+    fn record_id(&self) -> &str {
         &self.record_id
     }
 }
@@ -211,7 +212,7 @@ impl From<ProjectionOutboxAckWrite> for ProjectionOutboxAckRecord {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectionOutboxAckReceipt {
+struct ProjectionOutboxAckReceipt {
     token: StateToken,
     record: ProjectionOutboxAckRecord,
 }
@@ -219,19 +220,19 @@ pub(crate) struct ProjectionOutboxAckReceipt {
 #[allow(dead_code)]
 impl ProjectionOutboxAckReceipt {
     #[must_use]
-    pub(crate) const fn token(&self) -> &StateToken {
+    const fn token(&self) -> &StateToken {
         &self.token
     }
 
     #[must_use]
-    pub(crate) const fn record(&self) -> &ProjectionOutboxAckRecord {
+    const fn record(&self) -> &ProjectionOutboxAckRecord {
         &self.record
     }
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectionOutboxAckReadStatus {
+enum ProjectionOutboxAckReadStatus {
     Available(Option<ProjectionOutboxAckRecord>),
     TokenUnavailable {
         manifest_id: String,
@@ -241,7 +242,7 @@ pub(crate) enum ProjectionOutboxAckReadStatus {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectionOutboxAckFreshness {
+enum ProjectionOutboxAckFreshness {
     Current {
         committed_sequence: u64,
         latest_projected_sequence: u64,
@@ -255,7 +256,7 @@ pub(crate) enum ProjectionOutboxAckFreshness {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProjectionOutboxAckWatermarkLag {
+struct ProjectionOutboxAckWatermarkLag {
     committed_sequence: u64,
     latest_projected_sequence: Option<u64>,
     pending_sequences: Option<u64>,

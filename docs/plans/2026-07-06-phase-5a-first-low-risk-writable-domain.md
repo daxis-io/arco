@@ -12,27 +12,35 @@ adds a crate-private writer over `ControlMvpStateStore` in the
 `projection-outbox-acks` domain. A successful acknowledgement commit returns a
 usable `StateToken`, and projection freshness is exposed only as diagnostics.
 
-**Selected base:** `381ebb9e96a84c43382bdc4924000a7375e43d2e`
-(`Add Phase 4B internal comparison reads`) from
-`.worktrees/phase4b-internal-read-comparison`.
+**PR-prep base:** `9577097b0723932ee696780d1e432e7cff3fd222`
+(`Add Phase 4 shadow replay and internal comparison reads (#317)`) from
+current `origin/main`.
 
-**Worktree:** `.worktrees/phase5a-projection-outbox-acks`
+**Original implementation base:** `381ebb9e96a84c43382bdc4924000a7375e43d2e`
+(`Add Phase 4B internal comparison reads`), before Phase 4 landed on
+`origin/main`.
 
-**Branch:** `codex/phase5a-projection-outbox-acks`
+**PR-prep worktree:** `.worktrees/phase5-low-risk-writable-domains`
+
+**PR-prep branch:** `codex/phase5-low-risk-writable-domains`
+
+**Original implementation worktree:** `.worktrees/phase5a-projection-outbox-acks`
+
+**Original implementation branch:** `codex/phase5a-projection-outbox-acks`
 
 ## Prerequisite Evidence
 
-- Root checkout observed before worktree creation:
-  `main...origin/main [ahead 16, behind 11]` with tracked deletion
+- Root checkout observed before PR-prep worktree creation:
+  `main...origin/main [ahead 16, behind 12]` with tracked deletion
   `docs/plans/2026-06-27-state-store-seam-current-adapter-slice.md`; root was
   not modified.
-- Phase 4A commits:
-  - `743c6f6 Add Phase 4A catalog shadow replay`
-  - `48822d0 Address Phase 4A shadow replay review feedback`
-- Phase 4B commit:
-  - `381ebb9 Add Phase 4B internal comparison reads`
-- Baseline in this Phase 5A worktree before source edits:
-  - `cargo test -p arco-catalog comparison_reads`: 8 passed.
+- Phase 3 prerequisite is present in `origin/main`:
+  `adccaa4 Add Phase 3 state-store prototype gates (#316)`.
+- Phase 4 prerequisite is present in `origin/main`:
+  `9577097 Add Phase 4 shadow replay and internal comparison reads (#317)`.
+- Original Phase 5A execution was developed on the pre-merge Phase 4B commit
+  `381ebb9`, then cherry-picked onto current `origin/main` for this clean PR
+  branch.
 
 ## Modified Files
 

@@ -9,26 +9,37 @@ pointer CAS`. This phase adds crate-private diagnostics and deterministic
 operations evidence around the existing projection outbox acknowledgement
 writer. It does not move production authority.
 
-**Selected base:** `0b562589c1d5498523676ad6fcab6ca1d7fd6703`
-(`Address Phase 5A ack review feedback`) from
-`.worktrees/phase5a-projection-outbox-acks`.
+**PR-prep base:** `9577097b0723932ee696780d1e432e7cff3fd222`
+(`Add Phase 4 shadow replay and internal comparison reads (#317)`) from
+current `origin/main`.
 
-**Worktree:** `.worktrees/phase5b-low-risk-writable-domain-hardening`
+**Original implementation base:** `0b562589c1d5498523676ad6fcab6ca1d7fd6703`
+(`Address Phase 5A ack review feedback`), before the combined Phase 5 branch
+was rebuilt onto current `origin/main`.
 
-**Branch:** `codex/phase5b-low-risk-writable-domain-hardening`
+**PR-prep worktree:** `.worktrees/phase5-low-risk-writable-domains`
+
+**PR-prep branch:** `codex/phase5-low-risk-writable-domains`
+
+**Original implementation worktree:** `.worktrees/phase5b-low-risk-writable-domain-hardening`
+
+**Original implementation branch:** `codex/phase5b-low-risk-writable-domain-hardening`
 
 ## Phase 5A Evidence
 
-- Root checkout observed before worktree creation:
-  `main...origin/main [ahead 16, behind 11]` with tracked deletion
+- Root checkout observed before PR-prep worktree creation:
+  `main...origin/main [ahead 16, behind 12]` with tracked deletion
   `docs/plans/2026-06-27-state-store-seam-current-adapter-slice.md`; root was
   not modified.
-- Phase 4B base:
-  `381ebb9e96a84c43382bdc4924000a7375e43d2e`
-  (`Add Phase 4B internal comparison reads`).
-- Phase 5A commits:
-  - `9e4c38b Add Phase 5A projection outbox ack writes`
-  - `0b56258 Address Phase 5A ack review feedback`
+- Phase 3 prerequisite is present in `origin/main`:
+  `adccaa4 Add Phase 3 state-store prototype gates (#316)`.
+- Phase 4 prerequisite is present in `origin/main`:
+  `9577097 Add Phase 4 shadow replay and internal comparison reads (#317)`.
+- Clean PR-prep Phase 5A commits:
+  - `6174ae4 Add Phase 5A projection outbox ack writes`
+  - `e334671 Address Phase 5A ack review feedback`
+- Clean PR-prep Phase 5B commit:
+  - `06a61ec Add Phase 5B ack-domain hardening`
 - Selected domain: `projection-outbox-acks`.
 - Phase 5A changed only:
   - `crates/arco-catalog/src/state_store.rs`

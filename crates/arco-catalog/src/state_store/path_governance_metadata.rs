@@ -526,6 +526,19 @@ mod tests {
         }
     }
 
+    fn assert_precondition_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Err(CatalogError::PreconditionFailed { message }) => assert!(
+                message.contains(expected),
+                "expected precondition message containing {expected:?}, got {message:?}"
+            ),
+            Err(error) => {
+                panic!("expected precondition failure containing {expected}, got {error:?}")
+            }
+            Ok(_) => panic!("expected precondition failure containing {expected}"),
+        }
+    }
+
     #[tokio::test]
     async fn successful_declaration_returns_state_token() {
         let writer = writer(storage());
@@ -638,6 +651,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_canonical_conflict_is_rejected() {
+        let writer = writer(storage());
+        writer
+            .declare_path(declaration("decl_orders", "gs://Bucket//warehouse/orders"))
+            .await
+            .expect("declare first canonical path");
+
+        assert_precondition_contains(
+            writer
+                .declare_path(declaration(
+                    "decl_orders_duplicate",
+                    "gs://bucket/warehouse/orders/",
+                ))
+                .await,
+            "exact path governance metadata conflict",
+        );
+    }
+
+    #[tokio::test]
     async fn descendant_conflict_is_rejected() {
         let writer = writer(storage());
         writer
@@ -674,6 +706,41 @@ mod tests {
 
         assert_eq!(1, orders.token().logical_sequence());
         assert_eq!(2, archive.token().logical_sequence());
+    }
+
+    #[tokio::test]
+    async fn range_empty_blocks_tombstoned_descendant_index() {
+        let storage = storage();
+        let writer = writer(storage.clone());
+        let store = ControlMvpStateStore::new(storage, metadata_scope()).expect("control store");
+        let descendant_index_key = path_index_key("gs://bucket/warehouse/orders/");
+
+        let mut seed_txn = store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
+            .await
+            .expect("begin seed transaction");
+        seed_txn
+            .put(&descendant_index_key, Bytes::from_static(b"decl_orders"))
+            .await
+            .expect("stage descendant index");
+        seed_txn.commit().await.expect("commit descendant index");
+
+        let mut delete_txn = store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
+            .await
+            .expect("begin delete transaction");
+        delete_txn
+            .delete(&descendant_index_key)
+            .await
+            .expect("tombstone descendant index");
+        delete_txn.commit().await.expect("commit tombstone");
+
+        assert_precondition_contains(
+            writer
+                .declare_path(declaration("decl_parent", "gs://bucket/warehouse"))
+                .await,
+            "cannot assert a non-empty control MVP range",
+        );
     }
 
     #[tokio::test]

@@ -152,8 +152,11 @@ Out:
   `PathGovernanceCompiledStateStatus`, `PathGovernanceProjectionLag`,
   `descendant_conflict_range`, and `ControlMvpTxn::range_witness` were not
   implemented.
-- Green run after implementation:
-  `cargo test -p arco-catalog state_store::path_governance_metadata`: 12 passed.
+- Fresh audit feedback follow-up added explicit coverage for canonical exact
+  path conflicts and tombstoned descendant index keys that make the descendant
+  `range_empty` witness deny closed.
+- Green run after feedback follow-up:
+  `cargo test -p arco-catalog state_store::path_governance_metadata`: 14 passed.
 
 ## Verification
 

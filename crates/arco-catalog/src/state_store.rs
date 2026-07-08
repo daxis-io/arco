@@ -12,6 +12,7 @@ use crate::error::{CatalogError, Result};
 pub(crate) mod comparison_reads;
 pub mod control_mvp;
 pub mod model;
+pub(crate) mod projection_outbox_acks;
 pub mod promotion_gate;
 pub(crate) mod shadow_replay;
 

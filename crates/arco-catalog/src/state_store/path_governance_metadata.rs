@@ -596,6 +596,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_canonical_conflict_is_rejected() {
+        let writer = writer(storage());
+        writer
+            .declare_path(declaration("orders", "gs://Bucket//warehouse/orders"))
+            .await
+            .expect("seed canonical declaration");
+
+        assert_precondition(
+            writer
+                .declare_path(declaration(
+                    "orders_duplicate",
+                    "gs://bucket/warehouse/orders/",
+                ))
+                .await,
+            "exact",
+        );
+    }
+
+    #[tokio::test]
     async fn descendant_conflict_is_rejected() {
         let writer = writer(storage());
         writer
@@ -640,18 +659,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_empty_blocks_existing_descendant_conflict() {
+    async fn range_empty_blocks_tombstoned_descendant_index() {
         let writer = writer(storage());
-        writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+        let descendant_index_key = path_index_key("gs://bucket/warehouse/orders/");
+        let mut seed_txn = writer
+            .store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
             .await
-            .expect("seed descendant");
+            .expect("begin seed transaction");
+        seed_txn
+            .put(&descendant_index_key, Bytes::from_static(b"orders"))
+            .await
+            .expect("stage descendant index");
+        seed_txn.commit().await.expect("commit descendant index");
+
+        let mut delete_txn = writer
+            .store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
+            .await
+            .expect("begin delete transaction");
+        delete_txn
+            .delete(&descendant_index_key)
+            .await
+            .expect("stage descendant tombstone");
+        delete_txn
+            .commit()
+            .await
+            .expect("commit descendant tombstone");
 
         assert_precondition(
             writer
                 .declare_path(declaration("warehouse", "gs://bucket/warehouse"))
                 .await,
-            "descendant",
+            "non-empty",
         );
     }
 

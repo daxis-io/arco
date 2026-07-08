@@ -489,6 +489,12 @@ impl ControlMvpTxn {
         Ok(())
     }
 
+    /// Returns the current transaction-base witness for a key range.
+    #[must_use]
+    pub(crate) fn range_witness(&self, range: &KeyRange) -> u64 {
+        self.base.state.range_witness(range)
+    }
+
     async fn commit_inner(self) -> Result<StateToken> {
         for precondition in &self.preconditions {
             self.base.state.validate_precondition(precondition)?;

@@ -56,40 +56,6 @@ impl GovernedPath {
             && self.authority == other.authority
             && (self_contains_other || other_contains_self)
     }
-
-    /// Returns canonical ancestor URIs from the authority root to the direct parent.
-    #[must_use]
-    pub(crate) fn canonical_ancestor_uris(&self) -> Vec<String> {
-        let segments = self
-            .path
-            .trim_matches('/')
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect::<Vec<_>>();
-        let mut ancestors = Vec::new();
-
-        for depth in 0..segments.len() {
-            let path = if depth == 0 {
-                "/".to_string()
-            } else {
-                format!("/{}/", segments[..depth].join("/"))
-            };
-            ancestors.push(canonical_uri_for_parts(
-                &self.scheme,
-                self.authority.as_deref(),
-                &path,
-            ));
-        }
-
-        ancestors
-    }
-}
-
-fn canonical_uri_for_parts(scheme: &str, authority: Option<&str>, path: &str) -> String {
-    authority.map_or_else(
-        || format!("{scheme}://{path}"),
-        |authority| format!("{scheme}://{authority}{path}"),
-    )
 }
 
 fn parse_cloud_uri(scheme: &str, rest: &str) -> Result<GovernedPath> {

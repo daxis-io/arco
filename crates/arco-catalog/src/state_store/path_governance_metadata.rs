@@ -3,7 +3,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, KeyRange, PredicateInputSet, StateScope,
+    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange, StateScope,
     StateToken, TxnOptions,
 };
 use crate::error::{CatalogError, Result};
@@ -12,7 +12,6 @@ use crate::storage_governance::path_normalization::GovernedPath;
 
 #[allow(dead_code)]
 pub(crate) const PATH_GOVERNANCE_METADATA_DOMAIN: &str = "path-governance-metadata";
-const SCHEMA_VERSION: u32 = 1;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -35,68 +34,25 @@ impl PathGovernanceMetadataWriter {
 
     pub(crate) async fn declare_path(
         &self,
-        write: PathGovernanceMetadataWrite,
+        declaration: PathGovernanceDeclaration,
     ) -> Result<PathGovernanceMetadataReceipt> {
-        let inputs = self.compile_inputs(write.clone()).await?;
-        self.declare_path_with_inputs(write, inputs).await
+        self.begin_declare_path(declaration).await?.commit().await
     }
 
-    pub(crate) async fn compile_inputs(
+    pub(crate) async fn begin_declare_path(
         &self,
-        write: PathGovernanceMetadataWrite,
-    ) -> Result<PathGovernanceMetadataInputs> {
-        let record = PathGovernanceMetadataRecord::from_write(write)?;
-        let keys = MetadataKeys::new(record.declaration_id(), record.canonical_uri())?;
+        declaration: PathGovernanceDeclaration,
+    ) -> Result<PathGovernancePendingDeclaration> {
+        let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
         let mut txn = self
             .store
             .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
             .await?;
-        let predicate_inputs = txn
-            .read_set(
-                &keys.predicate_point_keys(),
-                &[keys.descendant_range.clone()],
-            )
-            .await?;
-
-        Ok(PathGovernanceMetadataInputs {
-            scope: self.scope.clone(),
-            declaration_id: record.declaration_id().to_string(),
-            canonical_uri: record.canonical_uri().to_string(),
-            predicate_inputs,
-        })
-    }
-
-    pub(crate) async fn declare_path_with_inputs(
-        &self,
-        write: PathGovernanceMetadataWrite,
-        inputs: PathGovernanceMetadataInputs,
-    ) -> Result<PathGovernanceMetadataReceipt> {
-        if inputs.scope != self.scope {
-            return Err(validation_failed(
-                "path governance metadata compiled inputs scope does not match writer",
-            ));
-        }
-
-        let record = PathGovernanceMetadataRecord::from_write(write)?;
-        if inputs.declaration_id != record.declaration_id()
-            || inputs.canonical_uri != record.canonical_uri()
-        {
-            return Err(validation_failed(
-                "path governance metadata compiled inputs do not match write",
-            ));
-        }
-
-        let keys = MetadataKeys::new(record.declaration_id(), record.canonical_uri())?;
-        let mut txn = self
-            .store
-            .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
-            .await?;
-        txn.assert_inputs_unchanged(inputs.predicate_inputs).await?;
 
         if txn.get(&keys.record_key).await?.is_some() {
             return Err(CatalogError::AlreadyExists {
                 entity: "path_governance_metadata".to_string(),
-                name: record.declaration_id().to_string(),
+                name: declaration.declaration_id().to_string(),
             });
         }
         if txn.get(&keys.exact_path_key).await?.is_some() {
@@ -111,37 +67,79 @@ impl PathGovernanceMetadataWriter {
                 ));
             }
         }
-        if !txn.scan_prefix(&keys.exact_path_key).await?.is_empty() {
+        if !txn.scan_prefix(&keys.descendant_prefix).await?.is_empty() {
             return Err(precondition_failed(
                 "descendant path governance metadata conflict",
             ));
         }
 
+        let descendant_witness = txn.range_witness(&keys.descendant_range);
         txn.assert_absent(&keys.record_key).await?;
         txn.assert_absent(&keys.exact_path_key).await?;
-        txn.assert_range_empty(keys.descendant_range).await?;
-        txn.put(&keys.record_key, encode_record(&record)?).await?;
+        for ancestor_key in &keys.ancestor_path_keys {
+            txn.assert_absent(ancestor_key).await?;
+        }
+        txn.assert_range_empty(keys.descendant_range.clone())
+            .await?;
+        txn.assert_range_unchanged(keys.descendant_range.clone(), descendant_witness)
+            .await?;
+        let predicate_inputs = txn
+            .read_set(
+                &keys.predicate_point_keys(),
+                &[keys.descendant_range.clone()],
+            )
+            .await?;
+        txn.assert_inputs_unchanged(predicate_inputs).await?;
+
+        txn.put(&keys.record_key, encode_declaration(&declaration)?)
+            .await?;
         txn.put(
             &keys.exact_path_key,
-            Bytes::from(record.declaration_id().to_string()),
+            Bytes::from(declaration.declaration_id().to_string()),
         )
         .await?;
-        let token = txn.commit().await?;
 
-        Ok(PathGovernanceMetadataReceipt { token, record })
+        Ok(PathGovernancePendingDeclaration {
+            writer: self.clone(),
+            txn,
+            declaration,
+        })
     }
 
     pub(crate) async fn read_declaration_at(
         &self,
         token: StateToken,
         declaration_id: &str,
-    ) -> Result<Option<PathGovernanceMetadataRecord>> {
+    ) -> Result<Option<PathGovernanceDeclaration>> {
         let key = declaration_key(declaration_id);
         let reader = self.store.read_at(token).await?;
         let Some(bytes) = reader.get(&key).await? else {
             return Ok(None);
         };
-        decode_record(&bytes).map(Some)
+        decode_declaration(&bytes).map(Some)
+    }
+
+    pub(crate) async fn read_declaration_at_status(
+        &self,
+        token: StateToken,
+        declaration_id: &str,
+    ) -> Result<PathGovernanceDeclarationReadStatus> {
+        let key = declaration_key(declaration_id);
+        let reader = match self.store.read_at(token.clone()).await {
+            Ok(reader) => reader,
+            Err(CatalogError::NotFound { .. }) => {
+                return Ok(PathGovernanceDeclarationReadStatus::TokenUnavailable {
+                    manifest_id: token.authority_manifest_id().to_string(),
+                    logical_sequence: token.logical_sequence(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = reader.get(&key).await? else {
+            return Ok(PathGovernanceDeclarationReadStatus::Available(None));
+        };
+        decode_declaration(&bytes)
+            .map(|declaration| PathGovernanceDeclarationReadStatus::Available(Some(declaration)))
     }
 
     pub(crate) fn projection_lag_for(
@@ -157,105 +155,108 @@ impl PathGovernanceMetadataWriter {
         }
     }
 
-    pub(crate) fn compiled_enforcement_readiness(
-        required: &StateToken,
-        compiled: Option<&CompiledPathGovernanceMetadataState>,
-    ) -> PathGovernanceReadiness {
-        let Some(compiled) = compiled else {
-            return PathGovernanceReadiness::DenyClosed(
-                PathGovernanceReadinessReason::MissingCompiledState,
-            );
-        };
-
-        if &compiled.scope != required.scope() || compiled.token.scope() != required.scope() {
-            return PathGovernanceReadiness::DenyClosed(
-                PathGovernanceReadinessReason::ScopeMismatch,
-            );
-        }
-
-        let required_sequence = required.logical_sequence();
-        let compiled_sequence = compiled.token.logical_sequence();
-        if compiled_sequence < required_sequence {
-            return PathGovernanceReadiness::DenyClosed(
-                PathGovernanceReadinessReason::StaleCompiledState {
+    pub(crate) fn compiled_state_status_for(
+        token: &StateToken,
+        compiled_sequence: Option<u64>,
+    ) -> PathGovernanceCompiledStateStatus {
+        let required_sequence = token.logical_sequence();
+        match compiled_sequence {
+            None => PathGovernanceCompiledStateStatus::DenyClosedMissing { required_sequence },
+            Some(compiled_sequence) if compiled_sequence < required_sequence => {
+                PathGovernanceCompiledStateStatus::DenyClosedStale {
                     required_sequence,
                     compiled_sequence,
-                },
-            );
+                }
+            }
+            Some(compiled_sequence) => PathGovernanceCompiledStateStatus::Ready {
+                required_sequence,
+                compiled_sequence,
+            },
         }
+    }
 
-        PathGovernanceReadiness::Ready {
-            required_sequence,
-            compiled_sequence,
+    async fn has_path_conflict(&self, declaration: &PathGovernanceDeclaration) -> Result<bool> {
+        let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
+        if self.store.get(&keys.exact_path_key).await?.is_some() {
+            return Ok(true);
         }
+        for ancestor_key in &keys.ancestor_path_keys {
+            if self.store.get(ancestor_key).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(!self
+            .store
+            .scan_prefix(&keys.descendant_prefix)
+            .await?
+            .is_empty())
     }
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PathGovernanceMetadataWrite {
-    declaration_id: String,
-    name: String,
-    raw_uri: String,
-    owner: String,
-    workspace_id: Option<String>,
+pub(crate) struct PathGovernancePendingDeclaration {
+    writer: PathGovernanceMetadataWriter,
+    txn: ControlMvpTxn,
+    declaration: PathGovernanceDeclaration,
 }
 
 #[allow(dead_code)]
-impl PathGovernanceMetadataWrite {
-    #[must_use]
-    pub(crate) fn new(
-        declaration_id: impl Into<String>,
-        name: impl Into<String>,
-        raw_uri: impl Into<String>,
-        owner: impl Into<String>,
-    ) -> Self {
-        Self {
-            declaration_id: declaration_id.into(),
-            name: name.into(),
-            raw_uri: raw_uri.into(),
-            owner: owner.into(),
-            workspace_id: None,
+impl PathGovernancePendingDeclaration {
+    pub(crate) async fn commit(self) -> Result<PathGovernanceMetadataReceipt> {
+        let declaration = self.declaration;
+        match self.txn.commit().await {
+            Ok(token) => Ok(PathGovernanceMetadataReceipt { token, declaration }),
+            Err(CatalogError::CasFailed { .. }) => {
+                if self.writer.has_path_conflict(&declaration).await? {
+                    Err(precondition_failed(
+                        "path governance metadata conflict changed before commit",
+                    ))
+                } else {
+                    Err(CatalogError::CasFailed {
+                        message: "path governance metadata pointer CAS lost".to_string(),
+                    })
+                }
+            }
+            Err(error) => Err(error),
         }
-    }
-
-    #[must_use]
-    pub(crate) fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
-        self.workspace_id = Some(workspace_id.into());
-        self
     }
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PathGovernanceMetadataRecord {
-    schema_version: u32,
+pub(crate) struct PathGovernanceDeclaration {
     declaration_id: String,
-    name: String,
+    authority_object_id: String,
+    authority_object_type: String,
+    workspace_id: Option<String>,
     canonical_uri: String,
     owner: String,
-    workspace_id: Option<String>,
     lifecycle_state: LifecycleState,
 }
 
 #[allow(dead_code)]
-impl PathGovernanceMetadataRecord {
-    fn from_write(write: PathGovernanceMetadataWrite) -> Result<Self> {
-        let governed_path = GovernedPath::parse(&write.raw_uri)?;
+impl PathGovernanceDeclaration {
+    pub(crate) fn active<W>(
+        declaration_id: impl Into<String>,
+        authority_object_id: impl Into<String>,
+        authority_object_type: impl Into<String>,
+        workspace_id: Option<W>,
+        raw_uri: impl AsRef<str>,
+        owner: impl Into<String>,
+    ) -> Result<Self>
+    where
+        W: Into<String>,
+    {
+        let governed_path = GovernedPath::parse(raw_uri.as_ref())?;
         Ok(Self {
-            schema_version: SCHEMA_VERSION,
-            declaration_id: write.declaration_id,
-            name: write.name,
+            declaration_id: declaration_id.into(),
+            authority_object_id: authority_object_id.into(),
+            authority_object_type: authority_object_type.into(),
+            workspace_id: workspace_id.map(Into::into),
             canonical_uri: governed_path.canonical_uri(),
-            owner: write.owner,
-            workspace_id: write.workspace_id,
+            owner: owner.into(),
             lifecycle_state: LifecycleState::Active,
         })
-    }
-
-    #[must_use]
-    pub(crate) const fn schema_version(&self) -> u32 {
-        self.schema_version
     }
 
     #[must_use]
@@ -264,8 +265,18 @@ impl PathGovernanceMetadataRecord {
     }
 
     #[must_use]
-    pub(crate) fn name(&self) -> &str {
-        &self.name
+    pub(crate) fn authority_object_id(&self) -> &str {
+        &self.authority_object_id
+    }
+
+    #[must_use]
+    pub(crate) fn authority_object_type(&self) -> &str {
+        &self.authority_object_type
+    }
+
+    #[must_use]
+    pub(crate) fn workspace_id(&self) -> Option<&str> {
+        self.workspace_id.as_deref()
     }
 
     #[must_use]
@@ -279,30 +290,16 @@ impl PathGovernanceMetadataRecord {
     }
 
     #[must_use]
-    pub(crate) fn workspace_id(&self) -> Option<&str> {
-        self.workspace_id.as_deref()
-    }
-
-    #[must_use]
     pub(crate) const fn lifecycle_state(&self) -> LifecycleState {
         self.lifecycle_state
     }
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub(crate) struct PathGovernanceMetadataInputs {
-    scope: StateScope,
-    declaration_id: String,
-    canonical_uri: String,
-    predicate_inputs: PredicateInputSet,
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PathGovernanceMetadataReceipt {
     token: StateToken,
-    record: PathGovernanceMetadataRecord,
+    declaration: PathGovernanceDeclaration,
 }
 
 #[allow(dead_code)]
@@ -313,44 +310,18 @@ impl PathGovernanceMetadataReceipt {
     }
 
     #[must_use]
-    pub(crate) const fn record(&self) -> &PathGovernanceMetadataRecord {
-        &self.record
+    pub(crate) const fn declaration(&self) -> &PathGovernanceDeclaration {
+        &self.declaration
     }
 }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledPathGovernanceMetadataState {
-    scope: StateScope,
-    token: StateToken,
-}
-
-#[allow(dead_code)]
-impl CompiledPathGovernanceMetadataState {
-    #[must_use]
-    pub(crate) const fn new(scope: StateScope, token: StateToken) -> Self {
-        Self { scope, token }
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathGovernanceReadiness {
-    Ready {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosed(PathGovernanceReadinessReason),
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathGovernanceReadinessReason {
-    MissingCompiledState,
-    ScopeMismatch,
-    StaleCompiledState {
-        required_sequence: u64,
-        compiled_sequence: u64,
+pub(crate) enum PathGovernanceDeclarationReadStatus {
+    Available(Option<PathGovernanceDeclaration>),
+    TokenUnavailable {
+        manifest_id: String,
+        logical_sequence: u64,
     },
 }
 
@@ -362,28 +333,45 @@ pub(crate) struct PathGovernanceProjectionLag {
     pending_sequences: Option<u64>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PathGovernanceCompiledStateStatus {
+    Ready {
+        required_sequence: u64,
+        compiled_sequence: u64,
+    },
+    DenyClosedMissing {
+        required_sequence: u64,
+    },
+    DenyClosedStale {
+        required_sequence: u64,
+        compiled_sequence: u64,
+    },
+}
+
 struct MetadataKeys {
     record_key: Vec<u8>,
     exact_path_key: Vec<u8>,
     ancestor_path_keys: Vec<Vec<u8>>,
+    descendant_prefix: Vec<u8>,
     descendant_range: KeyRange,
 }
 
 impl MetadataKeys {
     fn new(declaration_id: &str, canonical_uri: &str) -> Result<Self> {
-        let governed_path = GovernedPath::parse(canonical_uri)?;
+        GovernedPath::parse(canonical_uri)?;
         let exact_path_key = path_index_key(canonical_uri);
-        let ancestor_path_keys = governed_path
-            .canonical_ancestor_uris()
+        let ancestor_path_keys = canonical_ancestor_uris(canonical_uri)?
             .into_iter()
             .map(|ancestor_uri| path_index_key(&ancestor_uri))
             .collect();
-        let descendant_range = descendant_range(canonical_uri);
+        let descendant_range = descendant_conflict_range(canonical_uri)?;
 
         Ok(Self {
             record_key: declaration_key(declaration_id),
-            exact_path_key,
+            exact_path_key: exact_path_key.clone(),
             ancestor_path_keys,
+            descendant_prefix: exact_path_key,
             descendant_range,
         })
     }
@@ -404,16 +392,53 @@ fn declaration_key(declaration_id: &str) -> Vec<u8> {
 }
 
 fn path_index_key(canonical_uri: &str) -> Vec<u8> {
-    let mut key = b"path-governance-metadata/path-index/".to_vec();
+    let mut key = b"path-governance-metadata/active-path/".to_vec();
     key.extend_from_slice(canonical_uri.as_bytes());
     key
 }
 
-fn descendant_range(canonical_uri: &str) -> KeyRange {
+fn descendant_conflict_range(canonical_uri: &str) -> Result<KeyRange> {
+    GovernedPath::parse(canonical_uri)?;
     let start = path_index_key(canonical_uri);
     let mut end = start.clone();
     end.push(0xff);
-    KeyRange::new(start, end)
+    Ok(KeyRange::new(start, end))
+}
+
+fn canonical_ancestor_uris(canonical_uri: &str) -> Result<Vec<String>> {
+    let (scheme, rest) = canonical_uri
+        .split_once("://")
+        .ok_or_else(|| validation_failed("path must include a URI scheme"))?;
+    let (authority, path) = if scheme == "file" {
+        (None, rest)
+    } else {
+        let (authority, path) = rest
+            .split_once('/')
+            .ok_or_else(|| validation_failed("cloud URI authority must include a path root"))?;
+        (Some(authority), path)
+    };
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let mut ancestors = Vec::new();
+    for depth in 0..segments.len() {
+        let path = if depth == 0 {
+            "/".to_string()
+        } else {
+            format!("/{}/", segments[..depth].join("/"))
+        };
+        ancestors.push(canonical_uri_for_parts(scheme, authority, &path));
+    }
+    Ok(ancestors)
+}
+
+fn canonical_uri_for_parts(scheme: &str, authority: Option<&str>, path: &str) -> String {
+    authority.map_or_else(
+        || format!("{scheme}://{path}"),
+        |authority| format!("{scheme}://{authority}{path}"),
+    )
 }
 
 fn push_length_prefixed(key: &mut Vec<u8>, value: &[u8]) {
@@ -422,17 +447,21 @@ fn push_length_prefixed(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(value);
 }
 
-fn encode_record(record: &PathGovernanceMetadataRecord) -> Result<Bytes> {
-    serde_json::to_vec(record)
+fn encode_declaration(declaration: &PathGovernanceDeclaration) -> Result<Bytes> {
+    serde_json::to_vec(declaration)
         .map(Bytes::from)
         .map_err(|error| {
-            serialization_failed(format!("path governance metadata record encode: {error}"))
+            serialization_failed(format!(
+                "path governance metadata declaration encode: {error}"
+            ))
         })
 }
 
-fn decode_record(bytes: &Bytes) -> Result<PathGovernanceMetadataRecord> {
+fn decode_declaration(bytes: &Bytes) -> Result<PathGovernanceDeclaration> {
     serde_json::from_slice(bytes).map_err(|error| {
-        serialization_failed(format!("path governance metadata record decode: {error}"))
+        serialization_failed(format!(
+            "path governance metadata declaration decode: {error}"
+        ))
     })
 }
 
@@ -457,27 +486,15 @@ fn precondition_failed(message: impl Into<String>) -> CatalogError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use arco_core::{MemoryBackend, ScopedStorage};
 
     use super::*;
-    use crate::authz::privileges::Privilege;
-    use crate::credential_vending::{
-        CredentialDecision, CredentialOperation, CredentialVendingAuthorization,
-        CredentialVendingEngine, CredentialVendingRequest,
-    };
     use crate::error::{CatalogError, Result};
-    use crate::metastore::events::LifecycleState;
-    use crate::state_store::StateScope;
-    use crate::storage_governance::StorageGovernanceState;
+    use crate::state_store::{ArcoStateTxn, ControlMvpStateStore, StateScope, TxnOptions};
 
     fn metadata_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PATH_GOVERNANCE_METADATA_DOMAIN)
-    }
-
-    fn other_scope(domain: &str) -> StateScope {
-        StateScope::new("tenant", "workspace", domain)
     }
 
     fn storage() -> ScopedStorage {
@@ -489,34 +506,23 @@ mod tests {
         PathGovernanceMetadataWriter::new(storage, metadata_scope()).expect("metadata writer")
     }
 
-    fn declaration(id: &str, raw_uri: &str) -> PathGovernanceMetadataWrite {
-        PathGovernanceMetadataWrite::new(id, format!("path-{id}"), raw_uri, "owner")
-            .with_workspace_id("workspace")
+    fn declaration(id: &str, uri: &str) -> PathGovernanceDeclaration {
+        PathGovernanceDeclaration::active(
+            id,
+            format!("authority_{id}"),
+            "EXTERNAL_LOCATION",
+            Some("workspace"),
+            uri,
+            "owner",
+        )
+        .expect("declaration")
     }
 
-    fn assert_precondition<T>(result: Result<T>, expected: &str) {
+    fn assert_precondition_failed<T>(result: Result<T>, context: &str) {
         match result {
-            Err(CatalogError::PreconditionFailed { message }) => {
-                assert!(
-                    message.contains(expected),
-                    "expected precondition containing {expected:?}, got {message:?}"
-                );
-            }
-            Err(error) => panic!("expected PreconditionFailed for {expected}, got {error:?}"),
-            Ok(_) => panic!("expected PreconditionFailed for {expected}"),
-        }
-    }
-
-    fn assert_validation<T>(result: Result<T>, expected: &str) {
-        match result {
-            Err(CatalogError::Validation { message }) => {
-                assert!(
-                    message.contains(expected),
-                    "expected validation containing {expected:?}, got {message:?}"
-                );
-            }
-            Err(error) => panic!("expected Validation for {expected}, got {error:?}"),
-            Ok(_) => panic!("expected Validation for {expected}"),
+            Err(CatalogError::PreconditionFailed { .. }) => {}
+            Err(error) => panic!("expected precondition failure for {context}, got {error:?}"),
+            Ok(_) => panic!("expected precondition failure for {context}"),
         }
     }
 
@@ -525,57 +531,90 @@ mod tests {
         let writer = writer(storage());
 
         let receipt = writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
             .await
             .expect("declare path");
 
         assert_eq!(&metadata_scope(), receipt.token().scope());
         assert_eq!(1, receipt.token().logical_sequence());
         assert!(!receipt.token().authority_manifest_id().is_empty());
-        assert_eq!("orders", receipt.record().declaration_id());
-        assert_eq!("path-orders", receipt.record().name());
+        assert_eq!("decl_orders", receipt.declaration().declaration_id());
         assert_eq!(
             "gs://bucket/warehouse/orders/",
-            receipt.record().canonical_uri()
+            receipt.declaration().canonical_uri()
         );
-        assert_eq!("owner", receipt.record().owner());
-        assert_eq!(Some("workspace"), receipt.record().workspace_id());
-        assert_eq!(LifecycleState::Active, receipt.record().lifecycle_state());
+        assert_eq!("active", receipt.declaration().lifecycle_state().as_str());
     }
 
     #[tokio::test]
-    async fn read_declaration_at_state_token_returns_committed_record() {
+    async fn read_declaration_at_state_token_returns_committed_declaration() {
         let writer = writer(storage());
 
         let first = writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
             .await
             .expect("first declaration");
         let second = writer
-            .declare_path(declaration("customers", "gs://bucket/warehouse/customers"))
+            .declare_path(declaration(
+                "decl_customers",
+                "gs://bucket/warehouse/customers",
+            ))
             .await
             .expect("second declaration");
 
         assert_eq!(
-            Some(first.record().clone()),
+            Some(declaration("decl_orders", "gs://bucket/warehouse/orders")),
             writer
-                .read_declaration_at(first.token().clone(), "orders")
+                .read_declaration_at(first.token().clone(), "decl_orders")
                 .await
                 .expect("read first token")
         );
         assert_eq!(
             None,
             writer
-                .read_declaration_at(first.token().clone(), "customers")
+                .read_declaration_at(first.token().clone(), "decl_customers")
                 .await
                 .expect("first token excludes later declaration")
         );
         assert_eq!(
-            Some(second.record().clone()),
+            Some(declaration(
+                "decl_customers",
+                "gs://bucket/warehouse/customers"
+            )),
             writer
-                .read_declaration_at(second.token().clone(), "customers")
+                .read_declaration_at(second.token().clone(), "decl_customers")
                 .await
                 .expect("read second token")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_status_marks_missing_retained_manifest_unavailable() {
+        let storage = storage();
+        let writer = writer(storage.clone());
+
+        let receipt = writer
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
+            .await
+            .expect("declare path");
+        let token = receipt.token().clone();
+        let manifest_id = token.authority_manifest_id().to_string();
+        let logical_sequence = token.logical_sequence();
+        let paths = crate::state_store::ControlMvpPaths::new(PATH_GOVERNANCE_METADATA_DOMAIN);
+        storage
+            .delete(&paths.manifest_object(&manifest_id))
+            .await
+            .expect("expire retained manifest");
+
+        assert_eq!(
+            PathGovernanceDeclarationReadStatus::TokenUnavailable {
+                manifest_id,
+                logical_sequence,
+            },
+            writer
+                .read_declaration_at_status(token, "decl_orders")
+                .await
+                .expect("token status")
         );
     }
 
@@ -583,34 +622,18 @@ mod tests {
     async fn ancestor_conflict_is_rejected() {
         let writer = writer(storage());
         writer
-            .declare_path(declaration("warehouse", "gs://bucket/warehouse"))
+            .declare_path(declaration("decl_parent", "gs://bucket/warehouse/orders"))
             .await
-            .expect("seed ancestor");
+            .expect("declare parent");
 
-        assert_precondition(
-            writer
-                .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
-                .await,
-            "ancestor",
-        );
-    }
-
-    #[tokio::test]
-    async fn exact_canonical_conflict_is_rejected() {
-        let writer = writer(storage());
-        writer
-            .declare_path(declaration("orders", "gs://Bucket//warehouse/orders"))
-            .await
-            .expect("seed canonical declaration");
-
-        assert_precondition(
+        assert_precondition_failed(
             writer
                 .declare_path(declaration(
-                    "orders_duplicate",
-                    "gs://bucket/warehouse/orders/",
+                    "decl_child",
+                    "gs://bucket/warehouse/orders/2026",
                 ))
                 .await,
-            "exact",
+            "ancestor conflict",
         );
     }
 
@@ -618,240 +641,173 @@ mod tests {
     async fn descendant_conflict_is_rejected() {
         let writer = writer(storage());
         writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+            .declare_path(declaration(
+                "decl_child",
+                "gs://bucket/warehouse/orders/2026",
+            ))
             .await
-            .expect("seed descendant");
+            .expect("declare child");
 
-        assert_precondition(
+        assert_precondition_failed(
             writer
-                .declare_path(declaration("warehouse", "gs://bucket/warehouse"))
+                .declare_path(declaration("decl_parent", "gs://bucket/warehouse/orders"))
                 .await,
-            "descendant",
+            "descendant conflict",
         );
     }
 
     #[tokio::test]
-    async fn non_overlapping_paths_are_accepted() {
+    async fn non_overlapping_sibling_paths_are_accepted() {
         let writer = writer(storage());
 
-        let first = writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+        let orders = writer
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
             .await
             .expect("orders declaration");
-        let sibling = writer
+        let archive = writer
             .declare_path(declaration(
-                "orders_archive",
+                "decl_orders_archive",
                 "gs://bucket/warehouse/orders-archive",
             ))
             .await
-            .expect("sibling declaration");
-        let other_bucket = writer
+            .expect("orders archive declaration");
+
+        assert_eq!(1, orders.token().logical_sequence());
+        assert_eq!(2, archive.token().logical_sequence());
+    }
+
+    #[tokio::test]
+    async fn range_empty_blocks_concurrent_descendant_insert() {
+        let writer = writer(storage());
+        let pending_parent = writer
+            .begin_declare_path(declaration("decl_parent", "gs://bucket/warehouse/orders"))
+            .await
+            .expect("begin parent declaration");
+        writer
             .declare_path(declaration(
-                "orders_other",
-                "gs://other-bucket/warehouse/orders",
+                "decl_child",
+                "gs://bucket/warehouse/orders/2026",
             ))
             .await
-            .expect("other bucket declaration");
+            .expect("concurrent child declaration");
 
-        assert_eq!(1, first.token().logical_sequence());
-        assert_eq!(2, sibling.token().logical_sequence());
-        assert_eq!(3, other_bucket.token().logical_sequence());
-    }
-
-    #[tokio::test]
-    async fn range_empty_blocks_tombstoned_descendant_index() {
-        let writer = writer(storage());
-        let descendant_index_key = path_index_key("gs://bucket/warehouse/orders/");
-        let mut seed_txn = writer
-            .store
-            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
-            .await
-            .expect("begin seed transaction");
-        seed_txn
-            .put(&descendant_index_key, Bytes::from_static(b"orders"))
-            .await
-            .expect("stage descendant index");
-        seed_txn.commit().await.expect("commit descendant index");
-
-        let mut delete_txn = writer
-            .store
-            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
-            .await
-            .expect("begin delete transaction");
-        delete_txn
-            .delete(&descendant_index_key)
-            .await
-            .expect("stage descendant tombstone");
-        delete_txn
-            .commit()
-            .await
-            .expect("commit descendant tombstone");
-
-        assert_precondition(
-            writer
-                .declare_path(declaration("warehouse", "gs://bucket/warehouse"))
-                .await,
-            "non-empty",
+        assert_precondition_failed(
+            pending_parent.commit().await,
+            "concurrent descendant insert",
         );
     }
 
     #[tokio::test]
-    async fn range_unchanged_catches_stale_compiled_assumptions() {
-        let writer = writer(storage());
-        let write = declaration("warehouse", "gs://bucket/warehouse");
-        let inputs = writer
-            .compile_inputs(write.clone())
+    async fn range_unchanged_catches_stale_assumptions() {
+        let storage = storage();
+        let writer = writer(storage.clone());
+        let store = ControlMvpStateStore::new(storage, metadata_scope()).expect("control store");
+        let txn = store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
             .await
-            .expect("compile empty conflict inputs");
+            .expect("begin transaction");
+        let range = descendant_conflict_range("gs://bucket/warehouse/orders/").expect("range");
+        let stale_witness = txn.range_witness(&range);
 
         writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
+            .declare_path(declaration(
+                "decl_child",
+                "gs://bucket/warehouse/orders/2026",
+            ))
             .await
-            .expect("concurrent descendant declaration");
+            .expect("child declaration");
 
-        assert_precondition(
-            writer.declare_path_with_inputs(write, inputs).await,
-            "stale",
+        let mut stale_txn = store
+            .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
+            .await
+            .expect("begin stale transaction");
+        assert_precondition_failed(
+            stale_txn.assert_range_unchanged(range, stale_witness).await,
+            "stale range witness",
         );
     }
 
-    #[test]
-    fn missing_compiled_state_denies_closed() {
-        let required = required_token(7);
+    #[tokio::test]
+    async fn missing_compiled_state_denies_closed() {
+        let writer = writer(storage());
+        let receipt = writer
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
+            .await
+            .expect("declare path");
 
         assert_eq!(
-            PathGovernanceReadiness::DenyClosed(
-                PathGovernanceReadinessReason::MissingCompiledState
-            ),
-            PathGovernanceMetadataWriter::compiled_enforcement_readiness(&required, None)
+            PathGovernanceCompiledStateStatus::DenyClosedMissing {
+                required_sequence: receipt.token().logical_sequence(),
+            },
+            PathGovernanceMetadataWriter::compiled_state_status_for(receipt.token(), None)
         );
     }
 
-    #[test]
-    fn stale_compiled_state_denies_closed() {
-        let required = required_token(7);
-        let compiled =
-            CompiledPathGovernanceMetadataState::new(metadata_scope(), required_token(6));
+    #[tokio::test]
+    async fn stale_compiled_state_denies_closed() {
+        let writer = writer(storage());
+        let receipt = writer
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
+            .await
+            .expect("declare path");
 
         assert_eq!(
-            PathGovernanceReadiness::DenyClosed(
-                PathGovernanceReadinessReason::StaleCompiledState {
-                    required_sequence: 7,
-                    compiled_sequence: 6,
-                }
-            ),
-            PathGovernanceMetadataWriter::compiled_enforcement_readiness(
-                &required,
-                Some(&compiled)
-            )
+            PathGovernanceCompiledStateStatus::DenyClosedStale {
+                required_sequence: receipt.token().logical_sequence(),
+                compiled_sequence: 0,
+            },
+            PathGovernanceMetadataWriter::compiled_state_status_for(receipt.token(), Some(0))
         );
     }
 
-    #[test]
-    fn scope_mismatched_compiled_state_denies_closed() {
-        let required = required_token(7);
-        let other_scope =
-            StateScope::new("tenant", "other-workspace", PATH_GOVERNANCE_METADATA_DOMAIN);
-        let compiled = CompiledPathGovernanceMetadataState::new(
-            other_scope.clone(),
-            StateToken::for_test(other_scope, 7, "manifest-7"),
-        );
-
-        assert_eq!(
-            PathGovernanceReadiness::DenyClosed(PathGovernanceReadinessReason::ScopeMismatch),
-            PathGovernanceMetadataWriter::compiled_enforcement_readiness(
-                &required,
-                Some(&compiled)
-            )
-        );
-    }
-
-    #[test]
-    fn projection_lag_does_not_affect_enforcement_readiness() {
-        let required = required_token(7);
-        let compiled = CompiledPathGovernanceMetadataState::new(metadata_scope(), required.clone());
+    #[tokio::test]
+    async fn projection_lag_does_not_affect_compiled_state_gate() {
+        let writer = writer(storage());
+        let receipt = writer
+            .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
+            .await
+            .expect("declare path");
 
         assert_eq!(
             PathGovernanceProjectionLag {
-                committed_sequence: 7,
-                latest_projected_sequence: Some(2),
-                pending_sequences: Some(5),
+                committed_sequence: receipt.token().logical_sequence(),
+                latest_projected_sequence: Some(0),
+                pending_sequences: Some(receipt.token().logical_sequence()),
             },
-            PathGovernanceMetadataWriter::projection_lag_for(&required, Some(2))
+            PathGovernanceMetadataWriter::projection_lag_for(receipt.token(), Some(0))
         );
         assert_eq!(
-            PathGovernanceReadiness::Ready {
-                required_sequence: 7,
-                compiled_sequence: 7,
+            PathGovernanceCompiledStateStatus::Ready {
+                required_sequence: receipt.token().logical_sequence(),
+                compiled_sequence: receipt.token().logical_sequence(),
             },
-            PathGovernanceMetadataWriter::compiled_enforcement_readiness(
-                &required,
-                Some(&compiled)
+            PathGovernanceMetadataWriter::compiled_state_status_for(
+                receipt.token(),
+                Some(receipt.token().logical_sequence())
             )
         );
     }
 
-    #[tokio::test]
-    async fn credential_vending_does_not_read_path_governance_metadata() -> Result<()> {
-        let writer = writer(storage());
-        writer
-            .declare_path(declaration("orders", "gs://bucket/warehouse/orders"))
-            .await
-            .expect("declare metadata-only path");
-
-        let engine = CredentialVendingEngine::default();
-        let decision = engine.decide_path(
-            &StorageGovernanceState::default(),
-            &CredentialVendingRequest {
-                principal_id: "user_alice".to_string(),
-                groups_snapshot_version: "groups-rev-1".to_string(),
-                workspace_id: "workspace".to_string(),
-                request_id: "request-no-vending-authority".to_string(),
-                operation: CredentialOperation::Read,
-                requested_path: "gs://bucket/warehouse/orders/day=1/".to_string(),
-                requested_ttl: Duration::from_secs(300),
-                client_kind: "uc".to_string(),
-                catalog_snapshot_version: "event_001".to_string(),
-                authorization: Some(CredentialVendingAuthorization {
-                    principal_id: "user_alice".to_string(),
-                    object_id: "orders".to_string(),
-                    object_type: "EXTERNAL_LOCATION".to_string(),
-                    privilege: Privilege::ReadFiles,
-                    permission_ledger_watermark: "event_001".to_string(),
-                    path_authority_object_id: "orders".to_string(),
-                    path_authority_object_type: "EXTERNAL_LOCATION".to_string(),
-                }),
-            },
-        )?;
-
-        assert_eq!(CredentialDecision::Deny, decision.decision);
-        assert_eq!("path_not_governed", decision.reason_code);
-        Ok(())
-    }
-
     #[test]
-    fn unsupported_domains_reject_phase6a_writes() {
+    fn unsupported_domains_reject_phase6a_metadata_writes() {
         for domain in [
             "catalog",
             "grants",
-            "credential-vending",
-            "storage-credentials",
-            "external-locations",
-            "managed-roots",
+            "storage-governance",
             "projection-outbox-acks",
+            "credential-vending",
         ] {
-            assert_validation(
-                PathGovernanceMetadataWriter::new(storage(), other_scope(domain)),
-                PATH_GOVERNANCE_METADATA_DOMAIN,
+            let unsupported_scope = StateScope::new("tenant", "workspace", domain);
+
+            let error = match PathGovernanceMetadataWriter::new(storage(), unsupported_scope) {
+                Err(error) => error,
+                Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
+            };
+
+            assert!(
+                matches!(error, CatalogError::Validation { .. }),
+                "unexpected error for {domain}: {error:?}"
             );
         }
-    }
-
-    fn required_token(logical_sequence: u64) -> StateToken {
-        StateToken::for_test(
-            metadata_scope(),
-            logical_sequence,
-            format!("manifest-{logical_sequence}"),
-        )
     }
 }

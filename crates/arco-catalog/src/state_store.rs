@@ -17,6 +17,7 @@ pub(crate) mod path_governance_metadata;
 pub(crate) mod projection_outbox_acks;
 pub mod promotion_gate;
 pub(crate) mod shadow_replay;
+pub(crate) mod workspace_binding_metadata;
 
 pub use control_mvp::{
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, ControlMvpTxn,

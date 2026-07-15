@@ -102,8 +102,9 @@ Port the existing tests for:
 - non-overlapping sibling paths;
 - same-token companion path-declaration readback;
 - credential-reference readback at the later external-location token;
-- unsupported domain rejection;
-- vending independence and projection-lag diagnostics.
+- unsupported domain rejection and projection-lag diagnostics;
+- the vending boundary remains enforced by module scope and the existing
+  credential-vending integration suite rather than a disconnected unit test.
 
 **Step 2: Add merged-Phase-6A regression tests before reconciliation**
 
@@ -156,6 +157,11 @@ Add external-location records containing:
 - `location_id`, `name`, `canonical_uri`, `credential_id`,
   `path_declaration_id`, `owner`, `lifecycle_state`, `updated_at_ms`, and
   `properties`.
+
+Until a typed compatibility-property allowlist exists, the input interface
+keeps `properties` closed and records persist an empty map. Any future public
+adapter must define an allowlist and add secret-redaction coverage before it
+can populate this field.
 
 Creating an external location must require an existing credential reference
 and atomically stage the location record plus its companion
@@ -230,6 +236,9 @@ Records contain `binding_id`, `workspace_id`, `metastore_id`, `owner`,
 duplicate workspace/metastore pairs, and records whose workspace differs from
 the writer scope. Add token-pinned reads/status, diagnostic projection lag, and
 token-bound compiled-state readiness with scope-mismatch denial.
+
+As with external locations, binding compatibility properties remain empty
+until a typed allowlist and public-surface redaction contract are defined.
 
 **Step 3: Run the combined Phase 6 gate**
 
@@ -307,6 +316,51 @@ git status --short --branch
 Expected: the branch is clean, contains only the six allowed files, and is
 directly based on current `origin/main`.
 
+## Task 5: Close Fresh Review Feedback
+
+**Files:**
+
+- Modify: `crates/arco-catalog/src/state_store.rs`
+- Modify: `crates/arco-catalog/src/state_store/path_governance_metadata.rs`
+- Modify: `crates/arco-catalog/src/state_store/external_location_metadata.rs`
+- Modify: `crates/arco-catalog/src/state_store/workspace_binding_metadata.rs`
+- Modify: this plan
+
+**Step 1: Add red tests for shared token mechanics and durable inputs**
+
+Add one private metadata-readiness module beside `StateToken`. Test missing,
+stale, scope-mismatched, equal, and newer compiled tokens plus projection lag.
+Before implementing input validation, add writer-boundary tests proving that
+blank required fields and negative timestamps are rejected.
+
+**Step 2: Deepen the token-readiness seam**
+
+Move token-unavailable reads, projection-lag calculation, and compiled-token
+comparison behind the shared module. Keep nominal compiled-state wrappers in
+each domain so callers cannot mix path, location, and binding compiled state.
+Remove the per-read `StateToken` clones.
+
+**Step 3: Add deterministic concurrency and atomicity regressions**
+
+Use a test-only backend gate that pauses the first control-pointer CAS. Prove
+that concurrent Phase 6A and external-location writers leave only the winner's
+state visible, that a losing external-location commit exposes neither its
+location nor companion path declaration, and that concurrent duplicate
+workspace/metastore bindings publish exactly one record.
+
+**Step 4: Remove low-value surfaces**
+
+Remove the disconnected vending test, the input-only property builder test,
+and all property builders until a typed allowlist exists. Strengthen the direct
+percent-escaped path assertion, narrow sibling-only path helpers, and replace
+repeated dead-code allowances in the new staged modules with reasoned
+module-level allowances.
+
+**Step 5: Re-run the complete PR-readiness gate**
+
+Run the Task 4 checks, the focused state-store suites, `git diff --check`, and a
+fresh final diff audit before committing the review closure.
+
 ## Exit Gate
 
 - All four Phase 6 metadata areas are covered: path governance,
@@ -322,6 +376,9 @@ directly based on current `origin/main`.
 - Projection lag does not participate in enforcement decisions.
 - Credential records contain no secrets and credential vending ignores the new
   metadata domain.
+- External-location and binding compatibility-property maps remain empty until
+  a typed allowlist exists. Public APIs, projections, logs, and system tables
+  must add explicit secret-redaction coverage before activating those fields.
 - Credential vending authority, grants, catalog DDL, APIs, system tables,
   snapshots, exports, and later roadmap phases remain untouched.
 - Required local checks pass and the branch is clean and PR-ready without any

@@ -4,21 +4,21 @@ use arco_core::ScopedStorage;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, StateScope, StateToken, TxnOptions,
+    validate_metadata_timestamp, validate_required_metadata_field,
 };
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
 use crate::state_store::path_governance_metadata::PATH_GOVERNANCE_METADATA_DOMAIN;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct WorkspaceMetastoreBindingMetadataWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
 
-#[allow(dead_code)]
 impl WorkspaceMetastoreBindingMetadataWriter {
     pub(crate) fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         if scope.domain() != PATH_GOVERNANCE_METADATA_DOMAIN {
@@ -34,6 +34,7 @@ impl WorkspaceMetastoreBindingMetadataWriter {
         &self,
         input: WorkspaceMetastoreBindingMetadataInput,
     ) -> Result<WorkspaceMetastoreBindingMetadataReceipt> {
+        input.validate()?;
         let record = WorkspaceMetastoreBindingMetadataRecord::from(input);
         if record.workspace_id() != self.scope.workspace_id() {
             return Err(validation_failed(
@@ -88,70 +89,27 @@ impl WorkspaceMetastoreBindingMetadataWriter {
         binding_id: &str,
     ) -> Result<WorkspaceMetastoreBindingReadStatus> {
         let key = binding_key(binding_id);
-        let reader = match self.store.read_at(token.clone()).await {
-            Ok(reader) => reader,
-            Err(CatalogError::NotFound { .. }) => {
-                return Ok(WorkspaceMetastoreBindingReadStatus::TokenUnavailable {
-                    manifest_id: token.authority_manifest_id().to_string(),
-                    logical_sequence: token.logical_sequence(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(bytes) = reader.get(&key).await? else {
-            return Ok(WorkspaceMetastoreBindingReadStatus::Available(None));
-        };
-        decode_binding(&bytes)
-            .map(|record| WorkspaceMetastoreBindingReadStatus::Available(Some(record)))
+        metadata_readiness::read_at_status(&self.store, token, &key, decode_binding).await
     }
 
     pub(crate) fn projection_lag_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> WorkspaceMetastoreBindingProjectionLag {
-        let committed_sequence = token.logical_sequence();
-        WorkspaceMetastoreBindingProjectionLag {
-            committed_sequence,
-            latest_projected_sequence,
-            pending_sequences: latest_projected_sequence
-                .map(|projected| committed_sequence.saturating_sub(projected)),
-        }
+        metadata_readiness::projection_lag_for(token, latest_projected_sequence)
     }
 
     pub(crate) fn compiled_state_status_for(
         token: &StateToken,
         compiled: Option<&CompiledWorkspaceMetastoreBindingMetadataState>,
     ) -> WorkspaceMetastoreBindingCompiledStateStatus {
-        let required_sequence = token.logical_sequence();
-        let Some(compiled) = compiled else {
-            return WorkspaceMetastoreBindingCompiledStateStatus::DenyClosedMissing {
-                required_sequence,
-            };
-        };
-        if compiled.source_token().scope() != token.scope() {
-            return WorkspaceMetastoreBindingCompiledStateStatus::DenyClosedScopeMismatch {
-                required_scope: token.scope().clone(),
-                compiled_scope: compiled.source_token().scope().clone(),
-            };
-        }
-
-        let compiled_sequence = compiled.source_token().logical_sequence();
-        match compiled_sequence {
-            compiled_sequence if compiled_sequence < required_sequence => {
-                WorkspaceMetastoreBindingCompiledStateStatus::DenyClosedStale {
-                    required_sequence,
-                    compiled_sequence,
-                }
-            }
-            compiled_sequence => WorkspaceMetastoreBindingCompiledStateStatus::Ready {
-                required_sequence,
-                compiled_sequence,
-            },
-        }
+        metadata_readiness::compiled_state_status_for(
+            token,
+            compiled.map(CompiledWorkspaceMetastoreBindingMetadataState::source_token),
+        )
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceMetastoreBindingMetadataInput {
     binding_id: String,
@@ -160,10 +118,8 @@ pub struct WorkspaceMetastoreBindingMetadataInput {
     owner: String,
     lifecycle_state: LifecycleState,
     updated_at_ms: i64,
-    properties: BTreeMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl WorkspaceMetastoreBindingMetadataInput {
     #[must_use]
     pub(crate) fn active(
@@ -180,38 +136,18 @@ impl WorkspaceMetastoreBindingMetadataInput {
             owner: owner.into(),
             lifecycle_state: LifecycleState::Active,
             updated_at_ms,
-            properties: BTreeMap::new(),
         }
     }
 
-    #[must_use]
-    pub(crate) fn with_property(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.properties.insert(key.into(), value.into());
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_properties(mut self, properties: BTreeMap<String, String>) -> Self {
-        self.properties.extend(properties);
-        self
-    }
-
-    #[must_use]
-    pub(crate) const fn lifecycle_state(&self) -> LifecycleState {
-        self.lifecycle_state
-    }
-
-    #[must_use]
-    pub(crate) const fn properties(&self) -> &BTreeMap<String, String> {
-        &self.properties
+    fn validate(&self) -> Result<()> {
+        validate_required_metadata_field(&self.binding_id, "binding_id")?;
+        validate_required_metadata_field(&self.workspace_id, "workspace_id")?;
+        validate_required_metadata_field(&self.metastore_id, "metastore_id")?;
+        validate_required_metadata_field(&self.owner, "owner")?;
+        validate_metadata_timestamp(self.updated_at_ms)
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceMetastoreBindingMetadataRecord {
     binding_id: String,
@@ -223,7 +159,6 @@ pub struct WorkspaceMetastoreBindingMetadataRecord {
     properties: BTreeMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl WorkspaceMetastoreBindingMetadataRecord {
     #[must_use]
     pub(crate) fn binding_id(&self) -> &str {
@@ -254,11 +189,6 @@ impl WorkspaceMetastoreBindingMetadataRecord {
     pub(crate) const fn updated_at_ms(&self) -> i64 {
         self.updated_at_ms
     }
-
-    #[must_use]
-    pub(crate) const fn properties(&self) -> &BTreeMap<String, String> {
-        &self.properties
-    }
 }
 
 impl From<WorkspaceMetastoreBindingMetadataInput> for WorkspaceMetastoreBindingMetadataRecord {
@@ -270,19 +200,17 @@ impl From<WorkspaceMetastoreBindingMetadataInput> for WorkspaceMetastoreBindingM
             owner: value.owner,
             lifecycle_state: value.lifecycle_state,
             updated_at_ms: value.updated_at_ms,
-            properties: value.properties,
+            properties: BTreeMap::new(),
         }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceMetastoreBindingMetadataReceipt {
     token: StateToken,
     record: WorkspaceMetastoreBindingMetadataRecord,
 }
 
-#[allow(dead_code)]
 impl WorkspaceMetastoreBindingMetadataReceipt {
     #[must_use]
     pub(crate) const fn token(&self) -> &StateToken {
@@ -295,31 +223,16 @@ impl WorkspaceMetastoreBindingMetadataReceipt {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceMetastoreBindingReadStatus {
-    Available(Option<WorkspaceMetastoreBindingMetadataRecord>),
-    TokenUnavailable {
-        manifest_id: String,
-        logical_sequence: u64,
-    },
-}
+pub type WorkspaceMetastoreBindingReadStatus =
+    TokenPinnedReadStatus<WorkspaceMetastoreBindingMetadataRecord>;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceMetastoreBindingProjectionLag {
-    committed_sequence: u64,
-    latest_projected_sequence: Option<u64>,
-    pending_sequences: Option<u64>,
-}
+pub type WorkspaceMetastoreBindingProjectionLag = ProjectionLag;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledWorkspaceMetastoreBindingMetadataState {
     source_token: StateToken,
 }
 
-#[allow(dead_code)]
 impl CompiledWorkspaceMetastoreBindingMetadataState {
     #[must_use]
     pub(crate) const fn new(source_token: StateToken) -> Self {
@@ -332,25 +245,7 @@ impl CompiledWorkspaceMetastoreBindingMetadataState {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceMetastoreBindingCompiledStateStatus {
-    Ready {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedMissing {
-        required_sequence: u64,
-    },
-    DenyClosedStale {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedScopeMismatch {
-        required_scope: StateScope,
-        compiled_scope: StateScope,
-    },
-}
+pub type WorkspaceMetastoreBindingCompiledStateStatus = CompiledStateStatus;
 
 fn binding_key(binding_id: &str) -> Vec<u8> {
     let mut key = b"workspace-binding-metadata/bindings/".to_vec();
@@ -409,15 +304,14 @@ fn precondition_failed(message: impl Into<String>) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use arco_core::{MemoryBackend, ScopedStorage};
 
     use super::*;
     use crate::error::CatalogError;
-    use crate::metastore::events::LifecycleState;
     use crate::state_store::path_governance_metadata::PATH_GOVERNANCE_METADATA_DOMAIN;
+    use crate::state_store::test_support::{FirstPointerCasGateBackend, POINTER_CAS_GATE_TIMEOUT};
     use crate::state_store::{ControlMvpPaths, StateScope};
 
     fn metadata_scope() -> StateScope {
@@ -427,6 +321,13 @@ mod tests {
     fn storage() -> ScopedStorage {
         ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
             .expect("scoped storage")
+    }
+
+    fn gated_storage() -> (ScopedStorage, Arc<FirstPointerCasGateBackend>) {
+        let backend = FirstPointerCasGateBackend::new(PATH_GOVERNANCE_METADATA_DOMAIN);
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace")
+            .expect("gated scoped storage");
+        (storage, backend)
     }
 
     fn writer(storage: ScopedStorage) -> WorkspaceMetastoreBindingMetadataWriter {
@@ -445,7 +346,19 @@ mod tests {
             "owner",
             300,
         )
-        .with_property("purpose", "tests")
+    }
+
+    fn assert_validation_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Err(CatalogError::Validation { message }) => assert!(
+                message.contains(expected),
+                "expected validation message containing {expected:?}, got {message:?}"
+            ),
+            Err(error) => {
+                panic!("expected validation failure containing {expected}, got {error:?}")
+            }
+            Ok(_) => panic!("expected validation failure containing {expected}"),
+        }
     }
 
     #[tokio::test]
@@ -466,14 +379,8 @@ mod tests {
         assert_eq!("owner", receipt.record().owner());
         assert_eq!("active", receipt.record().lifecycle_state().as_str());
         assert_eq!(300, receipt.record().updated_at_ms());
-        assert_eq!(
-            Some("tests"),
-            receipt
-                .record()
-                .properties()
-                .get("purpose")
-                .map(String::as_str)
-        );
+        let encoded = serde_json::to_value(receipt.record()).expect("serialize binding record");
+        assert_eq!(Some(&serde_json::json!({})), encoded.get("properties"));
     }
 
     #[tokio::test]
@@ -519,6 +426,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_duplicate_pair_publishes_exactly_one_binding() {
+        let (shared_storage, gate) = gated_storage();
+        let writer = writer(shared_storage);
+
+        gate.arm();
+        let losing_writer = writer.clone();
+        let losing_write = tokio::spawn(async move {
+            losing_writer
+                .bind_workspace(binding_input("binding_01", "metastore_01"))
+                .await
+        });
+        gate.wait_until_blocked().await;
+
+        let winner = writer
+            .bind_workspace(binding_input("binding_02", "metastore_01"))
+            .await
+            .expect("publish duplicate-pair winner");
+        gate.release();
+
+        let losing_result = tokio::time::timeout(POINTER_CAS_GATE_TIMEOUT, losing_write)
+            .await
+            .expect("losing binding write did not finish before timeout")
+            .expect("join losing binding write");
+        assert!(
+            matches!(losing_result, Err(CatalogError::CasFailed { .. })),
+            "duplicate-pair pointer loser must report CAS failure: {losing_result:?}"
+        );
+        assert_eq!(
+            None,
+            writer
+                .read_binding_at(winner.token().clone(), "binding_01")
+                .await
+                .expect("read losing binding")
+        );
+        assert_eq!(
+            Some(winner.record().clone()),
+            writer
+                .read_binding_at(winner.token().clone(), "binding_02")
+                .await
+                .expect("read winning binding")
+        );
+        match writer
+            .bind_workspace(binding_input("binding_03", "metastore_01"))
+            .await
+        {
+            Err(CatalogError::PreconditionFailed { .. }) => {}
+            Err(error) => panic!("expected committed pair precondition, got {error:?}"),
+            Ok(_) => panic!("a third binding for the committed pair must fail"),
+        }
+    }
+
+    #[tokio::test]
     async fn binding_workspace_must_match_scope_workspace() {
         let writer = writer(storage());
 
@@ -538,6 +497,66 @@ mod tests {
             ),
             Err(error) => panic!("expected workspace mismatch validation, got {error:?}"),
             Ok(_) => panic!("workspace mismatch must fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_binding_rejects_invalid_required_metadata() {
+        let cases = [
+            (
+                "binding_id",
+                WorkspaceMetastoreBindingMetadataInput::active(
+                    " ",
+                    "workspace",
+                    "metastore_01",
+                    "owner",
+                    300,
+                ),
+            ),
+            (
+                "workspace_id",
+                WorkspaceMetastoreBindingMetadataInput::active(
+                    "binding_01",
+                    " ",
+                    "metastore_01",
+                    "owner",
+                    300,
+                ),
+            ),
+            (
+                "metastore_id",
+                WorkspaceMetastoreBindingMetadataInput::active(
+                    "binding_01",
+                    "workspace",
+                    " ",
+                    "owner",
+                    300,
+                ),
+            ),
+            (
+                "owner",
+                WorkspaceMetastoreBindingMetadataInput::active(
+                    "binding_01",
+                    "workspace",
+                    "metastore_01",
+                    " ",
+                    300,
+                ),
+            ),
+            (
+                "updated_at_ms",
+                WorkspaceMetastoreBindingMetadataInput::active(
+                    "binding_01",
+                    "workspace",
+                    "metastore_01",
+                    "owner",
+                    -1,
+                ),
+            ),
+        ];
+
+        for (field, input) in cases {
+            assert_validation_contains(writer(storage()).bind_workspace(input).await, field);
         }
     }
 
@@ -704,37 +723,16 @@ mod tests {
         ] {
             let unsupported_scope = StateScope::new("tenant", "workspace", domain);
 
-            let error =
-                match WorkspaceMetastoreBindingMetadataWriter::new(storage(), unsupported_scope) {
-                    Err(error) => error,
-                    Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
-                };
+            let Err(error) =
+                WorkspaceMetastoreBindingMetadataWriter::new(storage(), unsupported_scope)
+            else {
+                panic!("unsupported scope {domain} must reject writer creation");
+            };
 
             assert!(
                 matches!(error, CatalogError::Validation { .. }),
                 "unexpected error for {domain}: {error:?}"
             );
         }
-    }
-
-    #[test]
-    fn binding_input_properties_are_explicit_metadata() {
-        let input = WorkspaceMetastoreBindingMetadataInput::active(
-            "binding_01",
-            "workspace",
-            "metastore_01",
-            "owner",
-            300,
-        )
-        .with_properties(BTreeMap::from([(
-            "purpose".to_string(),
-            "tests".to_string(),
-        )]));
-
-        assert_eq!(
-            Some("tests"),
-            input.properties().get("purpose").map(String::as_str)
-        );
-        assert_eq!(LifecycleState::Active, input.lifecycle_state());
     }
 }

@@ -2,6 +2,7 @@ use arco_core::ScopedStorage;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange, StateScope,
     StateToken, TxnOptions,
@@ -76,64 +77,24 @@ impl PathGovernanceMetadataWriter {
         declaration_id: &str,
     ) -> Result<PathGovernanceDeclarationReadStatus> {
         let key = declaration_key(declaration_id);
-        let reader = match self.store.read_at(token.clone()).await {
-            Ok(reader) => reader,
-            Err(CatalogError::NotFound { .. }) => {
-                return Ok(PathGovernanceDeclarationReadStatus::TokenUnavailable {
-                    manifest_id: token.authority_manifest_id().to_string(),
-                    logical_sequence: token.logical_sequence(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(bytes) = reader.get(&key).await? else {
-            return Ok(PathGovernanceDeclarationReadStatus::Available(None));
-        };
-        decode_declaration(&bytes)
-            .map(|declaration| PathGovernanceDeclarationReadStatus::Available(Some(declaration)))
+        metadata_readiness::read_at_status(&self.store, token, &key, decode_declaration).await
     }
 
     pub(crate) fn projection_lag_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> PathGovernanceProjectionLag {
-        let committed_sequence = token.logical_sequence();
-        PathGovernanceProjectionLag {
-            committed_sequence,
-            latest_projected_sequence,
-            pending_sequences: latest_projected_sequence
-                .map(|projected| committed_sequence.saturating_sub(projected)),
-        }
+        metadata_readiness::projection_lag_for(token, latest_projected_sequence)
     }
 
     pub(crate) fn compiled_state_status_for(
         token: &StateToken,
         compiled: Option<&CompiledPathGovernanceMetadataState>,
     ) -> PathGovernanceCompiledStateStatus {
-        let required_sequence = token.logical_sequence();
-        let Some(compiled) = compiled else {
-            return PathGovernanceCompiledStateStatus::DenyClosedMissing { required_sequence };
-        };
-        if compiled.source_token().scope() != token.scope() {
-            return PathGovernanceCompiledStateStatus::DenyClosedScopeMismatch {
-                required_scope: token.scope().clone(),
-                compiled_scope: compiled.source_token().scope().clone(),
-            };
-        }
-
-        let compiled_sequence = compiled.source_token().logical_sequence();
-        match compiled_sequence {
-            compiled_sequence if compiled_sequence < required_sequence => {
-                PathGovernanceCompiledStateStatus::DenyClosedStale {
-                    required_sequence,
-                    compiled_sequence,
-                }
-            }
-            compiled_sequence => PathGovernanceCompiledStateStatus::Ready {
-                required_sequence,
-                compiled_sequence,
-            },
-        }
+        metadata_readiness::compiled_state_status_for(
+            token,
+            compiled.map(CompiledPathGovernanceMetadataState::source_token),
+        )
     }
 
     async fn has_path_conflict(&self, declaration: &PathGovernanceDeclaration) -> Result<bool> {
@@ -284,23 +245,9 @@ impl PathGovernanceMetadataReceipt {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathGovernanceDeclarationReadStatus {
-    Available(Option<PathGovernanceDeclaration>),
-    TokenUnavailable {
-        manifest_id: String,
-        logical_sequence: u64,
-    },
-}
+pub type PathGovernanceDeclarationReadStatus = TokenPinnedReadStatus<PathGovernanceDeclaration>;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathGovernanceProjectionLag {
-    committed_sequence: u64,
-    latest_projected_sequence: Option<u64>,
-    pending_sequences: Option<u64>,
-}
+pub type PathGovernanceProjectionLag = ProjectionLag;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,25 +268,7 @@ impl CompiledPathGovernanceMetadataState {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathGovernanceCompiledStateStatus {
-    Ready {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedMissing {
-        required_sequence: u64,
-    },
-    DenyClosedStale {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedScopeMismatch {
-        required_scope: StateScope,
-        compiled_scope: StateScope,
-    },
-}
+pub type PathGovernanceCompiledStateStatus = CompiledStateStatus;
 
 struct MetadataKeys {
     record_key: Vec<u8>,
@@ -376,7 +305,7 @@ impl MetadataKeys {
     }
 }
 
-pub async fn stage_path_governance_declaration(
+pub(super) async fn stage_path_governance_declaration(
     txn: &mut ControlMvpTxn,
     expected_scope: &StateScope,
     declaration: &PathGovernanceDeclaration,
@@ -435,7 +364,7 @@ pub async fn stage_path_governance_declaration(
     .await
 }
 
-pub async fn path_governance_declaration_conflicts(
+pub(super) async fn path_governance_declaration_conflicts(
     store: &ControlMvpStateStore,
     expected_scope: &StateScope,
     declaration: &PathGovernanceDeclaration,
@@ -818,6 +747,10 @@ mod tests {
             .expect("declare percent-bearing canonical path");
 
         assert_eq!("decl_percent", receipt.declaration().declaration_id());
+        assert_eq!(
+            "gs://bucket/warehouse/100%-complete/",
+            receipt.declaration().canonical_uri()
+        );
     }
 
     #[tokio::test]
@@ -1047,9 +980,8 @@ mod tests {
         ] {
             let unsupported_scope = StateScope::new("tenant", "workspace", domain);
 
-            let error = match PathGovernanceMetadataWriter::new(storage(), unsupported_scope) {
-                Err(error) => error,
-                Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
+            let Err(error) = PathGovernanceMetadataWriter::new(storage(), unsupported_scope) else {
+                panic!("unsupported scope {domain} must reject writer creation");
             };
 
             assert!(

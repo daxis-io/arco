@@ -4,8 +4,10 @@ use arco_core::ScopedStorage;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, StateScope, StateToken, TxnOptions,
+    validate_metadata_timestamp, validate_required_metadata_field,
 };
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
@@ -15,14 +17,12 @@ use crate::state_store::path_governance_metadata::{
 };
 use crate::storage_governance::path_normalization::GovernedPath;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ExternalLocationMetadataWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
 
-#[allow(dead_code)]
 impl ExternalLocationMetadataWriter {
     pub(crate) fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         if scope.domain() != PATH_GOVERNANCE_METADATA_DOMAIN {
@@ -38,6 +38,7 @@ impl ExternalLocationMetadataWriter {
         &self,
         input: CredentialReferenceMetadataInput,
     ) -> Result<CredentialReferenceMetadataReceipt> {
+        input.validate()?;
         let record = CredentialReferenceMetadataRecord::from(input);
         let key = credential_reference_key(record.credential_id());
         let mut txn = self
@@ -60,6 +61,7 @@ impl ExternalLocationMetadataWriter {
         &self,
         input: ExternalLocationMetadataInput,
     ) -> Result<ExternalLocationMetadataReceipt> {
+        input.validate()?;
         let governed_path = GovernedPath::parse(&input.raw_uri)?;
         let record =
             ExternalLocationMetadataRecord::from_input(input, governed_path.canonical_uri());
@@ -144,21 +146,8 @@ impl ExternalLocationMetadataWriter {
         credential_id: &str,
     ) -> Result<CredentialReferenceMetadataReadStatus> {
         let key = credential_reference_key(credential_id);
-        let reader = match self.store.read_at(token.clone()).await {
-            Ok(reader) => reader,
-            Err(CatalogError::NotFound { .. }) => {
-                return Ok(CredentialReferenceMetadataReadStatus::TokenUnavailable {
-                    manifest_id: token.authority_manifest_id().to_string(),
-                    logical_sequence: token.logical_sequence(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(bytes) = reader.get(&key).await? else {
-            return Ok(CredentialReferenceMetadataReadStatus::Available(None));
-        };
-        decode_credential_reference(&bytes)
-            .map(|record| CredentialReferenceMetadataReadStatus::Available(Some(record)))
+        metadata_readiness::read_at_status(&self.store, token, &key, decode_credential_reference)
+            .await
     }
 
     pub(crate) async fn read_external_location_at(
@@ -180,68 +169,27 @@ impl ExternalLocationMetadataWriter {
         location_id: &str,
     ) -> Result<ExternalLocationMetadataReadStatus> {
         let key = external_location_key(location_id);
-        let reader = match self.store.read_at(token.clone()).await {
-            Ok(reader) => reader,
-            Err(CatalogError::NotFound { .. }) => {
-                return Ok(ExternalLocationMetadataReadStatus::TokenUnavailable {
-                    manifest_id: token.authority_manifest_id().to_string(),
-                    logical_sequence: token.logical_sequence(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(bytes) = reader.get(&key).await? else {
-            return Ok(ExternalLocationMetadataReadStatus::Available(None));
-        };
-        decode_external_location(&bytes)
-            .map(|record| ExternalLocationMetadataReadStatus::Available(Some(record)))
+        metadata_readiness::read_at_status(&self.store, token, &key, decode_external_location).await
     }
 
     pub(crate) fn projection_lag_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> ExternalLocationProjectionLag {
-        let committed_sequence = token.logical_sequence();
-        ExternalLocationProjectionLag {
-            committed_sequence,
-            latest_projected_sequence,
-            pending_sequences: latest_projected_sequence
-                .map(|projected| committed_sequence.saturating_sub(projected)),
-        }
+        metadata_readiness::projection_lag_for(token, latest_projected_sequence)
     }
 
     pub(crate) fn compiled_state_status_for(
         token: &StateToken,
         compiled: Option<&CompiledExternalLocationMetadataState>,
     ) -> ExternalLocationCompiledStateStatus {
-        let required_sequence = token.logical_sequence();
-        let Some(compiled) = compiled else {
-            return ExternalLocationCompiledStateStatus::DenyClosedMissing { required_sequence };
-        };
-        if compiled.source_token().scope() != token.scope() {
-            return ExternalLocationCompiledStateStatus::DenyClosedScopeMismatch {
-                required_scope: token.scope().clone(),
-                compiled_scope: compiled.source_token().scope().clone(),
-            };
-        }
-
-        let compiled_sequence = compiled.source_token().logical_sequence();
-        match compiled_sequence {
-            compiled_sequence if compiled_sequence < required_sequence => {
-                ExternalLocationCompiledStateStatus::DenyClosedStale {
-                    required_sequence,
-                    compiled_sequence,
-                }
-            }
-            compiled_sequence => ExternalLocationCompiledStateStatus::Ready {
-                required_sequence,
-                compiled_sequence,
-            },
-        }
+        metadata_readiness::compiled_state_status_for(
+            token,
+            compiled.map(CompiledExternalLocationMetadataState::source_token),
+        )
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialReferenceMetadataInput {
     credential_id: String,
@@ -252,7 +200,6 @@ pub struct CredentialReferenceMetadataInput {
     updated_at_ms: i64,
 }
 
-#[allow(dead_code)]
 impl CredentialReferenceMetadataInput {
     #[must_use]
     pub(crate) fn active(
@@ -271,9 +218,16 @@ impl CredentialReferenceMetadataInput {
             updated_at_ms,
         }
     }
+
+    fn validate(&self) -> Result<()> {
+        validate_required_metadata_field(&self.credential_id, "credential_id")?;
+        validate_required_metadata_field(&self.name, "name")?;
+        validate_required_metadata_field(&self.cloud, "cloud")?;
+        validate_required_metadata_field(&self.owner, "owner")?;
+        validate_metadata_timestamp(self.updated_at_ms)
+    }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CredentialReferenceMetadataRecord {
     credential_id: String,
@@ -284,7 +238,6 @@ pub struct CredentialReferenceMetadataRecord {
     updated_at_ms: i64,
 }
 
-#[allow(dead_code)]
 impl CredentialReferenceMetadataRecord {
     #[must_use]
     pub(crate) fn credential_id(&self) -> &str {
@@ -330,7 +283,6 @@ impl From<CredentialReferenceMetadataInput> for CredentialReferenceMetadataRecor
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLocationMetadataInput {
     location_id: String,
@@ -340,10 +292,8 @@ pub struct ExternalLocationMetadataInput {
     owner: String,
     lifecycle_state: LifecycleState,
     updated_at_ms: i64,
-    properties: BTreeMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl ExternalLocationMetadataInput {
     #[must_use]
     pub(crate) fn active(
@@ -362,28 +312,18 @@ impl ExternalLocationMetadataInput {
             owner: owner.into(),
             lifecycle_state: LifecycleState::Active,
             updated_at_ms,
-            properties: BTreeMap::new(),
         }
     }
 
-    #[must_use]
-    pub(crate) fn with_property(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<String>,
-    ) -> Self {
-        self.properties.insert(key.into(), value.into());
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_properties(mut self, properties: BTreeMap<String, String>) -> Self {
-        self.properties.extend(properties);
-        self
+    fn validate(&self) -> Result<()> {
+        validate_required_metadata_field(&self.location_id, "location_id")?;
+        validate_required_metadata_field(&self.name, "name")?;
+        validate_required_metadata_field(&self.credential_id, "credential_id")?;
+        validate_required_metadata_field(&self.owner, "owner")?;
+        validate_metadata_timestamp(self.updated_at_ms)
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalLocationMetadataRecord {
     location_id: String,
@@ -397,7 +337,6 @@ pub struct ExternalLocationMetadataRecord {
     properties: BTreeMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl ExternalLocationMetadataRecord {
     fn from_input(value: ExternalLocationMetadataInput, canonical_uri: String) -> Self {
         let path_declaration_id = format!("external-location/{}", value.location_id);
@@ -410,7 +349,7 @@ impl ExternalLocationMetadataRecord {
             owner: value.owner,
             lifecycle_state: value.lifecycle_state,
             updated_at_ms: value.updated_at_ms,
-            properties: value.properties,
+            properties: BTreeMap::new(),
         }
     }
 
@@ -453,21 +392,14 @@ impl ExternalLocationMetadataRecord {
     pub(crate) const fn updated_at_ms(&self) -> i64 {
         self.updated_at_ms
     }
-
-    #[must_use]
-    pub(crate) const fn properties(&self) -> &BTreeMap<String, String> {
-        &self.properties
-    }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialReferenceMetadataReceipt {
     token: StateToken,
     record: CredentialReferenceMetadataRecord,
 }
 
-#[allow(dead_code)]
 impl CredentialReferenceMetadataReceipt {
     #[must_use]
     pub(crate) const fn token(&self) -> &StateToken {
@@ -480,7 +412,6 @@ impl CredentialReferenceMetadataReceipt {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLocationMetadataReceipt {
     token: StateToken,
@@ -488,7 +419,6 @@ pub struct ExternalLocationMetadataReceipt {
     path_declaration: PathGovernanceDeclaration,
 }
 
-#[allow(dead_code)]
 impl ExternalLocationMetadataReceipt {
     #[must_use]
     pub(crate) const fn token(&self) -> &StateToken {
@@ -506,41 +436,18 @@ impl ExternalLocationMetadataReceipt {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CredentialReferenceMetadataReadStatus {
-    Available(Option<CredentialReferenceMetadataRecord>),
-    TokenUnavailable {
-        manifest_id: String,
-        logical_sequence: u64,
-    },
-}
+pub type CredentialReferenceMetadataReadStatus =
+    TokenPinnedReadStatus<CredentialReferenceMetadataRecord>;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalLocationMetadataReadStatus {
-    Available(Option<ExternalLocationMetadataRecord>),
-    TokenUnavailable {
-        manifest_id: String,
-        logical_sequence: u64,
-    },
-}
+pub type ExternalLocationMetadataReadStatus = TokenPinnedReadStatus<ExternalLocationMetadataRecord>;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalLocationProjectionLag {
-    committed_sequence: u64,
-    latest_projected_sequence: Option<u64>,
-    pending_sequences: Option<u64>,
-}
+pub type ExternalLocationProjectionLag = ProjectionLag;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledExternalLocationMetadataState {
     source_token: StateToken,
 }
 
-#[allow(dead_code)]
 impl CompiledExternalLocationMetadataState {
     #[must_use]
     pub(crate) const fn new(source_token: StateToken) -> Self {
@@ -553,25 +460,7 @@ impl CompiledExternalLocationMetadataState {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExternalLocationCompiledStateStatus {
-    Ready {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedMissing {
-        required_sequence: u64,
-    },
-    DenyClosedStale {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedScopeMismatch {
-        required_scope: StateScope,
-        compiled_scope: StateScope,
-    },
-}
+pub type ExternalLocationCompiledStateStatus = CompiledStateStatus;
 
 fn credential_reference_key(credential_id: &str) -> Vec<u8> {
     let mut key = b"external-location-metadata/credential-references/".to_vec();
@@ -645,22 +534,16 @@ fn precondition_failed(message: impl Into<String>) -> CatalogError {
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use arco_core::{MemoryBackend, ScopedStorage};
 
     use super::*;
-    use crate::authz::privileges::Privilege;
-    use crate::credential_vending::{
-        CredentialDecision, CredentialOperation, CredentialVendingAuthorization,
-        CredentialVendingEngine, CredentialVendingRequest,
-    };
     use crate::error::{CatalogError, Result};
     use crate::state_store::path_governance_metadata::{
         PATH_GOVERNANCE_METADATA_DOMAIN, PathGovernanceDeclaration, PathGovernanceMetadataWriter,
     };
+    use crate::state_store::test_support::{FirstPointerCasGateBackend, POINTER_CAS_GATE_TIMEOUT};
     use crate::state_store::{ControlMvpPaths, StateScope};
-    use crate::storage_governance::StorageGovernanceState;
 
     fn metadata_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PATH_GOVERNANCE_METADATA_DOMAIN)
@@ -669,6 +552,13 @@ mod tests {
     fn storage() -> ScopedStorage {
         ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
             .expect("scoped storage")
+    }
+
+    fn gated_storage() -> (ScopedStorage, Arc<FirstPointerCasGateBackend>) {
+        let backend = FirstPointerCasGateBackend::new(PATH_GOVERNANCE_METADATA_DOMAIN);
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace")
+            .expect("gated scoped storage");
+        (storage, backend)
     }
 
     fn writer(storage: ScopedStorage) -> ExternalLocationMetadataWriter {
@@ -694,7 +584,6 @@ mod tests {
             "owner",
             200,
         )
-        .with_property("purpose", "tests")
     }
 
     fn phase6a_declaration(id: &str, uri: &str) -> PathGovernanceDeclaration {
@@ -723,6 +612,19 @@ mod tests {
             Err(CatalogError::PreconditionFailed { .. }) => {}
             Err(error) => panic!("expected precondition failure for {context}, got {error:?}"),
             Ok(_) => panic!("expected precondition failure for {context}"),
+        }
+    }
+
+    fn assert_validation_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Err(CatalogError::Validation { message }) => assert!(
+                message.contains(expected),
+                "expected validation message containing {expected:?}, got {message:?}"
+            ),
+            Err(error) => {
+                panic!("expected validation failure containing {expected}, got {error:?}")
+            }
+            Ok(_) => panic!("expected validation failure containing {expected}"),
         }
     }
 
@@ -770,6 +672,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_reference_rejects_invalid_required_metadata() {
+        let cases = [
+            (
+                "credential_id",
+                CredentialReferenceMetadataInput::active(" ", "credential", "gcs", "owner", 100),
+            ),
+            (
+                "name",
+                CredentialReferenceMetadataInput::active("cred_01", " ", "gcs", "owner", 100),
+            ),
+            (
+                "cloud",
+                CredentialReferenceMetadataInput::active(
+                    "cred_01",
+                    "credential",
+                    " ",
+                    "owner",
+                    100,
+                ),
+            ),
+            (
+                "owner",
+                CredentialReferenceMetadataInput::active("cred_01", "credential", "gcs", " ", 100),
+            ),
+            (
+                "updated_at_ms",
+                CredentialReferenceMetadataInput::active(
+                    "cred_01",
+                    "credential",
+                    "gcs",
+                    "owner",
+                    -1,
+                ),
+            ),
+        ];
+
+        for (field, input) in cases {
+            assert_validation_contains(
+                writer(storage()).declare_credential_reference(input).await,
+                field,
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn external_location_create_returns_usable_state_token() {
         let writer = writer(storage());
         declare_credential(&writer).await;
@@ -800,6 +747,9 @@ mod tests {
             "gs://bucket/warehouse/orders/",
             receipt.record().canonical_uri()
         );
+        let encoded =
+            serde_json::to_value(receipt.record()).expect("serialize external location record");
+        assert_eq!(Some(&serde_json::json!({})), encoded.get("properties"));
     }
 
     #[tokio::test]
@@ -991,6 +941,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_exact_path_winner_leaves_losing_external_location_atomic() {
+        let (shared_storage, gate) = gated_storage();
+        let writer = writer(shared_storage.clone());
+        let path_writer = PathGovernanceMetadataWriter::new(shared_storage, metadata_scope())
+            .expect("path writer");
+        declare_credential(&writer).await;
+
+        gate.arm();
+        let losing_writer = writer.clone();
+        let losing_write = tokio::spawn(async move {
+            losing_writer
+                .create_external_location(location_input(
+                    "loc_orders",
+                    "gs://bucket/warehouse/orders",
+                ))
+                .await
+        });
+        gate.wait_until_blocked().await;
+
+        let winner = path_writer
+            .declare_path(phase6a_declaration(
+                "decl_orders",
+                "gs://bucket/warehouse/orders",
+            ))
+            .await
+            .expect("publish exact-path winner");
+        gate.release();
+
+        let losing_result = tokio::time::timeout(POINTER_CAS_GATE_TIMEOUT, losing_write)
+            .await
+            .expect("losing external write did not finish before timeout")
+            .expect("join losing external write");
+        assert_precondition_failed(losing_result, "concurrent exact-path winner");
+        assert_eq!(
+            None,
+            writer
+                .read_external_location_at(winner.token().clone(), "loc_orders")
+                .await
+                .expect("read losing external location")
+        );
+        assert_eq!(
+            None,
+            path_writer
+                .read_declaration_at(winner.token().clone(), "external-location/loc_orders",)
+                .await
+                .expect("read losing companion declaration")
+        );
+        assert_eq!(
+            Some(winner.declaration().clone()),
+            path_writer
+                .read_declaration_at(winner.token().clone(), "decl_orders")
+                .await
+                .expect("read winning declaration")
+        );
+    }
+
+    #[tokio::test]
     async fn external_location_child_path_conflicts_with_phase6a_ancestor_declaration() {
         let shared_storage = storage();
         let path_writer =
@@ -1063,6 +1070,66 @@ mod tests {
 
         assert_eq!(2, orders.token().logical_sequence());
         assert_eq!(3, archive.token().logical_sequence());
+    }
+
+    #[tokio::test]
+    async fn concurrent_non_overlapping_winner_leaves_losing_external_state_absent() {
+        let (shared_storage, gate) = gated_storage();
+        let writer = writer(shared_storage.clone());
+        let path_writer = PathGovernanceMetadataWriter::new(shared_storage, metadata_scope())
+            .expect("path writer");
+        declare_credential(&writer).await;
+
+        gate.arm();
+        let losing_writer = writer.clone();
+        let losing_write = tokio::spawn(async move {
+            losing_writer
+                .create_external_location(location_input(
+                    "loc_orders",
+                    "gs://bucket/warehouse/orders",
+                ))
+                .await
+        });
+        gate.wait_until_blocked().await;
+
+        let winner = path_writer
+            .declare_path(phase6a_declaration(
+                "decl_customers",
+                "gs://bucket/warehouse/customers",
+            ))
+            .await
+            .expect("publish non-overlapping winner");
+        gate.release();
+
+        let losing_result = tokio::time::timeout(POINTER_CAS_GATE_TIMEOUT, losing_write)
+            .await
+            .expect("losing external write did not finish before timeout")
+            .expect("join losing external write");
+        assert!(
+            matches!(losing_result, Err(CatalogError::CasFailed { .. })),
+            "non-overlapping pointer loser must report CAS failure: {losing_result:?}"
+        );
+        assert_eq!(
+            None,
+            writer
+                .read_external_location_at(winner.token().clone(), "loc_orders")
+                .await
+                .expect("read losing external location")
+        );
+        assert_eq!(
+            None,
+            path_writer
+                .read_declaration_at(winner.token().clone(), "external-location/loc_orders",)
+                .await
+                .expect("read losing companion declaration")
+        );
+        assert_eq!(
+            Some(winner.declaration().clone()),
+            path_writer
+                .read_declaration_at(winner.token().clone(), "decl_customers")
+                .await
+                .expect("read winning declaration")
+        );
     }
 
     #[tokio::test]
@@ -1146,45 +1213,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn credential_vending_ignores_phase6b_metadata() {
-        let writer = writer(storage());
-        declare_credential(&writer).await;
-        writer
-            .create_external_location(location_input("loc_orders", "gs://bucket/warehouse/orders"))
-            .await
-            .expect("create external location metadata");
-
-        let decision = CredentialVendingEngine::default()
-            .decide_path(
-                &StorageGovernanceState::default(),
-                &CredentialVendingRequest {
-                    principal_id: "principal".to_string(),
-                    groups_snapshot_version: "groups-1".to_string(),
-                    workspace_id: "workspace".to_string(),
-                    request_id: "request-1".to_string(),
-                    operation: CredentialOperation::Read,
-                    requested_path: "gs://bucket/warehouse/orders/part-1.parquet".to_string(),
-                    requested_ttl: Duration::from_secs(300),
-                    client_kind: "uc".to_string(),
-                    catalog_snapshot_version: "watermark-1".to_string(),
-                    authorization: Some(CredentialVendingAuthorization {
-                        principal_id: "principal".to_string(),
-                        object_id: "loc_orders".to_string(),
-                        object_type: "EXTERNAL_LOCATION".to_string(),
-                        privilege: Privilege::ReadFiles,
-                        permission_ledger_watermark: "watermark-1".to_string(),
-                        path_authority_object_id: "loc_orders".to_string(),
-                        path_authority_object_type: "EXTERNAL_LOCATION".to_string(),
-                    }),
-                },
-            )
-            .expect("credential vending decision");
-
-        assert_eq!(CredentialDecision::Deny, decision.decision);
-        assert_eq!("path_not_governed", decision.reason_code);
-    }
-
     #[test]
     fn unsupported_domains_reject_phase6b_metadata_writes() {
         for domain in [
@@ -1196,9 +1224,9 @@ mod tests {
         ] {
             let unsupported_scope = StateScope::new("tenant", "workspace", domain);
 
-            let error = match ExternalLocationMetadataWriter::new(storage(), unsupported_scope) {
-                Err(error) => error,
-                Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
+            let Err(error) = ExternalLocationMetadataWriter::new(storage(), unsupported_scope)
+            else {
+                panic!("unsupported scope {domain} must reject writer creation");
             };
 
             assert!(
@@ -1222,6 +1250,73 @@ mod tests {
             }
             Err(error) => panic!("expected missing credential reference, got {error:?}"),
             Ok(_) => panic!("external location without credential reference must fail"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_location_rejects_invalid_required_metadata() {
+        let cases = [
+            (
+                "location_id",
+                ExternalLocationMetadataInput::active(
+                    " ",
+                    "location",
+                    "gs://bucket/warehouse/orders",
+                    "cred_01",
+                    "owner",
+                    200,
+                ),
+            ),
+            (
+                "name",
+                ExternalLocationMetadataInput::active(
+                    "loc_orders",
+                    " ",
+                    "gs://bucket/warehouse/orders",
+                    "cred_01",
+                    "owner",
+                    200,
+                ),
+            ),
+            (
+                "credential_id",
+                ExternalLocationMetadataInput::active(
+                    "loc_orders",
+                    "location",
+                    "gs://bucket/warehouse/orders",
+                    " ",
+                    "owner",
+                    200,
+                ),
+            ),
+            (
+                "owner",
+                ExternalLocationMetadataInput::active(
+                    "loc_orders",
+                    "location",
+                    "gs://bucket/warehouse/orders",
+                    "cred_01",
+                    " ",
+                    200,
+                ),
+            ),
+            (
+                "updated_at_ms",
+                ExternalLocationMetadataInput::active(
+                    "loc_orders",
+                    "location",
+                    "gs://bucket/warehouse/orders",
+                    "cred_01",
+                    "owner",
+                    -1,
+                ),
+            ),
+        ];
+
+        for (field, input) in cases {
+            let writer = writer(storage());
+            declare_credential(&writer).await;
+            assert_validation_contains(writer.create_external_location(input).await, field);
         }
     }
 

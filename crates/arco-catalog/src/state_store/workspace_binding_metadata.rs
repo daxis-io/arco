@@ -13,7 +13,7 @@ use crate::state_store::path_governance_metadata::PATH_GOVERNANCE_METADATA_DOMAI
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct WorkspaceMetastoreBindingMetadataWriter {
+pub struct WorkspaceMetastoreBindingMetadataWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
@@ -153,7 +153,7 @@ impl WorkspaceMetastoreBindingMetadataWriter {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceMetastoreBindingMetadataInput {
+pub struct WorkspaceMetastoreBindingMetadataInput {
     binding_id: String,
     workspace_id: String,
     metastore_id: String,
@@ -213,7 +213,7 @@ impl WorkspaceMetastoreBindingMetadataInput {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WorkspaceMetastoreBindingMetadataRecord {
+pub struct WorkspaceMetastoreBindingMetadataRecord {
     binding_id: String,
     workspace_id: String,
     metastore_id: String,
@@ -277,7 +277,7 @@ impl From<WorkspaceMetastoreBindingMetadataInput> for WorkspaceMetastoreBindingM
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceMetastoreBindingMetadataReceipt {
+pub struct WorkspaceMetastoreBindingMetadataReceipt {
     token: StateToken,
     record: WorkspaceMetastoreBindingMetadataRecord,
 }
@@ -297,7 +297,7 @@ impl WorkspaceMetastoreBindingMetadataReceipt {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WorkspaceMetastoreBindingReadStatus {
+pub enum WorkspaceMetastoreBindingReadStatus {
     Available(Option<WorkspaceMetastoreBindingMetadataRecord>),
     TokenUnavailable {
         manifest_id: String,
@@ -307,7 +307,7 @@ pub(crate) enum WorkspaceMetastoreBindingReadStatus {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WorkspaceMetastoreBindingProjectionLag {
+pub struct WorkspaceMetastoreBindingProjectionLag {
     committed_sequence: u64,
     latest_projected_sequence: Option<u64>,
     pending_sequences: Option<u64>,
@@ -315,7 +315,7 @@ pub(crate) struct WorkspaceMetastoreBindingProjectionLag {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledWorkspaceMetastoreBindingMetadataState {
+pub struct CompiledWorkspaceMetastoreBindingMetadataState {
     source_token: StateToken,
 }
 
@@ -334,7 +334,7 @@ impl CompiledWorkspaceMetastoreBindingMetadataState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WorkspaceMetastoreBindingCompiledStateStatus {
+pub enum WorkspaceMetastoreBindingCompiledStateStatus {
     Ready {
         required_sequence: u64,
         compiled_sequence: u64,

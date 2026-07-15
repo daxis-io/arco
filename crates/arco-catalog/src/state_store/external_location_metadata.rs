@@ -17,7 +17,7 @@ use crate::storage_governance::path_normalization::GovernedPath;
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct ExternalLocationMetadataWriter {
+pub struct ExternalLocationMetadataWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
@@ -243,7 +243,7 @@ impl ExternalLocationMetadataWriter {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CredentialReferenceMetadataInput {
+pub struct CredentialReferenceMetadataInput {
     credential_id: String,
     name: String,
     cloud: String,
@@ -275,7 +275,7 @@ impl CredentialReferenceMetadataInput {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CredentialReferenceMetadataRecord {
+pub struct CredentialReferenceMetadataRecord {
     credential_id: String,
     name: String,
     cloud: String,
@@ -332,7 +332,7 @@ impl From<CredentialReferenceMetadataInput> for CredentialReferenceMetadataRecor
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternalLocationMetadataInput {
+pub struct ExternalLocationMetadataInput {
     location_id: String,
     name: String,
     raw_uri: String,
@@ -385,7 +385,7 @@ impl ExternalLocationMetadataInput {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ExternalLocationMetadataRecord {
+pub struct ExternalLocationMetadataRecord {
     location_id: String,
     name: String,
     canonical_uri: String,
@@ -462,7 +462,7 @@ impl ExternalLocationMetadataRecord {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CredentialReferenceMetadataReceipt {
+pub struct CredentialReferenceMetadataReceipt {
     token: StateToken,
     record: CredentialReferenceMetadataRecord,
 }
@@ -482,7 +482,7 @@ impl CredentialReferenceMetadataReceipt {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternalLocationMetadataReceipt {
+pub struct ExternalLocationMetadataReceipt {
     token: StateToken,
     record: ExternalLocationMetadataRecord,
     path_declaration: PathGovernanceDeclaration,
@@ -508,7 +508,7 @@ impl ExternalLocationMetadataReceipt {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CredentialReferenceMetadataReadStatus {
+pub enum CredentialReferenceMetadataReadStatus {
     Available(Option<CredentialReferenceMetadataRecord>),
     TokenUnavailable {
         manifest_id: String,
@@ -518,7 +518,7 @@ pub(crate) enum CredentialReferenceMetadataReadStatus {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExternalLocationMetadataReadStatus {
+pub enum ExternalLocationMetadataReadStatus {
     Available(Option<ExternalLocationMetadataRecord>),
     TokenUnavailable {
         manifest_id: String,
@@ -528,7 +528,7 @@ pub(crate) enum ExternalLocationMetadataReadStatus {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExternalLocationProjectionLag {
+pub struct ExternalLocationProjectionLag {
     committed_sequence: u64,
     latest_projected_sequence: Option<u64>,
     pending_sequences: Option<u64>,
@@ -536,7 +536,7 @@ pub(crate) struct ExternalLocationProjectionLag {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompiledExternalLocationMetadataState {
+pub struct CompiledExternalLocationMetadataState {
     source_token: StateToken,
 }
 
@@ -555,7 +555,7 @@ impl CompiledExternalLocationMetadataState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExternalLocationCompiledStateStatus {
+pub enum ExternalLocationCompiledStateStatus {
     Ready {
         required_sequence: u64,
         compiled_sequence: u64,

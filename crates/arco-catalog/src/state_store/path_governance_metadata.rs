@@ -376,7 +376,7 @@ impl MetadataKeys {
     }
 }
 
-pub(crate) async fn stage_path_governance_declaration(
+pub async fn stage_path_governance_declaration(
     txn: &mut ControlMvpTxn,
     expected_scope: &StateScope,
     declaration: &PathGovernanceDeclaration,
@@ -435,7 +435,7 @@ pub(crate) async fn stage_path_governance_declaration(
     .await
 }
 
-pub(crate) async fn path_governance_declaration_conflicts(
+pub async fn path_governance_declaration_conflicts(
     store: &ControlMvpStateStore,
     expected_scope: &StateScope,
     declaration: &PathGovernanceDeclaration,

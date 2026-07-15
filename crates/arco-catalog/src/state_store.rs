@@ -11,6 +11,7 @@ use crate::error::{CatalogError, Result};
 
 pub(crate) mod comparison_reads;
 pub mod control_mvp;
+pub(crate) mod external_location_metadata;
 pub mod model;
 pub(crate) mod path_governance_metadata;
 pub(crate) mod projection_outbox_acks;

@@ -11,16 +11,44 @@ use crate::error::{CatalogError, Result};
 
 pub(crate) mod comparison_reads;
 pub mod control_mvp;
+#[allow(
+    dead_code,
+    reason = "Phase 6 metadata stays crate-internal until its public activation gate"
+)]
+pub(crate) mod external_location_metadata;
 pub mod model;
 pub(crate) mod path_governance_metadata;
 pub(crate) mod projection_outbox_acks;
 pub mod promotion_gate;
 pub(crate) mod shadow_replay;
+#[allow(
+    dead_code,
+    reason = "Phase 6 metadata stays crate-internal until its public activation gate"
+)]
+pub(crate) mod workspace_binding_metadata;
 
 pub use control_mvp::{
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, ControlMvpTxn,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
+
+fn validate_required_metadata_field(value: &str, field: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(CatalogError::Validation {
+            message: format!("{field} must not be blank"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_metadata_timestamp(updated_at_ms: i64) -> Result<()> {
+    if updated_at_ms < 0 {
+        return Err(CatalogError::Validation {
+            message: "updated_at_ms must not be negative".to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Opaque retained authority token for a future state-store scope.
 ///
@@ -71,6 +99,294 @@ impl StateToken {
     #[must_use]
     pub fn authority_manifest_id(&self) -> &str {
         &self.authority_manifest_id
+    }
+}
+
+mod metadata_readiness {
+    use bytes::Bytes;
+
+    use super::{ArcoStateReader, ControlMvpStateStore, StateScope, StateToken};
+    use crate::error::{CatalogError, Result};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TokenPinnedReadStatus<T> {
+        Available(Option<T>),
+        TokenUnavailable {
+            manifest_id: String,
+            logical_sequence: u64,
+        },
+    }
+
+    pub(super) async fn read_at_status<T>(
+        store: &ControlMvpStateStore,
+        token: StateToken,
+        key: &[u8],
+        decode: impl FnOnce(&Bytes) -> Result<T>,
+    ) -> Result<TokenPinnedReadStatus<T>> {
+        let manifest_id = token.authority_manifest_id().to_string();
+        let logical_sequence = token.logical_sequence();
+        let reader = match store.read_at(token).await {
+            Ok(reader) => reader,
+            Err(CatalogError::NotFound { .. }) => {
+                return Ok(TokenPinnedReadStatus::TokenUnavailable {
+                    manifest_id,
+                    logical_sequence,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = reader.get(key).await? else {
+            return Ok(TokenPinnedReadStatus::Available(None));
+        };
+        decode(&bytes).map(|value| TokenPinnedReadStatus::Available(Some(value)))
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ProjectionLag {
+        pub(super) committed_sequence: u64,
+        pub(super) latest_projected_sequence: Option<u64>,
+        pub(super) pending_sequences: Option<u64>,
+    }
+
+    pub(super) fn projection_lag_for(
+        token: &StateToken,
+        latest_projected_sequence: Option<u64>,
+    ) -> ProjectionLag {
+        let committed_sequence = token.logical_sequence();
+        ProjectionLag {
+            committed_sequence,
+            latest_projected_sequence,
+            pending_sequences: latest_projected_sequence
+                .map(|projected| committed_sequence.saturating_sub(projected)),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum CompiledStateStatus {
+        Ready {
+            required_sequence: u64,
+            compiled_sequence: u64,
+        },
+        DenyClosedMissing {
+            required_sequence: u64,
+        },
+        DenyClosedStale {
+            required_sequence: u64,
+            compiled_sequence: u64,
+        },
+        DenyClosedScopeMismatch {
+            required_scope: StateScope,
+            compiled_scope: StateScope,
+        },
+    }
+
+    pub(super) fn compiled_state_status_for(
+        required: &StateToken,
+        compiled: Option<&StateToken>,
+    ) -> CompiledStateStatus {
+        let required_sequence = required.logical_sequence();
+        let Some(compiled) = compiled else {
+            return CompiledStateStatus::DenyClosedMissing { required_sequence };
+        };
+        if compiled.scope() != required.scope() {
+            return CompiledStateStatus::DenyClosedScopeMismatch {
+                required_scope: required.scope().clone(),
+                compiled_scope: compiled.scope().clone(),
+            };
+        }
+
+        let compiled_sequence = compiled.logical_sequence();
+        if compiled_sequence < required_sequence {
+            CompiledStateStatus::DenyClosedStale {
+                required_sequence,
+                compiled_sequence,
+            }
+        } else {
+            CompiledStateStatus::Ready {
+                required_sequence,
+                compiled_sequence,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn token(scope: &StateScope, sequence: u64) -> StateToken {
+            StateToken::for_test(scope.clone(), sequence, format!("manifest-{sequence}"))
+        }
+
+        #[test]
+        fn compiled_state_status_is_fail_closed_and_accepts_equal_or_newer_state() {
+            let scope = StateScope::new("tenant", "workspace", "path-governance-metadata");
+            let other_scope =
+                StateScope::new("tenant", "other-workspace", "path-governance-metadata");
+            let required = token(&scope, 7);
+
+            assert_eq!(
+                CompiledStateStatus::DenyClosedMissing {
+                    required_sequence: 7,
+                },
+                compiled_state_status_for(&required, None)
+            );
+            assert_eq!(
+                CompiledStateStatus::DenyClosedStale {
+                    required_sequence: 7,
+                    compiled_sequence: 6,
+                },
+                compiled_state_status_for(&required, Some(&token(&scope, 6)))
+            );
+            assert_eq!(
+                CompiledStateStatus::DenyClosedScopeMismatch {
+                    required_scope: scope.clone(),
+                    compiled_scope: other_scope.clone(),
+                },
+                compiled_state_status_for(&required, Some(&token(&other_scope, 7)))
+            );
+            for compiled_sequence in [7, 9] {
+                assert_eq!(
+                    CompiledStateStatus::Ready {
+                        required_sequence: 7,
+                        compiled_sequence,
+                    },
+                    compiled_state_status_for(&required, Some(&token(&scope, compiled_sequence)))
+                );
+            }
+        }
+
+        #[test]
+        fn projection_lag_is_diagnostic_and_saturates_when_projection_is_ahead() {
+            let scope = StateScope::new("tenant", "workspace", "path-governance-metadata");
+            let committed = token(&scope, 7);
+
+            assert_eq!(
+                ProjectionLag {
+                    committed_sequence: 7,
+                    latest_projected_sequence: None,
+                    pending_sequences: None,
+                },
+                projection_lag_for(&committed, None)
+            );
+            for (projected, pending) in [(3, 4), (7, 0), (9, 0)] {
+                assert_eq!(
+                    ProjectionLag {
+                        committed_sequence: 7,
+                        latest_projected_sequence: Some(projected),
+                        pending_sequences: Some(pending),
+                    },
+                    projection_lag_for(&committed, Some(projected))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use std::ops::Range;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use arco_core::error::Result as StorageResult;
+    use arco_core::{MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use tokio::sync::Notify;
+
+    use super::ControlMvpPaths;
+
+    pub(super) const POINTER_CAS_GATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Deterministically pauses the first current-pointer CAS after it is armed.
+    pub(super) struct FirstPointerCasGateBackend {
+        inner: MemoryBackend,
+        pointer_suffix: String,
+        armed: AtomicBool,
+        intercepted: AtomicBool,
+        blocked: Notify,
+        release: Notify,
+    }
+
+    impl FirstPointerCasGateBackend {
+        pub(super) fn new(domain: &str) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryBackend::new(),
+                pointer_suffix: ControlMvpPaths::new(domain).current_pointer(),
+                armed: AtomicBool::new(false),
+                intercepted: AtomicBool::new(false),
+                blocked: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+
+        pub(super) fn arm(&self) {
+            self.intercepted.store(false, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        pub(super) async fn wait_until_blocked(&self) {
+            tokio::time::timeout(POINTER_CAS_GATE_TIMEOUT, async {
+                loop {
+                    let notified = self.blocked.notified();
+                    if self.intercepted.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("writer did not reach the first pointer CAS before timeout");
+        }
+
+        pub(super) fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FirstPointerCasGateBackend {
+        async fn get(&self, path: &str) -> StorageResult<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> StorageResult<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> StorageResult<WriteResult> {
+            if self.armed.load(Ordering::SeqCst)
+                && path.ends_with(&self.pointer_suffix)
+                && !self.intercepted.swap(true, Ordering::SeqCst)
+            {
+                self.blocked.notify_waiters();
+                self.release.notified().await;
+                self.armed.store(false, Ordering::SeqCst);
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> StorageResult<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> StorageResult<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> StorageResult<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> StorageResult<String> {
+            self.inner.signed_url(path, expiry).await
+        }
     }
 }
 

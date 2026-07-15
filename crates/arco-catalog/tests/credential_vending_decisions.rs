@@ -102,7 +102,11 @@ fn credential_vending_denies_stale_authorization_watermark() -> Result<()> {
 
     assert_eq!(decision.decision, CredentialDecision::Deny);
     assert_eq!(decision.reason_code, "stale_projection");
+    assert!(decision.provider.is_none());
+    assert!(decision.credential_kind.is_none());
+    assert!(decision.authorized_object_id.is_none());
     assert!(decision.authorized_path_prefixes.is_empty());
+    assert!(!decision.audit_event_id.is_empty());
     Ok(())
 }
 

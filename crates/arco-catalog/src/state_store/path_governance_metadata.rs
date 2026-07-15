@@ -2,6 +2,7 @@ use arco_core::ScopedStorage;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange, StateScope,
     StateToken, TxnOptions,
@@ -43,70 +44,12 @@ impl PathGovernanceMetadataWriter {
         &self,
         declaration: PathGovernanceDeclaration,
     ) -> Result<PathGovernancePendingDeclaration> {
-        if declaration
-            .workspace_id()
-            .is_some_and(|workspace_id| workspace_id != self.scope.workspace_id())
-        {
-            return Err(validation_failed(
-                "path governance metadata workspace_id must match state scope",
-            ));
-        }
-
-        let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
         let mut txn = self
             .store
             .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
             .await?;
 
-        if txn.get(&keys.record_key).await?.is_some() {
-            return Err(CatalogError::AlreadyExists {
-                entity: "path_governance_metadata".to_string(),
-                name: declaration.declaration_id().to_string(),
-            });
-        }
-        if txn.get(&keys.exact_path_key).await?.is_some() {
-            return Err(precondition_failed(
-                "exact path governance metadata conflict",
-            ));
-        }
-        for ancestor_key in &keys.ancestor_path_keys {
-            if txn.get(ancestor_key).await?.is_some() {
-                return Err(precondition_failed(
-                    "ancestor path governance metadata conflict",
-                ));
-            }
-        }
-        if !txn.scan_prefix(&keys.descendant_prefix).await?.is_empty() {
-            return Err(precondition_failed(
-                "descendant path governance metadata conflict",
-            ));
-        }
-
-        let descendant_witness = txn.range_witness(&keys.descendant_range);
-        txn.assert_absent(&keys.record_key).await?;
-        txn.assert_absent(&keys.exact_path_key).await?;
-        for ancestor_key in &keys.ancestor_path_keys {
-            txn.assert_absent(ancestor_key).await?;
-        }
-        txn.assert_range_empty(keys.descendant_range.clone())
-            .await?;
-        txn.assert_range_unchanged(keys.descendant_range.clone(), descendant_witness)
-            .await?;
-        let predicate_inputs = txn
-            .read_set(
-                &keys.predicate_point_keys(),
-                &[keys.descendant_range.clone()],
-            )
-            .await?;
-        txn.assert_inputs_unchanged(predicate_inputs).await?;
-
-        txn.put(&keys.record_key, encode_declaration(&declaration)?)
-            .await?;
-        txn.put(
-            &keys.exact_path_key,
-            Bytes::from(declaration.declaration_id().to_string()),
-        )
-        .await?;
+        stage_path_governance_declaration(&mut txn, &self.scope, &declaration).await?;
 
         Ok(PathGovernancePendingDeclaration {
             writer: self.clone(),
@@ -134,81 +77,28 @@ impl PathGovernanceMetadataWriter {
         declaration_id: &str,
     ) -> Result<PathGovernanceDeclarationReadStatus> {
         let key = declaration_key(declaration_id);
-        let reader = match self.store.read_at(token.clone()).await {
-            Ok(reader) => reader,
-            Err(CatalogError::NotFound { .. }) => {
-                return Ok(PathGovernanceDeclarationReadStatus::TokenUnavailable {
-                    manifest_id: token.authority_manifest_id().to_string(),
-                    logical_sequence: token.logical_sequence(),
-                });
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(bytes) = reader.get(&key).await? else {
-            return Ok(PathGovernanceDeclarationReadStatus::Available(None));
-        };
-        decode_declaration(&bytes)
-            .map(|declaration| PathGovernanceDeclarationReadStatus::Available(Some(declaration)))
+        metadata_readiness::read_at_status(&self.store, token, &key, decode_declaration).await
     }
 
     pub(crate) fn projection_lag_for(
         token: &StateToken,
         latest_projected_sequence: Option<u64>,
     ) -> PathGovernanceProjectionLag {
-        let committed_sequence = token.logical_sequence();
-        PathGovernanceProjectionLag {
-            committed_sequence,
-            latest_projected_sequence,
-            pending_sequences: latest_projected_sequence
-                .map(|projected| committed_sequence.saturating_sub(projected)),
-        }
+        metadata_readiness::projection_lag_for(token, latest_projected_sequence)
     }
 
     pub(crate) fn compiled_state_status_for(
         token: &StateToken,
         compiled: Option<&CompiledPathGovernanceMetadataState>,
     ) -> PathGovernanceCompiledStateStatus {
-        let required_sequence = token.logical_sequence();
-        let Some(compiled) = compiled else {
-            return PathGovernanceCompiledStateStatus::DenyClosedMissing { required_sequence };
-        };
-        if compiled.source_token().scope() != token.scope() {
-            return PathGovernanceCompiledStateStatus::DenyClosedScopeMismatch {
-                required_scope: token.scope().clone(),
-                compiled_scope: compiled.source_token().scope().clone(),
-            };
-        }
-
-        let compiled_sequence = compiled.source_token().logical_sequence();
-        match compiled_sequence {
-            compiled_sequence if compiled_sequence < required_sequence => {
-                PathGovernanceCompiledStateStatus::DenyClosedStale {
-                    required_sequence,
-                    compiled_sequence,
-                }
-            }
-            compiled_sequence => PathGovernanceCompiledStateStatus::Ready {
-                required_sequence,
-                compiled_sequence,
-            },
-        }
+        metadata_readiness::compiled_state_status_for(
+            token,
+            compiled.map(CompiledPathGovernanceMetadataState::source_token),
+        )
     }
 
     async fn has_path_conflict(&self, declaration: &PathGovernanceDeclaration) -> Result<bool> {
-        let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
-        if self.store.get(&keys.exact_path_key).await?.is_some() {
-            return Ok(true);
-        }
-        for ancestor_key in &keys.ancestor_path_keys {
-            if self.store.get(ancestor_key).await?.is_some() {
-                return Ok(true);
-            }
-        }
-        Ok(!self
-            .store
-            .scan_prefix(&keys.descendant_prefix)
-            .await?
-            .is_empty())
+        path_governance_declaration_conflicts(&self.store, &self.scope, declaration).await
     }
 }
 
@@ -267,7 +157,28 @@ impl PathGovernanceDeclaration {
         W: Into<String>,
     {
         let governed_path = GovernedPath::parse(raw_uri.as_ref())?;
-        Ok(Self {
+        Ok(Self::active_from_governed_path(
+            declaration_id,
+            authority_object_id,
+            authority_object_type,
+            workspace_id,
+            &governed_path,
+            owner,
+        ))
+    }
+
+    pub(crate) fn active_from_governed_path<W>(
+        declaration_id: impl Into<String>,
+        authority_object_id: impl Into<String>,
+        authority_object_type: impl Into<String>,
+        workspace_id: Option<W>,
+        governed_path: &GovernedPath,
+        owner: impl Into<String>,
+    ) -> Self
+    where
+        W: Into<String>,
+    {
+        Self {
             declaration_id: declaration_id.into(),
             authority_object_id: authority_object_id.into(),
             authority_object_type: authority_object_type.into(),
@@ -275,7 +186,7 @@ impl PathGovernanceDeclaration {
             canonical_uri: governed_path.canonical_uri(),
             owner: owner.into(),
             lifecycle_state: LifecycleState::Active,
-        })
+        }
     }
 
     #[must_use]
@@ -334,23 +245,9 @@ impl PathGovernanceMetadataReceipt {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathGovernanceDeclarationReadStatus {
-    Available(Option<PathGovernanceDeclaration>),
-    TokenUnavailable {
-        manifest_id: String,
-        logical_sequence: u64,
-    },
-}
+pub type PathGovernanceDeclarationReadStatus = TokenPinnedReadStatus<PathGovernanceDeclaration>;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathGovernanceProjectionLag {
-    committed_sequence: u64,
-    latest_projected_sequence: Option<u64>,
-    pending_sequences: Option<u64>,
-}
+pub type PathGovernanceProjectionLag = ProjectionLag;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,25 +268,7 @@ impl CompiledPathGovernanceMetadataState {
     }
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PathGovernanceCompiledStateStatus {
-    Ready {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedMissing {
-        required_sequence: u64,
-    },
-    DenyClosedStale {
-        required_sequence: u64,
-        compiled_sequence: u64,
-    },
-    DenyClosedScopeMismatch {
-        required_scope: StateScope,
-        compiled_scope: StateScope,
-    },
-}
+pub type PathGovernanceCompiledStateStatus = CompiledStateStatus;
 
 struct MetadataKeys {
     record_key: Vec<u8>,
@@ -424,6 +303,98 @@ impl MetadataKeys {
         keys.extend(self.ancestor_path_keys.iter().cloned());
         keys
     }
+}
+
+pub(super) async fn stage_path_governance_declaration(
+    txn: &mut ControlMvpTxn,
+    expected_scope: &StateScope,
+    declaration: &PathGovernanceDeclaration,
+) -> Result<()> {
+    validate_declaration_scope(expected_scope, declaration)?;
+    let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
+
+    if txn.get(&keys.record_key).await?.is_some() {
+        return Err(CatalogError::AlreadyExists {
+            entity: "path_governance_metadata".to_string(),
+            name: declaration.declaration_id().to_string(),
+        });
+    }
+    if txn.get(&keys.exact_path_key).await?.is_some() {
+        return Err(precondition_failed(
+            "exact path governance metadata conflict",
+        ));
+    }
+    for ancestor_key in &keys.ancestor_path_keys {
+        if txn.get(ancestor_key).await?.is_some() {
+            return Err(precondition_failed(
+                "ancestor path governance metadata conflict",
+            ));
+        }
+    }
+    if !txn.scan_prefix(&keys.descendant_prefix).await?.is_empty() {
+        return Err(precondition_failed(
+            "descendant path governance metadata conflict",
+        ));
+    }
+
+    let descendant_witness = txn.range_witness(&keys.descendant_range);
+    txn.assert_absent(&keys.record_key).await?;
+    txn.assert_absent(&keys.exact_path_key).await?;
+    for ancestor_key in &keys.ancestor_path_keys {
+        txn.assert_absent(ancestor_key).await?;
+    }
+    txn.assert_range_empty(keys.descendant_range.clone())
+        .await?;
+    txn.assert_range_unchanged(keys.descendant_range.clone(), descendant_witness)
+        .await?;
+    let predicate_inputs = txn
+        .read_set(
+            &keys.predicate_point_keys(),
+            &[keys.descendant_range.clone()],
+        )
+        .await?;
+    txn.assert_inputs_unchanged(predicate_inputs).await?;
+
+    txn.put(&keys.record_key, encode_declaration(declaration)?)
+        .await?;
+    txn.put(
+        &keys.exact_path_key,
+        Bytes::from(declaration.declaration_id().to_string()),
+    )
+    .await
+}
+
+pub(super) async fn path_governance_declaration_conflicts(
+    store: &ControlMvpStateStore,
+    expected_scope: &StateScope,
+    declaration: &PathGovernanceDeclaration,
+) -> Result<bool> {
+    validate_declaration_scope(expected_scope, declaration)?;
+    let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
+    if store.get(&keys.exact_path_key).await?.is_some() {
+        return Ok(true);
+    }
+    for ancestor_key in &keys.ancestor_path_keys {
+        if store.get(ancestor_key).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(!store.scan_prefix(&keys.descendant_prefix).await?.is_empty())
+}
+
+fn validate_declaration_scope(
+    expected_scope: &StateScope,
+    declaration: &PathGovernanceDeclaration,
+) -> Result<()> {
+    if declaration
+        .workspace_id()
+        .is_some_and(|workspace_id| workspace_id != expected_scope.workspace_id())
+    {
+        return Err(validation_failed(
+            "path governance metadata workspace_id must match state scope",
+        ));
+    }
+    Ok(())
 }
 
 fn declaration_key(declaration_id: &str) -> Vec<u8> {
@@ -626,6 +597,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staging_helper_rejects_workspace_mismatch() {
+        let scope = metadata_scope();
+        let store = ControlMvpStateStore::new(storage(), scope.clone()).expect("control store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::new(Some(scope.clone())))
+            .await
+            .expect("begin transaction");
+        let declaration = PathGovernanceDeclaration::active(
+            "decl_orders",
+            "authority_orders",
+            "EXTERNAL_LOCATION",
+            Some("other-workspace"),
+            "gs://bucket/warehouse/orders",
+            "owner",
+        )
+        .expect("declaration input");
+
+        match stage_path_governance_declaration(&mut txn, &scope, &declaration).await {
+            Err(CatalogError::Validation { message }) => assert!(
+                message.contains("workspace_id must match state scope"),
+                "unexpected validation message: {message:?}"
+            ),
+            Err(error) => panic!("expected workspace mismatch validation, got {error:?}"),
+            Ok(()) => panic!("workspace mismatch must fail before staging"),
+        }
+    }
+
+    #[tokio::test]
     async fn read_declaration_at_state_token_returns_committed_declaration() {
         let writer = writer(storage());
 
@@ -748,6 +747,10 @@ mod tests {
             .expect("declare percent-bearing canonical path");
 
         assert_eq!("decl_percent", receipt.declaration().declaration_id());
+        assert_eq!(
+            "gs://bucket/warehouse/100%-complete/",
+            receipt.declaration().canonical_uri()
+        );
     }
 
     #[tokio::test]
@@ -977,9 +980,8 @@ mod tests {
         ] {
             let unsupported_scope = StateScope::new("tenant", "workspace", domain);
 
-            let error = match PathGovernanceMetadataWriter::new(storage(), unsupported_scope) {
-                Err(error) => error,
-                Ok(_) => panic!("unsupported scope {domain} must reject writer creation"),
+            let Err(error) = PathGovernanceMetadataWriter::new(storage(), unsupported_scope) else {
+                panic!("unsupported scope {domain} must reject writer creation");
             };
 
             assert!(

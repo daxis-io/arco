@@ -1226,6 +1226,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_reference_status_marks_missing_retained_manifest_unavailable() {
+        let shared_storage = storage();
+        let writer = writer(shared_storage.clone());
+        let receipt = declare_credential(&writer).await;
+        let token = receipt.token().clone();
+        let manifest_id = token.authority_manifest_id().to_string();
+        let logical_sequence = token.logical_sequence();
+        let paths = ControlMvpPaths::new(PATH_GOVERNANCE_METADATA_DOMAIN);
+        shared_storage
+            .delete(&paths.manifest_object(&manifest_id))
+            .await
+            .expect("expire retained manifest");
+
+        assert_eq!(
+            CredentialReferenceMetadataReadStatus::TokenUnavailable {
+                manifest_id,
+                logical_sequence,
+            },
+            writer
+                .read_credential_reference_at_status(token, "cred_01")
+                .await
+                .expect("token status")
+        );
+    }
+
+    #[tokio::test]
     async fn external_location_status_marks_missing_retained_manifest_unavailable() {
         let shared_storage = storage();
         let writer = writer(shared_storage.clone());

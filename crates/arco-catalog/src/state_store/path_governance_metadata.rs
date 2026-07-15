@@ -11,11 +11,11 @@ use crate::metastore::events::LifecycleState;
 use crate::storage_governance::path_normalization::GovernedPath;
 
 #[allow(dead_code)]
-pub(crate) const PATH_GOVERNANCE_METADATA_DOMAIN: &str = "path-governance-metadata";
+pub const PATH_GOVERNANCE_METADATA_DOMAIN: &str = "path-governance-metadata";
 
 #[allow(dead_code)]
 #[derive(Clone)]
-pub(crate) struct PathGovernanceMetadataWriter {
+pub struct PathGovernanceMetadataWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
 }
@@ -43,6 +43,15 @@ impl PathGovernanceMetadataWriter {
         &self,
         declaration: PathGovernanceDeclaration,
     ) -> Result<PathGovernancePendingDeclaration> {
+        if declaration
+            .workspace_id()
+            .is_some_and(|workspace_id| workspace_id != self.scope.workspace_id())
+        {
+            return Err(validation_failed(
+                "path governance metadata workspace_id must match state scope",
+            ));
+        }
+
         let keys = MetadataKeys::new(declaration.declaration_id(), declaration.canonical_uri())?;
         let mut txn = self
             .store
@@ -157,18 +166,28 @@ impl PathGovernanceMetadataWriter {
 
     pub(crate) fn compiled_state_status_for(
         token: &StateToken,
-        compiled_sequence: Option<u64>,
+        compiled: Option<&CompiledPathGovernanceMetadataState>,
     ) -> PathGovernanceCompiledStateStatus {
         let required_sequence = token.logical_sequence();
+        let Some(compiled) = compiled else {
+            return PathGovernanceCompiledStateStatus::DenyClosedMissing { required_sequence };
+        };
+        if compiled.source_token().scope() != token.scope() {
+            return PathGovernanceCompiledStateStatus::DenyClosedScopeMismatch {
+                required_scope: token.scope().clone(),
+                compiled_scope: compiled.source_token().scope().clone(),
+            };
+        }
+
+        let compiled_sequence = compiled.source_token().logical_sequence();
         match compiled_sequence {
-            None => PathGovernanceCompiledStateStatus::DenyClosedMissing { required_sequence },
-            Some(compiled_sequence) if compiled_sequence < required_sequence => {
+            compiled_sequence if compiled_sequence < required_sequence => {
                 PathGovernanceCompiledStateStatus::DenyClosedStale {
                     required_sequence,
                     compiled_sequence,
                 }
             }
-            Some(compiled_sequence) => PathGovernanceCompiledStateStatus::Ready {
+            compiled_sequence => PathGovernanceCompiledStateStatus::Ready {
                 required_sequence,
                 compiled_sequence,
             },
@@ -194,7 +213,7 @@ impl PathGovernanceMetadataWriter {
 }
 
 #[allow(dead_code)]
-pub(crate) struct PathGovernancePendingDeclaration {
+pub struct PathGovernancePendingDeclaration {
     writer: PathGovernanceMetadataWriter,
     txn: ControlMvpTxn,
     declaration: PathGovernanceDeclaration,
@@ -224,7 +243,7 @@ impl PathGovernancePendingDeclaration {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PathGovernanceDeclaration {
+pub struct PathGovernanceDeclaration {
     declaration_id: String,
     authority_object_id: String,
     authority_object_type: String,
@@ -297,7 +316,7 @@ impl PathGovernanceDeclaration {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PathGovernanceMetadataReceipt {
+pub struct PathGovernanceMetadataReceipt {
     token: StateToken,
     declaration: PathGovernanceDeclaration,
 }
@@ -317,7 +336,7 @@ impl PathGovernanceMetadataReceipt {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathGovernanceDeclarationReadStatus {
+pub enum PathGovernanceDeclarationReadStatus {
     Available(Option<PathGovernanceDeclaration>),
     TokenUnavailable {
         manifest_id: String,
@@ -327,7 +346,7 @@ pub(crate) enum PathGovernanceDeclarationReadStatus {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PathGovernanceProjectionLag {
+pub struct PathGovernanceProjectionLag {
     committed_sequence: u64,
     latest_projected_sequence: Option<u64>,
     pending_sequences: Option<u64>,
@@ -335,7 +354,26 @@ pub(crate) struct PathGovernanceProjectionLag {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PathGovernanceCompiledStateStatus {
+pub struct CompiledPathGovernanceMetadataState {
+    source_token: StateToken,
+}
+
+#[allow(dead_code)]
+impl CompiledPathGovernanceMetadataState {
+    #[must_use]
+    pub const fn new(source_token: StateToken) -> Self {
+        Self { source_token }
+    }
+
+    #[must_use]
+    pub const fn source_token(&self) -> &StateToken {
+        &self.source_token
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathGovernanceCompiledStateStatus {
     Ready {
         required_sequence: u64,
         compiled_sequence: u64,
@@ -346,6 +384,10 @@ pub(crate) enum PathGovernanceCompiledStateStatus {
     DenyClosedStale {
         required_sequence: u64,
         compiled_sequence: u64,
+    },
+    DenyClosedScopeMismatch {
+        required_scope: StateScope,
+        compiled_scope: StateScope,
     },
 }
 
@@ -359,13 +401,12 @@ struct MetadataKeys {
 
 impl MetadataKeys {
     fn new(declaration_id: &str, canonical_uri: &str) -> Result<Self> {
-        GovernedPath::parse(canonical_uri)?;
         let exact_path_key = path_index_key(canonical_uri);
         let ancestor_path_keys = canonical_ancestor_uris(canonical_uri)?
             .into_iter()
             .map(|ancestor_uri| path_index_key(&ancestor_uri))
             .collect();
-        let descendant_range = descendant_conflict_range(canonical_uri)?;
+        let descendant_range = descendant_conflict_range(canonical_uri);
 
         Ok(Self {
             record_key: declaration_key(declaration_id),
@@ -397,12 +438,11 @@ fn path_index_key(canonical_uri: &str) -> Vec<u8> {
     key
 }
 
-fn descendant_conflict_range(canonical_uri: &str) -> Result<KeyRange> {
-    GovernedPath::parse(canonical_uri)?;
+fn descendant_conflict_range(canonical_uri: &str) -> KeyRange {
     let start = path_index_key(canonical_uri);
     let mut end = start.clone();
     end.push(0xff);
-    Ok(KeyRange::new(start, end))
+    KeyRange::new(start, end)
 }
 
 fn canonical_ancestor_uris(canonical_uri: &str) -> Result<Vec<String>> {
@@ -427,7 +467,10 @@ fn canonical_ancestor_uris(canonical_uri: &str) -> Result<Vec<String>> {
         let path = if depth == 0 {
             "/".to_string()
         } else {
-            format!("/{}/", segments[..depth].join("/"))
+            let ancestor_segments = segments
+                .get(..depth)
+                .ok_or_else(|| validation_failed("invalid canonical ancestor depth"))?;
+            format!("/{}/", ancestor_segments.join("/"))
         };
         ancestors.push(canonical_uri_for_parts(scheme, authority, &path));
     }
@@ -560,6 +603,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declaration_workspace_must_match_writer_scope() {
+        let writer = writer(storage());
+        let declaration = PathGovernanceDeclaration::active(
+            "decl_orders",
+            "authority_orders",
+            "EXTERNAL_LOCATION",
+            Some("other-workspace"),
+            "gs://bucket/warehouse/orders",
+            "owner",
+        )
+        .expect("declaration input");
+
+        match writer.declare_path(declaration).await {
+            Err(CatalogError::Validation { message }) => assert!(
+                message.contains("workspace_id must match state scope"),
+                "unexpected validation message: {message:?}"
+            ),
+            Err(error) => panic!("expected workspace mismatch validation, got {error:?}"),
+            Ok(_) => panic!("workspace mismatch must fail before commit"),
+        }
+    }
+
+    #[tokio::test]
     async fn read_declaration_at_state_token_returns_committed_declaration() {
         let writer = writer(storage());
 
@@ -670,6 +736,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn percent_escaped_path_uses_one_canonicalization_pass() {
+        let writer = writer(storage());
+
+        let receipt = writer
+            .declare_path(declaration(
+                "decl_percent",
+                "gs://bucket/warehouse/100%25-complete",
+            ))
+            .await
+            .expect("declare percent-bearing canonical path");
+
+        assert_eq!("decl_percent", receipt.declaration().declaration_id());
+    }
+
+    #[tokio::test]
     async fn descendant_conflict_is_rejected() {
         let writer = writer(storage());
         writer
@@ -773,7 +854,7 @@ mod tests {
             .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
             .await
             .expect("begin transaction");
-        let range = descendant_conflict_range("gs://bucket/warehouse/orders/").expect("range");
+        let range = descendant_conflict_range("gs://bucket/warehouse/orders/");
         let stale_witness = txn.range_witness(&range);
 
         writer
@@ -817,13 +898,42 @@ mod tests {
             .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
             .await
             .expect("declare path");
+        let compiled = CompiledPathGovernanceMetadataState::new(StateToken::for_test(
+            receipt.token().scope().clone(),
+            0,
+            "manifest-compiled",
+        ));
 
         assert_eq!(
             PathGovernanceCompiledStateStatus::DenyClosedStale {
                 required_sequence: receipt.token().logical_sequence(),
                 compiled_sequence: 0,
             },
-            PathGovernanceMetadataWriter::compiled_state_status_for(receipt.token(), Some(0))
+            PathGovernanceMetadataWriter::compiled_state_status_for(
+                receipt.token(),
+                Some(&compiled)
+            )
+        );
+    }
+
+    #[test]
+    fn scope_mismatched_compiled_state_denies_closed() {
+        let required_scope = metadata_scope();
+        let required = StateToken::for_test(required_scope.clone(), 7, "manifest-required");
+        let compiled_scope =
+            StateScope::new("tenant", "other-workspace", PATH_GOVERNANCE_METADATA_DOMAIN);
+        let compiled = CompiledPathGovernanceMetadataState::new(StateToken::for_test(
+            compiled_scope.clone(),
+            7,
+            "manifest-compiled",
+        ));
+
+        assert_eq!(
+            PathGovernanceCompiledStateStatus::DenyClosedScopeMismatch {
+                required_scope,
+                compiled_scope,
+            },
+            PathGovernanceMetadataWriter::compiled_state_status_for(&required, Some(&compiled))
         );
     }
 
@@ -834,6 +944,7 @@ mod tests {
             .declare_path(declaration("decl_orders", "gs://bucket/warehouse/orders"))
             .await
             .expect("declare path");
+        let compiled = CompiledPathGovernanceMetadataState::new(receipt.token().clone());
 
         assert_eq!(
             PathGovernanceProjectionLag {
@@ -850,7 +961,7 @@ mod tests {
             },
             PathGovernanceMetadataWriter::compiled_state_status_for(
                 receipt.token(),
-                Some(receipt.token().logical_sequence())
+                Some(&compiled)
             )
         );
     }

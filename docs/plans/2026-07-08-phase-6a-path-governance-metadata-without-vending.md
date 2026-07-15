@@ -15,39 +15,29 @@ credentials or authorize access.
 pointer CAS`. This phase adds a crate-private writer over
 `ControlMvpStateStore` in the `path-governance-metadata` domain. Successful
 declarations return retained `StateToken`s. Projection lag is diagnostic only.
-Enforcement-style readiness checks use authoritative or compiled sequence
-freshness and deny closed when missing or stale.
+Enforcement-style readiness checks bind compiled state to its source token and
+deny closed when the token scope does not match or the compiled sequence is
+missing or stale.
 
-**Selected base:** `8ce83f5d544cc482cc0dfa8511a9a581733fc3a0`
-(`Add Phase 5B ack-domain hardening`) from
-`.worktrees/phase5b-low-risk-writable-domain-hardening`.
-
-**Worktree:** `.worktrees/phase6a-path-governance-metadata`
-
-**Branch:** `codex/phase6a-path-governance-metadata`
+**PR base:** `4cd8bd2675b54b51f40cb87fd97da7f2b8df1686`
+(`Add control-store projection outbox acknowledgements (#319)`) from current
+`origin/main`.
 
 ## Prerequisite Evidence
 
-- Root checkout observed after fetch:
-  `main...origin/main [ahead 16, behind 12]` with tracked deletion
-  `docs/plans/2026-06-27-state-store-seam-current-adapter-slice.md`; root was
-  not modified.
-- `origin/main` after fetch:
-  `9577097b0723932ee696780d1e432e7cff3fd222`
-  (`Add Phase 4 shadow replay and internal comparison reads (#317)`).
-- Phase 5A commits:
-  - `9e4c38b Add Phase 5A projection outbox ack writes`
-  - `0b56258 Address Phase 5A ack review feedback`
-- Phase 5B commit:
-  - `8ce83f5 Add Phase 5B ack-domain hardening`
-- Baseline in this Phase 6A worktree before edits:
+- Phase 3 landed as `adccaa4` (`#316`).
+- Phase 4 landed as `9577097` (`#317`).
+- The complete Phase 5 acknowledgement domain landed as `4cd8bd2` (`#319`).
+- This Phase 6A branch was restacked directly onto that Phase 5 merge so its
+  diff contains only the four files listed below.
+- Baseline before Phase 6A edits:
   - `cargo test -p arco-catalog projection_outbox_acks`: 13 passed.
   - `cargo test -p arco-catalog --test state_store_control_mvp`: 13 passed.
   - `cargo test -p arco-catalog --test state_store_model`: 10 passed.
 
 ## Source Context Inspected
 
-Read from the clean Phase 6A worktree:
+Read from the isolated Phase 6A worktree:
 
 - `docs/plans/2026-07-06-phase-5a-first-low-risk-writable-domain.md`
 - `docs/plans/2026-07-07-phase-5b-low-risk-writable-domain-hardening.md`
@@ -64,8 +54,8 @@ Read from the clean Phase 6A worktree:
 - `crates/arco-catalog/tests/path_governance.rs`
 - `crates/arco-catalog/tests/credential_vending_decisions.rs`
 
-Read-only from the dirty root/local doc commit because these roadmap/design docs
-are absent from the clean Phase 6A worktree:
+Read-only from the local documentation history because these roadmap/design
+docs are not present on the PR base:
 
 - `docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
 - `docs/plans/2026-06-26-arco-tier1-single-authority-combined-vision.md`
@@ -128,8 +118,12 @@ In:
   `read_declaration_at_status`, with missing retained manifests reported as
   explicit token-unavailable status.
 - Add diagnostic projection lag reporting.
-- Add deny-closed compiled-state readiness helper that requires compiled
-  sequence freshness at or above `StateToken.logical_sequence()`.
+- Add deny-closed compiled-state readiness helper that requires an identical
+  `StateScope` and compiled sequence freshness at or above
+  `StateToken.logical_sequence()`.
+- Require a declaration's optional `workspace_id` to match the writer scope.
+- Canonicalize each raw URI once, then use the trusted canonical identifier for
+  metadata keys and conflict ranges.
 
 Out:
 
@@ -155,8 +149,12 @@ Out:
 - Fresh audit feedback follow-up added explicit coverage for canonical exact
   path conflicts and tombstoned descendant index keys that make the descendant
   `range_empty` witness deny closed.
-- Green run after feedback follow-up:
-  `cargo test -p arco-catalog state_store::path_governance_metadata`: 14 passed.
+- Further regression-first review coverage proved and fixed three boundary
+  failures: compiled state from another scope, a declaration workspace that
+  differs from the writer scope, and a valid percent-escaped URI being parsed
+  a second time after canonicalization.
+- Green focused run after those fixes:
+  `cargo test -p arco-catalog state_store::path_governance_metadata`: 17 passed.
 
 ## Verification
 
@@ -171,6 +169,8 @@ cargo test -p arco-catalog --test path_governance
 cargo test -p arco-catalog --test credential_vending_decisions
 cargo check -p arco-catalog
 cargo fmt --check
+cargo clippy --workspace --all-features -- -D warnings
+cargo xtask repo-hygiene-check
 git diff --check
 ```
 
@@ -186,7 +186,8 @@ git diff --check
 - Non-overlapping sibling paths are accepted.
 - Range-empty, range-unchanged, and predicate input-set revalidation are
   exercised by tests.
-- Compiled-state readiness denies closed on missing or stale compiled state.
+- Compiled-state readiness denies closed on missing, stale, or scope-mismatched
+  compiled state.
 - Projection lag is diagnostic only and does not affect compiled-state
   readiness.
 - Catalog/governance production authority remains current ledger append,
@@ -195,4 +196,4 @@ git diff --check
   snapshots, exports, lineage/search/projection authority, and user-visible API
   behavior are untouched.
 - `git diff --name-only` contains only the four planned files.
-- Commit locally only; do not push or open a PR.
+- The PR is a clean four-file Phase 6A delta on top of merged Phase 5.

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, CatalogError, CheckpointOptions,
-    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, KeyRange, StateScope,
+    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, KeyRange,
+    PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference, StateScope,
     TxnOptions,
 };
 use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
@@ -15,6 +16,8 @@ use arco_core::{MemoryBackend, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
+
+use chrono::{Duration as ChronoDuration, Utc};
 
 fn scope() -> StateScope {
     StateScope::new("tenant", "workspace", "catalog")
@@ -29,6 +32,205 @@ fn storage() -> (Arc<MemoryBackend>, ScopedStorage) {
 
 fn store(storage: ScopedStorage) -> ControlMvpStateStore {
     ControlMvpStateStore::new(storage, scope()).expect("control MVP store")
+}
+
+#[tokio::test]
+async fn persisted_authority_references_round_trip_state_tokens_and_checkpoints() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let paths = ControlMvpPaths::new("catalog");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("stage value");
+    let token = txn.commit().await.expect("commit");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())).with_min_retention_seconds(60))
+        .await
+        .expect("checkpoint");
+    let deadline = Utc::now() + ChronoDuration::hours(1);
+
+    let state_reference = store
+        .persist_state_reference(&token, deadline)
+        .await
+        .expect("persist state reference");
+    assert_eq!("arco-state-control-mvp", state_reference.implementation());
+    assert_eq!(&scope(), state_reference.scope());
+    assert_eq!(
+        PersistedAuthorityKind::StateToken,
+        state_reference.reference_kind()
+    );
+    assert_eq!(token.authority_manifest_id(), state_reference.manifest_id());
+    assert_eq!(token.logical_sequence(), state_reference.logical_sequence());
+    assert_eq!(
+        paths.manifest_object(token.authority_manifest_id()),
+        state_reference.manifest_path()
+    );
+    assert!(state_reference.manifest_sha256().starts_with("sha256:"));
+    assert_eq!(None, state_reference.checkpoint_path());
+    assert_eq!(deadline, state_reference.retention_deadline());
+
+    let checkpoint_reference = store
+        .persist_checkpoint_reference(&checkpoint, deadline)
+        .await
+        .expect("persist checkpoint reference");
+    assert_eq!(
+        PersistedAuthorityKind::Checkpoint,
+        checkpoint_reference.reference_kind()
+    );
+    assert_eq!(
+        Some(paths.checkpoint_object(checkpoint.checkpoint_id()).as_str()),
+        checkpoint_reference.checkpoint_path()
+    );
+    assert!(
+        checkpoint_reference
+            .checkpoint_sha256()
+            .expect("checkpoint digest")
+            .starts_with("sha256:")
+    );
+
+    for reference in [&state_reference, &checkpoint_reference] {
+        let reader = store
+            .resolve_persisted_reference(reference)
+            .await
+            .expect("resolve reference");
+        assert_eq!(
+            Some(Bytes::from_static(b"v1")),
+            reader.get(b"catalog/default").await.expect("retained read")
+        );
+        let json = serde_json::to_string(reference).expect("reference json");
+        assert!(!json.contains("StateToken"));
+        assert!(!json.contains("CheckpointToken"));
+    }
+}
+
+#[tokio::test]
+async fn persisted_authority_resolution_revalidates_every_stable_field() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("stage value");
+    let token = txn.commit().await.expect("commit");
+    let reference = store
+        .persist_state_reference(&token, Utc::now() + ChronoDuration::hours(1))
+        .await
+        .expect("persist reference");
+
+    let mutations = [
+        ("implementation", Value::String("other-backend".to_string())),
+        ("manifest_id", Value::String("other-manifest".to_string())),
+        ("logical_sequence", Value::from(99_u64)),
+        (
+            "manifest_path",
+            Value::String("other/path.json".to_string()),
+        ),
+        (
+            "manifest_sha256",
+            Value::String(format!("sha256:{}", "f".repeat(64))),
+        ),
+        (
+            "retention_deadline",
+            Value::String("2000-01-01T00:00:00Z".to_string()),
+        ),
+    ];
+    for (field, replacement) in mutations {
+        let mut value = serde_json::to_value(&reference).expect("reference json");
+        value[field] = replacement;
+        let corrupt: PersistedAuthorityReference =
+            serde_json::from_value(value).expect("reference shape");
+        assert!(
+            store.resolve_persisted_reference(&corrupt).await.is_err(),
+            "corrupt {field} must fail closed"
+        );
+    }
+
+    let mut value = serde_json::to_value(&reference).expect("reference json");
+    value["scope"]["workspace_id"] = Value::String("other-workspace".to_string());
+    let corrupt_scope: PersistedAuthorityReference =
+        serde_json::from_value(value).expect("reference shape");
+    assert!(
+        store
+            .resolve_persisted_reference(&corrupt_scope)
+            .await
+            .is_err()
+    );
+
+    let incoherent = PersistedAuthorityReference::new(
+        "arco-state-control-mvp",
+        scope(),
+        PersistedAuthorityKind::StateToken,
+        token.authority_manifest_id(),
+        token.logical_sequence(),
+        ControlMvpPaths::new("catalog").manifest_object(token.authority_manifest_id()),
+        format!("sha256:{}", "1".repeat(64)),
+        Some("checkpoints/not-allowed.json".to_string()),
+        Some(format!("sha256:{}", "2".repeat(64))),
+        Utc::now() + ChronoDuration::hours(1),
+    );
+    assert!(incoherent.is_err());
+}
+
+#[tokio::test]
+async fn checkpoint_references_reject_drive_paths_digest_corruption_and_missing_fields() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("stage value");
+    txn.commit().await.expect("commit");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint");
+    let reference = store
+        .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+        .await
+        .expect("checkpoint reference");
+
+    let mut drive_path = serde_json::to_value(&reference).expect("reference json");
+    drive_path["checkpoint_path"] = Value::String("C:/outside/checkpoint.json".to_string());
+    let drive_path: PersistedAuthorityReference =
+        serde_json::from_value(drive_path).expect("reference shape");
+    assert!(
+        drive_path.validate().is_err(),
+        "persisted authority validation must reject drive-qualified absolute paths"
+    );
+
+    let mutations = [
+        (
+            "checkpoint_path",
+            Value::String("state-store/control-mvp/catalog/checkpoints/other.json".to_string()),
+        ),
+        (
+            "checkpoint_sha256",
+            Value::String(format!("sha256:{}", "f".repeat(64))),
+        ),
+        ("checkpoint_path", Value::Null),
+        ("checkpoint_sha256", Value::Null),
+    ];
+    for (field, replacement) in mutations {
+        let mut value = serde_json::to_value(&reference).expect("reference json");
+        value[field] = replacement;
+        let corrupt: PersistedAuthorityReference =
+            serde_json::from_value(value).expect("reference shape");
+        assert!(
+            corrupt.validate().is_err()
+                || store.resolve_persisted_reference(&corrupt).await.is_err(),
+            "corrupt or missing {field} must fail closed"
+        );
+    }
 }
 
 #[tokio::test]

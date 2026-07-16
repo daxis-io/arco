@@ -14,7 +14,9 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::array::{Array as _, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{
+    Array as _, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray, UInt32Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -24,7 +26,10 @@ use parquet::file::properties::WriterProperties;
 use parquet::format::KeyValue;
 use serde::{Deserialize, Serialize};
 
+use chrono::{DateTime, Utc};
+
 use crate::error::{CatalogError, Result};
+use crate::workspace_snapshot::{RetentionStatus, RetentionTarget};
 
 /// Record stored in `namespaces.parquet`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +172,67 @@ pub struct CatalogCommitRecord {
     pub object_name: Option<String>,
 }
 
+/// Safe row exposed by the manifest-selected `system.catalog.snapshots` projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshotCatalogRecord {
+    snapshot_id: String,
+    record_version: u32,
+    created_at: i64,
+    retained_until: i64,
+    retention_status: RetentionStatus,
+    domain_count: u32,
+    parent_snapshot_id: Option<String>,
+    has_legacy_compatibility: bool,
+}
+
+impl WorkspaceSnapshotCatalogRecord {
+    /// Creates one exact-safe snapshot catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed IDs, versions, times, or counts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        snapshot_id: impl Into<String>,
+        record_version: u32,
+        created_at: DateTime<Utc>,
+        retained_until: DateTime<Utc>,
+        retention_status: RetentionStatus,
+        domain_count: usize,
+        parent_snapshot_id: Option<String>,
+        has_legacy_compatibility: bool,
+    ) -> Result<Self> {
+        let snapshot_id = snapshot_id.into();
+        RetentionTarget::snapshot(snapshot_id.clone())?;
+        if record_version != 1 {
+            return Err(CatalogError::Validation {
+                message: "snapshot catalog record_version must be 1".to_string(),
+            });
+        }
+        if retained_until <= created_at {
+            return Err(CatalogError::Validation {
+                message: "snapshot catalog retained_until must follow created_at".to_string(),
+            });
+        }
+        if let Some(parent) = &parent_snapshot_id {
+            RetentionTarget::snapshot(parent.clone())?;
+        }
+        let domain_count = u32::try_from(domain_count).map_err(|_| CatalogError::Validation {
+            message: "snapshot catalog domain_count exceeds u32".to_string(),
+        })?;
+        Ok(Self {
+            snapshot_id,
+            record_version,
+            created_at: created_at.timestamp_millis(),
+            retained_until: retained_until.timestamp_millis(),
+            retention_status,
+            domain_count,
+            parent_snapshot_id,
+            has_legacy_compatibility,
+        })
+    }
+}
+
 fn namespaces_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -255,6 +321,19 @@ fn commits_schema() -> Arc<Schema> {
     ]))
 }
 
+fn workspace_snapshots_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("snapshot_id", DataType::Utf8, false),
+        Field::new("record_version", DataType::UInt32, false),
+        Field::new("created_at", DataType::Int64, false),
+        Field::new("retained_until", DataType::Int64, false),
+        Field::new("retention_status", DataType::Utf8, false),
+        Field::new("domain_count", DataType::UInt32, false),
+        Field::new("parent_snapshot_id", DataType::Utf8, true),
+        Field::new("has_legacy_compatibility", DataType::Boolean, false),
+    ]))
+}
+
 // ============================================================================
 // Public Schema Accessors (for tests and external consumers)
 // ============================================================================
@@ -299,6 +378,12 @@ pub fn search_posting_schema() -> Schema {
 #[must_use]
 pub fn commit_schema() -> Schema {
     (*commits_schema()).clone()
+}
+
+/// Returns the exact safe schema for `system.catalog.snapshots`.
+#[must_use]
+pub fn workspace_snapshot_schema() -> Schema {
+    (*workspace_snapshots_schema()).clone()
 }
 
 fn writer_properties() -> WriterProperties {
@@ -717,6 +802,71 @@ pub fn write_commits(rows: &[CatalogCommitRecord]) -> Result<Bytes> {
         message: format!("record batch build failed: {e}"),
     })?;
 
+    write_single_batch(schema, &batch)
+}
+
+/// Writes the exact-safe `snapshots.parquet` projection.
+///
+/// # Errors
+///
+/// Returns an error if the record batch or Parquet file cannot be built.
+pub fn write_workspace_snapshots(rows: &[WorkspaceSnapshotCatalogRecord]) -> Result<Bytes> {
+    let schema = workspace_snapshots_schema();
+    let snapshot_ids = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.snapshot_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let record_versions = UInt32Array::from(
+        rows.iter()
+            .map(|row| row.record_version)
+            .collect::<Vec<_>>(),
+    );
+    let created_at = Int64Array::from(rows.iter().map(|row| row.created_at).collect::<Vec<_>>());
+    let retained_until = Int64Array::from(
+        rows.iter()
+            .map(|row| row.retained_until)
+            .collect::<Vec<_>>(),
+    );
+    let retention_status = StringArray::from(
+        rows.iter()
+            .map(|row| {
+                Some(match row.retention_status {
+                    RetentionStatus::Active => "active",
+                    RetentionStatus::Expired => "expired",
+                    RetentionStatus::Released => "released",
+                })
+            })
+            .collect::<Vec<_>>(),
+    );
+    let domain_count =
+        UInt32Array::from(rows.iter().map(|row| row.domain_count).collect::<Vec<_>>());
+    let parent_snapshot_ids = StringArray::from(
+        rows.iter()
+            .map(|row| row.parent_snapshot_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let has_legacy_compatibility = BooleanArray::from(
+        rows.iter()
+            .map(|row| row.has_legacy_compatibility)
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(snapshot_ids),
+            Arc::new(record_versions),
+            Arc::new(created_at),
+            Arc::new(retained_until),
+            Arc::new(retention_status),
+            Arc::new(domain_count),
+            Arc::new(parent_snapshot_ids),
+            Arc::new(has_legacy_compatibility),
+        ],
+    )
+    .map_err(|error| CatalogError::Parquet {
+        message: format!("snapshot catalog record batch build failed: {error}"),
+    })?;
     write_single_batch(schema, &batch)
 }
 

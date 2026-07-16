@@ -9,7 +9,9 @@ use bytes::Bytes;
 use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::catalog_common::{CatalogProvider, SchemaProvider};
 use datafusion::prelude::SessionContext;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+use arco_catalog::parquet_util::workspace_snapshot_schema;
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_core::{CatalogDomain, ScopedStorage};
 use arco_flow::orchestration::compactor::{
@@ -57,6 +59,11 @@ const CATALOG_SYSTEM_TABLES: &[SystemTableSpec] = &[
         schema: "catalog",
         table: "commits",
         path: "commits.parquet",
+    },
+    SystemTableSpec {
+        schema: "catalog",
+        table: "snapshots",
+        path: "snapshots.parquet",
     },
 ];
 
@@ -215,6 +222,9 @@ async fn register_domain_specs(
         };
 
         let bytes = storage.get_raw(&path).await.map_err(ApiError::from)?;
+        if spec.path == "snapshots.parquet" {
+            validate_workspace_snapshot_schema(&bytes)?;
+        }
         let table = parquet_bytes_to_mem_table(bytes)?;
         schema_provider
             .register_table(spec.table.to_string(), table)
@@ -223,6 +233,22 @@ async fn register_domain_specs(
     }
 
     Ok(registered)
+}
+
+fn validate_workspace_snapshot_schema(bytes: &Bytes) -> Result<(), ApiError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to read snapshot projection schema: {error}"
+        ))
+    })?;
+    let actual = builder.schema();
+    let expected = workspace_snapshot_schema();
+    if actual.fields() != expected.fields() {
+        return Err(ApiError::internal(
+            "system.catalog.snapshots has an unsafe or incompatible schema",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]

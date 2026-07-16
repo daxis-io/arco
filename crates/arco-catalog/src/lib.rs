@@ -106,6 +106,7 @@ pub mod tier1_events;
 pub mod tier1_snapshot;
 pub mod tier1_state;
 pub mod tier1_writer;
+pub mod workspace_snapshot;
 pub mod write_options;
 pub mod writer;
 
@@ -135,8 +136,8 @@ pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
     CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
     ControlMvpTxn, CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore,
-    ModelWrite, PredicateInputSet, StateScope, StateStoreCapabilities, StateToken, TxnOptions,
-    VersionedValue,
+    ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
+    PredicateInputSet, StateScope, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

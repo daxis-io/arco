@@ -6,14 +6,16 @@ use arco_core::ScopedStorage;
 use arco_core::storage::{WritePrecondition, WriteResult};
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, KeyRange, KvPair, PredicateInputSet, StateScope, StateStoreCapabilities,
-    StateToken, TxnOptions, VersionedValue,
+    CheckpointToken, KeyRange, KvPair, PersistedAuthorityAdapter, PersistedAuthorityKind,
+    PersistedAuthorityReference, PredicateInputSet, StateScope, StateStoreCapabilities, StateToken,
+    TxnOptions, VersionedValue,
 };
 use crate::error::{CatalogError, Result};
 
@@ -665,6 +667,204 @@ impl ArcoStateAdmin for ControlMvpStateStore {
         };
         self.write_checkpoint(&checkpoint).await?;
         Ok(self.checkpoint_token(checkpoint_id))
+    }
+}
+
+#[async_trait]
+impl PersistedAuthorityAdapter for ControlMvpStateStore {
+    async fn persist_state_reference(
+        &self,
+        token: &StateToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        if retention_deadline <= Utc::now() {
+            return Err(validation_failed(
+                "persisted authority retention deadline must be in the future",
+            ));
+        }
+        if token.scope() != &self.scope {
+            return Err(validation_failed(
+                "StateToken scope does not match control MVP store",
+            ));
+        }
+        let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
+        let bytes = self.storage.get_raw(&manifest_path).await?;
+        let manifest: ControlMvpManifest =
+            decode_envelope(&bytes, "control-mvp-manifest", "control MVP manifest")?;
+        manifest.validate(&self.scope, token.authority_manifest_id())?;
+        if manifest.logical_sequence != token.logical_sequence() {
+            return Err(invariant_violation(
+                "StateToken logical sequence does not match manifest",
+            ));
+        }
+        PersistedAuthorityReference::new(
+            IMPLEMENTATION,
+            self.scope.clone(),
+            PersistedAuthorityKind::StateToken,
+            token.authority_manifest_id(),
+            token.logical_sequence(),
+            manifest_path,
+            prefixed_sha256(&bytes),
+            None,
+            None,
+            retention_deadline,
+        )
+    }
+
+    async fn persist_checkpoint_reference(
+        &self,
+        token: &CheckpointToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        if retention_deadline <= Utc::now() {
+            return Err(validation_failed(
+                "persisted authority retention deadline must be in the future",
+            ));
+        }
+        if token.scope() != &self.scope {
+            return Err(validation_failed(
+                "CheckpointToken scope does not match control MVP store",
+            ));
+        }
+        let checkpoint_path = self.paths.checkpoint_object(token.checkpoint_id());
+        let checkpoint_bytes = self.storage.get_raw(&checkpoint_path).await?;
+        let checkpoint: ControlMvpCheckpoint = decode_envelope(
+            &checkpoint_bytes,
+            "control-mvp-checkpoint",
+            "control MVP checkpoint",
+        )?;
+        checkpoint.validate(&self.scope, token.checkpoint_id())?;
+
+        let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
+        let manifest_bytes = self.storage.get_raw(&manifest_path).await?;
+        validate_raw_checksum(
+            &manifest_bytes,
+            Some(&checkpoint.manifest_checksum_sha256),
+            "control MVP checkpoint manifest checksum",
+        )?;
+        let manifest: ControlMvpManifest = decode_envelope(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            "control MVP manifest",
+        )?;
+        manifest.validate(&self.scope, &checkpoint.manifest_id)?;
+        if manifest.logical_sequence != checkpoint.logical_sequence {
+            return Err(invariant_violation(
+                "checkpoint logical sequence does not match manifest",
+            ));
+        }
+
+        PersistedAuthorityReference::new(
+            IMPLEMENTATION,
+            self.scope.clone(),
+            PersistedAuthorityKind::Checkpoint,
+            checkpoint.manifest_id,
+            checkpoint.logical_sequence,
+            manifest_path,
+            prefixed_sha256(&manifest_bytes),
+            Some(checkpoint_path),
+            Some(prefixed_sha256(&checkpoint_bytes)),
+            retention_deadline,
+        )
+    }
+
+    async fn resolve_persisted_reference(
+        &self,
+        reference: &PersistedAuthorityReference,
+    ) -> Result<Box<dyn ArcoStateReader>> {
+        reference.validate()?;
+        if reference.implementation() != IMPLEMENTATION {
+            return Err(validation_failed(
+                "persisted authority implementation does not match control MVP",
+            ));
+        }
+        if reference.scope() != &self.scope {
+            return Err(validation_failed(
+                "persisted authority scope does not match control MVP store",
+            ));
+        }
+        if reference.retention_deadline() <= Utc::now() {
+            return Err(validation_failed(
+                "persisted authority reference is expired",
+            ));
+        }
+
+        let manifest_path = self.paths.manifest_object(reference.manifest_id());
+        if reference.manifest_path() != manifest_path {
+            return Err(validation_failed(
+                "persisted authority manifest path is not canonical for this store",
+            ));
+        }
+        let manifest_bytes = self.storage.get_raw(&manifest_path).await?;
+        if prefixed_sha256(&manifest_bytes) != reference.manifest_sha256() {
+            return Err(invariant_violation(
+                "persisted authority manifest checksum mismatch",
+            ));
+        }
+        let manifest: ControlMvpManifest = decode_envelope(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            "control MVP manifest",
+        )?;
+        manifest.validate(&self.scope, reference.manifest_id())?;
+        if manifest.logical_sequence != reference.logical_sequence() {
+            return Err(invariant_violation(
+                "persisted authority sequence does not match manifest",
+            ));
+        }
+
+        match reference.reference_kind() {
+            PersistedAuthorityKind::StateToken => {
+                self.read_at(self.token(
+                    reference.manifest_id().to_string(),
+                    reference.logical_sequence(),
+                ))
+                .await
+            }
+            PersistedAuthorityKind::Checkpoint => {
+                let checkpoint_path = reference
+                    .checkpoint_path()
+                    .ok_or_else(|| validation_failed("checkpoint path is missing"))?;
+                let prefix = format!("{}/checkpoints/", self.paths.base_prefix());
+                let checkpoint_id = checkpoint_path
+                    .strip_prefix(&prefix)
+                    .and_then(|path| path.strip_suffix(".json"))
+                    .filter(|id| !id.is_empty() && !id.contains('/'))
+                    .ok_or_else(|| {
+                        validation_failed(
+                            "persisted checkpoint path is not canonical for this store",
+                        )
+                    })?;
+                if self.paths.checkpoint_object(checkpoint_id) != checkpoint_path {
+                    return Err(validation_failed(
+                        "persisted checkpoint path is not canonical for this store",
+                    ));
+                }
+                let checkpoint_bytes = self.storage.get_raw(checkpoint_path).await?;
+                if prefixed_sha256(&checkpoint_bytes) != reference.checkpoint_sha256().unwrap_or("")
+                {
+                    return Err(invariant_violation(
+                        "persisted checkpoint checksum mismatch",
+                    ));
+                }
+                let checkpoint: ControlMvpCheckpoint = decode_envelope(
+                    &checkpoint_bytes,
+                    "control-mvp-checkpoint",
+                    "control MVP checkpoint",
+                )?;
+                checkpoint.validate(&self.scope, checkpoint_id)?;
+                if checkpoint.manifest_id != reference.manifest_id()
+                    || checkpoint.logical_sequence != reference.logical_sequence()
+                    || checkpoint.manifest_checksum_sha256 != sha256_hex(&manifest_bytes)
+                {
+                    return Err(invariant_violation(
+                        "persisted checkpoint does not match authority manifest",
+                    ));
+                }
+                self.read_checkpoint(self.checkpoint_token(checkpoint_id.to_string()))
+                    .await
+            }
+        }
     }
 }
 
@@ -1343,6 +1543,10 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+fn prefixed_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
 }
 
 fn digest_u64(hasher: Sha256) -> u64 {

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -23,7 +24,10 @@ use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, LineageManifest, SearchManifest,
     compute_manifest_hash, next_manifest_id,
 };
-use crate::parquet_util::{CatalogCommitRecord, SearchPostingRecord};
+use crate::parquet_util::{
+    CatalogCommitEventWitness, CatalogCommitRecord, SearchPostingRecord,
+    encode_catalog_commit_event_witnesses,
+};
 use crate::sync_compact_permit_issuer;
 use crate::tier1_events::{
     CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, CatalogDdlEventV4, LineageDdlEvent,
@@ -398,13 +402,17 @@ impl Tier1Compactor {
                 .map_err(map_processing_error)?;
 
             let mut commit_metadata = CatalogCommitMetadata::default();
+            let mut event_witnesses = Vec::with_capacity(unapplied_event_paths.len());
             for path in &unapplied_event_paths {
                 let event = read_catalog_event(&self.storage, path).await?;
                 if unapplied_event_paths.len() == 1 {
-                    commit_metadata = catalog_commit_metadata(&event);
+                    commit_metadata = catalog_commit_metadata(&event.value);
                 }
-                apply_catalog_event(&mut state, event)?;
+                event_witnesses.push(event.witness);
+                apply_catalog_event(&mut state, event.value)?;
             }
+            let event_witnesses_json = encode_catalog_commit_event_witnesses(event_witnesses)
+                .map_err(map_processing_error)?;
 
             let next_version = manifest.snapshot_version + 1;
             let next_commit = reserved_commit
@@ -427,11 +435,12 @@ impl Tier1Compactor {
                 CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
 
             state.commits.push(build_catalog_commit_record(
-                &next_commit.commit_ulid,
+                &next_commit,
+                &manifest_id,
                 next_version,
-                next_commit.published_at.timestamp_millis(),
                 fencing_token,
                 last_event_id.clone(),
+                event_witnesses_json,
                 commit_metadata,
             )?);
 
@@ -1036,6 +1045,11 @@ enum ParsedCatalogDdlEvent {
     V4(CatalogDdlEventV4),
 }
 
+struct ReadCatalogDdlEvent {
+    value: ParsedCatalogDdlEvent,
+    witness: CatalogCommitEventWitness,
+}
+
 fn catalog_commit_metadata(event: &ParsedCatalogDdlEvent) -> CatalogCommitMetadata {
     match event {
         ParsedCatalogDdlEvent::V1(event) => match event {
@@ -1134,11 +1148,12 @@ fn catalog_commit_metadata(event: &ParsedCatalogDdlEvent) -> CatalogCommitMetada
 }
 
 fn build_catalog_commit_record(
-    commit_ulid: &str,
+    reserved_commit: &ReservedCatalogCommit,
+    manifest_id: &str,
     snapshot_version: u64,
-    published_at: i64,
     fencing_token: u64,
     watermark_event_id: Option<String>,
+    event_witnesses_json: String,
     metadata: CatalogCommitMetadata,
 ) -> Result<CatalogCommitRecord, Tier1CompactionError> {
     let snapshot_version =
@@ -1151,9 +1166,11 @@ fn build_catalog_commit_record(
         })?;
 
     Ok(CatalogCommitRecord {
-        commit_ulid: commit_ulid.to_string(),
+        commit_ulid: reserved_commit.commit_ulid.clone(),
+        manifest_id: Some(manifest_id.to_string()),
+        event_witnesses_json: Some(event_witnesses_json),
         snapshot_version,
-        published_at,
+        published_at: reserved_commit.published_at.timestamp_millis(),
         fencing_token,
         watermark_event_id,
         operation: metadata.operation,
@@ -1166,7 +1183,7 @@ fn build_catalog_commit_record(
 async fn read_catalog_event(
     storage: &ScopedStorage,
     path: &str,
-) -> Result<ParsedCatalogDdlEvent, Tier1CompactionError> {
+) -> Result<ReadCatalogDdlEvent, Tier1CompactionError> {
     let data = storage
         .get_raw(path)
         .await
@@ -1193,34 +1210,47 @@ async fn read_catalog_event(
             message: format!("invalid catalog event envelope: {e}"),
         })?;
 
-    match envelope.event_version {
+    let value = match envelope.event_version {
         CatalogDdlEvent::EVENT_VERSION => {
             let payload: CatalogDdlEvent =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V1(payload))
+            ParsedCatalogDdlEvent::V1(payload)
         }
         CatalogDdlEventV2::EVENT_VERSION => {
             let payload: CatalogDdlEventV2 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V2(payload))
+            ParsedCatalogDdlEvent::V2(payload)
         }
         CatalogDdlEventV3::EVENT_VERSION => {
             let payload: CatalogDdlEventV3 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V3(payload))
+            ParsedCatalogDdlEvent::V3(payload)
         }
         CatalogDdlEventV4::EVENT_VERSION => {
             let payload: CatalogDdlEventV4 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V4(payload))
+            ParsedCatalogDdlEvent::V4(payload)
         }
-        other => Err(Tier1CompactionError::ProcessingError {
-            message: format!(
-                "unexpected catalog event type {} v{other}",
-                envelope.event_type
-            ),
-        }),
-    }
+        other => {
+            return Err(Tier1CompactionError::ProcessingError {
+                message: format!(
+                    "unexpected catalog event type {} v{other}",
+                    envelope.event_type
+                ),
+            });
+        }
+    };
+    let event_id =
+        event_id_from_path(path).ok_or_else(|| Tier1CompactionError::ProcessingError {
+            message: format!("catalog event path '{path}' has no event ID"),
+        })?;
+    Ok(ReadCatalogDdlEvent {
+        value,
+        witness: CatalogCommitEventWitness {
+            event_id: event_id.to_string(),
+            event_sha256: format!("sha256:{}", hex::encode(Sha256::digest(&data))),
+        },
+    })
 }
 
 async fn read_lineage_event(

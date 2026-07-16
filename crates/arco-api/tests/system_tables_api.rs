@@ -16,9 +16,11 @@ use arco_api::server::ServerBuilder;
 use arco_catalog::CatalogReader;
 use arco_catalog::manifest::{CatalogDomainManifest, DomainManifestPointer, SnapshotFile};
 use arco_catalog::parquet_util::{
-    WorkspaceSnapshotCatalogRecord, workspace_snapshot_schema, write_workspace_snapshots,
+    TransactionHandleCatalogRecord, WorkspaceSnapshotCatalogRecord, transaction_handle_schema,
+    workspace_snapshot_schema, write_transaction_handles, write_workspace_snapshots,
 };
 use arco_catalog::workspace_snapshot::RetentionStatus;
+use arco_core::control_plane_transactions::ControlPlaneHandleStatus;
 use arco_core::storage::{ObjectMeta, StorageBackend, WriteResult};
 use arco_core::{CatalogDomain, CatalogPaths, MemoryBackend, ScopedStorage, WritePrecondition};
 use arco_flow::orchestration::compactor::{
@@ -75,6 +77,7 @@ const DEFERRED_CATALOG_PRODUCT_SYSTEM_TABLES: &[(&str, &str)] = &[
 
 const SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const PARENT_SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const TRANSACTION_HANDLE_ID: &str = "hdl_01ARZ3NDEKTSV4RRFFQ69G5FAX";
 
 #[derive(Debug, Default)]
 struct DenyListBackend {
@@ -114,7 +117,7 @@ impl StorageBackend for DenyListBackend {
     async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
         if self.deny_list.load(Ordering::SeqCst) {
             return Err(arco_core::Error::Internal {
-                message: format!("list forbidden during snapshot query: {prefix}"),
+                message: format!("list forbidden during system-table query: {prefix}"),
             });
         }
         self.inner.list(prefix).await
@@ -164,8 +167,62 @@ fn snapshot_projection_with_extra_column() -> Result<Bytes> {
     Ok(Bytes::from(cursor.into_inner()))
 }
 
-async fn install_snapshot_projection(
+fn transaction_projection_bytes() -> Result<Bytes> {
+    Ok(write_transaction_handles(&[
+        TransactionHandleCatalogRecord::new(
+            TRANSACTION_HANDLE_ID,
+            1,
+            ControlPlaneHandleStatus::Visible,
+            Utc.timestamp_opt(1_700_000_000, 0)
+                .single()
+                .expect("created timestamp"),
+            Utc.timestamp_opt(1_700_000_040, 0)
+                .single()
+                .expect("updated timestamp"),
+            Utc.timestamp_opt(1_800_000_000, 0)
+                .single()
+                .expect("expiry timestamp"),
+            Some(
+                Utc.timestamp_opt(1_700_000_010, 0)
+                    .single()
+                    .expect("prepared timestamp"),
+            ),
+            Some(
+                Utc.timestamp_opt(1_700_000_020, 0)
+                    .single()
+                    .expect("committing timestamp"),
+            ),
+            Some(
+                Utc.timestamp_opt(1_700_000_030, 0)
+                    .single()
+                    .expect("visible timestamp"),
+            ),
+            None,
+            2,
+            2,
+        )?,
+    ])?)
+}
+
+fn transaction_projection_with_extra_column() -> Result<Bytes> {
+    let mut fields = transaction_handle_schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(
+        "review_token_verifier",
+        DataType::Utf8,
+        false,
+    )));
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::new_empty(schema.clone());
+    let mut cursor = Cursor::new(Vec::new());
+    let mut writer = ArrowWriter::try_new(&mut cursor, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(Bytes::from(cursor.into_inner()))
+}
+
+async fn install_catalog_projection(
     storage: &ScopedStorage,
+    file_name: &str,
     bytes: Bytes,
     selected: bool,
 ) -> Result<String> {
@@ -178,13 +235,13 @@ async fn install_snapshot_projection(
     let manifest_bytes = storage.get_raw(&pointer.manifest_path).await?;
     let mut manifest: CatalogDomainManifest = serde_json::from_slice(&manifest_bytes)?;
     let snapshot = manifest.snapshot.as_mut().expect("seeded catalog snapshot");
-    let path = format!("{}/snapshots.parquet", snapshot.path.trim_end_matches('/'));
+    let path = format!("{}/{file_name}", snapshot.path.trim_end_matches('/'));
     storage
         .put_raw(&path, bytes.clone(), WritePrecondition::None)
         .await?;
     if selected {
         snapshot.add_file(SnapshotFile {
-            path: "snapshots.parquet".to_string(),
+            path: file_name.to_string(),
             checksum_sha256: "11".repeat(32),
             byte_size: u64::try_from(bytes.len()).expect("projection size"),
             row_count: 1,
@@ -199,6 +256,22 @@ async fn install_snapshot_projection(
             .await?;
     }
     Ok(path)
+}
+
+async fn install_snapshot_projection(
+    storage: &ScopedStorage,
+    bytes: Bytes,
+    selected: bool,
+) -> Result<String> {
+    install_catalog_projection(storage, "snapshots.parquet", bytes, selected).await
+}
+
+async fn install_transaction_projection(
+    storage: &ScopedStorage,
+    bytes: Bytes,
+    selected: bool,
+) -> Result<String> {
+    install_catalog_projection(storage, "transactions.parquet", bytes, selected).await
 }
 
 fn catalog_run_index_row(
@@ -394,19 +467,71 @@ async fn query_can_select_from_system_catalog_commits() -> Result<()> {
 }
 
 #[tokio::test]
-async fn query_does_not_expose_manifest_paths_in_system_catalog_commits() -> Result<()> {
+async fn query_does_not_expose_internal_authority_in_system_catalog_commits() -> Result<()> {
     let router = seed_catalog(test_router()).await?;
 
-    let request = helpers::make_request(
-        Method::POST,
-        "/api/v1/query?format=json",
-        Some(serde_json::json!({
-            "sql": "SELECT manifest_path FROM system.catalog.commits"
-        })),
-    )?;
+    for column in ["manifest_path", "manifest_id", "event_witnesses_json"] {
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": format!("SELECT {column} FROM system.catalog.commits")
+            })),
+        )?;
 
-    let response = router.oneshot(request).await.map_err(|err| match err {})?;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{column} must remain private",
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn commit_system_table_exposes_only_its_pre_handle_schema() -> Result<()> {
+    let router = seed_catalog(test_router()).await?;
+
+    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
+        router,
+        "/api/v1/query?format=json",
+        serde_json::json!({
+            "sql": "SELECT * FROM system.catalog.commits"
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !rows.is_empty(),
+        "seeded catalog should publish a commit row"
+    );
+    let mut keys = rows[0]
+        .as_object()
+        .expect("commit row object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "commit_ulid",
+            "fencing_token",
+            "object_id",
+            "object_name",
+            "object_type",
+            "operation",
+            "published_at",
+            "snapshot_version",
+            "watermark_event_id",
+        ],
+        "private durable-handle witnesses must not expand system.catalog.commits",
+    );
     Ok(())
 }
 
@@ -554,6 +679,213 @@ async fn snapshot_system_table_selected_projection_requires_no_storage_listing()
         .await
         .map_err(|error| match error {})?;
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_system_table_exposes_only_the_exact_safe_manifest_selected_schema()
+-> Result<()> {
+    let (router, backend) = test_router_with_backend();
+    let router = seed_catalog(router).await?;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let storage = ScopedStorage::new(backend, "test-tenant", "test-workspace")?;
+    install_transaction_projection(&storage, transaction_projection_bytes()?, true).await?;
+
+    let (status, rows): (_, Vec<serde_json::Value>) = helpers::post_json(
+        router.clone(),
+        "/api/v1/query?format=json",
+        serde_json::json!({
+            "sql": "SELECT * FROM system.catalog.transactions"
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(1, rows.len());
+    let mut keys = rows[0]
+        .as_object()
+        .expect("row object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "committing_at",
+            "created_at",
+            "expires_at",
+            "handle_id",
+            "lifecycle",
+            "mutation_count",
+            "prepared_at",
+            "record_version",
+            "updated_at",
+            "visible_at",
+            "visible_mutation_count",
+        ]
+    );
+    assert_eq!(rows[0]["handle_id"], TRANSACTION_HANDLE_ID);
+    assert_eq!(rows[0]["lifecycle"], "VISIBLE");
+    assert_eq!(rows[0]["mutation_count"].as_u64(), Some(2));
+    assert_eq!(rows[0]["visible_mutation_count"].as_u64(), Some(2));
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT terminal_at IS NULL AS terminal_at_is_null FROM system.catalog.transactions"
+        })),
+    )?;
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .map_err(|error| match error {})?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for forbidden in [
+        "review_token",
+        "review_token_verifier",
+        "actor",
+        "request_id",
+        "idempotency_key",
+        "mutation_kind",
+        "mutation_payload",
+        "staged_path",
+        "digest",
+        "transaction_id",
+        "receipt",
+        "manifest",
+        "read_token",
+        "failure_detail",
+        "provider_uri",
+        "storage_root",
+        "credential",
+    ] {
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/query?format=json",
+            Some(serde_json::json!({
+                "sql": format!("SELECT {forbidden} FROM system.catalog.transactions")
+            })),
+        )?;
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|error| match error {})?;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "must omit {forbidden}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_system_table_ignores_a_physically_present_unselected_projection() -> Result<()>
+{
+    let (router, backend) = test_router_with_backend();
+    let router = seed_catalog(router).await?;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let storage = ScopedStorage::new(backend, "test-tenant", "test-workspace")?;
+    install_transaction_projection(&storage, transaction_projection_bytes()?, false).await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM system.catalog.transactions"
+        })),
+    )?;
+    let response = router
+        .oneshot(request)
+        .await
+        .map_err(|error| match error {})?;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_system_table_rejects_selected_projection_with_extra_columns() -> Result<()> {
+    let (router, backend) = test_router_with_backend();
+    let router = seed_catalog(router).await?;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let storage = ScopedStorage::new(backend, "test-tenant", "test-workspace")?;
+    install_transaction_projection(&storage, transaction_projection_with_extra_column()?, true)
+        .await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM system.catalog.transactions"
+        })),
+    )?;
+    let response = router
+        .oneshot(request)
+        .await
+        .map_err(|error| match error {})?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_system_table_selected_projection_requires_no_storage_listing() -> Result<()> {
+    let backend = Arc::new(DenyListBackend::default());
+    let storage_backend: Arc<dyn StorageBackend> = backend.clone();
+    let router = ServerBuilder::new()
+        .debug(true)
+        .storage_backend(storage_backend.clone())
+        .build()
+        .test_router();
+    let router = seed_catalog(router).await?;
+    let storage = ScopedStorage::new(storage_backend, "test-tenant", "test-workspace")?;
+    install_transaction_projection(&storage, transaction_projection_bytes()?, true).await?;
+    backend.deny_list();
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT handle_id FROM system.catalog.transactions"
+        })),
+    )?;
+    let response = router
+        .oneshot(request)
+        .await
+        .map_err(|error| match error {})?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn transaction_system_table_allowlist_rejects_a_selected_alias() -> Result<()> {
+    let (router, backend) = test_router_with_backend();
+    let router = seed_catalog(router).await?;
+    let backend: Arc<dyn StorageBackend> = backend;
+    let storage = ScopedStorage::new(backend, "test-tenant", "test-workspace")?;
+    install_catalog_projection(
+        &storage,
+        "transaction_handles.parquet",
+        transaction_projection_bytes()?,
+        true,
+    )
+    .await?;
+
+    let request = helpers::make_request(
+        Method::POST,
+        "/api/v1/query?format=json",
+        Some(serde_json::json!({
+            "sql": "SELECT * FROM system.catalog.transaction_handles"
+        })),
+    )?;
+    let response = router
+        .oneshot(request)
+        .await
+        .map_err(|error| match error {})?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 

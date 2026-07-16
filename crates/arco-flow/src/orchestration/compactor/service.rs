@@ -11,7 +11,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
@@ -27,6 +27,7 @@ use metrics::{counter, gauge, histogram};
 use crate::error::{Error, Result};
 use crate::metrics::{labels as metric_labels, names as metric_names};
 use crate::orchestration::events::OrchestrationEvent;
+use crate::orchestration::ledger::LedgerWriter;
 use crate::paths::{
     orchestration_base_snapshot_dir, orchestration_compaction_lock_path, orchestration_l0_dir,
     orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path,
@@ -42,8 +43,8 @@ use super::fold::{
 };
 use super::manifest::{
     BaseSnapshot, EventRange, L0Delta, LedgerRebuildManifest, OrchestrationManifest,
-    OrchestrationManifestPointer, RowCounts, TableArtifact, TablePaths, Watermarks,
-    next_manifest_id,
+    OrchestrationManifestPointer, OrchestrationPublicationWitness, RowCounts, TableArtifact,
+    TablePaths, Watermarks, next_manifest_id,
 };
 use super::parquet_util::{
     read_partition_status, write_backfill_chunks, write_backfills, write_catalog_run_index,
@@ -504,13 +505,23 @@ impl MicroCompactor {
 
             // Process events
             let mut events = Vec::new();
+            let mut seen_event_paths = BTreeSet::new();
             for path in &event_paths {
+                if !seen_event_paths.insert(path) {
+                    continue;
+                }
                 let data = self.storage.get_raw(path).await?;
                 let event: OrchestrationEvent =
                     serde_json::from_slice(&data).map_err(|e| Error::Serialization {
                         message: format!("failed to parse event at {path}: {e}"),
                     })?;
                 self.validate_event_scope(path, &event)?;
+                let canonical_path = LedgerWriter::event_path(&event);
+                if path != &canonical_path {
+                    return Err(Error::from(arco_core::Error::InvalidInput(format!(
+                        "noncanonical event path {path:?}: expected {canonical_path:?}"
+                    ))));
+                }
                 events.push((path.clone(), event));
             }
 
@@ -649,6 +660,16 @@ impl MicroCompactor {
             let watermark_changed =
                 update_watermarks(&mut manifest, &events, &last_event, self.durability_mode);
             let manifest_changed = storage_changed || watermark_changed;
+            if manifest_changed {
+                let witnessed_events = events
+                    .iter()
+                    .map(|(_, event)| event.clone())
+                    .collect::<Vec<_>>();
+                manifest.publication_witness = Some(
+                    OrchestrationPublicationWitness::for_events(&witnessed_events)
+                        .map_err(|message| Error::Serialization { message })?,
+                );
+            }
 
             let mut visibility_status = CompactionVisibility::Visible;
             let mut repair_pending = false;
@@ -2217,18 +2238,17 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        write_events(storage, "2025-01-15", vec![event1, event2]).await
+        write_events(storage, vec![event1, event2]).await
     }
 
     async fn write_events(
         storage: &ScopedStorage,
-        date: &str,
         events: Vec<OrchestrationEvent>,
     ) -> Result<Vec<String>> {
         let mut paths = Vec::with_capacity(events.len());
 
         for event in events {
-            let path = orchestration_event_path(date, &event.event_id);
+            let path = LedgerWriter::event_path(&event);
             storage
                 .put_raw(
                     &path,
@@ -2734,8 +2754,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
-        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
+        let path1 = LedgerWriter::event_path(&event1);
+        let path2 = LedgerWriter::event_path(&event2);
 
         storage
             .put_raw(
@@ -2794,6 +2814,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_rejects_event_loaded_from_noncanonical_path() -> Result<()> {
+        let (compactor, storage) = create_test_compactor().await?;
+        let event = make_run_triggered_event();
+        let canonical_path = LedgerWriter::event_path(&event);
+        let noncanonical_path = format!("{canonical_path}.copy");
+        storage
+            .put_raw(
+                &noncanonical_path,
+                Bytes::from(serde_json::to_string(&event).expect("serialize")),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let error = compactor
+            .compact_events(vec![noncanonical_path.clone()])
+            .await
+            .expect_err("noncanonical event path must be rejected");
+
+        assert!(
+            error.to_string().contains("noncanonical event path"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            storage
+                .get_raw(orchestration_manifest_pointer_path())
+                .await
+                .is_err(),
+            "rejected event must not publish a manifest"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compact_rejects_event_outside_storage_scope() -> Result<()> {
         let (compactor, storage) = create_test_compactor().await?;
 
@@ -2815,7 +2869,7 @@ mod tests {
         let events = [event1, event2, event3];
         let mut paths = Vec::new();
         for event in events {
-            let path = orchestration_event_path("2025-01-15", &event.event_id);
+            let path = LedgerWriter::event_path(&event);
             storage
                 .put_raw(
                     &path,
@@ -2846,8 +2900,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
-        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
+        let path1 = LedgerWriter::event_path(&event1);
+        let path2 = LedgerWriter::event_path(&event2);
 
         storage
             .put_raw(
@@ -3080,7 +3134,7 @@ mod tests {
 
         let mut paths = Vec::new();
         for event in &events {
-            let path = orchestration_event_path("2026-01-15", &event.event_id);
+            let path = LedgerWriter::event_path(event);
             storage
                 .put_raw(
                     &path,
@@ -3134,8 +3188,8 @@ mod tests {
 
         let event1_id = event1.event_id.clone();
         let event2_id = event2.event_id.clone();
-        let path1 = orchestration_event_path("2025-01-15", &event1_id);
-        let path2 = orchestration_event_path("2025-01-15", &event2_id);
+        let path1 = LedgerWriter::event_path(&event1);
+        let path2 = LedgerWriter::event_path(&event2);
 
         storage
             .put_raw(
@@ -3183,8 +3237,8 @@ mod tests {
         let event1 = make_run_triggered_event();
         let event2 = make_plan_created_event();
 
-        let path1 = orchestration_event_path("2025-01-15", &event1.event_id);
-        let path2 = orchestration_event_path("2025-01-15", &event2.event_id);
+        let path1 = LedgerWriter::event_path(&event1);
+        let path2 = LedgerWriter::event_path(&event2);
 
         storage
             .put_raw(
@@ -3205,7 +3259,7 @@ mod tests {
 
         let attempt_id = Ulid::new().to_string();
         let event3 = make_task_started_event(&attempt_id);
-        let path3 = orchestration_event_path("2025-01-15", &event3.event_id);
+        let path3 = LedgerWriter::event_path(&event3);
         storage
             .put_raw(
                 &path3,
@@ -3242,7 +3296,7 @@ mod tests {
         for index in 0..32 {
             history.extend(make_history_run_events(index));
         }
-        let history_paths = write_events(&storage, "2025-01-15", history).await?;
+        let history_paths = write_events(&storage, history).await?;
         compactor.compact_events(history_paths).await?;
 
         let history_manifest = load_current_manifest(&storage).await?;
@@ -3268,7 +3322,7 @@ mod tests {
             },
             "evt_callback_001_started",
         );
-        let started_paths = write_events(&storage, "2025-01-15", vec![started]).await?;
+        let started_paths = write_events(&storage, vec![started]).await?;
         compactor.compact_events(started_paths).await?;
 
         let heartbeat = OrchestrationEvent::new_with_event_id(
@@ -3286,7 +3340,7 @@ mod tests {
             },
             "evt_callback_002_heartbeat",
         );
-        let heartbeat_paths = write_events(&storage, "2025-01-15", vec![heartbeat]).await?;
+        let heartbeat_paths = write_events(&storage, vec![heartbeat]).await?;
         compactor.compact_events(heartbeat_paths).await?;
 
         let heartbeat_manifest = load_current_manifest(&storage).await?;
@@ -3327,7 +3381,7 @@ mod tests {
             },
             "evt_callback_003_finished",
         );
-        let finished_paths = write_events(&storage, "2025-01-15", vec![finished]).await?;
+        let finished_paths = write_events(&storage, vec![finished]).await?;
         compactor.compact_events(finished_paths).await?;
 
         let finished_manifest = load_current_manifest(&storage).await?;
@@ -3355,7 +3409,7 @@ mod tests {
         // DispatchEnqueued arrives first (newer ULID)
         let mut enqueued = make_dispatch_enqueued_event(&dispatch_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
+        let path1 = LedgerWriter::event_path(&enqueued);
         storage
             .put_raw(
                 &path1,
@@ -3368,7 +3422,7 @@ mod tests {
         // DispatchRequested arrives later but with older ULID
         let mut requested = make_dispatch_requested_event("run_01", "extract", 1, "01HQ123ATT");
         requested.event_id = "01A".to_string();
-        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
+        let path2 = LedgerWriter::event_path(&requested);
         storage
             .put_raw(
                 &path2,
@@ -3399,7 +3453,7 @@ mod tests {
         // TimerEnqueued arrives first (newer ULID)
         let mut enqueued = make_timer_enqueued_event(&timer_id);
         enqueued.event_id = "01B".to_string();
-        let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
+        let path1 = LedgerWriter::event_path(&enqueued);
         storage
             .put_raw(
                 &path1,
@@ -3413,7 +3467,7 @@ mod tests {
         let canonical_fire_at = DateTime::from_timestamp(fire_epoch + 30, 0).unwrap();
         let mut requested = make_timer_requested_event(&timer_id, canonical_fire_at);
         requested.event_id = "01A".to_string();
-        let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
+        let path2 = LedgerWriter::event_path(&requested);
         storage
             .put_raw(
                 &path2,

@@ -14,11 +14,12 @@ use chrono::{TimeZone, Utc};
 use proptest::prelude::*;
 use tokio_test::block_on;
 
-use arco_core::{AssetId, FlowPaths, MemoryBackend, ScopedStorage, TaskId, WritePrecondition};
+use arco_core::{AssetId, MemoryBackend, ScopedStorage, TaskId, WritePrecondition};
 use arco_flow::orchestration::compactor::{FoldState, MicroCompactor};
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
 };
+use arco_flow::orchestration::ledger::LedgerWriter;
 use arco_flow::plan::{AssetKey, PlanBuilder, ResourceRequirements, TaskSpec};
 use arco_flow::run::RunState;
 use arco_flow::task::TaskState;
@@ -170,7 +171,7 @@ async fn compact_state_for_path_order(path_order: &[usize]) -> FoldState {
 
     let mut paths = Vec::with_capacity(events.len());
     for event in &events {
-        let path = FlowPaths::orchestration_event_path("2025-01-15", &event.event_id);
+        let path = LedgerWriter::event_path(event);
         storage
             .put_raw(
                 &path,
@@ -206,7 +207,7 @@ async fn crash_replay_state(split_index: usize) -> FoldState {
 
     let mut paths = Vec::with_capacity(events.len());
     for event in &events {
-        let path = FlowPaths::orchestration_event_path("2025-01-15", &event.event_id);
+        let path = LedgerWriter::event_path(event);
         storage
             .put_raw(
                 &path,

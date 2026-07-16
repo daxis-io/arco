@@ -5,13 +5,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::catalog_common::{CatalogProvider, SchemaProvider};
+use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use arco_catalog::parquet_util::workspace_snapshot_schema;
+use arco_catalog::parquet_util::{transaction_handle_schema, workspace_snapshot_schema};
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_core::{CatalogDomain, ScopedStorage};
 use arco_flow::orchestration::compactor::{
@@ -64,6 +66,11 @@ const CATALOG_SYSTEM_TABLES: &[SystemTableSpec] = &[
         schema: "catalog",
         table: "snapshots",
         path: "snapshots.parquet",
+    },
+    SystemTableSpec {
+        schema: "catalog",
+        table: "transactions",
+        path: "transactions.parquet",
     },
 ];
 
@@ -225,7 +232,14 @@ async fn register_domain_specs(
         if spec.path == "snapshots.parquet" {
             validate_workspace_snapshot_schema(&bytes)?;
         }
-        let table = parquet_bytes_to_mem_table(bytes)?;
+        if spec.path == "transactions.parquet" {
+            validate_transaction_handle_schema(&bytes)?;
+        }
+        let table = if spec.path == "commits.parquet" {
+            catalog_commits_to_safe_mem_table(bytes)?
+        } else {
+            parquet_bytes_to_mem_table(bytes)?
+        };
         schema_provider
             .register_table(spec.table.to_string(), table)
             .map_err(|err| ApiError::internal(format!("failed to register system table: {err}")))?;
@@ -233,6 +247,64 @@ async fn register_domain_specs(
     }
 
     Ok(registered)
+}
+
+fn catalog_commits_to_safe_mem_table(bytes: Bytes) -> Result<Arc<MemTable>, ApiError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to read catalog commit projection schema: {error}"
+        ))
+    })?;
+    let source_schema = builder.schema();
+    let safe_schema = Arc::new(Schema::new(vec![
+        Field::new("commit_ulid", DataType::Utf8, false),
+        Field::new("snapshot_version", DataType::Int64, false),
+        Field::new("published_at", DataType::Int64, false),
+        Field::new("fencing_token", DataType::Int64, false),
+        Field::new("watermark_event_id", DataType::Utf8, true),
+        Field::new("operation", DataType::Utf8, true),
+        Field::new("object_type", DataType::Utf8, true),
+        Field::new("object_id", DataType::Utf8, true),
+        Field::new("object_name", DataType::Utf8, true),
+    ]));
+    let mut projection = Vec::with_capacity(safe_schema.fields().len());
+    for expected in safe_schema.fields() {
+        let index = source_schema.index_of(expected.name()).map_err(|_| {
+            ApiError::internal(
+                "system.catalog.commits is missing a required public projection column",
+            )
+        })?;
+        if source_schema.field(index) != expected.as_ref() {
+            return Err(ApiError::internal(
+                "system.catalog.commits has an unsafe or incompatible public projection column",
+            ));
+        }
+        projection.push(index);
+    }
+    let reader = builder.build().map_err(|error| {
+        ApiError::internal(format!(
+            "failed to build catalog commit projection reader: {error}"
+        ))
+    })?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        let batch = batch.map_err(|error| {
+            ApiError::internal(format!(
+                "failed to decode catalog commit projection: {error}"
+            ))
+        })?;
+        batches.push(batch.project(&projection).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to project safe catalog commit columns: {error}"
+            ))
+        })?);
+    }
+    let table = MemTable::try_new(safe_schema, vec![batches]).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to register safe catalog commit projection: {error}"
+        ))
+    })?;
+    Ok(Arc::new(table))
 }
 
 fn validate_workspace_snapshot_schema(bytes: &Bytes) -> Result<(), ApiError> {
@@ -246,6 +318,22 @@ fn validate_workspace_snapshot_schema(bytes: &Bytes) -> Result<(), ApiError> {
     if actual.fields() != expected.fields() {
         return Err(ApiError::internal(
             "system.catalog.snapshots has an unsafe or incompatible schema",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transaction_handle_schema(bytes: &Bytes) -> Result<(), ApiError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to read transaction projection schema: {error}"
+        ))
+    })?;
+    let actual = builder.schema();
+    let expected = transaction_handle_schema();
+    if actual.fields() != expected.fields() {
+        return Err(ApiError::internal(
+            "system.catalog.transactions has an unsafe or incompatible schema",
         ));
     }
     Ok(())

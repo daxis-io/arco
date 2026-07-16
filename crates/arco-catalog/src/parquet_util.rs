@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize};
 
 use chrono::{DateTime, Utc};
 
+use arco_core::EventId;
+use arco_core::control_plane_transactions::{ControlPlaneHandleStatus, ControlPlaneTxPaths};
+
 use crate::error::{CatalogError, Result};
 use crate::workspace_snapshot::{RetentionStatus, RetentionTarget};
 
@@ -154,6 +157,12 @@ pub struct SearchPostingRecord {
 pub struct CatalogCommitRecord {
     /// Visible commit ULID.
     pub commit_ulid: String,
+    /// Immutable manifest selected for this commit when recorded by a witness-aware writer.
+    #[serde(default)]
+    pub manifest_id: Option<String>,
+    /// Canonical private per-event publication witnesses for this commit.
+    #[serde(default)]
+    pub event_witnesses_json: Option<String>,
     /// Pointer-selected snapshot version.
     pub snapshot_version: i64,
     /// Publication timestamp in milliseconds since epoch.
@@ -170,6 +179,79 @@ pub struct CatalogCommitRecord {
     pub object_id: Option<String>,
     /// Object name affected by the commit.
     pub object_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CatalogCommitEventWitness {
+    pub event_id: String,
+    pub event_sha256: String,
+}
+
+pub(crate) fn encode_catalog_commit_event_witnesses(
+    mut witnesses: Vec<CatalogCommitEventWitness>,
+) -> Result<String> {
+    if witnesses.is_empty() {
+        return Err(CatalogError::InvariantViolation {
+            message: "catalog commit event witness set is empty".to_string(),
+        });
+    }
+    for witness in &witnesses {
+        let event_id =
+            witness
+                .event_id
+                .parse::<EventId>()
+                .map_err(|_| CatalogError::InvariantViolation {
+                    message: "catalog commit event witness has an invalid event ID".to_string(),
+                })?;
+        if event_id.to_string() != witness.event_id {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog commit event witness has a non-canonical event ID".to_string(),
+            });
+        }
+        let Some(digest) = witness.event_sha256.strip_prefix("sha256:") else {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog commit event witness has an invalid event digest".to_string(),
+            });
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog commit event witness has an invalid event digest".to_string(),
+            });
+        }
+    }
+    witnesses.sort_unstable_by(|left, right| left.event_id.cmp(&right.event_id));
+    if witnesses
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left.event_id == right.event_id))
+    {
+        return Err(CatalogError::InvariantViolation {
+            message: "catalog commit event witnesses contain a duplicate event ID".to_string(),
+        });
+    }
+    serde_json::to_string(&witnesses).map_err(|error| CatalogError::Serialization {
+        message: format!("failed to encode catalog commit event witnesses: {error}"),
+    })
+}
+
+pub(crate) fn decode_catalog_commit_event_witnesses(
+    encoded: &str,
+) -> Result<Vec<CatalogCommitEventWitness>> {
+    let witnesses: Vec<CatalogCommitEventWitness> =
+        serde_json::from_str(encoded).map_err(|_| CatalogError::InvariantViolation {
+            message: "catalog commit event witnesses are corrupt".to_string(),
+        })?;
+    let canonical = encode_catalog_commit_event_witnesses(witnesses.clone())?;
+    if canonical != encoded {
+        return Err(CatalogError::InvariantViolation {
+            message: "catalog commit event witnesses are not canonical".to_string(),
+        });
+    }
+    Ok(witnesses)
 }
 
 /// Safe row exposed by the manifest-selected `system.catalog.snapshots` projection.
@@ -231,6 +313,265 @@ impl WorkspaceSnapshotCatalogRecord {
             has_legacy_compatibility,
         })
     }
+}
+
+/// Safe row exposed by the manifest-selected `system.catalog.transactions` projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionHandleCatalogRecord {
+    handle_id: String,
+    record_version: u32,
+    lifecycle: ControlPlaneHandleStatus,
+    created_at: i64,
+    updated_at: i64,
+    expires_at: i64,
+    prepared_at: Option<i64>,
+    committing_at: Option<i64>,
+    visible_at: Option<i64>,
+    terminal_at: Option<i64>,
+    mutation_count: u32,
+    visible_mutation_count: u32,
+}
+
+impl TransactionHandleCatalogRecord {
+    /// Creates one exact-safe transaction-handle catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed IDs, versions, lifecycle
+    /// evidence, timestamps, or counts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        handle_id: impl Into<String>,
+        record_version: u32,
+        lifecycle: ControlPlaneHandleStatus,
+        created_at: DateTime<Utc>,
+        updated_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        prepared_at: Option<DateTime<Utc>>,
+        committing_at: Option<DateTime<Utc>>,
+        visible_at: Option<DateTime<Utc>>,
+        terminal_at: Option<DateTime<Utc>>,
+        mutation_count: usize,
+        visible_mutation_count: usize,
+    ) -> Result<Self> {
+        let handle_id = handle_id.into();
+        validate_transaction_handle_id(&handle_id)?;
+        if record_version != 1 {
+            return Err(transaction_catalog_validation(
+                "transaction handle catalog record_version must be 1",
+            ));
+        }
+        validate_transaction_timestamp_order(
+            lifecycle,
+            created_at,
+            updated_at,
+            expires_at,
+            prepared_at.as_ref(),
+            committing_at.as_ref(),
+            visible_at.as_ref(),
+            terminal_at.as_ref(),
+        )?;
+
+        let mutation_count = u32::try_from(mutation_count).map_err(|_| {
+            transaction_catalog_validation("transaction handle catalog mutation_count exceeds u32")
+        })?;
+        let visible_mutation_count = u32::try_from(visible_mutation_count).map_err(|_| {
+            transaction_catalog_validation(
+                "transaction handle catalog visible_mutation_count exceeds u32",
+            )
+        })?;
+        if visible_mutation_count > mutation_count {
+            return Err(transaction_catalog_validation(
+                "transaction handle catalog visible_mutation_count exceeds mutation_count",
+            ));
+        }
+
+        validate_transaction_lifecycle_evidence(
+            lifecycle,
+            expires_at,
+            prepared_at.as_ref(),
+            committing_at.as_ref(),
+            visible_at.as_ref(),
+            terminal_at.as_ref(),
+            mutation_count,
+            visible_mutation_count,
+        )?;
+
+        Ok(Self {
+            handle_id,
+            record_version,
+            lifecycle,
+            created_at: created_at.timestamp_millis(),
+            updated_at: updated_at.timestamp_millis(),
+            expires_at: expires_at.timestamp_millis(),
+            prepared_at: prepared_at.map(|timestamp| timestamp.timestamp_millis()),
+            committing_at: committing_at.map(|timestamp| timestamp.timestamp_millis()),
+            visible_at: visible_at.map(|timestamp| timestamp.timestamp_millis()),
+            terminal_at: terminal_at.map(|timestamp| timestamp.timestamp_millis()),
+            mutation_count,
+            visible_mutation_count,
+        })
+    }
+}
+
+fn transaction_catalog_validation(message: impl Into<String>) -> CatalogError {
+    CatalogError::Validation {
+        message: message.into(),
+    }
+}
+
+fn validate_transaction_handle_id(handle_id: &str) -> Result<()> {
+    ControlPlaneTxPaths::handle_record(handle_id)
+        .map(|_| ())
+        .map_err(|error| {
+            transaction_catalog_validation(format!(
+                "transaction handle catalog handle_id is invalid: {error}"
+            ))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_transaction_timestamp_order(
+    lifecycle: ControlPlaneHandleStatus,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    prepared_at: Option<&DateTime<Utc>>,
+    committing_at: Option<&DateTime<Utc>>,
+    visible_at: Option<&DateTime<Utc>>,
+    terminal_at: Option<&DateTime<Utc>>,
+) -> Result<()> {
+    if updated_at < created_at {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog updated_at must not precede created_at",
+        ));
+    }
+    if expires_at <= created_at {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog expires_at must follow created_at",
+        ));
+    }
+    for (field, timestamp) in [
+        ("prepared_at", prepared_at),
+        ("committing_at", committing_at),
+        ("visible_at", visible_at),
+        ("terminal_at", terminal_at),
+    ] {
+        if timestamp.is_some_and(|timestamp| timestamp < &created_at || timestamp > &updated_at) {
+            return Err(transaction_catalog_validation(format!(
+                "transaction handle catalog {field} must be between created_at and updated_at"
+            )));
+        }
+    }
+    if prepared_at
+        .zip(committing_at)
+        .is_some_and(|(prepared, committing)| committing < prepared)
+    {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog committing_at must not precede prepared_at",
+        ));
+    }
+    if committing_at
+        .zip(visible_at)
+        .is_some_and(|(committing, visible)| visible < committing)
+    {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog visible_at must not precede committing_at",
+        ));
+    }
+    if prepared_at.is_some_and(|prepared| prepared >= &expires_at) {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog prepared_at must precede expires_at",
+        ));
+    }
+    if committing_at.is_some_and(|committing| committing >= &expires_at) {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog committing_at must precede expires_at",
+        ));
+    }
+    if terminal_at
+        .zip(prepared_at)
+        .is_some_and(|(terminal, prepared)| terminal < prepared)
+    {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog terminal_at must not precede prepared_at",
+        ));
+    }
+    if lifecycle == ControlPlaneHandleStatus::Aborted
+        && terminal_at.is_some_and(|terminal| terminal >= &expires_at)
+    {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog ABORTED terminal_at must precede expires_at",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_transaction_lifecycle_evidence(
+    lifecycle: ControlPlaneHandleStatus,
+    expires_at: DateTime<Utc>,
+    prepared_at: Option<&DateTime<Utc>>,
+    committing_at: Option<&DateTime<Utc>>,
+    visible_at: Option<&DateTime<Utc>>,
+    terminal_at: Option<&DateTime<Utc>>,
+    mutation_count: u32,
+    visible_mutation_count: u32,
+) -> Result<()> {
+    let no_forward_timestamps = committing_at.is_none() && visible_at.is_none();
+    let no_visible_mutations = visible_mutation_count == 0;
+    let has_mutations = mutation_count > 0;
+    let valid = match lifecycle {
+        ControlPlaneHandleStatus::Open => {
+            prepared_at.is_none()
+                && no_forward_timestamps
+                && terminal_at.is_none()
+                && no_visible_mutations
+        }
+        ControlPlaneHandleStatus::Preparing => {
+            has_mutations
+                && prepared_at.is_none()
+                && no_forward_timestamps
+                && terminal_at.is_none()
+                && no_visible_mutations
+        }
+        ControlPlaneHandleStatus::Prepared => {
+            has_mutations
+                && prepared_at.is_some()
+                && no_forward_timestamps
+                && terminal_at.is_none()
+                && no_visible_mutations
+        }
+        ControlPlaneHandleStatus::Committing | ControlPlaneHandleStatus::RepairRequired => {
+            has_mutations
+                && prepared_at.is_some()
+                && committing_at.is_some()
+                && visible_at.is_none()
+                && terminal_at.is_none()
+        }
+        ControlPlaneHandleStatus::Visible => {
+            has_mutations
+                && prepared_at.is_some()
+                && committing_at.is_some()
+                && visible_at.is_some()
+                && terminal_at.is_none()
+                && visible_mutation_count == mutation_count
+        }
+        ControlPlaneHandleStatus::Aborted => {
+            no_forward_timestamps && terminal_at.is_some() && no_visible_mutations
+        }
+        ControlPlaneHandleStatus::Expired => {
+            no_forward_timestamps
+                && terminal_at.is_some_and(|terminal| terminal >= &expires_at)
+                && no_visible_mutations
+        }
+    };
+    if !valid {
+        return Err(transaction_catalog_validation(format!(
+            "transaction handle catalog lifecycle evidence is inconsistent for {lifecycle:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn namespaces_schema() -> Arc<Schema> {
@@ -318,6 +659,8 @@ fn commits_schema() -> Arc<Schema> {
         Field::new("object_type", DataType::Utf8, true),
         Field::new("object_id", DataType::Utf8, true),
         Field::new("object_name", DataType::Utf8, true),
+        Field::new("manifest_id", DataType::Utf8, true),
+        Field::new("event_witnesses_json", DataType::Utf8, true),
     ]))
 }
 
@@ -331,6 +674,23 @@ fn workspace_snapshots_schema() -> Arc<Schema> {
         Field::new("domain_count", DataType::UInt32, false),
         Field::new("parent_snapshot_id", DataType::Utf8, true),
         Field::new("has_legacy_compatibility", DataType::Boolean, false),
+    ]))
+}
+
+fn transaction_handles_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("handle_id", DataType::Utf8, false),
+        Field::new("record_version", DataType::UInt32, false),
+        Field::new("lifecycle", DataType::Utf8, false),
+        Field::new("created_at", DataType::Int64, false),
+        Field::new("updated_at", DataType::Int64, false),
+        Field::new("expires_at", DataType::Int64, false),
+        Field::new("prepared_at", DataType::Int64, true),
+        Field::new("committing_at", DataType::Int64, true),
+        Field::new("visible_at", DataType::Int64, true),
+        Field::new("terminal_at", DataType::Int64, true),
+        Field::new("mutation_count", DataType::UInt32, false),
+        Field::new("visible_mutation_count", DataType::UInt32, false),
     ]))
 }
 
@@ -384,6 +744,12 @@ pub fn commit_schema() -> Schema {
 #[must_use]
 pub fn workspace_snapshot_schema() -> Schema {
     (*workspace_snapshots_schema()).clone()
+}
+
+/// Returns the exact safe schema for `system.catalog.transactions`.
+#[must_use]
+pub fn transaction_handle_schema() -> Schema {
+    (*transaction_handles_schema()).clone()
 }
 
 fn writer_properties() -> WriterProperties {
@@ -754,6 +1120,16 @@ pub fn write_commits(rows: &[CatalogCommitRecord]) -> Result<Bytes> {
             .map(|r| Some(r.commit_ulid.as_str()))
             .collect::<Vec<_>>(),
     );
+    let manifest_ids = StringArray::from(
+        rows.iter()
+            .map(|r| r.manifest_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let event_witnesses = StringArray::from(
+        rows.iter()
+            .map(|r| r.event_witnesses_json.as_deref())
+            .collect::<Vec<_>>(),
+    );
     let snapshot_versions =
         Int64Array::from(rows.iter().map(|r| r.snapshot_version).collect::<Vec<_>>());
     let published_at = Int64Array::from(rows.iter().map(|r| r.published_at).collect::<Vec<_>>());
@@ -796,6 +1172,8 @@ pub fn write_commits(rows: &[CatalogCommitRecord]) -> Result<Bytes> {
             Arc::new(object_types),
             Arc::new(object_ids),
             Arc::new(object_names),
+            Arc::new(manifest_ids),
+            Arc::new(event_witnesses),
         ],
     )
     .map_err(|e| CatalogError::Parquet {
@@ -868,6 +1246,97 @@ pub fn write_workspace_snapshots(rows: &[WorkspaceSnapshotCatalogRecord]) -> Res
         message: format!("snapshot catalog record batch build failed: {error}"),
     })?;
     write_single_batch(schema, &batch)
+}
+
+/// Writes the exact-safe `transactions.parquet` projection.
+///
+/// Rows are sorted by canonical handle ID so an equivalent row set produces
+/// identical Parquet bytes regardless of caller order.
+///
+/// # Errors
+///
+/// Returns an error for duplicate handle IDs or if the record batch or
+/// Parquet file cannot be built.
+pub fn write_transaction_handles(rows: &[TransactionHandleCatalogRecord]) -> Result<Bytes> {
+    let schema = transaction_handles_schema();
+    let mut rows = rows.iter().collect::<Vec<_>>();
+    rows.sort_unstable_by(|left, right| left.handle_id.cmp(&right.handle_id));
+    if rows
+        .windows(2)
+        .any(|pair| matches!(pair, [left, right] if left.handle_id == right.handle_id))
+    {
+        return Err(transaction_catalog_validation(
+            "transaction handle catalog projection contains duplicate handle_id rows",
+        ));
+    }
+
+    let handle_ids = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.handle_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let record_versions = UInt32Array::from(
+        rows.iter()
+            .map(|row| row.record_version)
+            .collect::<Vec<_>>(),
+    );
+    let lifecycles = StringArray::from(
+        rows.iter()
+            .map(|row| Some(transaction_handle_lifecycle_name(row.lifecycle)))
+            .collect::<Vec<_>>(),
+    );
+    let created_at = Int64Array::from(rows.iter().map(|row| row.created_at).collect::<Vec<_>>());
+    let updated_at = Int64Array::from(rows.iter().map(|row| row.updated_at).collect::<Vec<_>>());
+    let expires_at = Int64Array::from(rows.iter().map(|row| row.expires_at).collect::<Vec<_>>());
+    let prepared_at = Int64Array::from(rows.iter().map(|row| row.prepared_at).collect::<Vec<_>>());
+    let committing_at =
+        Int64Array::from(rows.iter().map(|row| row.committing_at).collect::<Vec<_>>());
+    let visible_at = Int64Array::from(rows.iter().map(|row| row.visible_at).collect::<Vec<_>>());
+    let terminal_at = Int64Array::from(rows.iter().map(|row| row.terminal_at).collect::<Vec<_>>());
+    let mutation_count = UInt32Array::from(
+        rows.iter()
+            .map(|row| row.mutation_count)
+            .collect::<Vec<_>>(),
+    );
+    let visible_mutation_count = UInt32Array::from(
+        rows.iter()
+            .map(|row| row.visible_mutation_count)
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(handle_ids),
+            Arc::new(record_versions),
+            Arc::new(lifecycles),
+            Arc::new(created_at),
+            Arc::new(updated_at),
+            Arc::new(expires_at),
+            Arc::new(prepared_at),
+            Arc::new(committing_at),
+            Arc::new(visible_at),
+            Arc::new(terminal_at),
+            Arc::new(mutation_count),
+            Arc::new(visible_mutation_count),
+        ],
+    )
+    .map_err(|error| CatalogError::Parquet {
+        message: format!("transaction handle catalog record batch build failed: {error}"),
+    })?;
+    write_single_batch(schema, &batch)
+}
+
+const fn transaction_handle_lifecycle_name(status: ControlPlaneHandleStatus) -> &'static str {
+    match status {
+        ControlPlaneHandleStatus::Open => "OPEN",
+        ControlPlaneHandleStatus::Preparing => "PREPARING",
+        ControlPlaneHandleStatus::Prepared => "PREPARED",
+        ControlPlaneHandleStatus::Committing => "COMMITTING",
+        ControlPlaneHandleStatus::Visible => "VISIBLE",
+        ControlPlaneHandleStatus::Aborted => "ABORTED",
+        ControlPlaneHandleStatus::Expired => "EXPIRED",
+        ControlPlaneHandleStatus::RepairRequired => "REPAIR_REQUIRED",
+    }
 }
 
 fn read_batches(bytes: &Bytes) -> Result<Vec<RecordBatch>> {
@@ -1278,6 +1747,8 @@ pub fn read_commits(bytes: &Bytes) -> Result<Vec<CatalogCommitRecord>> {
     let mut out = Vec::new();
     for batch in read_batches(bytes)? {
         let commit_ulid = col_string(&batch, "commit_ulid")?;
+        let manifest_id = col_string_optional(&batch, "manifest_id")?;
+        let event_witnesses_json = col_string_optional(&batch, "event_witnesses_json")?;
         let snapshot_version = col_i64(&batch, "snapshot_version")?;
         let published_at = col_i64(&batch, "published_at")?;
         let fencing_token = col_i64(&batch, "fencing_token")?;
@@ -1290,6 +1761,20 @@ pub fn read_commits(bytes: &Bytes) -> Result<Vec<CatalogCommitRecord>> {
         for row in 0..batch.num_rows() {
             out.push(CatalogCommitRecord {
                 commit_ulid: commit_ulid.value(row).to_string(),
+                manifest_id: manifest_id.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
+                event_witnesses_json: event_witnesses_json.and_then(|col| {
+                    if col.is_null(row) {
+                        None
+                    } else {
+                        Some(col.value(row).to_string())
+                    }
+                }),
                 snapshot_version: snapshot_version.value(row),
                 published_at: published_at.value(row),
                 fencing_token: fencing_token.value(row),
@@ -1540,5 +2025,83 @@ mod tests {
         assert_eq!(rows[0].source_id, "tbl_a");
         assert_eq!(rows[0].target_id, "tbl_b");
         assert_eq!(rows[0].run_id, None);
+    }
+
+    #[test]
+    fn read_commits_tolerates_missing_manifest_id_witness() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("commit_ulid", DataType::Utf8, false),
+            Field::new("snapshot_version", DataType::Int64, false),
+            Field::new("published_at", DataType::Int64, false),
+            Field::new("fencing_token", DataType::Int64, false),
+            Field::new("watermark_event_id", DataType::Utf8, true),
+            Field::new("operation", DataType::Utf8, true),
+            Field::new("object_type", DataType::Utf8, true),
+            Field::new("object_id", DataType::Utf8, true),
+            Field::new("object_name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![123_i64])),
+                Arc::new(Int64Array::from(vec![7_i64])),
+                Arc::new(StringArray::from(vec![Some("01ARZ3NDEKTSV4RRFFQ69G5FAW")])),
+                Arc::new(StringArray::from(vec![Some("catalog_created")])),
+                Arc::new(StringArray::from(vec![Some("catalog")])),
+                Arc::new(StringArray::from(vec![Some("catalog-id")])),
+                Arc::new(StringArray::from(vec![Some("main")])),
+            ],
+        )
+        .expect("record batch build");
+
+        let bytes = write_single_batch(schema, &batch).expect("write legacy commits parquet");
+        let rows = read_commits(&bytes).expect("read legacy commits parquet");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].manifest_id, None);
+        assert_eq!(rows[0].event_witnesses_json, None);
+    }
+
+    #[test]
+    fn catalog_commit_event_witnesses_are_canonical_sorted_and_unique() {
+        let first = CatalogCommitEventWitness {
+            event_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_string(),
+            event_sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        let second = CatalogCommitEventWitness {
+            event_id: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_string(),
+            event_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        let encoded = encode_catalog_commit_event_witnesses(vec![second.clone(), first.clone()])
+            .expect("encode canonical witnesses");
+
+        assert_eq!(
+            decode_catalog_commit_event_witnesses(&encoded).expect("decode canonical witnesses"),
+            vec![first.clone(), second.clone()],
+        );
+        assert!(
+            decode_catalog_commit_event_witnesses("[]").is_err(),
+            "an empty witness set is not a catalog commit"
+        );
+        assert!(
+            encode_catalog_commit_event_witnesses(vec![first.clone(), first.clone()]).is_err(),
+            "duplicate event IDs must fail closed"
+        );
+        assert!(
+            decode_catalog_commit_event_witnesses(&format!(
+                r#"[{{"eventId":"{}","eventSha256":"sha256:{}"}}]"#,
+                second.event_id,
+                "A".repeat(64),
+            ))
+            .is_err(),
+            "event digests must use canonical lowercase hex"
+        );
+        let reversed = serde_json::to_string(&vec![second, first]).expect("encode reversed list");
+        assert!(
+            decode_catalog_commit_event_witnesses(&reversed).is_err(),
+            "stored witness order must be canonical"
+        );
     }
 }

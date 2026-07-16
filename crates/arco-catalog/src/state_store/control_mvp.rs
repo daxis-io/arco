@@ -14,12 +14,18 @@ use ulid::Ulid;
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
     CheckpointToken, KeyRange, KvPair, PersistedAuthorityAdapter, PersistedAuthorityKind,
-    PersistedAuthorityReference, PredicateInputSet, StateScope, StateStoreCapabilities, StateToken,
-    TxnOptions, VersionedValue,
+    PersistedAuthorityReference, PersistedRestoreParticipantPlan, PredicateInputSet,
+    RestoreAttemptIdentity, RestoreParticipantInspection, RestoredAuthorityEvidence,
+    StateRestoreParticipant, StateScope, StateStoreBindingIdentity, StateStoreCapabilities,
+    StateToken, TxnOptions, VersionedValue,
 };
 use crate::error::{CatalogError, Result};
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
+const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
+const RESTORE_PLAN_VERSION: u32 = 1;
+const EMPTY_CURRENT_BASE_MARKER: &[u8] =
+    br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
 /// Object-store-backed state-store MVP for validating control-manifest authority.
 #[derive(Clone)]
@@ -40,6 +46,7 @@ impl ControlMvpStateStore {
     /// Returns validation errors when the storage scope does not match the state
     /// scope or when the domain cannot be represented as a safe object path.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+        scope.validate()?;
         if storage.tenant_id() != scope.tenant_id()
             || storage.workspace_id() != scope.workspace_id()
         {
@@ -289,6 +296,307 @@ impl ControlMvpStateStore {
             checkpoint_id,
         }
     }
+
+    async fn load_restore_source_lineage(
+        &self,
+        source: &PersistedAuthorityReference,
+    ) -> Result<ControlMvpBase> {
+        if source.manifest_path() != self.paths.manifest_object(source.manifest_id()) {
+            return Err(validation_failed(
+                "Control MVP restore source manifest path mismatch",
+            ));
+        }
+        let manifest_bytes = self.storage.get_raw(source.manifest_path()).await?;
+        if prefixed_sha256(&manifest_bytes) != source.manifest_sha256() {
+            return Err(invariant_violation(
+                "Control MVP restore source manifest checksum mismatch",
+            ));
+        }
+        let manifest: ControlMvpManifest = decode_envelope(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            "Control MVP restore source manifest",
+        )?;
+        manifest.validate(&self.scope, source.manifest_id())?;
+        if manifest.logical_sequence != source.logical_sequence() {
+            return Err(invariant_violation(
+                "Control MVP restore source manifest sequence mismatch",
+            ));
+        }
+        let state = self.replay_manifest(&manifest).await?;
+        Ok(ControlMvpBase {
+            pointer_version: None,
+            manifest_id: Some(manifest.manifest_id),
+            state,
+            tx_refs: manifest.tx_refs,
+        })
+    }
+
+    async fn load_stable_restore_base(
+        &self,
+        source: &PersistedAuthorityReference,
+    ) -> Result<StableRestoreBase> {
+        for _ in 0..4 {
+            let before = self.storage.head_raw(&self.paths.current_pointer()).await?;
+            let Some(before) = before else {
+                if self
+                    .storage
+                    .head_raw(&self.paths.current_pointer())
+                    .await?
+                    .is_some()
+                {
+                    continue;
+                }
+                let candidate_parent = self.load_restore_source_lineage(source).await?;
+                return Ok(StableRestoreBase {
+                    current: ControlMvpBase {
+                        pointer_version: None,
+                        manifest_id: None,
+                        state: ReplayState::default(),
+                        tx_refs: Vec::new(),
+                    },
+                    candidate_parent,
+                    current_base_kind: ControlMvpRestoreCurrentBaseKind::Empty,
+                    pointer_bytes: Bytes::from_static(EMPTY_CURRENT_BASE_MARKER),
+                });
+            };
+            let pointer_bytes = self.storage.get_raw(&self.paths.current_pointer()).await?;
+            let Some(after) = self.storage.head_raw(&self.paths.current_pointer()).await? else {
+                continue;
+            };
+            if before.version != after.version {
+                continue;
+            }
+            let pointer: ControlMvpPointer =
+                decode_json(&pointer_bytes, "Control MVP restore base pointer")?;
+            pointer.validate(&self.scope)?;
+            let manifest = self.load_manifest_for_pointer(&pointer).await?;
+            if manifest.logical_sequence != pointer.logical_sequence {
+                return Err(invariant_violation(
+                    "Control MVP restore base pointer sequence mismatch",
+                ));
+            }
+            let state = self.replay_manifest(&manifest).await?;
+            let current = ControlMvpBase {
+                pointer_version: Some(before.version),
+                manifest_id: Some(pointer.manifest_id),
+                state,
+                tx_refs: manifest.tx_refs,
+            };
+            return Ok(StableRestoreBase {
+                candidate_parent: current.clone(),
+                current,
+                current_base_kind: ControlMvpRestoreCurrentBaseKind::Pointer,
+                pointer_bytes,
+            });
+        }
+        Err(CatalogError::CasFailed {
+            message: "Control MVP current pointer was unstable during restore planning".to_string(),
+        })
+    }
+
+    async fn restore_source_values(
+        &self,
+        source: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+    ) -> Result<BTreeMap<Vec<u8>, Bytes>> {
+        if source.reference_kind() != PersistedAuthorityKind::Checkpoint
+            || source.checkpoint_path().is_none()
+            || source.checkpoint_sha256().is_none()
+        {
+            return Err(validation_failed(
+                "Control MVP restore requires checkpoint authority evidence",
+            ));
+        }
+        let reader = self.resolve_persisted_reference_at(source, now).await?;
+        Ok(reader
+            .scan_prefix(b"")
+            .await?
+            .into_iter()
+            .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
+            .collect())
+    }
+
+    fn restore_writes(
+        source_values: &BTreeMap<Vec<u8>, Bytes>,
+        current: &ReplayState,
+    ) -> BTreeMap<Vec<u8>, StagedWrite> {
+        let mut writes = BTreeMap::new();
+        for (key, current) in current.kv.iter().filter(|(_key, value)| !value.tombstone) {
+            match source_values.get(key) {
+                Some(source_value) if source_value == &current.bytes => {}
+                Some(source_value) => {
+                    writes.insert(key.clone(), StagedWrite::Put(source_value.clone()));
+                }
+                None => {
+                    writes.insert(key.clone(), StagedWrite::Delete);
+                }
+            }
+        }
+        for (key, source_value) in source_values {
+            if current.kv.get(key).is_none_or(|current| current.tombstone) {
+                writes.insert(key.clone(), StagedWrite::Put(source_value.clone()));
+            }
+        }
+        writes
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_restore_candidate(
+        &self,
+        source: &PersistedAuthorityReference,
+        source_values: &BTreeMap<Vec<u8>, Bytes>,
+        identity: &RestoreAttemptIdentity,
+        stable: &StableRestoreBase,
+    ) -> Result<RenderedControlMvpRestore> {
+        let base_manifest_id = stable
+            .candidate_parent
+            .manifest_id
+            .as_deref()
+            .ok_or_else(|| validation_failed("Control MVP restore lineage has no manifest"))?;
+        let result_sequence = stable
+            .candidate_parent
+            .state
+            .logical_sequence
+            .checked_add(1)
+            .ok_or_else(|| validation_failed("Control MVP restore sequence overflow"))?;
+        if result_sequence <= source.logical_sequence() {
+            return Err(validation_failed(
+                "Control MVP restore result must be newer than source authority",
+            ));
+        }
+
+        let suffix = restore_identity_suffix(
+            &self.scope,
+            identity,
+            source,
+            stable.current_base_kind,
+            base_manifest_id,
+            stable.current.pointer_version.as_deref(),
+            &prefixed_sha256(&stable.pointer_bytes),
+            result_sequence,
+        );
+        let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
+        let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
+        let outbox_record_id = format!(
+            "restore:{}:{}:{}",
+            identity.restore_id(),
+            identity.attempt(),
+            identity.domain()
+        );
+
+        let writes = Self::restore_writes(source_values, &stable.current.state);
+
+        let notice = ControlMvpRestoreNotice {
+            restore_id: identity.restore_id().to_string(),
+            participant_attempt: identity.attempt(),
+            domain: identity.domain().to_string(),
+            source_logical_sequence: source.logical_sequence(),
+            result_logical_sequence: result_sequence,
+        };
+        let tx = ControlMvpTxObject {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&self.scope),
+            tx_id: transaction_id.clone(),
+            base_manifest_id: Some(base_manifest_id.to_string()),
+            sequence: result_sequence,
+            request_id: Some(format!(
+                "restore:{}:{}:{}",
+                identity.restore_id(),
+                identity.attempt(),
+                identity.domain()
+            )),
+            writes: writes
+                .into_iter()
+                .map(|(key, write)| ControlMvpWriteEntry::from_staged(key, result_sequence, write))
+                .collect(),
+            outbox: vec![ControlMvpOutboxEntry {
+                record_id: outbox_record_id.clone(),
+                payload: encode_json_vec(&notice, "Control MVP restore notice")?,
+            }],
+        };
+        let transaction_bytes = encode_envelope("control-mvp-tx", &tx)?;
+        let transaction_checksum = sha256_hex(&transaction_bytes);
+        let mut candidate_state = stable.candidate_parent.state.clone();
+        candidate_state.apply_tx(&tx)?;
+        let mut tx_refs = stable.candidate_parent.tx_refs.clone();
+        tx_refs.push(ControlMvpTxRef {
+            tx_id: transaction_id.clone(),
+            sequence: result_sequence,
+            checksum_sha256: transaction_checksum,
+        });
+        let manifest = ControlMvpManifest {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&self.scope),
+            manifest_id: candidate_manifest_id.clone(),
+            logical_sequence: result_sequence,
+            base_manifest_id: Some(base_manifest_id.to_string()),
+            tx_refs,
+            state_checksum_sha256: candidate_state.checksum()?,
+        };
+        let manifest_bytes = encode_envelope("control-mvp-manifest", &manifest)?;
+        let manifest_checksum = sha256_hex(&manifest_bytes);
+        let pointer = ControlMvpPointer {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&self.scope),
+            manifest_id: candidate_manifest_id.clone(),
+            logical_sequence: result_sequence,
+            manifest_checksum_sha256: manifest_checksum,
+        };
+        let pointer_bytes = encode_json(&pointer, "Control MVP restore pointer")?;
+
+        Ok(RenderedControlMvpRestore {
+            transaction_id,
+            transaction_bytes,
+            candidate_manifest_id,
+            manifest_bytes,
+            pointer_bytes,
+            outbox_record_id,
+            result_sequence,
+        })
+    }
+
+    async fn build_restore_plan(
+        &self,
+        source: &PersistedAuthorityReference,
+        identity: &RestoreAttemptIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<ControlMvpRestorePlan> {
+        if identity.domain() != self.scope.domain() {
+            return Err(validation_failed("restore identity domain mismatch"));
+        }
+        let source_values = self.restore_source_values(source, now).await?;
+        let stable = self.load_stable_restore_base(source).await?;
+        let rendered = self.render_restore_candidate(source, &source_values, identity, &stable)?;
+        let plan = ControlMvpRestorePlan {
+            record_type: RESTORE_PLAN_RECORD_TYPE.to_string(),
+            version: RESTORE_PLAN_VERSION,
+            implementation: IMPLEMENTATION.to_string(),
+            scope: self.scope.clone(),
+            identity: identity.clone(),
+            source: source.clone(),
+            current_base_kind: stable.current_base_kind,
+            base_pointer_version: stable.current.pointer_version.clone(),
+            observed_base_pointer_sha256: prefixed_sha256(&stable.pointer_bytes),
+            base_manifest_id: stable
+                .candidate_parent
+                .manifest_id
+                .clone()
+                .ok_or_else(|| validation_failed("restore lineage manifest missing"))?,
+            base_logical_sequence: stable.candidate_parent.state.logical_sequence,
+            transaction_id: rendered.transaction_id.clone(),
+            transaction_path: self.paths.tx_object(&rendered.transaction_id),
+            transaction_sha256: prefixed_sha256(&rendered.transaction_bytes),
+            candidate_manifest_id: rendered.candidate_manifest_id.clone(),
+            candidate_manifest_path: self.paths.manifest_object(&rendered.candidate_manifest_id),
+            candidate_manifest_sha256: prefixed_sha256(&rendered.manifest_bytes),
+            candidate_pointer_sha256: prefixed_sha256(&rendered.pointer_bytes),
+            result_logical_sequence: rendered.result_sequence,
+            restore_outbox_record_id: rendered.outbox_record_id,
+        };
+        plan.validate(self)?;
+        Ok(plan)
+    }
 }
 
 /// Path helper for the control-state MVP object layout.
@@ -342,6 +650,340 @@ impl ControlMvpPaths {
 pub struct ControlMvpProjectionOutboxRecord {
     record_id: String,
     payload: Bytes,
+}
+
+/// Durable deterministic evidence for one Control MVP restore participant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ControlMvpRestoreCurrentBaseKind {
+    Empty,
+    Pointer,
+}
+
+impl ControlMvpRestoreCurrentBaseKind {
+    const fn identity_label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Pointer => "pointer",
+        }
+    }
+}
+
+/// Durable deterministic evidence for one Control MVP restore participant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlMvpRestorePlan {
+    record_type: String,
+    version: u32,
+    implementation: String,
+    scope: StateScope,
+    identity: RestoreAttemptIdentity,
+    source: PersistedAuthorityReference,
+    current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    base_pointer_version: Option<String>,
+    observed_base_pointer_sha256: String,
+    base_manifest_id: String,
+    base_logical_sequence: u64,
+    transaction_id: String,
+    transaction_path: String,
+    transaction_sha256: String,
+    candidate_manifest_id: String,
+    candidate_manifest_path: String,
+    candidate_manifest_sha256: String,
+    candidate_pointer_sha256: String,
+    result_logical_sequence: u64,
+    restore_outbox_record_id: String,
+}
+
+impl ControlMvpRestorePlan {
+    /// Returns the exact source authority reference.
+    #[must_use]
+    pub const fn source(&self) -> &PersistedAuthorityReference {
+        &self.source
+    }
+
+    /// Returns the originating participant attempt identity.
+    #[must_use]
+    pub const fn identity(&self) -> &RestoreAttemptIdentity {
+        &self.identity
+    }
+
+    /// Returns the exact base-pointer object version.
+    #[must_use]
+    pub fn base_pointer_version(&self) -> Option<&str> {
+        self.base_pointer_version.as_deref()
+    }
+
+    /// Returns the digest of raw base-pointer bytes bound to the observed version.
+    #[must_use]
+    pub fn observed_base_pointer_sha256(&self) -> &str {
+        &self.observed_base_pointer_sha256
+    }
+
+    /// Returns the deterministic candidate-pointer payload digest.
+    #[must_use]
+    pub fn candidate_pointer_sha256(&self) -> &str {
+        &self.candidate_pointer_sha256
+    }
+
+    /// Returns the deterministic transaction ID.
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    /// Returns the exact immutable transaction path.
+    #[must_use]
+    pub fn transaction_path(&self) -> &str {
+        &self.transaction_path
+    }
+
+    /// Returns the exact planned transaction digest.
+    #[must_use]
+    pub fn transaction_sha256(&self) -> &str {
+        &self.transaction_sha256
+    }
+
+    /// Returns the deterministic candidate manifest ID.
+    #[must_use]
+    pub fn candidate_manifest_id(&self) -> &str {
+        &self.candidate_manifest_id
+    }
+
+    /// Returns the exact immutable candidate manifest path.
+    #[must_use]
+    pub fn candidate_manifest_path(&self) -> &str {
+        &self.candidate_manifest_path
+    }
+
+    /// Returns the exact candidate manifest digest.
+    #[must_use]
+    pub fn candidate_manifest_sha256(&self) -> &str {
+        &self.candidate_manifest_sha256
+    }
+
+    /// Returns the strictly newer planned logical sequence.
+    #[must_use]
+    pub const fn result_logical_sequence(&self) -> u64 {
+        self.result_logical_sequence
+    }
+
+    fn validate(&self, store: &ControlMvpStateStore) -> Result<()> {
+        self.scope.validate()?;
+        self.source.validate()?;
+        let validated_identity = RestoreAttemptIdentity::new(
+            self.identity.restore_id(),
+            self.identity.attempt(),
+            self.identity.domain(),
+        )?;
+        let current_base_valid = match self.current_base_kind {
+            ControlMvpRestoreCurrentBaseKind::Empty => {
+                self.base_pointer_version.is_none()
+                    && self.observed_base_pointer_sha256
+                        == prefixed_sha256(EMPTY_CURRENT_BASE_MARKER)
+                    && self.base_manifest_id == self.source.manifest_id()
+                    && self.base_logical_sequence == self.source.logical_sequence()
+            }
+            ControlMvpRestoreCurrentBaseKind::Pointer => self
+                .base_pointer_version
+                .as_ref()
+                .is_some_and(|version| !version.is_empty()),
+        };
+        if self.record_type != RESTORE_PLAN_RECORD_TYPE
+            || self.version != RESTORE_PLAN_VERSION
+            || self.implementation != IMPLEMENTATION
+            || self.scope != store.scope
+            || self.identity != validated_identity
+            || self.identity.domain() != store.scope.domain()
+            || self.source.implementation() != IMPLEMENTATION
+            || self.source.scope() != &store.scope
+            || self.source.reference_kind() != PersistedAuthorityKind::Checkpoint
+            || self.source.checkpoint_path().is_none()
+            || self.source.checkpoint_sha256().is_none()
+            || !current_base_valid
+            || self.base_manifest_id.is_empty()
+            || self.base_logical_sequence == 0
+            || self.result_logical_sequence
+                != self.base_logical_sequence.checked_add(1).unwrap_or(0)
+            || self.result_logical_sequence <= self.source.logical_sequence()
+        {
+            return Err(validation_failed("invalid Control MVP restore plan"));
+        }
+        let suffix = restore_identity_suffix(
+            &self.scope,
+            &self.identity,
+            &self.source,
+            self.current_base_kind,
+            &self.base_manifest_id,
+            self.base_pointer_version.as_deref(),
+            &self.observed_base_pointer_sha256,
+            self.result_logical_sequence,
+        );
+        let expected_transaction_id =
+            format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
+        let expected_manifest_id = format!(
+            "manifest-{:020}-restore-{suffix}",
+            self.result_logical_sequence
+        );
+        let expected_outbox_id = format!(
+            "restore:{}:{}:{}",
+            self.identity.restore_id(),
+            self.identity.attempt(),
+            self.identity.domain()
+        );
+        if self.transaction_id != expected_transaction_id
+            || self.transaction_path != store.paths.tx_object(&expected_transaction_id)
+            || self.candidate_manifest_id != expected_manifest_id
+            || self.candidate_manifest_path != store.paths.manifest_object(&expected_manifest_id)
+            || self.restore_outbox_record_id != expected_outbox_id
+        {
+            return Err(validation_failed(
+                "Control MVP restore plan deterministic identity mismatch",
+            ));
+        }
+        for digest in [
+            &self.observed_base_pointer_sha256,
+            &self.transaction_sha256,
+            &self.candidate_manifest_sha256,
+            &self.candidate_pointer_sha256,
+        ] {
+            validate_prefixed_digest(digest, "Control MVP restore digest")?;
+        }
+        Ok(())
+    }
+}
+
+/// Explicit deterministic roll-forward adapter for [`ControlMvpStateStore`].
+#[derive(Clone)]
+pub struct ControlMvpRestoreParticipant {
+    store: ControlMvpStateStore,
+}
+
+impl ControlMvpRestoreParticipant {
+    /// Creates an explicitly configured restore participant.
+    #[must_use]
+    pub const fn new(store: ControlMvpStateStore) -> Self {
+        Self { store }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn inspect_visible_restore(
+        &self,
+        plan: &ControlMvpRestorePlan,
+        planned_checksum: &str,
+    ) -> Result<RestoreParticipantInspection> {
+        let tx_bytes = self.store.storage.get_raw(&plan.transaction_path).await?;
+        if prefixed_sha256(&tx_bytes) != plan.transaction_sha256 {
+            return Err(invariant_violation(
+                "visible restore transaction checksum mismatch",
+            ));
+        }
+        let planned_tx_ref = ControlMvpTxRef {
+            tx_id: plan.transaction_id.clone(),
+            sequence: plan.result_logical_sequence,
+            checksum_sha256: planned_checksum.to_string(),
+        };
+        let tx: ControlMvpTxObject = decode_envelope(
+            &tx_bytes,
+            "control-mvp-tx",
+            "Control MVP visible restore transaction",
+        )?;
+        tx.validate(&self.store.scope, &planned_tx_ref)?;
+        let expected_request_id = format!(
+            "restore:{}:{}:{}",
+            plan.identity.restore_id(),
+            plan.identity.attempt(),
+            plan.identity.domain()
+        );
+        let [restore_notice] = tx.outbox.as_slice() else {
+            return Err(invariant_violation(
+                "visible restore transaction does not contain exactly one outbox notice",
+            ));
+        };
+        if tx.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
+            || tx.request_id.as_deref() != Some(expected_request_id.as_str())
+            || restore_notice.record_id != plan.restore_outbox_record_id
+        {
+            return Err(invariant_violation(
+                "visible restore transaction does not match planned restore metadata",
+            ));
+        }
+        let notice: ControlMvpRestoreNotice = decode_json(
+            &restore_notice.payload,
+            "Control MVP visible restore outbox notice",
+        )?;
+        if notice.restore_id != plan.identity.restore_id()
+            || notice.participant_attempt != plan.identity.attempt()
+            || notice.domain != plan.identity.domain()
+            || notice.source_logical_sequence != plan.source.logical_sequence()
+            || notice.result_logical_sequence != plan.result_logical_sequence
+        {
+            return Err(invariant_violation(
+                "visible restore outbox notice does not match planned restore",
+            ));
+        }
+        let manifest_bytes = self
+            .store
+            .storage
+            .get_raw(&plan.candidate_manifest_path)
+            .await?;
+        if prefixed_sha256(&manifest_bytes) != plan.candidate_manifest_sha256 {
+            return Err(invariant_violation(
+                "visible restore manifest checksum mismatch",
+            ));
+        }
+        let manifest: ControlMvpManifest = decode_envelope(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            "Control MVP restore candidate manifest",
+        )?;
+        manifest.validate(&self.store.scope, &plan.candidate_manifest_id)?;
+        let base_manifest = self.store.load_manifest(&plan.base_manifest_id).await?;
+        if manifest.logical_sequence != plan.result_logical_sequence
+            || manifest.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
+            || manifest.tx_refs.len() != base_manifest.tx_refs.len() + 1
+            || manifest.tx_refs.get(..base_manifest.tx_refs.len())
+                != Some(base_manifest.tx_refs.as_slice())
+            || manifest.tx_refs.last() != Some(&planned_tx_ref)
+        {
+            return Err(invariant_violation(
+                "visible restore candidate manifest does not extend the planned base",
+            ));
+        }
+        self.store.replay_manifest(&manifest).await?;
+        let candidate_pointer = ControlMvpPointer {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&self.store.scope),
+            manifest_id: plan.candidate_manifest_id.clone(),
+            logical_sequence: plan.result_logical_sequence,
+            manifest_checksum_sha256: sha256_hex(&manifest_bytes),
+        };
+        if prefixed_sha256(&encode_json(
+            &candidate_pointer,
+            "Control MVP visible restore candidate pointer",
+        )?) != plan.candidate_pointer_sha256
+        {
+            return Err(invariant_violation(
+                "visible restore candidate pointer digest mismatch",
+            ));
+        }
+        let evidence = RestoredAuthorityEvidence::new(
+            IMPLEMENTATION,
+            self.store.scope.clone(),
+            &plan.transaction_id,
+            &plan.candidate_manifest_id,
+            &plan.candidate_manifest_path,
+            &plan.candidate_manifest_sha256,
+            plan.result_logical_sequence,
+            plan.identity.attempt(),
+        )?;
+        Ok(RestoreParticipantInspection::Visible {
+            token: self.store.token(
+                plan.candidate_manifest_id.clone(),
+                plan.result_logical_sequence,
+            ),
+            evidence,
+        })
+    }
 }
 
 impl ControlMvpProjectionOutboxRecord {
@@ -870,7 +1512,178 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
 }
 
 #[async_trait]
+impl StateRestoreParticipant for ControlMvpRestoreParticipant {
+    fn implementation(&self) -> &'static str {
+        IMPLEMENTATION
+    }
+
+    fn scope(&self) -> &StateScope {
+        &self.store.scope
+    }
+
+    fn restore_binding_identity(&self) -> StateStoreBindingIdentity {
+        StateStoreBindingIdentity::from_scoped_storage(&self.store.storage)
+    }
+
+    async fn plan_restore(
+        &self,
+        source: &PersistedAuthorityReference,
+        identity: &RestoreAttemptIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<PersistedRestoreParticipantPlan> {
+        Ok(PersistedRestoreParticipantPlan::ControlMvp(
+            self.store.build_restore_plan(source, identity, now).await?,
+        ))
+    }
+
+    async fn inspect_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+    ) -> Result<RestoreParticipantInspection> {
+        let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
+        plan.validate(&self.store)?;
+        let stable = self.store.load_stable_restore_base(&plan.source).await?;
+        let planned_checksum = plan
+            .transaction_sha256
+            .strip_prefix("sha256:")
+            .ok_or_else(|| validation_failed("restore transaction digest is malformed"))?;
+        let in_lineage = stable.candidate_parent.tx_refs.iter().any(|reference| {
+            reference.tx_id == plan.transaction_id
+                && reference.sequence == plan.result_logical_sequence
+                && reference.checksum_sha256 == planned_checksum
+        });
+        if in_lineage {
+            return self.inspect_visible_restore(plan, planned_checksum).await;
+        }
+
+        let version_matches = stable.current_base_kind == plan.current_base_kind
+            && stable.current.pointer_version.as_deref() == plan.base_pointer_version.as_deref();
+        let bytes_match =
+            prefixed_sha256(&stable.pointer_bytes) == plan.observed_base_pointer_sha256;
+        let manifest_matches =
+            stable.candidate_parent.manifest_id.as_deref() == Some(plan.base_manifest_id.as_str());
+        if version_matches && bytes_match && manifest_matches {
+            let source_values = self
+                .store
+                .restore_source_values(&plan.source, Utc::now())
+                .await?;
+            let rendered = self.store.render_restore_candidate(
+                &plan.source,
+                &source_values,
+                &plan.identity,
+                &stable,
+            )?;
+            if plan.base_logical_sequence != stable.candidate_parent.state.logical_sequence
+                || rendered.transaction_id != plan.transaction_id
+                || prefixed_sha256(&rendered.transaction_bytes) != plan.transaction_sha256
+                || rendered.candidate_manifest_id != plan.candidate_manifest_id
+                || prefixed_sha256(&rendered.manifest_bytes) != plan.candidate_manifest_sha256
+                || prefixed_sha256(&rendered.pointer_bytes) != plan.candidate_pointer_sha256
+                || rendered.outbox_record_id != plan.restore_outbox_record_id
+                || rendered.result_sequence != plan.result_logical_sequence
+            {
+                return Err(invariant_violation(
+                    "Control MVP Ready restore plan cannot reproduce deterministic candidate bytes",
+                ));
+            }
+            Ok(RestoreParticipantInspection::Ready)
+        } else {
+            Ok(RestoreParticipantInspection::Superseded)
+        }
+    }
+
+    async fn apply_restore(
+        &self,
+        persisted: &PersistedRestoreParticipantPlan,
+        now: DateTime<Utc>,
+    ) -> Result<RestoreParticipantInspection> {
+        let PersistedRestoreParticipantPlan::ControlMvp(plan) = persisted;
+        plan.validate(&self.store)?;
+        match self.inspect_restore(persisted).await? {
+            RestoreParticipantInspection::Ready => {}
+            other => return Ok(other),
+        }
+
+        let source_values = self.store.restore_source_values(&plan.source, now).await?;
+        let stable = self.store.load_stable_restore_base(&plan.source).await?;
+        if stable.current_base_kind != plan.current_base_kind
+            || stable.current.pointer_version.as_deref() != plan.base_pointer_version.as_deref()
+            || prefixed_sha256(&stable.pointer_bytes) != plan.observed_base_pointer_sha256
+        {
+            return self.inspect_restore(persisted).await;
+        }
+        let rendered = self.store.render_restore_candidate(
+            &plan.source,
+            &source_values,
+            &plan.identity,
+            &stable,
+        )?;
+        if rendered.transaction_id != plan.transaction_id
+            || prefixed_sha256(&rendered.transaction_bytes) != plan.transaction_sha256
+            || rendered.candidate_manifest_id != plan.candidate_manifest_id
+            || prefixed_sha256(&rendered.manifest_bytes) != plan.candidate_manifest_sha256
+            || prefixed_sha256(&rendered.pointer_bytes) != plan.candidate_pointer_sha256
+            || rendered.result_sequence != plan.result_logical_sequence
+        {
+            return Err(invariant_violation(
+                "Control MVP restore plan cannot reproduce deterministic candidate bytes",
+            ));
+        }
+
+        put_restore_immutable(
+            &self.store.storage,
+            &plan.transaction_path,
+            rendered.transaction_bytes,
+        )
+        .await?;
+        put_restore_immutable(
+            &self.store.storage,
+            &plan.candidate_manifest_path,
+            rendered.manifest_bytes,
+        )
+        .await?;
+        let pointer_precondition = match plan.current_base_kind {
+            ControlMvpRestoreCurrentBaseKind::Empty => WritePrecondition::DoesNotExist,
+            ControlMvpRestoreCurrentBaseKind::Pointer => WritePrecondition::MatchesVersion(
+                plan.base_pointer_version
+                    .clone()
+                    .ok_or_else(|| validation_failed("restore base pointer version missing"))?,
+            ),
+        };
+        let pointer_write = self
+            .store
+            .storage
+            .put_raw(
+                &self.store.paths.current_pointer(),
+                rendered.pointer_bytes,
+                pointer_precondition,
+            )
+            .await;
+        let inspection = self.inspect_restore(persisted).await;
+        match (pointer_write, inspection) {
+            (_, Ok(RestoreParticipantInspection::Visible { token, evidence })) => {
+                Ok(RestoreParticipantInspection::Visible { token, evidence })
+            }
+            (_, Ok(RestoreParticipantInspection::Superseded)) => {
+                Ok(RestoreParticipantInspection::Superseded)
+            }
+            (Ok(_), Ok(RestoreParticipantInspection::Ready)) => Err(invariant_violation(
+                "Control MVP pointer CAS reported success but restore is not visible",
+            )),
+            (Err(error), Ok(RestoreParticipantInspection::Ready)) => Err(error.into()),
+            (_, Err(error)) => Err(error),
+        }
+    }
+}
+
+#[async_trait]
 impl ArcoStateStore for ControlMvpStateStore {
+    fn restore_binding_identity(&self) -> Option<StateStoreBindingIdentity> {
+        Some(StateStoreBindingIdentity::from_scoped_storage(
+            &self.storage,
+        ))
+    }
+
     async fn begin_txn(&self, opts: TxnOptions) -> Result<Box<dyn ArcoStateTxn>> {
         Ok(Box::new(self.begin_control_txn(opts).await?))
     }
@@ -980,6 +1793,32 @@ struct ControlMvpBase {
     manifest_id: Option<String>,
     state: ReplayState,
     tx_refs: Vec<ControlMvpTxRef>,
+}
+
+struct StableRestoreBase {
+    current: ControlMvpBase,
+    candidate_parent: ControlMvpBase,
+    current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    pointer_bytes: Bytes,
+}
+
+struct RenderedControlMvpRestore {
+    transaction_id: String,
+    transaction_bytes: Bytes,
+    candidate_manifest_id: String,
+    manifest_bytes: Bytes,
+    pointer_bytes: Bytes,
+    outbox_record_id: String,
+    result_sequence: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlMvpRestoreNotice {
+    restore_id: String,
+    participant_attempt: u64,
+    domain: String,
+    source_logical_sequence: u64,
+    result_logical_sequence: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1307,7 +2146,7 @@ impl ControlMvpManifest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlMvpTxRef {
     tx_id: String,
     sequence: u64,
@@ -1483,6 +2322,25 @@ async fn put_immutable(
     }
 }
 
+async fn put_restore_immutable(storage: &ScopedStorage, path: &str, bytes: Bytes) -> Result<()> {
+    match storage
+        .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+        .await?
+    {
+        WriteResult::Success { .. } => Ok(()),
+        WriteResult::PreconditionFailed { .. } => {
+            let existing = storage.get_raw(path).await?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(precondition_failed(
+                    "Control MVP restore immutable object already exists with different bytes",
+                ))
+            }
+        }
+    }
+}
+
 fn encode_envelope<T: Serialize>(artifact_type: &str, payload: &T) -> Result<Bytes> {
     let payload_bytes = encode_json_vec(payload, artifact_type)?;
     let envelope = ChecksumEnvelope {
@@ -1548,6 +2406,61 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn prefixed_sha256(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
+}
+
+fn validate_prefixed_digest(value: &str, context: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(CatalogError::Validation {
+            message: format!("{context} must use sha256: prefix"),
+        });
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CatalogError::Validation {
+            message: format!("{context} must contain 64 lowercase hexadecimal characters"),
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_identity_suffix(
+    scope: &StateScope,
+    identity: &RestoreAttemptIdentity,
+    source: &PersistedAuthorityReference,
+    current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    base_manifest_id: &str,
+    base_pointer_version: Option<&str>,
+    observed_base_pointer_sha256: &str,
+    result_sequence: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        scope.tenant_id(),
+        scope.workspace_id(),
+        scope.domain(),
+        identity.restore_id(),
+        identity.domain(),
+        source.implementation(),
+        source.manifest_id(),
+        source.manifest_path(),
+        source.manifest_sha256(),
+        source.checkpoint_path().unwrap_or_default(),
+        source.checkpoint_sha256().unwrap_or_default(),
+        current_base_kind.identity_label(),
+        base_manifest_id,
+        base_pointer_version.unwrap_or_default(),
+        observed_base_pointer_sha256,
+    ] {
+        hash_bytes(&mut hasher, value.as_bytes());
+    }
+    hash_u64(&mut hasher, identity.attempt());
+    hash_u64(&mut hasher, source.logical_sequence());
+    hash_u64(&mut hasher, result_sequence);
+    hex::encode(hasher.finalize())[..32].to_string()
 }
 
 fn digest_u64(hasher: Sha256) -> u64 {

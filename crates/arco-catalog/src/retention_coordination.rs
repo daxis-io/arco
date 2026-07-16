@@ -1,5 +1,6 @@
 //! Durable exclusion between retained-root publication and mutating GC runs.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 
 use bytes::Bytes;
@@ -26,6 +27,7 @@ pub enum RetentionMutationKind {
     WorkspaceSnapshotRetry,
     WorkspaceExportFinalize,
     WorkspaceExportRetry,
+    WorkspaceRestoreApply,
     CatalogGc,
 }
 
@@ -224,6 +226,128 @@ impl RetentionMutationEpoch {
             Err(error) => {
                 self.uncertain_mutation = true;
                 Err(error)
+            }
+        }
+    }
+
+    /// Conservatively keeps this epoch in flight when exact reconciliation cannot
+    /// prove whether an implementation-owned mutation became visible.
+    pub(crate) fn mark_uncertain(&mut self) {
+        self.uncertain_mutation = true;
+    }
+
+    /// Performs a stable, read-only check for the exact uncertain epoch that a
+    /// workflow has independently proven terminal.
+    pub(crate) async fn terminal_match_is_in_flight(
+        storage: &ScopedStorage,
+        operation_kind: RetentionMutationKind,
+        terminal_operation_ids: &BTreeSet<String>,
+    ) -> Result<bool> {
+        if terminal_operation_ids.is_empty() {
+            return Ok(false);
+        }
+        for _ in 0..4 {
+            let Some(before) = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? else {
+                return Ok(false);
+            };
+            let bytes = storage.get_raw(RETENTION_MUTATION_EPOCH_PATH).await?;
+            let Some(after) = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? else {
+                return Err(CatalogError::CasFailed {
+                    message: "retention mutation epoch disappeared during terminal precheck"
+                        .to_string(),
+                });
+            };
+            if before.version != after.version {
+                continue;
+            }
+            let record = decode_record(&bytes)?;
+            return Ok(record.state == RetentionMutationState::InFlight
+                && record.operation_kind == operation_kind
+                && terminal_operation_ids.contains(&record.operation_id));
+        }
+        Err(CatalogError::CasFailed {
+            message: "retention mutation epoch was unstable during terminal precheck".to_string(),
+        })
+    }
+
+    /// Settles a previously uncertain epoch only after its owning workflow has
+    /// supplied exact terminal operation identities while holding the shared
+    /// retention lock.
+    ///
+    /// This is intentionally not an adoption path: an in-flight epoch for any
+    /// other operation remains in flight and fails closed. The caller must prove
+    /// the supplied identities terminal before invoking this method.
+    pub(crate) async fn settle_terminal_matching(
+        storage: ScopedStorage,
+        guard: &mut LockGuard<ScopedStorage>,
+        operation_kind: RetentionMutationKind,
+        terminal_operation_ids: &BTreeSet<String>,
+    ) -> Result<bool> {
+        if terminal_operation_ids.is_empty() {
+            return Ok(false);
+        }
+        let Some(before) = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? else {
+            return Ok(false);
+        };
+        let bytes = storage.get_raw(RETENTION_MUTATION_EPOCH_PATH).await?;
+        let after = storage
+            .head_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await?
+            .ok_or_else(|| CatalogError::CasFailed {
+                message: "retention mutation epoch disappeared during reconciliation".to_string(),
+            })?;
+        if before.version != after.version {
+            return Err(CatalogError::CasFailed {
+                message: "retention mutation epoch changed during reconciliation".to_string(),
+            });
+        }
+        let record = decode_record(&bytes)?;
+        if record.state == RetentionMutationState::Idle {
+            return Ok(false);
+        }
+        if record.operation_kind != operation_kind
+            || !terminal_operation_ids.contains(&record.operation_id)
+        {
+            // A foreign in-flight operation remains the global fail-closed
+            // boundary. This recovery helper does not adopt or rewrite it.
+            return Ok(false);
+        }
+
+        guard.extend(RETENTION_GC_LOCK_TTL).await.map_err(|error| {
+            CatalogError::PreconditionFailed {
+                message: format!(
+                    "retention coordination lease was lost before terminal settlement: {error}"
+                ),
+            }
+        })?;
+        let completed = record.completed()?;
+        let completed_bytes = Bytes::from(encode_record(&completed)?);
+        let write = storage
+            .put_raw(
+                RETENTION_MUTATION_EPOCH_PATH,
+                completed_bytes,
+                WritePrecondition::MatchesVersion(after.version),
+            )
+            .await;
+        match write {
+            Ok(WriteResult::Success { .. }) => Ok(true),
+            Ok(WriteResult::PreconditionFailed { .. }) | Err(_) => {
+                let selected =
+                    decode_record(&storage.get_raw(RETENTION_MUTATION_EPOCH_PATH).await?)?;
+                if selected.epoch == record.epoch
+                    && selected.state == RetentionMutationState::Idle
+                    && selected.operation_kind == record.operation_kind
+                    && selected.operation_id == record.operation_id
+                    && selected.holder_id == record.holder_id
+                    && selected.started_at == record.started_at
+                {
+                    Ok(true)
+                } else {
+                    Err(CatalogError::CasFailed {
+                        message: "terminal retention mutation epoch settlement is uncertain"
+                            .to_string(),
+                    })
+                }
             }
         }
     }
@@ -516,6 +640,71 @@ mod tests {
             .expect("unchanged in-flight bytes");
         assert_eq!(after, before);
         second_guard.release().await.expect("release second lease");
+    }
+
+    #[tokio::test]
+    async fn terminal_reconciliation_requires_the_exact_operation_identity() {
+        let storage = storage();
+        let mut first_guard = acquire(&storage).await;
+        let _uncertain = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut first_guard,
+            RetentionMutationKind::WorkspaceRestoreApply,
+            "restore-apply-exact-plan-digest",
+        )
+        .await
+        .expect("restore claim");
+        let before = storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .expect("in-flight bytes");
+        first_guard.release().await.expect("release first lease");
+
+        let mut recovery_guard = acquire(&storage).await;
+        assert!(
+            !RetentionMutationEpoch::settle_terminal_matching(
+                storage.clone(),
+                &mut recovery_guard,
+                RetentionMutationKind::WorkspaceRestoreApply,
+                &BTreeSet::from(["restore-apply-wrong-plan-digest".to_string()]),
+            )
+            .await
+            .expect("mismatched terminal proof is a no-op")
+        );
+        assert_eq!(
+            before,
+            storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("in-flight bytes remain")
+        );
+        assert!(
+            RetentionMutationEpoch::claim(
+                storage.clone(),
+                &mut recovery_guard,
+                RetentionMutationKind::CatalogGc,
+                "blocked-gc",
+            )
+            .await
+            .is_err(),
+            "a mismatched terminal proof must leave GC fail closed"
+        );
+
+        assert!(
+            RetentionMutationEpoch::settle_terminal_matching(
+                storage.clone(),
+                &mut recovery_guard,
+                RetentionMutationKind::WorkspaceRestoreApply,
+                &BTreeSet::from(["restore-apply-exact-plan-digest".to_string()]),
+            )
+            .await
+            .expect("exact terminal proof settles")
+        );
+        assert_eq!("IDLE", read_epoch(&storage).await["state"]);
+        recovery_guard
+            .release()
+            .await
+            .expect("release recovery lease");
     }
 
     #[tokio::test]

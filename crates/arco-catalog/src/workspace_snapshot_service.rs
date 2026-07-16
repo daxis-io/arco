@@ -16,7 +16,7 @@ use crate::gc::reachability::load_selected_retention_pin;
 use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
 use crate::state_store::{
     ArcoStateStore, CheckpointOptions, PersistedAuthorityAdapter, PersistedAuthorityKind,
-    StateScope, StateStoreCapabilities,
+    StateRestoreParticipant, StateScope, StateStoreCapabilities,
 };
 use crate::workspace_snapshot::{
     DomainAuthorityReference, DomainEventArchive, EventArchiveCut, ExportManifest,
@@ -201,9 +201,12 @@ impl CreateWorkspaceExportRequest {
     }
 }
 
+/// Kind of retained record used as a restore source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RestoreSourceKind {
+pub enum RestoreSourceKind {
+    /// An immutable workspace snapshot.
     Snapshot,
+    /// An immutable portable export manifest.
     Export,
 }
 
@@ -260,6 +263,12 @@ impl RestoreSource {
     #[must_use]
     pub fn pin_id(&self) -> &str {
         &self.pin_id
+    }
+
+    /// Returns the retained record kind.
+    #[must_use]
+    pub const fn kind(&self) -> RestoreSourceKind {
+        self.kind
     }
 }
 
@@ -354,15 +363,16 @@ impl RestorePreflightReport {
     }
 }
 
-struct PreflightCut {
-    initial_pin: RetentionPinRevision,
-    usable_retention_deadline: DateTime<Utc>,
-    scope: WorkspaceScope,
-    domains: Vec<DomainAuthorityReference>,
-    projections: Vec<ProjectionWatermark>,
-    archives: Vec<DomainEventArchive>,
-    required_objects: Vec<RequiredObject>,
-    compatibility: Vec<LegacyCompatibilityArtifact>,
+pub(crate) struct PreflightCut {
+    pub(crate) source_record_sha256: String,
+    pub(crate) initial_pin: RetentionPinRevision,
+    pub(crate) usable_retention_deadline: DateTime<Utc>,
+    pub(crate) scope: WorkspaceScope,
+    pub(crate) domains: Vec<DomainAuthorityReference>,
+    pub(crate) projections: Vec<ProjectionWatermark>,
+    pub(crate) archives: Vec<DomainEventArchive>,
+    pub(crate) required_objects: Vec<RequiredObject>,
+    pub(crate) compatibility: Vec<LegacyCompatibilityArtifact>,
 }
 
 struct CapturedSnapshotCut {
@@ -516,6 +526,7 @@ pub struct WorkspaceDomainBinding {
     authority_adapter: Arc<dyn PersistedAuthorityAdapter>,
     projection_provider: Arc<dyn ProjectionWatermarkProvider>,
     event_archive_provider: Arc<dyn EventArchiveProvider>,
+    restore_participant: Option<Arc<dyn StateRestoreParticipant>>,
 }
 
 impl WorkspaceDomainBinding {
@@ -538,6 +549,7 @@ impl WorkspaceDomainBinding {
             authority_adapter,
             projection_provider,
             event_archive_provider,
+            restore_participant: None,
         })
     }
 
@@ -551,6 +563,46 @@ impl WorkspaceDomainBinding {
     #[must_use]
     pub fn capabilities(&self) -> StateStoreCapabilities {
         self.state_store.capabilities()
+    }
+
+    /// Explicitly configures deterministic roll-forward restore for this domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when capability, implementation, or scope does not match.
+    pub fn with_restore_participant(
+        mut self,
+        participant: Arc<dyn StateRestoreParticipant>,
+    ) -> Result<Self> {
+        if !self.capabilities().roll_forward_restore()
+            || participant.implementation() != self.capabilities().implementation()
+            || participant.scope() != &self.state_scope
+        {
+            return Err(validation(
+                "restore participant does not match workspace domain binding",
+            ));
+        }
+        let store_identity = self
+            .state_store
+            .restore_binding_identity()
+            .ok_or_else(|| validation("state store does not expose a restore binding identity"))?;
+        if store_identity != participant.restore_binding_identity() {
+            return Err(validation(
+                "restore participant backend does not match workspace domain binding",
+            ));
+        }
+        self.restore_participant = Some(participant);
+        Ok(self)
+    }
+
+    /// Returns whether restore was configured explicitly for this binding.
+    #[must_use]
+    pub fn restore_configured(&self) -> bool {
+        self.restore_participant.is_some()
+    }
+
+    pub(crate) fn restore_participant(&self) -> Option<&Arc<dyn StateRestoreParticipant>> {
+        self.restore_participant.as_ref()
     }
 }
 
@@ -636,6 +688,108 @@ impl WorkspaceSnapshotService {
             ));
         }
         Ok(Self { storage, registry })
+    }
+
+    pub(crate) fn registry(&self) -> &WorkspaceDomainRegistry {
+        &self.registry
+    }
+
+    pub(crate) async fn validated_restore_cut_for_domains(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        selected_domains: &BTreeSet<String>,
+        now: DateTime<Utc>,
+    ) -> Result<PreflightCut> {
+        expected_scope.validate()?;
+        if selected_domains.is_empty() {
+            return Err(validation("restore preflight requires a selected domain"));
+        }
+        let before = self.load_preflight_cut(source).await?;
+        if &before.scope != expected_scope || self.registry.scope() != expected_scope {
+            return Err(validation("restore source record is out of scope"));
+        }
+        let selected = before
+            .domains
+            .iter()
+            .filter(|authority| selected_domains.contains(authority.domain()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.len() != selected_domains.len() {
+            return Err(validation("selected restore domain is absent from source"));
+        }
+
+        let mut issues = Vec::new();
+        self.preflight_source_pin(
+            source,
+            &before.initial_pin,
+            before.usable_retention_deadline,
+            now,
+            &mut issues,
+        )
+        .await?;
+        let invalid_paths = self
+            .scan_preflight_objects(&before.required_objects, &mut issues)
+            .await?;
+        let required: BTreeMap<&str, &RequiredObject> = before
+            .required_objects
+            .iter()
+            .map(|object| (object.relative_path(), object))
+            .collect();
+        Self::preflight_reference_closure(
+            &before.domains,
+            &before.projections,
+            &before.archives,
+            &before.compatibility,
+            &required,
+            &mut issues,
+        );
+        self.preflight_authorities(&selected, expected_scope, now, &invalid_paths, &mut issues)
+            .await?;
+        if !issues.is_empty() {
+            return Err(validation("restore source preflight did not pass"));
+        }
+        let after = self.load_preflight_cut(source).await?;
+        if before.source_record_sha256 != after.source_record_sha256 {
+            return Err(validation("restore source record changed during preflight"));
+        }
+        Ok(after)
+    }
+
+    pub(crate) async fn immutable_restore_cut(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+    ) -> Result<PreflightCut> {
+        expected_scope.validate()?;
+        let cut = self.load_preflight_cut(source).await?;
+        if &cut.scope != expected_scope || self.registry.scope() != expected_scope {
+            return Err(validation("restore source record is out of scope"));
+        }
+        Ok(cut)
+    }
+
+    pub(crate) async fn require_active_restore_source_pin(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let cut = self.immutable_restore_cut(source, expected_scope).await?;
+        let mut issues = Vec::new();
+        self.preflight_source_pin(
+            source,
+            &cut.initial_pin,
+            cut.usable_retention_deadline,
+            now,
+            &mut issues,
+        )
+        .await?;
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(validation("restore source pin is not active"))
+        }
     }
 
     /// Loads one snapshot by its exact validated identifier.
@@ -991,8 +1145,13 @@ impl WorkspaceSnapshotService {
     async fn load_preflight_cut(&self, source: &RestoreSource) -> Result<PreflightCut> {
         match source.kind {
             RestoreSourceKind::Snapshot => {
-                let snapshot = self.get_snapshot(source.id()).await?;
+                let bytes = self
+                    .storage
+                    .get_raw(&snapshot_record_path(source.id())?)
+                    .await?;
+                let snapshot = decode_workspace_snapshot(&bytes)?;
                 Ok(PreflightCut {
+                    source_record_sha256: prefixed_sha256(&bytes),
                     initial_pin: Self::snapshot_initial_pin(&snapshot)?,
                     usable_retention_deadline: snapshot.usable_retention_deadline(),
                     scope: snapshot.scope().clone(),
@@ -1004,11 +1163,16 @@ impl WorkspaceSnapshotService {
                 })
             }
             RestoreSourceKind::Export => {
-                let export = self.get_export(source.id()).await?;
+                let bytes = self
+                    .storage
+                    .get_raw(&export_record_path(source.id())?)
+                    .await?;
+                let export = decode_export_manifest(&bytes)?;
                 if export.relocation() != RelocationPolicy::relative_to_caller_export_root() {
                     return Err(validation("unsupported export relocation policy"));
                 }
                 Ok(PreflightCut {
+                    source_record_sha256: prefixed_sha256(&bytes),
                     initial_pin: Self::export_initial_pin(&export)?,
                     usable_retention_deadline: export.usable_retention_deadline(),
                     scope: export.scope().clone(),

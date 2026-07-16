@@ -5,11 +5,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
 
+use arco_core::ScopedStorage;
+
 use crate::error::{CatalogError, Result};
 use crate::workspace_snapshot::{
     EventArchiveCut, ExportManifest, RetentionPinLatest, RetentionPinRevision, RetentionStatus,
-    RetentionTarget, WorkspaceSnapshot, decode_retention_pin_revision,
+    RetentionTarget, WorkspaceSnapshot, decode_retention_pin_latest, decode_retention_pin_revision,
 };
+pub(super) use crate::workspace_snapshot::{
+    export_record_path, retention_pin_latest_path as pin_latest_path,
+    retention_pin_revision_path as pin_revision_path, snapshot_record_path,
+};
+
+/// Maximum immutable revisions read to validate one selected pin chain.
+///
+/// The bound is checked from the selector before any revision object is read,
+/// preventing corrupt selectors from forcing unbounded request-time traversal.
+const MAX_RETENTION_PIN_REVISIONS: u64 = 1_024;
 
 /// Complete background inventory used to build one fail-closed protection set.
 #[derive(Debug, Clone, Default)]
@@ -38,13 +50,13 @@ impl PinRevisionEvidence {
 
 /// Latest selector and complete immutable predecessor-chain evidence.
 #[derive(Debug, Clone)]
-pub(super) struct SelectedRetentionPin {
+pub struct SelectedRetentionPin {
     selector: RetentionPinLatest,
     revisions: Vec<PinRevisionEvidence>,
 }
 
 impl SelectedRetentionPin {
-    pub(super) fn from_revision_bytes(
+    pub fn from_revision_bytes(
         selector: RetentionPinLatest,
         revision_bytes: &[Vec<u8>],
     ) -> Result<Self> {
@@ -58,14 +70,21 @@ impl SelectedRetentionPin {
         })
     }
 
-    pub(super) fn latest_revision(&self) -> Result<&RetentionPinRevision> {
+    pub fn latest_revision(&self) -> Result<&RetentionPinRevision> {
         self.revisions
             .last()
             .map(|evidence| &evidence.revision)
             .ok_or_else(|| validation("selected retention pin has no revision evidence"))
     }
 
-    pub(super) fn validate(&mut self) -> Result<()> {
+    pub fn initial_revision(&self) -> Result<&RetentionPinRevision> {
+        self.revisions
+            .first()
+            .map(|evidence| &evidence.revision)
+            .ok_or_else(|| validation("selected retention pin has no revision evidence"))
+    }
+
+    pub fn validate(&mut self) -> Result<()> {
         self.selector.validate()?;
         self.validate_revision_evidence()?;
         self.validate_transitions()?;
@@ -82,6 +101,11 @@ impl SelectedRetentionPin {
         if self.revisions.is_empty() {
             return Err(validation(
                 "selected retention pin has no revision evidence",
+            ));
+        }
+        if u64::try_from(self.revisions.len()).unwrap_or(u64::MAX) > MAX_RETENTION_PIN_REVISIONS {
+            return Err(validation(
+                "selected retention pin exceeds the revision traversal limit",
             ));
         }
 
@@ -129,7 +153,7 @@ impl SelectedRetentionPin {
             .ok_or_else(|| validation("retention pin successor is missing predecessor evidence"))?;
         if predecessor.revision() != previous.revision.revision()
             || predecessor.revision_path()
-                != pin_revision_path(previous.revision.pin_id(), previous.revision.revision())
+                != pin_revision_path(previous.revision.pin_id(), previous.revision.revision())?
             || predecessor.revision_sha256() != previous.raw_sha256
         {
             return Err(validation(
@@ -182,7 +206,7 @@ impl SelectedRetentionPin {
                 "latest pin selector and immutable revision disagree",
             ));
         }
-        let expected_path = pin_revision_path(latest.pin_id(), latest.revision());
+        let expected_path = pin_revision_path(latest.pin_id(), latest.revision())?;
         if self.selector.revision_path() != expected_path {
             return Err(validation(
                 "latest pin selector revision path is not canonical",
@@ -197,15 +221,69 @@ impl SelectedRetentionPin {
         Ok(())
     }
 
-    pub(super) fn status_at(&self, now: DateTime<Utc>) -> Result<RetentionStatus> {
+    pub fn status_at(&self, now: DateTime<Utc>) -> Result<RetentionStatus> {
         self.latest_revision()?.status_at(now)
     }
 
-    fn revision_paths(&self) -> impl Iterator<Item = String> + '_ {
-        self.revisions.iter().map(|evidence| {
-            pin_revision_path(evidence.revision.pin_id(), evidence.revision.revision())
-        })
+    fn revision_paths(&self) -> Result<Vec<String>> {
+        self.revisions
+            .iter()
+            .map(|evidence| {
+                pin_revision_path(evidence.revision.pin_id(), evidence.revision.revision())
+            })
+            .collect()
     }
+}
+
+/// Directly loads and validates one selected retention pin without listing.
+pub async fn load_selected_retention_pin(
+    storage: &ScopedStorage,
+    pin_id: &str,
+) -> Result<SelectedRetentionPin> {
+    let selector_path = pin_latest_path(pin_id)?;
+    let selector_bytes = storage.get_raw(&selector_path).await?;
+    let selector = decode_retention_pin_latest(&selector_bytes)?;
+    if selector.pin_id() != pin_id || pin_latest_path(selector.pin_id())? != selector_path {
+        return Err(validation(
+            "retention pin selector path is not canonical for the requested pin",
+        ));
+    }
+    if selector.revision() > MAX_RETENTION_PIN_REVISIONS {
+        return Err(validation(
+            "selected retention pin exceeds the revision traversal limit",
+        ));
+    }
+
+    let mut revision_path = selector.revision_path().to_string();
+    let mut expected_revision = selector.revision();
+    let mut revision_bytes = Vec::new();
+    loop {
+        let bytes = storage.get_raw(&revision_path).await?;
+        let revision = decode_retention_pin_revision(&bytes)?;
+        if revision.pin_id() != selector.pin_id()
+            || revision.revision() != expected_revision
+            || revision_path != pin_revision_path(revision.pin_id(), revision.revision())?
+        {
+            return Err(validation(
+                "retention pin revision chain path is not canonical",
+            ));
+        }
+        revision_bytes.push(bytes.to_vec());
+        if expected_revision == 1 {
+            break;
+        }
+        let predecessor = revision
+            .predecessor()
+            .ok_or_else(|| validation("retention pin successor is missing predecessor evidence"))?;
+        revision_path = predecessor.revision_path().to_string();
+        expected_revision = expected_revision
+            .checked_sub(1)
+            .ok_or_else(|| validation("retention pin revision chain underflow"))?;
+    }
+    revision_bytes.reverse();
+    let mut selected = SelectedRetentionPin::from_revision_bytes(selector, &revision_bytes)?;
+    selected.validate()?;
+    Ok(selected)
 }
 
 /// Deterministic exact-object and prefix protection computed before deletion.
@@ -287,8 +365,8 @@ pub(super) fn build_protection_set(
 
     for selected in pins.values() {
         let revision = selected.latest_revision()?;
-        protection.protect_exact(pin_latest_path(revision.pin_id()));
-        for path in selected.revision_paths() {
+        protection.protect_exact(pin_latest_path(revision.pin_id())?);
+        for path in selected.revision_paths()? {
             protection.protect_exact(path);
         }
         if selected.status_at(now)? != RetentionStatus::Active {
@@ -299,21 +377,69 @@ pub(super) fn build_protection_set(
                 let snapshot = snapshots.get(snapshot_id).ok_or_else(|| {
                     validation(format!("active pin target {snapshot_id} is missing"))
                 })?;
-                protect_snapshot(&mut protection, snapshot);
+                validate_snapshot_pin_binding(selected, snapshot)?;
+                protect_snapshot(&mut protection, snapshot)?;
             }
             RetentionTarget::Export(export_id) => {
                 let export = exports.get(export_id).ok_or_else(|| {
                     validation(format!("active pin target {export_id} is missing"))
                 })?;
-                protect_export(&mut protection, export);
+                validate_export_pin_binding(selected, export)?;
+                protect_export(&mut protection, export)?;
             }
         }
     }
     Ok(protection)
 }
 
-fn protect_snapshot(protection: &mut ProtectionSet, snapshot: &WorkspaceSnapshot) {
-    protection.protect_exact(snapshot_record_path(snapshot.snapshot_id()));
+fn validate_snapshot_pin_binding(
+    selected: &SelectedRetentionPin,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<()> {
+    let expected = RetentionPinRevision::new(
+        snapshot.target_pin_id(),
+        1,
+        RetentionTarget::snapshot(snapshot.snapshot_id())?,
+        snapshot.created_at(),
+        snapshot.retained_until(),
+        None,
+    )?;
+    validate_active_pin_binding(selected, &expected, snapshot.usable_retention_deadline())
+}
+
+fn validate_export_pin_binding(
+    selected: &SelectedRetentionPin,
+    export: &ExportManifest,
+) -> Result<()> {
+    let expected = RetentionPinRevision::new(
+        export.target_pin_id(),
+        1,
+        RetentionTarget::export(export.export_id())?,
+        export.created_at(),
+        export.retained_until(),
+        None,
+    )?;
+    validate_active_pin_binding(selected, &expected, export.usable_retention_deadline())
+}
+
+fn validate_active_pin_binding(
+    selected: &SelectedRetentionPin,
+    expected: &RetentionPinRevision,
+    usable_retention_deadline: DateTime<Utc>,
+) -> Result<()> {
+    if selected.initial_revision()? != expected
+        || selected.latest_revision()?.target() != expected.target()
+        || selected.latest_revision()?.retained_until() > usable_retention_deadline
+    {
+        return Err(validation(
+            "active retention pin does not match its immutable target record",
+        ));
+    }
+    Ok(())
+}
+
+fn protect_snapshot(protection: &mut ProtectionSet, snapshot: &WorkspaceSnapshot) -> Result<()> {
+    protection.protect_exact(snapshot_record_path(snapshot.snapshot_id())?);
     protect_cut(
         protection,
         snapshot.domains(),
@@ -322,11 +448,12 @@ fn protect_snapshot(protection: &mut ProtectionSet, snapshot: &WorkspaceSnapshot
         snapshot.required_objects(),
         snapshot.compatibility_artifacts(),
     );
+    Ok(())
 }
 
-fn protect_export(protection: &mut ProtectionSet, export: &ExportManifest) {
-    protection.protect_exact(export_record_path(export.export_id()));
-    protection.protect_exact(snapshot_record_path(export.snapshot_id()));
+fn protect_export(protection: &mut ProtectionSet, export: &ExportManifest) -> Result<()> {
+    protection.protect_exact(export_record_path(export.export_id())?);
+    protection.protect_exact(snapshot_record_path(export.snapshot_id())?);
     protect_cut(
         protection,
         export.domains(),
@@ -335,6 +462,7 @@ fn protect_export(protection: &mut ProtectionSet, export: &ExportManifest) {
         export.required_objects(),
         export.compatibility_artifacts(),
     );
+    Ok(())
 }
 
 fn protect_cut(
@@ -368,22 +496,6 @@ fn protect_cut(
     for artifact in compatibility {
         protection.protect_exact(artifact.relative_path().to_string());
     }
-}
-
-pub(super) fn snapshot_record_path(snapshot_id: &str) -> String {
-    format!("retention/snapshots/{snapshot_id}.json")
-}
-
-pub(super) fn export_record_path(export_id: &str) -> String {
-    format!("retention/exports/{export_id}.json")
-}
-
-pub(super) fn pin_latest_path(pin_id: &str) -> String {
-    format!("retention/pins/{pin_id}/latest.json")
-}
-
-pub(super) fn pin_revision_path(pin_id: &str, revision: u64) -> String {
-    format!("retention/pins/{pin_id}/revisions/{revision}.json")
 }
 
 fn canonical_prefix(prefix: &str) -> String {
@@ -461,6 +573,8 @@ mod tests {
     const EXPORT_ID: &str = "exp_01ARZ3NDEKTSV4RRFFQ69G5FAW";
     const EXPORT_PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAX";
     const PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAY";
+    const ALIAS_PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAZ";
+    const ALIAS_EXPORT_PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FB0";
     const DIGEST_1: &str =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const DIGEST_2: &str =
@@ -489,6 +603,7 @@ mod tests {
         .expect("authority");
         WorkspaceSnapshot::new(
             SNAPSHOT_ID,
+            PIN_ID,
             scope.clone(),
             ts(1_700_000_000),
             ts(1_800_000_000),
@@ -565,7 +680,9 @@ mod tests {
         .expect("authority");
         ExportManifest::new(
             EXPORT_ID,
+            EXPORT_PIN_ID,
             SNAPSHOT_ID,
+            PIN_ID,
             scope.clone(),
             ts(1_700_000_000),
             ts(1_800_000_000),
@@ -576,6 +693,13 @@ mod tests {
             vec![],
             vec![DomainEventArchive::empty("catalog").expect("archive")],
             vec![
+                RequiredObject::new(
+                    snapshot_record_path(SNAPSHOT_ID).expect("source snapshot path"),
+                    1,
+                    RequiredObjectKind::SnapshotRecord,
+                    DIGEST_1,
+                )
+                .expect("source snapshot record"),
                 RequiredObject::new(
                     "exports/root-token.json",
                     1,
@@ -625,7 +749,7 @@ mod tests {
         let selector = RetentionPinLatest::new(
             pin_id,
             revision.revision(),
-            pin_revision_path(pin_id, revision.revision()),
+            pin_revision_path(pin_id, revision.revision()).expect("revision path"),
             revision_sha256,
         )
         .expect("selector");
@@ -640,6 +764,37 @@ mod tests {
             released,
             retained_until,
         )
+    }
+
+    fn renewed_selected_pin(
+        initial_retained_until: i64,
+        renewed_retained_until: i64,
+    ) -> SelectedRetentionPin {
+        let initial = RetentionPinRevision::new(
+            PIN_ID,
+            1,
+            RetentionTarget::snapshot(SNAPSHOT_ID).expect("target"),
+            ts(1_700_000_000),
+            ts(initial_retained_until),
+            None,
+        )
+        .expect("initial pin revision");
+        let renewed = initial
+            .renew(2, ts(renewed_retained_until), ts(1_710_000_000))
+            .expect("renewed pin revision");
+        let revision_bytes = vec![
+            encode_retention_pin_revision(&initial).expect("initial pin bytes"),
+            encode_retention_pin_revision(&renewed).expect("renewed pin bytes"),
+        ];
+        let selector = RetentionPinLatest::new(
+            PIN_ID,
+            2,
+            pin_revision_path(PIN_ID, 2).expect("revision path"),
+            sha256_digest(&revision_bytes[1]),
+        )
+        .expect("selector");
+        SelectedRetentionPin::from_revision_bytes(selector, &revision_bytes)
+            .expect("selected renewed pin")
     }
 
     #[test]
@@ -691,12 +846,89 @@ mod tests {
         }
         assert!(protection.protects_prefix("snapshots/catalog/v99/"));
         assert!(protection.protects_prefix("snapshots/search/v42/"));
-        assert!(protection.protects_object(&snapshot_record_path(SNAPSHOT_ID)));
-        assert!(protection.protects_object(&export_record_path(EXPORT_ID)));
+        assert!(
+            protection
+                .protects_object(&snapshot_record_path(SNAPSHOT_ID).expect("snapshot record path"))
+        );
+        assert!(
+            protection.protects_object(&export_record_path(EXPORT_ID).expect("export record path"))
+        );
         for (pin_id, revision) in [(PIN_ID, 1), (EXPORT_PIN_ID, 1)] {
-            assert!(protection.protects_object(&pin_latest_path(pin_id)));
-            assert!(protection.protects_object(&pin_revision_path(pin_id, revision)));
+            assert!(protection.protects_object(&pin_latest_path(pin_id).expect("pin latest path")));
+            assert!(
+                protection.protects_object(
+                    &pin_revision_path(pin_id, revision).expect("pin revision path")
+                )
+            );
         }
+    }
+
+    #[test]
+    fn active_pin_identity_must_match_the_immutable_target_record_binding() {
+        let snapshot_alias = ReachabilityInventory {
+            snapshots: vec![snapshot()],
+            selected_pins: vec![selected_pin_for(
+                ALIAS_PIN_ID,
+                RetentionTarget::snapshot(SNAPSHOT_ID).expect("snapshot target"),
+                false,
+                1_800_000_000,
+            )],
+            ..ReachabilityInventory::default()
+        };
+        assert!(build_protection_set(ts(1_750_000_000), snapshot_alias).is_err());
+
+        let export_alias = ReachabilityInventory {
+            exports: vec![export()],
+            selected_pins: vec![selected_pin_for(
+                ALIAS_EXPORT_PIN_ID,
+                RetentionTarget::export(EXPORT_ID).expect("export target"),
+                false,
+                1_800_000_000,
+            )],
+            ..ReachabilityInventory::default()
+        };
+        assert!(build_protection_set(ts(1_750_000_000), export_alias).is_err());
+    }
+
+    #[test]
+    fn active_pin_initial_semantics_must_match_the_immutable_target_record() {
+        let snapshot_substitution = ReachabilityInventory {
+            snapshots: vec![snapshot()],
+            selected_pins: vec![selected_pin_for(
+                PIN_ID,
+                RetentionTarget::snapshot(SNAPSHOT_ID).expect("snapshot target"),
+                false,
+                1_800_000_001,
+            )],
+            ..ReachabilityInventory::default()
+        };
+        assert!(build_protection_set(ts(1_750_000_000), snapshot_substitution).is_err());
+
+        let export_substitution = ReachabilityInventory {
+            exports: vec![export()],
+            selected_pins: vec![selected_pin_for(
+                EXPORT_PIN_ID,
+                RetentionTarget::export(EXPORT_ID).expect("export target"),
+                false,
+                1_800_000_001,
+            )],
+            ..ReachabilityInventory::default()
+        };
+        assert!(build_protection_set(ts(1_750_000_000), export_substitution).is_err());
+    }
+
+    #[test]
+    fn active_pin_must_not_outlive_the_immutable_target_cut() {
+        let inventory = ReachabilityInventory {
+            snapshots: vec![snapshot()],
+            selected_pins: vec![renewed_selected_pin(1_800_000_000, 1_900_000_000)],
+            ..ReachabilityInventory::default()
+        };
+
+        assert!(
+            build_protection_set(ts(1_750_000_000), inventory).is_err(),
+            "GC must fail closed when a selected pin outlives its immutable target cut"
+        );
     }
 
     #[test]
@@ -716,7 +948,9 @@ mod tests {
             )
             .expect("inactive pin inventory remains valid");
             assert!(!protection.protects_object("roots/root-token.json"));
-            assert!(!protection.protects_object(&snapshot_record_path(SNAPSHOT_ID)));
+            assert!(!protection.protects_object(
+                &snapshot_record_path(SNAPSHOT_ID).expect("snapshot record path")
+            ));
         }
     }
 
@@ -734,9 +968,13 @@ mod tests {
         assert!(missing.is_err());
 
         let mut corrupt_digest = selected_pin(false, 1_800_000_000);
-        corrupt_digest.selector =
-            RetentionPinLatest::new(PIN_ID, 1, pin_revision_path(PIN_ID, 1), DIGEST_1)
-                .expect("corrupt selector is structurally valid");
+        corrupt_digest.selector = RetentionPinLatest::new(
+            PIN_ID,
+            1,
+            pin_revision_path(PIN_ID, 1).expect("pin revision path"),
+            DIGEST_1,
+        )
+        .expect("corrupt selector is structurally valid");
         assert!(
             build_protection_set(
                 ts(1_750_000_000),
@@ -790,8 +1028,13 @@ mod tests {
             .expect("valid successor");
         let bytes = encode_retention_pin_revision(&revision).expect("revision bytes");
         let digest = sha256_digest(&bytes);
-        let selector = RetentionPinLatest::new(PIN_ID, 2, pin_revision_path(PIN_ID, 2), digest)
-            .expect("selector");
+        let selector = RetentionPinLatest::new(
+            PIN_ID,
+            2,
+            pin_revision_path(PIN_ID, 2).expect("pin revision path"),
+            digest,
+        )
+        .expect("selector");
         let inventory = ReachabilityInventory {
             current_heads: vec![],
             snapshots: vec![snapshot()],

@@ -768,9 +768,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         )
     }
 
-    async fn resolve_persisted_reference(
+    async fn resolve_persisted_reference_at(
         &self,
         reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
     ) -> Result<Box<dyn ArcoStateReader>> {
         reference.validate()?;
         if reference.implementation() != IMPLEMENTATION {
@@ -783,7 +784,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "persisted authority scope does not match control MVP store",
             ));
         }
-        if reference.retention_deadline() <= Utc::now() {
+        if reference.retention_deadline() <= now {
             return Err(validation_failed(
                 "persisted authority reference is expired",
             ));

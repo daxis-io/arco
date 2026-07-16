@@ -2,10 +2,12 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, Utc};
 
+use arco_core::lock::DistributedLock;
 use arco_core::scoped_storage::ScopedStorage;
 use arco_core::{CatalogDomain, CatalogPaths};
 
@@ -14,17 +16,19 @@ use crate::gc::RetentionPolicy;
 #[cfg(test)]
 use crate::gc::reachability::sha256_digest;
 use crate::gc::reachability::{
-    ProtectionSet, ReachabilityInventory, SelectedRetentionPin, build_protection_set,
-    export_record_path, pin_latest_path, pin_revision_path, snapshot_record_path,
-    validate_inventory_path,
+    ProtectionSet, ReachabilityInventory, build_protection_set, export_record_path,
+    load_selected_retention_pin, snapshot_record_path, validate_inventory_path,
 };
+#[cfg(test)]
+use crate::gc::reachability::{pin_latest_path, pin_revision_path};
 use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
     RootManifest, SearchManifest,
 };
+use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
 use crate::workspace_snapshot::{
-    RetentionStatus, RetentionTarget, decode_export_manifest, decode_retention_pin_latest,
-    decode_retention_pin_revision, decode_workspace_snapshot,
+    RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RetentionStatus,
+    RetentionTarget, decode_export_manifest, decode_workspace_snapshot,
 };
 
 // =========================================================================
@@ -158,6 +162,43 @@ impl GarbageCollector {
     /// Returns an error if critical operations fail. Non-fatal errors are
     /// collected in the result's `errors` field without aborting the run.
     pub async fn collect(&self) -> Result<GcResult> {
+        let mut guard =
+            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
+                .acquire_with_operation(
+                    RETENTION_GC_LOCK_TTL,
+                    RETENTION_GC_LOCK_MAX_RETRIES,
+                    Some("catalog-gc".to_string()),
+                )
+                .await
+                .map_err(CatalogError::from)?;
+        let operation_id = guard.holder_id().to_string();
+        let mut epoch = match RetentionMutationEpoch::claim(
+            self.storage.clone(),
+            &mut guard,
+            RetentionMutationKind::CatalogGc,
+            operation_id,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                let _ = guard.release().await;
+                return Err(error);
+            }
+        };
+        let collection = self.collect_while_coordinated(&mut epoch).await;
+        let settlement = epoch.settle().await;
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (collection, settlement, release) {
+            (Ok(result), Ok(()), Ok(())) => Ok(result),
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    async fn collect_while_coordinated(
+        &self,
+        epoch: &mut RetentionMutationEpoch,
+    ) -> Result<GcResult> {
         let start = Instant::now();
         let mut result = GcResult::default();
         let protection = self.load_protection_set(Utc::now()).await?;
@@ -182,24 +223,24 @@ impl GarbageCollector {
         self.run_phase(
             "orphaned_snapshots",
             "orphaned snapshots",
-            || self.gc_orphaned_snapshots(orphaned, &protection),
+            || self.gc_orphaned_snapshots(orphaned, &protection, epoch),
             &mut result,
         )
-        .await;
+        .await?;
         self.run_phase(
             "compacted_ledger",
             "compacted ledger",
-            || self.gc_compacted_ledger(old_events, &protection),
+            || self.gc_compacted_ledger(old_events, &protection, epoch),
             &mut result,
         )
-        .await;
+        .await?;
         self.run_phase(
             "old_snapshots",
             "old snapshots",
-            || self.gc_old_snapshots(old_versions, &protection),
+            || self.gc_old_snapshots(old_versions, &protection, epoch),
             &mut result,
         )
-        .await;
+        .await?;
 
         let total_duration_secs = start.elapsed().as_secs_f64();
         tracing::info!(
@@ -225,7 +266,8 @@ impl GarbageCollector {
         error_context: &'static str,
         f: F,
         result: &mut GcResult,
-    ) where
+    ) -> Result<()>
+    where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<GcResult>>,
     {
@@ -252,6 +294,7 @@ impl GarbageCollector {
 
                 result.merge(phase_result);
             }
+            Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
             Err(e) => {
                 tracing::error!(
                     phase,
@@ -266,6 +309,7 @@ impl GarbageCollector {
                 result.errors.push(format!("{error_context}: {e}"));
             }
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -314,6 +358,7 @@ impl GarbageCollector {
         &self,
         orphaned: Vec<String>,
         protection: &ProtectionSet,
+        epoch: &mut RetentionMutationEpoch,
     ) -> Result<GcResult> {
         let mut result = GcResult::default();
         let cutoff = Utc::now() - Duration::hours(i64::from(self.policy.delay_hours));
@@ -333,13 +378,14 @@ impl GarbageCollector {
                 }
 
                 // Delete all files under the directory
-                match self.delete_prefix(&dir, protection).await {
+                match self.delete_prefix(&dir, protection, epoch).await {
                     Ok((count, bytes)) => {
                         tracing::info!(path = %dir, count, bytes, "deleted orphaned snapshot");
                         result.objects_deleted += count;
                         result.bytes_reclaimed += bytes;
                         result.orphaned_snapshots_deleted += 1;
                     }
+                    Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
                     Err(e) => {
                         result.errors.push(format!("delete {dir}: {e}"));
                     }
@@ -403,6 +449,7 @@ impl GarbageCollector {
         &self,
         old_events: Vec<String>,
         protection: &ProtectionSet,
+        epoch: &mut RetentionMutationEpoch,
     ) -> Result<GcResult> {
         let mut result = GcResult::default();
 
@@ -410,11 +457,12 @@ impl GarbageCollector {
             if protection.protects_object(&path) {
                 continue;
             }
-            match self.storage.delete(&path).await {
+            match epoch.delete(&path).await {
                 Ok(()) => {
                     result.objects_deleted += 1;
                     result.ledger_events_deleted += 1;
                 }
+                Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
                 Err(e) => {
                     result.errors.push(format!("delete {path}: {e}"));
                 }
@@ -501,17 +549,19 @@ impl GarbageCollector {
         &self,
         old_versions: Vec<String>,
         protection: &ProtectionSet,
+        epoch: &mut RetentionMutationEpoch,
     ) -> Result<GcResult> {
         let mut result = GcResult::default();
 
         for dir in old_versions {
-            match self.delete_prefix(&dir, protection).await {
+            match self.delete_prefix(&dir, protection, epoch).await {
                 Ok((count, bytes)) => {
                     tracing::info!(path = %dir, count, bytes, "deleted old snapshot version");
                     result.objects_deleted += count;
                     result.bytes_reclaimed += bytes;
                     result.old_snapshots_deleted += 1;
                 }
+                Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
                 Err(e) => {
                     result.errors.push(format!("delete {dir}: {e}"));
                 }
@@ -542,54 +592,15 @@ impl GarbageCollector {
             if !path.ends_with("/latest.json") {
                 continue;
             }
-            let selector_bytes = self.storage.get_raw(path).await?;
-            let selector = decode_retention_pin_latest(&selector_bytes)?;
-            if pin_latest_path(selector.pin_id()) != path {
+            let Some(pin_id) = path
+                .strip_prefix("retention/pins/")
+                .and_then(|value| value.strip_suffix("/latest.json"))
+            else {
                 return Err(CatalogError::Validation {
                     message: "retention pin selector path is not canonical".to_string(),
                 });
-            }
-            let mut revision_path = selector.revision_path().to_string();
-            let mut expected_revision = selector.revision();
-            let mut revision_bytes = Vec::new();
-            loop {
-                let bytes = self.storage.get_raw(&revision_path).await?;
-                let revision = decode_retention_pin_revision(&bytes)?;
-                if revision.pin_id() != selector.pin_id()
-                    || revision.revision() != expected_revision
-                    || revision_path != pin_revision_path(revision.pin_id(), revision.revision())
-                {
-                    return Err(CatalogError::Validation {
-                        message: "retention pin revision chain path is not canonical".to_string(),
-                    });
-                }
-                revision_bytes.push(bytes.to_vec());
-                if expected_revision == 1 {
-                    break;
-                }
-                let predecessor =
-                    revision
-                        .predecessor()
-                        .ok_or_else(|| CatalogError::Validation {
-                            message: "retention pin successor is missing predecessor evidence"
-                                .to_string(),
-                        })?;
-                revision_path = predecessor.revision_path().to_string();
-                expected_revision =
-                    expected_revision
-                        .checked_sub(1)
-                        .ok_or_else(|| CatalogError::Validation {
-                            message: "retention pin revision chain underflow".to_string(),
-                        })?;
-            }
-            revision_bytes.reverse();
-            let mut selected =
-                SelectedRetentionPin::from_revision_bytes(selector, &revision_bytes)?;
-
-            // Validate the complete predecessor chain and exact stored-byte digests
-            // before consulting lifecycle state or reading the retained target.
-            selected.validate()?;
-            selected_pins.push(selected);
+            };
+            selected_pins.push(load_selected_retention_pin(&self.storage, pin_id).await?);
         }
 
         // No retained target is read until every selected pin has passed full
@@ -606,14 +617,13 @@ impl GarbageCollector {
             }
             match &target {
                 RetentionTarget::Snapshot(snapshot_id) => {
-                    let bytes = self
-                        .storage
-                        .get_raw(&snapshot_record_path(snapshot_id))
-                        .await?;
+                    let snapshot_path = snapshot_record_path(snapshot_id)?;
+                    let bytes = self.storage.get_raw(&snapshot_path).await?;
                     snapshots.push(decode_workspace_snapshot(&bytes)?);
                 }
                 RetentionTarget::Export(export_id) => {
-                    let bytes = self.storage.get_raw(&export_record_path(export_id)).await?;
+                    let export_path = export_record_path(export_id)?;
+                    let bytes = self.storage.get_raw(&export_path).await?;
                     exports.push(decode_export_manifest(&bytes)?);
                 }
             }
@@ -724,7 +734,12 @@ impl GarbageCollector {
     }
 
     /// Deletes all objects under a prefix.
-    async fn delete_prefix(&self, prefix: &str, protection: &ProtectionSet) -> Result<(u64, u64)> {
+    async fn delete_prefix(
+        &self,
+        prefix: &str,
+        protection: &ProtectionSet,
+        epoch: &mut RetentionMutationEpoch,
+    ) -> Result<(u64, u64)> {
         if protection.protects_prefix(prefix) {
             return Ok((0, 0));
         }
@@ -762,12 +777,7 @@ impl GarbageCollector {
                 continue;
             }
 
-            self.storage
-                .delete(&path)
-                .await
-                .map_err(|e| CatalogError::Storage {
-                    message: format!("failed to delete {path}: {e}"),
-                })?;
+            epoch.delete(&path).await?;
 
             count += 1;
             bytes += size;
@@ -1380,7 +1390,8 @@ mod tests {
     async fn seed_retained_snapshot_record(
         storage: &ScopedStorage,
         required_objects: Vec<RequiredObject>,
-    ) -> DateTime<Utc> {
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        let created_at = Utc::now() - ChronoDuration::hours(1);
         let deadline = Utc::now() + ChronoDuration::days(1);
         let digest = format!("sha256:{}", "1".repeat(64));
         let workspace_scope = WorkspaceScope::new(storage.tenant_id(), storage.workspace_id())
@@ -1400,8 +1411,9 @@ mod tests {
         .expect("authority reference");
         let snapshot = WorkspaceSnapshot::new(
             TEST_SNAPSHOT_ID,
+            TEST_PIN_ID,
             workspace_scope.clone(),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
             vec![
@@ -1416,13 +1428,13 @@ mod tests {
         .expect("snapshot");
         storage
             .put_raw(
-                &snapshot_record_path(TEST_SNAPSHOT_ID),
+                &snapshot_record_path(TEST_SNAPSHOT_ID).expect("snapshot record path"),
                 Bytes::from(encode_workspace_snapshot(&snapshot).expect("snapshot bytes")),
                 WritePrecondition::None,
             )
             .await
             .expect("write snapshot record");
-        deadline
+        (created_at, deadline)
     }
 
     async fn seed_active_snapshot_pin(storage: &ScopedStorage, required_paths: &[(&str, u64)]) {
@@ -1434,20 +1446,20 @@ mod tests {
                     .expect("required retained object")
             })
             .collect();
-        let deadline = seed_retained_snapshot_record(storage, required_objects).await;
+        let (created_at, deadline) = seed_retained_snapshot_record(storage, required_objects).await;
 
         let revision = RetentionPinRevision::new(
             TEST_PIN_ID,
             1,
             RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("target"),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
         )
         .expect("pin revision");
         let revision_bytes = encode_retention_pin_revision(&revision).expect("revision bytes");
         let revision_digest = sha256_digest(&revision_bytes);
-        let revision_path = pin_revision_path(TEST_PIN_ID, 1);
+        let revision_path = pin_revision_path(TEST_PIN_ID, 1).expect("pin revision path");
         storage
             .put_raw(
                 &revision_path,
@@ -1460,7 +1472,7 @@ mod tests {
             .expect("selector");
         storage
             .put_raw(
-                &pin_latest_path(TEST_PIN_ID),
+                &pin_latest_path(TEST_PIN_ID).expect("pin latest path"),
                 Bytes::from(encode_retention_pin_latest(&selector).expect("selector bytes")),
                 WritePrecondition::None,
             )
@@ -1580,7 +1592,8 @@ mod tests {
         revision: &RetentionPinRevision,
         revision_bytes: Vec<u8>,
     ) {
-        let revision_path = pin_revision_path(revision.pin_id(), revision.revision());
+        let revision_path =
+            pin_revision_path(revision.pin_id(), revision.revision()).expect("pin revision path");
         let digest = sha256_digest(&revision_bytes);
         storage
             .put_raw(
@@ -1599,7 +1612,7 @@ mod tests {
         .expect("selector");
         storage
             .put_raw(
-                &pin_latest_path(revision.pin_id()),
+                &pin_latest_path(revision.pin_id()).expect("pin latest path"),
                 Bytes::from(encode_retention_pin_latest(&selector).expect("selector bytes")),
                 WritePrecondition::None,
             )
@@ -1617,7 +1630,7 @@ mod tests {
             .expect("init");
         let old_path = seed_old_and_current_catalog_snapshots(&storage).await;
         let digest = format!("sha256:{}", "1".repeat(64));
-        let deadline = seed_retained_snapshot_record(
+        let (created_at, deadline) = seed_retained_snapshot_record(
             &storage,
             vec![
                 RequiredObject::new(&old_path, 3, RequiredObjectKind::Other, &digest)
@@ -1629,7 +1642,7 @@ mod tests {
             TEST_PIN_ID,
             1,
             RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("target"),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
         )
@@ -1637,7 +1650,7 @@ mod tests {
         let initial_bytes = encode_retention_pin_revision(&initial).expect("initial bytes");
         storage
             .put_raw(
-                &pin_revision_path(TEST_PIN_ID, 1),
+                &pin_revision_path(TEST_PIN_ID, 1).expect("pin revision path"),
                 Bytes::from(initial_bytes),
                 WritePrecondition::None,
             )
@@ -1677,7 +1690,7 @@ mod tests {
             .expect("init");
         let old_path = seed_old_and_current_catalog_snapshots(&storage).await;
         let digest = format!("sha256:{}", "1".repeat(64));
-        let deadline = seed_retained_snapshot_record(
+        let (created_at, deadline) = seed_retained_snapshot_record(
             &storage,
             vec![
                 RequiredObject::new(&old_path, 3, RequiredObjectKind::Other, &digest)
@@ -1689,7 +1702,7 @@ mod tests {
             TEST_PIN_ID,
             1,
             RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("target"),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
         )
@@ -1728,12 +1741,12 @@ mod tests {
             .await
             .expect("init");
         seed_old_and_current_catalog_snapshots(&storage).await;
-        let deadline = seed_retained_snapshot_record(&storage, vec![]).await;
+        let (created_at, deadline) = seed_retained_snapshot_record(&storage, vec![]).await;
         let earlier_valid = RetentionPinRevision::new(
             "pin_01ARZ3NDEKTSV4RRFFQ69G5FAX",
             1,
             RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("valid target"),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
         )
@@ -1748,13 +1761,13 @@ mod tests {
             TEST_PIN_ID,
             1,
             RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("target"),
-            Utc::now() - ChronoDuration::hours(1),
+            created_at,
             deadline,
             None,
         )
         .expect("revision");
         let revision_bytes = encode_retention_pin_revision(&revision).expect("revision bytes");
-        let revision_path = pin_revision_path(TEST_PIN_ID, 1);
+        let revision_path = pin_revision_path(TEST_PIN_ID, 1).expect("pin revision path");
         storage
             .put_raw(
                 &revision_path,
@@ -1772,7 +1785,7 @@ mod tests {
         .expect("selector shape");
         storage
             .put_raw(
-                &pin_latest_path(TEST_PIN_ID),
+                &pin_latest_path(TEST_PIN_ID).expect("pin latest path"),
                 Bytes::from(
                     encode_retention_pin_latest(&corrupt_selector).expect("selector bytes"),
                 ),
@@ -1793,7 +1806,9 @@ mod tests {
         assert!(collector.collect().await.is_err());
         assert_eq!(0, backend.delete_calls());
         assert!(
-            !backend.read_path_suffix(&snapshot_record_path(TEST_SNAPSHOT_ID)),
+            !backend.read_path_suffix(
+                &snapshot_record_path(TEST_SNAPSHOT_ID).expect("snapshot record path")
+            ),
             "no target may be read until every selected pin validates"
         );
     }
@@ -2005,10 +2020,25 @@ mod tests {
         assert!(candidates.contains(&old_dir));
 
         move_current_catalog_head_to_version_one(&storage).await;
+        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire(RETENTION_GC_LOCK_TTL, 1)
+            .await
+            .expect("retention coordination");
+        let operation_id = guard.holder_id().to_string();
+        let mut epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::CatalogGc,
+            operation_id,
+        )
+        .await
+        .expect("durable retention epoch");
         collector
-            .gc_old_snapshots(candidates, &protection)
+            .gc_old_snapshots(candidates, &protection, &mut epoch)
             .await
             .expect("delete pass");
+        epoch.settle().await.expect("settle durable epoch");
+        guard.release().await.expect("release coordination");
 
         assert_eq!(0, backend.delete_calls());
         assert_eq!(

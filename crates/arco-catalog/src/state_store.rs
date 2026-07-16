@@ -1117,6 +1117,20 @@ pub trait PersistedAuthorityAdapter: Send + Sync {
     async fn resolve_persisted_reference(
         &self,
         reference: &PersistedAuthorityReference,
+    ) -> Result<Box<dyn ArcoStateReader>> {
+        self.resolve_persisted_reference_at(reference, Utc::now())
+            .await
+    }
+
+    /// Resolves a stable reference at an explicit decision time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for expired, corrupt, incompatible, or out-of-scope references.
+    async fn resolve_persisted_reference_at(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
     ) -> Result<Box<dyn ArcoStateReader>>;
 }
 
@@ -1304,9 +1318,10 @@ impl PersistedAuthorityAdapter for CurrentStateStore {
         ))
     }
 
-    async fn resolve_persisted_reference(
+    async fn resolve_persisted_reference_at(
         &self,
         _reference: &PersistedAuthorityReference,
+        _now: DateTime<Utc>,
     ) -> Result<Box<dyn ArcoStateReader>> {
         Err(unsupported(
             "persisted authority resolution through arco-state-current",

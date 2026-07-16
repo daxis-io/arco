@@ -101,6 +101,13 @@ async fn persisted_authority_references_round_trip_state_tokens_and_checkpoints(
             Some(Bytes::from_static(b"v1")),
             reader.get(b"catalog/default").await.expect("retained read")
         );
+        assert!(
+            store
+                .resolve_persisted_reference_at(reference, deadline + ChronoDuration::seconds(1),)
+                .await
+                .is_err(),
+            "caller-supplied time after the deadline must expire the reference"
+        );
         let json = serde_json::to_string(reference).expect("reference json");
         assert!(!json.contains("StateToken"));
         assert!(!json.contains("CheckpointToken"));

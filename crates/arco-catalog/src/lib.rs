@@ -96,6 +96,7 @@ pub mod parquet_util;
 mod read_model;
 pub mod reader;
 pub mod reconciler;
+mod retention_coordination;
 pub mod search_tombstone;
 mod state;
 pub mod state_store;
@@ -107,6 +108,7 @@ pub mod tier1_snapshot;
 pub mod tier1_state;
 pub mod tier1_writer;
 pub mod workspace_snapshot;
+pub mod workspace_snapshot_service;
 pub mod write_options;
 pub mod writer;
 

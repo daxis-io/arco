@@ -17,6 +17,10 @@ const EXPORT_RECORD_TYPE: &str = "workspace_export";
 const PIN_REVISION_RECORD_TYPE: &str = "retention_pin_revision";
 const PIN_LATEST_RECORD_TYPE: &str = "retention_pin_latest";
 
+pub(crate) const RETENTION_GC_LOCK_PATH: &str = "locks/workspace-retention-gc.lock.json";
+pub(crate) const RETENTION_GC_LOCK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RETENTION_GC_LOCK_MAX_RETRIES: u32 = 5;
+
 fn validation(message: impl Into<String>) -> CatalogError {
     CatalogError::Validation {
         message: message.into(),
@@ -52,6 +56,49 @@ fn validate_id(value: &str, prefix: &str, field: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Returns the canonical immutable snapshot-record path for a validated ID.
+///
+/// # Errors
+///
+/// Returns a validation error before formatting when the snapshot ID is malformed.
+pub fn snapshot_record_path(snapshot_id: &str) -> Result<String> {
+    validate_id(snapshot_id, "snap_", "snapshot_id")?;
+    Ok(format!("retention/snapshots/{snapshot_id}.json"))
+}
+
+/// Returns the canonical immutable export-record path for a validated ID.
+///
+/// # Errors
+///
+/// Returns a validation error before formatting when the export ID is malformed.
+pub fn export_record_path(export_id: &str) -> Result<String> {
+    validate_id(export_id, "exp_", "export_id")?;
+    Ok(format!("retention/exports/{export_id}.json"))
+}
+
+/// Returns the canonical latest-selector path for a validated pin ID.
+///
+/// # Errors
+///
+/// Returns a validation error before formatting when the pin ID is malformed.
+pub fn retention_pin_latest_path(pin_id: &str) -> Result<String> {
+    validate_id(pin_id, "pin_", "pin_id")?;
+    Ok(format!("retention/pins/{pin_id}/latest.json"))
+}
+
+/// Returns the canonical immutable pin-revision path.
+///
+/// # Errors
+///
+/// Returns a validation error before formatting when the pin ID or revision is malformed.
+pub fn retention_pin_revision_path(pin_id: &str, revision: u64) -> Result<String> {
+    validate_id(pin_id, "pin_", "pin_id")?;
+    if revision == 0 {
+        return Err(validation("pin revision must be positive"));
+    }
+    Ok(pin_revision_relative_path(pin_id, revision))
 }
 
 fn validate_relative_path(path: &str, field: &str) -> Result<()> {
@@ -730,6 +777,7 @@ pub struct WorkspaceSnapshot {
     record_type: String,
     version: u32,
     snapshot_id: String,
+    target_pin_id: String,
     scope: WorkspaceScope,
     created_at: DateTime<Utc>,
     retained_until: DateTime<Utc>,
@@ -746,6 +794,7 @@ struct WorkspaceSnapshotWire {
     record_type: String,
     version: u32,
     snapshot_id: String,
+    target_pin_id: String,
     scope: WorkspaceScope,
     created_at: DateTime<Utc>,
     retained_until: DateTime<Utc>,
@@ -763,6 +812,7 @@ impl From<WorkspaceSnapshotWire> for WorkspaceSnapshot {
             record_type: wire.record_type,
             version: wire.version,
             snapshot_id: wire.snapshot_id,
+            target_pin_id: wire.target_pin_id,
             scope: wire.scope,
             created_at: wire.created_at,
             retained_until: wire.retained_until,
@@ -785,6 +835,7 @@ impl WorkspaceSnapshot {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         snapshot_id: impl Into<String>,
+        target_pin_id: impl Into<String>,
         scope: WorkspaceScope,
         created_at: DateTime<Utc>,
         retained_until: DateTime<Utc>,
@@ -799,6 +850,7 @@ impl WorkspaceSnapshot {
             record_type: SNAPSHOT_RECORD_TYPE.to_string(),
             version: VERSION,
             snapshot_id: snapshot_id.into(),
+            target_pin_id: target_pin_id.into(),
             scope,
             created_at,
             retained_until,
@@ -818,6 +870,7 @@ impl WorkspaceSnapshot {
             return Err(validation("unsupported workspace snapshot envelope"));
         }
         validate_id(&self.snapshot_id, "snap_", "snapshot_id")?;
+        validate_id(&self.target_pin_id, "pin_", "target_pin_id")?;
         if let Some(parent) = &self.parent_snapshot_id {
             validate_id(parent, "snap_", "parent_snapshot_id")?;
             if parent == &self.snapshot_id {
@@ -844,6 +897,12 @@ impl WorkspaceSnapshot {
         &self.snapshot_id
     }
 
+    /// Returns the immutable retention pin identity that selects this snapshot.
+    #[must_use]
+    pub fn target_pin_id(&self) -> &str {
+        &self.target_pin_id
+    }
+
     /// Returns the record version.
     #[must_use]
     pub const fn version(&self) -> u32 {
@@ -866,6 +925,17 @@ impl WorkspaceSnapshot {
     #[must_use]
     pub const fn retained_until(&self) -> DateTime<Utc> {
         self.retained_until
+    }
+
+    /// Returns the latest time for which every immutable authority in this cut
+    /// is guaranteed to remain readable.
+    #[must_use]
+    pub fn usable_retention_deadline(&self) -> DateTime<Utc> {
+        self.domains
+            .iter()
+            .fold(self.retained_until, |deadline, domain| {
+                deadline.min(domain.authority().retention_deadline())
+            })
     }
 
     /// Returns the optional parent snapshot identifier.
@@ -936,7 +1006,9 @@ pub struct ExportManifest {
     record_type: String,
     version: u32,
     export_id: String,
+    target_pin_id: String,
     snapshot_id: String,
+    source_pin_id: String,
     scope: WorkspaceScope,
     created_at: DateTime<Utc>,
     retained_until: DateTime<Utc>,
@@ -953,7 +1025,9 @@ struct ExportManifestWire {
     record_type: String,
     version: u32,
     export_id: String,
+    target_pin_id: String,
     snapshot_id: String,
+    source_pin_id: String,
     scope: WorkspaceScope,
     created_at: DateTime<Utc>,
     retained_until: DateTime<Utc>,
@@ -971,7 +1045,9 @@ impl From<ExportManifestWire> for ExportManifest {
             record_type: wire.record_type,
             version: wire.version,
             export_id: wire.export_id,
+            target_pin_id: wire.target_pin_id,
             snapshot_id: wire.snapshot_id,
+            source_pin_id: wire.source_pin_id,
             scope: wire.scope,
             created_at: wire.created_at,
             retained_until: wire.retained_until,
@@ -994,7 +1070,9 @@ impl ExportManifest {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         export_id: impl Into<String>,
+        target_pin_id: impl Into<String>,
         snapshot_id: impl Into<String>,
+        source_pin_id: impl Into<String>,
         scope: WorkspaceScope,
         created_at: DateTime<Utc>,
         retained_until: DateTime<Utc>,
@@ -1009,7 +1087,9 @@ impl ExportManifest {
             record_type: EXPORT_RECORD_TYPE.to_string(),
             version: VERSION,
             export_id: export_id.into(),
+            target_pin_id: target_pin_id.into(),
             snapshot_id: snapshot_id.into(),
+            source_pin_id: source_pin_id.into(),
             scope,
             created_at,
             retained_until,
@@ -1029,7 +1109,14 @@ impl ExportManifest {
             return Err(validation("unsupported workspace export envelope"));
         }
         validate_id(&self.export_id, "exp_", "export_id")?;
+        validate_id(&self.target_pin_id, "pin_", "target_pin_id")?;
         validate_id(&self.snapshot_id, "snap_", "snapshot_id")?;
+        validate_id(&self.source_pin_id, "pin_", "source_pin_id")?;
+        if self.target_pin_id == self.source_pin_id {
+            return Err(validation(
+                "export target pin and source snapshot pin must be distinct",
+            ));
+        }
         if self.retained_until <= self.created_at {
             return Err(validation("retained_until must be after created_at"));
         }
@@ -1042,7 +1129,25 @@ impl ExportManifest {
             &mut self.event_archives,
             &mut self.required_objects,
             &mut self.compatibility_artifacts,
-        )
+        )?;
+        let expected_snapshot_path = snapshot_record_path(&self.snapshot_id)?;
+        let mut snapshot_records = self
+            .required_objects
+            .iter()
+            .filter(|object| object.kind() == RequiredObjectKind::SnapshotRecord);
+        let Some(source_snapshot_record) = snapshot_records.next() else {
+            return Err(validation(
+                "export requires its canonical source snapshot record",
+            ));
+        };
+        if source_snapshot_record.relative_path() != expected_snapshot_path
+            || snapshot_records.next().is_some()
+        {
+            return Err(validation(
+                "export must contain exactly one canonical source snapshot record",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the immutable export identifier.
@@ -1051,10 +1156,63 @@ impl ExportManifest {
         &self.export_id
     }
 
+    /// Returns the immutable retention pin identity that selects this export.
+    #[must_use]
+    pub fn target_pin_id(&self) -> &str {
+        &self.target_pin_id
+    }
+
     /// Returns the source snapshot identifier.
     #[must_use]
     pub fn snapshot_id(&self) -> &str {
         &self.snapshot_id
+    }
+
+    /// Returns the immutable source-snapshot retention pin identity.
+    #[must_use]
+    pub fn source_pin_id(&self) -> &str {
+        &self.source_pin_id
+    }
+
+    /// Returns the record version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns the repeated workspace scope.
+    #[must_use]
+    pub const fn scope(&self) -> &WorkspaceScope {
+        &self.scope
+    }
+
+    /// Returns the creation timestamp.
+    #[must_use]
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    /// Returns the initial retention deadline.
+    #[must_use]
+    pub const fn retained_until(&self) -> DateTime<Utc> {
+        self.retained_until
+    }
+
+    /// Returns the latest time for which every immutable authority in this cut
+    /// is guaranteed to remain readable.
+    #[must_use]
+    pub fn usable_retention_deadline(&self) -> DateTime<Utc> {
+        self.domains
+            .iter()
+            .fold(self.retained_until, |deadline, domain| {
+                deadline.min(domain.authority().retention_deadline())
+            })
+    }
+
+    /// Returns the provider-free relocation rule.
+    #[must_use]
+    pub const fn relocation(&self) -> RelocationPolicy {
+        self.relocation
     }
 
     /// Returns canonical domain authority references.

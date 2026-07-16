@@ -37,7 +37,7 @@
 
 mod collector;
 mod policy;
-mod reachability;
+pub(crate) mod reachability;
 
 pub use collector::{GarbageCollector, GcReport, GcResult};
 pub use policy::RetentionPolicy;

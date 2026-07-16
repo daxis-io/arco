@@ -506,49 +506,53 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     ///
     /// Returns an error if the lock is no longer held by this guard.
     pub async fn extend(&mut self, additional_ttl: Duration) -> Result<()> {
-        let current = self.read_lock().await?;
+        // Read the version first, then the contents, and bind the renewal to
+        // that earlier version with CAS. Reading the contents first would let a
+        // stale holder overwrite a newer owner if takeover happened before HEAD.
+        let meta = self
+            .storage
+            .head(&self.lock_path)
+            .await?
+            .ok_or_else(|| Error::NotFound(self.lock_path.clone()))?;
+        let info = self
+            .read_lock()
+            .await?
+            .ok_or_else(|| Error::NotFound(self.lock_path.clone()))?;
 
-        match current {
-            Some(info) if info.holder_id == self.holder_id => {
-                let mut new_info = info;
-                new_info.expires_at = Utc::now()
-                    + chrono::Duration::from_std(additional_ttl)
-                        .unwrap_or(chrono::Duration::seconds(30));
+        if meta.version != self.version
+            || info.holder_id != self.holder_id
+            || info.sequence_number != self.fencing_token.sequence()
+            || info.is_expired()
+        {
+            return Err(Error::PreconditionFailed {
+                message: "lock lease is expired or held by a different owner".into(),
+            });
+        }
 
-                let lock_bytes =
-                    Bytes::from(serde_json::to_vec(&new_info).map_err(|e| Error::Internal {
-                        message: format!("serialize lock: {e}"),
-                    })?);
+        let mut renewed = info;
+        renewed.expires_at = Utc::now()
+            + chrono::Duration::from_std(additional_ttl).unwrap_or(chrono::Duration::seconds(30));
+        let lock_bytes =
+            Bytes::from(serde_json::to_vec(&renewed).map_err(|e| Error::Internal {
+                message: format!("serialize lock: {e}"),
+            })?);
 
-                // Use CAS to ensure we still own it
-                let meta = self
-                    .storage
-                    .head(&self.lock_path)
-                    .await?
-                    .ok_or_else(|| Error::NotFound(self.lock_path.clone()))?;
-
-                match self
-                    .storage
-                    .put(
-                        &self.lock_path,
-                        lock_bytes,
-                        WritePrecondition::MatchesVersion(meta.version),
-                    )
-                    .await?
-                {
-                    WriteResult::Success { version } => {
-                        self.version = version;
-                        Ok(())
-                    }
-                    WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
-                        message: "lock modified by another holder".into(),
-                    }),
-                }
+        match self
+            .storage
+            .put(
+                &self.lock_path,
+                lock_bytes,
+                WritePrecondition::MatchesVersion(meta.version),
+            )
+            .await?
+        {
+            WriteResult::Success { version } => {
+                self.version = version;
+                Ok(())
             }
-            Some(_) => Err(Error::PreconditionFailed {
-                message: "lock held by different holder".into(),
+            WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
+                message: "lock modified by another holder".into(),
             }),
-            None => Err(Error::NotFound(self.lock_path.clone())),
         }
     }
 }
@@ -640,7 +644,84 @@ pub mod paths {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryBackend;
+    use std::ops::Range;
+    use std::sync::Mutex;
+
+    use tokio::sync::Notify;
+
+    use crate::storage::{MemoryBackend, ObjectMeta};
+
+    #[derive(Debug, Default)]
+    struct PauseAfterGetBackend {
+        inner: MemoryBackend,
+        pause_path: Mutex<Option<String>>,
+        get_reached: Notify,
+        resume_get: Notify,
+    }
+
+    impl PauseAfterGetBackend {
+        fn pause_after_next_get(&self, path: impl Into<String>) {
+            *self.pause_path.lock().expect("pause path") = Some(path.into());
+        }
+
+        async fn wait_for_paused_get(&self) {
+            self.get_reached.notified().await;
+        }
+
+        fn resume_paused_get(&self) {
+            self.resume_get.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for PauseAfterGetBackend {
+        async fn get(&self, path: &str) -> Result<Bytes> {
+            let bytes = self.inner.get(path).await?;
+            let should_pause = {
+                let mut pause_path = self.pause_path.lock().expect("pause path");
+                if pause_path.as_deref() == Some(path) {
+                    pause_path.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_pause {
+                self.get_reached.notify_one();
+                self.resume_get.notified().await;
+            }
+            Ok(bytes)
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     #[tokio::test]
     async fn test_acquire_and_release() {
@@ -843,6 +924,42 @@ mod tests {
         assert!(info.remaining_ttl() > Duration::from_secs(20));
 
         guard.release().await.expect("release");
+    }
+
+    #[tokio::test]
+    async fn stale_holder_cannot_extend_over_a_new_owner() {
+        let backend = Arc::new(PauseAfterGetBackend::default());
+        let lock_a = DistributedLock::new(backend.clone(), "test.lock");
+        let mut guard_a = lock_a
+            .acquire(Duration::from_millis(1), 1)
+            .await
+            .expect("holder A acquires");
+
+        backend.pause_after_next_get("test.lock");
+        let stale_extend = tokio::spawn(async move {
+            let result = guard_a.extend(Duration::from_secs(30)).await;
+            (guard_a, result)
+        });
+        backend.wait_for_paused_get().await;
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let lock_b = DistributedLock::new(backend.clone(), "test.lock");
+        let guard_b = lock_b
+            .acquire(Duration::from_secs(30), 1)
+            .await
+            .expect("holder B takes over expired lease");
+
+        backend.resume_paused_get();
+        let (guard_a, result) = stale_extend.await.expect("stale extend task");
+        assert!(result.is_err(), "stale holder A must lose ownership");
+
+        let bytes = backend.get("test.lock").await.expect("current lock");
+        let current: LockInfo = serde_json::from_slice(&bytes).expect("parse current lock");
+        assert_eq!(current.holder_id, guard_b.holder_id());
+        assert_eq!(current.sequence_number, guard_b.fencing_token().sequence());
+
+        drop(guard_a);
+        guard_b.release().await.expect("release holder B");
     }
 
     #[test]

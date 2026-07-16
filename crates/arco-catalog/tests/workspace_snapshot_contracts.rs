@@ -13,7 +13,7 @@ use arco_catalog::workspace_snapshot::{
     RequiredObjectKind, RetentionPinLatest, RetentionPinRevision, RetentionStatus, RetentionTarget,
     WorkspaceScope, WorkspaceSnapshot, decode_export_manifest, decode_retention_pin_revision,
     decode_workspace_snapshot, encode_export_manifest, encode_retention_pin_revision,
-    encode_workspace_snapshot,
+    encode_workspace_snapshot, snapshot_record_path,
 };
 use arco_catalog::{PersistedAuthorityKind, PersistedAuthorityReference, StateScope};
 
@@ -21,6 +21,7 @@ const SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const PARENT_SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const EXPORT_ID: &str = "exp_01ARZ3NDEKTSV4RRFFQ69G5FAX";
 const PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAY";
+const EXPORT_PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAZ";
 const MANIFEST_DIGEST: &str =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const CHECKPOINT_DIGEST: &str =
@@ -114,6 +115,7 @@ fn required_objects() -> Vec<RequiredObject> {
 fn snapshot() -> WorkspaceSnapshot {
     WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -155,9 +157,24 @@ fn snapshot() -> WorkspaceSnapshot {
     .expect("workspace snapshot")
 }
 
+fn export_required_objects(snapshot: &WorkspaceSnapshot) -> Vec<RequiredObject> {
+    let mut objects = snapshot.required_objects().to_vec();
+    objects.push(
+        RequiredObject::new(
+            snapshot_record_path(snapshot.snapshot_id()).expect("source snapshot path"),
+            1,
+            RequiredObjectKind::SnapshotRecord,
+            MANIFEST_DIGEST,
+        )
+        .expect("source snapshot record"),
+    );
+    objects
+}
+
 #[test]
 fn snapshot_v1_round_trips_canonically_and_accepts_additive_fields() {
     let snapshot = snapshot();
+    assert_eq!(snapshot.target_pin_id(), PIN_ID);
     assert_eq!(
         snapshot
             .domains()
@@ -183,6 +200,16 @@ fn snapshot_v1_round_trips_canonically_and_accepts_additive_fields() {
     assert_eq!(
         snapshot,
         decode_workspace_snapshot(&additive).expect("additive v1")
+    );
+
+    let mut missing_binding: Value = serde_json::from_slice(&encoded).expect("snapshot json");
+    missing_binding
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("target_pin_id");
+    assert!(
+        decode_workspace_snapshot(&serde_json::to_vec(&missing_binding).expect("json")).is_err(),
+        "snapshot target pin identity is required"
     );
 }
 
@@ -217,17 +244,28 @@ fn identifiers_require_canonical_ulid_spelling() {
         "lowercase snapshot ULID alias must be rejected"
     );
 
+    let mut snapshot_value: Value =
+        serde_json::from_slice(&encoded_snapshot).expect("snapshot json");
+    snapshot_value["target_pin_id"] = Value::String(PIN_ID.to_ascii_lowercase());
+    assert!(
+        decode_workspace_snapshot(&serde_json::to_vec(&snapshot_value).expect("snapshot json"))
+            .is_err(),
+        "lowercase snapshot target-pin ULID alias must be rejected"
+    );
+
     let retained = snapshot();
     let export = ExportManifest::new(
         EXPORT_ID,
+        EXPORT_PIN_ID,
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_100),
         ts(1_800_000_000),
         retained.domains().to_vec(),
         retained.projection_watermarks().to_vec(),
         retained.event_archives().to_vec(),
-        retained.required_objects().to_vec(),
+        export_required_objects(&retained),
         retained.compatibility_artifacts().to_vec(),
         RelocationPolicy::relative_to_caller_export_root(),
     )
@@ -239,6 +277,21 @@ fn identifiers_require_canonical_ulid_spelling() {
     assert!(
         decode_export_manifest(&serde_json::to_vec(&export_value).expect("export json")).is_err(),
         "lowercase export ULID alias must be rejected"
+    );
+
+    let encoded_export = encode_export_manifest(&export).expect("export bytes");
+    let mut export_value: Value = serde_json::from_slice(&encoded_export).expect("export json");
+    export_value["target_pin_id"] = Value::String(EXPORT_PIN_ID.to_ascii_lowercase());
+    assert!(
+        decode_export_manifest(&serde_json::to_vec(&export_value).expect("export json")).is_err(),
+        "lowercase export target-pin ULID alias must be rejected"
+    );
+
+    let mut export_value: Value = serde_json::from_slice(&encoded_export).expect("export json");
+    export_value["source_pin_id"] = Value::String(PIN_ID.to_ascii_lowercase());
+    assert!(
+        decode_export_manifest(&serde_json::to_vec(&export_value).expect("export json")).is_err(),
+        "lowercase export source-pin ULID alias must be rejected"
     );
 
     assert!(
@@ -299,6 +352,7 @@ fn snapshot_validation_rejects_bad_ids_scope_domains_archives_and_paths() {
     );
     let archive_beyond_cut = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -322,6 +376,7 @@ fn snapshot_validation_rejects_bad_ids_scope_domains_archives_and_paths() {
 
     let omitted_archive = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -366,6 +421,7 @@ fn snapshot_validation_rejects_bad_ids_scope_domains_archives_and_paths() {
 
     let duplicate_domain = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -383,6 +439,7 @@ fn snapshot_validation_rejects_bad_ids_scope_domains_archives_and_paths() {
 
     let duplicate_path = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -432,6 +489,7 @@ fn compatibility_is_read_only_and_must_match_a_required_object() {
 
     let missing = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -446,6 +504,7 @@ fn compatibility_is_read_only_and_must_match_a_required_object() {
 
     let wrong_digest = WorkspaceSnapshot::new(
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_000),
         ts(1_800_000_000),
@@ -472,18 +531,23 @@ fn export_v1_is_canonical_portable_and_contains_no_provider_root() {
     let snapshot = snapshot();
     let export = ExportManifest::new(
         EXPORT_ID,
+        EXPORT_PIN_ID,
         SNAPSHOT_ID,
+        PIN_ID,
         workspace_scope(),
         ts(1_700_000_100),
         ts(1_800_000_000),
         snapshot.domains().to_vec(),
         snapshot.projection_watermarks().to_vec(),
         snapshot.event_archives().to_vec(),
-        snapshot.required_objects().to_vec(),
+        export_required_objects(&snapshot),
         snapshot.compatibility_artifacts().to_vec(),
         RelocationPolicy::relative_to_caller_export_root(),
     )
     .expect("export manifest");
+
+    assert_eq!(export.target_pin_id(), EXPORT_PIN_ID);
+    assert_eq!(export.source_pin_id(), PIN_ID);
 
     let encoded = encode_export_manifest(&export).expect("encode export");
     let text = String::from_utf8_lossy(&encoded);
@@ -502,9 +566,90 @@ fn export_v1_is_canonical_portable_and_contains_no_provider_root() {
         decode_export_manifest(&encoded).expect("decode export manifest")
     );
 
+    let mut additive: Value = serde_json::from_slice(&encoded).expect("export json");
+    additive["future_v1_hint"] = Value::String("ignored".to_string());
+    let additive = serde_jcs::to_vec(&additive).expect("canonical additive export json");
+    assert_eq!(
+        export,
+        decode_export_manifest(&additive).expect("additive export v1")
+    );
+
+    let mut missing_binding: Value = serde_json::from_slice(&encoded).expect("export json");
+    missing_binding
+        .as_object_mut()
+        .expect("export object")
+        .remove("source_pin_id");
+    assert!(
+        decode_export_manifest(&serde_json::to_vec(&missing_binding).expect("json")).is_err(),
+        "source pin identity is required"
+    );
+
     let mut value: Value = serde_json::from_slice(&encoded).expect("export json");
     value["relocation"]["provider_uri"] = Value::String("s3://secret-bucket".to_string());
     assert!(decode_export_manifest(&serde_json::to_vec(&value).expect("json")).is_err());
+}
+
+#[test]
+fn export_requires_exactly_one_canonical_source_snapshot_record() {
+    let snapshot = snapshot();
+    let build = |objects: Vec<RequiredObject>| {
+        ExportManifest::new(
+            EXPORT_ID,
+            EXPORT_PIN_ID,
+            SNAPSHOT_ID,
+            PIN_ID,
+            workspace_scope(),
+            ts(1_700_000_100),
+            ts(1_800_000_000),
+            snapshot.domains().to_vec(),
+            snapshot.projection_watermarks().to_vec(),
+            snapshot.event_archives().to_vec(),
+            objects,
+            snapshot.compatibility_artifacts().to_vec(),
+            RelocationPolicy::relative_to_caller_export_root(),
+        )
+    };
+
+    assert!(
+        build(snapshot.required_objects().to_vec()).is_err(),
+        "an export must explicitly retain its source snapshot record"
+    );
+
+    let canonical_path = snapshot_record_path(SNAPSHOT_ID).expect("canonical snapshot path");
+    let mut wrong_kind = snapshot.required_objects().to_vec();
+    wrong_kind.push(
+        RequiredObject::new(
+            &canonical_path,
+            1,
+            RequiredObjectKind::Other,
+            MANIFEST_DIGEST,
+        )
+        .expect("wrong-kind source record"),
+    );
+    assert!(build(wrong_kind).is_err());
+
+    let mut exact = snapshot.required_objects().to_vec();
+    exact.push(
+        RequiredObject::new(
+            &canonical_path,
+            1,
+            RequiredObjectKind::SnapshotRecord,
+            MANIFEST_DIGEST,
+        )
+        .expect("source snapshot record"),
+    );
+    assert!(build(exact.clone()).is_ok());
+
+    exact.push(
+        RequiredObject::new(
+            snapshot_record_path(PARENT_SNAPSHOT_ID).expect("second snapshot path"),
+            1,
+            RequiredObjectKind::SnapshotRecord,
+            CHECKPOINT_DIGEST,
+        )
+        .expect("second snapshot record"),
+    );
+    assert!(build(exact).is_err());
 }
 
 #[test]

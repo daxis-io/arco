@@ -21,6 +21,7 @@ use arco_flow::orchestration::compactor::{
 use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TaskOutcome, TriggerInfo,
 };
+use arco_flow::orchestration::ledger::LedgerWriter;
 
 const TENANT: &str = "tenant";
 const WORKSPACE: &str = "workspace";
@@ -165,7 +166,7 @@ fn task_finished(event_id: &str, run_id: &str, attempt_id: &str) -> Orchestratio
 }
 
 async fn write_event(storage: &ScopedStorage, event: &OrchestrationEvent) -> Result<String> {
-    let path = format!("ledger/orchestration/2026-02-21/{}.json", event.event_id);
+    let path = LedgerWriter::event_path(event);
     storage
         .put_raw(
             &path,
@@ -181,7 +182,9 @@ async fn write_raw_event_json(
     event_id: &str,
     raw_json: &str,
 ) -> Result<String> {
-    let path = format!("ledger/orchestration/2026-02-21/{event_id}.json");
+    let event: OrchestrationEvent = serde_json::from_str(raw_json).expect("parse raw event");
+    assert_eq!(event.event_id, event_id);
+    let path = LedgerWriter::event_path(&event);
     storage
         .put_raw(
             &path,

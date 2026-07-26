@@ -15,6 +15,7 @@ use futures::TryStreamExt;
 use futures::stream;
 use ulid::Ulid;
 
+use arco_core::canonical_json::to_canonical_bytes;
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use super::events::OrchestrationEvent;
@@ -95,13 +96,14 @@ impl LedgerWriter {
         let path = orchestration_event_path(&date, &event.event_id);
         tracing::Span::current().record("path", tracing::field::display(&path));
 
-        let json = serde_json::to_string(&event).map_err(|e| Error::Serialization {
+        let json = to_canonical_bytes(&event).map_err(|e| Error::Serialization {
             message: format!("failed to serialize orchestration event: {e}"),
         })?;
+        let payload = Bytes::from(json);
 
         let result = self
             .storage
-            .put_raw(&path, Bytes::from(json), WritePrecondition::DoesNotExist)
+            .put_raw(&path, payload.clone(), WritePrecondition::DoesNotExist)
             .await?;
 
         match result {
@@ -110,8 +112,24 @@ impl LedgerWriter {
                 Ok(())
             }
             WriteResult::PreconditionFailed { .. } => {
-                tracing::debug!("duplicate orchestration event delivery - no-op");
-                Ok(())
+                let existing = self.storage.get_raw(&path).await?;
+                let canonically_equivalent_legacy =
+                    serde_json::from_slice::<serde_json::Value>(existing.as_ref())
+                        .ok()
+                        .and_then(|value| to_canonical_bytes(&value).ok())
+                        .is_some_and(|canonical| canonical.as_slice() == payload.as_ref());
+                if existing == payload || canonically_equivalent_legacy {
+                    tracing::debug!("duplicate orchestration event delivery - no-op");
+                    Ok(())
+                } else {
+                    Err(Error::Storage {
+                        message: format!(
+                            "orchestration event '{}' already exists with a different payload",
+                            event.event_id
+                        ),
+                        source: None,
+                    })
+                }
             }
         }
     }
@@ -235,6 +253,92 @@ mod tests {
 
         // Duplicate write should also succeed (no-op)
         writer.append(event).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_bytes_are_canonical_across_multi_entry_label_maps() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage.clone());
+        let mut event = make_test_event("tenant", "workspace");
+        let OrchestrationEventData::RunTriggered { labels, .. } = &mut event.data else {
+            panic!("run-triggered fixture");
+        };
+        labels.extend([
+            ("zeta".to_string(), "last".to_string()),
+            ("alpha".to_string(), "first".to_string()),
+            ("middle".to_string(), "between".to_string()),
+        ]);
+        let expected = to_canonical_bytes(&event).expect("canonical orchestration event");
+        let path = LedgerWriter::event_path(&event);
+
+        writer.append(event).await?;
+
+        assert_eq!(
+            storage.get_raw(&path).await?.as_ref(),
+            expected.as_slice(),
+            "durable same-ID comparisons require one canonical event encoding"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_retry_accepts_an_equivalent_legacy_json_encoding() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage.clone());
+        let mut event = make_test_event("tenant", "workspace");
+        let OrchestrationEventData::RunTriggered { labels, .. } = &mut event.data else {
+            panic!("run-triggered fixture");
+        };
+        labels.extend([
+            ("zeta".to_string(), "last".to_string()),
+            ("alpha".to_string(), "first".to_string()),
+            ("middle".to_string(), "between".to_string()),
+        ]);
+        let legacy = serde_json::to_vec(&event).expect("legacy orchestration event JSON");
+        let canonical = to_canonical_bytes(&event).expect("canonical orchestration event");
+        assert_ne!(
+            legacy, canonical,
+            "fixture must exercise legacy key ordering"
+        );
+        let path = LedgerWriter::event_path(&event);
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(legacy.clone()),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        writer.append(event).await?;
+
+        assert_eq!(
+            storage.get_raw(&path).await?.as_ref(),
+            legacy.as_slice(),
+            "an equivalent legacy winner remains immutable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_event_id_with_different_bytes_fails_closed() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage);
+
+        let event = make_test_event("tenant", "workspace");
+        writer.append(event.clone()).await?;
+
+        let mut conflicting = event;
+        conflicting.correlation_id = Some("different-reviewed-correlation".to_string());
+        let error = writer
+            .append(conflicting)
+            .await
+            .expect_err("same event ID with different bytes must fail");
+        assert!(error.to_string().contains("different payload"));
 
         Ok(())
     }

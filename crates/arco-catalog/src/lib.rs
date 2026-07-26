@@ -96,6 +96,7 @@ pub mod parquet_util;
 mod read_model;
 pub mod reader;
 pub mod reconciler;
+mod retention_coordination;
 pub mod search_tombstone;
 mod state;
 pub mod state_store;
@@ -106,6 +107,9 @@ pub mod tier1_events;
 pub mod tier1_snapshot;
 pub mod tier1_state;
 pub mod tier1_writer;
+pub mod workspace_restore;
+pub mod workspace_snapshot;
+pub mod workspace_snapshot_service;
 pub mod write_options;
 pub mod writer;
 
@@ -133,10 +137,13 @@ pub use reconciler::{
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
-    ControlMvpTxn, CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore,
-    ModelWrite, PredicateInputSet, StateScope, StateStoreCapabilities, StateToken, TxnOptions,
-    VersionedValue,
+    CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
+    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
+    CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore, ModelWrite,
+    PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
+    PersistedRestoreParticipantPlan, PredicateInputSet, RestoreAttemptIdentity,
+    RestoreParticipantInspection, RestoredAuthorityEvidence, StateRestoreParticipant, StateScope,
+    StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

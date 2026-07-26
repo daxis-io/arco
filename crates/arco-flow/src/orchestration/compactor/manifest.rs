@@ -10,9 +10,14 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
+use arco_core::canonical_json::to_canonical_bytes;
+
 use super::fold::event_id_from_ledger_path;
+use crate::orchestration::events::OrchestrationEvent;
+use crate::orchestration::ledger::LedgerWriter;
 
 /// Fixed width for immutable orchestration manifest identifiers.
 pub const MANIFEST_ID_WIDTH: usize = 20;
@@ -120,6 +125,10 @@ pub struct OrchestrationManifest {
 
     /// L0 limits for triggering merge.
     pub l0_limits: L0Limits,
+
+    /// Exact event batch whose processing produced this immutable revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_witness: Option<OrchestrationPublicationWitness>,
 }
 
 impl OrchestrationManifest {
@@ -138,6 +147,7 @@ impl OrchestrationManifest {
             l0_deltas: Vec::new(),
             l0_count: 0,
             l0_limits: L0Limits::default(),
+            publication_witness: None,
         }
     }
 
@@ -192,6 +202,53 @@ impl OrchestrationManifest {
         }
 
         Ok(())
+    }
+}
+
+/// Exact immutable evidence for the event batch processed by one manifest revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationPublicationWitness {
+    /// Canonically ordered event paths and payload digests.
+    pub events: Vec<OrchestrationEventPublication>,
+}
+
+/// One exact event included in an orchestration publication witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationEventPublication {
+    /// Canonical ledger path.
+    pub path: String,
+    /// SHA-256 digest of the canonical event payload.
+    pub checksum_sha256: String,
+}
+
+impl OrchestrationPublicationWitness {
+    /// Builds a canonical exact-batch witness from typed orchestration events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an event cannot be canonically encoded or the
+    /// batch contains a duplicate canonical path.
+    pub fn for_events(events: &[OrchestrationEvent]) -> Result<Self, String> {
+        let mut witnessed = events
+            .iter()
+            .map(|event| {
+                let path = LedgerWriter::event_path(event);
+                let bytes = to_canonical_bytes(event)
+                    .map_err(|error| format!("failed to canonicalize event '{path}': {error}"))?;
+                Ok(OrchestrationEventPublication {
+                    path,
+                    checksum_sha256: format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        witnessed.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        if witnessed
+            .windows(2)
+            .any(|pair| matches!(pair, [left, right] if left.path == right.path))
+        {
+            return Err("orchestration publication witness contains duplicate event paths".into());
+        }
+        Ok(Self { events: witnessed })
     }
 }
 

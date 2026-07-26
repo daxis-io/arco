@@ -4,8 +4,15 @@
 //! not delegate production reads or writes, and it must not mint synthetic
 //! state tokens for today's ledger plus synchronous compactor path.
 
+use std::fmt;
+use std::sync::Arc;
+
+use arco_core::ScopedStorage;
+use arco_core::storage::StorageBackend;
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
 
@@ -28,9 +35,48 @@ pub(crate) mod shadow_replay;
 pub(crate) mod workspace_binding_metadata;
 
 pub use control_mvp::{
-    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpStateStore, ControlMvpTxn,
+    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant,
+    ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
+
+/// Opaque process-local identity for one configured state-store backend.
+///
+/// The value is deliberately non-serializable and exposes no provider details.
+/// It is used only to prove that separately configured capabilities share the
+/// same in-process backend authority.
+#[derive(Clone)]
+pub struct StateStoreBindingIdentity {
+    backend: Arc<dyn StorageBackend>,
+}
+
+impl StateStoreBindingIdentity {
+    /// Derives an opaque identity from a workspace-scoped backend handle.
+    ///
+    /// Clones of storage backed by the same [`Arc`] compare equal. Separately
+    /// constructed backend handles compare unequal even when their scope strings
+    /// or provider configuration happen to match.
+    #[must_use]
+    pub fn from_scoped_storage(storage: &ScopedStorage) -> Self {
+        Self {
+            backend: storage.backend().clone(),
+        }
+    }
+}
+
+impl fmt::Debug for StateStoreBindingIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("StateStoreBindingIdentity(<opaque>)")
+    }
+}
+
+impl PartialEq for StateStoreBindingIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backend, &other.backend)
+    }
+}
+
+impl Eq for StateStoreBindingIdentity {}
 
 fn validate_required_metadata_field(value: &str, field: &str) -> Result<()> {
     if value.trim().is_empty() {
@@ -59,6 +105,14 @@ fn validate_metadata_timestamp(updated_at_ms: i64) -> Result<()> {
 ///
 /// let scope = StateScope::new("tenant", "workspace", "catalog");
 /// let _token = StateToken::new(scope, 1, "manifest-1");
+/// ```
+///
+/// ```compile_fail
+/// use arco_catalog::StateToken;
+/// use serde::Serialize;
+///
+/// fn assert_serializable<T: Serialize>() {}
+/// assert_serializable::<StateToken>();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateToken {
@@ -400,6 +454,14 @@ mod test_support {
 /// let scope = StateScope::new("tenant", "workspace", "catalog");
 /// let _token = CheckpointToken::new(scope, "checkpoint-1");
 /// ```
+///
+/// ```compile_fail
+/// use arco_catalog::CheckpointToken;
+/// use serde::Serialize;
+///
+/// fn assert_serializable<T: Serialize>() {}
+/// assert_serializable::<CheckpointToken>();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointToken {
     scope: StateScope,
@@ -642,7 +704,7 @@ impl KvPair {
 }
 
 /// Authority scope addressed by state-store tokens and transactions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateScope {
     tenant_id: String,
     workspace_id: String,
@@ -680,6 +742,415 @@ impl StateScope {
     #[must_use]
     pub fn domain(&self) -> &str {
         &self.domain
+    }
+
+    /// Validates that every scope component is one nonblank, printable, path-safe value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for blank values, separators, dot segments, or controls.
+    pub fn validate(&self) -> Result<()> {
+        validate_scope_component(&self.tenant_id, "tenant_id")?;
+        validate_scope_component(&self.workspace_id, "workspace_id")?;
+        validate_scope_component(&self.domain, "domain")
+    }
+}
+
+fn validate_scope_component(value: &str, field: &str) -> Result<()> {
+    if value.trim().is_empty()
+        || matches!(value, "." | "..")
+        || value.contains(['/', '\\'])
+        || value.chars().any(char::is_control)
+    {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "{field} must be a nonblank path-safe component without separators, dot segments, or control characters"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_authority_relative_path(path: &str, field: &str) -> Result<()> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || matches!(
+            path.as_bytes(),
+            [drive, b':', ..] if drive.is_ascii_alphabetic()
+        )
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(CatalogError::Validation {
+            message: format!("{field} must be a canonical relative path"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_prefixed_sha256(value: &str, field: &str) -> Result<()> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(CatalogError::Validation {
+            message: format!("{field} must use the sha256: prefix"),
+        });
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CatalogError::Validation {
+            message: format!("{field} must contain 64 lowercase hexadecimal characters"),
+        });
+    }
+    Ok(())
+}
+
+/// Stable kind of authority named by a persisted reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistedAuthorityKind {
+    /// A retained state token backed directly by an authority manifest.
+    StateToken,
+    /// A retained checkpoint backed by both checkpoint and manifest objects.
+    Checkpoint,
+}
+
+/// Serializable, validated storage reference for otherwise opaque authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedAuthorityReference {
+    implementation: String,
+    scope: StateScope,
+    reference_kind: PersistedAuthorityKind,
+    manifest_id: String,
+    logical_sequence: u64,
+    manifest_path: String,
+    manifest_sha256: String,
+    checkpoint_path: Option<String>,
+    checkpoint_sha256: Option<String>,
+    retention_deadline: DateTime<Utc>,
+}
+
+/// Deterministic identity of one domain participant inside a restore aggregate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreAttemptIdentity {
+    restore_id: String,
+    attempt: u64,
+    domain: String,
+}
+
+impl RestoreAttemptIdentity {
+    /// Creates a validated participant attempt identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for a malformed restore ID, zero attempt, or domain.
+    pub fn new(
+        restore_id: impl Into<String>,
+        attempt: u64,
+        domain: impl Into<String>,
+    ) -> Result<Self> {
+        let identity = Self {
+            restore_id: restore_id.into(),
+            attempt,
+            domain: domain.into(),
+        };
+        crate::workspace_restore::restore_request_path(&identity.restore_id)?;
+        if identity.attempt == 0 {
+            return Err(CatalogError::Validation {
+                message: "restore participant attempt must be positive".to_string(),
+            });
+        }
+        validate_scope_component(&identity.domain, "restore domain")?;
+        Ok(identity)
+    }
+
+    /// Returns the canonical restore ID.
+    #[must_use]
+    pub fn restore_id(&self) -> &str {
+        &self.restore_id
+    }
+
+    /// Returns the originating participant attempt number.
+    #[must_use]
+    pub const fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    /// Returns the exact domain name.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+}
+
+/// Typed durable plan produced by an explicitly configured restore adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "plan_kind", rename_all = "snake_case")]
+pub enum PersistedRestoreParticipantPlan {
+    /// Deterministic object-store Control MVP transaction plan.
+    ControlMvp(ControlMvpRestorePlan),
+}
+
+/// Stable, serializable proof of one visible restored authority manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoredAuthorityEvidence {
+    implementation: String,
+    scope: StateScope,
+    transaction_id: String,
+    manifest_id: String,
+    manifest_path: String,
+    manifest_sha256: String,
+    logical_sequence: u64,
+    participant_attempt: u64,
+}
+
+impl RestoredAuthorityEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        implementation: impl Into<String>,
+        scope: StateScope,
+        transaction_id: impl Into<String>,
+        manifest_id: impl Into<String>,
+        manifest_path: impl Into<String>,
+        manifest_sha256: impl Into<String>,
+        logical_sequence: u64,
+        participant_attempt: u64,
+    ) -> Result<Self> {
+        let evidence = Self {
+            implementation: implementation.into(),
+            scope,
+            transaction_id: transaction_id.into(),
+            manifest_id: manifest_id.into(),
+            manifest_path: manifest_path.into(),
+            manifest_sha256: manifest_sha256.into(),
+            logical_sequence,
+            participant_attempt,
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Revalidates every durable evidence field after deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed scope, identifiers, path, digest,
+    /// or non-positive sequence fields.
+    pub fn validate(&self) -> Result<()> {
+        validate_scope_component(&self.implementation, "restore implementation")?;
+        self.scope.validate()?;
+        validate_scope_component(&self.transaction_id, "restore transaction_id")?;
+        validate_scope_component(&self.manifest_id, "restore manifest_id")?;
+        validate_authority_relative_path(&self.manifest_path, "restore manifest_path")?;
+        validate_prefixed_sha256(&self.manifest_sha256, "restore manifest_sha256")?;
+        if self.logical_sequence == 0 || self.participant_attempt == 0 {
+            return Err(CatalogError::Validation {
+                message: "restore evidence sequences must be positive".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the state-store implementation.
+    #[must_use]
+    pub fn implementation(&self) -> &str {
+        &self.implementation
+    }
+
+    /// Returns the exact state scope.
+    #[must_use]
+    pub const fn scope(&self) -> &StateScope {
+        &self.scope
+    }
+
+    /// Returns the deterministic transaction ID.
+    #[must_use]
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    /// Returns the immutable manifest ID.
+    #[must_use]
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
+    /// Returns the immutable manifest path.
+    #[must_use]
+    pub fn manifest_path(&self) -> &str {
+        &self.manifest_path
+    }
+
+    /// Returns the exact manifest digest.
+    #[must_use]
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    /// Returns the restored logical sequence.
+    #[must_use]
+    pub const fn logical_sequence(&self) -> u64 {
+        self.logical_sequence
+    }
+
+    /// Returns the originating participant attempt.
+    #[must_use]
+    pub const fn participant_attempt(&self) -> u64 {
+        self.participant_attempt
+    }
+}
+
+/// Exact-path inspection result for a deterministic participant restore plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum RestoreParticipantInspection {
+    /// The exact planned base is still selected and the plan may be applied.
+    Ready,
+    /// The planned transaction occurs in current checksum-valid lineage.
+    Visible {
+        /// Opaque in-memory token for the restored manifest.
+        token: StateToken,
+        /// Stable evidence safe for durable journal records.
+        evidence: RestoredAuthorityEvidence,
+    },
+    /// The planned base CAS is irreversibly lost and the plan is not in lineage.
+    Superseded,
+}
+
+impl PersistedAuthorityReference {
+    /// Creates and validates a stable persisted authority reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for incoherent kinds, scopes, paths, or digests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        implementation: impl Into<String>,
+        scope: StateScope,
+        reference_kind: PersistedAuthorityKind,
+        manifest_id: impl Into<String>,
+        logical_sequence: u64,
+        manifest_path: impl Into<String>,
+        manifest_sha256: impl Into<String>,
+        checkpoint_path: Option<String>,
+        checkpoint_sha256: Option<String>,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<Self> {
+        let reference = Self {
+            implementation: implementation.into(),
+            scope,
+            reference_kind,
+            manifest_id: manifest_id.into(),
+            logical_sequence,
+            manifest_path: manifest_path.into(),
+            manifest_sha256: manifest_sha256.into(),
+            checkpoint_path,
+            checkpoint_sha256,
+            retention_deadline,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Revalidates all persisted fields before the reference is trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed or kind-incoherent fields.
+    pub fn validate(&self) -> Result<()> {
+        validate_scope_component(&self.implementation, "implementation")?;
+        self.scope.validate()?;
+        validate_scope_component(&self.manifest_id, "manifest_id")?;
+        validate_authority_relative_path(&self.manifest_path, "manifest_path")?;
+        validate_prefixed_sha256(&self.manifest_sha256, "manifest_sha256")?;
+        match self.reference_kind {
+            PersistedAuthorityKind::StateToken => {
+                if self.checkpoint_path.is_some() || self.checkpoint_sha256.is_some() {
+                    return Err(CatalogError::Validation {
+                        message: "state_token references must omit checkpoint fields".to_string(),
+                    });
+                }
+            }
+            PersistedAuthorityKind::Checkpoint => {
+                let Some(path) = self.checkpoint_path.as_deref() else {
+                    return Err(CatalogError::Validation {
+                        message: "checkpoint references require checkpoint_path".to_string(),
+                    });
+                };
+                let Some(digest) = self.checkpoint_sha256.as_deref() else {
+                    return Err(CatalogError::Validation {
+                        message: "checkpoint references require checkpoint_sha256".to_string(),
+                    });
+                };
+                validate_authority_relative_path(path, "checkpoint_path")?;
+                validate_prefixed_sha256(digest, "checkpoint_sha256")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the stable backend implementation identifier.
+    #[must_use]
+    pub fn implementation(&self) -> &str {
+        &self.implementation
+    }
+
+    /// Returns the repeated authority scope.
+    #[must_use]
+    pub const fn scope(&self) -> &StateScope {
+        &self.scope
+    }
+
+    /// Returns the persisted reference kind.
+    #[must_use]
+    pub const fn reference_kind(&self) -> PersistedAuthorityKind {
+        self.reference_kind
+    }
+
+    /// Returns the authority manifest identifier.
+    #[must_use]
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
+    /// Returns the logical authority sequence.
+    #[must_use]
+    pub const fn logical_sequence(&self) -> u64 {
+        self.logical_sequence
+    }
+
+    /// Returns the workspace-relative authority manifest path.
+    #[must_use]
+    pub fn manifest_path(&self) -> &str {
+        &self.manifest_path
+    }
+
+    /// Returns the checksum of the exact stored manifest bytes.
+    #[must_use]
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+
+    /// Returns the workspace-relative checkpoint path, when applicable.
+    #[must_use]
+    pub fn checkpoint_path(&self) -> Option<&str> {
+        self.checkpoint_path.as_deref()
+    }
+
+    /// Returns the checksum of the exact stored checkpoint bytes, when applicable.
+    #[must_use]
+    pub fn checkpoint_sha256(&self) -> Option<&str> {
+        self.checkpoint_sha256.as_deref()
+    }
+
+    /// Returns the absolute retention deadline carried by the reference.
+    #[must_use]
+    pub const fn retention_deadline(&self) -> DateTime<Utc> {
+        self.retention_deadline
     }
 }
 
@@ -720,7 +1191,8 @@ impl StateStoreCapabilities {
                 .union(StateStoreCapabilityFlags::READ_AT)
                 .union(StateStoreCapabilityFlags::TRANSACTIONS)
                 .union(StateStoreCapabilityFlags::RANGE_PRECONDITIONS)
-                .union(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS),
+                .union(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS)
+                .union(StateStoreCapabilityFlags::ROLL_FORWARD_RESTORE),
         }
     }
 
@@ -768,6 +1240,13 @@ impl StateStoreCapabilities {
         self.flags
             .contains(StateStoreCapabilityFlags::PREDICATE_PRECONDITIONS)
     }
+
+    /// Returns whether an explicit deterministic roll-forward restore adapter is available.
+    #[must_use]
+    pub const fn roll_forward_restore(&self) -> bool {
+        self.flags
+            .contains(StateStoreCapabilityFlags::ROLL_FORWARD_RESTORE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,6 +1259,7 @@ impl StateStoreCapabilityFlags {
     const TRANSACTIONS: Self = Self(1 << 3);
     const RANGE_PRECONDITIONS: Self = Self(1 << 4);
     const PREDICATE_PRECONDITIONS: Self = Self(1 << 5);
+    const ROLL_FORWARD_RESTORE: Self = Self(1 << 6);
 
     const fn empty() -> Self {
         Self(0)
@@ -847,9 +1327,121 @@ pub trait ArcoStateAdmin: Send + Sync {
     async fn checkpoint(&self, opts: CheckpointOptions) -> Result<CheckpointToken>;
 }
 
+/// Adapter between opaque state tokens and validated durable storage references.
+///
+/// This surface is deliberately separate from [`ArcoStateAdmin`] so backends
+/// without durable object references do not fabricate them.
+#[async_trait]
+pub trait PersistedAuthorityAdapter: Send + Sync {
+    /// Converts an opaque state token into a validated stable storage reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the token cannot be verified or retained durably.
+    async fn persist_state_reference(
+        &self,
+        token: &StateToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference>;
+
+    /// Converts an opaque checkpoint token into a validated stable storage reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint cannot be verified or retained durably.
+    async fn persist_checkpoint_reference(
+        &self,
+        token: &CheckpointToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference>;
+
+    /// Resolves a stable reference after revalidating every persisted field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for expired, corrupt, incompatible, or out-of-scope references.
+    async fn resolve_persisted_reference(
+        &self,
+        reference: &PersistedAuthorityReference,
+    ) -> Result<Box<dyn ArcoStateReader>> {
+        self.resolve_persisted_reference_at(reference, Utc::now())
+            .await
+    }
+
+    /// Resolves a stable reference at an explicit decision time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for expired, corrupt, incompatible, or out-of-scope references.
+    async fn resolve_persisted_reference_at(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+    ) -> Result<Box<dyn ArcoStateReader>>;
+}
+
+/// Explicit adapter for a backend that can durably plan, inspect, and apply restore.
+///
+/// This seam is separate from [`ArcoStateStore`]: generic transactions do not
+/// provide deterministic identities or crash-recovery evidence.
+#[async_trait]
+pub trait StateRestoreParticipant: Send + Sync {
+    /// Returns the stable backend implementation identifier.
+    fn implementation(&self) -> &'static str;
+
+    /// Returns the exact domain authority scope.
+    fn scope(&self) -> &StateScope;
+
+    /// Returns an opaque identity for the backend authority this adapter mutates.
+    ///
+    /// Every usable restore adapter must explicitly identify its backing authority.
+    fn restore_binding_identity(&self) -> StateStoreBindingIdentity;
+
+    /// Builds a deterministic, read-only durable restore plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible, expired, corrupt, or unplannable authority.
+    async fn plan_restore(
+        &self,
+        source: &PersistedAuthorityReference,
+        identity: &RestoreAttemptIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<PersistedRestoreParticipantPlan>;
+
+    /// Inspects exact durable evidence without mutation or listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt or ambiguous evidence.
+    async fn inspect_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+    ) -> Result<RestoreParticipantInspection>;
+
+    /// Applies only the supplied deterministic plan through the backend's existing CAS.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for expired/corrupt evidence or failed immutable writes.
+    async fn apply_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+        now: DateTime<Utc>,
+    ) -> Result<RestoreParticipantInspection>;
+}
+
 /// Combined state-store read, admin, and transaction surface.
 #[async_trait]
 pub trait ArcoStateStore: ArcoStateReader + ArcoStateAdmin {
+    /// Returns an opaque identity for the backend authority this store selects.
+    ///
+    /// Stores that do not support deterministic roll-forward restore may leave
+    /// this unavailable.
+    fn restore_binding_identity(&self) -> Option<StateStoreBindingIdentity> {
+        None
+    }
+
     /// Begins a write transaction.
     ///
     /// # Errors
@@ -1005,6 +1597,39 @@ impl ArcoStateAdmin for CurrentStateStore {
     async fn checkpoint(&self, _opts: CheckpointOptions) -> Result<CheckpointToken> {
         Err(unsupported(
             "CheckpointToken issuance through arco-state-current",
+        ))
+    }
+}
+
+#[async_trait]
+impl PersistedAuthorityAdapter for CurrentStateStore {
+    async fn persist_state_reference(
+        &self,
+        _token: &StateToken,
+        _retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        Err(unsupported(
+            "persisted StateToken references through arco-state-current",
+        ))
+    }
+
+    async fn persist_checkpoint_reference(
+        &self,
+        _token: &CheckpointToken,
+        _retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        Err(unsupported(
+            "persisted CheckpointToken references through arco-state-current",
+        ))
+    }
+
+    async fn resolve_persisted_reference_at(
+        &self,
+        _reference: &PersistedAuthorityReference,
+        _now: DateTime<Utc>,
+    ) -> Result<Box<dyn ArcoStateReader>> {
+        Err(unsupported(
+            "persisted authority resolution through arco-state-current",
         ))
     }
 }

@@ -616,6 +616,7 @@ mod tests {
             }],
             l0_count: 1,
             l0_limits: Default::default(),
+            publication_witness: None,
         };
 
         storage

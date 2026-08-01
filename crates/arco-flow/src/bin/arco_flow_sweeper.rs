@@ -30,15 +30,20 @@ use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
 use arco_flow::orchestration::controllers::{AntiEntropySweeper, Repair};
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData, TaskOutcome};
-use arco_flow::orchestration::flow_service::append_events_and_compact;
+use arco_flow::orchestration::flow_service::{
+    append_events_and_compact, orchestration_ledger_freshness,
+};
 use arco_flow::orchestration::ids::{cloud_task_id, deterministic_attempt_id};
-use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_flow::orchestration::worker_contract::{
+    DispatchEnvelopeSpec, dispatch_envelope_for_attempt,
+};
 use arco_worker_contract::callback_task_id;
 
 #[derive(Clone)]
 struct AppState {
     tenant_id: String,
     workspace_id: String,
+    storage: ScopedStorage,
     compactor: MicroCompactor,
     ledger: LedgerWriter,
     orch_compactor_url: Option<String>,
@@ -133,7 +138,18 @@ async fn run_handler(
         .map(|row| (row.dispatch_id.clone(), row))
         .collect();
 
-    let repairs = sweeper.scan(&manifest.watermarks, &tasks, &outbox, Utc::now());
+    let now = Utc::now();
+    // Prove ledger freshness so an idle workspace (no event flow keeping the
+    // wall-clock watermark fresh) can still reap zombie tasks; see issue #338.
+    let ledger_freshness =
+        orchestration_ledger_freshness(&state.storage, &manifest.watermarks, now).await;
+    let repairs = sweeper.scan_with_ledger_freshness(
+        &manifest.watermarks,
+        ledger_freshness,
+        &tasks,
+        &outbox,
+        now,
+    );
 
     let mut events = Vec::new();
     let mut errors = Vec::new();
@@ -198,23 +214,23 @@ async fn run_handler(
                 )
                 .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
 
-                let envelope = WorkerDispatchEnvelope {
-                    tenant_id: state.tenant_id.clone(),
-                    workspace_id: state.workspace_id.clone(),
-                    run_id: run_id.clone(),
-                    task_id: callback_task_id,
-                    task_key: task_key.clone(),
-                    attempt,
-                    attempt_id,
-                    dispatch_id: original_dispatch_id.clone(),
-                    execution_location_id: None,
-                    worker_queue: "default-queue".to_string(),
-                    callback_base_url: state.callback_base_url.clone(),
-                    task_token: minted.token,
-                    token_expires_at: minted.expires_at,
-                    traceparent: None,
-                    payload: serde_json::Value::Object(serde_json::Map::new()),
-                };
+                let task_row = fold_state.tasks.get(&(run_id.clone(), task_key.clone()));
+                let envelope = dispatch_envelope_for_attempt(
+                    DispatchEnvelopeSpec {
+                        tenant_id: state.tenant_id.clone(),
+                        workspace_id: state.workspace_id.clone(),
+                        run_id: run_id.clone(),
+                        task_key: task_key.clone(),
+                        attempt,
+                        attempt_id,
+                        dispatch_id: original_dispatch_id.clone(),
+                        worker_queue: "default-queue".to_string(),
+                        callback_base_url: state.callback_base_url.clone(),
+                        task_token: minted.token,
+                        token_expires_at: minted.expires_at,
+                    },
+                    task_row,
+                );
 
                 let body = envelope
                     .to_json()
@@ -525,6 +541,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         tenant_id,
         workspace_id,
+        storage: storage.clone(),
         compactor: MicroCompactor::new(storage.clone()),
         ledger: LedgerWriter::new(storage),
         orch_compactor_url,

@@ -9,14 +9,19 @@ import io
 import json
 import os
 import socket
+import threading
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from rich.console import Console
 
@@ -30,6 +35,83 @@ console = Console()
 err_console = Console(stderr=True)
 
 DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
+
+# Heartbeat timing. The control plane force-fails a RUNNING task after
+# `heartbeat_timeout_sec` (300s at the planner default) plus a 30s grace
+# (`RUNNING_TASK_STALENESS_GRACE` in
+# crates/arco-flow/src/orchestration/controllers/anti_entropy.rs). The worker
+# heartbeats at `heartbeat_timeout_sec / HEARTBEAT_INTERVAL_DIVISOR`, clamped
+# to [HEARTBEAT_MIN_INTERVAL_SECONDS, HEARTBEAT_MAX_INTERVAL_SECONDS] — 60s at
+# defaults — so several consecutive heartbeats must be lost before the
+# force-fail window can expire (issue #367).
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 300
+HEARTBEAT_INTERVAL_DIVISOR = 5
+HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+HEARTBEAT_MAX_INTERVAL_SECONDS = 60.0
+
+# Bounded memory for dispatch deduplication (issue #328).
+RECENT_DISPATCH_LIMIT = 1024
+
+
+def heartbeat_interval_seconds(heartbeat_timeout_sec: int | None) -> float:
+    """Choose the heartbeat interval for a task attempt.
+
+    Args:
+        heartbeat_timeout_sec: Timeout carried by the dispatch envelope, or
+            None for envelopes from older control planes (the planner default
+            of 300s is assumed).
+
+    Returns:
+        Seconds between heartbeats, well under the staleness threshold.
+    """
+    timeout = heartbeat_timeout_sec or DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+    interval = timeout / HEARTBEAT_INTERVAL_DIVISOR
+    return min(HEARTBEAT_MAX_INTERVAL_SECONDS, max(HEARTBEAT_MIN_INTERVAL_SECONDS, interval))
+
+
+class HeartbeatSender:
+    """Posts periodic task heartbeats on a daemon thread while an asset runs.
+
+    Heartbeats are advisory: any error is logged and swallowed so a heartbeat
+    failure can never fail the task itself.
+    """
+
+    def __init__(self, post: Callable[[], None], interval_seconds: float) -> None:
+        """Initialize the sender.
+
+        Args:
+            post: Callable that sends one heartbeat.
+            interval_seconds: Seconds between heartbeats.
+        """
+        self._post = post
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="arco-task-heartbeat",
+        )
+
+    def start(self) -> None:
+        """Start heartbeating in the background."""
+        self._thread.start()
+
+    def stop(self, timeout_seconds: float = 5.0) -> None:
+        """Stop heartbeating and wait briefly for the thread to exit.
+
+        Args:
+            timeout_seconds: Maximum time to wait for the thread.
+        """
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout_seconds)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                self._post()
+            except Exception as exc:  # heartbeats are advisory; never fail the task
+                err_console.print(f"[yellow]![/yellow] Task heartbeat failed: {exc}")
 
 
 def _now_iso() -> str:
@@ -136,6 +218,8 @@ class WorkerDispatchEnvelope:
     attempt: int
     attempt_id: str
     dispatch_id: str
+    partition_key: str | None
+    heartbeat_timeout_sec: int | None
     worker_queue: str
     callback_base_url: str
     task_token: str
@@ -158,6 +242,8 @@ class WorkerDispatchEnvelope:
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
         dispatch_id = _get_field(payload, "dispatch_id", "dispatchId")
+        partition_key = _get_field(payload, "partition_key", "partitionKey")
+        heartbeat_timeout_sec = _get_field(payload, "heartbeat_timeout_sec", "heartbeatTimeoutSec")
         worker_queue = _get_field(payload, "worker_queue", "workerQueue")
         callback_base_url = _get_field(payload, "callback_base_url", "callbackBaseUrl")
         task_token = _get_field(payload, "task_token", "taskToken")
@@ -198,6 +284,10 @@ class WorkerDispatchEnvelope:
             attempt=int(attempt),
             attempt_id=str(attempt_id),
             dispatch_id=str(dispatch_id),
+            partition_key=str(partition_key) if partition_key else None,
+            heartbeat_timeout_sec=(
+                int(heartbeat_timeout_sec) if heartbeat_timeout_sec is not None else None
+            ),
             worker_queue=str(worker_queue),
             callback_base_url=str(callback_base_url),
             task_token=str(task_token),
@@ -223,9 +313,18 @@ class DispatchWorker:
             config.task_token.get_secret_value() or config.api_key.get_secret_value() or "debug"
         )
         self._client = ArcoFlowApiClient(config)
-        self._assets = self._load_assets(root_path)
+        self._assets: dict[str, Any] = {}
+        self._partitioned_assets: set[str] = set()
+        self._load_assets(root_path)
+        self._init_dispatch_state()
 
-    def _load_assets(self, root_path: Path) -> dict[str, Any]:
+    def _init_dispatch_state(self) -> None:
+        """Initialize the dispatch_id deduplication registry (issue #328)."""
+        self._dedup_lock = threading.Lock()
+        self._inflight_dispatch_ids: set[str] = set()
+        self._recent_dispatch_ids: OrderedDict[str, None] = OrderedDict()
+
+    def _load_assets(self, root_path: Path) -> None:
         discovery = AssetDiscovery(root_path=root_path)
         try:
             assets = discovery.discover(strict=True)
@@ -235,7 +334,10 @@ class DispatchWorker:
                 err_console.print(f"  - {failure.file_path}: {failure.error}")
             raise SystemExit(1) from err
 
-        return {str(asset.key): asset.func for asset in assets}
+        self._assets = {str(asset.key): asset.func for asset in assets}
+        self._partitioned_assets = {
+            str(asset.key) for asset in assets if asset.definition.partitioning.is_partitioned
+        }
 
     def close(self) -> None:
         """Close worker resources."""
@@ -243,6 +345,44 @@ class DispatchWorker:
 
     def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
         self._validate_dispatch_envelope(payload)
+        if not self._begin_dispatch(payload.dispatch_id):
+            console.print(
+                f"[blue]i[/blue] Duplicate dispatch {payload.dispatch_id} acknowledged "
+                "without re-execution"
+            )
+            return
+        try:
+            self._run_dispatch(payload)
+        finally:
+            self._finish_dispatch(payload.dispatch_id)
+
+    def _begin_dispatch(self, dispatch_id: str) -> bool:
+        """Atomically claim a dispatch_id for execution.
+
+        Cloud Tasks delivers at-least-once, so a redelivery can arrive while
+        the first delivery is still executing (issue #328). Returns False for
+        a dispatch that is in flight or recently completed; such deliveries
+        must be acknowledged without executing the asset again.
+        """
+        with self._dedup_lock:
+            if (
+                dispatch_id in self._inflight_dispatch_ids
+                or dispatch_id in self._recent_dispatch_ids
+            ):
+                return False
+            self._inflight_dispatch_ids.add(dispatch_id)
+            return True
+
+    def _finish_dispatch(self, dispatch_id: str) -> None:
+        """Move a dispatch_id from in-flight to the bounded recent set."""
+        with self._dedup_lock:
+            self._inflight_dispatch_ids.discard(dispatch_id)
+            self._recent_dispatch_ids[dispatch_id] = None
+            self._recent_dispatch_ids.move_to_end(dispatch_id)
+            while len(self._recent_dispatch_ids) > RECENT_DISPATCH_LIMIT:
+                self._recent_dispatch_ids.popitem(last=False)
+
+    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(
@@ -256,6 +396,8 @@ class DispatchWorker:
             task_token=task_token,
             callback_base_url=payload.callback_base_url,
         )
+
+        heartbeat = self._start_heartbeat(payload, task_token)
 
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
@@ -281,6 +423,7 @@ class DispatchWorker:
                 "stackTrace": traceback.format_exc(),
             }
         finally:
+            heartbeat.stop()
             completed_at = _now_iso()
             self._client.task_completed(
                 task_id=payload.callback_task_id,
@@ -309,6 +452,39 @@ class DispatchWorker:
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
 
+    def _start_heartbeat(
+        self,
+        payload: WorkerDispatchEnvelope,
+        task_token: str,
+    ) -> HeartbeatSender:
+        """Start periodic heartbeats for the attempt (issue #367).
+
+        Anti-entropy force-fails a RUNNING task once it has been silent for
+        `heartbeat_timeout_sec` plus grace, so long-running assets must
+        heartbeat well inside that window. Heartbeat failures never fail the
+        task.
+        """
+
+        def post_heartbeat() -> None:
+            self._client.task_heartbeat(
+                task_id=payload.callback_task_id,
+                task_key=payload.task_key,
+                attempt=payload.attempt,
+                attempt_id=payload.attempt_id,
+                worker_id=self.worker_id,
+                traceparent=payload.traceparent,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
+                heartbeat_at=_now_iso(),
+            )
+
+        heartbeat = HeartbeatSender(
+            post=post_heartbeat,
+            interval_seconds=heartbeat_interval_seconds(payload.heartbeat_timeout_sec),
+        )
+        heartbeat.start()
+        return heartbeat
+
     def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:
         asset_func = self._assets.get(payload.task_key)
         if asset_func is None:
@@ -323,7 +499,7 @@ class DispatchWorker:
             raise RuntimeError(msg)
 
         ctx = AssetContext(
-            partition_key=PartitionKey(),
+            partition_key=self._resolve_partition_key(payload),
             run_id=payload.run_id,
             task_id=payload.task_key,
             tenant_id=self.config.tenant_id,
@@ -335,6 +511,35 @@ class DispatchWorker:
             result = asyncio.run(result)
 
         return result
+
+    def _resolve_partition_key(self, payload: WorkerDispatchEnvelope) -> PartitionKey:
+        """Build the execution partition scope from the dispatch envelope.
+
+        The envelope's `partition_key` is the exact value the control plane
+        records as materialized, so executing with anything else silently
+        corrupts materialization identity (issue #339). A partitioned asset
+        dispatched without a partition key fails loudly instead of executing
+        unpartitioned while the catalog records a partition as materialized.
+
+        Raises:
+            RuntimeError: If a partitioned asset was dispatched without a
+                partition key, or the partition key cannot be parsed.
+        """
+        if payload.partition_key is None:
+            if payload.task_key in self._partitioned_assets:
+                msg = (
+                    f"asset {payload.task_key} is partitioned but the dispatch "
+                    "envelope carried no partition key; refusing to execute "
+                    "unpartitioned"
+                )
+                raise RuntimeError(msg)
+            return PartitionKey()
+
+        try:
+            return PartitionKey.from_canonical_string(payload.partition_key)
+        except ValueError as err:
+            msg = f"invalid partition key in dispatch envelope: {payload.partition_key!r}: {err}"
+            raise RuntimeError(msg) from err
 
     def _validate_dispatch_envelope(self, payload: WorkerDispatchEnvelope) -> None:
         mismatches = []

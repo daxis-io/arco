@@ -2092,6 +2092,26 @@ impl FoldState {
         false
     }
 
+    /// Deterministic retry backoff for a failed attempt entering `RetryWait`.
+    ///
+    /// The deadline this produces activates the anti-entropy
+    /// `retry_wait_bootstrap` repair (issue #337 / #250): the sweeper creates
+    /// the next attempt's dispatch once `retry_not_before` has passed, so no
+    /// separate retry timer bootstrap is required. Derived only from event
+    /// data (`attempt`), so replay is byte-stable.
+    ///
+    /// Backoff doubles per completed attempt from a 30-second base and is
+    /// capped at 15 minutes. The deployed sweeper cadence (one scan per
+    /// minute to five minutes) means short backoffs round up to the next
+    /// sweep, which is acceptable slack for a repair path.
+    fn retry_backoff(attempt: u32) -> chrono::Duration {
+        const BASE_SECONDS: i64 = 30;
+        const MAX_SECONDS: i64 = 15 * 60;
+        let doublings = attempt.saturating_sub(1).min(6);
+        let seconds = BASE_SECONDS.saturating_mul(1_i64 << doublings);
+        chrono::Duration::seconds(seconds.min(MAX_SECONDS))
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
@@ -2170,7 +2190,13 @@ impl FoldState {
                 }
                 TaskOutcome::Failed | TaskOutcome::Skipped | TaskOutcome::Cancelled => {
                     task.error_message = error_message;
-                    if new_state != TaskState::RetryWait {
+                    if new_state == TaskState::RetryWait {
+                        // Schedule the retry at fold time (issue #337): nothing
+                        // else durably emits a first retry deadline, and the
+                        // anti-entropy sweeper only bootstraps the next attempt
+                        // once `retry_not_before` has passed.
+                        task.retry_not_before = Some(timestamp + Self::retry_backoff(task.attempt));
+                    } else {
                         task.retry_not_before = None;
                     }
                 }
@@ -6930,6 +6956,70 @@ mod tests {
         assert_eq!(row.task_status, TaskState::Running);
         assert!(row.materialization_id.is_none());
         assert!(row.completed_at.is_none());
+    }
+
+    #[test]
+    fn test_retry_backoff_doubles_and_caps() {
+        assert_eq!(FoldState::retry_backoff(1), chrono::Duration::seconds(30));
+        assert_eq!(FoldState::retry_backoff(2), chrono::Duration::seconds(60));
+        assert_eq!(FoldState::retry_backoff(3), chrono::Duration::seconds(120));
+        assert_eq!(
+            FoldState::retry_backoff(100),
+            chrono::Duration::seconds(900)
+        );
+    }
+
+    /// Issue #337: entering `RetryWait` must durably schedule the retry
+    /// deadline at fold time — this is what makes the anti-entropy
+    /// `retry_wait_bootstrap` repair reachable for a first failure.
+    #[test]
+    fn test_failed_attempt_enters_retry_wait_with_scheduled_deadline() {
+        let mut state = FoldState::new();
+        let attempt_1_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
+            }],
+        ));
+        state.fold_event(&dispatch_requested_event(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+        ));
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_1_id));
+
+        let failure = task_finished_event_with_asset(
+            "run1",
+            "extract",
+            1,
+            &attempt_1_id,
+            TaskOutcome::Failed,
+            None,
+            None,
+        );
+        let failed_at = failure.timestamp;
+        state.fold_event(&failure);
+
+        let task = state
+            .tasks
+            .get(&("run1".to_string(), "extract".to_string()))
+            .expect("task row should exist");
+        assert_eq!(task.state, TaskState::RetryWait);
+        assert_eq!(
+            task.retry_not_before,
+            Some(failed_at + FoldState::retry_backoff(1)),
+            "fold must schedule the first retry deadline deterministically"
+        );
     }
 
     #[test]

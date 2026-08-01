@@ -1,5 +1,7 @@
 //! Planner/runtime seam tests for the run-bridge compatibility compiler.
 
+#![allow(clippy::expect_used)]
+
 use std::fs;
 use std::path::Path;
 
@@ -15,7 +17,8 @@ fn compile_run_bridge(
     partition_selection: Option<Vec<String>>,
 ) -> arco_flow::planning::CompileResult {
     let intent = RunIntent::run_bridge_compatibility(asset_selection, partition_selection);
-    let snapshot = CurrentInProcessPlanningSnapshotProvider::default().snapshot_for_intent(&intent);
+    let provider = CurrentInProcessPlanningSnapshotProvider;
+    let snapshot = provider.snapshot_for_intent(&intent);
     let compiler = PlanCompiler::for_run_bridge_compatibility();
 
     compiler

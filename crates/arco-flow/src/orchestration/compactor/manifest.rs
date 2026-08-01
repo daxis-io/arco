@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use arco_core::canonical_json::to_canonical_bytes;
 
-use super::fold::event_id_from_ledger_path;
+use super::fold::{CatalogRunIndexKey, event_id_from_ledger_path};
 use crate::orchestration::events::OrchestrationEvent;
 use crate::orchestration::ledger::LedgerWriter;
 
@@ -161,7 +161,7 @@ impl OrchestrationManifest {
         let total_rows: u64 = self
             .l0_deltas
             .iter()
-            .map(|delta| u64::from(delta.row_counts.total()))
+            .map(|delta| u64::from(delta.row_counts.total()) + u64::from(delta.deletion_count))
             .sum();
         if total_rows >= u64::from(self.l0_limits.max_rows) {
             return true;
@@ -631,6 +631,17 @@ pub struct L0Delta {
 
     /// Number of rows in this delta (for merge optimization).
     pub row_counts: RowCounts,
+
+    /// Deleted-key artifact for this delta, when the producing fold removed rows.
+    ///
+    /// Additive field: manifests written before the delete channel existed parse
+    /// with no deletions, which matches their producers' behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<TableArtifact>,
+
+    /// Number of deleted keys recorded in the deletions artifact.
+    #[serde(default)]
+    pub deletion_count: u32,
 }
 
 /// Event range covered by a delta or snapshot.
@@ -726,6 +737,169 @@ impl RowCounts {
     }
 }
 
+/// Current schema version for [`DeltaDeletions`] artifacts.
+pub const DELTA_DELETIONS_SCHEMA_VERSION: u32 = 1;
+
+/// Keys removed from fold state by one L0 delta (the delete channel).
+///
+/// Persisted as an immutable JSON artifact referenced from
+/// [`L0Delta::deletions`]. Readers apply these removals after merging the
+/// delta's upserted rows, so deletions performed during a fold survive the
+/// `base ⊎ Δ1 ⊎ Δ2 …` state reconstruction instead of being resurrected by
+/// older copies of the deleted rows.
+///
+/// Key vectors are sorted by the producer so artifact bytes are deterministic
+/// for a given fold. All fields are additive-defaultable for forward
+/// compatibility, mirroring [`RowCounts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeltaDeletions {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+
+    /// Deleted run ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<String>,
+
+    /// Deleted task keys as (`run_id`, `task_key`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<(String, String)>,
+
+    /// Deleted catalog run index keys as (`org_id`, `workspace_id`, `run_id`, `task_key`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub catalog_run_index: Vec<CatalogRunIndexKey>,
+
+    /// Deleted dependency edges as (`run_id`, `upstream_task_key`, `downstream_task_key`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dep_satisfaction: Vec<(String, String, String)>,
+
+    /// Deleted timer ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub timers: Vec<String>,
+
+    /// Deleted dispatch outbox ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_outbox: Vec<String>,
+
+    /// Deleted sensor ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sensor_state: Vec<String>,
+
+    /// Deleted sensor evaluation ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sensor_evals: Vec<String>,
+
+    /// Deleted backfill ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub backfills: Vec<String>,
+
+    /// Deleted backfill chunk ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub backfill_chunks: Vec<String>,
+
+    /// Deleted run keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub run_key_index: Vec<String>,
+
+    /// Deleted run key conflict ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub run_key_conflicts: Vec<String>,
+
+    /// Deleted partition status keys as (`asset_key`, `partition_key`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub partition_status: Vec<(String, String)>,
+
+    /// Deleted idempotency keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub idempotency_keys: Vec<String>,
+
+    /// Deleted schedule definition ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schedule_definitions: Vec<String>,
+
+    /// Deleted schedule state ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schedule_state: Vec<String>,
+
+    /// Deleted schedule tick ids.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub schedule_ticks: Vec<String>,
+}
+
+impl Default for DeltaDeletions {
+    fn default() -> Self {
+        Self {
+            schema_version: DELTA_DELETIONS_SCHEMA_VERSION,
+            runs: Vec::new(),
+            tasks: Vec::new(),
+            catalog_run_index: Vec::new(),
+            dep_satisfaction: Vec::new(),
+            timers: Vec::new(),
+            dispatch_outbox: Vec::new(),
+            sensor_state: Vec::new(),
+            sensor_evals: Vec::new(),
+            backfills: Vec::new(),
+            backfill_chunks: Vec::new(),
+            run_key_index: Vec::new(),
+            run_key_conflicts: Vec::new(),
+            partition_status: Vec::new(),
+            idempotency_keys: Vec::new(),
+            schedule_definitions: Vec::new(),
+            schedule_state: Vec::new(),
+            schedule_ticks: Vec::new(),
+        }
+    }
+}
+
+impl DeltaDeletions {
+    /// Returns true when no keys are recorded for deletion.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+            && self.tasks.is_empty()
+            && self.catalog_run_index.is_empty()
+            && self.dep_satisfaction.is_empty()
+            && self.timers.is_empty()
+            && self.dispatch_outbox.is_empty()
+            && self.sensor_state.is_empty()
+            && self.sensor_evals.is_empty()
+            && self.backfills.is_empty()
+            && self.backfill_chunks.is_empty()
+            && self.run_key_index.is_empty()
+            && self.run_key_conflicts.is_empty()
+            && self.partition_status.is_empty()
+            && self.idempotency_keys.is_empty()
+            && self.schedule_definitions.is_empty()
+            && self.schedule_state.is_empty()
+            && self.schedule_ticks.is_empty()
+    }
+
+    /// Total deleted keys across all tables.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        let total = self
+            .runs
+            .len()
+            .saturating_add(self.tasks.len())
+            .saturating_add(self.catalog_run_index.len())
+            .saturating_add(self.dep_satisfaction.len())
+            .saturating_add(self.timers.len())
+            .saturating_add(self.dispatch_outbox.len())
+            .saturating_add(self.sensor_state.len())
+            .saturating_add(self.sensor_evals.len())
+            .saturating_add(self.backfills.len())
+            .saturating_add(self.backfill_chunks.len())
+            .saturating_add(self.run_key_index.len())
+            .saturating_add(self.run_key_conflicts.len())
+            .saturating_add(self.partition_status.len())
+            .saturating_add(self.idempotency_keys.len())
+            .saturating_add(self.schedule_definitions.len())
+            .saturating_add(self.schedule_state.len())
+            .saturating_add(self.schedule_ticks.len());
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+}
+
 /// L0 compaction limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L0Limits {
@@ -818,6 +992,8 @@ mod tests {
                 runs: 6,
                 ..Default::default()
             },
+            deletions: None,
+            deletion_count: 0,
         });
         manifest.l0_count = 1;
 
@@ -945,6 +1121,8 @@ mod tests {
                 tasks: 25,
                 ..Default::default()
             },
+            deletions: None,
+            deletion_count: 0,
         };
 
         manifest.l0_deltas.push(delta);
@@ -953,6 +1131,85 @@ mod tests {
         let json = serde_json::to_string_pretty(&manifest).unwrap();
         assert!(json.contains("l0/delta-01/tasks.parquet"));
         assert!(json.contains("01HQXYZ001EVT"));
+    }
+
+    #[test]
+    fn test_l0_delta_without_deletion_fields_parses_as_no_deletions() {
+        // Manifests written before the delete channel existed must keep parsing.
+        let json = r#"{
+            "delta_id": "01HQXYZ456DEL",
+            "created_at": "2026-02-21T00:00:00Z",
+            "event_range": {
+                "from_event": "01HQXYZ001EVT",
+                "to_event": "01HQXYZ010EVT",
+                "event_count": 10
+            },
+            "tables": {},
+            "row_counts": {}
+        }"#;
+
+        let delta: L0Delta = serde_json::from_str(json).expect("legacy delta parses");
+        assert!(delta.deletions.is_none());
+        assert_eq!(delta.deletion_count, 0);
+    }
+
+    #[test]
+    fn test_delta_deletions_roundtrip_and_forward_compat() {
+        let deletions = DeltaDeletions {
+            runs: vec!["run_01".to_string()],
+            tasks: vec![("run_01".to_string(), "extract".to_string())],
+            dispatch_outbox: vec!["dispatch:run_01:extract:1".to_string()],
+            ..DeltaDeletions::default()
+        };
+        assert!(!deletions.is_empty());
+        assert_eq!(deletions.total(), 3);
+        assert_eq!(deletions.schema_version, DELTA_DELETIONS_SCHEMA_VERSION);
+
+        let json = serde_json::to_string_pretty(&deletions).expect("serialize");
+        let parsed: DeltaDeletions = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed, deletions);
+
+        // Unknown fields (future additive evolution) and missing fields are tolerated.
+        let future = r#"{
+            "schema_version": 2,
+            "runs": ["run_02"],
+            "future_table": ["x"]
+        }"#;
+        let parsed: DeltaDeletions = serde_json::from_str(future).expect("future parses");
+        assert_eq!(parsed.runs, vec!["run_02".to_string()]);
+        assert!(parsed.tasks.is_empty());
+        assert_eq!(parsed.total(), 1);
+
+        let empty = DeltaDeletions::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.total(), 0);
+    }
+
+    #[test]
+    fn test_l0_compaction_trigger_counts_deletions_toward_row_limit() {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.l0_limits.max_count = u32::MAX;
+        manifest.l0_limits.max_rows = 5;
+        manifest.l0_limits.max_age_seconds = u32::MAX;
+        manifest.l0_deltas.push(L0Delta {
+            delta_id: "01HQXYZ457DEL".to_string(),
+            created_at: Utc::now(),
+            event_range: EventRange {
+                from_event: "01HQXYZ001EVT".to_string(),
+                to_event: "01HQXYZ010EVT".to_string(),
+                event_count: 10,
+            },
+            tables: TablePaths::default(),
+            row_counts: RowCounts::default(),
+            deletions: None,
+            deletion_count: 6,
+        });
+        manifest.l0_count = 1;
+
+        assert!(
+            manifest.should_compact_l0(),
+            "deletion-heavy deltas should trigger base merge via the row limit"
+        );
     }
 
     #[test]

@@ -81,6 +81,11 @@ const COMPACTION_PUBLISH_RETRY_DELAYS_MS: [u64; 3] = [0, 5, 25];
 /// ([`DeltaDeletions`]), so an expired run cannot be resurrected by folding
 /// older L0 deltas or base snapshots that still contain it.
 ///
+/// Expiring a run also expires its `run_key_index` and `run_key_conflicts`
+/// rows, so the run-key dedup window equals the retention window: a
+/// `RunRequested` that reuses a run key after its run expired starts a fresh
+/// run instead of deduplicating against a run that no longer exists.
+///
 /// Operators set the window with the `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS`
 /// environment variable on every process that performs orchestration
 /// compaction (the API sync-compaction path and the `arco_flow_compactor`
@@ -602,10 +607,11 @@ impl MicroCompactor {
                 state.fold_event(event);
             }
 
-            let retention_now = retention_reference_time_for_events(&events);
-            prune_sensor_evals(&mut state, retention_now);
-            prune_idempotency_keys(&mut state, retention_now);
-            prune_terminal_runs(&mut state, retention_now, &self.retention_limits);
+            if let Some(retention_now) = retention_reference_time_for_events(&events) {
+                prune_sensor_evals(&mut state, retention_now);
+                prune_idempotency_keys(&mut state, retention_now);
+                prune_terminal_runs(&mut state, retention_now, &self.retention_limits);
+            }
 
             // Compute delta state (rows changed by this batch) and the
             // tombstones for rows deleted by this batch.
@@ -1043,11 +1049,12 @@ impl MicroCompactor {
             }
         }
 
-        let retention_now = retention_reference_time_for_state(&state);
-        if let Some(retention_now) = retention_now {
-            prune_sensor_evals(&mut state, retention_now);
-            prune_idempotency_keys(&mut state, retention_now);
-        }
+        // Expired sensor_evals/idempotency rows are pruned only during
+        // compaction folds (see `prune_sensor_evals`/`prune_idempotency_keys`),
+        // never here: a read-path prune would remove the rows before the fold
+        // diffs against base state, so their expiry would never reach the
+        // delta tombstone channel and the rows would resurrect from the L0
+        // delta chain on every load (#345).
         state.rebuild_dependency_graph();
 
         Ok(state)
@@ -2108,34 +2115,35 @@ fn should_retry_l0_write_conflict(error: &Error, retry_attempt: usize) -> Option
         _ => None,
     }
 }
-fn retention_reference_time_for_events(events: &[(String, OrchestrationEvent)]) -> DateTime<Utc> {
+/// Derives the retention reference time from the batch's event-id ULIDs.
+///
+/// Event ids are ULIDs minted by the appending server, so their embedded
+/// timestamps cannot be moved by skewed producer clocks. `event.timestamp`
+/// is producer-supplied metadata and must not be used here: a single
+/// far-future timestamp would advance the reference and irreversibly
+/// mass-prune recent terminal runs. Returns `None` when no event id in the
+/// batch parses as a ULID; retention then skips the batch entirely rather
+/// than consulting the wall clock, keeping replay byte- and state-stable.
+fn retention_reference_time_for_events(
+    events: &[(String, OrchestrationEvent)],
+) -> Option<DateTime<Utc>> {
     events
         .iter()
-        .map(|(_, event)| event.timestamp)
+        .filter_map(|(_, event)| Ulid::from_string(&event.event_id).ok())
+        .filter_map(|ulid| {
+            i64::try_from(ulid.timestamp_ms())
+                .ok()
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+        })
         .max()
-        .unwrap_or_else(Utc::now)
 }
 
-fn retention_reference_time_for_state(state: &FoldState) -> Option<DateTime<Utc>> {
-    let max_sensor_eval = state
-        .sensor_evals
-        .values()
-        .map(|row| row.evaluated_at)
-        .max();
-    let max_idempotency = state
-        .idempotency_keys
-        .values()
-        .map(|row| row.recorded_at)
-        .max();
-
-    match (max_sensor_eval, max_idempotency) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
-}
-
+/// Expires sensor evaluations older than the retention window.
+///
+/// Runs only during compaction folds (never on read paths), so every expiry
+/// is captured by `deletions_from_states` as delta tombstones instead of
+/// being invisibly re-pruned on each load (#345). Row timestamps are
+/// producer-supplied; only the reference time is server-derived.
 fn prune_sensor_evals(state: &mut FoldState, retention_now: DateTime<Utc>) {
     let cutoff = retention_now - chrono::Duration::days(SENSOR_EVAL_RETENTION_DAYS);
     state
@@ -2143,6 +2151,12 @@ fn prune_sensor_evals(state: &mut FoldState, retention_now: DateTime<Utc>) {
         .retain(|_, row| row.evaluated_at >= cutoff);
 }
 
+/// Expires idempotency keys older than the retention window.
+///
+/// Runs only during compaction folds (never on read paths), so every expiry
+/// is captured by `deletions_from_states` as delta tombstones instead of
+/// being invisibly re-pruned on each load (#345). Row timestamps are
+/// producer-supplied; only the reference time is server-derived.
 fn prune_idempotency_keys(state: &mut FoldState, retention_now: DateTime<Utc>) {
     let cutoff = retention_now - chrono::Duration::days(IDEMPOTENCY_KEY_RETENTION_DAYS);
     state
@@ -2151,11 +2165,17 @@ fn prune_idempotency_keys(state: &mut FoldState, retention_now: DateTime<Utc>) {
 }
 
 /// Expires terminal runs older than the retention window, together with their
-/// task, dependency, dispatch outbox, and catalog run index rows.
+/// task, dependency, dispatch outbox, catalog run index, run-key index, and
+/// run-key conflict rows.
 ///
 /// Runs only during compaction folds (never on read paths), so every expiry is
 /// captured by `deletions_from_states` as delta tombstones and stays durable
 /// through later folds of older deltas and base snapshots.
+///
+/// Pruning the run-key index alongside the run makes the run-key dedup window
+/// equal to the retention window: without it a later `RunRequested` reusing
+/// the key would be idempotently swallowed into a run that no longer exists,
+/// handing the client a `run_id` that can never be found.
 fn prune_terminal_runs(
     state: &mut FoldState,
     retention_now: DateTime<Utc>,
@@ -2181,6 +2201,13 @@ fn prune_terminal_runs(
         return;
     }
 
+    let expired_run_keys: BTreeSet<String> = state
+        .run_key_index
+        .iter()
+        .filter(|(_, row)| expired.contains(&row.run_id))
+        .map(|(run_key, _)| run_key.clone())
+        .collect();
+
     state.runs.retain(|run_id, _| !expired.contains(run_id));
     state
         .tasks
@@ -2194,6 +2221,12 @@ fn prune_terminal_runs(
     state
         .dispatch_outbox
         .retain(|_, row| !expired.contains(&row.run_id));
+    state
+        .run_key_index
+        .retain(|run_key, _| !expired_run_keys.contains(run_key));
+    state
+        .run_key_conflicts
+        .retain(|_, row| !expired_run_keys.contains(&row.run_key));
 }
 
 fn update_watermarks(
@@ -4050,10 +4083,29 @@ mod tests {
     /// Builds the full event chain for one run that completes successfully,
     /// with every event stamped at `timestamp` and deterministic event ids
     /// prefixed by `id_prefix` (ids must sort in fold order).
+    /// Mints a ULID event id whose embedded timestamp is `timestamp`, using
+    /// `seq` as the random component so ids within the same millisecond sort
+    /// in `seq` order. Retention derives its reference from event-id ULID
+    /// timestamps, so fixtures must align event ids with the times their
+    /// events intend.
+    fn ulid_event_id_at(timestamp: DateTime<Utc>, seq: u128) -> String {
+        let ms = u64::try_from(timestamp.timestamp_millis()).unwrap_or(0);
+        Ulid::from_parts(ms, seq).to_string()
+    }
+
     fn make_completed_run_events(
         run_id: &str,
         timestamp: DateTime<Utc>,
-        id_prefix: &str,
+        base_seq: u128,
+    ) -> Vec<OrchestrationEvent> {
+        make_completed_run_events_with_key(run_id, None, timestamp, base_seq)
+    }
+
+    fn make_completed_run_events_with_key(
+        run_id: &str,
+        run_key: Option<&str>,
+        timestamp: DateTime<Utc>,
+        base_seq: u128,
     ) -> Vec<OrchestrationEvent> {
         let attempt_id = format!("{run_id}_attempt_1");
         let mut events = vec![
@@ -4067,11 +4119,11 @@ mod tests {
                         user_id: "user@example.com".to_string(),
                     },
                     root_assets: vec!["analytics.extract".to_string()],
-                    run_key: None,
+                    run_key: run_key.map(ToString::to_string),
                     labels: HashMap::new(),
                     code_version: None,
                 },
-                format!("{id_prefix}_01_run_triggered"),
+                ulid_event_id_at(timestamp, base_seq + 1),
             ),
             OrchestrationEvent::new_with_event_id(
                 "tenant",
@@ -4089,7 +4141,7 @@ mod tests {
                         requires_visible_output: false,
                     }],
                 },
-                format!("{id_prefix}_02_plan_created"),
+                ulid_event_id_at(timestamp, base_seq + 2),
             ),
             OrchestrationEvent::new_with_event_id(
                 "tenant",
@@ -4101,7 +4153,7 @@ mod tests {
                     attempt_id: attempt_id.clone(),
                     worker_id: "worker-01".to_string(),
                 },
-                format!("{id_prefix}_03_task_started"),
+                ulid_event_id_at(timestamp, base_seq + 3),
             ),
             OrchestrationEvent::new_with_event_id(
                 "tenant",
@@ -4124,7 +4176,7 @@ mod tests {
                     partition_key: None,
                     code_version: None,
                 },
-                format!("{id_prefix}_04_task_finished"),
+                ulid_event_id_at(timestamp, base_seq + 4),
             ),
         ];
         for event in &mut events {
@@ -4133,7 +4185,58 @@ mod tests {
         events
     }
 
-    fn make_fresh_run_triggered_event(run_id: &str, event_id: &str) -> OrchestrationEvent {
+    fn make_run_requested_event(
+        run_key: &str,
+        request_fingerprint: &str,
+        timestamp: DateTime<Utc>,
+        seq: u128,
+    ) -> OrchestrationEvent {
+        let mut event = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::RunRequested {
+                run_key: run_key.to_string(),
+                request_fingerprint: request_fingerprint.to_string(),
+                asset_selection: vec!["analytics.extract".to_string()],
+                partition_selection: None,
+                trigger_source_ref: SourceRef::Manual {
+                    user_id: "user@example.com".to_string(),
+                    request_id: format!("req_{run_key}"),
+                },
+                labels: HashMap::new(),
+                code_version: None,
+            },
+            ulid_event_id_at(timestamp, seq),
+        );
+        event.timestamp = timestamp;
+        event
+    }
+
+    /// Builds a requested + triggered + completed run for `run_key`, with the
+    /// deterministic run id the fold derives from the key.
+    fn make_completed_keyed_run_events(
+        run_key: &str,
+        timestamp: DateTime<Utc>,
+        base_seq: u128,
+    ) -> (String, Vec<OrchestrationEvent>) {
+        let run_id =
+            crate::orchestration::ids::run_id_from_run_key("tenant", "workspace", run_key, &[]);
+        let mut events = vec![make_run_requested_event(
+            run_key,
+            "fp_a",
+            timestamp,
+            base_seq + 1,
+        )];
+        events.extend(make_completed_run_events_with_key(
+            &run_id,
+            Some(run_key),
+            timestamp,
+            base_seq + 1,
+        ));
+        (run_id, events)
+    }
+
+    fn make_fresh_run_triggered_event(run_id: &str, seq: u128) -> OrchestrationEvent {
         OrchestrationEvent::new_with_event_id(
             "tenant",
             "workspace",
@@ -4148,7 +4251,7 @@ mod tests {
                 labels: HashMap::new(),
                 code_version: None,
             },
-            event_id,
+            ulid_event_id_at(Utc::now(), seq),
         )
     }
 
@@ -4336,11 +4439,11 @@ mod tests {
 
         let old_timestamp = Utc::now() - chrono::Duration::days(40);
         let mut old_events = Vec::new();
-        for index in 0..3 {
+        for index in 0..3_u128 {
             old_events.extend(make_completed_run_events(
                 &format!("run_old_{index}"),
                 old_timestamp,
-                &format!("evt_a{index}"),
+                (index + 1) * 0x10,
             ));
         }
         let old_paths = write_events(&storage, old_events).await?;
@@ -4354,7 +4457,7 @@ mod tests {
 
         // A fresh event advances the retention reference to now, expiring the
         // terminal runs beyond the 30-day window.
-        let trigger = make_fresh_run_triggered_event("run_new", "evt_z_run_triggered");
+        let trigger = make_fresh_run_triggered_event("run_new", 0x100);
         let fresh_paths = write_events(&storage, vec![trigger]).await?;
         compactor.compact_events(fresh_paths).await?;
 
@@ -4429,13 +4532,13 @@ mod tests {
         let old_timestamp = Utc::now() - chrono::Duration::days(40);
         let old_paths = write_events(
             &storage,
-            make_completed_run_events("run_old", old_timestamp, "evt_a"),
+            make_completed_run_events("run_old", old_timestamp, 0x10),
         )
         .await?;
         compactor.compact_events(old_paths).await?;
 
         // Δ2 carries the retention tombstones.
-        let trigger = make_fresh_run_triggered_event("run_new", "evt_b_run_triggered");
+        let trigger = make_fresh_run_triggered_event("run_new", 0x100);
         let fresh_paths = write_events(&storage, vec![trigger]).await?;
         compactor.compact_events(fresh_paths).await?;
 
@@ -4462,7 +4565,7 @@ mod tests {
         );
 
         // Further folds over the same chain must also keep it expired.
-        let trigger = make_fresh_run_triggered_event("run_new_2", "evt_c_run_triggered");
+        let trigger = make_fresh_run_triggered_event("run_new_2", 0x200);
         let fresh_paths = write_events(&storage, vec![trigger]).await?;
         compactor.compact_events(fresh_paths).await?;
 
@@ -4495,7 +4598,7 @@ mod tests {
         let old_timestamp = Utc::now() - chrono::Duration::days(40);
         let old_paths = write_events(
             &storage,
-            make_completed_run_events("run_old", old_timestamp, "evt_a"),
+            make_completed_run_events("run_old", old_timestamp, 0x10),
         )
         .await?;
         compactor.compact_events(old_paths).await?;
@@ -4505,7 +4608,7 @@ mod tests {
         let (_, state) = compactor.load_state().await?;
         assert!(state.runs.contains_key("run_old"));
 
-        let trigger = make_fresh_run_triggered_event("run_new", "evt_b_run_triggered");
+        let trigger = make_fresh_run_triggered_event("run_new", 0x100);
         let fresh_paths = write_events(&storage, vec![trigger]).await?;
         compactor.compact_events(fresh_paths).await?;
 
@@ -4536,16 +4639,16 @@ mod tests {
         let recent_timestamp = Utc::now() - chrono::Duration::days(1);
 
         let mut chain = Vec::new();
-        chain.extend(make_completed_run_events("run_old", old_timestamp, "evt_a"));
+        let (keyed_run_id, keyed_events) =
+            make_completed_keyed_run_events("rk_replay", old_timestamp, 0x08);
+        chain.extend(keyed_events);
+        chain.extend(make_completed_run_events("run_old", old_timestamp, 0x10));
         chain.extend(make_completed_run_events(
             "run_live",
             recent_timestamp,
-            "evt_b",
+            0x20,
         ));
-        chain.push(make_fresh_run_triggered_event(
-            "run_new",
-            "evt_c_run_triggered",
-        ));
+        chain.push(make_fresh_run_triggered_event("run_new", 0x100));
 
         // (a) Incremental: one compaction per event.
         let (incremental, incremental_storage) = create_test_compactor().await?;
@@ -4563,8 +4666,14 @@ mod tests {
         full.compact_events(paths).await?;
         let (_, full_state) = full.load_state().await?;
 
-        // Both paths expire run_old, retain run_live, and see run_new.
+        // Both paths expire run_old and the keyed run (including its run-key
+        // index entry), retain run_live, and see run_new.
         assert!(!full_state.runs.contains_key("run_old"));
+        assert!(!full_state.runs.contains_key(&keyed_run_id));
+        assert!(
+            !full_state.run_key_index.contains_key("rk_replay"),
+            "pruning a keyed run must prune its run_key_index entry"
+        );
         assert!(full_state.runs.contains_key("run_live"));
         assert!(full_state.runs.contains_key("run_new"));
         assert_fold_states_equivalent(&incremental_state, &full_state);
@@ -4572,9 +4681,304 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn skewed_producer_timestamp_does_not_mass_prune_recent_runs() -> Result<()> {
+        // Regression: the retention reference must come from server-minted
+        // event-id ULIDs, not producer `event.timestamp`. A single event with
+        // a far-future producer clock must not advance the reference and
+        // irreversibly prune terminal runs that are recent by event-id time.
+        let (compactor, storage) = create_test_compactor().await?;
+        let compactor = compactor.with_retention_limits(RetentionLimits {
+            terminal_run_days: 30,
+        });
+
+        let recent_timestamp = Utc::now() - chrono::Duration::days(1);
+        let recent_paths = write_events(
+            &storage,
+            make_completed_run_events("run_recent", recent_timestamp, 0x10),
+        )
+        .await?;
+        compactor.compact_events(recent_paths).await?;
+
+        // The skewed event's producer timestamp is ten years in the future,
+        // but its event id is a ULID minted "now" by the appending server.
+        let mut skewed = make_fresh_run_triggered_event("run_skewed", 0x100);
+        skewed.timestamp = Utc::now() + chrono::Duration::days(3650);
+        let skewed_paths = write_events(&storage, vec![skewed]).await?;
+        compactor.compact_events(skewed_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            state.runs.contains_key("run_recent"),
+            "a skewed producer timestamp must not prune runs that are recent by event-id time"
+        );
+        assert!(state.runs.contains_key("run_skewed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pruned_run_key_frees_dedup_for_a_fresh_run() -> Result<()> {
+        // Regression: expiring a terminal run must expire its run_key_index
+        // entry through the same tombstone channel. Otherwise a later
+        // RunRequested reusing the key is idempotently swallowed into a run
+        // that no longer exists and the client gets a run_id that can never
+        // be found.
+        let (compactor, storage) = create_test_compactor().await?;
+        let compactor = compactor.with_retention_limits(RetentionLimits {
+            terminal_run_days: 30,
+        });
+
+        // Δ1: a keyed run, requested/completed 40 days ago.
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let (keyed_run_id, keyed_events) =
+            make_completed_keyed_run_events("rk_retire", old_timestamp, 0x08);
+        let old_paths = write_events(&storage, keyed_events).await?;
+        compactor.compact_events(old_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(state.runs.contains_key(&keyed_run_id));
+        assert_eq!(
+            state
+                .run_key_index
+                .get("rk_retire")
+                .map(|row| row.run_id.as_str()),
+            Some(keyed_run_id.as_str())
+        );
+
+        // Δ2: a fresh event expires the keyed run together with its run-key
+        // index entry, recorded as delta tombstones.
+        let fresh_paths = write_events(
+            &storage,
+            vec![make_fresh_run_triggered_event("run_new", 0x100)],
+        )
+        .await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        let tombstone_delta = manifest.l0_deltas.last().expect("tombstone delta");
+        let deletions_artifact = tombstone_delta
+            .deletions
+            .as_ref()
+            .expect("retention sweep must reference a deletions artifact");
+        let deletions_bytes = storage.get_raw(deletions_artifact.path()).await?;
+        let deletions: DeltaDeletions =
+            serde_json::from_slice(&deletions_bytes).expect("parse deletions artifact");
+        assert!(
+            deletions.run_key_index.contains(&"rk_retire".to_string()),
+            "expiring a keyed run must tombstone its run_key_index entry"
+        );
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(!state.runs.contains_key(&keyed_run_id));
+        assert!(
+            !state.run_key_index.contains_key("rk_retire"),
+            "pruned run's run_key_index entry must leave the projection"
+        );
+
+        // Δ3: reusing the run key after expiry must create a fresh dedup
+        // entry instead of being swallowed into the pruned run.
+        let request = make_run_requested_event("rk_retire", "fp_a", Utc::now(), 0x200);
+        let request_event_id = request.event_id.clone();
+        let request_paths = write_events(&storage, vec![request]).await?;
+        compactor.compact_events(request_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert_eq!(
+            state
+                .run_key_index
+                .get("rk_retire")
+                .map(|row| row.row_version.as_str()),
+            Some(request_event_id.as_str()),
+            "a reused run key must create a fresh run_key_index entry after expiry"
+        );
+
+        // Δ4: the re-requested run triggers and is visible again.
+        let mut retrigger = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::RunTriggered {
+                run_id: keyed_run_id.clone(),
+                plan_id: format!("{keyed_run_id}_plan"),
+                trigger: TriggerInfo::Manual {
+                    user_id: "user@example.com".to_string(),
+                },
+                root_assets: vec!["analytics.extract".to_string()],
+                run_key: Some("rk_retire".to_string()),
+                labels: HashMap::new(),
+                code_version: None,
+            },
+            ulid_event_id_at(Utc::now(), 0x300),
+        );
+        retrigger.timestamp = Utc::now();
+        let retrigger_paths = write_events(&storage, vec![retrigger]).await?;
+        compactor.compact_events(retrigger_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            state.runs.contains_key(&keyed_run_id),
+            "the reused run key must produce a live run, not a dangling run_id"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_sensor_evals_and_idempotency_keys_prune_via_tombstones() -> Result<()> {
+        // Regression mirroring #345 for sensor_evals/idempotency_keys: their
+        // expiry must flow through the delta tombstone channel during folds,
+        // not be silently re-applied by every read of the delta chain.
+        let (compactor, storage) = create_test_compactor().await?;
+
+        // Δ1: a sensor evaluation recorded 40 days ago.
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let mut eval = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: "sensor_a".to_string(),
+                eval_id: "eval_old".to_string(),
+                cursor_before: None,
+                cursor_after: Some("cursor_1".to_string()),
+                expected_state_version: None,
+                trigger_source: TriggerSource::Poll {
+                    poll_epoch: old_timestamp.timestamp(),
+                },
+                run_requests: vec![],
+                status: SensorEvalStatus::NoNewData,
+            },
+            ulid_event_id_at(old_timestamp, 0x10),
+        );
+        eval.timestamp = old_timestamp;
+        let old_idempotency_key = eval.idempotency_key.clone();
+        let old_paths = write_events(&storage, vec![eval]).await?;
+        compactor.compact_events(old_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(state.sensor_evals.contains_key("eval_old"));
+        assert!(state.idempotency_keys.contains_key(&old_idempotency_key));
+
+        // Δ2: a fresh event advances the retention reference; the expiry must
+        // be recorded as delta tombstones.
+        let fresh_paths = write_events(
+            &storage,
+            vec![make_fresh_run_triggered_event("run_new", 0x100)],
+        )
+        .await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        assert!(
+            manifest.base_snapshot.snapshot_id.is_none(),
+            "test requires the expiry to survive via the delta chain, not a base merge"
+        );
+        let older_delta = &manifest.l0_deltas[manifest.l0_deltas.len() - 2];
+        assert!(
+            older_delta.row_counts.sensor_evals >= 1,
+            "the older delta must still physically contain the expired eval"
+        );
+        let tombstone_delta = manifest.l0_deltas.last().expect("tombstone delta");
+        let deletions_artifact = tombstone_delta
+            .deletions
+            .as_ref()
+            .expect("sensor/idempotency expiry must reference a deletions artifact");
+        let deletions_bytes = storage.get_raw(deletions_artifact.path()).await?;
+        let deletions: DeltaDeletions =
+            serde_json::from_slice(&deletions_bytes).expect("parse deletions artifact");
+        assert!(
+            deletions.sensor_evals.contains(&"eval_old".to_string()),
+            "expired sensor eval must be tombstoned"
+        );
+        assert!(
+            deletions.idempotency_keys.contains(&old_idempotency_key),
+            "expired idempotency key must be tombstoned"
+        );
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(!state.sensor_evals.contains_key("eval_old"));
+        assert!(!state.idempotency_keys.contains_key(&old_idempotency_key));
+
+        // Further folds over the same chain must not resurrect the rows.
+        let more_paths = write_events(
+            &storage,
+            vec![make_fresh_run_triggered_event("run_new_2", 0x200)],
+        )
+        .await?;
+        compactor.compact_events(more_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            !state.sensor_evals.contains_key("eval_old"),
+            "expired sensor eval resurrected from the delta chain"
+        );
+        assert!(
+            !state.idempotency_keys.contains_key(&old_idempotency_key),
+            "expired idempotency key resurrected from the delta chain"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skewed_sensor_eval_timestamp_does_not_hide_recent_rows_on_load() -> Result<()> {
+        // Regression for the read-path half of the prune asymmetry: the old
+        // load-time prune derived its reference from producer row timestamps,
+        // so one far-future `evaluated_at` invisibly suppressed recent rows
+        // on every load, with no tombstones recording the removal.
+        let (compactor, storage) = create_test_compactor().await?;
+
+        let mut skewed = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: "sensor_skew".to_string(),
+                eval_id: "eval_skew".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                expected_state_version: None,
+                trigger_source: TriggerSource::Poll { poll_epoch: 1 },
+                run_requests: vec![],
+                status: SensorEvalStatus::NoNewData,
+            },
+            ulid_event_id_at(Utc::now(), 0x10),
+        );
+        skewed.timestamp = Utc::now() + chrono::Duration::days(3650);
+        let skewed_paths = write_events(&storage, vec![skewed]).await?;
+        compactor.compact_events(skewed_paths).await?;
+
+        let mut recent = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::SensorEvaluated {
+                sensor_id: "sensor_fresh".to_string(),
+                eval_id: "eval_fresh".to_string(),
+                cursor_before: None,
+                cursor_after: None,
+                expected_state_version: None,
+                trigger_source: TriggerSource::Poll { poll_epoch: 2 },
+                run_requests: vec![],
+                status: SensorEvalStatus::NoNewData,
+            },
+            ulid_event_id_at(Utc::now(), 0x100),
+        );
+        recent.timestamp = Utc::now();
+        let recent_paths = write_events(&storage, vec![recent]).await?;
+        compactor.compact_events(recent_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            state.sensor_evals.contains_key("eval_fresh"),
+            "a skewed row timestamp must not hide recent rows from readers"
+        );
+
+        Ok(())
+    }
+
     #[test]
     fn prune_terminal_runs_respects_window_terminal_state_and_disable() {
-        use crate::orchestration::compactor::fold::{DispatchStatus, RunRow, RunState};
+        use crate::orchestration::compactor::fold::{
+            DispatchStatus, RunKeyConflictRow, RunKeyIndexRow, RunRow, RunState,
+        };
 
         fn make_run_row(
             run_id: &str,
@@ -4661,6 +5065,42 @@ mod tests {
             },
         );
 
+        let make_run_key_row = |run_key: &str, run_id: &str| RunKeyIndexRow {
+            tenant_id: "tenant".to_string(),
+            workspace_id: "workspace".to_string(),
+            run_key: run_key.to_string(),
+            run_id: run_id.to_string(),
+            request_fingerprint: "fp_a".to_string(),
+            code_version: None,
+            created_at: now - chrono::Duration::days(40),
+            row_version: "01HQXYZROWVERSION0000000002".to_string(),
+        };
+        state.run_key_index.insert(
+            "rk_expired".to_string(),
+            make_run_key_row("rk_expired", "run_expired"),
+        );
+        state.run_key_index.insert(
+            "rk_recent".to_string(),
+            make_run_key_row("rk_recent", "run_recent"),
+        );
+        let make_conflict_row = |run_key: &str| RunKeyConflictRow {
+            tenant_id: "tenant".to_string(),
+            workspace_id: "workspace".to_string(),
+            run_key: run_key.to_string(),
+            existing_fingerprint: "fp_a".to_string(),
+            conflicting_fingerprint: "fp_b".to_string(),
+            conflicting_event_id: "01HQXYZCONFLICTEVENT0000000".to_string(),
+            detected_at: now - chrono::Duration::days(40),
+        };
+        state.run_key_conflicts.insert(
+            "conflict:rk_expired:evt".to_string(),
+            make_conflict_row("rk_expired"),
+        );
+        state.run_key_conflicts.insert(
+            "conflict:rk_recent:evt".to_string(),
+            make_conflict_row("rk_recent"),
+        );
+
         let limits = RetentionLimits {
             terminal_run_days: 30,
         };
@@ -4673,6 +5113,26 @@ mod tests {
         assert!(
             !state.dispatch_outbox.contains_key(&expired_dispatch_id),
             "expired run's dispatch outbox rows must be pruned with it"
+        );
+        assert!(
+            !state.run_key_index.contains_key("rk_expired"),
+            "expired run's run_key_index entry must be pruned with it"
+        );
+        assert!(
+            !state
+                .run_key_conflicts
+                .contains_key("conflict:rk_expired:evt"),
+            "expired run key's conflict rows must be pruned with it"
+        );
+        assert!(
+            state.run_key_index.contains_key("rk_recent"),
+            "live run's run_key_index entry must survive"
+        );
+        assert!(
+            state
+                .run_key_conflicts
+                .contains_key("conflict:rk_recent:evt"),
+            "live run key's conflict rows must survive"
         );
 
         // A zero-day window disables terminal-run expiry entirely.

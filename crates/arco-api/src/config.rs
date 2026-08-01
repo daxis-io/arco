@@ -258,6 +258,18 @@ pub struct Config {
     /// Default: 300 (5 minutes).
     #[serde(default = "default_idempotency_stale_timeout_secs")]
     pub idempotency_stale_timeout_secs: u64,
+
+    /// Enable the operator-only control-store endpoints at
+    /// `/internal/control-store/*`.
+    ///
+    /// Default off. These are Phase 4/5 operator surfaces, not tenant-facing
+    /// routes; when disabled the routes are not mounted at all, so they 404.
+    ///
+    /// They live in this service because platform IAM makes `arco-api` the
+    /// sole writer of the `state-store/` object prefix — no other service
+    /// account may mutate it, so no other service can host them.
+    #[serde(default)]
+    pub control_store_operator_endpoints: bool,
 }
 
 const MIN_IDEMPOTENCY_STALE_TIMEOUT_SECS: u64 = 10;
@@ -371,6 +383,7 @@ impl Default for Config {
             unity_catalog: UnityCatalogApiConfig::default(),
             audit: AuditConfig::default(),
             idempotency_stale_timeout_secs: default_idempotency_stale_timeout_secs(),
+            control_store_operator_endpoints: false,
         }
     }
 }
@@ -691,6 +704,9 @@ impl Config {
         }
 
         // Unity Catalog facade configuration
+        if let Some(enabled) = env_bool("ARCO_CONTROL_STORE_OPERATOR_ENDPOINTS")? {
+            config.control_store_operator_endpoints = enabled;
+        }
         if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_ENABLED")? {
             config.unity_catalog.enabled = enabled;
         }

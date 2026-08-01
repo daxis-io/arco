@@ -35,8 +35,9 @@ pub mod shadow_replay;
 pub(crate) mod workspace_binding_metadata;
 
 pub use control_mvp::{
-    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant,
-    ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
+    ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
+    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
+    control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

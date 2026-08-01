@@ -137,13 +137,14 @@ pub use reconciler::{
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
+    CheckpointToken, ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
     ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
     CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore, ModelWrite,
     PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
     PersistedRestoreParticipantPlan, PredicateInputSet, RestoreAttemptIdentity,
     RestoreParticipantInspection, RestoredAuthorityEvidence, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
+    control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

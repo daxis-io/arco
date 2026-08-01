@@ -6,6 +6,13 @@
 //! locations against the governed-path model. When storage governance has
 //! never been enabled for the scope, current behavior is preserved.
 
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_value,
+    reason = "route integration helpers own and index JSON fixtures and fail fast on setup errors"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

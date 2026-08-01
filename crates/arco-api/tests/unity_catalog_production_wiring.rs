@@ -175,8 +175,10 @@ async fn empty_metastore_scope_authorizes_nobody_for_republish() {
 }
 
 fn production_router(backend: Arc<dyn StorageBackend>) -> Router {
-    let mut config = Config::default();
-    config.debug = true;
+    let mut config = Config {
+        debug: true,
+        ..Config::default()
+    };
     config.unity_catalog.enabled = true;
     ServerBuilder::new()
         .config(config)

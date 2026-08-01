@@ -538,7 +538,7 @@ async fn sync_compact_does_not_create_legacy_manifest_mirror_or_report_repair_pe
         .append_ledger_event(&guard, CatalogDomain::Catalog, &event, "test")
         .await
         .expect("append event");
-    let event_path = format!("ledger/catalog/{}.json", event_id);
+    let event_path = format!("ledger/catalog/{event_id}.json");
 
     let compactor = Tier1Compactor::new(storage.clone());
     let result = compactor

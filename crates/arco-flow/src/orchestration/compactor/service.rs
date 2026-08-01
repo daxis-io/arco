@@ -2054,6 +2054,13 @@ fn record_compaction_publish_retry(
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(
+    clippy::float_cmp,
+    clippy::items_after_statements,
+    clippy::large_futures
+)]
 mod tests {
     use super::*;
     use crate::orchestration::compactor::fold::{DispatchOutboxRow, TimerRow};
@@ -2687,7 +2694,7 @@ mod tests {
             .as_str()
             .expect("artifact path must be a string");
         assert!(
-            path.contains("."),
+            path.contains('.'),
             "artifact file should include a hash-derived suffix: {path}"
         );
         assert!(

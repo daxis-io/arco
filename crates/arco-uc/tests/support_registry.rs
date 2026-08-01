@@ -1,5 +1,10 @@
 //! Contract tests for the Unity Catalog support registry.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

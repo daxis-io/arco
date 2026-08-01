@@ -2,6 +2,10 @@
 //!
 //! Tests the complete request flow: HTTP → routes → catalog → storage.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -1678,7 +1682,7 @@ mod orchestration {
         let ready_actions = ready_controller.reconcile(&manifest, &fold_state);
         let ready_events: Vec<_> = ready_actions
             .into_iter()
-            .filter_map(|action| action.into_event_data())
+            .filter_map(arco_flow::orchestration::controllers::ReadyDispatchAction::into_event_data)
             .map(|data| OrchestrationEvent::new("test-tenant", "test-workspace", data))
             .collect();
 
@@ -1851,7 +1855,7 @@ mod cross_cutting {
     use super::*;
     use serde::Deserialize;
 
-    const TEST_RSA_PRIVATE_KEY_PEM: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+    const TEST_RSA_PRIVATE_KEY_PEM: &str = r"-----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTL
 UTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2V
 rUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8H
@@ -1877,16 +1881,16 @@ QOLMyUqqMUILxdthHyFmiGkCgYEAn9+PjpjGMPHxL0gj8Q8VbzsFtou6b1deIRRA
 PYPeRz0CgYALHCj/Ji8XSsDoF/MhVhnGdIs2P99NNdmo3R2Pv0CuZbDKMU559LJH
 UvrKS8WkuWRDuKrz1W/EQKApFjDGpdqToZqriUFQzwy7mR3ayIiogzNtHcvbDHx8
 oFnGY0OFksX/ye0/XGpy2SFxYRwGU98HPYeBvAQQrVjdkzfy7BmXQQ==
------END RSA PRIVATE KEY-----"#;
+-----END RSA PRIVATE KEY-----";
 
-    const TEST_RSA_PUBLIC_KEY_PEM: &str = r#"-----BEGIN RSA PUBLIC KEY-----
+    const TEST_RSA_PUBLIC_KEY_PEM: &str = r"-----BEGIN RSA PUBLIC KEY-----
 MIIBCgKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4
 l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2VrUyW
 yj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG
 /AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4l
 QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
 3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQIDAQAB
------END RSA PUBLIC KEY-----"#;
+-----END RSA PUBLIC KEY-----";
 
     const TEST_USER_ID: &str = "test-user";
 

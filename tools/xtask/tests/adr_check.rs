@@ -37,7 +37,7 @@ fn duplicate_adr_ids_are_rejected() {
             "Parquet schema evolution policy",
         ),
     ] {
-        write_adr(&adr_dir.join(&filename), id, &title);
+        write_adr(&adr_dir.join(filename), id, title);
         readme.push_str(&format!("| [{id:03}]({filename}) | {title} | Accepted |\n"));
     }
 

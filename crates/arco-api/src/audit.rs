@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert!(hash1.starts_with("user:"));
         assert!(!hash1.contains("alice"));
-        assert!(!hash1.contains("@"));
+        assert!(!hash1.contains('@'));
     }
 
     #[test]

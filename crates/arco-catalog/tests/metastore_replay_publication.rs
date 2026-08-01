@@ -1,6 +1,9 @@
 //! Tests for the native metastore replay and projection kernel.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::needless_collect, clippy::needless_pass_by_value)]
 
 #[path = "../../arco-core/tests/support/spy_backend.rs"]
 mod spy_backend;

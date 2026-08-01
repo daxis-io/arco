@@ -717,6 +717,9 @@ pub struct RepairResult {
 // ============================================================================
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::future_not_send, clippy::similar_names, clippy::too_many_lines)]
 mod tests {
     use super::*;
     use std::sync::Arc;

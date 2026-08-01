@@ -1,6 +1,9 @@
 //! Task 3 metastore scope replay and API-threading contracts.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_wrap)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,7 +22,7 @@ fn metastore_scope_facades_default_to_workspace_alias_and_preserve_paths() {
 
     let writer = CatalogWriter::new(storage.clone());
     let reader = CatalogReader::new(storage.clone());
-    let compactor = Tier1Compactor::new(storage.clone());
+    let compactor = Tier1Compactor::new(storage);
 
     assert_eq!(writer.scope().tenant_id(), "acme");
     assert_eq!(writer.scope().workspace_id(), "workspace_a");

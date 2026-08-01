@@ -795,7 +795,57 @@ fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) 
         .with_state(state)
 }
 
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_logging(log_format_from_env());
+
+    let tenant_id = required_env("ARCO_TENANT_ID")?;
+    let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
+    let bucket = required_env("ARCO_STORAGE_BUCKET")?;
+    let port = resolve_port()?;
+    let tenant_secret = load_tenant_secret()?;
+    let internal_auth = build_internal_auth()?;
+    let repair_automation = RepairAutomationConfig::from_env()?;
+    init_metrics();
+    arco_flow::metrics::register_metrics();
+
+    let backend = ObjectStoreBackend::from_bucket(&bucket)?;
+    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+    let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
+
+    tracing::info!(
+        request_contract = "fenced_only",
+        repair_automation_mode = repair_automation.mode.as_str(),
+        repair_automation_scope = repair_scope_as_str(repair_automation.scope),
+        "loaded orchestration compactor production config"
+    );
+
+    let state = AppState {
+        compactor: MicroCompactor::with_tenant_secret(storage.clone(), tenant_secret),
+        storage,
+        repair_automation: repair_automation.clone(),
+        repair_backlog: Arc::new(Mutex::new(RepairBacklogState::default())),
+    };
+
+    let app = build_router(state.clone(), internal_auth);
+    if repair_automation.mode != RepairAutomationMode::Disabled {
+        tokio::spawn(run_repair_automation_loop(state.clone()));
+    }
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::configuration(format!("failed to bind: {e}")))?;
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| Error::configuration(format!("server error: {e}")))
+}
+
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::iter_on_single_items)]
 mod tests {
     use std::collections::BTreeSet;
     use std::io;
@@ -1409,51 +1459,4 @@ mod tests {
             "expected request_id in tracing output, got {rendered}"
         );
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    init_logging(log_format_from_env());
-
-    let tenant_id = required_env("ARCO_TENANT_ID")?;
-    let workspace_id = required_env("ARCO_WORKSPACE_ID")?;
-    let bucket = required_env("ARCO_STORAGE_BUCKET")?;
-    let port = resolve_port()?;
-    let tenant_secret = load_tenant_secret()?;
-    let internal_auth = build_internal_auth()?;
-    let repair_automation = RepairAutomationConfig::from_env()?;
-    init_metrics();
-    arco_flow::metrics::register_metrics();
-
-    let backend = ObjectStoreBackend::from_bucket(&bucket)?;
-    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
-    let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
-
-    tracing::info!(
-        request_contract = "fenced_only",
-        repair_automation_mode = repair_automation.mode.as_str(),
-        repair_automation_scope = repair_scope_as_str(repair_automation.scope),
-        "loaded orchestration compactor production config"
-    );
-
-    let state = AppState {
-        compactor: MicroCompactor::with_tenant_secret(storage.clone(), tenant_secret),
-        storage,
-        repair_automation: repair_automation.clone(),
-        repair_backlog: Arc::new(Mutex::new(RepairBacklogState::default())),
-    };
-
-    let app = build_router(state.clone(), internal_auth);
-    if repair_automation.mode != RepairAutomationMode::Disabled {
-        tokio::spawn(run_repair_automation_loop(state.clone()));
-    }
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| Error::configuration(format!("failed to bind: {e}")))?;
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| Error::configuration(format!("server error: {e}")))
 }

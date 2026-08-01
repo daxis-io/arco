@@ -616,6 +616,8 @@ mod tests {
                     runs: 1,
                     ..Default::default()
                 },
+                deletions: None,
+                deletion_count: 0,
             }],
             l0_count: 1,
             l0_limits: Default::default(),

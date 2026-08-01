@@ -8,6 +8,16 @@
 //! ```
 //!
 //! The compactor is the sole writer of Parquet files (IAM-enforced).
+//!
+//! Row deletions performed during a fold (consumed dispatch outbox rows,
+//! retention sweeps) are recorded as explicit delta tombstones
+//! ([`DeltaDeletions`]) referenced from each L0 delta, and are re-applied in
+//! delta order when state is reconstructed, so deletions survive the
+//! `base ⊎ Δ1 ⊎ Δ2 …` merge instead of being resurrected by older rows.
+//!
+//! Terminal runs (succeeded/failed/cancelled) are expired from the projection
+//! after a configurable retention window; see [`RetentionLimits`] for the
+//! operator knob (`ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS`).
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -42,9 +52,9 @@ use super::fold::{
     merge_timer_rows,
 };
 use super::manifest::{
-    BaseSnapshot, EventRange, L0Delta, LedgerRebuildManifest, OrchestrationManifest,
-    OrchestrationManifestPointer, OrchestrationPublicationWitness, RowCounts, TableArtifact,
-    TablePaths, Watermarks, next_manifest_id,
+    BaseSnapshot, DeltaDeletions, EventRange, L0Delta, LedgerRebuildManifest,
+    OrchestrationManifest, OrchestrationManifestPointer, OrchestrationPublicationWitness,
+    RowCounts, TableArtifact, TablePaths, Watermarks, next_manifest_id,
 };
 use super::parquet_util::{
     read_partition_status, write_backfill_chunks, write_backfills, write_catalog_run_index,
@@ -56,7 +66,55 @@ use super::parquet_util::{
 
 const SENSOR_EVAL_RETENTION_DAYS: i64 = 30;
 const IDEMPOTENCY_KEY_RETENTION_DAYS: i64 = 30;
+/// Conservative default retention window for terminal runs, in days.
+const TERMINAL_RUN_RETENTION_DAYS_DEFAULT: u32 = 90;
+/// Environment variable overriding the terminal-run retention window, in days.
+const TERMINAL_RUN_RETENTION_DAYS_ENV: &str = "ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS";
 const COMPACTION_PUBLISH_RETRY_DELAYS_MS: [u64; 3] = [0, 5, 25];
+
+/// Retention configuration for folded orchestration state.
+///
+/// Terminal runs (succeeded/failed/cancelled) whose completion time is older
+/// than the configured window are expired from the projection during
+/// compaction, together with their task, dependency, dispatch outbox, and
+/// catalog run index rows. Expiry is recorded as explicit delta tombstones
+/// ([`DeltaDeletions`]), so an expired run cannot be resurrected by folding
+/// older L0 deltas or base snapshots that still contain it.
+///
+/// Operators set the window with the `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS`
+/// environment variable on every process that performs orchestration
+/// compaction (the API sync-compaction path and the `arco_flow_compactor`
+/// service). A value of `0` disables terminal-run expiry. The default is
+/// 90 days.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionLimits {
+    /// Days a terminal run is retained after completion; `0` disables expiry.
+    pub terminal_run_days: u32,
+}
+
+impl Default for RetentionLimits {
+    fn default() -> Self {
+        Self {
+            terminal_run_days: TERMINAL_RUN_RETENTION_DAYS_DEFAULT,
+        }
+    }
+}
+
+impl RetentionLimits {
+    /// Reads the retention override from the environment, when set and valid.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var(TERMINAL_RUN_RETENTION_DAYS_ENV).ok()?;
+        let terminal_run_days = raw.trim().parse::<u32>().ok()?;
+        Some(Self { terminal_run_days })
+    }
+
+    /// Returns environment-provided limits, falling back to the default window.
+    #[must_use]
+    pub fn from_env_or_default() -> Self {
+        Self::from_env().unwrap_or_default()
+    }
+}
 
 /// Internal durability mode for orchestration compaction acknowledgements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +252,7 @@ pub struct MicroCompactor {
     storage: ScopedStorage,
     tenant_secret: Vec<u8>,
     durability_mode: DurabilityMode,
+    retention_limits: RetentionLimits,
 }
 
 /// Result of a micro-compaction run.
@@ -223,6 +282,7 @@ impl MicroCompactor {
             storage,
             tenant_secret: Vec::new(),
             durability_mode: DurabilityMode::Visible,
+            retention_limits: RetentionLimits::from_env_or_default(),
         }
     }
 
@@ -233,6 +293,7 @@ impl MicroCompactor {
             storage,
             tenant_secret,
             durability_mode: DurabilityMode::Visible,
+            retention_limits: RetentionLimits::from_env_or_default(),
         }
     }
 
@@ -240,6 +301,13 @@ impl MicroCompactor {
     #[must_use]
     pub const fn with_durability_mode(mut self, durability_mode: DurabilityMode) -> Self {
         self.durability_mode = durability_mode;
+        self
+    }
+
+    /// Sets retention limits for folded state, overriding environment/defaults.
+    #[must_use]
+    pub fn with_retention_limits(mut self, retention_limits: RetentionLimits) -> Self {
+        self.retention_limits = retention_limits;
         self
     }
 
@@ -537,10 +605,13 @@ impl MicroCompactor {
             let retention_now = retention_reference_time_for_events(&events);
             prune_sensor_evals(&mut state, retention_now);
             prune_idempotency_keys(&mut state, retention_now);
+            prune_terminal_runs(&mut state, retention_now, &self.retention_limits);
 
-            // Compute delta state (rows changed by this batch)
+            // Compute delta state (rows changed by this batch) and the
+            // tombstones for rows deleted by this batch.
             let delta_state = delta_from_states(&base_state, &state);
-            let has_delta = !delta_state_is_empty(&delta_state);
+            let deletions = deletions_from_states(&base_state, &state);
+            let has_delta = !delta_state_is_empty(&delta_state) || !deletions.is_empty();
 
             // Count rows
             let row_counts = RowCounts {
@@ -595,6 +666,8 @@ impl MicroCompactor {
                     event_range: event_range.clone(),
                     tables: TablePaths::default(),
                     row_counts: row_counts.clone(),
+                    deletions: None,
+                    deletion_count: deletions.total(),
                 });
                 projected_manifest.l0_count += 1;
                 projected_manifest.should_compact_l0()
@@ -643,12 +716,30 @@ impl MicroCompactor {
                         return Err(error);
                     }
                 };
+                let deletions_artifact = if deletions.is_empty() {
+                    None
+                } else {
+                    match self.write_delta_deletions(&new_delta_id, &deletions).await {
+                        Ok(artifact) => Some(artifact),
+                        Err(error) => {
+                            if let Some(delay_ms) =
+                                should_retry_l0_write_conflict(&error, retry_attempt)
+                            {
+                                wait_for_publish_retry(delay_ms).await;
+                                continue 'retry;
+                            }
+                            return Err(error);
+                        }
+                    }
+                };
                 manifest.l0_deltas.push(L0Delta {
                     delta_id: new_delta_id.clone(),
                     created_at: delta_created_at,
                     event_range,
                     tables: delta_paths,
                     row_counts,
+                    deletions: deletions_artifact,
+                    deletion_count: deletions.total(),
                 });
                 manifest.l0_count += 1;
                 delta_id = Some(new_delta_id);
@@ -939,12 +1030,17 @@ impl MicroCompactor {
             FoldState::new()
         };
 
-        // Apply L0 deltas in order
+        // Apply L0 deltas in order: upserts first, then the delta's tombstones,
+        // so deletions recorded by newer folds win over older row copies.
         for delta in &manifest.l0_deltas {
             let delta_state = self
                 .load_delta_state(&delta.delta_id, &delta.tables)
                 .await?;
             state = merge_states(state, delta_state);
+            if let Some(ref deletions_artifact) = delta.deletions {
+                let deletions = self.load_delta_deletions(deletions_artifact).await?;
+                apply_deletions(&mut state, &deletions);
+            }
         }
 
         let retention_now = retention_reference_time_for_state(&state);
@@ -1139,6 +1235,34 @@ impl MicroCompactor {
     async fn write_delta_parquet(&self, delta_id: &str, state: &FoldState) -> Result<TablePaths> {
         self.write_state_parquet(&orchestration_l0_dir(delta_id), state, false)
             .await
+    }
+
+    /// Writes the deleted-key artifact for an L0 delta.
+    async fn write_delta_deletions(
+        &self,
+        delta_id: &str,
+        deletions: &DeltaDeletions,
+    ) -> Result<TableArtifact> {
+        let json = serde_json::to_string_pretty(deletions).map_err(|e| Error::Serialization {
+            message: format!("failed to serialize delta deletions: {e}"),
+        })?;
+        self.write_parquet_artifact(
+            &orchestration_l0_dir(delta_id),
+            "deletions.json",
+            Bytes::from(json),
+        )
+        .await
+    }
+
+    /// Loads the deleted-key artifact referenced by an L0 delta.
+    async fn load_delta_deletions(&self, artifact: &TableArtifact) -> Result<DeltaDeletions> {
+        let data = self.storage.get_raw(artifact.path()).await?;
+        serde_json::from_slice(&data).map_err(|e| Error::Serialization {
+            message: format!(
+                "failed to parse delta deletions at {}: {e}",
+                artifact.path()
+            ),
+        })
     }
 
     fn validate_event_scope(&self, path: &str, event: &OrchestrationEvent) -> Result<()> {
@@ -1852,6 +1976,106 @@ fn delta_from_states(base: &FoldState, current: &FoldState) -> FoldState {
     delta
 }
 
+/// Returns keys present in `base` but absent from `current`, sorted for
+/// deterministic tombstone artifacts.
+fn deleted_keys<K, V>(
+    base: &std::collections::HashMap<K, V>,
+    current: &std::collections::HashMap<K, V>,
+) -> Vec<K>
+where
+    K: std::hash::Hash + Eq + Ord + Clone,
+{
+    let mut keys: Vec<K> = base
+        .keys()
+        .filter(|key| !current.contains_key(*key))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Computes the tombstones for rows deleted between two fold states.
+fn deletions_from_states(base: &FoldState, current: &FoldState) -> DeltaDeletions {
+    DeltaDeletions {
+        runs: deleted_keys(&base.runs, &current.runs),
+        tasks: deleted_keys(&base.tasks, &current.tasks),
+        catalog_run_index: deleted_keys(&base.catalog_run_index, &current.catalog_run_index),
+        dep_satisfaction: deleted_keys(&base.dep_satisfaction, &current.dep_satisfaction),
+        timers: deleted_keys(&base.timers, &current.timers),
+        dispatch_outbox: deleted_keys(&base.dispatch_outbox, &current.dispatch_outbox),
+        sensor_state: deleted_keys(&base.sensor_state, &current.sensor_state),
+        sensor_evals: deleted_keys(&base.sensor_evals, &current.sensor_evals),
+        backfills: deleted_keys(&base.backfills, &current.backfills),
+        backfill_chunks: deleted_keys(&base.backfill_chunks, &current.backfill_chunks),
+        run_key_index: deleted_keys(&base.run_key_index, &current.run_key_index),
+        run_key_conflicts: deleted_keys(&base.run_key_conflicts, &current.run_key_conflicts),
+        partition_status: deleted_keys(&base.partition_status, &current.partition_status),
+        idempotency_keys: deleted_keys(&base.idempotency_keys, &current.idempotency_keys),
+        schedule_definitions: deleted_keys(
+            &base.schedule_definitions,
+            &current.schedule_definitions,
+        ),
+        schedule_state: deleted_keys(&base.schedule_state, &current.schedule_state),
+        schedule_ticks: deleted_keys(&base.schedule_ticks, &current.schedule_ticks),
+        ..DeltaDeletions::default()
+    }
+}
+
+/// Applies one delta's tombstones to a merged fold state.
+fn apply_deletions(state: &mut FoldState, deletions: &DeltaDeletions) {
+    for key in &deletions.runs {
+        state.runs.remove(key);
+    }
+    for key in &deletions.tasks {
+        state.tasks.remove(key);
+    }
+    for key in &deletions.catalog_run_index {
+        state.catalog_run_index.remove(key);
+    }
+    for key in &deletions.dep_satisfaction {
+        state.dep_satisfaction.remove(key);
+    }
+    for key in &deletions.timers {
+        state.timers.remove(key);
+    }
+    for key in &deletions.dispatch_outbox {
+        state.dispatch_outbox.remove(key);
+    }
+    for key in &deletions.sensor_state {
+        state.sensor_state.remove(key);
+    }
+    for key in &deletions.sensor_evals {
+        state.sensor_evals.remove(key);
+    }
+    for key in &deletions.backfills {
+        state.backfills.remove(key);
+    }
+    for key in &deletions.backfill_chunks {
+        state.backfill_chunks.remove(key);
+    }
+    for key in &deletions.run_key_index {
+        state.run_key_index.remove(key);
+    }
+    for key in &deletions.run_key_conflicts {
+        state.run_key_conflicts.remove(key);
+    }
+    for key in &deletions.partition_status {
+        state.partition_status.remove(key);
+    }
+    for key in &deletions.idempotency_keys {
+        state.idempotency_keys.remove(key);
+    }
+    for key in &deletions.schedule_definitions {
+        state.schedule_definitions.remove(key);
+    }
+    for key in &deletions.schedule_state {
+        state.schedule_state.remove(key);
+    }
+    for key in &deletions.schedule_ticks {
+        state.schedule_ticks.remove(key);
+    }
+}
+
 fn delta_state_is_empty(state: &FoldState) -> bool {
     state.runs.is_empty()
         && state.tasks.is_empty()
@@ -1924,6 +2148,52 @@ fn prune_idempotency_keys(state: &mut FoldState, retention_now: DateTime<Utc>) {
     state
         .idempotency_keys
         .retain(|_, row| row.recorded_at >= cutoff);
+}
+
+/// Expires terminal runs older than the retention window, together with their
+/// task, dependency, dispatch outbox, and catalog run index rows.
+///
+/// Runs only during compaction folds (never on read paths), so every expiry is
+/// captured by `deletions_from_states` as delta tombstones and stays durable
+/// through later folds of older deltas and base snapshots.
+fn prune_terminal_runs(
+    state: &mut FoldState,
+    retention_now: DateTime<Utc>,
+    limits: &RetentionLimits,
+) {
+    if limits.terminal_run_days == 0 {
+        return;
+    }
+    let window = chrono::Duration::days(i64::from(limits.terminal_run_days));
+    let Some(cutoff) = retention_now.checked_sub_signed(window) else {
+        return;
+    };
+
+    let expired: BTreeSet<String> = state
+        .runs
+        .values()
+        .filter(|run| {
+            run.state.is_terminal() && run.completed_at.unwrap_or(run.triggered_at) < cutoff
+        })
+        .map(|run| run.run_id.clone())
+        .collect();
+    if expired.is_empty() {
+        return;
+    }
+
+    state.runs.retain(|run_id, _| !expired.contains(run_id));
+    state
+        .tasks
+        .retain(|(run_id, _), _| !expired.contains(run_id));
+    state
+        .catalog_run_index
+        .retain(|(_, _, run_id, _), _| !expired.contains(run_id));
+    state
+        .dep_satisfaction
+        .retain(|(run_id, _, _), _| !expired.contains(run_id));
+    state
+        .dispatch_outbox
+        .retain(|_, row| !expired.contains(&row.run_id));
 }
 
 fn update_watermarks(
@@ -3775,5 +4045,728 @@ mod tests {
             last_processed_at: Utc::now(),
         };
         assert_eq!(visibility_lag_events(&watermarks), 1.0);
+    }
+
+    /// Builds the full event chain for one run that completes successfully,
+    /// with every event stamped at `timestamp` and deterministic event ids
+    /// prefixed by `id_prefix` (ids must sort in fold order).
+    fn make_completed_run_events(
+        run_id: &str,
+        timestamp: DateTime<Utc>,
+        id_prefix: &str,
+    ) -> Vec<OrchestrationEvent> {
+        let attempt_id = format!("{run_id}_attempt_1");
+        let mut events = vec![
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::RunTriggered {
+                    run_id: run_id.to_string(),
+                    plan_id: format!("{run_id}_plan"),
+                    trigger: TriggerInfo::Manual {
+                        user_id: "user@example.com".to_string(),
+                    },
+                    root_assets: vec!["analytics.extract".to_string()],
+                    run_key: None,
+                    labels: HashMap::new(),
+                    code_version: None,
+                },
+                format!("{id_prefix}_01_run_triggered"),
+            ),
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::PlanCreated {
+                    run_id: run_id.to_string(),
+                    plan_id: format!("{run_id}_plan"),
+                    tasks: vec![TaskDef {
+                        key: "extract".to_string(),
+                        depends_on: vec![],
+                        asset_key: Some("analytics.extract".to_string()),
+                        partition_key: None,
+                        max_attempts: 3,
+                        heartbeat_timeout_sec: 300,
+                        requires_visible_output: false,
+                    }],
+                },
+                format!("{id_prefix}_02_plan_created"),
+            ),
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::TaskStarted {
+                    run_id: run_id.to_string(),
+                    task_key: "extract".to_string(),
+                    attempt: 1,
+                    attempt_id: attempt_id.clone(),
+                    worker_id: "worker-01".to_string(),
+                },
+                format!("{id_prefix}_03_task_started"),
+            ),
+            OrchestrationEvent::new_with_event_id(
+                "tenant",
+                "workspace",
+                OrchestrationEventData::TaskFinished {
+                    run_id: run_id.to_string(),
+                    task_key: "extract".to_string(),
+                    attempt: 1,
+                    attempt_id,
+                    worker_id: "worker-01".to_string(),
+                    outcome: TaskOutcome::Succeeded,
+                    materialization_id: None,
+                    error_message: None,
+                    output: None,
+                    error: None,
+                    metrics: None,
+                    cancelled_during_phase: None,
+                    partial_progress_json: None,
+                    asset_key: Some("analytics.extract".to_string()),
+                    partition_key: None,
+                    code_version: None,
+                },
+                format!("{id_prefix}_04_task_finished"),
+            ),
+        ];
+        for event in &mut events {
+            event.timestamp = timestamp;
+        }
+        events
+    }
+
+    fn make_fresh_run_triggered_event(run_id: &str, event_id: &str) -> OrchestrationEvent {
+        OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::RunTriggered {
+                run_id: run_id.to_string(),
+                plan_id: format!("{run_id}_plan"),
+                trigger: TriggerInfo::Manual {
+                    user_id: "user@example.com".to_string(),
+                },
+                root_assets: vec!["analytics.extract".to_string()],
+                run_key: None,
+                labels: HashMap::new(),
+                code_version: None,
+            },
+            event_id,
+        )
+    }
+
+    /// Compares the public projection tables of two fold states.
+    ///
+    /// The private dependency-graph maps are rebuilt from `dep_satisfaction`
+    /// with `HashMap`-iteration-dependent vector ordering, so whole-struct
+    /// equality would be flaky; the persisted tables are the contract.
+    fn assert_fold_states_equivalent(left: &FoldState, right: &FoldState) {
+        assert_eq!(left.runs, right.runs, "runs diverged");
+        assert_eq!(left.tasks, right.tasks, "tasks diverged");
+        assert_eq!(
+            left.catalog_run_index, right.catalog_run_index,
+            "catalog_run_index diverged"
+        );
+        assert_eq!(
+            left.dep_satisfaction, right.dep_satisfaction,
+            "dep_satisfaction diverged"
+        );
+        assert_eq!(left.timers, right.timers, "timers diverged");
+        assert_eq!(
+            left.dispatch_outbox, right.dispatch_outbox,
+            "dispatch_outbox diverged"
+        );
+        assert_eq!(
+            left.sensor_state, right.sensor_state,
+            "sensor_state diverged"
+        );
+        assert_eq!(
+            left.sensor_evals, right.sensor_evals,
+            "sensor_evals diverged"
+        );
+        assert_eq!(left.backfills, right.backfills, "backfills diverged");
+        assert_eq!(
+            left.backfill_chunks, right.backfill_chunks,
+            "backfill_chunks diverged"
+        );
+        assert_eq!(
+            left.run_key_index, right.run_key_index,
+            "run_key_index diverged"
+        );
+        assert_eq!(
+            left.run_key_conflicts, right.run_key_conflicts,
+            "run_key_conflicts diverged"
+        );
+        assert_eq!(
+            left.partition_status, right.partition_status,
+            "partition_status diverged"
+        );
+        assert_eq!(
+            left.idempotency_keys, right.idempotency_keys,
+            "idempotency_keys diverged"
+        );
+        assert_eq!(
+            left.schedule_definitions, right.schedule_definitions,
+            "schedule_definitions diverged"
+        );
+        assert_eq!(
+            left.schedule_state, right.schedule_state,
+            "schedule_state diverged"
+        );
+        assert_eq!(
+            left.schedule_ticks, right.schedule_ticks,
+            "schedule_ticks diverged"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_dispatch_outbox_rows_do_not_resurrect_from_l0_deltas() -> Result<()> {
+        // Regression for the missing L0 delete channel (#345): a dispatch
+        // outbox row pruned by TaskStarted must not reappear after the delta
+        // is written and state is reloaded from base + L0 deltas.
+        let (compactor, storage) = create_test_compactor().await?;
+
+        // Δ1: run + plan.
+        let seed_paths = write_basic_compaction_events(&storage).await?;
+        compactor.compact_events(seed_paths).await?;
+
+        // Δ2: dispatch request creates the outbox row. Event ids must sort
+        // after the seed events so row-version merges replay in fold order.
+        let attempt_id = "attempt_extract_1".to_string();
+        let dispatch_id = DispatchOutboxRow::dispatch_id("run_01", "extract", 1);
+        let dispatch = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::DispatchRequested {
+                run_id: "run_01".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                worker_queue: "default-queue".to_string(),
+                dispatch_id: dispatch_id.clone(),
+            },
+            "evt_03_dispatch_requested",
+        );
+        let dispatch_paths = write_events(&storage, vec![dispatch]).await?;
+        compactor.compact_events(dispatch_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            state.dispatch_outbox.contains_key(&dispatch_id),
+            "dispatch outbox row should exist before consumption"
+        );
+
+        // Δ3: TaskStarted consumes and prunes the outbox row.
+        let started = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::TaskStarted {
+                run_id: "run_01".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                worker_id: "worker-01".to_string(),
+            },
+            "evt_04_task_started",
+        );
+        let started_paths = write_events(&storage, vec![started]).await?;
+        compactor.compact_events(started_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        assert!(
+            manifest.base_snapshot.snapshot_id.is_none(),
+            "test requires the deletion to survive via the delta chain, not a base merge"
+        );
+        let tombstone_delta = manifest.l0_deltas.last().expect("tombstone delta");
+        assert!(
+            tombstone_delta.deletion_count >= 1,
+            "consuming a dispatch outbox row must record a delta tombstone"
+        );
+        let deletions_artifact = tombstone_delta
+            .deletions
+            .as_ref()
+            .expect("tombstone delta must reference a deletions artifact");
+        let deletions_bytes = storage.get_raw(deletions_artifact.path()).await?;
+        let deletions: DeltaDeletions =
+            serde_json::from_slice(&deletions_bytes).expect("parse deletions artifact");
+        assert!(
+            deletions.dispatch_outbox.contains(&dispatch_id),
+            "deletions artifact must record the consumed dispatch outbox row"
+        );
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            !state.dispatch_outbox.contains_key(&dispatch_id),
+            "deleted dispatch outbox row must not resurrect from the L0 delta chain"
+        );
+
+        // A later DispatchEnqueued for the consumed attempt is pruned by the
+        // fold and must not resurrect the row either.
+        let enqueued = OrchestrationEvent::new_with_event_id(
+            "tenant",
+            "workspace",
+            OrchestrationEventData::DispatchEnqueued {
+                dispatch_id: dispatch_id.clone(),
+                run_id: Some("run_01".to_string()),
+                task_key: Some("extract".to_string()),
+                attempt: Some(1),
+                cloud_task_id: "d_cloud123".to_string(),
+            },
+            "evt_05_dispatch_enqueued",
+        );
+        let enqueued_paths = write_events(&storage, vec![enqueued]).await?;
+        compactor.compact_events(enqueued_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            !state.dispatch_outbox.contains_key(&dispatch_id),
+            "late DispatchEnqueued must not resurrect the consumed dispatch outbox row"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_runs_expire_after_retention_window_via_tombstones() -> Result<()> {
+        // Regression for missing terminal-run retention (#341, reopening #255):
+        // terminal runs past the retention window are expired together with
+        // their task, catalog index, dependency, and dispatch rows, and the
+        // remaining folded state no longer scales with expired history.
+        let (compactor, storage) = create_test_compactor().await?;
+        let compactor = compactor.with_retention_limits(RetentionLimits {
+            terminal_run_days: 30,
+        });
+
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let mut old_events = Vec::new();
+        for index in 0..3 {
+            old_events.extend(make_completed_run_events(
+                &format!("run_old_{index}"),
+                old_timestamp,
+                &format!("evt_a{index}"),
+            ));
+        }
+        let old_paths = write_events(&storage, old_events).await?;
+        compactor.compact_events(old_paths).await?;
+
+        // Not yet expired: the retention reference is the newest folded event,
+        // which is itself 40 days old.
+        let (_, state) = compactor.load_state().await?;
+        assert_eq!(state.runs.len(), 3);
+        assert!(state.runs.values().all(|run| run.state.is_terminal()));
+
+        // A fresh event advances the retention reference to now, expiring the
+        // terminal runs beyond the 30-day window.
+        let trigger = make_fresh_run_triggered_event("run_new", "evt_z_run_triggered");
+        let fresh_paths = write_events(&storage, vec![trigger]).await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        let retention_delta = manifest.l0_deltas.last().expect("retention delta");
+        assert!(
+            retention_delta.deletions.is_some(),
+            "terminal-run expiry must be recorded as delta tombstones"
+        );
+        assert!(
+            retention_delta.deletion_count >= 9,
+            "expected tombstones for 3 runs + 3 tasks + 3 catalog index rows, got {}",
+            retention_delta.deletion_count
+        );
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(state.runs.contains_key("run_new"), "live run must survive");
+        assert!(
+            !state
+                .runs
+                .keys()
+                .any(|run_id| run_id.starts_with("run_old")),
+            "expired terminal runs must leave the projection"
+        );
+        assert!(
+            !state
+                .tasks
+                .keys()
+                .any(|(run_id, _)| run_id.starts_with("run_old")),
+            "expired runs' tasks must leave the projection"
+        );
+        assert!(
+            !state
+                .catalog_run_index
+                .keys()
+                .any(|(_, _, run_id, _)| run_id.starts_with("run_old")),
+            "expired runs' catalog index rows must leave the projection"
+        );
+        assert!(
+            !state
+                .dep_satisfaction
+                .keys()
+                .any(|(run_id, _, _)| run_id.starts_with("run_old")),
+            "expired runs' dependency rows must leave the projection"
+        );
+        assert!(
+            state
+                .dispatch_outbox
+                .values()
+                .all(|row| !row.run_id.starts_with("run_old")),
+            "expired runs' dispatch outbox rows must leave the projection"
+        );
+
+        // #255 invariant: the state every compaction loads and rewrites is now
+        // bounded by live history, not all-time history.
+        assert_eq!(state.runs.len(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_terminal_run_stays_expired_when_older_deltas_still_contain_it() -> Result<()> {
+        // The #341/#345 coupling property: retention tombstones must win over
+        // older L0 deltas that still carry the expired run's rows. Without the
+        // delete channel this exact fold order resurrects the run.
+        let (compactor, storage) = create_test_compactor().await?;
+        let compactor = compactor.with_retention_limits(RetentionLimits {
+            terminal_run_days: 30,
+        });
+
+        // Δ1 carries the terminal run's rows (completed 40 days ago).
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let old_paths = write_events(
+            &storage,
+            make_completed_run_events("run_old", old_timestamp, "evt_a"),
+        )
+        .await?;
+        compactor.compact_events(old_paths).await?;
+
+        // Δ2 carries the retention tombstones.
+        let trigger = make_fresh_run_triggered_event("run_new", "evt_b_run_triggered");
+        let fresh_paths = write_events(&storage, vec![trigger]).await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        assert!(
+            manifest.base_snapshot.snapshot_id.is_none(),
+            "test requires the older delta to remain in the fold chain"
+        );
+        assert!(manifest.l0_deltas.len() >= 2);
+        let older_delta = &manifest.l0_deltas[manifest.l0_deltas.len() - 2];
+        assert!(
+            older_delta.row_counts.runs >= 1,
+            "the older delta must still physically contain the expired run"
+        );
+        let newest_delta = manifest.l0_deltas.last().expect("tombstone delta");
+        assert!(newest_delta.deletions.is_some());
+
+        // Loading folds the older delta (run present) and then the tombstone
+        // delta: the run must stay expired.
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            !state.runs.contains_key("run_old"),
+            "expired run resurrected by folding an older delta that still contains it"
+        );
+
+        // Further folds over the same chain must also keep it expired.
+        let trigger = make_fresh_run_triggered_event("run_new_2", "evt_c_run_triggered");
+        let fresh_paths = write_events(&storage, vec![trigger]).await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let (_, state) = compactor.load_state().await?;
+        assert!(!state.runs.contains_key("run_old"));
+        assert!(state.runs.contains_key("run_new"));
+        assert!(state.runs.contains_key("run_new_2"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_run_expiry_survives_base_merge() -> Result<()> {
+        // Merge-path counterpart: when the retention sweep coincides with a
+        // base merge, the rewritten base snapshot must exclude expired runs.
+        let (compactor, storage) = create_test_compactor().await?;
+        let compactor = compactor.with_retention_limits(RetentionLimits {
+            terminal_run_days: 30,
+        });
+
+        let mut manifest = OrchestrationManifest::new("01HQXYZ700REV");
+        manifest.manifest_id = "00000000000000000000".to_string();
+        manifest.l0_limits.max_count = 1;
+        manifest.l0_limits.max_rows = u32::MAX;
+        manifest.l0_limits.max_age_seconds = u32::MAX;
+        compactor
+            .publish_manifest(&manifest, None, None, None, None, None, None)
+            .await?;
+
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let old_paths = write_events(
+            &storage,
+            make_completed_run_events("run_old", old_timestamp, "evt_a"),
+        )
+        .await?;
+        compactor.compact_events(old_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        assert!(manifest.base_snapshot.snapshot_id.is_some());
+        let (_, state) = compactor.load_state().await?;
+        assert!(state.runs.contains_key("run_old"));
+
+        let trigger = make_fresh_run_triggered_event("run_new", "evt_b_run_triggered");
+        let fresh_paths = write_events(&storage, vec![trigger]).await?;
+        compactor.compact_events(fresh_paths).await?;
+
+        let manifest = load_current_manifest(&storage).await?;
+        assert!(
+            manifest.l0_deltas.is_empty(),
+            "retention sweep should have merged into the base snapshot"
+        );
+        let (_, state) = compactor.load_state().await?;
+        assert!(
+            !state.runs.contains_key("run_old"),
+            "expired run must not survive the base merge"
+        );
+        assert!(state.runs.contains_key("run_new"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_folds_match_full_replay_of_event_chain() -> Result<()> {
+        // Phase 3A replay-equivalence: folding the chain one event at a time
+        // (deltas, tombstones, retention sweeps) must produce the same state
+        // as replaying the full chain in one batch on a fresh workspace.
+        let limits = RetentionLimits {
+            terminal_run_days: 30,
+        };
+        let old_timestamp = Utc::now() - chrono::Duration::days(40);
+        let recent_timestamp = Utc::now() - chrono::Duration::days(1);
+
+        let mut chain = Vec::new();
+        chain.extend(make_completed_run_events("run_old", old_timestamp, "evt_a"));
+        chain.extend(make_completed_run_events(
+            "run_live",
+            recent_timestamp,
+            "evt_b",
+        ));
+        chain.push(make_fresh_run_triggered_event(
+            "run_new",
+            "evt_c_run_triggered",
+        ));
+
+        // (a) Incremental: one compaction per event.
+        let (incremental, incremental_storage) = create_test_compactor().await?;
+        let incremental = incremental.with_retention_limits(limits.clone());
+        for event in &chain {
+            let paths = write_events(&incremental_storage, vec![event.clone()]).await?;
+            incremental.compact_events(paths).await?;
+        }
+        let (_, incremental_state) = incremental.load_state().await?;
+
+        // (b) Full replay: the entire chain in one batch.
+        let (full, full_storage) = create_test_compactor().await?;
+        let full = full.with_retention_limits(limits);
+        let paths = write_events(&full_storage, chain).await?;
+        full.compact_events(paths).await?;
+        let (_, full_state) = full.load_state().await?;
+
+        // Both paths expire run_old, retain run_live, and see run_new.
+        assert!(!full_state.runs.contains_key("run_old"));
+        assert!(full_state.runs.contains_key("run_live"));
+        assert!(full_state.runs.contains_key("run_new"));
+        assert_fold_states_equivalent(&incremental_state, &full_state);
+
+        Ok(())
+    }
+
+    #[test]
+    fn prune_terminal_runs_respects_window_terminal_state_and_disable() {
+        use crate::orchestration::compactor::fold::{DispatchStatus, RunRow, RunState};
+
+        fn make_run_row(
+            run_id: &str,
+            state: RunState,
+            triggered_at: DateTime<Utc>,
+            completed_at: Option<DateTime<Utc>>,
+        ) -> RunRow {
+            RunRow {
+                run_id: run_id.to_string(),
+                plan_id: format!("{run_id}_plan"),
+                state,
+                run_key: None,
+                labels: HashMap::new(),
+                code_version: None,
+                cancel_requested: false,
+                tasks_total: 1,
+                tasks_completed: 1,
+                tasks_succeeded: 1,
+                tasks_failed: 0,
+                tasks_skipped: 0,
+                tasks_cancelled: 0,
+                triggered_at,
+                completed_at,
+                row_version: "01HQXYZROWVERSION0000000000".to_string(),
+            }
+        }
+
+        let now = Utc::now();
+        let mut state = FoldState::new();
+        // Terminal beyond the window: pruned.
+        state.runs.insert(
+            "run_expired".to_string(),
+            make_run_row(
+                "run_expired",
+                RunState::Succeeded,
+                now - chrono::Duration::days(41),
+                Some(now - chrono::Duration::days(40)),
+            ),
+        );
+        // Terminal within the window: kept.
+        state.runs.insert(
+            "run_recent".to_string(),
+            make_run_row(
+                "run_recent",
+                RunState::Failed,
+                now - chrono::Duration::days(11),
+                Some(now - chrono::Duration::days(10)),
+            ),
+        );
+        // Non-terminal, however old: kept.
+        state.runs.insert(
+            "run_running".to_string(),
+            make_run_row(
+                "run_running",
+                RunState::Running,
+                now - chrono::Duration::days(100),
+                None,
+            ),
+        );
+        // Terminal with missing completed_at: conservative triggered_at fallback.
+        state.runs.insert(
+            "run_no_completion".to_string(),
+            make_run_row(
+                "run_no_completion",
+                RunState::Cancelled,
+                now - chrono::Duration::days(50),
+                None,
+            ),
+        );
+        let expired_dispatch_id = DispatchOutboxRow::dispatch_id("run_expired", "extract", 1);
+        state.dispatch_outbox.insert(
+            expired_dispatch_id.clone(),
+            DispatchOutboxRow {
+                run_id: "run_expired".to_string(),
+                task_key: "extract".to_string(),
+                attempt: 1,
+                dispatch_id: expired_dispatch_id.clone(),
+                cloud_task_id: None,
+                status: DispatchStatus::Pending,
+                attempt_id: "attempt_1".to_string(),
+                worker_queue: "default-queue".to_string(),
+                created_at: now - chrono::Duration::days(40),
+                row_version: "01HQXYZROWVERSION0000000001".to_string(),
+            },
+        );
+
+        let limits = RetentionLimits {
+            terminal_run_days: 30,
+        };
+        prune_terminal_runs(&mut state, now, &limits);
+
+        assert!(!state.runs.contains_key("run_expired"));
+        assert!(!state.runs.contains_key("run_no_completion"));
+        assert!(state.runs.contains_key("run_recent"));
+        assert!(state.runs.contains_key("run_running"));
+        assert!(
+            !state.dispatch_outbox.contains_key(&expired_dispatch_id),
+            "expired run's dispatch outbox rows must be pruned with it"
+        );
+
+        // A zero-day window disables terminal-run expiry entirely.
+        let mut disabled_state = FoldState::new();
+        disabled_state.runs.insert(
+            "run_expired".to_string(),
+            make_run_row(
+                "run_expired",
+                RunState::Succeeded,
+                now - chrono::Duration::days(400),
+                Some(now - chrono::Duration::days(400)),
+            ),
+        );
+        prune_terminal_runs(
+            &mut disabled_state,
+            now,
+            &RetentionLimits {
+                terminal_run_days: 0,
+            },
+        );
+        assert!(disabled_state.runs.contains_key("run_expired"));
+    }
+
+    #[test]
+    fn deletions_from_states_records_all_removed_keys_sorted() {
+        use crate::orchestration::compactor::fold::{DispatchStatus, RunRow, RunState};
+
+        let now = Utc::now();
+        let run_row = RunRow {
+            run_id: "run_01".to_string(),
+            plan_id: "plan_01".to_string(),
+            state: RunState::Succeeded,
+            run_key: None,
+            labels: HashMap::new(),
+            code_version: None,
+            cancel_requested: false,
+            tasks_total: 1,
+            tasks_completed: 1,
+            tasks_succeeded: 1,
+            tasks_failed: 0,
+            tasks_skipped: 0,
+            tasks_cancelled: 0,
+            triggered_at: now,
+            completed_at: Some(now),
+            row_version: "01HQXYZROWVERSION0000000002".to_string(),
+        };
+        let dispatch_row = |dispatch_id: &str| DispatchOutboxRow {
+            run_id: "run_01".to_string(),
+            task_key: "extract".to_string(),
+            attempt: 1,
+            dispatch_id: dispatch_id.to_string(),
+            cloud_task_id: None,
+            status: DispatchStatus::Pending,
+            attempt_id: "attempt_1".to_string(),
+            worker_queue: "default-queue".to_string(),
+            created_at: now,
+            row_version: "01HQXYZROWVERSION0000000003".to_string(),
+        };
+
+        let mut base = FoldState::new();
+        base.runs.insert("run_01".to_string(), run_row.clone());
+        base.dispatch_outbox
+            .insert("dispatch:b".to_string(), dispatch_row("dispatch:b"));
+        base.dispatch_outbox
+            .insert("dispatch:a".to_string(), dispatch_row("dispatch:a"));
+
+        let mut current = FoldState::new();
+        current.runs.insert("run_01".to_string(), run_row);
+
+        let deletions = deletions_from_states(&base, &current);
+        assert!(
+            deletions.runs.is_empty(),
+            "retained rows must not be tombstoned"
+        );
+        assert_eq!(
+            deletions.dispatch_outbox,
+            vec!["dispatch:a".to_string(), "dispatch:b".to_string()],
+            "tombstone keys must be sorted for deterministic artifacts"
+        );
+        assert_eq!(deletions.total(), 2);
+
+        let mut merged = FoldState::new();
+        merged.runs.insert(
+            "run_01".to_string(),
+            current.runs.get("run_01").cloned().expect("run row"),
+        );
+        merged
+            .dispatch_outbox
+            .insert("dispatch:a".to_string(), dispatch_row("dispatch:a"));
+        merged
+            .dispatch_outbox
+            .insert("dispatch:b".to_string(), dispatch_row("dispatch:b"));
+        apply_deletions(&mut merged, &deletions);
+        assert!(merged.dispatch_outbox.is_empty());
+        assert!(merged.runs.contains_key("run_01"));
     }
 }

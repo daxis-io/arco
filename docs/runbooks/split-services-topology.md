@@ -22,6 +22,7 @@ Required env:
 - `ARCO_ORCH_COMPACTOR_URL`
 - User JWT auth config: `ARCO_JWT_*`
 - Task callback token config: `ARCO_TASK_TOKEN_SECRET`, `ARCO_TASK_TOKEN_ISSUER`, `ARCO_TASK_TOKEN_AUDIENCE`, `ARCO_TASK_TOKEN_TTL_SECS`
+- Optional `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS` (default `90`; `0` disables): retention window for terminal orchestration runs in the folded projection. Applies to any process that performs orchestration compaction; set it consistently here and on `arco_flow_compactor`.
 
 Health:
 - `GET /health`
@@ -56,6 +57,7 @@ Required env:
 - `ARCO_TENANT_ID`
 - `ARCO_WORKSPACE_ID`
 - `ARCO_STORAGE_BUCKET`
+- Optional `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS` (default `90`; `0` disables): terminal runs (succeeded/failed/cancelled) older than this many days are expired from the orchestration projection via delta tombstones during compaction. Set it consistently on every process that performs orchestration compaction (this service and `arco-api`).
 - Optional internal OIDC for `/compact`, `/rebuild`, and `/internal/reconcile`: `ARCO_INTERNAL_AUTH_ISSUER`, `ARCO_INTERNAL_AUTH_AUDIENCE`, `ARCO_INTERNAL_AUTH_ALLOWED_SUBS` and/or `ARCO_INTERNAL_AUTH_ALLOWED_EMAILS`, `ARCO_INTERNAL_AUTH_ENFORCE`
 
 HTTP:

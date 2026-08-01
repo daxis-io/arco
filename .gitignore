@@ -53,3 +53,6 @@ coverage/
 *.tfstate
 *.tfstate.backup
 *.tfplan
+
+# Local AI tool run manifests (session-scoped, never committed)
+.ai/

@@ -5,7 +5,10 @@ from __future__ import annotations
 import threading
 from typing import Any
 
+import pytest
+
 from arco_flow.cli.config import ArcoFlowConfig
+from arco_flow.client import ApiError
 from arco_flow.context import AssetContext
 from arco_flow.types import AssetOut
 from arco_flow.worker.server import DispatchWorker, WorkerDispatchEnvelope
@@ -156,6 +159,65 @@ def test_recent_dispatch_registry_is_bounded() -> None:
     from arco_flow.worker.server import RECENT_DISPATCH_LIMIT
 
     for index in range(RECENT_DISPATCH_LIMIT + 10):
-        worker._finish_dispatch(f"dispatch:run-123:analytics.daily_sales:{index}")
+        worker._record_dispatch_completed(f"dispatch:run-123:analytics.daily_sales:{index}")
 
     assert len(worker._recent_dispatch_ids) == RECENT_DISPATCH_LIMIT
+
+
+class _FailFirstStartedClient(_RecordingClient):
+    """Recording client whose first task_started call fails transiently."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._started_failures_remaining = 1
+
+    def task_started(self, **kwargs: Any) -> None:
+        with self.lock:
+            self.started_calls.append(kwargs)
+            if self._started_failures_remaining > 0:
+                self._started_failures_remaining -= 1
+                raise ApiError(500, "transient control-plane error")
+
+
+def test_failed_task_started_does_not_poison_dedup_and_redelivery_executes() -> None:
+    """A dispatch that raised before its terminal report must re-execute on redelivery.
+
+    Reproduces the reviewer's probe: the first delivery dies in the
+    `task_started` callback (transient ApiError -> HTTP 500 -> Cloud Tasks
+    redelivers the same deterministic dispatch_id). If that failure were
+    recorded as "recently completed", the redelivery would be duplicate-acked
+    and the task would be stuck in Dispatched forever, unrescuable by the
+    sweeper (which reuses the same dispatch_id).
+    """
+    executions: list[str] = []
+
+    def asset_fn(ctx: AssetContext) -> AssetOut:
+        executions.append(ctx.run_id)
+        return AssetOut([], row_count=1)
+
+    client = _FailFirstStartedClient()
+    worker = _make_worker(asset_fn, client)
+    envelope = WorkerDispatchEnvelope.from_dict(_sample_envelope_dict())
+
+    with pytest.raises(ApiError):
+        worker.handle_dispatch(envelope)
+
+    # Nothing executed and no terminal report was sent, so the dispatch_id
+    # must not be remembered as completed (and must not stay in flight).
+    assert executions == []
+    assert len(client.completed_calls) == 0
+    assert envelope.dispatch_id not in worker._recent_dispatch_ids
+    assert envelope.dispatch_id not in worker._inflight_dispatch_ids
+
+    # Cloud Tasks redelivers after the 500: the task must actually execute.
+    worker.handle_dispatch(envelope)
+
+    assert len(executions) == 1
+    assert len(client.started_calls) == 2
+    assert len(client.completed_calls) == 1
+
+    # Now that the terminal report was delivered, a further redelivery is
+    # duplicate-acked without re-execution.
+    worker.handle_dispatch(envelope)
+    assert len(executions) == 1
+    assert len(client.completed_calls) == 1

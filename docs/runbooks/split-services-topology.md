@@ -142,6 +142,38 @@ Worker protocol compatibility:
 - Legacy callback paths using `taskKey` are accepted only when the key is unambiguous.
 - The language-neutral schema lives in `arco.orchestration.v1` protobuf worker messages.
 
+## Rollout Order: Partition-Scoped Dispatch Envelopes
+
+Workers now hard-fail (deliberately loud) when a **partitioned** asset is
+dispatched without a `partitionKey` in the envelope: executing a partitioned
+asset unpartitioned while the catalog records a partition as materialized
+would corrupt materialization identity (issue #339). This makes deploy order
+matter:
+
+1. **Deploy the control plane first**: `arco-api`, `arco_flow_dispatcher`, and
+   `arco_flow_sweeper` at a version whose envelopes carry `partitionKey` (built
+   via `dispatch_envelope_for_attempt` from the planned task row).
+2. **Deploy workers second.** A partition-strict worker behind an old
+   dispatcher/sweeper fails every dispatch of a partitioned asset until the
+   control plane catches up.
+
+The reverse order is safe for unpartitioned assets only; the safe universal
+order is control plane/dispatcher before workers.
+
+### Known degradation: repair dispatches racing state pruning
+
+`dispatch_envelope_for_attempt` copies `partitionKey` and
+`heartbeatTimeoutSec` from the planned task row. On repair/anti-entropy paths
+(the sweeper redispatching a stuck attempt), the task row can be missing when
+the repair races state pruning; the builder then degrades to the legacy
+envelope shape **without** `partitionKey`. For a partitioned asset that repair
+dispatch fails loudly at the worker and burns an attempt rather than
+materializing under a corrupted (unpartitioned) identity. This is deliberate:
+prefer a visible failed attempt over silent identity corruption. Operators
+seeing repeated repair failures with
+`asset ... is partitioned but the dispatch envelope carried no partition key`
+should treat it as the repair path racing pruning, not as a worker bug.
+
 ## Non-goals (Current Cycle)
 
 - No in-process ETL execution engine in API/orchestration services.

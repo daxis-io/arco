@@ -110,6 +110,27 @@ const LEDGER_FRESHNESS_MAX_DATE_PREFIXES: u64 = 32;
 /// proof that lets the anti-entropy zombie reaper run in an idle workspace
 /// (issue #338) without weakening the guard when compaction is genuinely
 /// behind.
+///
+/// # Soundness assumption
+///
+/// This check proves "no unfolded events" only for event ids **above**
+/// `events_processed_through`. It assumes every durable event with an id at
+/// or below that watermark has been folded. A straggler below the watermark
+/// can exist: writer A appends `E1`, writer B appends `E2 > E1` and folds
+/// through `E2`, then A crashes before its fold — `E1` is durable, unfolded,
+/// and invisible here because its id does not exceed the watermark. That
+/// straggler is equally excluded from projection rebuilds (which also replay
+/// only above the watermark), so this function inherits a pre-existing
+/// straggler semantic of the fold pipeline rather than introducing a new
+/// unsoundness; [`LedgerFreshness::Current`] means "as fresh as the fold
+/// watermark semantics can prove", not a from-scratch audit of the ledger.
+///
+/// # Horizon limitation
+///
+/// The scan is bounded to [`LEDGER_FRESHNESS_MAX_DATE_PREFIXES`] (32) days of
+/// date prefixes. A watermark older than that horizon yields
+/// [`LedgerFreshness::Unknown`], deliberately restoring the conservative
+/// wall-clock compaction-lag path instead of listing unbounded prefixes.
 pub async fn orchestration_ledger_freshness(
     storage: &ScopedStorage,
     watermarks: &Watermarks,

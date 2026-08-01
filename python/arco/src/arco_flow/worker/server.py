@@ -14,6 +14,7 @@ import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -49,8 +50,64 @@ HEARTBEAT_INTERVAL_DIVISOR = 5
 HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
 HEARTBEAT_MAX_INTERVAL_SECONDS = 60.0
 
+# Smallest heartbeat timeout the control plane will plan, mirroring
+# `MIN_HEARTBEAT_TIMEOUT_SEC` in
+# crates/arco-flow/src/orchestration/controllers/run_request_processor.rs.
+#
+# Zero used to be representable and meant two different things: the control
+# plane read it as "reap after the 30s grace alone", while this worker read
+# `heartbeat_timeout_sec or DEFAULT` and heartbeated as if the timeout were
+# 300s. A task planned with zero was therefore reaped roughly a minute before
+# its worker's first heartbeat. The planner now refuses to emit a value below
+# this floor, and an envelope carrying one is treated as malformed here rather
+# than being silently reinterpreted.
+MIN_HEARTBEAT_TIMEOUT_SECONDS = 30
+
 # Bounded memory for dispatch deduplication (issue #328).
 RECENT_DISPATCH_LIMIT = 1024
+
+# Control-plane error codes that authoritatively say "this attempt is finished".
+#
+# Process-local dedup cannot cover the crash window between a durable
+# `task_completed` and the worker recording it: the replacement process starts
+# with an empty set and would re-execute the asset on redelivery. Only the
+# control plane knows the attempt already reported a terminal result, and it
+# says so on `task_started`.
+TERMINAL_ATTEMPT_CONFLICT_STATUS = 409
+TERMINAL_ATTEMPT_ERROR_CODES = frozenset(
+    {
+        "task_already_terminal",
+        "attempt_already_completed",
+        "attempt_mismatch",
+        "attempt_id_mismatch",
+    }
+)
+
+
+class DispatchClaim(Enum):
+    """Outcome of atomically classifying a dispatch id for execution."""
+
+    CLAIMED = "claimed"
+    """No other delivery holds this dispatch id; this delivery executes."""
+
+    IN_FLIGHT = "in_flight"
+    """Another delivery is executing it right now; its outcome is unknown."""
+
+    COMPLETED = "completed"
+    """A previous delivery reported a terminal result for it."""
+
+
+class DispatchOutcome(Enum):
+    """What the HTTP transport must do after a dispatch delivery."""
+
+    EXECUTED = "executed"
+    """The asset ran and its terminal result was reported."""
+
+    ALREADY_TERMINAL = "already_terminal"
+    """The attempt was already finished; acknowledge without re-executing."""
+
+    RETRY_LATER = "retry_later"
+    """The owner's outcome is not known yet; the delivery must be retried."""
 
 
 def heartbeat_interval_seconds(heartbeat_timeout_sec: int | None) -> float:
@@ -63,8 +120,24 @@ def heartbeat_interval_seconds(heartbeat_timeout_sec: int | None) -> float:
 
     Returns:
         Seconds between heartbeats, well under the staleness threshold.
+
+    Raises:
+        ValueError: If the envelope carries a timeout below
+            `MIN_HEARTBEAT_TIMEOUT_SECONDS`. Such a value has no consistent
+            meaning across the control plane and this worker, so it is
+            rejected rather than reinterpreted.
     """
-    timeout = heartbeat_timeout_sec or DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+    if heartbeat_timeout_sec is None:
+        timeout = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+    elif heartbeat_timeout_sec < MIN_HEARTBEAT_TIMEOUT_SECONDS:
+        msg = (
+            f"heartbeat_timeout_sec {heartbeat_timeout_sec} is below the "
+            f"{MIN_HEARTBEAT_TIMEOUT_SECONDS}s floor shared with the control plane; "
+            "refusing to guess an interval the reaper does not agree with"
+        )
+        raise ValueError(msg)
+    else:
+        timeout = heartbeat_timeout_sec
     interval = timeout / HEARTBEAT_INTERVAL_DIVISOR
     return min(HEARTBEAT_MAX_INTERVAL_SECONDS, max(HEARTBEAT_MIN_INTERVAL_SECONDS, interval))
 
@@ -116,6 +189,24 @@ class HeartbeatSender:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _is_terminal_attempt_conflict(error: ApiError) -> bool:
+    """Whether the control plane says this attempt already finished.
+
+    Args:
+        error: The failure raised by a `task_started` callback.
+
+    Returns:
+        True when the response is a 409 whose error code names a durable
+        terminal or superseded attempt. The worker must then skip execution:
+        the asset already ran, and re-running it would duplicate side effects
+        that the control plane has already recorded as complete.
+    """
+    if error.status_code != TERMINAL_ATTEMPT_CONFLICT_STATUS:
+        return False
+    message = str(error)
+    return any(code in message for code in TERMINAL_ATTEMPT_ERROR_CODES)
 
 
 def _get_field(payload: dict[str, Any], snake: str, camel: str) -> Any:
@@ -343,35 +434,55 @@ class DispatchWorker:
         """Close worker resources."""
         self._client.close()
 
-    def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+    def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> DispatchOutcome:
+        """Execute one dispatch delivery, or explain why it was not executed.
+
+        Returns:
+            The outcome the HTTP transport must translate into a status code.
+            A `RETRY_LATER` outcome must not be acknowledged as success: the
+            executing delivery may still crash before reporting anything.
+        """
         self._validate_dispatch_envelope(payload)
-        if not self._begin_dispatch(payload.dispatch_id):
+        claim = self._begin_dispatch(payload.dispatch_id)
+        if claim is DispatchClaim.COMPLETED:
             console.print(
-                f"[blue]i[/blue] Duplicate dispatch {payload.dispatch_id} acknowledged "
-                "without re-execution"
+                f"[blue]i[/blue] Dispatch {payload.dispatch_id} already reported a "
+                "terminal result; acknowledged without re-execution"
             )
-            return
+            return DispatchOutcome.ALREADY_TERMINAL
+        if claim is DispatchClaim.IN_FLIGHT:
+            console.print(
+                f"[blue]i[/blue] Dispatch {payload.dispatch_id} is still executing; "
+                "asking for redelivery instead of acknowledging an unknown outcome"
+            )
+            return DispatchOutcome.RETRY_LATER
         try:
-            self._run_dispatch(payload)
+            return self._run_dispatch(payload)
         finally:
             self._release_dispatch(payload.dispatch_id)
 
-    def _begin_dispatch(self, dispatch_id: str) -> bool:
-        """Atomically claim a dispatch_id for execution.
+    def _begin_dispatch(self, dispatch_id: str) -> DispatchClaim:
+        """Atomically classify and claim a dispatch_id for execution.
 
         Cloud Tasks delivers at-least-once, so a redelivery can arrive while
-        the first delivery is still executing (issue #328). Returns False for
-        a dispatch that is in flight or recently completed; such deliveries
-        must be acknowledged without executing the asset again.
+        the first delivery is still executing (issue #328). The two duplicate
+        cases are *not* equivalent and must not share a response:
+
+        - A completed dispatch has a durable terminal report behind it, so the
+          redelivery can be acknowledged.
+        - An in-flight dispatch has no outcome yet. Acknowledging it tells the
+          queue the work succeeded while the executing request may still crash
+          before reporting anything, stranding the attempt until the sweeper's
+          much slower repair path notices. The redelivery is therefore told to
+          retry, and mirrors whatever the owner ends up reporting.
         """
         with self._dedup_lock:
-            if (
-                dispatch_id in self._inflight_dispatch_ids
-                or dispatch_id in self._recent_dispatch_ids
-            ):
-                return False
+            if dispatch_id in self._recent_dispatch_ids:
+                return DispatchClaim.COMPLETED
+            if dispatch_id in self._inflight_dispatch_ids:
+                return DispatchClaim.IN_FLIGHT
             self._inflight_dispatch_ids.add(dispatch_id)
-            return True
+            return DispatchClaim.CLAIMED
 
     def _release_dispatch(self, dispatch_id: str) -> None:
         """Release a dispatch_id's in-flight claim without recording completion.
@@ -403,20 +514,35 @@ class DispatchWorker:
             while len(self._recent_dispatch_ids) > RECENT_DISPATCH_LIMIT:
                 self._recent_dispatch_ids.popitem(last=False)
 
-    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> DispatchOutcome:
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
-        self._client.task_started(
-            task_id=payload.callback_task_id,
-            task_key=payload.task_key,
-            attempt=payload.attempt,
-            attempt_id=payload.attempt_id,
-            worker_id=self.worker_id,
-            traceparent=payload.traceparent,
-            started_at=started_at,
-            task_token=task_token,
-            callback_base_url=payload.callback_base_url,
-        )
+        try:
+            self._client.task_started(
+                task_id=payload.callback_task_id,
+                task_key=payload.task_key,
+                attempt=payload.attempt,
+                attempt_id=payload.attempt_id,
+                worker_id=self.worker_id,
+                traceparent=payload.traceparent,
+                started_at=started_at,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
+            )
+        except ApiError as err:
+            if not _is_terminal_attempt_conflict(err):
+                raise
+            # The control plane holds a durable terminal result for this
+            # attempt. This is the only signal that covers the crash window
+            # between an accepted `task_completed` and this process recording
+            # it — a replacement worker has no local memory of the attempt, so
+            # the process-local set below is a fast path, never the guarantee.
+            console.print(
+                f"[blue]i[/blue] Attempt {payload.attempt} of {payload.task_key} is "
+                f"already terminal in the control plane ({err}); skipping execution"
+            )
+            self._record_dispatch_completed(payload.dispatch_id)
+            return DispatchOutcome.ALREADY_TERMINAL
 
         heartbeat = self._start_heartbeat(payload, task_token)
 
@@ -475,6 +601,8 @@ class DispatchWorker:
                 )
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
+
+        return DispatchOutcome.EXECUTED
 
     def _start_heartbeat(
         self,
@@ -632,7 +760,7 @@ class DispatchHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.server.worker.handle_dispatch(dispatch)  # type: ignore[attr-defined]
+            outcome = self.server.worker.handle_dispatch(dispatch)  # type: ignore[attr-defined]
         except ValueError as exc:
             self.send_response(400)
             self.end_headers()
@@ -642,6 +770,18 @@ class DispatchHandler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(str(exc).encode("utf-8"))
+            return
+
+        if outcome is DispatchOutcome.RETRY_LATER:
+            # The owner of this dispatch id is still executing. A 200 here
+            # would tell the queue the work succeeded before anyone knows
+            # whether it did (issue #328); 503 keeps the delivery retryable so
+            # a crashed owner is covered by the queue rather than by the much
+            # slower anti-entropy repair.
+            self.send_response(503)
+            self.send_header("Retry-After", "1")
+            self.end_headers()
+            self.wfile.write(b"dispatch is still executing; retry")
             return
 
         self.send_response(200)

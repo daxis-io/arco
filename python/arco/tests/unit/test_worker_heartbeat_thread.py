@@ -6,12 +6,14 @@ import threading
 import time
 from typing import Any
 
+import pytest
+
 from arco_flow.cli.config import ArcoFlowConfig
 from arco_flow.context import AssetContext
 from arco_flow.types import AssetOut
 from arco_flow.worker.server import (
     HEARTBEAT_MAX_INTERVAL_SECONDS,
-    HEARTBEAT_MIN_INTERVAL_SECONDS,
+    MIN_HEARTBEAT_TIMEOUT_SECONDS,
     DispatchWorker,
     HeartbeatSender,
     WorkerDispatchEnvelope,
@@ -25,10 +27,26 @@ def test_heartbeat_interval_is_well_under_staleness_threshold() -> None:
     assert heartbeat_interval_seconds(300) == 60.0
     # Legacy envelopes without the field assume the planner default.
     assert heartbeat_interval_seconds(None) == 60.0
-    # Short timeouts keep a sane floor.
-    assert heartbeat_interval_seconds(10) == HEARTBEAT_MIN_INTERVAL_SECONDS
+    # The shared floor is honoured exactly.
+    assert heartbeat_interval_seconds(MIN_HEARTBEAT_TIMEOUT_SECONDS) > 0.0
     # Long timeouts stay clamped so failures are still detected promptly.
     assert heartbeat_interval_seconds(3600) == HEARTBEAT_MAX_INTERVAL_SECONDS
+
+
+def test_sub_floor_heartbeat_timeout_is_rejected_rather_than_reinterpreted() -> None:
+    """Zero and other sub-floor timeouts meant two different things.
+
+    The control plane reaps a RUNNING task after
+    `heartbeat_timeout_sec + 30s` of silence, so zero left a 30-second window;
+    this worker read a falsy timeout as "missing" and heartbeated on the
+    300-second default, so the task was reaped about a minute before its first
+    heartbeat. Both sides now share `MIN_HEARTBEAT_TIMEOUT_SECONDS`: the
+    planner never emits a lower value, and an envelope carrying one is
+    malformed here instead of being silently reinterpreted.
+    """
+    for malformed in (0, 1, MIN_HEARTBEAT_TIMEOUT_SECONDS - 1):
+        with pytest.raises(ValueError, match="below the"):
+            heartbeat_interval_seconds(malformed)
 
 
 def test_heartbeat_sender_posts_periodically_until_stopped() -> None:

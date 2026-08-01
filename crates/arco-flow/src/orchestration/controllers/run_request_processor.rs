@@ -16,6 +16,20 @@ use crate::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskDef, TriggerInfo,
 };
 
+/// Smallest heartbeat timeout a planned task may carry.
+///
+/// Zero used to be representable and meant two different things: the
+/// anti-entropy sweeper reads `heartbeat_timeout_sec + RUNNING_TASK_STALENESS_GRACE`,
+/// so zero left a 30-second force-fail window, while the Python reference
+/// worker read a falsy timeout as "missing" and heartbeated on the 300-second
+/// default. A task planned with zero was therefore reaped roughly a minute
+/// before its worker's first heartbeat.
+///
+/// Planned timeouts are clamped to this floor, and the reference worker
+/// rejects an envelope carrying anything lower rather than reinterpreting it,
+/// so the two sides cannot disagree about what the value means.
+pub const MIN_HEARTBEAT_TIMEOUT_SEC: u32 = 30;
+
 /// Runtime processor that materializes durable runs from `RunRequested` state.
 #[derive(Debug, Clone)]
 pub struct RunRequestProcessor {
@@ -135,7 +149,9 @@ impl RunRequestProcessor {
                 asset_key: Some(asset),
                 partition_key: partition_key.clone(),
                 max_attempts: self.default_max_attempts,
-                heartbeat_timeout_sec: self.default_heartbeat_timeout_sec,
+                heartbeat_timeout_sec: self
+                    .default_heartbeat_timeout_sec
+                    .max(MIN_HEARTBEAT_TIMEOUT_SEC),
                 requires_visible_output: true,
             })
             .collect()

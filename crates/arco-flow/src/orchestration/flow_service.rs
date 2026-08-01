@@ -90,7 +90,7 @@ pub async fn append_events_and_compact(
 ///
 /// A watermark more than this many days behind `now` means the workspace has
 /// unprocessed history far beyond normal operation; the check fails safe to
-/// [`LedgerFreshness::Unknown`] instead of listing unbounded prefixes.
+/// [`LedgerFreshness::Stale`] instead of listing unbounded prefixes.
 const LEDGER_FRESHNESS_MAX_DATE_PREFIXES: u64 = 32;
 
 /// Determines whether the orchestration ledger has any event the compactor
@@ -105,39 +105,53 @@ const LEDGER_FRESHNESS_MAX_DATE_PREFIXES: u64 = 32;
 /// event id is at or below the watermark.
 ///
 /// Every failure mode (missing watermark data, list errors, unrecognized
-/// objects, out-of-range dates) degrades to [`LedgerFreshness::Unknown`], so
+/// objects, out-of-range dates) degrades to [`LedgerFreshness::Stale`], so
 /// callers fall back to the wall-clock compaction-lag guard. This is the
 /// proof that lets the anti-entropy zombie reaper run in an idle workspace
 /// (issue #338) without weakening the guard when compaction is genuinely
 /// behind.
 ///
-/// # Soundness assumption
+/// # This is not a contiguous-frontier proof
 ///
-/// This check proves "no unfolded events" only for event ids **above**
-/// `events_processed_through`. It assumes every durable event with an id at
-/// or below that watermark has been folded. A straggler below the watermark
-/// can exist: writer A appends `E1`, writer B appends `E2 > E1` and folds
-/// through `E2`, then A crashes before its fold — `E1` is durable, unfolded,
-/// and invisible here because its id does not exceed the watermark. That
-/// straggler is equally excluded from projection rebuilds (which also replay
-/// only above the watermark), so this function inherits a pre-existing
-/// straggler semantic of the fold pipeline rather than introducing a new
-/// unsoundness; [`LedgerFreshness::Current`] means "as fresh as the fold
-/// watermark semantics can prove", not a from-scratch audit of the ledger.
+/// The check compares ids against `events_processed_through`. It says nothing
+/// about events **at or below** that watermark. A straggler can exist: writer
+/// A appends `E1`, writer B appends `E2 > E1` and folds through `E2`, then A
+/// crashes before its fold — `E1` is durable, unfolded, and invisible here
+/// because its id does not exceed the watermark. If `E1` carries a terminal
+/// completion or a protective heartbeat, the projection is wrong in exactly
+/// the direction that matters.
+///
+/// [`LedgerFreshness::Current`] therefore means "no ledger id exceeds the fold
+/// watermark", not "every durable event is included". Callers must not treat
+/// it as authorisation to destroy evidence; the anti-entropy sweeper accepts
+/// it only for non-destructive repairs and still applies the wall-clock guard
+/// before force-failing a RUNNING task (see
+/// [`crate::orchestration::controllers::AntiEntropySweeper::scan_with_ledger_freshness`]).
+/// Upgrading this to a real proof needs an accepted-event manifest or per-fold
+/// publication witnesses covering the whole replayed prefix, not a maximum-id
+/// comparison.
 ///
 /// # Horizon limitation
 ///
 /// The scan is bounded to [`LEDGER_FRESHNESS_MAX_DATE_PREFIXES`] (32) days of
 /// date prefixes. A watermark older than that horizon yields
-/// [`LedgerFreshness::Unknown`], deliberately restoring the conservative
+/// [`LedgerFreshness::Stale`], deliberately restoring the conservative
 /// wall-clock compaction-lag path instead of listing unbounded prefixes.
+///
+/// Forward, the scan covers one day past `now`. That slack is sufficient
+/// precisely because
+/// [`MAX_EVENT_ID_FUTURE_SKEW`](crate::orchestration::ledger::MAX_EVENT_ID_FUTURE_SKEW)
+/// rejects out-of-policy ids at append: without it an event whose ULID
+/// timestamp is weeks ahead would be durable in a prefix this scan never
+/// lists, and the function would report `Current` while that event sat
+/// unfolded.
 pub async fn orchestration_ledger_freshness(
     storage: &ScopedStorage,
     watermarks: &Watermarks,
     now: DateTime<Utc>,
 ) -> LedgerFreshness {
     if watermarks.last_committed_event_id != watermarks.last_visible_event_id {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     }
 
     let Some(processed_through) = watermarks.events_processed_through.clone() else {
@@ -145,31 +159,31 @@ pub async fn orchestration_ledger_freshness(
         // completely empty.
         return match storage.list(FlowPaths::ORCHESTRATION_LEDGER_PREFIX).await {
             Ok(objects) if objects.is_empty() => LedgerFreshness::Current,
-            _ => LedgerFreshness::Unknown,
+            _ => LedgerFreshness::Stale,
         };
     };
 
     let Ok(watermark_ulid) = Ulid::from_string(&processed_through) else {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     };
     let Ok(watermark_ms) = i64::try_from(watermark_ulid.timestamp_ms()) else {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     };
     let Some(watermark_time) = DateTime::from_timestamp_millis(watermark_ms) else {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     };
 
     let start_date = watermark_time.date_naive();
     // One extra day absorbs forward producer-clock slack around midnight.
     let Some(end_date) = now.date_naive().checked_add_days(Days::new(1)) else {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     };
     if end_date < start_date {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     }
     let span_days = u64::try_from((end_date - start_date).num_days()).unwrap_or(u64::MAX);
     if span_days >= LEDGER_FRESHNESS_MAX_DATE_PREFIXES {
-        return LedgerFreshness::Unknown;
+        return LedgerFreshness::Stale;
     }
 
     let mut date = start_date;
@@ -180,18 +194,18 @@ pub async fn orchestration_ledger_freshness(
             date.format("%Y-%m-%d")
         );
         let Ok(objects) = storage.list(&prefix).await else {
-            return LedgerFreshness::Unknown;
+            return LedgerFreshness::Stale;
         };
         for object in objects {
             let Some(event_id) = event_id_from_ledger_path(object.as_str()) else {
-                return LedgerFreshness::Unknown;
+                return LedgerFreshness::Stale;
             };
             if event_id > processed_through.as_str() {
-                return LedgerFreshness::Unknown;
+                return LedgerFreshness::Stale;
             }
         }
         let Some(next) = date.succ_opt() else {
-            return LedgerFreshness::Unknown;
+            return LedgerFreshness::Stale;
         };
         date = next;
     }
@@ -417,7 +431,7 @@ mod tests {
         let watermarks = watermarks_processed_through(Some(&min_id));
         let freshness = orchestration_ledger_freshness(&storage, &watermarks, Utc::now()).await;
 
-        assert_eq!(freshness, LedgerFreshness::Unknown);
+        assert_eq!(freshness, LedgerFreshness::Stale);
     }
 
     #[tokio::test]
@@ -430,7 +444,7 @@ mod tests {
         let watermarks = watermarks_processed_through(None);
         let freshness = orchestration_ledger_freshness(&storage, &watermarks, Utc::now()).await;
 
-        assert_eq!(freshness, LedgerFreshness::Unknown);
+        assert_eq!(freshness, LedgerFreshness::Stale);
     }
 
     #[tokio::test]
@@ -443,7 +457,7 @@ mod tests {
 
         let freshness = orchestration_ledger_freshness(&storage, &watermarks, Utc::now()).await;
 
-        assert_eq!(freshness, LedgerFreshness::Unknown);
+        assert_eq!(freshness, LedgerFreshness::Stale);
     }
 
     #[tokio::test]
@@ -454,6 +468,72 @@ mod tests {
         let watermarks = watermarks_processed_through(Some("not-a-ulid"));
         let freshness = orchestration_ledger_freshness(&storage, &watermarks, Utc::now()).await;
 
-        assert_eq!(freshness, LedgerFreshness::Unknown);
+        assert_eq!(freshness, LedgerFreshness::Stale);
+    }
+
+    /// H4: this check cannot see a durable event at or below the watermark.
+    ///
+    /// Pinning the limitation in a test keeps [`LedgerFreshness::Current`]
+    /// honest: the previous cases only ever placed pending events *above* the
+    /// watermark, which made the result look like a completeness proof. It is
+    /// not one, which is why the sweeper refuses to force-fail on it.
+    #[tokio::test]
+    async fn ledger_freshness_reports_current_despite_a_pending_event_below_the_watermark() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+        let ledger = LedgerWriter::new(storage.clone());
+
+        // A straggler appended by a writer that crashed before folding it, and
+        // a later event that a second writer appended and folded through.
+        let straggler = sample_event("run_straggler");
+        let folded = sample_event("run_folded");
+        assert!(straggler.event_id < folded.event_id);
+        let watermark = folded.event_id.clone();
+
+        ledger.append(straggler).await.expect("append straggler");
+        ledger.append(folded).await.expect("append folded");
+
+        let watermarks = watermarks_processed_through(Some(&watermark));
+        let freshness = orchestration_ledger_freshness(&storage, &watermarks, Utc::now()).await;
+
+        assert_eq!(
+            freshness,
+            LedgerFreshness::Current,
+            "a maximum-id scan cannot exclude an unfolded event at or below the \
+             watermark; callers must not read Current as a completeness proof"
+        );
+    }
+
+    /// The append horizon is what makes the scan's one-day forward slack
+    /// sufficient: an id further ahead would live in a prefix the scan never
+    /// lists, so it is refused at append instead.
+    #[tokio::test]
+    async fn ledger_append_rejects_event_ids_beyond_the_future_horizon() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+        let ledger = LedgerWriter::new(storage.clone());
+
+        let mut far_future = sample_event("run_future");
+        let future_ms = u64::try_from((Utc::now() + chrono::Duration::days(30)).timestamp_millis())
+            .expect("a future timestamp fits a ULID millisecond");
+        far_future.event_id = Ulid::from_parts(future_ms, 1).to_string();
+
+        let error = ledger
+            .append(far_future)
+            .await
+            .expect_err("an out-of-policy future event id must be rejected at append");
+        assert!(
+            error.to_string().contains("append horizon"),
+            "the failure must name the horizon policy: {error}"
+        );
+
+        let objects = storage
+            .list(FlowPaths::ORCHESTRATION_LEDGER_PREFIX)
+            .await
+            .expect("list ledger");
+        assert!(
+            objects.is_empty(),
+            "a rejected event must not become durable"
+        );
     }
 }

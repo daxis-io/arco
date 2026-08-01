@@ -23,14 +23,23 @@
 //!
 //! The wall-clock watermark (`Watermarks::last_processed_at`) only advances
 //! when a new ledger event is compacted, so an idle-but-healthy workspace
-//! looks identical to a broken compactor. Callers that can prove the ledger
-//! has no unprocessed events (see [`LedgerFreshness::Current`]) bypass the
-//! wall-clock guard: when every appended event is already folded, the Parquet
-//! evidence is exact and every repair decision is safe. Without this bypass
-//! the zombie reaper is unreachable at default settings (issue #338): the
-//! task-staleness threshold (300s heartbeat timeout + 30s grace = 330s) is
-//! larger than the 300s compaction-lag guard, and a dead worker stops the
-//! event flow that would keep the watermark fresh.
+//! looks identical to a broken compactor. Callers that have checked the ledger
+//! for unprocessed events (see [`LedgerFreshness::Current`]) bypass the
+//! wall-clock guard for **non-destructive** repairs, which keeps dispatch
+//! re-drive reachable in an idle workspace (issue #338): the task-staleness
+//! threshold (300s heartbeat timeout + 30s grace = 330s) is larger than the
+//! 300s compaction-lag guard, and a dead worker stops the event flow that
+//! would keep the watermark fresh.
+//!
+//! That check compares event ids against the fold watermark; it cannot prove
+//! the folded prefix is contiguous, so it is not a warrant for destroying
+//! evidence. `FailStaleRunningTask` therefore still requires the wall-clock
+//! guard — see [`AntiEntropySweeper::scan_with_ledger_freshness`]. Making the
+//! zombie reaper reachable in a genuinely idle workspace needs the compactor
+//! to refresh `last_processed_at` on idle ticks so that "idle" stops looking
+//! like "lagging"; until then a stale-watermark workspace reports
+//! [`Repair::SkippedDueToLag`] for its stale RUNNING tasks instead of
+//! force-failing them on unproven evidence.
 
 use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
@@ -93,17 +102,50 @@ pub enum Repair {
     },
 }
 
-/// Whether the orchestration ledger provably has no events the compactor has
-/// not yet folded into the Parquet projections.
+impl Repair {
+    /// Whether executing this repair destroys evidence that cannot be recovered.
+    ///
+    /// [`Repair::FailStaleRunningTask`] writes a terminal failure over an
+    /// attempt that may still be running, or that may already have completed
+    /// durably without the projection showing it. Nothing undoes that.
+    ///
+    /// The dispatch repairs are re-drives: they route work through
+    /// deterministic dispatch ids that the control plane and the worker both
+    /// deduplicate, so a repair issued on incomplete evidence costs at most a
+    /// redundant delivery.
+    #[must_use]
+    pub const fn is_destructive(&self) -> bool {
+        matches!(self, Self::FailStaleRunningTask { .. })
+    }
+}
+
+/// What a caller has established about unfolded orchestration ledger events.
+///
+/// The three states are deliberately distinct: "checked and looks current",
+/// "checked and found behind", and "not checked". Collapsing the last two lets
+/// an unchecked caller inherit the permissions of a checked one, or the
+/// reverse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerFreshness {
-    /// Every appended ledger event is folded into the projections the sweeper
-    /// is reading. Task evidence (heartbeats, states) is exact, so repairs
-    /// are safe regardless of how long the workspace has been idle.
+    /// No ledger event id exceeds the fold watermark, as far as a bounded scan
+    /// of the ledger's date prefixes can tell.
+    ///
+    /// This is a maximum-id comparison, **not** a contiguous-frontier proof: an
+    /// event that is durable but unfolded and whose id sits at or below the
+    /// watermark is invisible to it. Non-destructive repairs may run on this
+    /// evidence; destructive ones may not.
     Current,
-    /// Unprocessed ledger events may exist (or the caller did not check).
-    /// The wall-clock compaction-lag guard applies.
-    Unknown,
+    /// The check ran and did **not** find the ledger current: an appended
+    /// event is missing from the projections, or the scan could not complete.
+    ///
+    /// This is positive evidence that the projection is behind, so it blocks
+    /// destructive repair outright — the stale RUNNING row the sweeper is
+    /// about to overwrite may be contradicted by the very event that has not
+    /// been folded.
+    Stale,
+    /// The caller did not check. Only the wall-clock compaction-lag guard
+    /// applies, which is the behaviour that predates the ledger scan.
+    Unchecked,
 }
 
 /// Anti-entropy sweeper for detecting stuck work.
@@ -134,10 +176,12 @@ const DEFAULT_MAX_COMPACTION_LAG: Duration = Duration::minutes(5);
 ///   `heartbeat_timeout_sec / 5` seconds, clamped to at most 60s
 ///   (`python/arco/src/arco_flow/worker/server.py`), so several consecutive
 ///   heartbeats must be lost before the window can expire.
-/// - `DEFAULT_MAX_COMPACTION_LAG` (300s) is intentionally *smaller* than the
-///   330s force-fail window; the reaper stays reachable because callers pass
-///   [`LedgerFreshness::Current`] when the ledger is proven fully folded,
-///   which bypasses the wall-clock lag guard.
+/// - `DEFAULT_MAX_COMPACTION_LAG` (300s) is *smaller* than the 330s force-fail
+///   window, so a workspace whose watermark has gone stale reports
+///   [`Repair::SkippedDueToLag`] for its stale RUNNING tasks.
+///   [`LedgerFreshness::Current`] does not lift that guard for the force-fail,
+///   because a maximum-id ledger scan cannot exclude a durable-but-unfolded
+///   straggler carrying the task's terminal result.
 pub const RUNNING_TASK_STALENESS_GRACE: Duration = Duration::seconds(30);
 
 impl AntiEntropySweeper {
@@ -173,7 +217,7 @@ impl AntiEntropySweeper {
     /// Scans for stuck work and returns repair actions.
     ///
     /// Equivalent to [`Self::scan_with_ledger_freshness`] with
-    /// [`LedgerFreshness::Unknown`]: the wall-clock compaction-lag guard
+    /// [`LedgerFreshness::Unchecked`]: the wall-clock compaction-lag guard
     /// applies unconditionally.
     ///
     /// # Arguments
@@ -194,17 +238,35 @@ impl AntiEntropySweeper {
         outbox: &[DispatchOutboxRow],
         now: DateTime<Utc>,
     ) -> Vec<Repair> {
-        self.scan_with_ledger_freshness(watermarks, LedgerFreshness::Unknown, tasks, outbox, now)
+        self.scan_with_ledger_freshness(watermarks, LedgerFreshness::Unchecked, tasks, outbox, now)
     }
 
     /// Scans for stuck work with explicit knowledge of ledger freshness.
     ///
     /// When `ledger_freshness` is [`LedgerFreshness::Current`], the caller has
-    /// proven that no appended ledger event is missing from the projections,
-    /// so the wall-clock compaction-lag guard is bypassed. This keeps the
-    /// zombie reaper reachable in an idle workspace whose only worker died
-    /// (issue #338): with no event flow the watermark cannot stay fresh, but
-    /// a fully-folded ledger makes the Parquet evidence exact.
+    /// checked that no ledger event id exceeds the fold watermark, so the
+    /// wall-clock compaction-lag guard is bypassed for **non-destructive**
+    /// repairs. This keeps the dispatch re-drive reachable in an idle
+    /// workspace whose only worker died (issue #338): with no event flow the
+    /// watermark cannot stay fresh, and a redundant re-dispatch is bounded by
+    /// deterministic dispatch ids.
+    ///
+    /// # Why freshness does not authorize destructive repair
+    ///
+    /// [`LedgerFreshness::Current`] is a maximum-id comparison, not a proof
+    /// that the ledger prefix is contiguous. A straggler event `E1` that is
+    /// durable but unfolded, and whose id is at or below the watermark
+    /// (because a concurrent writer appended and folded a higher `E2` first),
+    /// is invisible to that check. If `E1` carries the terminal completion or
+    /// a protective heartbeat for a task the projection still shows as
+    /// RUNNING, force-failing that task overwrites durable evidence with a
+    /// fabricated failure.
+    ///
+    /// A re-dispatch made on the same incomplete evidence is recoverable; a
+    /// force-fail is not. Destructive repairs therefore still require the
+    /// wall-clock guard, and are reported as
+    /// [`Repair::SkippedDueToLag`] when only freshness would have allowed
+    /// them, so the condition is observable rather than silent.
     #[must_use]
     pub fn scan_with_ledger_freshness(
         &self,
@@ -222,11 +284,17 @@ impl AntiEntropySweeper {
             .record(duration.as_secs_f64());
         });
 
-        // Check watermark freshness first. A proven-current ledger makes the
-        // projections exact, so wall-clock staleness is irrelevant.
+        // Check watermark freshness first. A current ledger scan lets
+        // non-destructive repairs proceed despite wall-clock staleness;
+        // destructive ones still need the wall-clock guard, because the scan
+        // cannot prove a lower-id straggler was folded.
         let compaction_lag = now - watermarks.last_processed_at;
-        let skip_for_lag = ledger_freshness == LedgerFreshness::Unknown
-            && compaction_lag > self.max_compaction_lag;
+        let lag_exceeded = compaction_lag > self.max_compaction_lag;
+        let skip_for_lag = ledger_freshness != LedgerFreshness::Current && lag_exceeded;
+        // Destructive repair needs the wall-clock guard *and* the absence of
+        // positive evidence that the ledger is behind. Freshness can only
+        // withhold that permission, never grant it.
+        let block_destructive = lag_exceeded || ledger_freshness == LedgerFreshness::Stale;
         let repairs = if skip_for_lag {
             // Skip all repairs when compaction is lagging
             tasks
@@ -250,6 +318,14 @@ impl AntiEntropySweeper {
 
             for task in tasks {
                 if let Some(repair) = self.check_task(task, &dispatched_tasks, outbox, now) {
+                    if block_destructive && repair.is_destructive() {
+                        repairs.push(Repair::SkippedDueToLag {
+                            run_id: task.run_id.clone(),
+                            task_key: task.task_key.clone(),
+                            compaction_lag_secs: compaction_lag.num_seconds(),
+                        });
+                        continue;
+                    }
                     repairs.push(repair);
                 }
             }
@@ -813,15 +889,32 @@ mod tests {
         task.heartbeat_timeout_sec = 300;
         task.last_heartbeat_at = Some(silence_started);
 
-        // Without proof of ledger freshness the wall-clock guard still wins:
-        // this is the deployed deadlock the fix removes.
+        // Without any freshness signal the wall-clock guard skips.
         let unproven = sweeper.scan(&watermarks, std::slice::from_ref(&task), &[], now);
         assert_eq!(unproven.len(), 1);
         assert!(matches!(unproven[0], Repair::SkippedDueToLag { .. }));
 
-        // With the ledger proven fully folded, the reaper runs.
-        let repairs = sweeper.scan_with_ledger_freshness(
+        // A current ledger scan is a maximum-id comparison, not a proof that
+        // the folded prefix is contiguous, so it must NOT authorise the
+        // destructive reap while the watermark is stale.
+        let with_freshness = sweeper.scan_with_ledger_freshness(
             &watermarks,
+            LedgerFreshness::Current,
+            std::slice::from_ref(&task),
+            &[],
+            now,
+        );
+        assert_eq!(with_freshness.len(), 1);
+        assert!(
+            matches!(with_freshness[0], Repair::SkippedDueToLag { .. }),
+            "ledger freshness must not authorise force-failing a RUNNING task \
+             on evidence that cannot exclude a lower-id straggler: {:?}",
+            with_freshness[0]
+        );
+
+        // Once compaction is demonstrably current by wall clock, the reaper runs.
+        let repairs = sweeper.scan_with_ledger_freshness(
+            &fresh_watermarks(now),
             LedgerFreshness::Current,
             &[task],
             &[],
@@ -838,6 +931,55 @@ mod tests {
             }
             _ => panic!("Expected FailStaleRunningTask repair"),
         }
+    }
+
+    /// H4: a durable-but-unfolded straggler below the watermark makes the
+    /// projection's RUNNING row untrustworthy. Freshness must not turn that
+    /// row into a fabricated terminal failure, while the non-destructive
+    /// dispatch re-drive that issue #338 needs stays reachable.
+    #[test]
+    fn ledger_freshness_bypass_covers_redrive_but_not_force_fail() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+
+        // Compaction looks stale by wall clock (idle workspace).
+        let mut watermarks = fresh_watermarks(now);
+        watermarks.last_processed_at = now - Duration::seconds(3_600);
+
+        let mut running = make_task_row("publish", TaskState::Running, None);
+        running.attempt = 1;
+        running.heartbeat_timeout_sec = 300;
+        running.last_heartbeat_at = Some(now - Duration::seconds(3_600));
+
+        let mut ready = make_task_row("extract", TaskState::Ready, Some(now - Duration::hours(1)));
+        ready.attempt = 0;
+
+        let repairs = sweeper.scan_with_ledger_freshness(
+            &watermarks,
+            LedgerFreshness::Current,
+            &[ready, running],
+            &[],
+            now,
+        );
+
+        assert!(
+            repairs.iter().any(|repair| matches!(
+                repair,
+                Repair::CreateDispatchOutbox { task_key, .. } if task_key == "extract"
+            )),
+            "non-destructive re-drive must still bypass the wall-clock guard: {repairs:?}"
+        );
+        assert!(
+            !repairs.iter().any(Repair::is_destructive),
+            "no destructive repair may be emitted on freshness alone: {repairs:?}"
+        );
+        assert!(
+            repairs.iter().any(|repair| matches!(
+                repair,
+                Repair::SkippedDueToLag { task_key, .. } if task_key == "publish"
+            )),
+            "the suppressed force-fail must be reported, not silently dropped: {repairs:?}"
+        );
     }
 
     /// A RUNNING task inside its staleness window must not be reaped even

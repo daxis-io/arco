@@ -297,7 +297,9 @@ impl From<CatalogError> for ApiError {
                 Self::not_found(format!("{entity} not found: {name}"))
             }
             CatalogError::PreconditionFailed { message } => Self::precondition_failed(message),
-            CatalogError::CasFailed { message } => Self::conflict(message),
+            CatalogError::CasFailed { message } | CatalogError::StaleWriterEpoch { message } => {
+                Self::conflict(message)
+            }
             CatalogError::RequestFailed {
                 http_status,
                 message,

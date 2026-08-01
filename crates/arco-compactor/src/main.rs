@@ -1652,6 +1652,10 @@ fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String>
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "one-shot router construction; owning Option<Arc> keeps the many call sites simple"
+)]
 fn build_router(
     state: Arc<ServiceState>,
     metrics_secret: Option<String>,
@@ -1662,15 +1666,16 @@ fn build_router(
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
+    let internal_route =
+        |method_router: axum::routing::MethodRouter<Arc<ServiceState>>| match internal_auth.clone()
+        {
+            None => method_router,
+            Some(auth) => method_router.route_layer(middleware::from_fn_with_state(
                 auth,
                 internal_auth_middleware,
-            ))
-        },
-    );
+            )),
+        };
+    let reconcile_route = internal_route(post(reconcile_handler));
     let base_router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))

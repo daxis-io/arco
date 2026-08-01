@@ -1,29 +1,52 @@
 //! Phase 4A shadow replay and projection-equivalence scaffolding.
 //!
 //! This module imports the current published catalog snapshot into an isolated
-//! control-MVP scope and compares only the domains Phase 4A can honestly prove.
+//! control-MVP scope and compares the nine roadmap-mandated domains, each to
+//! the extent current repo behavior makes an honest comparison possible.
+//!
+//! The base source/compare pair (`load_current_catalog_shadow_source` /
+//! `compare_catalog_shadow`) stays listing-free and is what the Phase 4B
+//! comparison-read request path uses. The extended pair used by the operator
+//! importer additionally replays the metastore ledger and enumerates
+//! idempotency markers — both `storage.list`-based, which is acceptable only
+//! because shadow import is an operator/repair-lane tool, never a request-time
+//! correctness path.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use arco_core::prelude::LedgerKey;
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 use bytes::Bytes;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::{ArcoStateReader, ArcoStateStore, ControlMvpStateStore, StateScope, TxnOptions};
 use crate::error::{CatalogError, Result};
+use crate::idempotency::CATALOG_IDEMPOTENCY_PREFIX;
 use crate::manifest::{CatalogDomainManifest, DomainManifestPointer, compute_manifest_hash};
+use crate::metastore::ledger::MetastoreLedger;
+use crate::metastore::publish::load_published_storage_governance;
+use crate::metastore::replay::MetastoreState;
+use crate::parquet_util::decode_catalog_commit_event_witnesses;
 use crate::state::CatalogState;
+use crate::storage_governance::StorageGovernanceState;
 use crate::tier1_state;
 
 const SHADOW_DOMAIN: &str = "catalog-shadow";
 const KEY_PREFIX: &str = "shadow/catalog/";
 const OBJECT_PREFIX: &str = "shadow/catalog/object/";
 const INDEX_PREFIX: &str = "shadow/catalog/index/";
+const TABLE_POINTER_PREFIX: &str = "shadow/catalog/pointer/table/";
+const GRANT_PREFIX: &str = "shadow/catalog/grant/";
+const GOVERNANCE_PREFIX: &str = "shadow/catalog/governance/";
+const IDEMPOTENCY_PREFIX: &str = "shadow/catalog/idempotency/";
+const REPLAY_WITNESS_PREFIX: &str = "shadow/catalog/replay-witness/";
 const MANIFEST_WATERMARK_KEY: &str = "shadow/catalog/metadata/source-watermark";
 #[cfg(test)]
 const LEGACY_DEFAULT_CATALOG_PARENT: &str = "__legacy_default_catalog__";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ShadowReplayReport` shadow-comparison type.
 pub struct ShadowReplayReport {
     source: CatalogShadowSourceIdentity,
     included_domains: Vec<ShadowIncludedDomain>,
@@ -33,28 +56,33 @@ pub struct ShadowReplayReport {
 
 impl ShadowReplayReport {
     #[must_use]
+    /// Returns `source` for this shadow-comparison item.
     pub fn source(&self) -> &CatalogShadowSourceIdentity {
         &self.source
     }
 
     #[must_use]
     #[cfg(test)]
+    /// Returns the domains this report compared.
     pub fn included_domains(&self) -> &[ShadowIncludedDomain] {
         &self.included_domains
     }
 
     #[must_use]
+    /// Returns `deferred_domains` for this shadow-comparison item.
     pub fn deferred_domains(&self) -> &[ShadowDeferredEntry] {
         &self.deferred_domains
     }
 
     #[must_use]
+    /// Returns `comparisons` for this shadow-comparison item.
     pub fn comparisons(&self) -> &[ShadowComparison] {
         &self.comparisons
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// `CatalogShadowSourceIdentity` shadow-comparison type.
 pub struct CatalogShadowSourceIdentity {
     pointer_path: String,
     pointer_version: String,
@@ -70,17 +98,20 @@ pub struct CatalogShadowSourceIdentity {
 
 impl CatalogShadowSourceIdentity {
     #[must_use]
+    /// Returns `manifest_id` for this shadow-comparison item.
     pub fn manifest_id(&self) -> &str {
         &self.manifest_id
     }
 
     #[must_use]
+    /// Returns `snapshot_version` for this shadow-comparison item.
     pub const fn snapshot_version(&self) -> u64 {
         self.snapshot_version
     }
 }
 
 #[derive(Debug, Clone)]
+/// `CatalogShadowSource` shadow-comparison type.
 pub struct CatalogShadowSource {
     identity: CatalogShadowSourceIdentity,
     state: CatalogState,
@@ -88,64 +119,104 @@ pub struct CatalogShadowSource {
 
 impl CatalogShadowSource {
     #[must_use]
+    /// Returns `identity` for this shadow-comparison item.
     pub const fn identity(&self) -> &CatalogShadowSourceIdentity {
         &self.identity
     }
 
     #[must_use]
+    /// Returns `state` for this shadow-comparison item.
     pub const fn state(&self) -> &CatalogState {
         &self.state
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `ShadowIncludedDomain` shadow-comparison classification.
 pub enum ShadowIncludedDomain {
+    /// Objects.
     Objects,
+    /// Name indexes.
     NameIndexes,
+    /// Manifest watermark.
     ManifestWatermark,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ShadowDeferredDomain {
+    /// Table current pointers.
     TableCurrentPointers,
+    /// Grants ownership.
     GrantsOwnership,
-    StorageGovernanceEquivalence,
+    /// Storage governance.
+    StorageGovernance,
+    /// Idempotency records.
     IdempotencyRecords,
-    FullProjectionWatermarks,
+    /// Event replay hashes.
     EventReplayHashes,
+    /// Parquet projection equality.
     ParquetProjectionEquality,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ShadowComparisonDomain {
-    Objects,
-    NameIndexes,
-    ManifestWatermark,
+/// `ShadowDeferredDomain` shadow-comparison classification.
+pub enum ShadowDeferredDomain {
+    /// Full projection watermarks.
+    FullProjectionWatermarks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `ShadowComparisonDomain` shadow-comparison classification.
+pub enum ShadowComparisonDomain {
+    /// Objects.
+    Objects,
+    /// Name indexes.
+    NameIndexes,
+    /// Manifest watermark.
+    ManifestWatermark,
+    /// Table current pointers.
+    TableCurrentPointers,
+    /// Grants ownership.
+    GrantsOwnership,
+    /// Storage governance.
+    StorageGovernance,
+    /// Idempotency records.
+    IdempotencyRecords,
+    /// Event replay hashes.
+    EventReplayHashes,
+    /// Parquet projection equality.
+    ParquetProjectionEquality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// `ShadowDifferenceClass` shadow-comparison classification.
 pub enum ShadowDifferenceClass {
+    /// Current state gap.
     CurrentStateGap,
+    /// Unsupported scope.
     UnsupportedScope,
+    /// Stale projection.
     StaleProjection,
+    /// Bug divergent result.
     BugDivergentResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ShadowComparisonStatus` shadow-comparison classification.
 pub enum ShadowComparisonStatus {
+    /// Equivalent.
     Equivalent,
+    /// Difference.
     Difference(ShadowDifferenceClass),
 }
 
 impl ShadowComparisonStatus {
     #[must_use]
     #[cfg(test)]
+    /// Returns whether the status is equivalence.
     pub const fn is_equivalent(self) -> bool {
         matches!(self, Self::Equivalent)
     }
 
     #[must_use]
     #[cfg(test)]
+    /// Returns the difference class when the status is a difference.
     pub const fn difference_class(self) -> Option<ShadowDifferenceClass> {
         match self {
             Self::Equivalent => None,
@@ -155,6 +226,7 @@ impl ShadowComparisonStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ShadowComparison` shadow-comparison type.
 pub struct ShadowComparison {
     domain: ShadowComparisonDomain,
     status: ShadowComparisonStatus,
@@ -163,22 +235,26 @@ pub struct ShadowComparison {
 
 impl ShadowComparison {
     #[must_use]
+    /// Returns `domain` for this shadow-comparison item.
     pub const fn domain(&self) -> ShadowComparisonDomain {
         self.domain
     }
 
     #[must_use]
+    /// Returns `status` for this shadow-comparison item.
     pub const fn status(&self) -> ShadowComparisonStatus {
         self.status
     }
 
     #[must_use]
+    /// Returns `detail` for this shadow-comparison item.
     pub fn detail(&self) -> &str {
         &self.detail
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// `ShadowDeferredEntry` shadow-comparison type.
 pub struct ShadowDeferredEntry {
     domain: ShadowDeferredDomain,
     status: ShadowComparisonStatus,
@@ -187,42 +263,114 @@ pub struct ShadowDeferredEntry {
 
 impl ShadowDeferredEntry {
     #[must_use]
+    /// Returns `domain` for this shadow-comparison item.
     pub const fn domain(&self) -> ShadowDeferredDomain {
         self.domain
     }
 
     #[must_use]
+    /// Returns `status` for this shadow-comparison item.
     pub const fn status(&self) -> ShadowComparisonStatus {
         self.status
     }
 
     #[must_use]
+    /// Returns `reason` for this shadow-comparison item.
     pub fn reason(&self) -> &str {
         &self.reason
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `ShadowObjectKind` shadow-comparison classification.
 pub enum ShadowObjectKind {
+    /// Catalog.
     Catalog,
+    /// Schema.
     Schema,
+    /// Table.
     Table,
+    /// Column.
     Column,
 }
 
-// Phase 4B comparison reads are intentionally no-write, so the Phase 4A shadow
-// importer remains an internal operator hook until a later route or job owns it.
-#[allow(
-    dead_code,
-    reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
-)]
-pub async fn import_current_catalog_shadow(storage: &ScopedStorage) -> Result<ShadowReplayReport> {
-    let source = load_current_catalog_shadow_source(storage).await?;
-    let shadow = open_catalog_shadow_store(storage)?;
-    import_catalog_source_into_shadow(&shadow, &source).await?;
-    compare_catalog_shadow(&shadow, &source).await
+/// Extended shadow source: the published catalog snapshot plus the
+/// governance/idempotency surfaces the roadmap's nine comparison domains need.
+#[derive(Debug, Clone)]
+pub struct CatalogShadowExtendedSource {
+    base: CatalogShadowSource,
+    metastore: Option<MetastoreState>,
+    idempotency: BTreeMap<String, Vec<u8>>,
 }
 
+impl CatalogShadowExtendedSource {
+    /// Returns the base catalog snapshot source.
+    #[must_use]
+    pub const fn base(&self) -> &CatalogShadowSource {
+        &self.base
+    }
+}
+
+/// OPERATOR/REPAIR-LANE ONLY: imports current published state into the
+/// isolated shadow scope and compares all nine roadmap domains.
+///
+/// This path replays the metastore ledger and enumerates idempotency markers
+/// via `storage.list`, which is forbidden on request-time correctness paths —
+/// it may only be invoked from operator surfaces (the compactor's internal
+/// shadow-import endpoint).
+///
+/// # Errors
+///
+/// Returns storage, decode, or serialization errors from any source surface.
+pub async fn import_current_catalog_shadow(storage: &ScopedStorage) -> Result<ShadowReplayReport> {
+    let source = load_extended_catalog_shadow_source(storage).await?;
+    let shadow = open_catalog_shadow_store(storage)?;
+    import_extended_catalog_source_into_shadow(&shadow, &source).await?;
+    compare_extended_catalog_shadow(storage, &shadow, &source).await
+}
+
+/// Loads the extended shadow source (operator/repair lane; lists the metastore
+/// ledger prefix and the idempotency marker prefix).
+///
+/// # Errors
+///
+/// Returns storage or decode errors from any source surface.
+pub async fn load_extended_catalog_shadow_source(
+    storage: &ScopedStorage,
+) -> Result<CatalogShadowExtendedSource> {
+    let base = load_current_catalog_shadow_source(storage).await?;
+
+    let metastore_state = MetastoreLedger::new(storage.clone()).replay().await?;
+    let metastore = if metastore_state.ledger_watermark.is_none() {
+        None
+    } else {
+        Some(metastore_state)
+    };
+
+    let mut idempotency = BTreeMap::new();
+    let marker_prefix = format!("{CATALOG_IDEMPOTENCY_PREFIX}/");
+    for path in storage.list(&marker_prefix).await? {
+        let relative = path.as_str();
+        let Some(suffix) = relative.strip_prefix(&marker_prefix) else {
+            continue;
+        };
+        let bytes = storage.get_raw(relative).await?;
+        idempotency.insert(suffix.to_string(), bytes.to_vec());
+    }
+
+    Ok(CatalogShadowExtendedSource {
+        base,
+        metastore,
+        idempotency,
+    })
+}
+
+/// Loads the published catalog snapshot source (listing-free; safe for the
+/// Phase 4B comparison-read path).
+///
+/// # Errors
+///
+/// Returns storage or decode errors, and fails closed on pointer races.
 pub async fn load_current_catalog_shadow_source(
     storage: &ScopedStorage,
 ) -> Result<CatalogShadowSource> {
@@ -290,6 +438,11 @@ pub async fn load_current_catalog_shadow_source(
     })
 }
 
+/// Opens the isolated `catalog-shadow` control-MVP store.
+///
+/// # Errors
+///
+/// Returns store-construction errors.
 pub fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<ControlMvpStateStore> {
     ControlMvpStateStore::new(
         storage.clone(),
@@ -297,29 +450,50 @@ pub fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<ControlMvpSt
     )
 }
 
-#[allow(
-    dead_code,
-    reason = "Phase 4A shadow import writes only isolated shadow state and is not called by Phase 4B read-only comparison reads"
-)]
+/// Imports the base (Phase 4B-visible) row families into the shadow scope.
+///
+/// # Errors
+///
+/// Returns storage or serialization errors.
 pub async fn import_catalog_source_into_shadow(
     store: &ControlMvpStateStore,
     source: &CatalogShadowSource,
 ) -> Result<()> {
     let expected = build_expected_shadow_rows(source)?;
+    import_rows_into_shadow(store, source.identity().manifest_id(), expected.rows).await
+}
+
+/// Imports all nine domains' row families into the shadow scope.
+///
+/// # Errors
+///
+/// Returns storage or serialization errors.
+pub async fn import_extended_catalog_source_into_shadow(
+    store: &ControlMvpStateStore,
+    source: &CatalogShadowExtendedSource,
+) -> Result<()> {
+    let expected = build_extended_expected_rows(source)?;
+    import_rows_into_shadow(store, source.base.identity().manifest_id(), expected.rows).await
+}
+
+async fn import_rows_into_shadow(
+    store: &ControlMvpStateStore,
+    manifest_id: &str,
+    rows: BTreeMap<Vec<u8>, Bytes>,
+) -> Result<()> {
     let mut txn = store
-        .begin_txn(TxnOptions::default().with_request_id(format!(
-            "phase4a-shadow-import-{}",
-            source.identity().manifest_id()
-        )))
+        .begin_txn(
+            TxnOptions::default().with_request_id(format!("phase4a-shadow-import-{manifest_id}")),
+        )
         .await?;
 
     for existing in txn.scan_prefix(KEY_PREFIX.as_bytes()).await? {
-        if !expected.rows.contains_key(existing.key()) {
+        if !rows.contains_key(existing.key()) {
             txn.delete(existing.key()).await?;
         }
     }
 
-    for (key, value) in expected.rows {
+    for (key, value) in rows {
         txn.put(&key, value).await?;
     }
 
@@ -327,39 +501,18 @@ pub async fn import_catalog_source_into_shadow(
     Ok(())
 }
 
+/// Compares the base three domains (listing-free; used by Phase 4B).
+///
+/// # Errors
+///
+/// Returns storage or serialization errors.
 pub async fn compare_catalog_shadow(
     store: &ControlMvpStateStore,
     source: &CatalogShadowSource,
 ) -> Result<ShadowReplayReport> {
     let expected = build_expected_shadow_rows(source)?;
-    let actual = store
-        .scan_prefix(KEY_PREFIX.as_bytes())
-        .await?
-        .into_iter()
-        .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
-        .collect::<BTreeMap<_, _>>();
-
-    let unknown_keys = unknown_shadow_keys(&actual);
-
-    let object_status = if !unknown_keys.is_empty() {
-        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
-    } else if rows_match_by(&expected.rows, &actual, is_object_key) {
-        ShadowComparisonStatus::Equivalent
-    } else {
-        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
-    };
-    let name_index_status = if !expected.source_gaps.is_empty() {
-        ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap)
-    } else if rows_match_by(&expected.rows, &actual, is_name_index_key) {
-        ShadowComparisonStatus::Equivalent
-    } else {
-        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
-    };
-    let watermark_status = if rows_match_by(&expected.rows, &actual, is_manifest_watermark_key) {
-        ShadowComparisonStatus::Equivalent
-    } else {
-        ShadowComparisonStatus::Difference(ShadowDifferenceClass::StaleProjection)
-    };
+    let actual = scan_shadow_rows(store).await?;
+    let comparisons = base_comparisons(&expected, &actual);
 
     Ok(ShadowReplayReport {
         source: source.identity().clone(),
@@ -369,35 +522,426 @@ pub async fn compare_catalog_shadow(
             ShadowIncludedDomain::ManifestWatermark,
         ],
         deferred_domains: deferred_domains(),
-        comparisons: vec![
-            ShadowComparison {
-                domain: ShadowComparisonDomain::Objects,
-                status: object_status,
-                detail: if unknown_keys.is_empty() {
-                    comparison_detail(object_status, "catalog object records")
-                } else {
-                    format!(
-                        "catalog object records diverged from current published state: unknown shadow row(s): {}",
-                        unknown_keys.join(", ")
-                    )
-                },
-            },
-            ShadowComparison {
-                domain: ShadowComparisonDomain::NameIndexes,
-                status: name_index_status,
-                detail: if expected.source_gaps.is_empty() {
-                    comparison_detail(name_index_status, "catalog normalized name indexes")
-                } else {
-                    expected.source_gaps.join("; ")
-                },
-            },
-            ShadowComparison {
-                domain: ShadowComparisonDomain::ManifestWatermark,
-                status: watermark_status,
-                detail: comparison_detail(watermark_status, "catalog manifest watermark metadata"),
-            },
-        ],
+        comparisons,
     })
+}
+
+/// OPERATOR/REPAIR-LANE ONLY nine-domain comparison.
+///
+/// Consults the metastore ledger, the published storage-governance
+/// projection, the idempotency marker prefix, the event ledger, and a second
+/// independent Parquet snapshot load.
+///
+/// # Errors
+///
+/// Returns storage or serialization errors; classification differences are
+/// reported in the returned comparisons, not as errors.
+pub async fn compare_extended_catalog_shadow(
+    storage: &ScopedStorage,
+    store: &ControlMvpStateStore,
+    source: &CatalogShadowExtendedSource,
+) -> Result<ShadowReplayReport> {
+    let expected = build_extended_expected_rows(source)?;
+    let actual = scan_shadow_rows(store).await?;
+    let mut comparisons = base_comparisons(&expected, &actual);
+
+    comparisons.push(simple_row_comparison(
+        ShadowComparisonDomain::TableCurrentPointers,
+        &expected,
+        &actual,
+        is_table_pointer_key,
+        "table current-pointer records (catalog location/format identity; the current path has no unified pointer object, so coverage is partial by design)",
+    ));
+
+    comparisons.push(if source.metastore.is_none() {
+        ShadowComparison {
+            domain: ShadowComparisonDomain::GrantsOwnership,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap),
+            detail: "no metastore ledger events exist for this workspace; grant/ownership comparison has no authoritative source".to_string(),
+        }
+    } else {
+        simple_row_comparison(
+            ShadowComparisonDomain::GrantsOwnership,
+            &expected,
+            &actual,
+            is_grant_key,
+            "grant and ownership records replayed from the metastore ledger",
+        )
+    });
+
+    comparisons.push(storage_governance_comparison(storage, source, &expected, &actual).await);
+
+    comparisons.push(idempotency_comparison(storage, source, &expected, &actual).await?);
+
+    comparisons.push(event_replay_hash_comparison(storage, source, &expected, &actual).await?);
+
+    comparisons.push(parquet_equality_comparison(storage, source, &actual).await);
+
+    Ok(ShadowReplayReport {
+        source: source.base.identity().clone(),
+        included_domains: vec![
+            ShadowIncludedDomain::Objects,
+            ShadowIncludedDomain::NameIndexes,
+            ShadowIncludedDomain::ManifestWatermark,
+            ShadowIncludedDomain::TableCurrentPointers,
+            ShadowIncludedDomain::GrantsOwnership,
+            ShadowIncludedDomain::StorageGovernance,
+            ShadowIncludedDomain::IdempotencyRecords,
+            ShadowIncludedDomain::EventReplayHashes,
+            ShadowIncludedDomain::ParquetProjectionEquality,
+        ],
+        deferred_domains: deferred_domains(),
+        comparisons,
+    })
+}
+
+async fn scan_shadow_rows(store: &ControlMvpStateStore) -> Result<BTreeMap<Vec<u8>, Bytes>> {
+    Ok(store
+        .scan_prefix(KEY_PREFIX.as_bytes())
+        .await?
+        .into_iter()
+        .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
+        .collect())
+}
+
+fn base_comparisons(
+    expected: &ExpectedShadowRows,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+) -> Vec<ShadowComparison> {
+    let unknown_keys = unknown_shadow_keys(actual);
+
+    let object_status = if !unknown_keys.is_empty() {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
+    } else if rows_match_by(&expected.rows, actual, is_object_key) {
+        ShadowComparisonStatus::Equivalent
+    } else {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
+    };
+    let name_index_status = if !expected.source_gaps.is_empty() {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap)
+    } else if rows_match_by(&expected.rows, actual, is_name_index_key) {
+        ShadowComparisonStatus::Equivalent
+    } else {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
+    };
+    let watermark_status = if rows_match_by(&expected.rows, actual, is_manifest_watermark_key) {
+        ShadowComparisonStatus::Equivalent
+    } else {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::StaleProjection)
+    };
+
+    vec![
+        ShadowComparison {
+            domain: ShadowComparisonDomain::Objects,
+            status: object_status,
+            detail: if unknown_keys.is_empty() {
+                comparison_detail(object_status, "catalog object records")
+            } else {
+                format!(
+                    "catalog object records diverged from current published state: unknown shadow row(s): {}",
+                    unknown_keys.join(", ")
+                )
+            },
+        },
+        ShadowComparison {
+            domain: ShadowComparisonDomain::NameIndexes,
+            status: name_index_status,
+            detail: if expected.source_gaps.is_empty() {
+                comparison_detail(name_index_status, "catalog normalized name indexes")
+            } else {
+                expected.source_gaps.join("; ")
+            },
+        },
+        ShadowComparison {
+            domain: ShadowComparisonDomain::ManifestWatermark,
+            status: watermark_status,
+            detail: comparison_detail(watermark_status, "catalog manifest watermark metadata"),
+        },
+    ]
+}
+
+fn simple_row_comparison(
+    domain: ShadowComparisonDomain,
+    expected: &ExpectedShadowRows,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+    predicate: fn(&[u8]) -> bool,
+    description: &str,
+) -> ShadowComparison {
+    let status = if rows_match_by(&expected.rows, actual, predicate) {
+        ShadowComparisonStatus::Equivalent
+    } else {
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult)
+    };
+    ShadowComparison {
+        domain,
+        status,
+        detail: comparison_detail(status, description),
+    }
+}
+
+async fn storage_governance_comparison(
+    storage: &ScopedStorage,
+    source: &CatalogShadowExtendedSource,
+    expected: &ExpectedShadowRows,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+) -> ShadowComparison {
+    // Import-fidelity failures are bugs regardless of projection status.
+    if !rows_match_by(&expected.rows, actual, is_governance_key) {
+        let status = ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult);
+        return ShadowComparison {
+            domain: ShadowComparisonDomain::StorageGovernance,
+            status,
+            detail: comparison_detail(
+                status,
+                "storage-governance records replayed from the metastore ledger",
+            ),
+        };
+    }
+
+    match load_published_storage_governance(storage).await {
+        Ok(published) => match &source.metastore {
+            Some(metastore) => match StorageGovernanceState::from_metastore_state(metastore) {
+                Ok(replayed) if governance_states_agree(&replayed, &published.state) => {
+                    ShadowComparison {
+                        domain: ShadowComparisonDomain::StorageGovernance,
+                        status: ShadowComparisonStatus::Equivalent,
+                        detail: "storage-governance ledger replay, shadow rows, and the published projection agree".to_string(),
+                    }
+                }
+                Ok(_) => ShadowComparison {
+                    domain: ShadowComparisonDomain::StorageGovernance,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::BugDivergentResult,
+                    ),
+                    detail: "published storage-governance projection diverges from metastore ledger replay".to_string(),
+                },
+                Err(error) => ShadowComparison {
+                    domain: ShadowComparisonDomain::StorageGovernance,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::CurrentStateGap,
+                    ),
+                    detail: format!(
+                        "metastore ledger replay could not build governance state: {error}"
+                    ),
+                },
+            },
+            None => ShadowComparison {
+                domain: ShadowComparisonDomain::StorageGovernance,
+                status: ShadowComparisonStatus::Difference(
+                    ShadowDifferenceClass::BugDivergentResult,
+                ),
+                detail: "a storage-governance projection is published but the metastore ledger has no events".to_string(),
+            },
+        },
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("stale") {
+                ShadowComparison {
+                    domain: ShadowComparisonDomain::StorageGovernance,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::StaleProjection,
+                    ),
+                    detail: format!("published storage-governance projection is stale: {message}"),
+                }
+            } else {
+                ShadowComparison {
+                    domain: ShadowComparisonDomain::StorageGovernance,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::CurrentStateGap,
+                    ),
+                    detail: format!(
+                        "no published storage-governance projection is available (#362: no production component publishes it, so deployed vending is deny-closed): {message}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn governance_states_agree(a: &StorageGovernanceState, b: &StorageGovernanceState) -> bool {
+    a.list_storage_credentials() == b.list_storage_credentials()
+        && a.list_external_locations() == b.list_external_locations()
+        && a.list_managed_roots() == b.list_managed_roots()
+        && a.list_workspace_bindings() == b.list_workspace_bindings()
+}
+
+async fn idempotency_comparison(
+    storage: &ScopedStorage,
+    source: &CatalogShadowExtendedSource,
+    expected: &ExpectedShadowRows,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+) -> Result<ShadowComparison> {
+    if !rows_match_by(&expected.rows, actual, is_idempotency_key) {
+        let status = ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult);
+        return Ok(ShadowComparison {
+            domain: ShadowComparisonDomain::IdempotencyRecords,
+            status,
+            detail: comparison_detail(status, "catalog idempotency markers"),
+        });
+    }
+
+    // Re-enumerate now (operator lane): markers written since import are
+    // shadow staleness, not divergence.
+    let marker_prefix = format!("{CATALOG_IDEMPOTENCY_PREFIX}/");
+    let mut current = BTreeMap::new();
+    for path in storage.list(&marker_prefix).await? {
+        let relative = path.as_str();
+        let Some(suffix) = relative.strip_prefix(&marker_prefix) else {
+            continue;
+        };
+        current.insert(
+            suffix.to_string(),
+            storage.get_raw(relative).await?.to_vec(),
+        );
+    }
+    if current == source.idempotency {
+        Ok(ShadowComparison {
+            domain: ShadowComparisonDomain::IdempotencyRecords,
+            status: ShadowComparisonStatus::Equivalent,
+            detail: format!(
+                "catalog idempotency markers are equivalent ({} marker(s))",
+                current.len()
+            ),
+        })
+    } else {
+        Ok(ShadowComparison {
+            domain: ShadowComparisonDomain::IdempotencyRecords,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::StaleProjection),
+            detail: "idempotency markers changed after the shadow import; re-import to refresh"
+                .to_string(),
+        })
+    }
+}
+
+async fn event_replay_hash_comparison(
+    storage: &ScopedStorage,
+    source: &CatalogShadowExtendedSource,
+    expected: &ExpectedShadowRows,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+) -> Result<ShadowComparison> {
+    if !rows_match_by(&expected.rows, actual, is_replay_witness_key) {
+        let status = ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult);
+        return Ok(ShadowComparison {
+            domain: ShadowComparisonDomain::EventReplayHashes,
+            status,
+            detail: comparison_detail(status, "catalog commit event-witness chains"),
+        });
+    }
+
+    let mut witnessed_commits = 0usize;
+    let mut verified_events = 0usize;
+    let mut missing_events = Vec::new();
+    let mut mismatched_events = Vec::new();
+    for commit in &source.base.state().commits {
+        let Some(witnesses_json) = &commit.event_witnesses_json else {
+            continue;
+        };
+        witnessed_commits += 1;
+        let witnesses = decode_catalog_commit_event_witnesses(witnesses_json)?;
+        for witness in witnesses {
+            let key = LedgerKey::event(CatalogDomain::Catalog, &witness.event_id);
+            match storage.head_raw(key.as_ref()).await? {
+                Some(_) => {
+                    let bytes = storage.get_raw(key.as_ref()).await?;
+                    let mut hasher = Sha256::new();
+                    hasher.update(&bytes);
+                    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+                    if digest == witness.event_sha256 {
+                        verified_events += 1;
+                    } else {
+                        mismatched_events.push(witness.event_id.clone());
+                    }
+                }
+                None => missing_events.push(witness.event_id.clone()),
+            }
+        }
+    }
+
+    Ok(if witnessed_commits == 0 {
+        ShadowComparison {
+            domain: ShadowComparisonDomain::EventReplayHashes,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap),
+            detail: "no witnessed commits exist in the retained snapshot; event replay hashes have no source".to_string(),
+        }
+    } else if !mismatched_events.is_empty() {
+        ShadowComparison {
+            domain: ShadowComparisonDomain::EventReplayHashes,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult),
+            detail: format!(
+                "ledger event bytes do not match their commit witnesses: {}",
+                mismatched_events.join(", ")
+            ),
+        }
+    } else if !missing_events.is_empty() {
+        ShadowComparison {
+            domain: ShadowComparisonDomain::EventReplayHashes,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap),
+            detail: format!(
+                "witnessed ledger events are no longer retained: {}",
+                missing_events.join(", ")
+            ),
+        }
+    } else {
+        ShadowComparison {
+            domain: ShadowComparisonDomain::EventReplayHashes,
+            status: ShadowComparisonStatus::Equivalent,
+            detail: format!(
+                "event replay hashes verified against ledger bytes ({verified_events} event(s) across {witnessed_commits} commit(s))"
+            ),
+        }
+    })
+}
+
+async fn parquet_equality_comparison(
+    storage: &ScopedStorage,
+    source: &CatalogShadowExtendedSource,
+    actual: &BTreeMap<Vec<u8>, Bytes>,
+) -> ShadowComparison {
+    let identity = source.base.identity().clone();
+    match tier1_state::load_catalog_state(storage, &identity.snapshot_path).await {
+        Ok(reloaded) => {
+            let synthetic = CatalogShadowSource {
+                identity,
+                state: reloaded,
+            };
+            match build_expected_shadow_rows(&synthetic) {
+                Ok(reloaded_expected) => {
+                    let matches = rows_match_by(&reloaded_expected.rows, actual, is_object_key)
+                        && rows_match_by(&reloaded_expected.rows, actual, is_name_index_key);
+                    if matches {
+                        ShadowComparison {
+                            domain: ShadowComparisonDomain::ParquetProjectionEquality,
+                            status: ShadowComparisonStatus::Equivalent,
+                            detail: format!(
+                                "an independent Parquet snapshot reload at watermark {} matches the shadow rows",
+                                synthetic.identity.snapshot_version
+                            ),
+                        }
+                    } else {
+                        ShadowComparison {
+                            domain: ShadowComparisonDomain::ParquetProjectionEquality,
+                            status: ShadowComparisonStatus::Difference(
+                                ShadowDifferenceClass::BugDivergentResult,
+                            ),
+                            detail: "independently reloaded Parquet snapshot rows diverge from the shadow rows".to_string(),
+                        }
+                    }
+                }
+                Err(error) => ShadowComparison {
+                    domain: ShadowComparisonDomain::ParquetProjectionEquality,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::CurrentStateGap,
+                    ),
+                    detail: format!("reloaded snapshot rows could not be built: {error}"),
+                },
+            }
+        }
+        Err(error) => ShadowComparison {
+            domain: ShadowComparisonDomain::ParquetProjectionEquality,
+            status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap),
+            detail: format!("the published Parquet snapshot could not be reloaded: {error}"),
+        },
+    }
 }
 
 fn stable_pointer_version(pointer_path: &str, before: &str, after: &str) -> Result<String> {
@@ -481,6 +1025,93 @@ fn build_expected_shadow_rows(source: &CatalogShadowSource) -> Result<ExpectedSh
     );
 
     Ok(ExpectedShadowRows { rows, source_gaps })
+}
+
+#[derive(Debug, Serialize)]
+struct ShadowTablePointerRecord<'a> {
+    table_id: &'a str,
+    location: Option<&'a str>,
+    format: Option<&'a str>,
+    table_type: Option<&'a str>,
+    updated_at: i64,
+    source_manifest_id: &'a str,
+}
+
+fn build_extended_expected_rows(
+    source: &CatalogShadowExtendedSource,
+) -> Result<ExpectedShadowRows> {
+    let mut expected = build_expected_shadow_rows(&source.base)?;
+    let state = source.base.state();
+    let manifest_id = source.base.identity().manifest_id();
+
+    // Table current pointers: the catalog's record of each table's current
+    // data pointer (location/format). The current path has no unified pointer
+    // object, so this is the partial-but-honest coverage the roadmap's slice 3
+    // allows ("only where current repo behavior is implemented or partial").
+    for table in &state.tables {
+        expected.rows.insert(
+            format!("{TABLE_POINTER_PREFIX}{}", table.id).into_bytes(),
+            encode_shadow_record(&ShadowTablePointerRecord {
+                table_id: &table.id,
+                location: table.location.as_deref(),
+                format: table.format.as_deref(),
+                table_type: table.table_type.as_deref(),
+                updated_at: table.updated_at,
+                source_manifest_id: manifest_id,
+            })?,
+        );
+    }
+
+    if let Some(metastore) = &source.metastore {
+        for (grant_id, record) in &metastore.grants {
+            expected.rows.insert(
+                format!("{GRANT_PREFIX}{grant_id}").into_bytes(),
+                encode_shadow_record(record)?,
+            );
+        }
+        for (id, record) in &metastore.storage_credentials {
+            expected.rows.insert(
+                format!("{GOVERNANCE_PREFIX}credential/{id}").into_bytes(),
+                encode_shadow_record(record)?,
+            );
+        }
+        for (id, record) in &metastore.external_locations {
+            expected.rows.insert(
+                format!("{GOVERNANCE_PREFIX}external-location/{id}").into_bytes(),
+                encode_shadow_record(record)?,
+            );
+        }
+        for (id, record) in &metastore.managed_roots {
+            expected.rows.insert(
+                format!("{GOVERNANCE_PREFIX}managed-root/{id}").into_bytes(),
+                encode_shadow_record(record)?,
+            );
+        }
+        for (id, record) in &metastore.workspace_bindings {
+            expected.rows.insert(
+                format!("{GOVERNANCE_PREFIX}workspace-binding/{id}").into_bytes(),
+                encode_shadow_record(record)?,
+            );
+        }
+    }
+
+    for (suffix, bytes) in &source.idempotency {
+        expected.rows.insert(
+            format!("{IDEMPOTENCY_PREFIX}{suffix}").into_bytes(),
+            Bytes::from(bytes.clone()),
+        );
+    }
+
+    for commit in &state.commits {
+        if let Some(witnesses_json) = &commit.event_witnesses_json {
+            expected.rows.insert(
+                format!("{REPLAY_WITNESS_PREFIX}{}", commit.commit_ulid).into_bytes(),
+                Bytes::from(witnesses_json.clone().into_bytes()),
+            );
+        }
+    }
+
+    Ok(expected)
 }
 
 fn insert_catalog_shadow_rows(
@@ -700,6 +1331,26 @@ fn is_manifest_watermark_key(key: &[u8]) -> bool {
     key == MANIFEST_WATERMARK_KEY.as_bytes()
 }
 
+fn is_table_pointer_key(key: &[u8]) -> bool {
+    key.starts_with(TABLE_POINTER_PREFIX.as_bytes())
+}
+
+fn is_grant_key(key: &[u8]) -> bool {
+    key.starts_with(GRANT_PREFIX.as_bytes())
+}
+
+fn is_governance_key(key: &[u8]) -> bool {
+    key.starts_with(GOVERNANCE_PREFIX.as_bytes())
+}
+
+fn is_idempotency_key(key: &[u8]) -> bool {
+    key.starts_with(IDEMPOTENCY_PREFIX.as_bytes())
+}
+
+fn is_replay_witness_key(key: &[u8]) -> bool {
+    key.starts_with(REPLAY_WITNESS_PREFIX.as_bytes())
+}
+
 fn unknown_shadow_keys(actual: &BTreeMap<Vec<u8>, Bytes>) -> Vec<String> {
     actual
         .keys()
@@ -708,6 +1359,11 @@ fn unknown_shadow_keys(actual: &BTreeMap<Vec<u8>, Bytes>) -> Vec<String> {
                 && !is_object_key(key)
                 && !is_name_index_key(key)
                 && !is_manifest_watermark_key(key)
+                && !is_table_pointer_key(key)
+                && !is_grant_key(key)
+                && !is_governance_key(key)
+                && !is_idempotency_key(key)
+                && !is_replay_witness_key(key)
         })
         .map(|key| String::from_utf8_lossy(key).into_owned())
         .collect()
@@ -732,43 +1388,11 @@ fn comparison_detail(status: ShadowComparisonStatus, domain: &str) -> String {
 }
 
 fn deferred_domains() -> Vec<ShadowDeferredEntry> {
-    [
-        (
-            ShadowDeferredDomain::TableCurrentPointers,
-            "table current-pointer equivalence is deferred until table-pointer state is routed into the shadow domain",
-        ),
-        (
-            ShadowDeferredDomain::GrantsOwnership,
-            "grant and ownership equivalence is deferred because current governance state is partial",
-        ),
-        (
-            ShadowDeferredDomain::StorageGovernanceEquivalence,
-            "storage-governance equivalence is deferred until the authoritative storage-governance scope is included",
-        ),
-        (
-            ShadowDeferredDomain::IdempotencyRecords,
-            "idempotency records are deferred until the protected mutation state migrates with the control store",
-        ),
-        (
-            ShadowDeferredDomain::FullProjectionWatermarks,
-            "full projection watermarks are deferred beyond the catalog manifest watermark metadata imported here",
-        ),
-        (
-            ShadowDeferredDomain::EventReplayHashes,
-            "event replay hashes are deferred until an event-archive replay substrate is directly reusable",
-        ),
-        (
-            ShadowDeferredDomain::ParquetProjectionEquality,
-            "Parquet projection equality is deferred until projection routing exposes comparable watermarks",
-        ),
-    ]
-    .into_iter()
-    .map(|(domain, reason)| ShadowDeferredEntry {
-        domain,
+    vec![ShadowDeferredEntry {
+        domain: ShadowDeferredDomain::FullProjectionWatermarks,
         status: ShadowComparisonStatus::Difference(ShadowDifferenceClass::UnsupportedScope),
-        reason: reason.to_string(),
-    })
-    .collect()
+        reason: "full projection watermarks are deferred beyond the catalog manifest watermark metadata imported here".to_string(),
+    }]
 }
 
 #[cfg(test)]
@@ -1025,6 +1649,12 @@ mod tests {
                 ShadowIncludedDomain::Objects,
                 ShadowIncludedDomain::NameIndexes,
                 ShadowIncludedDomain::ManifestWatermark,
+                ShadowIncludedDomain::TableCurrentPointers,
+                ShadowIncludedDomain::GrantsOwnership,
+                ShadowIncludedDomain::StorageGovernance,
+                ShadowIncludedDomain::IdempotencyRecords,
+                ShadowIncludedDomain::EventReplayHashes,
+                ShadowIncludedDomain::ParquetProjectionEquality,
             ],
             report.included_domains()
         );
@@ -1032,6 +1662,40 @@ mod tests {
         assert!(comparison_status(&report, ShadowComparisonDomain::NameIndexes).is_equivalent());
         assert!(
             comparison_status(&report, ShadowComparisonDomain::ManifestWatermark).is_equivalent()
+        );
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::TableCurrentPointers)
+                .is_equivalent()
+        );
+        // The fixture has no metastore ledger, no published governance
+        // projection, and no witnessed commits: those domains classify as
+        // current-state gaps rather than fake equivalence.
+        assert_eq!(
+            Some(ShadowDifferenceClass::CurrentStateGap),
+            comparison_status(&report, ShadowComparisonDomain::GrantsOwnership).difference_class()
+        );
+        assert_eq!(
+            Some(ShadowDifferenceClass::CurrentStateGap),
+            comparison_status(&report, ShadowComparisonDomain::StorageGovernance)
+                .difference_class()
+        );
+        assert!(
+            comparison(&report, ShadowComparisonDomain::StorageGovernance)
+                .detail()
+                .contains("#362"),
+            "storage-governance gap must cite the missing production publisher"
+        );
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::IdempotencyRecords).is_equivalent()
+        );
+        assert_eq!(
+            Some(ShadowDifferenceClass::CurrentStateGap),
+            comparison_status(&report, ShadowComparisonDomain::EventReplayHashes)
+                .difference_class()
+        );
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::ParquetProjectionEquality)
+                .is_equivalent()
         );
 
         let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
@@ -1372,15 +2036,7 @@ mod tests {
             .map(ShadowDeferredEntry::domain)
             .collect::<Vec<_>>();
         assert_eq!(
-            vec![
-                ShadowDeferredDomain::TableCurrentPointers,
-                ShadowDeferredDomain::GrantsOwnership,
-                ShadowDeferredDomain::StorageGovernanceEquivalence,
-                ShadowDeferredDomain::IdempotencyRecords,
-                ShadowDeferredDomain::FullProjectionWatermarks,
-                ShadowDeferredDomain::EventReplayHashes,
-                ShadowDeferredDomain::ParquetProjectionEquality,
-            ],
+            vec![ShadowDeferredDomain::FullProjectionWatermarks],
             domains
         );
         for deferred in report.deferred_domains() {
@@ -1390,5 +2046,328 @@ mod tests {
             );
             assert!(!deferred.reason().is_empty());
         }
+    }
+
+    fn witnessed_event(event_id: &str, payload: &'static [u8]) -> (String, String) {
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        (
+            event_id.to_string(),
+            format!("sha256:{}", hex::encode(hasher.finalize())),
+        )
+    }
+
+    async fn publish_witnessed_fixture(storage: &ScopedStorage) -> (String, &'static [u8]) {
+        let event_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let payload: &'static [u8] = br#"{"event":"create_namespace"}"#;
+        let ledger_key = LedgerKey::event(CatalogDomain::Catalog, event_id);
+        storage
+            .put_raw(
+                ledger_key.as_ref(),
+                Bytes::from_static(payload),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write ledger event");
+
+        let (id, digest) = witnessed_event(event_id, payload);
+        let witnesses_json =
+            serde_json::to_string(&serde_json::json!([{ "eventId": id, "eventSha256": digest }]))
+                .expect("witnesses json");
+        let mut state = fixture_state();
+        state.commits = vec![crate::parquet_util::CatalogCommitRecord {
+            commit_ulid: "01JPHASE4AWITNESS000000001".to_string(),
+            manifest_id: Some("manifest-witness".to_string()),
+            event_witnesses_json: Some(witnesses_json),
+            snapshot_version: 7,
+            published_at: 1_800_000_000_000,
+            fencing_token: 4,
+            watermark_event_id: Some(event_id.to_string()),
+            operation: Some("create_namespace".to_string()),
+            object_type: Some("namespace".to_string()),
+            object_id: Some("schema-1".to_string()),
+            object_name: Some("Sales".to_string()),
+        }];
+        publish_catalog_fixture(&storage, state).await;
+        (event_id.to_string(), payload)
+    }
+
+    #[tokio::test]
+    async fn event_replay_hashes_verify_against_ledger_bytes_and_detect_tamper() {
+        let (_backend, storage) = storage();
+        let (event_id, _payload) = publish_witnessed_fixture(&storage).await;
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import shadow state");
+        let replay = comparison(&report, ShadowComparisonDomain::EventReplayHashes);
+        assert!(
+            replay.status().is_equivalent(),
+            "expected verified witnesses, got: {}",
+            replay.detail()
+        );
+
+        // Tamper the retained ledger event bytes: the witness chain must
+        // classify the divergence as a bug.
+        let ledger_key = LedgerKey::event(CatalogDomain::Catalog, &event_id);
+        storage
+            .put_raw(
+                ledger_key.as_ref(),
+                Bytes::from_static(br#"{"event":"tampered"}"#),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("tamper ledger event");
+        let source = load_extended_catalog_shadow_source(&storage)
+            .await
+            .expect("reload source");
+        let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
+        let report = compare_extended_catalog_shadow(&storage, &shadow, &source)
+            .await
+            .expect("compare tampered ledger");
+        assert_eq!(
+            Some(ShadowDifferenceClass::BugDivergentResult),
+            comparison_status(&report, ShadowComparisonDomain::EventReplayHashes)
+                .difference_class()
+        );
+
+        // A missing (expired) ledger event is an archive gap, not a bug.
+        storage
+            .delete(ledger_key.as_ref())
+            .await
+            .expect("expire ledger event");
+        let report = compare_extended_catalog_shadow(&storage, &shadow, &source)
+            .await
+            .expect("compare missing ledger event");
+        let replay = comparison(&report, ShadowComparisonDomain::EventReplayHashes);
+        assert_eq!(
+            Some(ShadowDifferenceClass::CurrentStateGap),
+            replay.status().difference_class()
+        );
+        assert!(replay.detail().contains("no longer retained"));
+    }
+
+    #[tokio::test]
+    async fn grants_from_metastore_ledger_compare_equivalent_and_tampered_pointer_is_bug() {
+        use crate::metastore::events::{
+            GrantRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
+        };
+        use arco_core::ControlPlaneScope;
+
+        let (_backend, storage) = storage();
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let scope =
+            ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
+        let ledger = MetastoreLedger::new(storage.clone());
+        ledger
+            .append_event(&MetastoreEvent::new_scoped(
+                &scope,
+                "event_001",
+                1,
+                MetastoreMutation::GrantUpserted(GrantRecord {
+                    grant_id: "grant_01".to_string(),
+                    object_id: "table-1".to_string(),
+                    object_type: "TABLE".to_string(),
+                    principal_id: "principal_01".to_string(),
+                    privilege: "SELECT".to_string(),
+                    owner: "metastore-admin".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_001,
+                    properties: BTreeMap::new(),
+                }),
+            ))
+            .await
+            .expect("append grant event");
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import shadow state");
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::GrantsOwnership).is_equivalent(),
+            "expected grant equivalence, got: {}",
+            comparison(&report, ShadowComparisonDomain::GrantsOwnership).detail()
+        );
+
+        // Tamper a shadow table-pointer row: classified as a bug.
+        let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
+        let mut txn = shadow
+            .begin_txn(TxnOptions::default().with_request_id("tamper-pointer"))
+            .await
+            .expect("begin tamper txn");
+        txn.put(
+            format!("{TABLE_POINTER_PREFIX}table-1").as_bytes(),
+            Bytes::from_static(br#"{"tampered":true}"#),
+        )
+        .await
+        .expect("tamper pointer row");
+        txn.commit().await.expect("commit tamper");
+
+        let source = load_extended_catalog_shadow_source(&storage)
+            .await
+            .expect("reload source");
+        let report = compare_extended_catalog_shadow(&storage, &shadow, &source)
+            .await
+            .expect("compare tampered pointer");
+        assert_eq!(
+            Some(ShadowDifferenceClass::BugDivergentResult),
+            comparison_status(&report, ShadowComparisonDomain::TableCurrentPointers)
+                .difference_class()
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_governance_with_published_projection_compares_equivalent() {
+        use crate::metastore::events::{
+            LifecycleState, MetastoreEvent, MetastoreMutation, StorageCredentialRecord,
+        };
+        use crate::metastore::projections::{ProjectionRegistry, build_projection_set};
+        use crate::metastore::publish::publish_metastore_projection_set;
+        use crate::metastore::replay::replay_events;
+        use arco_core::ControlPlaneScope;
+
+        let (_backend, storage) = storage();
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let scope =
+            ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
+        let ledger = MetastoreLedger::new(storage.clone());
+        let event = MetastoreEvent::new_scoped(
+            &scope,
+            "event_001",
+            1,
+            MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
+                credential_id: "cred_01".to_string(),
+                name: "lakehouse-prod".to_string(),
+                cloud: "gcp".to_string(),
+                owner: "group:data-platform".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: 1_800_000_000_002,
+                properties: BTreeMap::new(),
+                secret_material_ref: None,
+                encrypted_payload: None,
+            }),
+        );
+        ledger.append_event(&event).await.expect("append event");
+        let metastore_state = replay_events([event].iter()).expect("replay events");
+        let set = build_projection_set(
+            &metastore_state,
+            &ProjectionRegistry::default(),
+            "event_001",
+        )
+        .expect("projection set");
+        publish_metastore_projection_set(&storage, &set, 1)
+            .await
+            .expect("publish projection");
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import shadow state");
+        let governance = comparison(&report, ShadowComparisonDomain::StorageGovernance);
+        assert!(
+            governance.status().is_equivalent(),
+            "expected governance equivalence, got: {}",
+            governance.detail()
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_markers_written_after_import_are_stale_projection() {
+        let (_backend, storage) = storage();
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let source = load_extended_catalog_shadow_source(&storage)
+            .await
+            .expect("load source");
+        let shadow = open_catalog_shadow_store(&storage).expect("shadow store");
+        import_extended_catalog_source_into_shadow(&shadow, &source)
+            .await
+            .expect("import shadow state");
+
+        storage
+            .put_raw(
+                &format!("{CATALOG_IDEMPOTENCY_PREFIX}/create_namespace/ab/abcd.json"),
+                Bytes::from_static(br#"{"status":"committed"}"#),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write marker after import");
+
+        let report = compare_extended_catalog_shadow(&storage, &shadow, &source)
+            .await
+            .expect("compare after marker write");
+        assert_eq!(
+            Some(ShadowDifferenceClass::StaleProjection),
+            comparison_status(&report, ShadowComparisonDomain::IdempotencyRecords)
+                .difference_class()
+        );
+    }
+
+    /// Larger opt-in fixture (roadmap 4A slice 6). Loudly skipped unless
+    /// `ARCO_TEST_LARGE_SHADOW_FIXTURE=1`.
+    #[tokio::test]
+    async fn opt_in_larger_fixture_runs_all_nine_domains_end_to_end() {
+        if std::env::var("ARCO_TEST_LARGE_SHADOW_FIXTURE").is_err() {
+            eprintln!(
+                "SKIPPED: opt_in_larger_fixture_runs_all_nine_domains_end_to_end — set ARCO_TEST_LARGE_SHADOW_FIXTURE=1 to run the larger Phase 4A fixture"
+            );
+            return;
+        }
+
+        let (_backend, storage) = storage();
+        let mut state = fixture_state();
+        state.namespaces.clear();
+        state.tables.clear();
+        state.columns.clear();
+        for namespace_index in 0..30 {
+            let namespace_id = format!("schema-{namespace_index}");
+            state.namespaces.push(NamespaceRecord {
+                id: namespace_id.clone(),
+                catalog_id: Some("cat-1".to_string()),
+                name: format!("Schema {namespace_index}"),
+                description: None,
+                created_at: 12,
+                updated_at: 13,
+                properties_json: None,
+                storage_root: None,
+            });
+            for table_index in 0..10 {
+                let table_id = format!("table-{namespace_index}-{table_index}");
+                state.tables.push(TableRecord {
+                    id: table_id.clone(),
+                    namespace_id: namespace_id.clone(),
+                    name: format!("Table {table_index}"),
+                    description: None,
+                    location: Some(format!("s3://warehouse/{namespace_id}/{table_id}")),
+                    format: Some("delta".to_string()),
+                    created_at: 14,
+                    updated_at: 15,
+                    table_type: Some("MANAGED".to_string()),
+                    properties_json: None,
+                });
+                state.columns.push(ColumnRecord {
+                    id: format!("column-{namespace_index}-{table_index}"),
+                    table_id,
+                    name: "id".to_string(),
+                    data_type: "string".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                });
+            }
+        }
+        publish_catalog_fixture(&storage, state).await;
+
+        let report = import_current_catalog_shadow(&storage)
+            .await
+            .expect("import larger fixture");
+        assert_eq!(9, report.included_domains().len());
+        assert!(comparison_status(&report, ShadowComparisonDomain::Objects).is_equivalent());
+        assert!(comparison_status(&report, ShadowComparisonDomain::NameIndexes).is_equivalent());
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::TableCurrentPointers)
+                .is_equivalent()
+        );
+        assert!(
+            comparison_status(&report, ShadowComparisonDomain::ParquetProjectionEquality)
+                .is_equivalent()
+        );
     }
 }

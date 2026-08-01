@@ -904,6 +904,17 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
     assert!(checkpoint_paths[0].contains("/control-mvp/catalog/"));
     assert!(checkpoint_paths[1].contains("/control-mvp/search/"));
 
+    // Checkpoint materialization writes exactly one immutable state-snapshot
+    // object per domain (the bounded-replay anchor), and nothing else.
+    let state_paths = put_paths
+        .iter()
+        .copied()
+        .filter(|path| path.contains("/states/"))
+        .collect::<Vec<_>>();
+    assert_eq!(state_paths.len(), 2);
+    assert!(state_paths[0].contains("/control-mvp/catalog/"));
+    assert!(state_paths[1].contains("/control-mvp/search/"));
+
     assert_eq!(
         put_paths
             .iter()
@@ -922,6 +933,7 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
     );
     assert!(put_paths.iter().all(|path| {
         path.contains("/checkpoints/")
+            || path.contains("/states/")
             || path.contains("/retention/")
             || path.ends_with("/locks/workspace-retention-gc.lock.json")
     }));

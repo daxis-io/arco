@@ -21,7 +21,16 @@
 //! epoch recorded in the current pointer. `claim_writer_authority` advances
 //! the epoch through the same pointer CAS, so a writer whose epoch has been
 //! superseded fails closed with [`CatalogError::StaleWriterEpoch`] before any
-//! state becomes visible.
+//! state becomes visible. Store-maintenance writers that must survive epoch
+//! claims (rather than fence competitors) adopt the published epoch via
+//! [`ControlMvpStateStore::at_current_writer_epoch`].
+//!
+//! # Format versioning
+//!
+//! Format version 2 is the only supported on-disk format. There is
+//! deliberately no migration path from format version 1: no production
+//! deployment ever wrote v1 artifacts, so v1 (or any other) `format_version`
+//! values fail closed at artifact validation instead of being migrated.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -105,10 +114,44 @@ impl ControlMvpStateStore {
     }
 
     /// Sets the writer fencing epoch this store publishes with.
+    ///
+    /// The epoch saturates one below [`u64::MAX`] so that a published pointer
+    /// can always be superseded by a later [`Self::claim_writer_authority`]
+    /// call: publishing `u64::MAX` directly would make the next claim's
+    /// increment overflow and wedge the domain permanently.
     #[must_use]
     pub const fn with_writer_epoch(mut self, writer_epoch: u64) -> Self {
-        self.writer_epoch = writer_epoch;
+        self.writer_epoch = if writer_epoch == u64::MAX {
+            u64::MAX - 1
+        } else {
+            writer_epoch
+        };
         self
+    }
+
+    /// Returns this store bound to the writer epoch currently recorded in the
+    /// published pointer (cooperative fencing), or unchanged when the domain
+    /// has no published state yet.
+    ///
+    /// Store-maintenance writers (for example the projection outbox worker)
+    /// use this to keep functioning after another writer advanced the epoch
+    /// through [`Self::claim_writer_authority`]: they adopt the published
+    /// epoch instead of failing [`CatalogError::StaleWriterEpoch`] forever.
+    /// The adopted epoch equals the published one, so cooperative writers can
+    /// never regress fencing nor fence other writers out.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or corrupt-pointer errors other than a missing pointer.
+    pub async fn at_current_writer_epoch(mut self) -> Result<Self> {
+        match self.load_pointer().await {
+            Ok(pointer) => {
+                self.writer_epoch = pointer.writer_epoch;
+                Ok(self)
+            }
+            Err(CatalogError::NotFound { .. }) => Ok(self),
+            Err(error) => Err(error),
+        }
     }
 
     /// Returns the writer fencing epoch this store publishes with.
@@ -451,6 +494,64 @@ impl ControlMvpStateStore {
         CheckpointToken {
             scope: self.scope.clone(),
             checkpoint_id,
+        }
+    }
+
+    /// Determines whether a planned restore transaction is part of the
+    /// visible lineage, independent of how many replay anchors have been
+    /// committed since the restore.
+    ///
+    /// The bounded transaction suffix resets at every anchor, so a suffix-only
+    /// scan would misreport an applied restore as absent (and therefore
+    /// Superseded) once `checkpoint_interval` commits pass. This walk starts
+    /// at the current suffix and follows the anchor chain backwards — each
+    /// anchor's `base_state` names the snapshot written by exactly one
+    /// producing manifest, whose own `anchor_state` must byte-match the
+    /// followed reference (binding the snapshot's raw checksum) — until the
+    /// planned sequence is covered or genesis is reached. Every hop loads an
+    /// envelope-checksummed manifest and the anchor sequence strictly
+    /// decreases, so the walk is deterministic, fail-closed, and bounded by
+    /// the number of anchors, not by history length.
+    async fn restore_tx_in_lineage(
+        &self,
+        parent: &ControlMvpBase,
+        planned: &ControlMvpTxRef,
+    ) -> Result<bool> {
+        if planned.sequence > parent.state.logical_sequence {
+            return Ok(false);
+        }
+        let mut tx_refs = parent.tx_refs.clone();
+        let mut base_state = parent.base_state.clone();
+        loop {
+            if let Some(found) = tx_refs
+                .iter()
+                .find(|reference| reference.sequence == planned.sequence)
+            {
+                return Ok(found == planned);
+            }
+            let Some(anchor) = base_state else {
+                // Genesis reached without covering the planned sequence.
+                return Ok(false);
+            };
+            if planned.sequence > anchor.logical_sequence {
+                // The suffix covered the planned sequence's range but a
+                // different, contiguous set of transactions occupies it.
+                return Ok(false);
+            }
+            let producing_manifest_id =
+                manifest_id_for_anchor_state(&anchor.state_id).ok_or_else(|| {
+                    invariant_violation(
+                        "control MVP anchor snapshot id does not name a producing manifest",
+                    )
+                })?;
+            let manifest = self.load_manifest(&producing_manifest_id).await?;
+            if manifest.anchor_state.as_ref() != Some(&anchor) {
+                return Err(invariant_violation(
+                    "control MVP anchor chain producing manifest does not carry the referenced anchor snapshot",
+                ));
+            }
+            tx_refs = manifest.tx_refs;
+            base_state = manifest.base_state;
         }
     }
 
@@ -835,10 +936,22 @@ fn state_id_for_manifest(manifest_id: &str) -> String {
     )
 }
 
+/// Returns the manifest id that produced a deterministic anchor snapshot.
+///
+/// Inverse of [`state_id_for_manifest`] for anchor snapshots, which are only
+/// ever written under the producing manifest's identity.
+fn manifest_id_for_anchor_state(state_id: &str) -> Option<String> {
+    state_id
+        .strip_prefix("state-")
+        .map(|suffix| format!("manifest-{suffix}"))
+}
+
 fn stale_writer_epoch(held: u64, current: u64) -> CatalogError {
     CatalogError::StaleWriterEpoch {
         message: format!(
-            "control MVP writer epoch {held} is superseded by published epoch {current}"
+            "control MVP writer epoch {held} is superseded by published epoch {current}; \
+             retry with an explicit epoch of {current} or newer, or resolve the published \
+             epoch cooperatively before writing"
         ),
     }
 }
@@ -1269,8 +1382,43 @@ impl ControlMvpTxn {
     }
 
     /// Stages a projection outbox record in this MVP transaction.
-    pub fn stage_projection_outbox(&mut self, record: ControlMvpProjectionOutboxRecord) {
+    ///
+    /// Record ids are unique across the retained outbox: staging an id that
+    /// is currently retained, staged for trimming, or already staged in this
+    /// transaction fails with a typed duplicate-id error, so a duplicate can
+    /// never wedge acknowledgement or trimming of the original record. Ack
+    /// retirement is ordered before source trims (see the projection outbox
+    /// worker), so an id absent from the retained outbox has no live
+    /// acknowledgement bound to it and re-staging it produces a fresh record.
+    /// Concurrent staging of the same id is resolved by the single-writer
+    /// pointer CAS: the losing commit fails and any retry begins from the
+    /// winning state, where this validation rejects the duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::AlreadyExists`] when the record id is already
+    /// retained in the transaction's base outbox or staged in this
+    /// transaction.
+    pub fn stage_projection_outbox(
+        &mut self,
+        record: ControlMvpProjectionOutboxRecord,
+    ) -> Result<()> {
+        let duplicate = self
+            .base
+            .state
+            .outbox
+            .iter()
+            .map(|existing| existing.record_id.as_str())
+            .chain(self.outbox.iter().map(|staged| staged.record_id.as_str()))
+            .any(|existing| existing == record.record_id);
+        if duplicate {
+            return Err(CatalogError::AlreadyExists {
+                entity: "projection outbox record".to_string(),
+                name: record.record_id,
+            });
+        }
         self.outbox.push(record);
+        Ok(())
     }
 
     /// Stages removal of already-consumed projection outbox records.
@@ -1874,11 +2022,15 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             .transaction_sha256
             .strip_prefix("sha256:")
             .ok_or_else(|| validation_failed("restore transaction digest is malformed"))?;
-        let in_lineage = stable.candidate_parent.tx_refs.iter().any(|reference| {
-            reference.tx_id == plan.transaction_id
-                && reference.sequence == plan.result_logical_sequence
-                && reference.checksum_sha256 == planned_checksum
-        });
+        let planned_tx_ref = ControlMvpTxRef {
+            tx_id: plan.transaction_id.clone(),
+            sequence: plan.result_logical_sequence,
+            checksum_sha256: planned_checksum.to_string(),
+        };
+        let in_lineage = self
+            .store
+            .restore_tx_in_lineage(&stable.candidate_parent, &planned_tx_ref)
+            .await?;
         if in_lineage {
             return self.inspect_visible_restore(plan, planned_checksum).await;
         }
@@ -2193,11 +2345,22 @@ impl ReplayState {
                 )));
             }
         }
-        self.outbox.extend(
-            tx.outbox
+        for entry in &tx.outbox {
+            // Mirror of the stage-time uniqueness validation: honestly
+            // produced histories can never contain a duplicate id, so a
+            // duplicate observed at replay is a corrupt or forged artifact.
+            if self
+                .outbox
                 .iter()
-                .map(|entry| entry.to_record_with_sequence(tx.sequence)),
-        );
+                .any(|record| record.record_id == entry.record_id)
+            {
+                return Err(invariant_violation(format!(
+                    "control MVP outbox stages record {} that is already present in replayed state",
+                    entry.record_id
+                )));
+            }
+            self.outbox.push(entry.to_record_with_sequence(tx.sequence));
+        }
         self.logical_sequence = tx.sequence;
         Ok(())
     }

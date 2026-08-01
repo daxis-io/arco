@@ -11,6 +11,20 @@
 //! idempotency markers — both `storage.list`-based, which is acceptable only
 //! because shadow import is an operator/repair-lane tool, never a request-time
 //! correctness path.
+//!
+//! # What the row-level comparisons prove
+//!
+//! The `TableCurrentPointers`, `GrantsOwnership`, and the row-level
+//! `StorageGovernance`/`IdempotencyRecords` checks compare shadow rows
+//! against expected rows derived by the *same* projection functions from the
+//! *same* in-memory source. They therefore verify control-store round-trip
+//! fidelity (import, replay, and read-back preserve the rows), NOT an
+//! independent derivation of the domain. Likewise `ParquetProjectionEquality`
+//! performs a second load of the published snapshot through the same loader,
+//! verifying load determinism plus round-trip fidelity, not an independent
+//! implementation. Independent evidence exists only where a second authority
+//! is consulted: the published storage-governance projection versus ledger
+//! replay, and ledger event bytes versus commit witnesses.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -530,7 +544,9 @@ pub async fn compare_catalog_shadow(
 ///
 /// Consults the metastore ledger, the published storage-governance
 /// projection, the idempotency marker prefix, the event ledger, and a second
-/// independent Parquet snapshot load.
+/// Parquet snapshot load through the same loader. See the module docs for
+/// which comparisons prove control-store round-trip fidelity versus
+/// independent evidence.
 ///
 /// # Errors
 ///
@@ -550,7 +566,7 @@ pub async fn compare_extended_catalog_shadow(
         &expected,
         &actual,
         is_table_pointer_key,
-        "table current-pointer records (catalog location/format identity; the current path has no unified pointer object, so coverage is partial by design)",
+        "table current-pointer records round-tripped through the control store (both sides derive from the same projection over the same imported snapshot: this verifies store round-trip fidelity, not an independent derivation; the current path has no unified pointer object, so coverage is partial by design)",
     ));
 
     comparisons.push(if source.metastore.is_none() {
@@ -565,7 +581,7 @@ pub async fn compare_extended_catalog_shadow(
             &expected,
             &actual,
             is_grant_key,
-            "grant and ownership records replayed from the metastore ledger",
+            "grant and ownership records round-tripped through the control store (both sides derive from the same metastore-ledger replay: store round-trip fidelity, not an independent derivation)",
         )
     });
 
@@ -685,7 +701,10 @@ async fn storage_governance_comparison(
     expected: &ExpectedShadowRows,
     actual: &BTreeMap<Vec<u8>, Bytes>,
 ) -> ShadowComparison {
-    // Import-fidelity failures are bugs regardless of projection status.
+    // Import-fidelity failures are bugs regardless of projection status. This
+    // row-level check compares rows derived by the same ledger replay on both
+    // sides: it proves control-store round-trip fidelity only; the published
+    // projection below is the independent evidence.
     if !rows_match_by(&expected.rows, actual, is_governance_key) {
         let status = ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult);
         return ShadowComparison {
@@ -693,7 +712,7 @@ async fn storage_governance_comparison(
             status,
             detail: comparison_detail(
                 status,
-                "storage-governance records replayed from the metastore ledger",
+                "storage-governance records round-tripped through the control store (same ledger replay derives both sides: store round-trip fidelity, not an independent derivation)",
             ),
         };
     }
@@ -771,12 +790,18 @@ async fn idempotency_comparison(
     expected: &ExpectedShadowRows,
     actual: &BTreeMap<Vec<u8>, Bytes>,
 ) -> Result<ShadowComparison> {
+    // Row-level check: both sides carry the same imported marker bytes, so a
+    // mismatch is a control-store round-trip fidelity bug, not an independent
+    // re-derivation of the markers.
     if !rows_match_by(&expected.rows, actual, is_idempotency_key) {
         let status = ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult);
         return Ok(ShadowComparison {
             domain: ShadowComparisonDomain::IdempotencyRecords,
             status,
-            detail: comparison_detail(status, "catalog idempotency markers"),
+            detail: comparison_detail(
+                status,
+                "catalog idempotency markers round-tripped through the control store (store round-trip fidelity, not an independent derivation)",
+            ),
         });
     }
 
@@ -913,7 +938,7 @@ async fn parquet_equality_comparison(
                             domain: ShadowComparisonDomain::ParquetProjectionEquality,
                             status: ShadowComparisonStatus::Equivalent,
                             detail: format!(
-                                "an independent Parquet snapshot reload at watermark {} matches the shadow rows",
+                                "a second Parquet snapshot load through the same loader at watermark {} matches the shadow rows (load determinism and store round-trip fidelity, not an independent implementation)",
                                 synthetic.identity.snapshot_version
                             ),
                         }
@@ -923,7 +948,7 @@ async fn parquet_equality_comparison(
                             status: ShadowComparisonStatus::Difference(
                                 ShadowDifferenceClass::BugDivergentResult,
                             ),
-                            detail: "independently reloaded Parquet snapshot rows diverge from the shadow rows".to_string(),
+                            detail: "a second Parquet snapshot load through the same loader diverges from the shadow rows".to_string(),
                         }
                     }
                 }

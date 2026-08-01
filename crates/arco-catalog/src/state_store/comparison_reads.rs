@@ -1,4 +1,10 @@
 //! Phase 4B internal read-only comparison reads.
+//!
+//! Diagnostics surfaced here re-expose the shadow-replay comparisons; the
+//! row-level domain checks verify control-store round-trip fidelity (both
+//! sides derive from the same functions over the same in-memory source), not
+//! independent derivations — see `shadow_replay` module docs for the honest
+//! scope of each comparison.
 
 use std::future::Future;
 

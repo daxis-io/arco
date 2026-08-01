@@ -195,10 +195,25 @@ async fn governed_scope_stale_projection_denies_closed() {
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_string(response).await;
+    // The public body carries only a stable reason code: the underlying
+    // CatalogError names internal projection state (ledger event IDs,
+    // manifest object paths and versions) and must not reach the client.
     assert!(
-        body.contains("Storage governance state unavailable"),
+        body.contains("storage_governance_state_unavailable"),
         "expected deny-closed stale projection error, got: {body}"
     );
+    for internal in [
+        "event_stale_004",
+        "manifests/",
+        "snapshots/metastore",
+        "tenant=",
+        "storage_governance_projection_stale",
+    ] {
+        assert!(
+            !body.contains(internal),
+            "public 503 body leaked internal detail {internal:?}: {body}"
+        );
+    }
 }
 
 /// F3: a location-bearing table property is a client-controlled location
@@ -304,6 +319,36 @@ async fn governed_scope_register_table_rejects_ungoverned_metadata_location() {
     assert!(
         body.contains("not governed"),
         "expected governed-path denial for metadata-file location, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn governed_scope_register_table_rejects_foreign_write_data_path_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    put_registerable_metadata_with_properties(
+        &backend,
+        "gs://bucket/warehouse/orders/registered",
+        serde_json::json!({
+            "write.data.path": "gs://attacker-bucket/exfil/data"
+        }),
+    )
+    .await;
+    let app = iceberg_router(crud_state(Arc::clone(&backend)));
+
+    let response = app
+        .oneshot(register_table_request(
+            "registered",
+            "warehouse/staged/metadata/v1.metadata.json",
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("write.data.path") && body.contains("not governed"),
+        "expected governed-path denial naming the metadata property, got: {body}"
     );
 }
 
@@ -433,6 +478,14 @@ async fn append_governance_event(
 }
 
 async fn put_registerable_metadata(backend: &Arc<dyn StorageBackend>, location: &str) {
+    put_registerable_metadata_with_properties(backend, location, serde_json::json!({})).await;
+}
+
+async fn put_registerable_metadata_with_properties(
+    backend: &Arc<dyn StorageBackend>,
+    location: &str,
+    properties: serde_json::Value,
+) {
     let metadata = serde_json::json!({
         "format-version": 2,
         "table-uuid": "550e8400-e29b-41d4-a716-446655440000",
@@ -450,7 +503,7 @@ async fn put_registerable_metadata(backend: &Arc<dyn StorageBackend>, location: 
         "snapshots": [],
         "snapshot-log": [],
         "metadata-log": [],
-        "properties": {},
+        "properties": properties,
         "default-spec-id": 0,
         "partition-specs": [{"spec-id": 0, "fields": []}],
         "last-partition-id": 0,
@@ -519,4 +572,404 @@ async fn body_string(response: axum::response::Response) -> String {
         .await
         .expect("body bytes");
     String::from_utf8_lossy(&body).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// #358 commit-machinery closure
+//
+// The route-level create/register checks are not sufficient: the commit
+// machinery is reachable from three routes, and `set-properties` was accepted
+// there because the guardrails only reject `set-location` and the reserved
+// `arco.` namespace. These tests drive every one of those paths.
+// ---------------------------------------------------------------------------
+
+/// Post-creation `set-properties` on the single-table commit path cannot
+/// redirect data writes to a foreign bucket, and the rejected commit mutates
+/// no metadata, pointer, or catalog state.
+#[tokio::test]
+async fn governed_scope_commit_rejects_foreign_write_data_path_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    let table_uuid = create_governed_table(&app, "events").await;
+
+    let before = storage_snapshot(&backend).await;
+    let response = app
+        .clone()
+        .oneshot(commit_request(
+            "events",
+            serde_json::json!({"write.data.path": "gs://attacker-bucket/exfil/data"}),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("write.data.path") && body.contains("not governed"),
+        "expected governed-path denial naming the offending property, got: {body}"
+    );
+    assert_no_table_state_mutation(&backend, &before, &table_uuid).await;
+}
+
+/// The same bypass through the single-table `transactions/commit` route.
+#[tokio::test]
+async fn governed_scope_one_table_transaction_rejects_foreign_write_data_path_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    let table_uuid = create_governed_table(&app, "events").await;
+
+    let before = storage_snapshot(&backend).await;
+    let response = app
+        .clone()
+        .oneshot(transaction_commit_request(vec![table_change(
+            "events",
+            serde_json::json!({"write.metadata.path": "gs://attacker-bucket/exfil/metadata"}),
+        )]))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("write.metadata.path") && body.contains("not governed"),
+        "expected governed-path denial naming the offending property, got: {body}"
+    );
+    assert_no_table_state_mutation(&backend, &before, &table_uuid).await;
+}
+
+/// The same bypass through the multi-table coordinator prepare phase.
+#[tokio::test]
+async fn governed_scope_multi_table_transaction_rejects_foreign_object_storage_path_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    let first_uuid = create_governed_table(&app, "events").await;
+    let second_uuid = create_governed_table(&app, "clicks").await;
+
+    let before = storage_snapshot(&backend).await;
+    let response = app
+        .clone()
+        .oneshot(transaction_commit_request(vec![
+            table_change("events", serde_json::json!({})),
+            table_change(
+                "clicks",
+                serde_json::json!({
+                    "write.object-storage.path": "gs://attacker-bucket/exfil/objects"
+                }),
+            ),
+        ]))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("write.object-storage.path") && body.contains("not governed"),
+        "expected governed-path denial naming the offending property, got: {body}"
+    );
+    assert_no_table_state_mutation(&backend, &before, &first_uuid).await;
+    assert_no_table_state_mutation(&backend, &before, &second_uuid).await;
+}
+
+/// Governed-value positive case: a location-bearing property inside the bound
+/// authority commits normally through the commit machinery.
+#[tokio::test]
+async fn governed_scope_commit_accepts_governed_location_bearing_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    create_governed_table(&app, "events").await;
+
+    let response = app
+        .clone()
+        .oneshot(commit_request(
+            "events",
+            serde_json::json!({"write.data.path": "gs://bucket/warehouse/orders/events/data"}),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a governed property location must commit: {}",
+        body_string(response).await
+    );
+}
+
+/// A `remove-properties` update that clears a governed property is evaluated
+/// on the *effective* map, so it is not rejected for a value it removes.
+#[tokio::test]
+async fn governed_scope_commit_accepts_removal_of_location_bearing_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    create_governed_table_with_properties(
+        &app,
+        "events",
+        serde_json::json!({"write.data.path": "gs://bucket/warehouse/orders/events/data"}),
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/v1/arco/namespaces/sales/tables/events",
+            &serde_json::json!({
+                "requirements": [],
+                "updates": [{
+                    "action": "remove-properties",
+                    "removals": ["write.data.path"]
+                }]
+            }),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "removing a location-bearing property must be allowed: {}",
+        body_string(response).await
+    );
+}
+
+/// A stale projection denies the commit path closed, exactly like the
+/// creation paths.
+#[tokio::test]
+async fn governed_scope_commit_stale_projection_denies_closed() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(commit_state(Arc::clone(&backend)));
+    let table_uuid = create_governed_table(&app, "events").await;
+
+    append_governance_event(
+        &backend,
+        MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
+            credential_id: "cred_02".to_string(),
+            name: "lakehouse-standby".to_string(),
+            cloud: "gcs".to_string(),
+            owner: "owner".to_string(),
+            lifecycle_state: LifecycleState::Active,
+            updated_at_ms: 1_800_000_000_005,
+            properties: BTreeMap::new(),
+            secret_material_ref: None,
+            encrypted_payload: None,
+        }),
+        "event_stale_commit_004",
+        4,
+    )
+    .await;
+
+    let before = storage_snapshot(&backend).await;
+    let response = app
+        .clone()
+        .oneshot(commit_request(
+            "events",
+            serde_json::json!({"write.data.path": "gs://bucket/warehouse/orders/events/data"}),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("storage_governance_state_unavailable"),
+        "expected deny-closed stale projection error, got: {body}"
+    );
+    assert!(
+        !body.contains("event_stale_commit_004"),
+        "public 503 body leaked the internal ledger event ID: {body}"
+    );
+    assert_no_table_state_mutation(&backend, &before, &table_uuid).await;
+}
+
+/// #362/S2: a duplicate-slash spelling of a governed prefix is not the
+/// governed prefix. It is rejected at the table routes rather than aliased
+/// onto the declaring authority.
+#[tokio::test]
+async fn governed_scope_rejects_duplicate_slash_location_aliases() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(crud_state(Arc::clone(&backend)));
+
+    for (index, alias) in [
+        "gs://bucket/warehouse//orders/events",
+        "gs://bucket//warehouse/orders/events",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = app
+            .clone()
+            .oneshot(create_table_request(&format!("alias{index}"), Some(alias)))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "duplicate-slash alias {alias} must not resolve to the governed authority"
+        );
+    }
+
+    for (index, alias) in [
+        "gs://bucket/warehouse//orders/events/data",
+        "gs://bucket//warehouse/orders/events/data",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = app
+            .clone()
+            .oneshot(create_table_request_with_properties(
+                &format!("propalias{index}"),
+                Some("gs://bucket/warehouse/orders/events"),
+                serde_json::json!({ "write.data.path": alias }),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "duplicate-slash property alias {alias} must not resolve to the governed authority"
+        );
+    }
+}
+
+fn commit_state(backend: Arc<dyn StorageBackend>) -> IcebergState {
+    let config = IcebergConfig {
+        allow_write: true,
+        allow_table_crud: true,
+        allow_multi_table_transactions: true,
+        ..Default::default()
+    };
+    IcebergState::with_config(backend, config)
+        .with_compactor_factory(Arc::new(Tier1CompactorFactory))
+}
+
+async fn create_governed_table(app: &axum::Router, name: &str) -> String {
+    create_governed_table_with_properties(app, name, serde_json::json!({})).await
+}
+
+async fn create_governed_table_with_properties(
+    app: &axum::Router,
+    name: &str,
+    properties: serde_json::Value,
+) -> String {
+    let response = app
+        .clone()
+        .oneshot(create_table_request_with_properties(
+            name,
+            Some(&format!("gs://bucket/warehouse/orders/{name}")),
+            properties,
+        ))
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "governed table creation must succeed"
+    );
+    let body = body_string(response).await;
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("create response json");
+    payload["metadata"]["table-uuid"]
+        .as_str()
+        .expect("table uuid")
+        .to_string()
+}
+
+fn commit_request(table: &str, property_updates: serde_json::Value) -> Request<Body> {
+    json_request(
+        "POST",
+        &format!("/v1/arco/namespaces/sales/tables/{table}"),
+        &serde_json::json!({
+            "requirements": [],
+            "updates": [{
+                "action": "set-properties",
+                "updates": property_updates
+            }]
+        }),
+    )
+}
+
+fn table_change(table: &str, property_updates: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "identifier": {"namespace": ["sales"], "name": table},
+        "requirements": [],
+        "updates": [{
+            "action": "set-properties",
+            "updates": property_updates
+        }]
+    })
+}
+
+fn transaction_commit_request(changes: Vec<serde_json::Value>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/arco/transactions/commit")
+        .header("content-type", "application/json")
+        .header("X-Tenant-Id", TENANT)
+        .header("X-Workspace-Id", WORKSPACE)
+        .header("Idempotency-Key", uuid::Uuid::now_v7().to_string())
+        .body(Body::from(
+            serde_json::json!({ "table-changes": changes }).to_string(),
+        ))
+        .expect("request")
+}
+
+/// Snapshot of every object under the request scope, used to prove a denied
+/// commit performs no metadata, pointer, or catalog write.
+async fn storage_snapshot(backend: &Arc<dyn StorageBackend>) -> Vec<(String, Vec<u8>)> {
+    let scoped = scoped(backend);
+    let mut objects = Vec::new();
+    for path in scoped.list("").await.expect("list scope") {
+        let bytes = scoped
+            .get_raw(path.as_str())
+            .await
+            .expect("read scoped object");
+        objects.push((path.as_str().to_string(), bytes.to_vec()));
+    }
+    objects.sort_by(|left, right| left.0.cmp(&right.0));
+    objects
+}
+
+async fn assert_no_table_state_mutation(
+    backend: &Arc<dyn StorageBackend>,
+    before: &[(String, Vec<u8>)],
+    table_uuid: &str,
+) {
+    let after = storage_snapshot(backend).await;
+    let before_paths: Vec<&String> = before.iter().map(|(path, _)| path).collect();
+    let after_paths: Vec<&String> = after.iter().map(|(path, _)| path).collect();
+    let added: Vec<&&String> = after_paths
+        .iter()
+        .filter(|path| !before_paths.contains(path))
+        .collect();
+    assert!(
+        added
+            .iter()
+            .all(|path| path.contains("iceberg_idempotency/")),
+        "a denied commit must not create metadata, pointer, or catalog objects; added: {added:?}"
+    );
+    for (path, bytes) in before {
+        if path.contains("iceberg_idempotency/") {
+            continue;
+        }
+        let current = after
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .map(|(_, bytes)| bytes.clone());
+        assert_eq!(
+            current.as_ref(),
+            Some(bytes),
+            "a denied commit must not rewrite {path}"
+        );
+    }
+    assert!(
+        !table_uuid.is_empty(),
+        "the created table UUID must be observable for pointer assertions"
+    );
 }

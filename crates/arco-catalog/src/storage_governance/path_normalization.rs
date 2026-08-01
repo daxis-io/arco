@@ -104,7 +104,10 @@ fn parse_cloud_uri(scheme: &str, rest: &str) -> Result<GovernedPath> {
     Ok(GovernedPath {
         scheme: scheme.to_string(),
         authority: Some(authority.to_ascii_lowercase()),
-        path: canonical_path(path, false)?,
+        // The authority split already consumed the single separator that roots
+        // the object key, so a further leading empty segment is a consecutive
+        // slash run, not structure.
+        path: canonical_path(path, LeadingSeparator::Consumed)?,
     })
 }
 
@@ -112,15 +115,48 @@ fn parse_file_uri(rest: &str) -> Result<GovernedPath> {
     Ok(GovernedPath {
         scheme: "file".to_string(),
         authority: None,
-        path: canonical_path(rest, true)?,
+        // `file:///tmp/...` roots the path with a separator that belongs to the
+        // path itself, so one leading empty segment is structural.
+        path: canonical_path(rest, LeadingSeparator::Structural)?,
     })
 }
 
-fn canonical_path(path: &str, absolute: bool) -> Result<String> {
-    let mut segments = Vec::new();
-    for raw_segment in path.split('/') {
+/// Whether a leading empty segment in the raw path is structure or a
+/// consecutive-slash run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeadingSeparator {
+    /// The scheme/authority split already consumed the rooting separator
+    /// (cloud URIs), so a leading empty segment is a duplicate slash.
+    Consumed,
+    /// The rooting separator is part of the path (`file://` URIs), so one
+    /// leading empty segment is structural.
+    Structural,
+}
+
+/// Canonicalizes the path component, rejecting non-structural empty segments.
+///
+/// Cloud object stores address objects by an opaque key in which consecutive
+/// `/` bytes are preserved: `a/b/object` and `a//b/object` are *different*
+/// objects under different physical prefixes. Collapsing empty segments would
+/// therefore alias distinct physical prefixes onto one canonical governed
+/// identity, letting a path authority declared over `gs://bucket/a/b/`
+/// authorize (and vend credentials scoped to) `gs://bucket/a//b/`, which is
+/// not physically under it. Rather than model per-provider key semantics, the
+/// boundary rejects the ambiguous input: only a rooting leading separator and
+/// a single trailing separator are structural.
+fn canonical_path(path: &str, leading: LeadingSeparator) -> Result<String> {
+    let raw_segments: Vec<&str> = path.split('/').collect();
+    let last_index = raw_segments.len().saturating_sub(1);
+    let mut segments = Vec::with_capacity(raw_segments.len());
+    for (index, raw_segment) in raw_segments.iter().enumerate() {
         if raw_segment.is_empty() {
-            continue;
+            if index == last_index || (index == 0 && leading == LeadingSeparator::Structural) {
+                continue;
+            }
+            return Err(validation(
+                "empty path segments are not allowed: consecutive '/' separators address a \
+                 distinct object prefix",
+            ));
         }
         let segment = percent_decode(raw_segment)?;
         if segment == "." || segment == ".." {
@@ -136,9 +172,6 @@ fn canonical_path(path: &str, absolute: bool) -> Result<String> {
     canonical.push_str(&segments.join("/"));
     if !canonical.ends_with('/') {
         canonical.push('/');
-    }
-    if absolute && !canonical.starts_with('/') {
-        canonical.insert(0, '/');
     }
     Ok(canonical)
 }

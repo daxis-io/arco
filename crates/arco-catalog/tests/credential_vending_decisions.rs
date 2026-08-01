@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use chrono::Utc;
+
 use arco_catalog::Result;
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{
@@ -32,6 +34,7 @@ fn credential_vending_allows_governed_gcs_path_with_clamped_ttl_and_audit_id() -
             requested_ttl: Duration::from_secs(7200),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;
@@ -44,7 +47,11 @@ fn credential_vending_allows_governed_gcs_path_with_clamped_ttl_and_audit_id() -
         decision.authorized_path_prefixes,
         vec!["gs://bucket/warehouse/orders/day=1/"]
     );
-    assert_eq!(decision.max_ttl, Duration::from_secs(3600));
+    // Clamped to MAX_CREDENTIAL_TTL measured from the freshness observation,
+    // not from the decision instant: a 7200s request is cut to at most 3600s,
+    // minus whatever elapsed since the watermark was observed.
+    assert!(decision.max_ttl <= Duration::from_secs(3600));
+    assert!(decision.max_ttl > Duration::from_secs(3599));
     assert!(!decision.audit_event_id.is_empty());
 
     let debug = format!("{decision:?}");
@@ -70,6 +77,7 @@ fn credential_vending_denies_without_authorization_context() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: None,
         },
     )?;
@@ -97,6 +105,7 @@ fn credential_vending_denies_stale_authorization_watermark() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_003")),
         },
     )?;
@@ -131,6 +140,7 @@ fn credential_vending_denies_unsupported_authorization_object_type() -> Result<(
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(authorization),
         },
     )?;
@@ -161,6 +171,7 @@ fn credential_vending_denies_ungoverned_paths_with_audit_id() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;
@@ -190,6 +201,7 @@ fn credential_vending_denies_unsupported_operations_closed() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;
@@ -239,6 +251,7 @@ fn credential_vending_denies_external_locations_backed_by_disabled_credentials()
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;
@@ -290,12 +303,17 @@ fn revocation_freshness_budget_is_projection_staleness_plus_max_ttl() -> Result<
             requested_ttl: Duration::from_secs(7 * 24 * 3600),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;
     assert_eq!(decision.decision, CredentialDecision::Allow);
+    // The TTL half is now anchored to the freshness observation, so an allow
+    // decided `elapsed` after the observation is clamped to
+    // `MAX_CREDENTIAL_TTL - elapsed`: never above the budget, and no lower
+    // than the budget minus the in-test decision latency.
     assert!(decision.max_ttl <= MAX_CREDENTIAL_TTL);
-    assert_eq!(decision.max_ttl, MAX_CREDENTIAL_TTL);
+    assert!(decision.max_ttl > MAX_CREDENTIAL_TTL - Duration::from_secs(1));
     Ok(())
 }
 
@@ -385,6 +403,7 @@ fn revoked_external_location_with_fresh_state_cannot_be_vended() -> Result<()> {
             requested_ttl: Duration::from_secs(300),
             client_kind: "uc".to_string(),
             catalog_snapshot_version: "event_004".to_string(),
+            freshness_observed_at: Utc::now(),
             authorization: Some(path_authorization("event_004")),
         },
     )?;

@@ -15,6 +15,9 @@ use arco_core::Error as CoreError;
 /// API result type.
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Fixed client-visible message for errors whose detail is internal state.
+const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
 /// Standard JSON error response body.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -291,12 +294,22 @@ impl From<CatalogError> for ApiError {
                 http_status,
                 message,
             } => Self::from_status_and_message(http_status, message),
+            // Storage, serialization, and invariant failures carry internal
+            // detail (object paths, ledger event IDs, object versions, raw
+            // provider errors). Correlate them in logs; expose only the stable
+            // `INTERNAL` code and a fixed message.
             CatalogError::Storage { message }
             | CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
-            | CatalogError::InvariantViolation { message } => Self::internal(message),
+            | CatalogError::InvariantViolation { message } => {
+                tracing::warn!(internal_error = %message, "redacted internal catalog error");
+                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+            }
             CatalogError::UnsupportedOperation { message } => Self::not_acceptable(message),
-            error => Self::internal(error.to_string()),
+            error => {
+                tracing::warn!(internal_error = %error, "redacted unknown catalog error");
+                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+            }
         }
     }
 }

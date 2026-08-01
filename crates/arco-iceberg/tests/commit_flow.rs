@@ -8,6 +8,7 @@ use arco_catalog::{CatalogWriter, Tier1Compactor};
 use arco_core::ScopedStorage;
 use arco_core::storage::{StorageBackend, WritePrecondition};
 use arco_iceberg::commit::{CommitError, CommitService};
+use arco_iceberg::governance::TableLocationGovernance;
 use arco_iceberg::idempotency::{
     IdempotencyMarker, IdempotencyStatus, IdempotencyStore, IdempotencyStoreImpl,
     canonical_request_hash,
@@ -168,7 +169,10 @@ fn snapshot(snapshot_id: i64, parent_snapshot_id: Option<i64>, sequence_number: 
 #[tokio::test]
 async fn test_commit_table_success_persists_state() {
     let fixture = Fixture::new().await;
-    let service = CommitService::new(Arc::clone(&fixture.storage));
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
 
     let request = commit_request(101);
     let request_value = serde_json::to_value(&request).expect("serialize request");
@@ -250,7 +254,10 @@ async fn test_commit_table_success_persists_state() {
 #[tokio::test]
 async fn test_commit_table_idempotent_replay_returns_cached_response() {
     let fixture = Fixture::new().await;
-    let service = CommitService::new(Arc::clone(&fixture.storage));
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
 
     let request = commit_request(202);
     let request_value = serde_json::to_value(&request).expect("serialize request");
@@ -314,7 +321,10 @@ async fn test_commit_table_idempotent_replay_returns_cached_response() {
 #[tokio::test]
 async fn test_single_table_requirement_conflict_marks_failed_and_replays_cached_failure() {
     let fixture = Fixture::new().await;
-    let service = CommitService::new(Arc::clone(&fixture.storage));
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
 
     let mut request = commit_request(303);
     request
@@ -434,7 +444,10 @@ async fn test_single_table_requirement_conflict_marks_failed_and_replays_cached_
 #[tokio::test]
 async fn test_remove_snapshots_prunes_snapshot_log_before_removed_entry() {
     let fixture = Fixture::new().await;
-    let service = CommitService::new(Arc::clone(&fixture.storage));
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
 
     let mut metadata = base_metadata(fixture.table_uuid, fixture.table_location.clone());
     metadata.snapshots = vec![
@@ -525,7 +538,10 @@ async fn test_remove_snapshots_prunes_snapshot_log_before_removed_entry() {
 #[tokio::test]
 async fn test_stale_marker_takeover_uses_fresh_metadata_location_when_orphan_exists() {
     let fixture = Fixture::new().await;
-    let service = CommitService::new(Arc::clone(&fixture.storage));
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
 
     let request = commit_request(303);
     let request_value = serde_json::to_value(&request).expect("serialize request");
@@ -1082,8 +1098,11 @@ mod multi_table_transactions {
         let fixture = MultiTableFixture::new().await;
         let storage = Arc::new(fixture.storage);
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
 
         let tx_id = Uuid::now_v7().to_string();
         let inputs = vec![
@@ -1130,8 +1149,11 @@ mod multi_table_transactions {
         let fixture = MultiTableFixture::new().await;
         let storage = Arc::new(fixture.storage);
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
 
         let table_location = "tenant=acme/workspace=analytics/warehouse/orders";
         let mut metadata = base_metadata(fixture.table1_uuid, table_location.to_string());
@@ -1291,8 +1313,11 @@ mod multi_table_transactions {
         let workspace = fixture.workspace.clone();
         let storage = Arc::new(fixture.storage);
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
 
         let tx_id = Uuid::now_v7().to_string();
         let request_hash = "same_hash".to_string();
@@ -1342,8 +1367,11 @@ mod multi_table_transactions {
         let workspace = fixture.workspace.clone();
         let storage = Arc::new(fixture.storage);
         let pointer_store = Arc::new(PointerStoreImpl::new(Arc::clone(&storage)));
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
 
         let tx_id = Uuid::now_v7().to_string();
         let inputs = vec![table_commit_input(table1_uuid, "sales", "orders", 4001)];
@@ -1401,6 +1429,7 @@ mod multi_table_transactions {
         let coordinator = MultiTableTransactionCoordinator::with_config(
             Arc::clone(&storage),
             Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
             config,
         );
 
@@ -1476,8 +1505,11 @@ mod multi_table_transactions {
             .expect("set pending");
 
         // TX2: attempt to commit the same table while TX1 is still preparing
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
         let tx2_id = Uuid::now_v7().to_string();
         let inputs = vec![table_commit_input(
             fixture.table1_uuid,
@@ -1544,6 +1576,7 @@ mod multi_table_transactions {
         let coordinator = MultiTableTransactionCoordinator::with_config(
             Arc::clone(&storage),
             Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
             config,
         );
 
@@ -1628,8 +1661,11 @@ mod multi_table_transactions {
             .await
             .expect("set pending");
 
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
         let new_tx_id = Uuid::now_v7().to_string();
         let inputs = vec![table_commit_input(
             fixture.table1_uuid,
@@ -1715,8 +1751,11 @@ mod multi_table_transactions {
             .await
             .expect("set pending");
 
-        let coordinator =
-            MultiTableTransactionCoordinator::new(Arc::clone(&storage), Arc::clone(&pointer_store));
+        let coordinator = MultiTableTransactionCoordinator::new(
+            Arc::clone(&storage),
+            Arc::clone(&pointer_store),
+            TableLocationGovernance::new((*storage).clone(), "analytics"),
+        );
         let tx2_id = Uuid::now_v7().to_string();
         let inputs = vec![table_commit_input(
             fixture.table2_uuid,

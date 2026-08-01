@@ -723,7 +723,7 @@ mod tests {
     async fn exact_canonical_conflict_is_rejected() {
         let writer = writer(storage());
         writer
-            .declare_path(declaration("decl_orders", "gs://Bucket//warehouse/orders"))
+            .declare_path(declaration("decl_orders", "gs://Bucket/warehouse/orders"))
             .await
             .expect("declare first canonical path");
 
@@ -1012,7 +1012,7 @@ mod tests {
             "abfss://container/warehouse/orders",
             "gs://Bucket/Warehouse/Orders",
             "gs://bucket/warehouse/100%25-complete",
-            "gs://bucket/warehouse//orders///2026",
+            "gs://bucket/warehouse/orders%20archive",
             "file:///data/warehouse/orders",
             "file:///data",
         ];

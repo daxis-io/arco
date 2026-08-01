@@ -3,8 +3,11 @@
 use std::sync::Arc;
 
 use arco_catalog::CatalogReader;
+use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
+use arco_catalog::authz::privileges::Privilege;
 use arco_core::storage::{MemoryBackend, WritePrecondition, WriteResult};
 use arco_core::{CatalogPaths, ScopedStorage};
+use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::Router;
 use axum::body::Body;
@@ -15,14 +18,63 @@ use uuid::Uuid;
 
 fn test_router() -> Router {
     let backend = Arc::new(MemoryBackend::new());
-    let state = UnityCatalogState::new(backend);
+    let state =
+        UnityCatalogState::new(backend).with_compiled_permissions(create_table_permissions());
     unity_catalog_router(state)
 }
 
 fn test_harness() -> (Router, Arc<MemoryBackend>) {
     let backend = Arc::new(MemoryBackend::new());
-    let state = UnityCatalogState::new(backend.clone());
+    let state = UnityCatalogState::new(backend.clone())
+        .with_compiled_permissions(create_table_permissions());
     (unity_catalog_router(state), backend)
+}
+
+/// Principal that the harness authorizes for table DDL.
+///
+/// `POST /tables` requires `CREATE_TABLE` on the target schema, so every
+/// request the harness sends carries a trusted principal and the state carries
+/// a compiled view granting that principal the privilege on the schemas these
+/// tests use. Requests without both are denied 403 — that is the fail-closed
+/// posture under test, not harness noise.
+const TEST_PRINCIPAL: &str = "user_test";
+
+fn create_table_permissions() -> CompiledPermissionSet {
+    let mut rows = Vec::new();
+    for catalog in ["main", "main2"] {
+        for schema in ["analytics", "default"] {
+            let object_id = format!("{catalog}.{schema}");
+            rows.push(CompiledPermissionRow {
+                principal_id: TEST_PRINCIPAL.to_string(),
+                object_id: object_id.clone(),
+                object_type: "SCHEMA".to_string(),
+                privilege: Privilege::CreateTable,
+                source: "grant".to_string(),
+                source_grant_id: Some(format!("grant_{catalog}_{schema}")),
+                source_principal_id: TEST_PRINCIPAL.to_string(),
+                source_object_id: object_id.clone(),
+                inheritance_path: object_id,
+                grant_option: false,
+                group_snapshot_version: "groups-test".to_string(),
+            });
+        }
+    }
+    CompiledPermissionSet::new("event_test", "groups-test", true, rows)
+}
+
+fn trusted_context(
+    tenant: &str,
+    workspace: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> UnityCatalogRequestContext {
+    UnityCatalogRequestContext {
+        tenant: tenant.to_string(),
+        workspace: workspace.to_string(),
+        request_id: request_id.to_string(),
+        user_id: Some(TEST_PRINCIPAL.to_string()),
+        idempotency_key: idempotency_key.map(str::to_string),
+    }
 }
 
 fn scoped_storage(
@@ -78,7 +130,7 @@ async fn uc_request(
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace);
 
-    let req = if let Some(payload) = body {
+    let mut req = if let Some(payload) = body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
         let bytes =
             serde_json::to_vec(&payload).map_err(|err| format!("serialize request body: {err}"))?;
@@ -90,6 +142,12 @@ async fn uc_request(
             .body(Body::empty())
             .map_err(|err| format!("build request: {err}"))?
     };
+    req.extensions_mut().insert(trusted_context(
+        tenant,
+        workspace,
+        "request-preview-crud",
+        None,
+    ));
 
     let response = router
         .clone()
@@ -125,7 +183,7 @@ async fn uc_request_with_idempotency(
         .header("X-Workspace-Id", workspace)
         .header("Idempotency-Key", idempotency_key);
 
-    let req = if let Some(payload) = body {
+    let mut req = if let Some(payload) = body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
         let bytes =
             serde_json::to_vec(&payload).map_err(|err| format!("serialize request body: {err}"))?;
@@ -137,6 +195,12 @@ async fn uc_request_with_idempotency(
             .body(Body::empty())
             .map_err(|err| format!("build request: {err}"))?
     };
+    req.extensions_mut().insert(trusted_context(
+        tenant,
+        workspace,
+        "request-preview-crud",
+        Some(idempotency_key),
+    ));
 
     let response = router
         .clone()
@@ -164,6 +228,8 @@ async fn uc_request_without_scope(
 ) -> Result<(StatusCode, Value), String> {
     let mut builder = Request::builder().method(method).uri(uri);
 
+    // Deliberately unscoped and unauthenticated: this helper drives the
+    // missing-scope rejection path, so it injects no trusted context.
     let req = if let Some(payload) = body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
         let bytes =

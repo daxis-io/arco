@@ -3,6 +3,7 @@
 //! These handlers expose UC-shaped table operations over Arco's authoritative
 //! catalog ledger and manifest-published snapshot path.
 
+use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::{CatalogError, CatalogReader};
 use arco_catalog::{ColumnDefinition, RegisterTableInSchemaRequest};
 use arco_core::IcebergPaths;
@@ -380,11 +381,47 @@ pub(crate) async fn post_tables(
     // for this scope it must resolve to a bound path authority
     // (ungoverned/ambiguous locations are a typed 400; a stale projection
     // denies closed with 503). Ungoverned scopes preserve current behavior.
+    // Authorize the DDL *before* any governance state is loaded or any
+    // location-specific error is produced. Until this check existed the route
+    // was authentication-only, so any authenticated principal in the workspace
+    // could probe candidate locations and read back which ones resolved to a
+    // bound path authority — a governance oracle over the workspace's storage
+    // layout. An unauthorized principal now receives the same 403 for governed
+    // and ungoverned candidates alike, with no catalog, metadata, pointer, or
+    // idempotency mutation.
+    common::require_authz(
+        &state,
+        &ctx,
+        &format!("{catalog_name}.{schema_name}"),
+        "SCHEMA",
+        Privilege::CreateTable,
+        "create_table_denied",
+    )
+    .await?;
+
     let scoped = common::scoped_storage(&state, &ctx)?;
     arco_catalog::metastore::publish::validate_governed_location_if_configured(
         &scoped,
         &ctx.workspace,
         &storage_location,
+    )
+    .await
+    .map_err(common::map_catalog_error)?;
+
+    // #358: `properties` is persisted verbatim onto the table, so a
+    // location-bearing property (`write.data.path`, `write.metadata.path`,
+    // `write.object-storage.path`) is a second client-controlled location
+    // channel on this route. Validate it before it reaches
+    // `RegisterTableInSchemaRequest`, or a governed `storage_location` would
+    // be enough to smuggle a foreign data path past governance.
+    let governed_properties = payload.properties.as_ref();
+    arco_catalog::metastore::publish::validate_governed_location_properties_if_configured(
+        &scoped,
+        &ctx.workspace,
+        governed_properties
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
     )
     .await
     .map_err(common::map_catalog_error)?;

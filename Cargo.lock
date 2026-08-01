@@ -517,6 +517,7 @@ dependencies = [
  "arco-catalog",
  "arco-core",
  "arco-delta",
+ "async-trait",
  "axum 0.7.9",
  "bytes",
  "chrono",

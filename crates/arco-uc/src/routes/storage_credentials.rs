@@ -53,7 +53,7 @@ async fn create_storage_credential(
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Json(request): Json<CreateStorageCredentialRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     // Self-heal before validating: republish any projection left stale by an
     // earlier commit whose synchronous publication failed (#362).
     publish_storage_governance_projection(&state, &ctx).await?;
@@ -116,7 +116,7 @@ async fn list_storage_credentials(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
     let credentials = metastore
@@ -139,7 +139,7 @@ async fn get_storage_credential(
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Path(credential_id): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
     let Some(record) = metastore.storage_credentials.get(&credential_id) else {
@@ -179,7 +179,7 @@ fn ledger(
     Ok(MetastoreLedger::new(scoped_storage(state, ctx)?))
 }
 
-fn require_storage_governance_admin(
+async fn require_storage_governance_admin(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
 ) -> Result<(), UnityCatalogError> {
@@ -192,4 +192,5 @@ fn require_storage_governance_admin(
         Privilege::Manage,
         "storage_governance_denied",
     )
+    .await
 }

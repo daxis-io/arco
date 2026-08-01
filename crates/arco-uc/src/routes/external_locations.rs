@@ -58,7 +58,7 @@ async fn create_external_location(
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Json(request): Json<CreateExternalLocationRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     // Self-heal before validating: republish any projection left stale by an
     // earlier commit whose synchronous publication failed (#362).
     publish_storage_governance_projection(&state, &ctx).await?;
@@ -129,7 +129,7 @@ async fn list_external_locations(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
     let locations = metastore
@@ -152,7 +152,7 @@ async fn get_external_location(
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Path(name): Path<String>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
     let Some(record) = metastore
@@ -202,7 +202,7 @@ async fn republish_storage_governance_projection_route(
     State(state): State<UnityCatalogState>,
     Extension(ctx): Extension<UnityCatalogRequestContext>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
-    require_storage_governance_admin(&state, &ctx)?;
+    require_storage_governance_admin(&state, &ctx).await?;
     let storage = scoped_storage(&state, &ctx)?;
     let publication =
         publish_current_metastore_projection(&storage, &ProjectionRegistry::default())
@@ -235,7 +235,7 @@ fn ledger(
     Ok(MetastoreLedger::new(scoped_storage(state, ctx)?))
 }
 
-fn require_storage_governance_admin(
+async fn require_storage_governance_admin(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
 ) -> Result<(), UnityCatalogError> {
@@ -248,4 +248,5 @@ fn require_storage_governance_admin(
         Privilege::Manage,
         "storage_governance_denied",
     )
+    .await
 }

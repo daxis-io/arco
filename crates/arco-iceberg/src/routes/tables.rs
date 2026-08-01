@@ -34,7 +34,8 @@ use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
 use crate::governance::{
-    validate_client_supplied_location, validate_location_bearing_table_properties,
+    TableLocationGovernance, validate_client_supplied_location,
+    validate_location_bearing_table_properties,
 };
 use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
@@ -732,7 +733,8 @@ async fn commit_table(
         principal: None,
     };
 
-    let commit_service = CommitService::new(Arc::new(storage));
+    let governance = TableLocationGovernance::new(storage.clone(), ctx.workspace.clone());
+    let commit_service = CommitService::new(Arc::new(storage), governance);
 
     let result = commit_service
         .commit_table(
@@ -1129,10 +1131,14 @@ async fn register_table(
         });
     }
 
-    // #358: the table location inside a client-supplied metadata file is a
-    // client-controlled location channel and must satisfy storage governance
-    // when it is enabled for this scope.
+    // #358: a registered metadata file is entirely client-controlled and is
+    // persisted wholesale, so both of its location channels must satisfy
+    // storage governance when it is enabled for this scope. Validating only
+    // `metadata.location` left a bypass: a metadata file whose advertised
+    // location is governed but whose properties name a foreign bucket.
     validate_client_supplied_location(&storage, &ctx.workspace, &metadata.location).await?;
+    validate_location_bearing_table_properties(&storage, &ctx.workspace, &metadata.properties)
+        .await?;
     let storage_relative_location =
         resolve_metadata_path(&metadata.location, &ctx.tenant, &ctx.workspace).map_err(|e| {
             IcebergError::BadRequest {

@@ -17,12 +17,14 @@ use std::time::Duration;
 
 use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
 use arco_catalog::authz::privileges::Privilege;
+use arco_catalog::credential_vending::MAX_CREDENTIAL_TTL_SECS;
 use arco_catalog::metastore::events::{
     ExternalLocationRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
     WorkspaceBindingRecord,
 };
 use arco_catalog::metastore::ledger::MetastoreLedger;
 use arco_catalog::metastore::publish::load_published_storage_governance;
+use arco_catalog::storage_governance::path_normalization::GovernedPath;
 use arco_core::error::Result as CoreResult;
 use arco_core::storage::{
     MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -33,6 +35,7 @@ use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
+use chrono::Utc;
 use tower::ServiceExt;
 
 /// Committing storage-governance changes through the production UC routes
@@ -548,7 +551,8 @@ fn set_permissions_at_watermark(state: &UnityCatalogState, watermark: &str) {
         .compiled_permissions
         .as_ref()
         .expect("compiled permissions configured");
-    *permissions.write().expect("permissions lock") = permission_set_at_watermark(watermark);
+    *permissions.write().expect("permissions lock") =
+        Arc::new(permission_set_at_watermark(watermark));
 }
 
 fn permission_set_at_watermark(watermark: &str) -> CompiledPermissionSet {
@@ -647,6 +651,11 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 struct PublicationFaultBackend {
     inner: Arc<dyn StorageBackend>,
     fail_publication_writes: AtomicBool,
+    /// Arms a one-shot revocation commit inside the credential request's
+    /// time-of-check/time-of-use window: it fires on the projection-object
+    /// `head` that runs *after* the watermark freshness check and before the
+    /// decision, which is exactly the window a delayed request sits in.
+    revoke_after_freshness_check: AtomicBool,
 }
 
 impl std::fmt::Debug for PublicationFaultBackend {
@@ -665,11 +674,17 @@ impl PublicationFaultBackend {
         Self {
             inner,
             fail_publication_writes: AtomicBool::new(false),
+            revoke_after_freshness_check: AtomicBool::new(false),
         }
     }
 
     fn fail_publication_writes(&self, fail: bool) {
         self.fail_publication_writes.store(fail, Ordering::SeqCst);
+    }
+
+    fn arm_revocation_after_freshness_check(&self) {
+        self.revoke_after_freshness_check
+            .store(true, Ordering::SeqCst);
     }
 
     fn is_publication_path(path: &str) -> bool {
@@ -760,7 +775,17 @@ impl StorageBackend for PublicationFaultBackend {
         'life1: 'async_trait,
         Self: Sync + 'async_trait,
     {
-        Box::pin(async move { self.inner.head(path).await })
+        Box::pin(async move {
+            if path.contains("snapshots/metastore/")
+                && path.ends_with(".parquet")
+                && self
+                    .revoke_after_freshness_check
+                    .swap(false, Ordering::SeqCst)
+            {
+                append_revocation_event(&self.inner, "event_revocation_race", 4).await;
+            }
+            self.inner.head(path).await
+        })
     }
 
     fn signed_url<'life0, 'life1, 'async_trait>(
@@ -775,4 +800,198 @@ impl StorageBackend for PublicationFaultBackend {
     {
         Box::pin(async move { self.inner.signed_url(path, expiry).await })
     }
+}
+
+/// S5: projection freshness is an *observation*, not a lock. These tests place
+/// a revocation commit inside the window between the watermark check and the
+/// decision, on both the cache-miss and the cache-hit path, and require the
+/// vend to either deny/retry or return a lifetime bounded by
+/// `observation + MAX_CREDENTIAL_TTL` — never an old-state allow whose expiry
+/// runs past `revocation_commit_time + 3600s`.
+#[tokio::test]
+async fn revocation_committed_inside_the_decision_window_cannot_be_answered_from_old_state() {
+    for warm_cache in [false, true] {
+        let flaky = Arc::new(PublicationFaultBackend::new(Arc::new(MemoryBackend::new())));
+        let backend: Arc<dyn StorageBackend> = flaky.clone();
+        let state = governed_state(Arc::clone(&backend), "unpublished");
+        let app = unity_catalog_router(state.clone());
+
+        seed_published_governance(&backend).await;
+        set_permissions_at_watermark(&state, "event_binding_003");
+
+        if warm_cache {
+            let response = app
+                .clone()
+                .oneshot(vending_request())
+                .await
+                .expect("warm-up vending response");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "the pre-revocation baseline must be an allow"
+            );
+        }
+
+        // The revocation lands after this request validated the watermark.
+        let revocation_commit_time = Utc::now();
+        flaky.arm_revocation_after_freshness_check();
+        let response = app
+            .clone()
+            .oneshot(vending_request())
+            .await
+            .expect("racing vending response");
+
+        let status = response.status();
+        if status == StatusCode::OK {
+            let payload = json_body(response).await;
+            assert_eq!(
+                payload["decision"], "allow",
+                "a 200 must carry an explicit decision"
+            );
+            let max_ttl = payload["max_ttl_seconds"]
+                .as_i64()
+                .expect("max_ttl_seconds");
+            let expires_at = revocation_commit_time.timestamp() + max_ttl;
+            assert!(
+                expires_at
+                    <= revocation_commit_time.timestamp()
+                        + i64::try_from(MAX_CREDENTIAL_TTL_SECS).expect("ttl fits i64"),
+                "an allow racing a revocation must expire within the revocation-freshness \
+                 budget (warm_cache={warm_cache})"
+            );
+        } else {
+            assert!(
+                status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::FORBIDDEN,
+                "a racing request must deny or retry, got {status} (warm_cache={warm_cache})"
+            );
+        }
+
+        // After the race the projection is behind the ledger, so every later
+        // request denies closed until it is republished.
+        let response = app
+            .clone()
+            .oneshot(vending_request())
+            .await
+            .expect("post-revocation vending response");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a projection behind a committed revocation must deny closed"
+        );
+    }
+}
+
+/// S2: the scoped prefix returned to (and later minted for) the caller is the
+/// canonical governed path, not the raw request string.
+#[tokio::test]
+async fn vended_prefixes_are_the_canonical_governed_path() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let state = governed_state(Arc::clone(&backend), "unpublished");
+    let app = unity_catalog_router(state.clone());
+    seed_published_governance(&backend).await;
+    set_permissions_at_watermark(&state, "event_binding_003");
+
+    // A request spelled with case and escape variation resolves to exactly one
+    // canonical prefix.
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/temporary-path-credentials",
+            serde_json::json!({
+                "url": "gs://Bucket/warehouse/orders/day%3D1",
+                "operation": "READ",
+                "requested_ttl_seconds": 300
+            }),
+        ))
+        .await
+        .expect("vending response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = json_body(response).await;
+    let canonical = GovernedPath::parse("gs://Bucket/warehouse/orders/day%3D1")
+        .expect("canonical governed path");
+    assert_eq!(
+        payload["authorized_path_prefixes"][0],
+        serde_json::Value::String(canonical.canonical_uri()),
+        "the advertised prefix must be the canonical governed path"
+    );
+    assert_eq!(
+        payload["credentials"][0]["prefix"],
+        serde_json::Value::String(canonical.canonical_uri()),
+        "the minted credential prefix must be the canonical governed path"
+    );
+
+    // A duplicate-slash spelling of the same governed prefix is a different
+    // physical prefix and is not vendable at all.
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/temporary-path-credentials",
+            serde_json::json!({
+                "url": "gs://bucket/warehouse//orders/day=1/",
+                "operation": "READ",
+                "requested_ttl_seconds": 300
+            }),
+        ))
+        .await
+        .expect("vending response");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a duplicate-slash alias must not be vendable under the governed authority"
+    );
+}
+
+/// Seeds credential, external location, and workspace binding events and
+/// publishes the projection at the resulting watermark.
+async fn seed_published_governance(backend: &Arc<dyn StorageBackend>) {
+    let scope = ControlPlaneScope::workspace_alias("tenant1", "workspace1").expect("scope");
+    let ledger = MetastoreLedger::new(scoped(backend));
+    ledger
+        .append_event(&MetastoreEvent::new_scoped(
+            &scope,
+            "event_credential_001",
+            1,
+            MetastoreMutation::StorageCredentialUpserted(
+                arco_catalog::metastore::events::StorageCredentialRecord {
+                    credential_id: "cred_01".to_string(),
+                    name: "lakehouse-prod".to_string(),
+                    cloud: "gcs".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_000,
+                    properties: std::collections::BTreeMap::new(),
+                    secret_material_ref: None,
+                    encrypted_payload: None,
+                },
+            ),
+        ))
+        .await
+        .expect("append credential event");
+    ledger
+        .append_event(&MetastoreEvent::new_scoped(
+            &scope,
+            "event_location_002",
+            2,
+            MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
+                location_id: "loc_orders".to_string(),
+                name: "orders".to_string(),
+                url: "gs://bucket/warehouse/orders/".to_string(),
+                credential_id: "cred_01".to_string(),
+                owner: "owner".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: 1_800_000_000_001,
+                properties: std::collections::BTreeMap::new(),
+            }),
+        ))
+        .await
+        .expect("append location event");
+    append_binding_event(backend, "event_binding_003", 3).await;
+    arco_catalog::metastore::publish::publish_current_metastore_projection(
+        &scoped(backend),
+        &arco_catalog::metastore::projections::ProjectionRegistry::default(),
+    )
+    .await
+    .expect("publish projection");
 }

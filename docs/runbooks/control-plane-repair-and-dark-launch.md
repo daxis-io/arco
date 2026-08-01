@@ -48,7 +48,7 @@ Writer and repair targeting:
 Repair automation defaults in PI-3:
 
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE`
-  - default: `enforce`
+  - default: `dry_run` (destructive enforcement is explicit opt-in)
   - supported values: `disabled`, `dry_run`, `enforce`
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
@@ -56,7 +56,7 @@ Repair automation defaults in PI-3:
   - default: `full`
   - supported values: `current_head_only`, `full`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE`
-  - default: `enforce`
+  - default: `dry_run` (destructive enforcement is explicit opt-in)
   - supported values: `disabled`, `dry_run`, `enforce`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
@@ -69,9 +69,13 @@ Repair automation defaults in PI-3:
 These env vars are read once during service startup. Apply changes through the deployment mechanism
 for the affected service and restart or redeploy before running the probes below.
 
-After legacy current-head side-effect removal, `full` is the production default because generic
-orphan cleanup is the remaining steady-state work. `current_head_only` is retained only for
-request/config compatibility and should stay empty in steady state.
+Repair automation mode now defaults to `dry_run`: findings are reported (metrics and logs) but
+nothing is deleted until an operator explicitly sets the mode to `enforce`. When enforcement is
+enabled, `full` is the recommended scope because generic orphan cleanup is the remaining
+steady-state work; catalog repair deletions additionally hold the workspace retention lock and
+durable mutation epoch, consult the GC protection set (retention pins), and skip any object
+younger than the minimum-age window (the maximum signed-URL TTL). `current_head_only` is retained
+only for request/config compatibility and should stay empty in steady state.
 
 ## Production Contract
 
@@ -111,7 +115,7 @@ Writer and repair targeting:
 Repair automation defaults in PI-3:
 
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE`
-  - default: `enforce`
+  - default: `dry_run` (destructive enforcement is explicit opt-in)
   - supported values: `disabled`, `dry_run`, `enforce`
 - `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
@@ -119,7 +123,7 @@ Repair automation defaults in PI-3:
   - default: `current_head_only`
   - supported values: `current_head_only`, `full`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE`
-  - default: `enforce`
+  - default: `dry_run` (destructive enforcement is explicit opt-in)
   - supported values: `disabled`, `dry_run`, `enforce`
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS`
   - default: `300`
@@ -132,9 +136,13 @@ Repair automation defaults in PI-3:
 These env vars are read once during service startup. Apply changes through the deployment mechanism
 for the affected service and restart or redeploy before running the probes below.
 
-After legacy current-head side-effect removal, `full` is the production default because generic
-orphan cleanup is the remaining steady-state work. `current_head_only` is retained only for
-request/config compatibility and should stay empty in steady state.
+Repair automation mode now defaults to `dry_run`: findings are reported (metrics and logs) but
+nothing is deleted until an operator explicitly sets the mode to `enforce`. When enforcement is
+enabled, `full` is the recommended scope because generic orphan cleanup is the remaining
+steady-state work; catalog repair deletions additionally hold the workspace retention lock and
+durable mutation epoch, consult the GC protection set (retention pins), and skip any object
+younger than the minimum-age window (the maximum signed-URL TTL). `current_head_only` is retained
+only for request/config compatibility and should stay empty in steady state.
 
 ## Preconditions
 

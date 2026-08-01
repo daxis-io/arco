@@ -444,8 +444,18 @@ impl Tier1Compactor {
                 commit_metadata,
             )?);
 
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Catalog, next_version, &manifest_id);
+            // The attempt directory embeds the reserved commit ULID so its
+            // identity is unique per attempt: a crashed attempt that already
+            // wrote snapshot files under a reused manifest id can never collide
+            // with (and permanently wedge) a later attempt, whose fresh
+            // reservation selects a fresh directory. Within one invocation the
+            // reservation is stable for the same parent manifest, so CAS
+            // retries rewrite byte-identical files into the same directory.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Catalog,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &next_commit.commit_ulid),
+            );
             let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -626,8 +636,14 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Lineage, next_version, &manifest_id);
+            // Unique per attempt (see the catalog compaction path above): a
+            // crashed attempt must never wedge later attempts on immutable
+            // snapshot files it already wrote under a reused manifest id.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Lineage,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid),
+            );
             let snapshot = tier1_snapshot::write_lineage_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -821,8 +837,14 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Search, next_version, &manifest_id);
+            // Unique per attempt (see the catalog compaction path above): a
+            // crashed attempt must never wedge later attempts on immutable
+            // snapshot files it already wrote under a reused manifest id.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Search,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid),
+            );
             let snapshot = tier1_snapshot::write_search_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -1879,6 +1901,20 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
             message: "commit_ulid overflow while generating monotonic successor".to_string(),
         })?;
     Ok(next.to_string())
+}
+
+/// Builds the attempt-unique token naming one snapshot attempt directory.
+///
+/// `next_available_manifest_id` probes only the immutable manifest JSON path,
+/// so a compaction that crashes after writing snapshot files but before the
+/// manifest put leaves the same manifest id selectable again. Deriving the
+/// attempt directory from the manifest id alone would then re-derive the
+/// crashed attempt's directory, and `put_state_if_absent` would fail closed
+/// forever on the differing `commits.parquet` bytes, wedging all subsequent
+/// DDL. Suffixing the per-invocation commit ULID makes the directory identity
+/// unique per attempt while keeping same-invocation CAS retries idempotent.
+fn snapshot_attempt_token(manifest_id: &str, commit_ulid: &str) -> String {
+    format!("{manifest_id}-{commit_ulid}")
 }
 
 async fn next_available_manifest_id(

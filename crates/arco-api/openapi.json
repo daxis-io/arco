@@ -4388,7 +4388,7 @@
         "properties": {
           "added": {
             "type": "integer",
-            "description": "Number of edges added.",
+            "description": "Number of unique edges accepted (duplicates within the request and\nacross retries converge on the same content-derived edge id).",
             "minimum": 0
           }
         }

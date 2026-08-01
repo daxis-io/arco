@@ -6,6 +6,15 @@
 //!
 //! - `POST /lineage/edges` - Add lineage edge(s)
 //! - `GET  /lineage/{table_id}` - Get lineage for a table
+//!
+//! ## Idempotency
+//!
+//! Edge ids are derived deterministically from edge content
+//! (`source_id`, `target_id`, `edge_type`, `run_id`), and the lineage fold
+//! dedupes by id with first-write-wins, so duplicate POSTs of the same edge
+//! converge to a single projected row (ADR-042 rule 10;
+//! `docs/plans/2026-07-30-lineage-l0-schema-plan.md`). `created_at` records
+//! the first accepted observation.
 
 use std::sync::Arc;
 
@@ -15,7 +24,6 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 use utoipa::ToSchema;
 
 use crate::context::RequestContext;
@@ -49,6 +57,82 @@ fn default_edge_type() -> String {
     "derives_from".to_string()
 }
 
+/// Maximum number of edges accepted in a single request.
+const MAX_EDGES_PER_REQUEST: usize = 1_000;
+/// Maximum length for source/target entity ids.
+const MAX_ENTITY_ID_LEN: usize = 256;
+/// Maximum length for an edge type.
+const MAX_EDGE_TYPE_LEN: usize = 64;
+/// Maximum length for a run id.
+const MAX_RUN_ID_LEN: usize = 256;
+
+/// Validates an add-edges request before any storage work.
+fn validate_edges(edges: &[EdgeDefinition]) -> Result<(), ApiError> {
+    if edges.is_empty() {
+        return Err(ApiError::bad_request("edges must not be empty"));
+    }
+    if edges.len() > MAX_EDGES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "edge count {} exceeds max {MAX_EDGES_PER_REQUEST}",
+            edges.len()
+        )));
+    }
+    for (index, edge) in edges.iter().enumerate() {
+        validate_edge_field(index, "source_id", &edge.source_id, MAX_ENTITY_ID_LEN)?;
+        validate_edge_field(index, "target_id", &edge.target_id, MAX_ENTITY_ID_LEN)?;
+        validate_edge_field(index, "edge_type", &edge.edge_type, MAX_EDGE_TYPE_LEN)?;
+        if let Some(run_id) = edge.run_id.as_deref() {
+            validate_edge_field(index, "run_id", run_id, MAX_RUN_ID_LEN)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_edge_field(
+    index: usize,
+    field: &str,
+    value: &str,
+    max_len: usize,
+) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "edges[{index}].{field} must not be empty"
+        )));
+    }
+    if value.len() > max_len {
+        return Err(ApiError::bad_request(format!(
+            "edges[{index}].{field} exceeds max length ({max_len} bytes)"
+        )));
+    }
+    Ok(())
+}
+
+/// Derives a deterministic content-derived edge id so duplicate POSTs
+/// converge at fold time (first-write-wins dedup by id).
+///
+/// Domain-separated: a NUL byte precedes each field and a presence tag
+/// precedes `run_id`, so `None` can never collide with an empty or shifted
+/// field encoding.
+fn deterministic_edge_id(edge: &EdgeDefinition) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"arco-lineage-edge-v1");
+    for part in [
+        edge.source_id.as_str(),
+        edge.target_id.as_str(),
+        edge.edge_type.as_str(),
+    ] {
+        hasher.update([0u8]);
+        hasher.update(part.as_bytes());
+    }
+    hasher.update([0u8]);
+    if let Some(run_id) = edge.run_id.as_deref() {
+        hasher.update([1u8]);
+        hasher.update(run_id.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Lineage edge response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EdgeResponse {
@@ -70,7 +154,8 @@ pub struct EdgeResponse {
 /// Add edges response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AddEdgesResponse {
-    /// Number of edges added.
+    /// Number of unique edges accepted (duplicates within the request and
+    /// across retries converge on the same content-derived edge id).
     pub added: usize,
 }
 
@@ -122,6 +207,8 @@ pub(crate) async fn add_edges(
         "Adding lineage edges"
     );
 
+    validate_edges(&req.edges)?;
+
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let compactor = state
@@ -145,20 +232,24 @@ pub(crate) async fn add_edges(
         options
     };
 
-    // Convert edges (generate IDs and timestamps)
+    // Convert edges: ids are content-derived so duplicate submissions
+    // (within one request or across retries) converge on one edge.
     let now = chrono::Utc::now().timestamp_millis();
-    let edges: Vec<arco_catalog::LineageEdge> = req
-        .edges
-        .into_iter()
-        .map(|e| arco_catalog::LineageEdge {
-            id: Ulid::new().to_string(),
-            source_id: e.source_id,
-            target_id: e.target_id,
-            edge_type: e.edge_type,
-            run_id: e.run_id,
-            created_at: now,
-        })
-        .collect();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut edges: Vec<arco_catalog::LineageEdge> = Vec::with_capacity(req.edges.len());
+    for e in req.edges {
+        let id = deterministic_edge_id(&e);
+        if seen_ids.insert(id.clone()) {
+            edges.push(arco_catalog::LineageEdge {
+                id,
+                source_id: e.source_id,
+                target_id: e.target_id,
+                edge_type: e.edge_type,
+                run_id: e.run_id,
+                created_at: now,
+            });
+        }
+    }
 
     let count = edges.len();
 

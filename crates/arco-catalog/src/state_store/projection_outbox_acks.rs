@@ -11,13 +11,31 @@
 //! no synthetic caller-supplied watermark is involved:
 //!
 //! - [`ProjectionOutboxAckWriter::latest_projected_sequence`] derives the
-//!   watermark from committed ack records (pure KV scan of replayed state; no
-//!   object-store listing).
+//!   watermark from committed ack records plus the per-consumer retired
+//!   watermark (pure KV reads of replayed state; no object-store listing).
 //! - [`ProjectionOutboxWorker`] drains a source domain's outbox through a
 //!   handler, acknowledges processed records, reports freshness/backlog, and
 //!   trims fully-acknowledged records from the source domain so outbox bytes
 //!   stop accumulating through state snapshots. Unacknowledged records are
 //!   never trimmed.
+//!
+//! # Delivery and trim contract
+//!
+//! Drain delivery is **at-least-once**: handlers must be idempotent. A trim
+//! retires the consumer's acknowledgements in the ack domain **before** the
+//! source-domain trim commit (cross-domain ordering: ack-domain commit first,
+//! source-domain commit second). A crash between the two leaves the records
+//! retained with no acknowledgement, so they are re-drained instead of being
+//! lost, and a record id re-staged after a completed trim is a fresh record
+//! that drains normally — retired acknowledgements can never shadow it. The
+//! retired watermark record preserves the consumer's projection watermark
+//! across ack retirement.
+//!
+//! Trim authority is **single-consumer** per source domain: the first
+//! successful drain or trim durably binds the consumer id in the source
+//! domain, and later drains/trims by a different consumer fail closed with a
+//! typed error naming the bound consumer. Operators transfer the binding
+//! deliberately with [`ProjectionOutboxWorker::rebind_consumer`].
 //!
 //! Metric names reserved for the deployed wiring (emitters live with the
 //! operator endpoints): `arco_control_store_outbox_backlog_records`,
@@ -39,11 +57,18 @@ use crate::error::{CatalogError, Result};
 /// State-store domain reserved for projection outbox acknowledgements.
 pub const PROJECTION_OUTBOX_ACK_DOMAIN: &str = "projection-outbox-acks";
 
+/// Reserved source-domain key recording the single consumer bound to
+/// drain/trim authority for that domain's projection outbox.
+pub const PROJECTION_OUTBOX_TRIM_BINDING_KEY: &[u8] = b"projection-outbox/trim-consumer-binding";
+
+const BINDING_REGISTRATION_ATTEMPTS: usize = 4;
+
 /// Internal/operator-only writer for projection outbox acknowledgements.
 #[derive(Clone)]
 pub struct ProjectionOutboxAckWriter {
     store: ControlMvpStateStore,
     scope: StateScope,
+    explicit_epoch: Option<u64>,
 }
 
 impl ProjectionOutboxAckWriter {
@@ -59,7 +84,30 @@ impl ProjectionOutboxAckWriter {
             )));
         }
         let store = ControlMvpStateStore::new(storage, scope.clone())?;
-        Ok(Self { store, scope })
+        Ok(Self {
+            store,
+            scope,
+            explicit_epoch: None,
+        })
+    }
+
+    /// Pins ack-domain commits to an explicit writer epoch instead of the
+    /// default cooperative resolution against the published pointer epoch.
+    #[must_use]
+    pub fn with_writer_epoch(mut self, writer_epoch: u64) -> Self {
+        self.explicit_epoch = Some(writer_epoch);
+        self
+    }
+
+    /// Resolves the store this writer commits through: pinned to the explicit
+    /// epoch when one was configured, otherwise cooperatively adopting the
+    /// currently published ack-domain epoch so the writer survives epoch
+    /// claims by other writers.
+    async fn writer_store(&self) -> Result<ControlMvpStateStore> {
+        match self.explicit_epoch {
+            Some(epoch) => Ok(self.store.clone().with_writer_epoch(epoch)),
+            None => self.store.clone().at_current_writer_epoch().await,
+        }
     }
 
     /// Durably acknowledges one consumed outbox record.
@@ -84,7 +132,8 @@ impl ProjectionOutboxAckWriter {
         }
 
         let mut txn = self
-            .store
+            .writer_store()
+            .await?
             .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
             .await?;
         txn.assert_absent(&key).await?;
@@ -156,10 +205,15 @@ impl ProjectionOutboxAckWriter {
     }
 
     /// Derives the projection watermark for a consumer from committed
-    /// acknowledgements: the highest acknowledged source sequence, or `None`
-    /// when the consumer has never acknowledged anything.
+    /// acknowledgements and the retired-acknowledgement watermark: the
+    /// highest acknowledged source sequence, or `None` when the consumer has
+    /// never acknowledged anything.
     ///
-    /// This is a pure KV scan over replayed state — no object-store listing.
+    /// Retiring acknowledgements during a trim folds their high-water source
+    /// sequence into a per-consumer watermark record, so the derived
+    /// watermark never regresses when consumed records are garbage-collected.
+    ///
+    /// This is a pure KV read over replayed state — no object-store listing.
     ///
     /// # Errors
     ///
@@ -173,7 +227,83 @@ impl ProjectionOutboxAckWriter {
                 latest = Some(record.source_sequence);
             }
         }
+        if let Some(bytes) = self.store.get(&retired_watermark_key(consumer_id)).await? {
+            let watermark = decode_retired_watermark(&bytes)?;
+            if latest.is_none_or(|current| watermark.latest_source_sequence > current) {
+                latest = Some(watermark.latest_source_sequence);
+            }
+        }
         Ok(latest)
+    }
+
+    /// Durably retires acknowledgements for records being trimmed from the
+    /// source domain, folding their high-water source sequence into the
+    /// per-consumer retired watermark so the projection watermark survives
+    /// acknowledgement garbage collection.
+    ///
+    /// Cross-domain ordering contract: callers MUST commit this ack-domain
+    /// retirement BEFORE the source-domain trim commit. A crash between the
+    /// two leaves the records retained with no acknowledgement, so they are
+    /// re-drained (at-least-once) instead of being lost; the reverse order
+    /// would leave acknowledgements shadowing a re-staged record id, which is
+    /// silent record loss.
+    ///
+    /// Idempotent per record: already-retired acknowledgements are skipped,
+    /// so a caller retry after a partial failure converges.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage/CAS errors, or an invariant violation when a retained
+    /// acknowledgement carries a different source sequence than the caller
+    /// observed.
+    pub async fn retire_acknowledgements(
+        &self,
+        consumer_id: &str,
+        records: &[(String, u64)],
+    ) -> Result<Option<StateToken>> {
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let mut txn = self
+            .writer_store()
+            .await?
+            .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
+            .await?;
+        let watermark_key = retired_watermark_key(consumer_id);
+        let mut watermark = match txn.get(&watermark_key).await? {
+            Some(value) => Some(decode_retired_watermark(value.bytes())?.latest_source_sequence),
+            None => None,
+        };
+        for (record_id, source_sequence) in records {
+            let key = ack_key(consumer_id, record_id);
+            // An absent acknowledgement was already retired by an earlier
+            // (partially failed) pass; retirement is idempotent per record.
+            if let Some(value) = txn.get(&key).await? {
+                let record = decode_ack_record(value.bytes())?;
+                if record.source_sequence != *source_sequence {
+                    return Err(invariant_violation(format!(
+                        "projection outbox ack for record {record_id} carries source sequence {} but retirement observed {source_sequence}",
+                        record.source_sequence
+                    )));
+                }
+                txn.delete(&key).await?;
+            }
+            if watermark.is_none_or(|current| *source_sequence > current) {
+                watermark = Some(*source_sequence);
+            }
+        }
+        let Some(watermark) = watermark else {
+            return Ok(None);
+        };
+        txn.put(
+            &watermark_key,
+            encode_retired_watermark(&ProjectionOutboxRetiredWatermark {
+                consumer_id: consumer_id.to_string(),
+                latest_source_sequence: watermark,
+            })?,
+        )
+        .await?;
+        txn.commit().await.map(Some)
     }
 
     /// Returns all acknowledged record ids for a consumer.
@@ -479,11 +609,56 @@ pub struct ProjectionOutboxTrimReport {
     pub trim_sequence: Option<u64>,
 }
 
+/// Result of a deliberate consumer-binding transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionOutboxRebindReport {
+    /// Consumer previously bound to the source domain, when any.
+    pub previous_consumer: Option<String>,
+    /// Source-domain sequence of the rebind commit, when one was made.
+    pub rebind_sequence: Option<u64>,
+}
+
+/// Durable single-consumer binding stored in the source domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectionOutboxConsumerBinding {
+    consumer_id: String,
+}
+
+/// Per-consumer watermark preserved when acknowledgements are retired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectionOutboxRetiredWatermark {
+    consumer_id: String,
+    latest_source_sequence: u64,
+}
+
 /// Internal/operator-only consumer harness for a source domain's outbox.
 ///
 /// Drains records through a handler, acknowledges them durably, and trims
 /// fully-acknowledged records so outbox bytes stop accumulating through
 /// state snapshots.
+///
+/// # Delivery contract
+///
+/// Drain delivery is **at-least-once**; handlers must be idempotent. A trim
+/// retires this consumer's acknowledgements in the ack domain before the
+/// source-domain trim commit, so a crash between the two commits re-drains
+/// the affected records instead of losing them.
+///
+/// # Trim authority
+///
+/// Trim authority is single-consumer per source domain: the first successful
+/// drain or trim registers this worker's consumer id as a KV record in the
+/// source domain, and later drains/trims by a different consumer fail closed
+/// with a typed error naming the bound consumer. Use
+/// [`Self::rebind_consumer`] to transfer the binding deliberately.
+///
+/// # Fencing
+///
+/// Source- and ack-domain commits resolve their writer epoch cooperatively
+/// against the published pointer epoch by default, so the worker keeps
+/// functioning after another writer claims a higher epoch. Operators can pin
+/// an explicit epoch with [`Self::with_writer_epoch`].
 ///
 /// Trim commits are store-maintenance writes to the source domain executed
 /// through the same pointer-CAS publish protocol as the domain writer;
@@ -493,6 +668,7 @@ pub struct ProjectionOutboxWorker {
     source_scope: StateScope,
     acks: ProjectionOutboxAckWriter,
     consumer_id: String,
+    explicit_epoch: Option<u64>,
 }
 
 impl ProjectionOutboxWorker {
@@ -527,13 +703,146 @@ impl ProjectionOutboxWorker {
             source_scope,
             acks,
             consumer_id: consumer_id.into(),
+            explicit_epoch: None,
         })
+    }
+
+    /// Pins source- and ack-domain commits to an explicit writer epoch
+    /// instead of the default cooperative resolution against each domain's
+    /// published pointer epoch.
+    #[must_use]
+    pub fn with_writer_epoch(mut self, writer_epoch: u64) -> Self {
+        self.explicit_epoch = Some(writer_epoch);
+        self.acks = self.acks.with_writer_epoch(writer_epoch);
+        self
     }
 
     /// Returns the acknowledgement writer bound to this worker.
     #[must_use]
     pub const fn acks(&self) -> &ProjectionOutboxAckWriter {
         &self.acks
+    }
+
+    /// Resolves the store source-domain commits go through: pinned to the
+    /// explicit epoch when one was configured, otherwise cooperatively
+    /// adopting the currently published source-domain epoch.
+    async fn source_writer(&self) -> Result<ControlMvpStateStore> {
+        match self.explicit_epoch {
+            Some(epoch) => Ok(self.source.clone().with_writer_epoch(epoch)),
+            None => self.source.clone().at_current_writer_epoch().await,
+        }
+    }
+
+    /// Returns the consumer currently bound to this source domain's
+    /// drain/trim authority, when any.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage errors or corrupt-artifact failures.
+    pub async fn bound_consumer(&self) -> Result<Option<String>> {
+        // A source domain with no committed state replays to the default
+        // empty state, so this reads as `None` without creating anything.
+        match self.source.get(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await? {
+            Some(bytes) => Ok(Some(decode_binding(&bytes)?.consumer_id)),
+            None => Ok(None),
+        }
+    }
+
+    /// Enforces the single-consumer binding for destructive operations and
+    /// registers this worker's consumer id when the domain is unbound.
+    ///
+    /// Registration is skipped while the source domain has no committed
+    /// state, so probing an empty (or misspelled) domain never creates one.
+    async fn ensure_binding(&self) -> Result<()> {
+        if self.source_committed_sequence().await?.is_none() {
+            return Ok(());
+        }
+        for _ in 0..BINDING_REGISTRATION_ATTEMPTS {
+            match self.bound_consumer().await? {
+                Some(bound) if bound == self.consumer_id => return Ok(()),
+                Some(bound) => {
+                    return Err(trim_consumer_conflict(
+                        self.source_scope.domain(),
+                        &bound,
+                        &self.consumer_id,
+                    ));
+                }
+                None => {}
+            }
+            let mut txn = self
+                .source_writer()
+                .await?
+                .begin_control_txn(TxnOptions::new(Some(self.source_scope.clone())))
+                .await?;
+            match txn.assert_absent(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await {
+                Ok(()) => {}
+                // Another worker registered between the read and this begin;
+                // loop to re-read and compare consumer identities.
+                Err(CatalogError::PreconditionFailed { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+            txn.put(
+                PROJECTION_OUTBOX_TRIM_BINDING_KEY,
+                encode_binding(&self.consumer_id)?,
+            )
+            .await?;
+            match txn.commit().await {
+                Ok(_) => return Ok(()),
+                // Lost the pointer race; loop to re-read the (possibly
+                // foreign) binding and either accept it or fail closed.
+                Err(CatalogError::CasFailed { .. } | CatalogError::PreconditionFailed { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CatalogError::CasFailed {
+            message: "projection outbox consumer-binding registration lost repeated pointer races"
+                .to_string(),
+        })
+    }
+
+    /// Deliberately rebinds this source domain's drain/trim authority to this
+    /// worker's consumer id, reporting the previous binding.
+    ///
+    /// This is the operator escape hatch for the single-consumer trim
+    /// semantics; it must only be used when the previous consumer is known to
+    /// be retired, because records it never acknowledged become trimmable by
+    /// the new consumer.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or CAS errors.
+    pub async fn rebind_consumer(&self) -> Result<ProjectionOutboxRebindReport> {
+        if self.source_committed_sequence().await?.is_none() {
+            return Err(validation_failed(format!(
+                "cannot rebind projection outbox consumer: source domain {} has no committed state",
+                self.source_scope.domain()
+            )));
+        }
+        let mut txn = self
+            .source_writer()
+            .await?
+            .begin_control_txn(TxnOptions::new(Some(self.source_scope.clone())))
+            .await?;
+        let previous_consumer = match txn.get(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await? {
+            Some(value) => Some(decode_binding(value.bytes())?.consumer_id),
+            None => None,
+        };
+        if previous_consumer.as_deref() == Some(self.consumer_id.as_str()) {
+            return Ok(ProjectionOutboxRebindReport {
+                previous_consumer,
+                rebind_sequence: None,
+            });
+        }
+        txn.put(
+            PROJECTION_OUTBOX_TRIM_BINDING_KEY,
+            encode_binding(&self.consumer_id)?,
+        )
+        .await?;
+        let token = txn.commit().await?;
+        Ok(ProjectionOutboxRebindReport {
+            previous_consumer,
+            rebind_sequence: Some(token.logical_sequence()),
+        })
     }
 
     /// Reports the current backlog for this consumer.
@@ -562,17 +871,24 @@ impl ProjectionOutboxWorker {
 
     /// Drains unacknowledged records through the handler in replay order.
     ///
+    /// Delivery is at-least-once: a record whose acknowledgement was retired
+    /// by an interrupted trim is redelivered, so handlers must be idempotent.
     /// Each record is processed before it is acknowledged; a handler error
     /// aborts the pass with earlier acknowledgements already durable, so a
     /// retry resumes exactly where processing stopped.
     ///
+    /// The first successful drain registers this worker's consumer id as the
+    /// source domain's single drain/trim consumer; a drain by a different
+    /// consumer fails closed naming the bound consumer.
+    ///
     /// # Errors
     ///
-    /// Returns handler, storage, or CAS errors.
+    /// Returns handler, storage, CAS, or consumer-binding errors.
     pub async fn drain(
         &self,
         handler: &dyn ProjectionOutboxHandler,
     ) -> Result<ProjectionOutboxDrainReport> {
+        self.ensure_binding().await?;
         let outbox = self.source.current_projection_outbox().await?;
         let acked = self.acks.acknowledged_record_ids(&self.consumer_id).await?;
         let mut drained_record_ids = Vec::new();
@@ -613,27 +929,84 @@ impl ProjectionOutboxWorker {
     /// unacknowledged records are never staged. Token-pinned reads of retained
     /// history continue to observe trimmed records.
     ///
+    /// Cross-domain ordering: the consumer's acknowledgements for the trimmed
+    /// records are retired first (ack-domain commit), then the records are
+    /// trimmed (source-domain commit). A crash or CAS loss between the two
+    /// leaves the records retained with no acknowledgement, so the next drain
+    /// redelivers them (at-least-once) instead of losing them, and a record
+    /// id re-staged after a completed trim is a fresh record no retired
+    /// acknowledgement can shadow.
+    ///
+    /// The first successful trim registers this worker's consumer id as the
+    /// source domain's single drain/trim consumer (within the trim commit
+    /// itself); a trim by a different consumer fails closed naming the bound
+    /// consumer.
+    ///
     /// # Errors
     ///
-    /// Returns storage or CAS errors.
+    /// Returns storage, CAS, or consumer-binding errors.
     pub async fn trim_acked(&self) -> Result<ProjectionOutboxTrimReport> {
+        if let Some(bound) = self.bound_consumer().await?
+            && bound != self.consumer_id
+        {
+            return Err(trim_consumer_conflict(
+                self.source_scope.domain(),
+                &bound,
+                &self.consumer_id,
+            ));
+        }
         let outbox = self.source.current_projection_outbox().await?;
         let acked = self.acks.acknowledged_record_ids(&self.consumer_id).await?;
-        let trimmed_record_ids: Vec<String> = outbox
+        let trimmed: Vec<(String, u64)> = outbox
             .iter()
             .filter(|record| acked.contains(&record.record_id().to_string()))
-            .map(|record| record.record_id().to_string())
-            .collect();
+            .map(|record| {
+                let origin_sequence = record.origin_sequence().ok_or_else(|| {
+                    invariant_violation(
+                        "projection outbox record read from state carries no origin sequence",
+                    )
+                })?;
+                Ok((record.record_id().to_string(), origin_sequence))
+            })
+            .collect::<Result<_>>()?;
+        let trimmed_record_ids: Vec<String> = trimmed.iter().map(|(id, _)| id.clone()).collect();
         if trimmed_record_ids.is_empty() {
             return Ok(ProjectionOutboxTrimReport {
                 trimmed_record_ids,
                 trim_sequence: None,
             });
         }
+        // Ack-domain commit FIRST: retire the acknowledgements so no ack can
+        // outlive its trimmed record (see the cross-domain ordering contract
+        // in the method docs).
+        self.acks
+            .retire_acknowledgements(&self.consumer_id, &trimmed)
+            .await?;
+        // Source-domain commit SECOND: remove the records from replayed state.
         let mut txn = self
-            .source
+            .source_writer()
+            .await?
             .begin_control_txn(TxnOptions::new(Some(self.source_scope.clone())))
             .await?;
+        match txn.get(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await? {
+            Some(value) => {
+                let bound = decode_binding(value.bytes())?.consumer_id;
+                if bound != self.consumer_id {
+                    return Err(trim_consumer_conflict(
+                        self.source_scope.domain(),
+                        &bound,
+                        &self.consumer_id,
+                    ));
+                }
+            }
+            None => {
+                txn.put(
+                    PROJECTION_OUTBOX_TRIM_BINDING_KEY,
+                    encode_binding(&self.consumer_id)?,
+                )
+                .await?;
+            }
+        }
         txn.trim_projection_outbox(trimmed_record_ids.clone())?;
         let token = txn.commit().await?;
         Ok(ProjectionOutboxTrimReport {
@@ -694,6 +1067,52 @@ fn ack_key(consumer_id: &str, record_id: &str) -> Vec<u8> {
     key
 }
 
+fn retired_watermark_key(consumer_id: &str) -> Vec<u8> {
+    let mut key = b"projection-outbox-acks/watermark/".to_vec();
+    push_length_prefixed(&mut key, consumer_id.as_bytes());
+    key
+}
+
+fn encode_binding(consumer_id: &str) -> Result<Bytes> {
+    serde_json::to_vec(&ProjectionOutboxConsumerBinding {
+        consumer_id: consumer_id.to_string(),
+    })
+    .map(Bytes::from)
+    .map_err(|error| serialization_failed(format!("projection consumer binding encode: {error}")))
+}
+
+fn decode_binding(bytes: &Bytes) -> Result<ProjectionOutboxConsumerBinding> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        serialization_failed(format!("projection consumer binding decode: {error}"))
+    })
+}
+
+fn encode_retired_watermark(record: &ProjectionOutboxRetiredWatermark) -> Result<Bytes> {
+    serde_json::to_vec(record)
+        .map(Bytes::from)
+        .map_err(|error| {
+            serialization_failed(format!("projection retired watermark encode: {error}"))
+        })
+}
+
+fn decode_retired_watermark(bytes: &Bytes) -> Result<ProjectionOutboxRetiredWatermark> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        serialization_failed(format!("projection retired watermark decode: {error}"))
+    })
+}
+
+fn trim_consumer_conflict(domain: &str, bound: &str, requested: &str) -> CatalogError {
+    CatalogError::PreconditionFailed {
+        message: format!(
+            "projection outbox source domain {domain} is bound to consumer {bound}; \
+             drain/trim by consumer {requested} is refused because trim authority is \
+             single-consumer (a second consumer would silently lose records trimmed \
+             before it acknowledged them); rebind deliberately with the force-rebind \
+             option to transfer trim authority"
+        ),
+    }
+}
+
 fn push_length_prefixed(key: &mut Vec<u8>, value: &[u8]) {
     key.extend_from_slice(value.len().to_string().as_bytes());
     key.push(b':');
@@ -732,8 +1151,8 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
@@ -785,6 +1204,14 @@ mod tests {
     }
 
     async fn commit_source_record(storage: &ScopedStorage, record_id: &str) -> StateToken {
+        commit_source_record_with_payload(storage, record_id, br#"{"projection":"phase5"}"#).await
+    }
+
+    async fn commit_source_record_with_payload(
+        storage: &ScopedStorage,
+        record_id: &str,
+        payload: &'static [u8],
+    ) -> StateToken {
         let scope = StateScope::new("tenant", "workspace", SOURCE_DOMAIN);
         let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("source");
         let mut txn = store
@@ -799,9 +1226,35 @@ mod tests {
         .expect("stage row");
         txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
             record_id.to_string(),
-            Bytes::from_static(br#"{"projection":"phase5"}"#),
-        ));
+            Bytes::from_static(payload),
+        ))
+        .expect("stage outbox record");
         txn.commit().await.expect("commit source record")
+    }
+
+    #[derive(Default)]
+    struct RecordingProjectionHandler {
+        payloads: Mutex<Vec<Bytes>>,
+    }
+
+    impl RecordingProjectionHandler {
+        fn payloads(&self) -> Vec<Bytes> {
+            self.payloads
+                .lock()
+                .expect("recording handler lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl ProjectionOutboxHandler for RecordingProjectionHandler {
+        async fn process(&self, record: &ControlMvpProjectionOutboxRecord) -> Result<()> {
+            self.payloads
+                .lock()
+                .expect("recording handler lock")
+                .push(record.payload().clone());
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -1319,18 +1772,21 @@ mod tests {
         let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
             .expect("worker");
 
-        // Consumer processes the first record, then "stops".
+        // Consumer processes the first record, then "stops". The first drain
+        // also registers the single-consumer trim binding, which is one
+        // source-domain maintenance commit, so ack-derived freshness honestly
+        // reports that commit as not-yet-projected.
         let first = commit_source_record(&storage, "record-1").await;
         worker
             .drain(&AckOnlyProjectionHandler)
             .await
             .expect("initial drain");
         assert_eq!(
-            ProjectionOutboxAckFreshness::Current {
-                committed_sequence: first.logical_sequence(),
+            ProjectionOutboxAckFreshness::StaleProjection {
+                committed_sequence: first.logical_sequence() + 1,
                 latest_projected_sequence: first.logical_sequence(),
             },
-            worker.freshness().await.expect("fresh after drain")
+            worker.freshness().await.expect("freshness after drain")
         );
 
         // Outage window: source commits keep succeeding with no consumer.
@@ -1376,6 +1832,350 @@ mod tests {
                 .pending_record_ids
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn restaged_record_id_after_trim_is_a_fresh_record_and_drains_normally() {
+        let storage = storage();
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        commit_source_record_with_payload(&storage, "record-r", br#"{"payload":"a"}"#).await;
+
+        let first = worker
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("first drain");
+        assert_eq!(vec!["record-r".to_string()], first.drained_record_ids);
+        let trim = worker.trim_acked().await.expect("trim");
+        assert_eq!(vec!["record-r".to_string()], trim.trimmed_record_ids);
+
+        // H1 reproduction: the same record id staged again with a different
+        // payload must be handed to the handler as a fresh record, not
+        // swallowed as already-acknowledged and then trimmed unseen.
+        commit_source_record_with_payload(&storage, "record-r", br#"{"payload":"b"}"#).await;
+        let handler = RecordingProjectionHandler::default();
+        let second = worker.drain(&handler).await.expect("second drain");
+        assert_eq!(vec!["record-r".to_string()], second.drained_record_ids);
+        assert_eq!(0, second.already_acknowledged);
+        assert_eq!(
+            vec![Bytes::from_static(br#"{"payload":"b"}"#)],
+            handler.payloads()
+        );
+
+        // The re-staged record trims normally and the retired watermark never
+        // regressed the derived projection watermark.
+        let second_trim = worker.trim_acked().await.expect("second trim");
+        assert_eq!(vec!["record-r".to_string()], second_trim.trimmed_record_ids);
+        assert_eq!(
+            Some(4),
+            worker
+                .acks()
+                .latest_projected_sequence("consumer-a")
+                .await
+                .expect("watermark survives ack retirement")
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_retirement_before_trim_crash_redelivers_instead_of_losing() {
+        let backend = Arc::new(FailOncePutBackend::new(
+            Arc::new(MemoryBackend::new()),
+            "/control-mvp/phase5-source/current.pointer.json",
+        ));
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        commit_source_record(&storage, "record-1").await;
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        let handler = RecordingProjectionHandler::default();
+        worker.drain(&handler).await.expect("first drain");
+
+        // Crash window: the ack-domain retirement commits, then the
+        // source-domain trim pointer CAS fails.
+        backend.arm();
+        let error = worker
+            .trim_acked()
+            .await
+            .expect_err("injected crash after ack retirement must interrupt the trim");
+        assert!(
+            matches!(error, CatalogError::Storage { .. }),
+            "unexpected error: {error:?}"
+        );
+
+        // At-least-once: the record is still retained, its acknowledgement is
+        // retired, so it is redelivered rather than lost.
+        let backlog = worker.backlog().await.expect("backlog after crash");
+        assert_eq!(vec!["record-1".to_string()], backlog.pending_record_ids);
+        let redelivery = worker.drain(&handler).await.expect("redelivery drain");
+        assert_eq!(vec!["record-1".to_string()], redelivery.drained_record_ids);
+        assert_eq!(2, handler.payloads().len());
+        assert_eq!(
+            Some(1),
+            worker
+                .acks()
+                .latest_projected_sequence("consumer-a")
+                .await
+                .expect("watermark preserved across retirement")
+        );
+
+        // The retried trim converges.
+        let trim = worker.trim_acked().await.expect("trim retry");
+        assert_eq!(vec!["record-1".to_string()], trim.trimmed_record_ids);
+        assert!(
+            worker
+                .backlog()
+                .await
+                .expect("final backlog")
+                .pending_record_ids
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn second_consumer_drain_and_trim_fail_closed_on_bound_domain() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+        let worker_a = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker a");
+        worker_a
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("first drain registers the binding");
+        assert_eq!(
+            Some("consumer-a".to_string()),
+            worker_a.bound_consumer().await.expect("binding")
+        );
+
+        let worker_b = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-b")
+            .expect("worker b");
+        let drain_error = worker_b
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect_err("second consumer drain must fail closed");
+        assert!(
+            matches!(&drain_error, CatalogError::PreconditionFailed { message }
+                if message.contains("consumer-a") && message.contains("single-consumer")),
+            "unexpected error: {drain_error:?}"
+        );
+        let trim_error = worker_b
+            .trim_acked()
+            .await
+            .expect_err("second consumer trim must fail closed");
+        assert!(
+            matches!(&trim_error, CatalogError::PreconditionFailed { message }
+                if message.contains("consumer-a")),
+            "unexpected error: {trim_error:?}"
+        );
+
+        // The bound consumer keeps functioning.
+        let trim = worker_a.trim_acked().await.expect("bound consumer trim");
+        assert_eq!(vec!["record-1".to_string()], trim.trimmed_record_ids);
+    }
+
+    #[tokio::test]
+    async fn deliberate_rebind_transfers_trim_authority_and_reports_previous_binding() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+        let worker_a = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker a");
+        worker_a
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("bind consumer-a");
+
+        let worker_b = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-b")
+            .expect("worker b");
+        let rebind = worker_b.rebind_consumer().await.expect("rebind");
+        assert_eq!(Some("consumer-a".to_string()), rebind.previous_consumer);
+        assert!(rebind.rebind_sequence.is_some());
+
+        let report = worker_b
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("rebound consumer drains");
+        assert_eq!(vec!["record-1".to_string()], report.drained_record_ids);
+        let error = worker_a
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect_err("previous consumer must fail closed after rebind");
+        assert!(
+            matches!(&error, CatalogError::PreconditionFailed { message }
+                if message.contains("consumer-b")),
+            "unexpected error: {error:?}"
+        );
+
+        // Rebinding to the already-bound consumer reports it without a commit.
+        let idempotent = worker_b.rebind_consumer().await.expect("idempotent rebind");
+        assert_eq!(Some("consumer-b".to_string()), idempotent.previous_consumer);
+        assert_eq!(None, idempotent.rebind_sequence);
+    }
+
+    #[tokio::test]
+    async fn consumer_binding_survives_replay_in_fresh_store_instances() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+        let worker_a = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker a");
+        worker_a
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("bind consumer-a");
+
+        // Fresh worker instances replay the binding from durable state.
+        let fresh_b = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-b")
+            .expect("fresh worker b");
+        let error = fresh_b
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect_err("binding must survive replay");
+        assert!(
+            matches!(&error, CatalogError::PreconditionFailed { message }
+                if message.contains("consumer-a")),
+            "unexpected error: {error:?}"
+        );
+        let fresh_a = ProjectionOutboxWorker::new(storage, SOURCE_DOMAIN, "consumer-a")
+            .expect("fresh worker a");
+        fresh_a
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("bound consumer functions after replay");
+    }
+
+    #[tokio::test]
+    async fn worker_survives_writer_epoch_fencing_and_stale_explicit_epoch_fails_closed() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+
+        // Another writer claims fencing authority over the source domain.
+        let source_scope = StateScope::new("tenant", "workspace", SOURCE_DOMAIN);
+        let claimed = ControlMvpStateStore::new(storage.clone(), source_scope.clone())
+            .expect("source store")
+            .claim_writer_authority()
+            .await
+            .expect("claim source epoch");
+        assert_eq!(1, claimed.writer_epoch());
+
+        // Cooperative default: the worker adopts the published epoch and
+        // keeps draining and trimming.
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        let report = worker
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("cooperative drain after source fencing");
+        assert_eq!(vec!["record-1".to_string()], report.drained_record_ids);
+        let trim = worker
+            .trim_acked()
+            .await
+            .expect("cooperative trim after source fencing");
+        assert_eq!(vec!["record-1".to_string()], trim.trimmed_record_ids);
+
+        // The ack domain fences independently; the worker adopts its
+        // published epoch cooperatively too.
+        let ack_store = ControlMvpStateStore::new(storage.clone(), ack_scope())
+            .expect("ack store")
+            .claim_writer_authority()
+            .await
+            .expect("claim ack epoch");
+        assert_eq!(1, ack_store.writer_epoch());
+        let mut txn = claimed
+            .begin_control_txn(TxnOptions::new(Some(source_scope.clone())))
+            .await
+            .expect("begin record-2");
+        txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-2",
+            Bytes::from_static(b"{}"),
+        ))
+        .expect("stage record-2");
+        txn.commit().await.expect("commit record-2");
+        let report = worker
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("cooperative drain after ack fencing");
+        assert_eq!(vec!["record-2".to_string()], report.drained_record_ids);
+
+        // An explicit epoch below the published one still fails closed with
+        // the typed fencing error.
+        let mut txn = claimed
+            .begin_control_txn(TxnOptions::new(Some(source_scope)))
+            .await
+            .expect("begin record-3");
+        txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-3",
+            Bytes::from_static(b"{}"),
+        ))
+        .expect("stage record-3");
+        txn.commit().await.expect("commit record-3");
+        let pinned = ProjectionOutboxWorker::new(storage, SOURCE_DOMAIN, "consumer-a")
+            .expect("pinned worker")
+            .with_writer_epoch(0);
+        let error = pinned
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect_err("stale explicit epoch must fail closed");
+        assert!(
+            matches!(error, CatalogError::StaleWriterEpoch { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    struct FailOncePutBackend {
+        inner: Arc<dyn StorageBackend>,
+        needle: String,
+        armed: AtomicBool,
+    }
+
+    impl FailOncePutBackend {
+        fn new(inner: Arc<dyn StorageBackend>, needle: &str) -> Self {
+            Self {
+                inner,
+                needle: needle.to_string(),
+                armed: AtomicBool::new(false),
+            }
+        }
+
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FailOncePutBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path.contains(&self.needle) && self.armed.swap(false, Ordering::SeqCst) {
+                return Err(arco_core::Error::storage("injected trim crash point"));
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
     }
 
     #[tokio::test]

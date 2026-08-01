@@ -372,10 +372,12 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
         .put(b"catalog/default", Bytes::from_static(b"stale"))
         .await
         .expect("stage stale write");
-    stale_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "stale-outbox",
-        Bytes::from_static(b"stale"),
-    ));
+    stale_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "stale-outbox",
+            Bytes::from_static(b"stale"),
+        ))
+        .expect("stage outbox record");
     let stale_tx_id = stale_txn.tx_id().to_string();
     let stale_manifest_id = stale_txn.candidate_manifest_id().to_string();
 
@@ -387,10 +389,12 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
         .put(b"catalog/default", Bytes::from_static(b"winner"))
         .await
         .expect("stage winning write");
-    winning_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "winning-outbox",
-        Bytes::from_static(b"winner"),
-    ));
+    winning_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "winning-outbox",
+            Bytes::from_static(b"winner"),
+        ))
+        .expect("stage outbox record");
     let winning_token = winning_txn.commit().await.expect("commit winner");
 
     let stale_error = stale_txn
@@ -446,10 +450,12 @@ async fn unreachable_manifest_artifacts_are_invisible_without_pointer_reachabili
         .put(b"catalog/hidden", Bytes::from_static(b"stale"))
         .await
         .expect("stage stale write");
-    stale_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "hidden-outbox",
-        Bytes::from_static(b"hidden"),
-    ));
+    stale_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "hidden-outbox",
+            Bytes::from_static(b"hidden"),
+        ))
+        .expect("stage outbox record");
 
     let mut winning_txn = store
         .begin_control_txn(TxnOptions::default().with_request_id("winning"))
@@ -604,29 +610,35 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin first transaction");
-    first_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "first",
-        Bytes::from_static(b"payload-1"),
-    ));
+    first_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "first",
+            Bytes::from_static(b"payload-1"),
+        ))
+        .expect("stage outbox record");
     let first_token = first_txn.commit().await.expect("commit first");
 
     let mut stale_txn = store
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin stale transaction");
-    stale_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "stale",
-        Bytes::from_static(b"payload-stale"),
-    ));
+    stale_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "stale",
+            Bytes::from_static(b"payload-stale"),
+        ))
+        .expect("stage outbox record");
 
     let mut winning_txn = store
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin winning transaction");
-    winning_txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        "second",
-        Bytes::from_static(b"payload-2"),
-    ));
+    winning_txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "second",
+            Bytes::from_static(b"payload-2"),
+        ))
+        .expect("stage outbox record");
     let second_token = winning_txn.commit().await.expect("commit second");
     assert!(matches!(
         stale_txn.commit().await,
@@ -2295,5 +2307,334 @@ async fn corrupt_state_snapshot_objects_fail_closed() {
             .get(b"catalog/default")
             .await
             .expect("restored snapshot reads again")
+    );
+}
+
+#[test]
+fn with_writer_epoch_saturates_below_max_so_claims_cannot_overflow() {
+    let (_backend, storage) = storage();
+    let saturated = store(storage).with_writer_epoch(u64::MAX);
+    assert_eq!(u64::MAX - 1, saturated.writer_epoch());
+}
+
+#[tokio::test]
+async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_trimmable() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+
+    // Duplicate staging within one transaction fails with the typed error.
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+        "record-r",
+        Bytes::from_static(b"payload-a"),
+    ))
+    .expect("first staging");
+    let error = txn
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-r",
+            Bytes::from_static(b"payload-dup"),
+        ))
+        .expect_err("duplicate staging within a transaction must fail");
+    assert!(
+        matches!(error, CatalogError::AlreadyExists { .. }),
+        "unexpected error: {error:?}"
+    );
+    let winning_token = txn.commit().await.expect("commit winner");
+
+    // Concurrent duplicate staging: both transactions began before either
+    // committed; exactly one wins the pointer CAS, and the loser's retry
+    // revalidates against the winning state and gets the typed error.
+    let mut loser = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin loser");
+    loser
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-s",
+            Bytes::from_static(b"loser"),
+        ))
+        .expect("loser stages a fresh id against its base");
+    let mut concurrent_winner = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin concurrent winner");
+    concurrent_winner
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-s",
+            Bytes::from_static(b"winner"),
+        ))
+        .expect("winner stages the same id concurrently");
+    concurrent_winner
+        .commit()
+        .await
+        .expect("concurrent winner commits");
+    assert!(matches!(
+        loser.commit().await,
+        Err(CatalogError::CasFailed { .. })
+    ));
+    let mut retry = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin retry");
+    let error = retry
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-s",
+            Bytes::from_static(b"retry"),
+        ))
+        .expect_err("retry against the winning state must reject the duplicate id");
+    assert!(
+        matches!(&error, CatalogError::AlreadyExists { entity, name }
+            if entity == "projection outbox record" && name == "record-s"),
+        "unexpected error: {error:?}"
+    );
+
+    // Exactly one record per id is retained, so acknowledgement and trimming
+    // stay functional: the domain cannot be wedged untrimmable.
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("current outbox");
+    assert_eq!(
+        vec!["record-r".to_string(), "record-s".to_string()],
+        outbox
+            .iter()
+            .map(|record| record.record_id().to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(1, winning_token.logical_sequence());
+    let mut trim_txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin trim");
+    trim_txn
+        .trim_projection_outbox(vec!["record-r".to_string(), "record-s".to_string()])
+        .expect("trim stays functional");
+    trim_txn.commit().await.expect("commit trim");
+    assert!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox after trim")
+            .is_empty()
+    );
+
+    // A trimmed id is re-stageable as a fresh record.
+    let mut restage = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin restage");
+    restage
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-r",
+            Bytes::from_static(b"payload-b"),
+        ))
+        .expect("trimmed id is stageable again");
+    restage.commit().await.expect("commit restage");
+}
+
+#[tokio::test]
+async fn restore_inspection_stays_visible_across_anchor_boundaries() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000010", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan");
+    let applied = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect("apply");
+    let RestoreParticipantInspection::Visible { token, .. } = applied else {
+        panic!("restore must become visible");
+    };
+    assert_eq!(3, token.logical_sequence());
+
+    // Commit past at least two replay-anchor boundaries so the bounded
+    // transaction suffix no longer covers the restore transaction.
+    for index in 0..6 {
+        commit_value(&store, b"catalog/later", &format!("v{index}")).await;
+    }
+
+    let inspection = adapter
+        .inspect_restore(&plan)
+        .await
+        .expect("anchor-crossing inspect");
+    let RestoreParticipantInspection::Visible { token, evidence } = inspection else {
+        panic!(
+            "an applied restore must remain Visible across anchor boundaries, got Superseded/Ready"
+        );
+    };
+    assert_eq!(3, token.logical_sequence());
+    assert_eq!(3, evidence.logical_sequence());
+}
+
+#[tokio::test]
+async fn genuinely_superseded_restore_stays_superseded_across_anchor_boundaries() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000011", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan");
+
+    // A foreign writer wins the planned sequence, then history keeps moving
+    // across anchor boundaries.
+    let mut foreign = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("foreign transaction");
+    foreign
+        .put(b"catalog/foreign", Bytes::from_static(b"winner"))
+        .await
+        .expect("foreign write");
+    foreign.commit().await.expect("foreign commit");
+    for index in 0..6 {
+        commit_value(&store, b"catalog/later", &format!("v{index}")).await;
+    }
+
+    assert!(matches!(
+        adapter
+            .inspect_restore(&plan)
+            .await
+            .expect("anchor-crossing superseded inspect"),
+        RestoreParticipantInspection::Superseded
+    ));
+    assert!(matches!(
+        adapter
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("superseded apply"),
+        RestoreParticipantInspection::Superseded
+    ));
+}
+
+#[tokio::test]
+async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recoverable() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(FailOncePathBackend::new(inner, "/current.pointer.json"));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+    let paths = ControlMvpPaths::new("catalog");
+
+    commit_value(&store, b"catalog/default", "v1").await;
+
+    // Torn boundary state: the transaction object, the anchor snapshot, and
+    // the manifest ARE persisted, but the pointer CAS fails.
+    backend.arm();
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin boundary transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"torn"))
+        .await
+        .expect("stage boundary write");
+    let torn_manifest_id = txn.candidate_manifest_id().to_string();
+    assert!(
+        txn.commit().await.is_err(),
+        "injected pointer crash must interrupt the boundary commit"
+    );
+
+    let torn_state_id = torn_manifest_id.replace("manifest-", "state-");
+    storage
+        .get_raw(&paths.state_object(&torn_state_id))
+        .await
+        .expect("the torn boundary's anchor snapshot IS persisted");
+    storage
+        .get_raw(&paths.manifest_object(&torn_manifest_id))
+        .await
+        .expect("the torn boundary's manifest IS persisted");
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("torn boundary commit is not visible")
+    );
+    assert_eq!(
+        1,
+        store
+            .current_state_token()
+            .await
+            .expect("current token")
+            .logical_sequence()
+    );
+
+    // The writer retries: the retried boundary anchors its own snapshot and
+    // publishes; the orphaned snapshot is inert.
+    commit_value(&store, b"catalog/default", "v2").await;
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("retried boundary commit is visible without checksum failures")
+    );
+    let recovered_token = store.current_state_token().await.expect("recovered token");
+    assert_eq!(2, recovered_token.logical_sequence());
+    assert_ne!(torn_manifest_id, recovered_token.authority_manifest_id());
+    let manifest_bytes = storage
+        .get_raw(&paths.manifest_object(recovered_token.authority_manifest_id()))
+        .await
+        .expect("recovered manifest object");
+    let manifest_json: Value = serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    assert_eq!(
+        Value::String(
+            recovered_token
+                .authority_manifest_id()
+                .replace("manifest-", "state-")
+        ),
+        manifest_json["payload"]["anchor_state"]["state_id"],
+        "the recovered boundary must anchor its own snapshot, not the orphan"
+    );
+    storage
+        .get_raw(&paths.state_object(&torn_state_id))
+        .await
+        .expect("the orphaned snapshot remains physically present but unreferenced");
+
+    // Replay stays bounded and checksum-clean through further boundaries.
+    for index in 3..8 {
+        commit_value(&store, b"catalog/default", &format!("v{index}")).await;
+    }
+    assert_eq!(
+        Some(Bytes::from_static(b"v7")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("post-recovery reads replay through the recovered anchors")
+    );
+    let final_token = store.current_state_token().await.expect("final token");
+    let final_manifest = storage
+        .get_raw(&paths.manifest_object(final_token.authority_manifest_id()))
+        .await
+        .expect("final manifest object");
+    let final_json: Value = serde_json::from_slice(&final_manifest).expect("final manifest json");
+    assert!(
+        final_json["payload"]["tx_refs"]
+            .as_array()
+            .is_some_and(|refs| refs.len() <= 2),
+        "replay suffix must stay bounded by the checkpoint interval"
     );
 }

@@ -2054,7 +2054,8 @@ mod tests {
         txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
             "record-1",
             Bytes::from_static(b"{}"),
-        ));
+        ))
+        .expect("stage outbox record");
         txn.commit().await.expect("commit source record");
 
         // Enabled: drain + trim through the operator endpoint.
@@ -2100,6 +2101,104 @@ mod tests {
             json["freshness"]
                 .as_str()
                 .is_some_and(|value| value.contains("StaleProjection")),
+            "unexpected body: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_store_outbox_endpoint_enforces_consumer_binding_and_force_rebind() {
+        use arco_catalog::ArcoStateTxn;
+        use arco_catalog::state_store::{
+            ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, TxnOptions,
+        };
+
+        let state = test_state();
+        let scope = StateScope::new("acme", "analytics", "phase5-source");
+        let store =
+            ControlMvpStateStore::new(state.storage.clone(), scope.clone()).expect("control store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::new(Some(scope)))
+            .await
+            .expect("begin txn");
+        txn.put(b"row/record-1", Bytes::from_static(b"{}"))
+            .await
+            .expect("stage row");
+        txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-1",
+            Bytes::from_static(b"{}"),
+        ))
+        .expect("stage outbox record");
+        txn.commit().await.expect("commit source record");
+
+        let router = build_router(state, None, None, true);
+        let post = |body: &'static str| {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/control-store/projection-outbox")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request build failed")
+        };
+
+        // consumer-a's first drain registers the single-consumer binding.
+        let response = router
+            .clone()
+            .oneshot(post(
+                r#"{"sourceDomain":"phase5-source","consumerId":"consumer-a","drain":true}"#,
+            ))
+            .await
+            .expect("request failed");
+        assert_eq!(StatusCode::OK, response.status());
+
+        // A different consumer fails closed with the typed conflict and a
+        // rebind hint.
+        let response = router
+            .clone()
+            .oneshot(post(
+                r#"{"sourceDomain":"phase5-source","consumerId":"consumer-b","drain":true}"#,
+            ))
+            .await
+            .expect("request failed");
+        assert_eq!(StatusCode::INTERNAL_SERVER_ERROR, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("consumer-a")),
+            "unexpected body: {json}"
+        );
+        assert!(
+            json["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("forceRebindConsumer")),
+            "unexpected body: {json}"
+        );
+
+        // A deliberate force rebind reports the previous binding and
+        // transfers drain authority.
+        let response = router
+            .clone()
+            .oneshot(post(
+                r#"{"sourceDomain":"phase5-source","consumerId":"consumer-b","forceRebindConsumer":true,"drain":true}"#,
+            ))
+            .await
+            .expect("request failed");
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            serde_json::json!("consumer-a"),
+            json["rebind"]["previousConsumer"],
+            "unexpected body: {json}"
+        );
+        assert_eq!(
+            serde_json::json!(["record-1"]),
+            json["drain"]["drainedRecordIds"],
             "unexpected body: {json}"
         );
     }
@@ -2168,6 +2267,14 @@ struct ControlStoreOutboxRequest {
     /// Trim records this consumer already acknowledged from the source outbox.
     #[serde(default)]
     trim: bool,
+    /// Explicit writer epoch for source/ack commits. Omit to operate
+    /// cooperatively at each domain's currently published epoch.
+    #[serde(default)]
+    writer_epoch: Option<u64>,
+    /// Deliberately transfer the source domain's single-consumer drain/trim
+    /// authority to `consumer_id`; the response reports the previous binding.
+    #[serde(default)]
+    force_rebind_consumer: bool,
 }
 
 async fn control_store_outbox_handler(
@@ -2191,7 +2298,19 @@ async fn control_store_outbox_handler(
                 .into_response();
         }
     };
+    let worker = match request.writer_epoch {
+        Some(epoch) => worker.with_writer_epoch(epoch),
+        None => worker,
+    };
 
+    let rebind_report = if request.force_rebind_consumer {
+        match worker.rebind_consumer().await {
+            Ok(report) => Some(report),
+            Err(error) => return control_store_error(&error),
+        }
+    } else {
+        None
+    };
     let drain_report = if request.drain {
         match worker.drain(&AckOnlyProjectionHandler).await {
             Ok(report) => Some(report),
@@ -2224,6 +2343,7 @@ async fn control_store_outbox_handler(
             "freshness": format!("{freshness:?}"),
             "drain": drain_report,
             "trim": trim_report,
+            "rebind": rebind_report,
         })),
     )
         .into_response()
@@ -2289,11 +2409,27 @@ fn shadow_status_label(status: ShadowComparisonStatus) -> &'static str {
 }
 
 fn control_store_error(error: &arco_catalog::CatalogError) -> Response {
+    let hint = match error {
+        arco_catalog::CatalogError::StaleWriterEpoch { .. } => Some(
+            "pass writerEpoch at or above the published epoch, or omit it to \
+             operate cooperatively at the current epoch",
+        ),
+        arco_catalog::CatalogError::PreconditionFailed { message }
+            if message.contains("bound to consumer") =>
+        {
+            Some(
+                "pass forceRebindConsumer=true to deliberately transfer the \
+                 single-consumer drain/trim authority to this consumerId",
+            )
+        }
+        _ => None,
+    };
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
             "error": "control_store_operation_failed",
             "message": error.to_string(),
+            "hint": hint,
         })),
     )
         .into_response()

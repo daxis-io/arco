@@ -1,11 +1,17 @@
 //! #358 sibling-route closure: UC `POST /tables` validates the client
-//! storage_location against published storage governance.
+//! `storage_location` against published storage governance.
 //!
 //! The Iceberg REST surface already enforces governed locations for
 //! create/register; this suite proves the UC facade's table-creation channel
 //! enforces the same rules — governed scopes deny foreign locations with a
 //! typed 400 (stale projections deny closed with 503) while ungoverned scopes
 //! preserve current behavior unchanged.
+
+#![allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "route integration tests use panic-based assertions and direct JSON fixture indexing"
+)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

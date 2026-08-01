@@ -8,6 +8,12 @@
 //! production path, assert the projection is published, and assert credential
 //! vending stops returning 503 and enforces the newly published state.
 
+#![allow(
+    clippy::expect_used,
+    clippy::needless_pass_by_value,
+    reason = "route integration helpers own JSON request fixtures and fail fast on setup errors"
+)]
+
 use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;

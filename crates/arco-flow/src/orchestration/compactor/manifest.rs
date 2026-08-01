@@ -29,6 +29,29 @@ fn default_manifest_id() -> String {
     INITIAL_MANIFEST_ID.to_string()
 }
 
+/// Manifest schema version written before the delta delete channel existed.
+///
+/// A manifest at this version makes no claim about deletions: its L0 deltas
+/// carry no tombstones and every reader (old or new) reconstructs state as
+/// `base ⊎ Δ1 ⊎ Δ2 …` with no removals.
+pub const MANIFEST_SCHEMA_VERSION_LEGACY: u32 = 1;
+
+/// Manifest schema version that declares the delta delete channel active.
+///
+/// This is the *required-understanding marker* for the two-phase rollout of
+/// the tombstone channel (see [`OrchestrationManifest::validate_delete_channel`]).
+pub const MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL: u32 = 2;
+
+/// Highest manifest schema version this build knows how to reconstruct.
+pub const MANIFEST_SCHEMA_VERSION_MAX: u32 = MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL;
+
+/// Delete-channel understanding level recorded on a base snapshot.
+///
+/// Written only by a compactor that folds tombstones into the merged base.
+/// A writer that does not understand the delete channel drops this field on
+/// round-trip, which is what makes stripping detectable.
+pub const BASE_SNAPSHOT_DELETE_CHANNEL_VERSION: u32 = 1;
+
 /// Formats an orchestration manifest ID as fixed-width decimal.
 #[must_use]
 pub fn format_manifest_id(value: u64) -> String {
@@ -139,7 +162,7 @@ impl OrchestrationManifest {
             manifest_id: default_manifest_id(),
             epoch: 0,
             previous_manifest_path: None,
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION_LEGACY,
             revision_ulid: revision_ulid.into(),
             published_at: Utc::now(),
             watermarks: Watermarks::default(),
@@ -149,6 +172,104 @@ impl OrchestrationManifest {
             l0_limits: L0Limits::default(),
             publication_witness: None,
         }
+    }
+
+    /// Returns true when this manifest declares the delta delete channel.
+    #[must_use]
+    pub const fn declares_delete_channel(&self) -> bool {
+        self.schema_version >= MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL
+    }
+
+    /// Returns true when every artifact the delete channel requires is present.
+    ///
+    /// Emitting writers stamp the channel's schema version only once this
+    /// holds, so a workspace that still carries deltas or a base snapshot from
+    /// an understand-only (or pre-feature) writer keeps declaring the legacy
+    /// version until those artifacts have been merged away or rebuilt.
+    #[must_use]
+    pub fn delete_channel_markers_complete(&self) -> bool {
+        self.l0_deltas.iter().all(|delta| delta.deletions.is_some())
+            && (self.base_snapshot.snapshot_id.is_none()
+                || self.base_snapshot.delete_channel_version
+                    >= BASE_SNAPSHOT_DELETE_CHANNEL_VERSION)
+    }
+
+    /// Verifies that a delete-channel manifest was not stripped by a writer
+    /// that does not understand tombstones.
+    ///
+    /// # The stripping hazard
+    ///
+    /// [`L0Delta::deletions`], [`L0Delta::deletion_count`] and
+    /// [`BaseSnapshot::delete_channel_version`] are additive JSON fields, so a
+    /// pre-delete-channel compactor deserializes a tombstone-bearing manifest
+    /// without them, reconstructs state with no removals, and can republish a
+    /// manifest (or a merged base snapshot) in which every expired run,
+    /// consumed dispatch outbox row and pruned run-key index entry has been
+    /// resurrected. Nothing in JSON can make that old binary reject an
+    /// additive document.
+    ///
+    /// # The marker that makes stripping detectable
+    ///
+    /// `schema_version` is a scalar the old writer *preserves* on round-trip,
+    /// while the three delete-channel fields are ones it *drops*. Emitting
+    /// writers therefore:
+    ///
+    /// - set `schema_version` to [`MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL`],
+    /// - attach a `deletions` artifact to **every** L0 delta, even when the
+    ///   fold removed nothing (an empty artifact is still an artifact), and
+    /// - stamp [`BASE_SNAPSHOT_DELETE_CHANNEL_VERSION`] on every base snapshot
+    ///   they merge.
+    ///
+    /// A stripped round-trip keeps `schema_version = 2` but loses the
+    /// artifacts, so the combination is contradictory and this function fails
+    /// closed. The projections must then be rebuilt from the ledger; the
+    /// stripped manifest is not safe to fold forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the inconsistency when the manifest declares
+    /// the delete channel but does not carry its required artifacts, or when
+    /// the manifest declares a schema version this build cannot reconstruct.
+    pub fn validate_delete_channel(&self) -> Result<(), String> {
+        if self.schema_version > MANIFEST_SCHEMA_VERSION_MAX {
+            return Err(format!(
+                "orchestration manifest schema_version {} is newer than this build supports \
+                 (max {MANIFEST_SCHEMA_VERSION_MAX}); refusing to fold forward",
+                self.schema_version
+            ));
+        }
+        if !self.declares_delete_channel() {
+            return Ok(());
+        }
+
+        if let Some(delta) = self
+            .l0_deltas
+            .iter()
+            .find(|delta| delta.deletions.is_none())
+        {
+            return Err(format!(
+                "orchestration manifest declares the delta delete channel \
+                 (schema_version {}) but L0 delta '{}' carries no deletions artifact; \
+                 a writer without delete-channel support stripped it. Rebuild the \
+                 projections from the ledger before compacting again.",
+                self.schema_version, delta.delta_id
+            ));
+        }
+
+        if self.base_snapshot.snapshot_id.is_some()
+            && self.base_snapshot.delete_channel_version < BASE_SNAPSHOT_DELETE_CHANNEL_VERSION
+        {
+            return Err(format!(
+                "orchestration manifest declares the delta delete channel \
+                 (schema_version {}) but its base snapshot records \
+                 delete_channel_version {}; a writer without delete-channel support \
+                 merged and stripped it. Rebuild the projections from the ledger \
+                 before compacting again.",
+                self.schema_version, self.base_snapshot.delete_channel_version
+            ));
+        }
+
+        Ok(())
     }
 
     /// Checks if L0 compaction should be triggered.
@@ -407,6 +528,15 @@ pub struct BaseSnapshot {
 
     /// Table file paths within the snapshot.
     pub tables: TablePaths,
+
+    /// Delete-channel understanding of the writer that merged this snapshot.
+    ///
+    /// Zero means "merged without tombstone support". A writer that does not
+    /// understand the delete channel drops this field on round-trip, so a
+    /// manifest that declares the channel while carrying a zero here has been
+    /// stripped; see [`OrchestrationManifest::validate_delete_channel`].
+    #[serde(default)]
+    pub delete_channel_version: u32,
 }
 
 /// Metadata for a stored Parquet artifact.
@@ -852,6 +982,30 @@ impl Default for DeltaDeletions {
 }
 
 impl DeltaDeletions {
+    /// Rejects artifacts written by a newer delete-channel schema.
+    ///
+    /// Tombstones are a *subtractive* channel: silently ignoring keys this
+    /// build does not understand reconstructs state with rows that a newer
+    /// producer already deleted, which is exactly the resurrection this
+    /// channel exists to prevent. Unknown versions therefore fail closed
+    /// rather than being tolerated as forward-compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when `schema_version` is not
+    /// [`DELTA_DELETIONS_SCHEMA_VERSION`].
+    pub fn validate_schema_version(&self) -> Result<(), String> {
+        if self.schema_version == DELTA_DELETIONS_SCHEMA_VERSION {
+            return Ok(());
+        }
+        Err(format!(
+            "unsupported delta deletions schema_version {}; expected \
+             {DELTA_DELETIONS_SCHEMA_VERSION}. Tombstones cannot be partially \
+             understood, so this build refuses to reconstruct state from it.",
+            self.schema_version
+        ))
+    }
+
     /// Returns true when no keys are recorded for deletion.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -1133,6 +1287,74 @@ mod tests {
         assert!(json.contains("01HQXYZ001EVT"));
     }
 
+    /// Builds a manifest whose single L0 delta carries a tombstone artifact,
+    /// stamped exactly the way an emitting compactor stamps it.
+    fn tombstone_bearing_manifest() -> OrchestrationManifest {
+        let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        manifest.schema_version = MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL;
+        manifest.base_snapshot = BaseSnapshot {
+            snapshot_id: Some("01HQXYZBASE0000000000000000".to_string()),
+            published_at: Utc::now(),
+            tables: TablePaths::default(),
+            delete_channel_version: BASE_SNAPSHOT_DELETE_CHANNEL_VERSION,
+        };
+        manifest.l0_deltas.push(L0Delta {
+            delta_id: "01HQXYZ456DEL".to_string(),
+            created_at: Utc::now(),
+            event_range: EventRange {
+                from_event: "01HQXYZ001EVT".to_string(),
+                to_event: "01HQXYZ010EVT".to_string(),
+                event_count: 10,
+            },
+            tables: TablePaths::default(),
+            row_counts: RowCounts::default(),
+            deletions: Some(TableArtifact::legacy("l0/delta-01/deletions.json")),
+            deletion_count: 3,
+        });
+        manifest.l0_count = 1;
+        manifest
+    }
+
+    /// The `c3c0867` shape of an L0 delta: no `deletions`, no `deletion_count`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct PreDeleteChannelL0Delta {
+        delta_id: String,
+        created_at: DateTime<Utc>,
+        event_range: EventRange,
+        tables: TablePaths,
+        row_counts: RowCounts,
+    }
+
+    /// The `c3c0867` shape of a manifest, carrying the pre-change `L0Delta`
+    /// and the pre-change `BaseSnapshot` (no `delete_channel_version`).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct PreDeleteChannelManifest {
+        #[serde(default = "default_manifest_id")]
+        manifest_id: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_manifest_path: Option<String>,
+        schema_version: u32,
+        revision_ulid: String,
+        published_at: DateTime<Utc>,
+        watermarks: Watermarks,
+        base_snapshot: PreDeleteChannelBaseSnapshot,
+        l0_deltas: Vec<PreDeleteChannelL0Delta>,
+        l0_count: u32,
+        l0_limits: L0Limits,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        publication_witness: Option<OrchestrationPublicationWitness>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct PreDeleteChannelBaseSnapshot {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
+        published_at: DateTime<Utc>,
+        tables: TablePaths,
+    }
+
     #[test]
     fn test_l0_delta_without_deletion_fields_parses_as_no_deletions() {
         // Manifests written before the delete channel existed must keep parsing.
@@ -1151,10 +1373,93 @@ mod tests {
         let delta: L0Delta = serde_json::from_str(json).expect("legacy delta parses");
         assert!(delta.deletions.is_none());
         assert_eq!(delta.deletion_count, 0);
+
+        // A legacy manifest that never declared the channel folds forward.
+        let mut legacy_manifest = OrchestrationManifest::new("01HQXYZ123REV");
+        legacy_manifest.l0_deltas.push(delta);
+        legacy_manifest.l0_count = 1;
+        assert_eq!(
+            legacy_manifest.schema_version,
+            MANIFEST_SCHEMA_VERSION_LEGACY
+        );
+        legacy_manifest
+            .validate_delete_channel()
+            .expect("a manifest that never declared the channel stays foldable");
     }
 
     #[test]
-    fn test_delta_deletions_roundtrip_and_forward_compat() {
+    fn test_tombstone_manifest_stripped_by_pre_change_writer_is_rejected() {
+        // A compactor at c3c0867 deserializes a tombstone-bearing manifest with
+        // the pre-change structs, losing every `deletions` reference and the
+        // base snapshot's delete-channel stamp, then republishes. `schema_version`
+        // is a plain scalar it round-trips untouched, which is what makes the
+        // strip detectable.
+        let manifest = tombstone_bearing_manifest();
+        manifest
+            .validate_delete_channel()
+            .expect("a correctly stamped delete-channel manifest is foldable");
+
+        let bytes = serde_json::to_vec(&manifest).expect("serialize v2 manifest");
+        let stripped: PreDeleteChannelManifest =
+            serde_json::from_slice(&bytes).expect("pre-change reader parses the v2 manifest");
+        assert_eq!(
+            stripped.schema_version, MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL,
+            "the pre-change reader preserves schema_version verbatim"
+        );
+
+        let republished = serde_json::to_vec(&stripped).expect("pre-change writer republishes");
+        let reloaded: OrchestrationManifest =
+            serde_json::from_slice(&republished).expect("new reader parses the republished bytes");
+        assert!(
+            reloaded.l0_deltas.iter().all(|d| d.deletions.is_none()),
+            "the round trip must actually strip the tombstone references"
+        );
+        assert_eq!(reloaded.base_snapshot.delete_channel_version, 0);
+
+        let error = reloaded
+            .validate_delete_channel()
+            .expect_err("stripped delete-channel manifest must fail closed, not fold forward");
+        assert!(
+            error.contains("stripped"),
+            "the failure must name the stripping cause: {error}"
+        );
+        assert!(
+            error.contains("Rebuild"),
+            "the failure must direct the operator to a ledger rebuild: {error}"
+        );
+    }
+
+    #[test]
+    fn test_delete_channel_manifest_requires_stamped_base_snapshot() {
+        // A pre-change compactor that merges every delta into the base leaves
+        // no L0 delta to inspect; the base snapshot stamp is the second marker
+        // it drops, so the strip is still detected.
+        let mut manifest = tombstone_bearing_manifest();
+        manifest.l0_deltas.clear();
+        manifest.l0_count = 0;
+        manifest
+            .validate_delete_channel()
+            .expect("a stamped base snapshot with no deltas is foldable");
+
+        manifest.base_snapshot.delete_channel_version = 0;
+        let error = manifest
+            .validate_delete_channel()
+            .expect_err("an unstamped base snapshot under schema_version 2 must fail closed");
+        assert!(error.contains("base snapshot"), "{error}");
+    }
+
+    #[test]
+    fn test_manifest_newer_than_this_build_fails_closed() {
+        let mut manifest = tombstone_bearing_manifest();
+        manifest.schema_version = MANIFEST_SCHEMA_VERSION_MAX + 1;
+        let error = manifest
+            .validate_delete_channel()
+            .expect_err("an unknown future manifest schema must fail closed");
+        assert!(error.contains("newer than this build supports"), "{error}");
+    }
+
+    #[test]
+    fn test_delta_deletions_roundtrip_and_unknown_version_fails_closed() {
         let deletions = DeltaDeletions {
             runs: vec!["run_01".to_string()],
             tasks: vec![("run_01".to_string(), "extract".to_string())],
@@ -1168,21 +1473,33 @@ mod tests {
         let json = serde_json::to_string_pretty(&deletions).expect("serialize");
         let parsed: DeltaDeletions = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed, deletions);
+        parsed
+            .validate_schema_version()
+            .expect("the current schema version is accepted");
 
-        // Unknown fields (future additive evolution) and missing fields are tolerated.
+        // A newer producer's artifact may carry deletion keys this build cannot
+        // interpret. Ignoring them would resurrect rows the producer deleted, so
+        // the artifact is rejected instead of being treated as forward-compatible.
         let future = r#"{
             "schema_version": 2,
             "runs": ["run_02"],
             "future_table": ["x"]
         }"#;
         let parsed: DeltaDeletions = serde_json::from_str(future).expect("future parses");
-        assert_eq!(parsed.runs, vec!["run_02".to_string()]);
-        assert!(parsed.tasks.is_empty());
-        assert_eq!(parsed.total(), 1);
+        let error = parsed
+            .validate_schema_version()
+            .expect_err("an unknown deletions schema version must fail closed");
+        assert!(
+            error.contains("unsupported delta deletions schema_version 2"),
+            "{error}"
+        );
 
         let empty = DeltaDeletions::default();
         assert!(empty.is_empty());
         assert_eq!(empty.total(), 0);
+        empty
+            .validate_schema_version()
+            .expect("the default artifact is at the current version");
     }
 
     #[test]

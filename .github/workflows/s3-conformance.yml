@@ -8,12 +8,26 @@ name: S3 Storage Conformance
 # workflow, had no runner anywhere. Until this workflow passes against a real
 # bucket, the S3 provider is NOT certified for production use.
 #
-# This workflow only runs on schedule and workflow_dispatch; on both triggers
-# a missing configuration is a loud failure, never a green skip.
+# TRIGGER POLICY: dispatch-only, deliberately. A missing configuration here is
+# a loud failure and never a green skip — but no AWS bucket or credentials are
+# provisioned yet, so a nightly cron would fail every night by design, for a
+# reason nobody can act on tonight. That is exactly the alert fatigue this
+# branch exists to remove: a scheduled job that is always red teaches everyone
+# to ignore scheduled jobs, including the GCS one next to it that is genuinely
+# actionable. Run it on demand to prove the gate, and add a `schedule:` block
+# here in the same change that provisions the configuration below.
+#
+# HOW TO CONFIGURE (also required to flip this workflow to a schedule):
+#   vars.ARCO_TEST_S3_BUCKET      — a dedicated, disposable test bucket
+#   vars.AWS_REGION               — that bucket's region
+#   secrets.AWS_ACCESS_KEY_ID     — static key for a principal scoped to it
+#   secrets.AWS_SECRET_ACCESS_KEY — the matching secret
+# The principal needs object read/write/delete plus conditional-write support
+# on that bucket only. Prefer replacing the static keys with AWS OIDC role
+# assumption when that infrastructure exists (see the note above the
+# prerequisite step).
 
 on:
-  schedule:
-    - cron: '30 5 * * *'
   workflow_dispatch:
 
 permissions:
@@ -41,10 +55,18 @@ jobs:
       # environment variables directly, so no third-party credentials action is
       # required. When AWS OIDC infra exists, add a role-assumption mode here
       # mirroring the GCS workflow's workload-identity path.
+      # Secrets and vars are passed through env: rather than interpolated into
+      # the script text, so their values never appear in the generated shell
+      # command.
       - name: Check S3 conformance prerequisites
         id: prereq
+        env:
+          BUCKET: ${{ vars.ARCO_TEST_S3_BUCKET }}
+          REGION: ${{ vars.AWS_REGION }}
+          ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          if [ -n "${{ vars.ARCO_TEST_S3_BUCKET }}" ] && [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && [ -n "${{ vars.AWS_REGION }}" ]; then
+          if [ -n "$BUCKET" ] && [ -n "$ACCESS_KEY_ID" ] && [ -n "$SECRET_ACCESS_KEY" ] && [ -n "$REGION" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
@@ -72,6 +94,10 @@ jobs:
             echo ""
             echo "Configure \`vars.ARCO_TEST_S3_BUCKET\`, \`vars.AWS_REGION\`,"
             echo "\`secrets.AWS_ACCESS_KEY_ID\`, and \`secrets.AWS_SECRET_ACCESS_KEY\`."
+            echo ""
+            echo "This workflow is \`workflow_dispatch\`-only until that configuration exists;"
+            echo "add a \`schedule:\` trigger in the same change that provisions it, so the"
+            echo "nightly signal starts out actionable instead of red by design."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::error::S3 conformance cannot run: AWS credentials/bucket unconfigured — the provider CAS gate is UNVERIFIED and S3 is NOT certified"
           exit 1

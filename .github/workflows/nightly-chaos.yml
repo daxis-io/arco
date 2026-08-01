@@ -24,6 +24,7 @@ jobs:
   deterministic-orchestration:
     name: Deterministic orchestration coverage
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: 1
@@ -39,13 +40,28 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
 
+      # Required, not optional: arco-flow depends on arco-proto, whose build.rs
+      # invokes compile_protos() and therefore needs a system protoc. Without
+      # this step the job fails in the build script before a single test runs.
+      # Every Rust job in ci.yml installs it the same way.
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Run deterministic orchestration coverage
+        id: coverage
         run: cargo test -p arco-flow --test orchestration_correctness_tests
 
+      # always(), so a failing suite still leaves an explanation in the job
+      # summary instead of an empty one.
       - name: Report chaos status
+        if: always()
+        env:
+          SUITE_OUTCOME: ${{ steps.coverage.outcome }}
         run: |
           {
             echo "## Nightly chaos status"
+            echo ""
+            echo "Deterministic orchestration coverage: \`${SUITE_OUTCOME:-not run}\`."
             echo ""
             echo "This workflow runs nightly (and on manual dispatch) and covers the deterministic multi-instance and clock-skew orchestration suites."
             echo "Full randomized chaos remains opt-in until stable backing suites and Cargo features exist."

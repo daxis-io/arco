@@ -5,7 +5,7 @@
 **Audit targets:**
 
 - Canonical code: `origin/main @ c3c0867` ("Add workspace snapshot export, restore, and durable transaction handles (#322)", 2026-07-26), audited in a clean read-only worktree. All file:line citations in this report refer to this commit unless a path is explicitly prefixed with the local tree.
-- Local diverged tree: `/Users/ethanurbanski/arco @ 8acff32` (last commit 2026-07-01) — **16 commits ahead / 17 behind** `origin/main`, 274 files different, +12,745/−87,136 lines.
+- Diverged local-main snapshot: `8acff32` (last commit 2026-07-01) — **16 commits ahead / 17 behind** `origin/main`, 274 files different, +12,745/−87,136 lines.
 
 **Method:** 12 specialized area auditors (divergence, Phase 0/2, Phase 1A/3A, Phase 1B, Phase 3B/3C, Phase 4/5, Phase 6, Phase 7A–D, lineage lanes, program rules, engineering quality, issue mapping), followed by 14 adversarial verifications of the highest-stakes claims (**8 CONFIRMED, 6 ADJUSTED, 0 REFUTED**), followed by a completeness-critic pass. Approximately 1.77M tokens across 27 agents; 728 tool invocations. The critic pass materially changed one headline conclusion (see PR #309, §3.3).
 
@@ -13,12 +13,12 @@
 
 | Document | Canonical status |
 |---|---|
-| `docs/plans/2026-06-27-arco-unified-execution-roadmap.md` (1,163 lines — the master roadmap: Phases 0–11 + lineage lanes L0–L6, each with explicit gates) | **Local tree only** |
-| `docs/plans/2026-06-25-arco-tier1-control-store-strategy.md` (2,081 lines) | **Local tree only** |
-| `docs/plans/2026-06-26-arco-tier1-single-authority-combined-vision.md` (674 lines) | **Local tree only** |
-| `docs/plans/2026-06-26-lineage-observation-projection-design.md` (761 lines) | **Local tree only** |
-| `docs/plans/2026-06-27-planner-runtime-seam-hardening-design.md` (1,342 lines) | **Local tree only** |
-| `docs/plans/2026-06-20-olympia-inspired-arco-strategy.md` | On origin, but as an **older fork** — local extended it by +438/−73 (commits 800d402, d93ba52) while origin's 6ab8d6c also modified it |
+| [`2026-06-27-arco-unified-execution-roadmap.md`](../plans/2026-06-27-arco-unified-execution-roadmap.md) (1,163 lines — the master roadmap: Phases 0–11 + lineage lanes L0–L6, each with explicit gates) | **Local tree only** |
+| [`2026-06-25-arco-tier1-control-store-strategy.md`](../plans/2026-06-25-arco-tier1-control-store-strategy.md) (2,081 lines) | **Local tree only** |
+| [`2026-06-26-arco-tier1-single-authority-combined-vision.md`](../plans/2026-06-26-arco-tier1-single-authority-combined-vision.md) (674 lines) | **Local tree only** |
+| [`2026-06-26-lineage-observation-projection-design.md`](../plans/2026-06-26-lineage-observation-projection-design.md) (761 lines) | **Local tree only** |
+| [`2026-06-27-planner-runtime-seam-hardening-design.md`](../plans/2026-06-27-planner-runtime-seam-hardening-design.md) (1,342 lines) | **Local tree only** |
+| [`2026-06-20-olympia-inspired-arco-strategy.md`](../plans/2026-06-20-olympia-inspired-arco-strategy.md) | On origin, but as an **older fork** — local extended it by +438/−73 (commits 800d402, d93ba52) while origin's 6ab8d6c also modified it |
 
 ---
 
@@ -51,7 +51,7 @@ Local `main` (last commit 2026-07-01) and `origin/main` (2026-07-26) have fully 
 | `9a9b781` ADR-041 L0 bundle writer | **Identical on origin** (`git diff origin/main main -- crates/arco-flow/src/orchestration/event_log.rs` is empty; landed via PR #299 / `6ab8d6c`, 53 files +8,131). Discard. |
 | `5161c8a` local pipeline UAT + Cloud Run worker | **Superseded and dangerous to merge**: its ops surface (`scripts/deploy.sh`, `python/arco/src/arco_flow/worker/server.py`, `infra/terraform/cloud_run.tf`, `iam_conditions.tf`, `tools/xtask/tests/deploy_script.rs`) pre-dates the June fix wave #301–#307; merging would regress hardened files. Discard. |
 | `a22317b` v0.2.0 release prep | **One release behind** — origin already shipped v0.2.1 prep (`10c72b8`, PR #308). Discard. |
-| `1a57ed4` planner runtime handoff seam | **The only unique unpushed code** (~1,311 lines: `crates/arco-flow/src/planning/{compiler,diagnostics,fingerprint,mod,selection}.rs`, `src/application/{mod,planning_snapshot_provider,run_planner}.rs`, `tests/planning_compiler_tests.rs` (219 lines), plus the child plan `docs/plans/2026-06-28-planner-runtime-handoff-seam-slice.md`). `git ls-tree origin/main crates/arco-flow/src/planning` returns nothing. **This is also the content of PR #309** — see §2.3. |
+| `1a57ed4` planner runtime handoff seam | **The only unique unpushed code** (~1,311 lines: `crates/arco-flow/src/planning/{compiler,diagnostics,fingerprint,mod,selection}.rs`, `src/application/{mod,planning_snapshot_provider,run_planner}.rs`, `tests/planning_compiler_tests.rs` (219 lines), plus the child plan [`2026-06-28-planner-runtime-handoff-seam-slice.md`](../plans/2026-06-28-planner-runtime-handoff-seam-slice.md)). `git ls-tree origin/main crates/arco-flow/src/planning` returns nothing. **This is also the content of PR #309** — see §2.3. |
 | `800d402`, `a15c864`, `5fb58ae`, `cc91d0b`, `e64d19e`, `d93ba52` (docs) | The five design docs, `docs/spec/*`, and the Olympia doc extension — **unique**, must be pushed (partly via PR #309, partly directly; see §2.4). |
 
 What the **local tree is missing** from origin (any correctness conclusion drawn from the local tree about state-store, transactions, snapshot/restore, or orchestration is void): 87,136 lines, including `arco-catalog` −39,833 (`workspace_snapshot*.rs`, `workspace_restore.rs` 3,679 lines, `tier1_writer.rs` −2,661, `shadow_replay` 1,394), `arco-api` −21,501 (`control_plane_transactions/handles.rs` 4,169 + `handles_tests.rs` 10,260), `arco-integration-tests` −4,132, `arco-flow` −3,265 (the June fix wave #301–#307), `arco-core` −2,074, `tools/xtask` −2,551.
@@ -62,7 +62,7 @@ What the **local tree is missing** from origin (any correctness conclusion drawn
 
 ### 2.3 PR #309 — the stranded seam and spec layer
 
-The audit's original divergence conclusion ("the specification layer exists only on this machine") was **corrected by the completeness critic and then verified directly**: PR #309 ("Prepare Phase 0-1 roadmap seams", branch `codex/phase-0-1-roadmap-seams`, opened 2026-06-29, non-draft, CI green at open time, currently `mergeable: CONFLICTING`) contains 35 files:
+The audit's original divergence conclusion ("the specification layer exists only on this machine") was **corrected by the completeness critic and then verified directly**: PR #309 ("Prepare Phase 0-1 roadmap seams", opened 2026-06-29, non-draft, CI green at open time, and `mergeable: CONFLICTING` at the audit cut) contains 35 files:
 
 - All 8 `docs/spec` contracts + `docs/spec/README.md` + both fixtures (`provider-capability-matrix-v1.json`, `root-ownership-and-iam-v1.json`);
 - Both arco-core contract tests (`provider_capability_matrix_contract.rs`, `root_ownership_iam_contract.rs`);
@@ -77,12 +77,12 @@ PR #309 does **not** contain the five design docs. Those remain local-only.
 1. **Do not merge local `main` wholesale** under any circumstances (17 conflicts; regresses #301–#307 hardening).
 2. **Rebase and land PR #309** onto `origin/main`. Conflict policy: keep origin's evolved `crates/arco-catalog/src/state_store.rs`, `lib.rs`, and current-adapter test (they are strict descendants of the PR's versions); take the PR's unique material (docs/spec, planning/, application/, arco-core contract tests, child plans). Reconcile two known seam-side details during rebase: local/PR `run_bridge.rs` emits `code_version: None` while origin now sources `index.code_version` (run_bridge.rs:300 vs origin's one-line change) — origin's line must win or the seam silently reverts a fix; and re-run `planning_compiler_tests.rs` on the rebased result before claiming the Phase 1B gate. Also check ADR-039 consistency against the spec contracts during this rebase (§9).
 3. **Push the five design docs** from the local tree (roadmap, control-store strategy, combined vision, lineage design, seam hardening). Manually merge local's +438-line Olympia doc extension into origin's forked copy — the two versions must not continue evolving separately.
-4. **Resolve the uncommitted local deletion** of `docs/plans/2026-06-27-state-store-seam-current-adapter-slice.md` (`git status` shows `D`). That doc exists nowhere on origin except inside PR #309 — landing #309 preserves it; until then the uncommitted deletion is erasing the only record of that slice's claims.
-5. **After #309 and the docs land, hard-reset local `main` to `origin/main`.** Triage the 8 stashes across 6 old branches first (they include multi-table-transactions and auth-hardening WIP of unknown value). Delete or archive the untracked `.ai/` directory deliberately.
+4. **Resolve the uncommitted local deletion** of [`2026-06-27-state-store-seam-current-adapter-slice.md`](../plans/2026-06-27-state-store-seam-current-adapter-slice.md) (`git status` shows `D`). That doc exists nowhere on origin except inside PR #309 — landing #309 preserves it; until then the uncommitted deletion is erasing the only record of that slice's claims.
+5. **After #309 and the docs land, hard-reset local `main` to `origin/main`.** Triage the 8 stashes across 6 old branches first (they include multi-table-transactions and auth-hardening WIP of unknown value). Delete or archive the untracked local run-manifest directory deliberately.
 6. **File two tracking issues** (none of open #239–#368 mentions the fork, the missing design docs, or origin's dangling docs/spec references): one for the docs/spec + roadmap push, one for the planner-seam rebase — so reconciliation is visible and assignable.
 7. **Update `docs/guide/src/reference/control-plane-scope.md` and backfill CHANGELOG** for #316–#322 (§6).
 
-Process lessons recorded by the divergence auditor: identical slices were landed twice through different channels (local commits vs codex PRs) without pushing first; origin merged plan documents with dangling references no CI check caught; local `main` was used as a 25-day-stale personal fork of the integration branch; release prep happened off-canonical.
+Process lessons recorded by the divergence auditor: identical slices were landed twice through different channels (local commits vs automation branches) without pushing first; origin merged plan documents with dangling references no CI check caught; local `main` was used as a 25-day-stale personal fork of the integration branch; release prep happened off-canonical.
 
 ---
 
@@ -94,7 +94,7 @@ Statuses used below: **DONE** (implemented and evidenced), **PARTIAL** (implemen
 
 Defined in the unified execution roadmap; deliverables at roadmap lines 113–123.
 
-- **[MISSING]** ADR `adr-0XX-tier1-control-store-single-authority.md`. Absent from both trees' `docs/adr/` (both end at adr-041). The local slice plan `docs/plans/2026-06-27-phase-0-contract-consolidation-slice.md:75,122` explicitly deferred it ("Do not add ADR files in this slice"). Gap: write and accept the ADR; add it to the xtask `REQUIRED_ADRS` list so `adr-check` can gate it.
+- **[MISSING]** ADR `adr-0XX-tier1-control-store-single-authority.md`. Absent from both trees' `docs/adr/` (both end at adr-041). The local [`2026-06-27-phase-0-contract-consolidation-slice.md`](../plans/2026-06-27-phase-0-contract-consolidation-slice.md) explicitly deferred it at lines 75 and 122 ("Do not add ADR files in this slice"). Gap: write and accept the ADR; add it to the xtask `REQUIRED_ADRS` list so `adr-check` can gate it.
 - **[MISSING]** ADRs `plan-compiler-runtime-handoff` and `lineage-observation-projection`. Neither exists in either tree; the local plan lists both as follow-up (`:123-124`). The Phase 0 gate vocabulary (`PlanArtifact`, `RunPlanBinding`, `PlanCreated`, `LineageObservation`; roadmap:158-161) has no spec or ADR anywhere — only design docs. *(Adversarial verdict: ADJUSTED — the ADRs were explicitly deferred by the named slice plan, not silently omitted.)*
 - **[DIVERGENT]** Phase 0 specs (`arco-storage-format-v0`, `object-store-contract`, `state-token-and-checkpoint-contract`, `projection-watermark-contract`): all four exist only in PR #309 / local `docs/spec/` (e.g. `object-store-contract.md:41-71` defines all required provider semantics; `state-token-and-checkpoint-contract.md:29-72` defines token fields and the full error vocabulary). Quality is good: consistent draft-status headers, banned-claims discipline ("prototype-approved only, not accepted production architecture" in every header; `docs/spec/README.md:37-45`), explicit open decisions. Origin has none of them while its code implements the semantics they describe.
 - **[DONE]** `docs/spec/api-token-exposure-matrix.md` covers all 6 required rows (Arco-native API, internal service call, Iceberg REST, UC-like, SQL/system-table, worker/runtime callback) and all required columns, with a controlled value vocabulary (`:12-24`, `:28-35`). Caveat: most cells are deliberately `candidate`/`unknown` and the required test families are explicitly not implemented (`:54`) — it is a decision surface, not a settled decision. Local-only.
@@ -279,7 +279,7 @@ The roadmap's ten Program Rules, audited as current-state invariants on origin/m
 - `docs/guide/src/reference/control-plane-scope.md` — the scorecard the roadmap orders every slice to consult (roadmap lines 33, 43) — was last modified 2026-05-30 (commit `c8ccdd5`), before any program slice landed; its 70-line scorecard (`:19-49`) has no row for the state store, shadow replay, comparison reads, projection outbox, path-governance metadata, workspace snapshots, or transaction handles; `docs/guide/src/` has zero state-store mentions at all. *(Adversarial verdict: ADJUSTED — the mandate to consult it comes from the local-only roadmap, but the staleness itself contradicts origin's own evidence policy for implementation claims.)*
 - `CHANGELOG.md:9` has an empty `[Unreleased]` section; the last entry is 0.2.1 (2026-06-27) — **before all six program PRs #316–#322**; grep for those PR numbers returns nothing. The release-tag-discipline gate (ci.yml:39-48) only fires at tag time and cannot reconstruct six PRs of history.
 - Child-plan discipline is exemplary — all eleven program child plans exist on origin with provenance gates, allowed-file lists, TDD requirements, and runnable verification commands (spot-checked targets all exist) — **but commit boundaries were not preserved at landing**: `adccaa4` (#316) contains three child plans' work; `9577097` (#317) contains 4A+4B; `4cd8bd2` (#319) contains 5A+5B; and `c3c0867` (#322) lands all of 7A–7D as a single 54,338-insertion / 45-file commit, despite `2026-07-15-phase-7-execution-program.md:97` mandating "exactly four amendable implementation commits". The plans' recorded per-commit SHAs are unreachable from origin/main. A 54k-line squash is effectively unreviewable and unbisectable.
-- Four landed plans on origin cite `docs/plans/2026-06-27-arco-unified-execution-roadmap.md` by path — a file that does not exist there; repo-hygiene-check does not flag dangling plan references.
+- Four landed plans on origin cite the unified execution roadmap by path — a file that does not exist there; repo-hygiene-check does not flag dangling plan references.
 
 ### 5.3 Code health
 
@@ -420,10 +420,10 @@ Other standing limitations: the audit ran one targeted live test suite (state_st
 
 **Prior-audit refutations honored (not re-reported):** schedule re-enable idempotency drop; root-transaction cross-domain atomicity (documented ADR-034 tradeoff); ledger rebuild floor dropping events; CI long-lived SA key; thrift patch publish risk. #324/#325 partial mitigations (live-lock token validation at `tier1_compactor.rs:304`; internal-only Cloud Run ingress) are reflected where cited.
 
-**Artifact locations (session-scoped, may not persist):**
+**Artifact retention:** session-scoped intermediate outputs and scratch worktrees were intentionally
+not recorded as durable repository evidence. The file-and-line citations above are the reviewable
+evidence retained by this report.
 
-- Full workflow output (all area items verbatim): `/private/tmp/claude-501/-Users-ethanurbanski-arco/434edac5-6eed-45ec-b64c-3b0f1f247841/tasks/wa80hdsu6.output`
-- Per-agent journal: `/Users/ethanurbanski/.claude/projects/-Users-ethanurbanski-arco/434edac5-6eed-45ec-b64c-3b0f1f247841/subagents/workflows/wf_3a74ebe4-9f0/journal.jsonl`
-- Audit worktree (origin/main @ c3c0867): `/private/tmp/claude-501/-Users-ethanurbanski-arco/434edac5-6eed-45ec-b64c-3b0f1f247841/scratchpad/arco-origin-main` (remove with `git worktree remove` when done)
-
-**Caveat on this file:** this report lives in the **diverged local tree** (`/Users/ethanurbanski/arco`). It must be committed and pushed alongside the design-doc push in §2.4 step 3, or it inherits the same single-copy loss risk it documents. Do not let it ride a wholesale merge of local `main`.
+**Caveat on this file:** this report captures the repository state at the audit cut named at the
+top. Branch, PR, and implementation statuses are historical observations and must be refreshed
+before using them as current release evidence.

@@ -29,11 +29,20 @@ beyond that, staleness must be explicit, never silent.
 
 Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
 
-- `ArcoProjectionWatermarkLagHigh` — lag in logical sequences
+- `ArcoProjectionWatermarkLagHigh` — backlog depth in logical sequences
   (`committed_sequence - latest_projected_sequence`, the `pending_sequences`
-  computation in `projection_watermark_lag_for`).
-- `ArcoProjectionWatermarkStale` — watermark age beyond the 60 s budget.
-- `ArcoProjectionPublishAbsent` — no projection publish completed in an hour.
+  computation in `projection_watermark_lag_for`) above 1000 for 10 minutes.
+  The threshold is a backlog budget, not a contract budget: a non-zero gap is
+  the normal steady state between a commit and the next publish, so only a
+  sustained backlog means the consumer is losing ground.
+- `ArcoProjectionWatermarkStale` — watermark age beyond the 60 s budget. This
+  is the contract-derived rule; it catches a small gap that is not advancing,
+  which the backlog-depth rule above deliberately ignores.
+- `ArcoProjectionPublishAbsent` — no projection publish completed in an hour,
+  evaluated against the watermark-age gauge as an anchor series so that it
+  still fires when the publish counter goes stale (publisher dead) or never
+  existed (domain never published). An alert instance with an empty `domain`
+  label means the projection metrics are not being exported at all.
 
 ## Diagnosis
 

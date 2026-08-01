@@ -17,13 +17,22 @@
 //! # Writer fencing
 //!
 //! Publication uses the strategy's two-condition protocol: the current-pointer
-//! CAS must succeed **and** the writer's fencing epoch must be at least the
-//! epoch recorded in the current pointer. `claim_writer_authority` advances
-//! the epoch through the same pointer CAS, so a writer whose epoch has been
-//! superseded fails closed with [`CatalogError::StaleWriterEpoch`] before any
-//! state becomes visible. Store-maintenance writers that must survive epoch
-//! claims (rather than fence competitors) adopt the published epoch via
-//! [`ControlMvpStateStore::at_current_writer_epoch`].
+//! CAS must succeed **and** the writer's fencing epoch must be **exactly** the
+//! epoch recorded in the current pointer. Only [the CAS-protected
+//! claim][`ControlMvpStateStore::claim_writer_authority`] advances the epoch,
+//! so an arbitrary future epoch supplied from outside can never publish and
+//! can never drag the pointer epoch forward without a claim. A writer whose
+//! epoch has been superseded fails closed with
+//! [`CatalogError::StaleWriterEpoch`]; a writer holding an unclaimed future
+//! epoch fails closed with [`CatalogError::PreconditionFailed`]. Both happen
+//! before any state becomes visible. Store-maintenance writers that must
+//! survive epoch claims (rather than fence competitors) adopt the published
+//! epoch via [`ControlMvpStateStore::at_current_writer_epoch`].
+//!
+//! [`u64::MAX`] is never an acceptable epoch: accepting it (or saturating an
+//! out-of-range input down to it) would make the next claim's increment
+//! overflow and wedge the domain permanently, so it is rejected at every
+//! entry point instead.
 //!
 //! # Format versioning
 //!
@@ -31,6 +40,13 @@
 //! deliberately no migration path from format version 1: no production
 //! deployment ever wrote v1 artifacts, so v1 (or any other) `format_version`
 //! values fail closed at artifact validation instead of being migrated.
+//!
+//! Restore *plans* are versioned separately from on-disk state artifacts,
+//! because an in-flight restore attempt written by an older revision must
+//! still be readable by the recovery path that has to supersede it. Plan
+//! version 1 (which predates `observed_writer_epoch`) is therefore decoded by
+//! an explicit migration into a legacy-marked plan that can be inspected and
+//! superseded but can never be applied. See [`ControlMvpRestorePlan`].
 
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
@@ -57,6 +73,9 @@ use crate::error::{CatalogError, Result};
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 2;
+/// Plan version written before `observed_writer_epoch` existed. Decoded by an
+/// explicit migration (see [`ControlMvpRestorePlan`]) and never applied.
+const RESTORE_PLAN_VERSION_LEGACY: u32 = 1;
 const CONTROL_MVP_FORMAT_VERSION: u32 = 2;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
@@ -113,20 +132,27 @@ impl ControlMvpStateStore {
         self
     }
 
-    /// Sets the writer fencing epoch this store publishes with.
+    /// Pins the writer fencing epoch this store publishes with.
     ///
-    /// The epoch saturates one below [`u64::MAX`] so that a published pointer
-    /// can always be superseded by a later [`Self::claim_writer_authority`]
-    /// call: publishing `u64::MAX` directly would make the next claim's
-    /// increment overflow and wedge the domain permanently.
-    #[must_use]
-    pub const fn with_writer_epoch(mut self, writer_epoch: u64) -> Self {
-        self.writer_epoch = if writer_epoch == u64::MAX {
-            u64::MAX - 1
-        } else {
-            writer_epoch
-        };
-        self
+    /// The epoch is *not* an authority grant: publication additionally
+    /// requires it to equal the epoch recorded in the published pointer, so a
+    /// pinned future epoch fails closed instead of advancing the pointer
+    /// without a [`Self::claim_writer_authority`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for [`u64::MAX`], which is never an
+    /// acceptable epoch: publishing it would make the next claim's increment
+    /// overflow and wedge the domain permanently. Out-of-range input is
+    /// rejected rather than saturated, because saturating `u64::MAX` to
+    /// `u64::MAX - 1` publishes the one epoch after which exactly one further
+    /// claim is possible, which is the same wedge one step later.
+    pub fn with_writer_epoch(mut self, writer_epoch: u64) -> Result<Self> {
+        if writer_epoch == u64::MAX {
+            return Err(unclaimable_writer_epoch());
+        }
+        self.writer_epoch = writer_epoch;
+        Ok(self)
     }
 
     /// Returns this store bound to the writer epoch currently recorded in the
@@ -164,13 +190,15 @@ impl ControlMvpStateStore {
     ///
     /// The claim is durably published through the current-pointer CAS, so
     /// every writer holding an older epoch fails closed on its next begin or
-    /// publish attempt.
+    /// publish attempt. This is the **only** operation that advances the
+    /// published epoch: ordinary publication requires exact equality with it.
     ///
     /// # Errors
     ///
     /// Returns a validation error before any state exists (there is no
-    /// authority to fence yet) and a CAS error when another writer moved the
-    /// pointer concurrently.
+    /// authority to fence yet), a validation error when the claim would
+    /// publish [`u64::MAX`] (which no later claim could supersede), and a CAS
+    /// error when another writer moved the pointer concurrently.
     pub async fn claim_writer_authority(mut self) -> Result<Self> {
         let pointer_meta = self.storage.head_raw(&self.paths.current_pointer()).await?;
         let Some(pointer_meta) = pointer_meta else {
@@ -183,6 +211,9 @@ impl ControlMvpStateStore {
             .writer_epoch
             .checked_add(1)
             .ok_or_else(|| validation_failed("control MVP writer epoch overflow during claim"))?;
+        if claimed_epoch == u64::MAX {
+            return Err(unclaimable_writer_epoch());
+        }
         let claimed = ControlMvpPointer {
             writer_epoch: claimed_epoch,
             ..pointer
@@ -229,9 +260,7 @@ impl ControlMvpStateStore {
         }
 
         let base = self.load_current_base_state().await?;
-        if self.writer_epoch < base.writer_epoch {
-            return Err(stale_writer_epoch(self.writer_epoch, base.writer_epoch));
-        }
+        validate_publication_epoch(self.writer_epoch, base.writer_epoch)?;
         let next_sequence = base.state.logical_sequence + 1;
         let request_id = opts.request_id().map(ToOwned::to_owned);
         let suffix = Ulid::new().to_string().to_ascii_lowercase();
@@ -950,10 +979,45 @@ fn stale_writer_epoch(held: u64, current: u64) -> CatalogError {
     CatalogError::StaleWriterEpoch {
         message: format!(
             "control MVP writer epoch {held} is superseded by published epoch {current}; \
-             retry with an explicit epoch of {current} or newer, or resolve the published \
+             retry with an explicit epoch of exactly {current}, or resolve the published \
              epoch cooperatively before writing"
         ),
     }
+}
+
+fn unclaimed_writer_epoch(held: u64, current: u64) -> CatalogError {
+    CatalogError::PreconditionFailed {
+        message: format!(
+            "control MVP writer epoch {held} is ahead of published epoch {current} but was \
+             never claimed; publication requires exact equality with the published epoch and \
+             only claim_writer_authority may advance it, so a future epoch supplied from \
+             outside is refused instead of silently becoming authority"
+        ),
+    }
+}
+
+fn unclaimable_writer_epoch() -> CatalogError {
+    CatalogError::Validation {
+        message: format!(
+            "control MVP writer epoch {} is not an acceptable epoch: publishing it would make \
+             every later claim_writer_authority increment overflow and wedge the domain \
+             permanently, so it is rejected rather than saturated",
+            u64::MAX
+        ),
+    }
+}
+
+/// Enforces the publication epoch condition: the held epoch must equal the
+/// epoch recorded in the published pointer. A lower epoch has been fenced out;
+/// a higher one was never claimed and must not become authority by publishing.
+fn validate_publication_epoch(held: u64, published: u64) -> Result<()> {
+    if held < published {
+        return Err(stale_writer_epoch(held, published));
+    }
+    if held > published {
+        return Err(unclaimed_writer_epoch(held, published));
+    }
+    Ok(())
 }
 
 /// MVP projection outbox record staged inside a control transaction.
@@ -961,11 +1025,77 @@ fn stale_writer_epoch(held: u64, current: u64) -> CatalogError {
 /// A staged record has no `origin_sequence`; replay stamps the committing
 /// transaction's logical sequence so consumers can acknowledge and derive
 /// projection watermarks from the record's provenance.
+///
+/// # Delivery identity
+///
+/// The `record_id` is a **business** identifier and is deliberately reusable:
+/// once a record has been trimmed, a producer may stage the same id again.
+/// Delivery identity is therefore [`Self::event_id`] — the immutable
+/// *incarnation* of one staging, derived from the committing transaction's
+/// logical sequence plus the record id. Record ids are unique across the
+/// retained outbox and the logical sequence increases strictly, so every
+/// staging that ever happens in a domain has a distinct event id, and a
+/// re-staged record id can never be mistaken for the incarnation that was
+/// consumed before it. The derivation is a pure function of committed
+/// transaction data, so replay is deterministic and the state-checksum chain
+/// is unchanged (event ids are derived, never stored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlMvpProjectionOutboxRecord {
     record_id: String,
     payload: Bytes,
     origin_sequence: Option<u64>,
+}
+
+/// Returns the immutable outbox-event id for one staging incarnation.
+///
+/// Deterministic from committed transaction data only: `origin_sequence` is
+/// the committing transaction's logical sequence (fixed width, so the
+/// encoding is unambiguous) and `record_id` is unique within it.
+#[must_use]
+pub fn control_mvp_outbox_event_id(origin_sequence: u64, record_id: &str) -> String {
+    format!("evt-{origin_sequence:020}-{record_id}")
+}
+
+/// Exact outbox event one trim removes from the source domain.
+///
+/// Trims are conditional on this identity, not on the reusable record id
+/// alone: an observation captured before a concurrent trim/re-stage cycle
+/// names an incarnation that no longer exists, and staging it fails closed
+/// with [`CatalogError::PreconditionFailed`] instead of deleting whatever
+/// record currently happens to carry that id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpOutboxTrimTarget {
+    record_id: String,
+    origin_sequence: u64,
+}
+
+impl ControlMvpOutboxTrimTarget {
+    /// Names the exact outbox event incarnation to remove.
+    #[must_use]
+    pub fn new(record_id: impl Into<String>, origin_sequence: u64) -> Self {
+        Self {
+            record_id: record_id.into(),
+            origin_sequence,
+        }
+    }
+
+    /// Returns the business record id.
+    #[must_use]
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    /// Returns the observed origin sequence.
+    #[must_use]
+    pub const fn origin_sequence(&self) -> u64 {
+        self.origin_sequence
+    }
+
+    /// Returns the immutable event id this target names.
+    #[must_use]
+    pub fn event_id(&self) -> String {
+        control_mvp_outbox_event_id(self.origin_sequence, &self.record_id)
+    }
 }
 
 /// Durable deterministic evidence for one Control MVP restore participant.
@@ -986,7 +1116,23 @@ impl ControlMvpRestoreCurrentBaseKind {
 }
 
 /// Durable deterministic evidence for one Control MVP restore participant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Plan versioning
+///
+/// Version 2 is the version this revision plans in. Version 1 predates
+/// `observed_writer_epoch` and is still **decodable**, by explicit migration
+/// rather than by Serde defaults: an in-flight attempt written by an older
+/// revision has to be readable by the recovery path whose job is to supersede
+/// it, and a plan that cannot be deserialized cannot be inspected, superseded,
+/// or safely replanned — recovery would degrade into a serialization failure.
+///
+/// The migration is fail-closed. A decoded v1 plan records
+/// `observed_writer_epoch = 0` as "not observed", is marked legacy by keeping
+/// `version == 1`, and reaches exactly one terminal outcome at inspection:
+/// [`RestoreParticipantInspection::Superseded`]. It is never Ready and is
+/// never applied, so the missing epoch observation can never be mistaken for
+/// an observation of epoch 0. The driver replans it as a version 2 plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     record_type: String,
     version: u32,
@@ -1011,7 +1157,102 @@ pub struct ControlMvpRestorePlan {
     restore_outbox_record_id: String,
 }
 
+/// Wire shape used to decode any supported restore-plan version.
+///
+/// `observed_writer_epoch` is optional here **only** so a version 1 record can
+/// be read at all; the migration below decides what its absence means per
+/// version instead of letting Serde silently default it.
+#[derive(Deserialize)]
+struct ControlMvpRestorePlanWire {
+    record_type: String,
+    version: u32,
+    implementation: String,
+    scope: StateScope,
+    identity: RestoreAttemptIdentity,
+    source: PersistedAuthorityReference,
+    current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    base_pointer_version: Option<String>,
+    observed_base_pointer_sha256: String,
+    #[serde(default)]
+    observed_writer_epoch: Option<u64>,
+    base_manifest_id: String,
+    base_logical_sequence: u64,
+    transaction_id: String,
+    transaction_path: String,
+    transaction_sha256: String,
+    candidate_manifest_id: String,
+    candidate_manifest_path: String,
+    candidate_manifest_sha256: String,
+    candidate_pointer_sha256: String,
+    result_logical_sequence: u64,
+    restore_outbox_record_id: String,
+}
+
+impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ControlMvpRestorePlanWire::deserialize(deserializer)?;
+        let observed_writer_epoch = if wire.version == RESTORE_PLAN_VERSION_LEGACY {
+            // Version 1 never carried the field. Present means the record is
+            // malformed for its declared version, absent means "not observed",
+            // which apply-time handling treats as fail-closed (never Ready).
+            match wire.observed_writer_epoch {
+                None => 0,
+                Some(_) => {
+                    return Err(serde::de::Error::custom(
+                        "control MVP restore plan version 1 must not carry observed_writer_epoch",
+                    ));
+                }
+            }
+        } else {
+            wire.observed_writer_epoch.ok_or_else(|| {
+                serde::de::Error::custom(
+                    "control MVP restore plan is missing observed_writer_epoch",
+                )
+            })?
+        };
+        Ok(Self {
+            record_type: wire.record_type,
+            version: wire.version,
+            implementation: wire.implementation,
+            scope: wire.scope,
+            identity: wire.identity,
+            source: wire.source,
+            current_base_kind: wire.current_base_kind,
+            base_pointer_version: wire.base_pointer_version,
+            observed_base_pointer_sha256: wire.observed_base_pointer_sha256,
+            observed_writer_epoch,
+            base_manifest_id: wire.base_manifest_id,
+            base_logical_sequence: wire.base_logical_sequence,
+            transaction_id: wire.transaction_id,
+            transaction_path: wire.transaction_path,
+            transaction_sha256: wire.transaction_sha256,
+            candidate_manifest_id: wire.candidate_manifest_id,
+            candidate_manifest_path: wire.candidate_manifest_path,
+            candidate_manifest_sha256: wire.candidate_manifest_sha256,
+            candidate_pointer_sha256: wire.candidate_pointer_sha256,
+            result_logical_sequence: wire.result_logical_sequence,
+            restore_outbox_record_id: wire.restore_outbox_record_id,
+        })
+    }
+}
+
 impl ControlMvpRestorePlan {
+    /// Returns the durable plan version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns whether this plan was migrated from the pre-`observed_writer_epoch`
+    /// version and therefore may only be superseded, never applied.
+    #[must_use]
+    pub const fn is_legacy_version(&self) -> bool {
+        self.version == RESTORE_PLAN_VERSION_LEGACY
+    }
+
     /// Returns the exact source authority reference.
     #[must_use]
     pub const fn source(&self) -> &PersistedAuthorityReference {
@@ -1106,8 +1347,18 @@ impl ControlMvpRestorePlan {
                 .as_ref()
                 .is_some_and(|version| !version.is_empty()),
         };
+        // Legacy plans are structurally validated exactly like current ones —
+        // the deterministic identity derivation never included the writer
+        // epoch, so every identity check below still binds. What a legacy plan
+        // may not do is become authority; `inspect_restore` refuses to report
+        // it Ready.
+        let version_supported =
+            self.version == RESTORE_PLAN_VERSION || self.version == RESTORE_PLAN_VERSION_LEGACY;
+        let legacy_epoch_valid =
+            self.version != RESTORE_PLAN_VERSION_LEGACY || self.observed_writer_epoch == 0;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
-            || self.version != RESTORE_PLAN_VERSION
+            || !version_supported
+            || !legacy_epoch_valid
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -1339,6 +1590,26 @@ impl ControlMvpProjectionOutboxRecord {
         self.origin_sequence
     }
 
+    /// Returns this staging incarnation's immutable event id — the delivery
+    /// identity consumers acknowledge and trim by.
+    ///
+    /// `None` only for records that have been staged but not yet committed,
+    /// because the event id is derived from the committing sequence.
+    #[must_use]
+    pub fn event_id(&self) -> Option<String> {
+        self.origin_sequence
+            .map(|sequence| control_mvp_outbox_event_id(sequence, &self.record_id))
+    }
+
+    /// Returns the trim target naming exactly this staging incarnation.
+    ///
+    /// `None` only for records that have been staged but not yet committed.
+    #[must_use]
+    pub fn trim_target(&self) -> Option<ControlMvpOutboxTrimTarget> {
+        self.origin_sequence
+            .map(|sequence| ControlMvpOutboxTrimTarget::new(self.record_id.clone(), sequence))
+    }
+
     /// Creates a record as it appears when read back from committed state,
     /// carrying the producing commit's logical sequence.
     #[must_use]
@@ -1365,7 +1636,7 @@ pub struct ControlMvpTxn {
     preconditions: Vec<Precondition>,
     writes: BTreeMap<Vec<u8>, StagedWrite>,
     outbox: Vec<ControlMvpProjectionOutboxRecord>,
-    outbox_trim: Vec<String>,
+    outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
 impl ControlMvpTxn {
@@ -1421,40 +1692,69 @@ impl ControlMvpTxn {
         Ok(())
     }
 
-    /// Stages removal of already-consumed projection outbox records.
+    /// Stages removal of already-consumed projection outbox events.
     ///
     /// Trimming bounds outbox growth through snapshots: trimmed records leave
     /// the replayed state from this commit forward, while token-pinned reads of
-    /// retained history still observe them. Callers must trim only records the
+    /// retained history still observe them. Callers must trim only events the
     /// consuming projection has durably acknowledged — the store enforces that
-    /// each id currently exists, not that it was acknowledged.
+    /// each named *event incarnation* currently exists, not that it was
+    /// acknowledged.
+    ///
+    /// Targets name `(record_id, origin_sequence)`, and that identity is
+    /// validated against the transaction's base state — i.e. inside the
+    /// transaction that will publish the trim. A caller whose observation
+    /// predates a concurrent trim-and-re-stage cycle therefore fails closed
+    /// instead of deleting the fresh incarnation that inherited the id.
     ///
     /// # Errors
     ///
-    /// Returns a precondition failure when an id is not present in the
-    /// transaction's base outbox or is trimmed twice.
+    /// Returns a precondition failure when a record id is not present in the
+    /// transaction's base outbox, when it is present under a different origin
+    /// sequence than the target observed, or when it is trimmed twice.
     pub fn trim_projection_outbox(
         &mut self,
-        record_ids: impl IntoIterator<Item = String>,
+        targets: impl IntoIterator<Item = ControlMvpOutboxTrimTarget>,
     ) -> Result<()> {
-        for record_id in record_ids {
-            if self
+        for target in targets {
+            let Some(present) = self
                 .base
                 .state
                 .outbox
                 .iter()
-                .all(|record| record.record_id != record_id)
+                .find(|record| record.record_id == target.record_id)
+            else {
+                return Err(precondition_failed(&format!(
+                    "cannot trim projection outbox record {}: not present in current state",
+                    target.record_id
+                )));
+            };
+            if present.origin_sequence != Some(target.origin_sequence) {
+                return Err(precondition_failed(&format!(
+                    "cannot trim projection outbox event {}: record {} is currently retained as \
+                     event {} (a different incarnation of the same record id)",
+                    target.event_id(),
+                    target.record_id,
+                    present
+                        .event_id()
+                        .unwrap_or_else(|| "<uncommitted>".to_string()),
+                )));
+            }
+            if self
+                .outbox_trim
+                .iter()
+                .any(|staged| staged.record_id() == target.record_id)
             {
                 return Err(precondition_failed(&format!(
-                    "cannot trim projection outbox record {record_id}: not present in current state"
+                    "projection outbox record {} is already staged for trimming",
+                    target.record_id
                 )));
             }
-            if self.outbox_trim.contains(&record_id) {
-                return Err(precondition_failed(&format!(
-                    "projection outbox record {record_id} is already staged for trimming"
-                )));
-            }
-            self.outbox_trim.push(record_id);
+            self.outbox_trim
+                .push(ControlMvpOutboxTrimEntry::Identified {
+                    record_id: target.record_id,
+                    origin_sequence: target.origin_sequence,
+                });
         }
         Ok(())
     }
@@ -1564,12 +1864,7 @@ impl ControlMvpTxn {
         for precondition in &self.preconditions {
             self.base.state.validate_precondition(precondition)?;
         }
-        if self.store.writer_epoch < self.base.writer_epoch {
-            return Err(stale_writer_epoch(
-                self.store.writer_epoch,
-                self.base.writer_epoch,
-            ));
-        }
+        validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
 
         let next_sequence = self.base.state.logical_sequence + 1;
         let tx = ControlMvpTxObject {
@@ -1726,7 +2021,31 @@ impl ArcoStateReader for ControlMvpStateStore {
                 "control MVP checkpoint state sequence does not match checkpoint",
             ));
         }
+        // Sequence agreement alone does not prove the snapshot is the state
+        // the checkpoint's authority manifest names. Concurrent losing anchor
+        // commits leave valid, same-scope, same-sequence orphan snapshots
+        // behind, so a coherently substituted state reference would otherwise
+        // select a losing fork. Load the named manifest under the
+        // checkpoint's own manifest checksum and require the snapshot's
+        // semantic state checksum to equal the manifest's. This stays bounded
+        // (checkpoint + manifest + snapshot) and never replays history.
+        let manifest = self
+            .load_manifest_with_expected_checksum(
+                &checkpoint.manifest_id,
+                Some(&checkpoint.manifest_checksum_sha256),
+            )
+            .await?;
+        if manifest.logical_sequence != checkpoint.logical_sequence {
+            return Err(invariant_violation(
+                "control MVP checkpoint sequence does not match its authority manifest",
+            ));
+        }
         let state = self.load_state_snapshot(&checkpoint.state).await?;
+        if state.checksum()? != manifest.state_checksum_sha256 {
+            return Err(invariant_violation(
+                "control MVP checkpoint snapshot is not the state named by its authority manifest",
+            ));
+        }
         Ok(Box::new(ControlMvpRetainedReader { state }))
     }
 }
@@ -2017,6 +2336,15 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
     ) -> Result<RestoreParticipantInspection> {
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
         plan.validate(&self.store)?;
+        if plan.is_legacy_version() {
+            // Defined terminal outcome for a migrated pre-`observed_writer_epoch`
+            // plan: it never observed the epoch it would have to publish under,
+            // so it can never be reproduced as deterministic candidate bytes
+            // and must not be applied. Reporting Superseded drives the restore
+            // driver to replan the domain at the current version instead of
+            // failing recovery outright.
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         let planned_checksum = plan
             .transaction_sha256
@@ -2336,14 +2664,33 @@ impl ReplayState {
                 },
             );
         }
-        for trimmed_id in &tx.outbox_trim {
-            let before = self.outbox.len();
-            self.outbox.retain(|record| &record.record_id != trimmed_id);
-            if self.outbox.len() == before {
+        for trimmed in &tx.outbox_trim {
+            let record_id = trimmed.record_id();
+            let retained = self
+                .outbox
+                .iter()
+                .enumerate()
+                .find(|(_, record)| record.record_id == record_id)
+                .map(|(position, record)| (position, record.origin_sequence, record.event_id()));
+            let Some((position, retained_sequence, retained_event)) = retained else {
                 return Err(invariant_violation(format!(
-                    "control MVP outbox trim names record {trimmed_id} that is not present in replayed state"
+                    "control MVP outbox trim names record {record_id} that is not present in replayed state"
+                )));
+            };
+            // Identified trims are conditional on the exact event
+            // incarnation, so a forged or stale trim cannot delete a record id
+            // that was re-staged after the observation it was built from.
+            if let Some(expected) = trimmed.origin_sequence()
+                && retained_sequence != Some(expected)
+            {
+                return Err(invariant_violation(format!(
+                    "control MVP outbox trim names event {} but record {record_id} is retained as \
+                     event {}",
+                    control_mvp_outbox_event_id(expected, record_id),
+                    retained_event.unwrap_or_else(|| "<uncommitted>".to_string()),
                 )));
             }
+            self.outbox.remove(position);
         }
         for entry in &tx.outbox {
             // Mirror of the stage-time uniqueness validation: honestly
@@ -2820,12 +3167,46 @@ struct ControlMvpTxObject {
     request_id: Option<String>,
     writes: Vec<ControlMvpWriteEntry>,
     outbox: Vec<ControlMvpOutboxEntry>,
-    /// Outbox record ids removed from replayed state by this transaction.
-    /// Consumers trim only records they have durably acknowledged; the store
-    /// enforces that every trimmed id exists at apply time and fails closed
-    /// otherwise.
+    /// Outbox events removed from replayed state by this transaction.
+    /// Consumers trim only events they have durably acknowledged; the store
+    /// enforces that every trimmed event incarnation exists at apply time and
+    /// fails closed otherwise.
     #[serde(default)]
-    outbox_trim: Vec<String>,
+    outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
+}
+
+/// Trim entry as persisted in a transaction object.
+///
+/// New transactions always write the identified form, which pins the exact
+/// event incarnation removed. The bare-string form is only ever *read*: it is
+/// how transactions committed before delivery identity existed encoded a
+/// trim, and replaying them by record id reproduces exactly the state those
+/// commits produced, so retained histories stay deterministic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ControlMvpOutboxTrimEntry {
+    Identified {
+        record_id: String,
+        origin_sequence: u64,
+    },
+    Legacy(String),
+}
+
+impl ControlMvpOutboxTrimEntry {
+    fn record_id(&self) -> &str {
+        match self {
+            Self::Identified { record_id, .. } | Self::Legacy(record_id) => record_id,
+        }
+    }
+
+    const fn origin_sequence(&self) -> Option<u64> {
+        match self {
+            Self::Identified {
+                origin_sequence, ..
+            } => Some(*origin_sequence),
+            Self::Legacy(_) => None,
+        }
+    }
 }
 
 impl ControlMvpTxObject {

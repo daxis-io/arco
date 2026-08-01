@@ -330,8 +330,9 @@ impl CatalogShadowExtendedSource {
 ///
 /// This path replays the metastore ledger and enumerates idempotency markers
 /// via `storage.list`, which is forbidden on request-time correctness paths —
-/// it may only be invoked from operator surfaces (the compactor's internal
-/// shadow-import endpoint).
+/// it may only be invoked from operator surfaces (arco-api's internal
+/// shadow-import endpoint, which is the service platform IAM makes the sole
+/// writer of the `state-store/` prefix).
 ///
 /// # Errors
 ///
@@ -719,6 +720,31 @@ async fn storage_governance_comparison(
 
     match load_published_storage_governance(storage).await {
         Ok(published) => match &source.metastore {
+            // The ledger replay above and this projection load are two reads of
+            // a moving world. When they land on different ledger watermarks —
+            // a producer appended and the projection was republished in
+            // between — the two sides describe different points in time, and
+            // any difference between them is a race, not a divergent result.
+            // Reporting it as a bug would be dishonest; reporting equivalence
+            // would be unearned. Classify the race and name both watermarks.
+            Some(metastore)
+                if metastore.ledger_watermark.as_deref() != Some(published.ledger_watermark.as_str()) =>
+            {
+                let captured = metastore.ledger_watermark.as_deref().unwrap_or("empty");
+                ShadowComparison {
+                    domain: ShadowComparisonDomain::StorageGovernance,
+                    status: ShadowComparisonStatus::Difference(
+                        ShadowDifferenceClass::StaleProjection,
+                    ),
+                    detail: format!(
+                        "storage-governance comparison spans two ledger watermarks: the shadow \
+                         source replayed the ledger at {captured} while the published projection \
+                         is at {}, so the two sides are not comparable; re-run the import to \
+                         compare at one watermark",
+                        published.ledger_watermark
+                    ),
+                }
+            }
             Some(metastore) => match StorageGovernanceState::from_metastore_state(metastore) {
                 Ok(replayed) if governance_states_agree(&replayed, &published.state) => {
                     ShadowComparison {
@@ -2393,6 +2419,200 @@ mod tests {
         assert!(
             comparison_status(&report, ShadowComparisonDomain::ParquetProjectionEquality)
                 .is_equivalent()
+        );
+    }
+    /// Barrier backend: blocks the first read of a path so a test can advance
+    /// the world at a precise point inside a multi-read comparison.
+    struct PauseOnceGetBackend {
+        inner: Arc<MemoryBackend>,
+        needle: String,
+        gate: std::sync::Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    }
+
+    impl PauseOnceGetBackend {
+        fn new(inner: Arc<MemoryBackend>, needle: &str) -> Self {
+            Self {
+                inner,
+                needle: needle.to_string(),
+                gate: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn arm(
+            &self,
+        ) -> (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.gate.lock().expect("barrier gate") = Some((reached_tx, release_rx));
+            (reached_rx, release_tx)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for PauseOnceGetBackend {
+        async fn get(&self, path: &str) -> arco_core::error::Result<Bytes> {
+            if path.ends_with(&self.needle) {
+                let gate = self.gate.lock().expect("barrier gate").take();
+                if let Some((reached, release)) = gate {
+                    let _ = reached.send(());
+                    let _ = release.await;
+                }
+            }
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: Range<u64>,
+        ) -> arco_core::error::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::error::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::error::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::error::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::error::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: Duration,
+        ) -> arco_core::error::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    /// The shadow governance comparison replays the metastore ledger when the
+    /// source is loaded and reads the published projection much later. A
+    /// producer that commits and republishes in that window leaves the two
+    /// sides describing different ledger watermarks. That is a race between
+    /// two reads, not evidence of a divergent result, and must not be reported
+    /// as `BugDivergentResult`.
+    #[tokio::test]
+    async fn concurrent_projection_advance_is_a_watermark_race_not_a_divergent_result() {
+        use crate::metastore::events::{
+            LifecycleState, MetastoreEvent, MetastoreMutation, StorageCredentialRecord,
+        };
+        use crate::metastore::projections::{ProjectionRegistry, build_projection_set};
+        use crate::metastore::publish::publish_metastore_projection_set;
+        use crate::metastore::replay::replay_events;
+        use arco_core::ControlPlaneScope;
+
+        fn credential_event(
+            scope: &ControlPlaneScope,
+            event_id: &str,
+            sequence: u64,
+            credential_id: &str,
+        ) -> MetastoreEvent {
+            MetastoreEvent::new_scoped(
+                scope,
+                event_id,
+                sequence,
+                MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
+                    credential_id: credential_id.to_string(),
+                    name: format!("lakehouse-{credential_id}"),
+                    cloud: "gcp".to_string(),
+                    owner: "group:data-platform".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_002,
+                    properties: BTreeMap::new(),
+                    secret_material_ref: None,
+                    encrypted_payload: None,
+                }),
+            )
+        }
+
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(PauseOnceGetBackend::new(
+            memory,
+            "manifests/metastore_projection.pointer.json",
+        ));
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        publish_catalog_fixture(&storage, fixture_state()).await;
+        let scope =
+            ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
+        let ledger = MetastoreLedger::new(storage.clone());
+        let first = credential_event(&scope, "event_001", 1, "cred_01");
+        ledger.append_event(&first).await.expect("append event one");
+        let first_state = replay_events([first.clone()].iter()).expect("replay event one");
+        publish_metastore_projection_set(
+            &storage,
+            &build_projection_set(&first_state, &ProjectionRegistry::default(), "event_001")
+                .expect("projection set"),
+            1,
+        )
+        .await
+        .expect("publish projection at event_001");
+
+        // Pause the import right before it loads the published projection, so
+        // its ledger replay is already fixed at event_001.
+        let (reached, release) = backend.arm();
+        let importing = tokio::spawn({
+            let storage = storage.clone();
+            async move { import_current_catalog_shadow(&storage).await }
+        });
+        reached
+            .await
+            .expect("import reached the published projection read");
+
+        // A producer commits and republishes: the world moves to event_002.
+        let second = credential_event(&scope, "event_002", 2, "cred_02");
+        ledger
+            .append_event(&second)
+            .await
+            .expect("append event two");
+        let second_state = replay_events([first, second].iter()).expect("replay both events");
+        publish_metastore_projection_set(
+            &storage,
+            &build_projection_set(&second_state, &ProjectionRegistry::default(), "event_002")
+                .expect("projection set"),
+            2,
+        )
+        .await
+        .expect("publish projection at event_002");
+        release.send(()).expect("release the paused import");
+
+        let report = importing
+            .await
+            .expect("import task")
+            .expect("import shadow state");
+        let governance = comparison(&report, ShadowComparisonDomain::StorageGovernance);
+        assert_eq!(
+            ShadowComparisonStatus::Difference(ShadowDifferenceClass::StaleProjection),
+            governance.status(),
+            "a concurrent projection advance must be classified as a watermark race, got: {}",
+            governance.detail()
+        );
+        assert!(
+            governance.detail().contains("event_001") && governance.detail().contains("event_002"),
+            "the race classification must name both watermarks: {}",
+            governance.detail()
         );
     }
 }

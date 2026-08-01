@@ -778,6 +778,26 @@ impl Server {
                     .layer(task_auth_layer),
             );
 
+        // Operator-only control-store surface (roadmap Phase 4/5: "write APIs
+        // behind internal or operator-only access"). Default off: when the
+        // flag is clear the routes are never mounted, so they 404 rather than
+        // existing and refusing. A public posture never mounts them at all,
+        // mirroring how `/metrics` is withheld there. They are hosted here
+        // because platform IAM makes this service the sole writer of the
+        // `state-store/` prefix, so no other service account may run them.
+        // Authentication is the same middleware every other authenticated
+        // route uses, so the tenant/workspace scope they operate on is the
+        // verified request scope rather than a caller-supplied one.
+        if state.config.control_store_operator_endpoints && !state.config.posture.is_public() {
+            tracing::info!("control-store operator endpoints enabled (/internal/control-store/*)");
+            let internal_auth_layer =
+                middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+            router = router.nest(
+                "/internal",
+                crate::routes::internal_operator_routes().layer(internal_auth_layer),
+            );
+        }
+
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
         if state.config.iceberg.enabled {

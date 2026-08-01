@@ -599,6 +599,7 @@ mod tests {
                     runs: Some(artifact(&base_path)),
                     ..Default::default()
                 },
+                delete_channel_version: 0,
             },
             l0_deltas: vec![L0Delta {
                 delta_id: delta_id.to_string(),

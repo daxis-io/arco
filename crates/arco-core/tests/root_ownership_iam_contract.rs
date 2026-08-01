@@ -14,6 +14,10 @@ struct RootOwnershipFixture {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "contract fixture fields intentionally mirror the boolean ownership matrix"
+)]
 struct RootRoleEntry {
     root: String,
     root_kind: RootKind,
@@ -254,6 +258,10 @@ fn assert_no_root_ownership_errors(fixture: &RootOwnershipFixture) {
     assert!(errors.is_empty(), "root ownership errors: {errors:?}");
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping the fixture invariants together makes contract failures easier to audit"
+)]
 fn root_ownership_errors(fixture: &RootOwnershipFixture) -> Vec<String> {
     let mut errors = Vec::new();
 

@@ -34,6 +34,10 @@ enum CertificationState {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "contract fixture fields intentionally mirror the boolean capability matrix"
+)]
 struct ProviderSemantics {
     conditional_create: bool,
     pointer_cas: bool,

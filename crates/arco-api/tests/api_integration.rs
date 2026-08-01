@@ -1432,6 +1432,29 @@ mod lineage {
                     "run_id": ""
                 }]
             }),
+            // NUL in target_id: the separator-injection shape that would have
+            // collided with a NUL in source_id under a separator-only edge-id
+            // encoding.
+            serde_json::json!({
+                "edges": [{ "source_id": "a", "target_id": "b\u{0000}c", "edge_type": "derives_from" }]
+            }),
+            // NUL in source_id: the other half of that pair.
+            serde_json::json!({
+                "edges": [{ "source_id": "a\u{0000}b", "target_id": "c", "edge_type": "derives_from" }]
+            }),
+            // Control character in edge_type.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "t", "edge_type": "derives\u{0001}from" }]
+            }),
+            // Control character in run_id.
+            serde_json::json!({
+                "edges": [{
+                    "source_id": "s",
+                    "target_id": "t",
+                    "edge_type": "derives_from",
+                    "run_id": "run\u{0000}1"
+                }]
+            }),
         ];
 
         for body in invalid_bodies {

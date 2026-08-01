@@ -6620,7 +6620,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 // Advisory lint scope for test code (#331): the allowed pedantic/nursery
 // lints conflict with test ergonomics here; production code keeps them active.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 mod tests {
     use super::*;
     use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};

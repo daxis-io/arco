@@ -17,9 +17,10 @@ use crate::storage_governance::StorageGovernanceState;
 
 use super::ledger::{MetastoreLedger, MetastoreLedgerWatermark};
 use super::projections::{
-    ProjectionSet, STORAGE_GOVERNANCE_PROJECTION, STORAGE_GOVERNANCE_SCHEMA_VERSION,
-    read_metastore_object_rows,
+    ProjectionRegistry, ProjectionSet, STORAGE_GOVERNANCE_PROJECTION,
+    STORAGE_GOVERNANCE_SCHEMA_VERSION, build_projection_set, read_metastore_object_rows,
 };
+use super::replay::replay_events;
 
 const METASTORE_PROJECTION_POINTER: &str = "manifests/metastore_projection.pointer.json";
 const METASTORE_PROJECTION_MANIFEST_PREFIX: &str = "manifests/metastore_projection/";
@@ -337,6 +338,95 @@ pub async fn publish_metastore_projection_set(
     Ok(manifest)
 }
 
+/// Outcome of a commit-synchronous metastore projection publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetastoreProjectionPublication {
+    /// The metastore ledger is empty; there is nothing to publish.
+    EmptyLedger,
+    /// The published pointer already covers the latest ledger watermark.
+    AlreadyCurrent {
+        /// Ledger watermark sequence covered by the published pointer.
+        ledger_watermark_sequence: u64,
+    },
+    /// A projection set was published at the latest ledger watermark.
+    Published(MetastoreProjectionManifest),
+}
+
+/// Publishes the metastore projection set at the current ledger watermark.
+///
+/// This is the production publisher for the storage-governance projection
+/// (issue #362): metastore ledger committers append their event and then call
+/// this to advance the published projection to the new watermark. Because
+/// [`load_published_storage_governance`] enforces exact-watermark freshness,
+/// publication must follow every ledger commit; a projection left behind the
+/// ledger keeps credential vending deny-closed (HTTP 503) until republished.
+///
+/// The publication is idempotent and monotonic:
+///
+/// - a pointer already at (or beyond) the latest watermark is left untouched;
+/// - losing the pointer CAS race to a publisher at the same or newer watermark
+///   is reported as [`MetastoreProjectionPublication::AlreadyCurrent`];
+/// - only events at or below the latest durable watermark are projected, so a
+///   concurrent in-flight append never leaks into an older watermark's set.
+///
+/// # Errors
+///
+/// Returns an error when the ledger cannot be read, the latest watermark is
+/// pending, or projection files/manifest/pointer cannot be written.
+pub async fn publish_current_metastore_projection(
+    storage: &ScopedStorage,
+    registry: &ProjectionRegistry,
+) -> Result<MetastoreProjectionPublication> {
+    let ledger = MetastoreLedger::new(storage.clone());
+    let Some(latest) = ledger.latest_watermark().await? else {
+        return Ok(MetastoreProjectionPublication::EmptyLedger);
+    };
+
+    if let Some(current) = load_current_projection_pointer(storage).await? {
+        if current.manifest.ledger_watermark_sequence >= latest.sequence {
+            return Ok(MetastoreProjectionPublication::AlreadyCurrent {
+                ledger_watermark_sequence: current.manifest.ledger_watermark_sequence,
+            });
+        }
+    }
+
+    let events = ledger.load_events().await?;
+    if !events
+        .iter()
+        .any(|event| event.sequence == latest.sequence && event.event_id == latest.event_id)
+    {
+        return Err(CatalogError::InvariantViolation {
+            message: format!(
+                "latest metastore watermark '{}' (sequence {}) is not yet readable from the ledger",
+                latest.event_id, latest.sequence
+            ),
+        });
+    }
+    let state = replay_events(
+        events
+            .iter()
+            .filter(|event| event.sequence <= latest.sequence),
+    )?;
+    let projection_set = build_projection_set(&state, registry, &latest.event_id)?;
+
+    match publish_metastore_projection_set(storage, &projection_set, latest.sequence).await {
+        Ok(manifest) => Ok(MetastoreProjectionPublication::Published(manifest)),
+        Err(CatalogError::PreconditionFailed { message }) => {
+            // A concurrent publisher may have moved the pointer to the same or
+            // a newer watermark; that publication covers this one.
+            if let Some(current) = load_current_projection_pointer(storage).await? {
+                if current.manifest.ledger_watermark_sequence >= latest.sequence {
+                    return Ok(MetastoreProjectionPublication::AlreadyCurrent {
+                        ledger_watermark_sequence: current.manifest.ledger_watermark_sequence,
+                    });
+                }
+            }
+            Err(CatalogError::PreconditionFailed { message })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Loads the published storage-governance projection for enforcement.
 ///
 /// # Errors
@@ -354,6 +444,49 @@ pub async fn load_published_storage_governance(
 
     load_published_storage_governance_from_manifest(storage, manifest).await
 }
+
+/// Loads the published storage-governance projection when one has been
+/// configured for this tenant/workspace scope.
+///
+/// Returns `Ok(None)` when no projection pointer exists, meaning storage
+/// governance has never been enabled for the scope and callers may preserve
+/// ungoverned behavior. When a pointer exists the projection must be fresh:
+/// stale or corrupt projections fail closed exactly like
+/// [`load_published_storage_governance`].
+///
+/// # Errors
+///
+/// Returns `RequestFailed(503)` when a pointer exists but the projection is
+/// stale, unsupported, or corrupt, and storage errors from the pointer probe.
+pub async fn load_published_storage_governance_if_configured(
+    storage: &ScopedStorage,
+) -> Result<Option<PublishedStorageGovernance>> {
+    if storage
+        .head_raw(METASTORE_PROJECTION_POINTER)
+        .await
+        .map_err(CatalogError::from)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    load_published_storage_governance(storage).await.map(Some)
+}
+
+/// Enforces the projection-staleness half of the revocation-freshness budget.
+///
+/// [`crate::credential_vending::MAX_PROJECTION_STALENESS_SECS`] is zero: only a
+/// projection at the *exact* latest ledger watermark may serve credential
+/// decisions, so a committed revocation is visible to every subsequent
+/// decision and stale state denies closed (HTTP 503). Relaxing this equality
+/// to any weaker freshness rule widens the revocation-freshness budget and
+/// must update `REVOCATION_FRESHNESS_BUDGET_SECS` and
+/// `docs/guide/src/reference/credential-vending-security.md` together; the
+/// compile-time assertion below pins that coupling.
+const _: () = assert!(
+    crate::credential_vending::MAX_PROJECTION_STALENESS_SECS == 0,
+    "validate_storage_governance_manifest_freshness enforces exact-watermark \
+     equality; a non-zero staleness bound requires changing this validator"
+);
 
 fn validate_storage_governance_manifest_freshness(
     manifest: &MetastoreProjectionManifest,

@@ -33,6 +33,7 @@ use crate::audit::{
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
+use crate::governance::validate_client_supplied_location;
 use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
@@ -214,6 +215,10 @@ async fn create_table(
 
     let (table_location, storage_relative_location) = match &req.location {
         Some(loc) => {
+            // #358: when storage governance is enabled for this scope, a
+            // client-supplied location must resolve to a governed path
+            // authority before it can be advertised or written.
+            validate_client_supplied_location(&storage, &ctx.workspace, loc).await?;
             let resolved =
                 resolve_metadata_path(loc, &ctx.tenant, &ctx.workspace).map_err(|e| {
                     IcebergError::BadRequest {
@@ -1115,6 +1120,10 @@ async fn register_table(
         });
     }
 
+    // #358: the table location inside a client-supplied metadata file is a
+    // client-controlled location channel and must satisfy storage governance
+    // when it is enabled for this scope.
+    validate_client_supplied_location(&storage, &ctx.workspace, &metadata.location).await?;
     let storage_relative_location =
         resolve_metadata_path(&metadata.location, &ctx.tenant, &ctx.workspace).map_err(|e| {
             IcebergError::BadRequest {

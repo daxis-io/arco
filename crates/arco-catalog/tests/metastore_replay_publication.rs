@@ -22,9 +22,10 @@ use arco_catalog::metastore::projections::{
     build_projection_set, write_metastore_objects,
 };
 use arco_catalog::metastore::publish::{
-    PointerPublishResult, PublishedProjectionSet, PublishedStorageGovernanceCache,
-    complete_pointer_publication, load_published_storage_governance,
-    publish_metastore_projection_set,
+    MetastoreProjectionPublication, PointerPublishResult, PublishedProjectionSet,
+    PublishedStorageGovernanceCache, complete_pointer_publication,
+    load_published_storage_governance, load_published_storage_governance_if_configured,
+    publish_current_metastore_projection, publish_metastore_projection_set,
 };
 use arco_catalog::metastore::replay::replay_events;
 use arco_catalog::{CatalogError, Result};
@@ -416,6 +417,173 @@ async fn storage_governance_projection_requires_latest_ledger_watermark_after_au
     let err = load_published_storage_governance(&storage)
         .await
         .expect_err("older projection must deny after any newer metastore event");
+    assert_projection_stale(err);
+    Ok(())
+}
+
+/// Production publisher (#362): `publish_current_metastore_projection` reads
+/// the ledger, publishes at the exact latest watermark, and is idempotent when
+/// the pointer is already current.
+#[tokio::test]
+async fn publish_current_metastore_projection_publishes_at_latest_watermark() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    // Empty ledger publishes nothing and leaves vending deny-closed.
+    assert_eq!(
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?,
+        MetastoreProjectionPublication::EmptyLedger
+    );
+    assert!(
+        load_published_storage_governance_if_configured(&storage)
+            .await?
+            .is_none()
+    );
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+
+    let published =
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?;
+    let MetastoreProjectionPublication::Published(manifest) = published else {
+        panic!("expected publication, got {published:?}");
+    };
+    assert_eq!(manifest.ledger_watermark_sequence, 4);
+    assert_eq!(manifest.ledger_watermark, "event_004");
+
+    // The published projection now serves enforcement reads.
+    let loaded = load_published_storage_governance(&storage).await?;
+    assert_eq!(loaded.ledger_watermark, "event_004");
+    assert!(
+        loaded
+            .state
+            .authority_for_path("workspace1", "gs://bucket/warehouse/orders/day=1/")
+            .is_ok()
+    );
+
+    // Re-running the publisher without new commits is a no-op.
+    assert_eq!(
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?,
+        MetastoreProjectionPublication::AlreadyCurrent {
+            ledger_watermark_sequence: 4
+        }
+    );
+    Ok(())
+}
+
+/// Revocation-freshness budget, staleness half (roadmap Phase 6 required
+/// test): after a revocation commits to the ledger, a projection that has not
+/// yet republished is *stale* and every credential read denies closed (503).
+/// After republication the revoked scope no longer resolves. The two halves
+/// bound worst-case exposure to `MAX_PROJECTION_STALENESS (0s) +
+/// MAX_CREDENTIAL_TTL (3600s)`.
+#[tokio::test]
+async fn revocation_with_stale_projection_denies_closed_until_republished() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?;
+    let fresh = load_published_storage_governance(&storage).await?;
+    assert!(
+        fresh
+            .state
+            .authority_for_path("workspace1", "gs://bucket/warehouse/orders/day=1/")
+            .is_ok(),
+        "pre-revocation projection must govern the path"
+    );
+
+    // Revocation commits: the external location transitions to Deleted.
+    ledger
+        .append_event(&MetastoreEvent::new_scoped(
+            &scope,
+            "event_005",
+            5,
+            MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
+                location_id: "loc_orders".to_string(),
+                name: "orders".to_string(),
+                url: "gs://bucket/warehouse/orders/".to_string(),
+                credential_id: "cred_01".to_string(),
+                owner: "owner".to_string(),
+                lifecycle_state: LifecycleState::Deleted,
+                updated_at_ms: 1_800_000_000_009,
+                properties: sensitive_properties(),
+            }),
+        ))
+        .await?;
+
+    // Revocation + stale projection => deny closed. No credential decision can
+    // be served from the state that predates the revocation.
+    let err = load_published_storage_governance(&storage)
+        .await
+        .expect_err("stale projection after a revocation must deny closed");
+    assert_projection_stale(err);
+
+    // Revocation + fresh projection => the revoked scope cannot be vended.
+    let republished =
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?;
+    let MetastoreProjectionPublication::Published(manifest) = republished else {
+        panic!("expected republication, got {republished:?}");
+    };
+    assert_eq!(manifest.ledger_watermark_sequence, 5);
+    let loaded = load_published_storage_governance(&storage).await?;
+    assert_eq!(loaded.ledger_watermark, "event_005");
+    assert!(
+        loaded
+            .state
+            .authority_for_path("workspace1", "gs://bucket/warehouse/orders/day=1/")
+            .is_err(),
+        "revoked external location must not govern any path"
+    );
+    Ok(())
+}
+
+/// `load_published_storage_governance_if_configured` distinguishes
+/// never-configured scopes (no pointer, `None`) from configured-but-stale
+/// scopes (pointer present, deny closed).
+#[tokio::test]
+async fn optional_storage_governance_load_fails_closed_once_configured() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
+    let ledger = MetastoreLedger::new(storage.clone());
+    let scope = test_scope();
+
+    assert!(
+        load_published_storage_governance_if_configured(&storage)
+            .await?
+            .is_none(),
+        "unconfigured scope must report no governance"
+    );
+
+    for event in scoped_storage_governance_events(&scope) {
+        ledger.append_event(&event).await?;
+    }
+    publish_current_metastore_projection(&storage, &ProjectionRegistry::default()).await?;
+    assert!(
+        load_published_storage_governance_if_configured(&storage)
+            .await?
+            .is_some(),
+        "configured scope must load the published projection"
+    );
+
+    ledger
+        .append_event(&scoped_storage_credential_event(
+            &scope,
+            "event_005",
+            5,
+            "cred_02",
+        ))
+        .await?;
+    let err = load_published_storage_governance_if_configured(&storage)
+        .await
+        .expect_err("configured-but-stale scope must deny closed");
     assert_projection_stale(err);
     Ok(())
 }

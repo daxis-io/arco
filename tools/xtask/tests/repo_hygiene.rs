@@ -281,7 +281,7 @@ fn run_repo_hygiene_check_fatal(workspace: &Path) -> (bool, String) {
 fn run_hygiene(workspace: &Path, dangling_fatal: bool) -> (bool, String) {
     for args in [["init", "--quiet"], ["add", "--all"]] {
         let status = Command::new("git")
-            .args(&args)
+            .args(args)
             .current_dir(workspace)
             .output()
             .expect("run git in temporary workspace");

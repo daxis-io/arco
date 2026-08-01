@@ -675,9 +675,9 @@ fn run_repo_hygiene_check() -> Result<()> {
         }
 
         let lower = text.to_ascii_lowercase();
-        if scans_forbidden_path_markers(&path) {
+        if scans_forbidden_path_markers(path) {
             for marker in &forbidden_paths {
-                if lower.contains(marker) && !is_allowed_forbidden_path_marker(&path, marker) {
+                if lower.contains(marker) && !is_allowed_forbidden_path_marker(path, marker) {
                     errors.push(format!(
                         "{path}: forbidden path reference '{marker}' (this scan runs over its \
                          own sources too; if the literal is genuinely needed in code, a test, \
@@ -689,8 +689,8 @@ fn run_repo_hygiene_check() -> Result<()> {
             }
         }
 
-        for hit in scan_proto_denylist(&path, &text) {
-            if is_allowed_proto_denylist_hit(&path, &hit) {
+        for hit in scan_proto_denylist(path, &text) {
+            if is_allowed_proto_denylist_hit(path, &hit) {
                 continue;
             }
             errors.push(format!("{path}: legacy proto symbol '{hit}'"));

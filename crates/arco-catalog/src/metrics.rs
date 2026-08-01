@@ -164,6 +164,10 @@ pub const REPAIR_REPEAT_FINDINGS_TOTAL: &str = "arco_catalog_repair_repeat_findi
 /// Registers all catalog metric descriptions.
 ///
 /// Call this once at application startup after initializing the metrics recorder.
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeping registration in one function makes the complete metric inventory auditable"
+)]
 pub fn register_metrics() {
     describe_counter!(GC_OBJECTS_DELETED, "Total objects deleted by GC");
     describe_counter!(GC_BYTES_RECLAIMED, "Total bytes reclaimed by GC");

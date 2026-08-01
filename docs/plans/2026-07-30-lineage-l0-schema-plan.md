@@ -125,10 +125,10 @@ The embryonic producer contract already in the code is formalized as the L0
 worker/materialization producer surface:
 
 - `arco-worker-contract` carries delta correlation on task completion
-  (`crates/arco-worker-contract/src/lib.rs:386-392`): delta table, delta
-  version, and partition "for lineage correlation".
+  (`TaskOutput`, `crates/arco-worker-contract/src/lib.rs:386-394`): delta
+  table, delta version, and partition "for lineage correlation".
 - The orchestration fold materializes these into
-  `CatalogRunIndexRow.delta_table` / `delta_version` /
+  `CatalogRunIndexRow.delta_table` / `delta_version` / `delta_partition` /
   `execution_lineage_ref` (`crates/arco-flow/src/orchestration/compactor/fold.rs:1063-1072`).
 
 Contract statement: workers report the storage-version identity of what they
@@ -137,18 +137,36 @@ edge projector consumes it as `*_storage_snapshot_id` /
 `*_materialization_id` evidence with `resolved_by_materialization` status.
 Producers must not fabricate versions they did not observe.
 
-Known caveat: the partition key currently does not reach the worker
-(issue #339 — the envelope lacks a partition field while the catalog records
-the partition as materialized), which would corrupt materialization-identity
-fidelity for partitioned assets. A fix adding the partition field to the
-envelope is in flight in a parallel change; L3 must not build on partitioned
-materialization identity until it lands.
+Known caveat, stated precisely because the two partition fields are easy to
+conflate: the *reported* partition is landed, the *dispatched* one is not.
+`TaskOutput.delta_partition` — what a worker reports it materialized — exists
+on this branch and on `origin/main` (`c3c0867`) at
+`crates/arco-worker-contract/src/lib.rs:394`, and folds into
+`CatalogRunIndexRow.delta_partition`
+(`crates/arco-flow/src/orchestration/compactor/fold.rs:1069`). L3 may consume
+it as materialization evidence today; that lane is not blocked.
+
+Issue #339 concerns the opposite direction. `WorkerDispatchEnvelope`
+(`crates/arco-worker-contract/src/lib.rs:105-140`) carries no partition field
+on this branch or on `origin/main`, so the control plane never tells a worker
+which partition scope to execute against. The reported partition is therefore
+self-asserted and unchecked against a dispatched scope, which is what would
+corrupt materialization-identity fidelity for partitioned assets. A change
+adding an additive `partition_key` to the dispatch envelope is in flight on a
+parallel branch (`fix/runtime-convergence`, commit `6916890f`) and has not
+landed. Until it does, L3 must not treat a reported partition as evidence that
+the control plane scoped the work to that partition.
 
 ## Legacy Edge Identity (L0 route change)
 
 As of this slice, `POST /api/v1/lineage/edges` derives each edge id
 deterministically: `sha256("arco-lineage-edge-v1", source_id, target_id,
-edge_type, run_id?)`, hex-encoded. Combined with the fold's first-write-wins
+edge_type, run_id?)`, hex-encoded. Each field is absorbed length-prefixed
+(byte length as a big-endian `u64`, then the bytes) rather than separated by a
+delimiter, so the encoding is injective and no field content can shift the
+boundary between two fields into another edge's digest; `run_id` carries a
+presence tag so absent and empty stay distinct. Validation independently
+rejects control characters in all four fields. Combined with the fold's first-write-wins
 dedup by id, duplicate POSTs (client retries without an Idempotency-Key)
 converge to a single projected row; `created_at` records the first accepted
 observation. Tenant/workspace scoping is physical (scoped storage), so equal

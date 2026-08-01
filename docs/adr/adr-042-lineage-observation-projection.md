@@ -98,3 +98,20 @@ Marquez-compatible read API.
   projection time, at the cost of collapsing intentionally repeated identical
   assertions (same source, target, type, and run) into one edge — repeated
   observations of the same logical dependency are the design intent.
+- That collapse is lossy in two specific ways, and the loss is accepted rather
+  than incidental. Because `run_id` participates in the edge id, every
+  observation of `(source, target, edge_type, None)` — that is, every edge
+  POSTed without a run id — folds into a single row, and first-write-wins
+  dedup keeps the *first* `created_at`. So on the legacy
+  `system.lineage.edges` surface: **multiplicity** is unrecoverable (the table
+  cannot say whether a dependency was asserted once or ten thousand times),
+  and **recency** is unrecoverable (`created_at` is the first observation, and
+  no column records the latest, so the table cannot say whether a dependency
+  is still being observed or was last seen months ago). A reader must not use
+  this surface for freshness, staleness, or frequency questions.
+- Callers that need observations kept distinct must supply a `run_id`, which
+  re-separates them one row per run; callers that need full multiplicity and
+  recency must wait for the L1+ observation model, where every observation is
+  retained as an append-only event with its own event time and ingest
+  sequence. The legacy table is a compatibility surface for *what depends on
+  what*, not an observation log.

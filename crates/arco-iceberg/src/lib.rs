@@ -49,7 +49,7 @@ pub mod credentials;
 pub mod error;
 pub mod events;
 pub mod gc;
-pub(crate) mod governance;
+pub mod governance;
 pub mod idempotency;
 pub mod metrics;
 pub mod openapi;

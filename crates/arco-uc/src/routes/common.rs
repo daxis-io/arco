@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::write_options::WriteOptions;
@@ -164,28 +165,47 @@ pub(crate) fn control_plane_scope(
     })
 }
 
-pub(crate) fn authz_denial_reason(
+/// Resolves the compiled permission view for this request scope.
+///
+/// Production wiring supplies a [`crate::permissions::CompiledPermissionSource`],
+/// which compiles a scope-correct view from the scope's authoritative metastore
+/// ledger; harnesses may instead pin a static view. Resolution failures return
+/// `None` and every caller treats that as a denial, so an unreachable or
+/// unreadable permission source is fail-closed, never fail-open.
+pub(crate) async fn resolve_compiled_permissions(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
-    object_id: &str,
-    object_type: &str,
-    privilege: Privilege,
-) -> Option<String> {
-    authz_denial_reason_for_watermark(state, ctx, object_id, object_type, privilege, None)
+) -> Option<Arc<CompiledPermissionSet>> {
+    if let Some(source) = state.permission_source.as_ref() {
+        return match source
+            .compiled_permissions(ctx.tenant.as_str(), ctx.workspace.as_str())
+            .await
+        {
+            Ok(permissions) => Some(permissions),
+            Err(error) => {
+                tracing::warn!(
+                    internal_error = %error,
+                    request_id = %ctx.request_id,
+                    "compiled permission view unavailable; denying closed"
+                );
+                None
+            }
+        };
+    }
+    let compiled = state.compiled_permissions.as_ref()?;
+    let guard = compiled.read().ok()?;
+    Some(Arc::clone(&guard))
 }
 
 pub(crate) fn authz_context_denial_reason_for_watermark(
-    state: &UnityCatalogState,
+    permissions: Option<&CompiledPermissionSet>,
     ctx: &UnityCatalogRequestContext,
     expected_ledger_watermark: Option<&str>,
 ) -> Option<String> {
     let Some(principal_id) = ctx.user_id.as_ref() else {
         return Some("unauthenticated_principal".to_string());
     };
-    let Some(compiled_permissions) = state.compiled_permissions.as_ref() else {
-        return Some("permissions_unavailable".to_string());
-    };
-    let Ok(compiled_permissions) = compiled_permissions.read() else {
+    let Some(compiled_permissions) = permissions else {
         return Some("permissions_unavailable".to_string());
     };
     if !compiled_permissions.fresh {
@@ -204,7 +224,7 @@ pub(crate) fn authz_context_denial_reason_for_watermark(
 }
 
 pub(crate) fn authz_denial_reason_for_watermark(
-    state: &UnityCatalogState,
+    permissions: Option<&CompiledPermissionSet>,
     ctx: &UnityCatalogRequestContext,
     object_id: &str,
     object_type: &str,
@@ -212,14 +232,11 @@ pub(crate) fn authz_denial_reason_for_watermark(
     expected_ledger_watermark: Option<&str>,
 ) -> Option<String> {
     if let Some(reason_code) =
-        authz_context_denial_reason_for_watermark(state, ctx, expected_ledger_watermark)
+        authz_context_denial_reason_for_watermark(permissions, ctx, expected_ledger_watermark)
     {
         return Some(reason_code);
     }
-    let Some(compiled_permissions) = state.compiled_permissions.as_ref() else {
-        return Some("permissions_unavailable".to_string());
-    };
-    let Ok(compiled_permissions) = compiled_permissions.read() else {
+    let Some(compiled_permissions) = permissions else {
         return Some("permissions_unavailable".to_string());
     };
     let Some(principal_id) = ctx.user_id.as_ref() else {
@@ -232,7 +249,7 @@ pub(crate) fn authz_denial_reason_for_watermark(
         privilege,
     )
     .with_request_id(&ctx.request_id);
-    let decision = AuthzDecision::evaluate(&request, &compiled_permissions);
+    let decision = AuthzDecision::evaluate(&request, compiled_permissions);
     if decision.outcome == DecisionOutcome::Allow {
         None
     } else {
@@ -240,7 +257,9 @@ pub(crate) fn authz_denial_reason_for_watermark(
     }
 }
 
-pub(crate) fn require_authz(
+/// Authorizes a privilege on a securable, resolving the request scope's
+/// compiled permission view first.
+pub(crate) async fn require_authz(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     object_id: &str,
@@ -248,7 +267,15 @@ pub(crate) fn require_authz(
     privilege: Privilege,
     message_prefix: &str,
 ) -> Result<(), UnityCatalogError> {
-    if let Some(reason_code) = authz_denial_reason(state, ctx, object_id, object_type, privilege) {
+    let permissions = resolve_compiled_permissions(state, ctx).await;
+    if let Some(reason_code) = authz_denial_reason_for_watermark(
+        permissions.as_deref(),
+        ctx,
+        object_id,
+        object_type,
+        privilege,
+        None,
+    ) {
         return Err(UnityCatalogError::Forbidden {
             message: format!("{message_prefix}:{reason_code}"),
         });

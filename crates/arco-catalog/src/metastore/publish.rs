@@ -147,6 +147,25 @@ pub struct PublishedStorageGovernance {
     pub ledger_watermark: String,
 }
 
+/// A published storage-governance projection together with the instant its
+/// freshness was observed.
+///
+/// Freshness validation is a point-in-time observation, not a lock: a
+/// revocation can commit while a request that already validated the watermark
+/// is still running. Consumers that mint time-bounded authority (credential
+/// vending) must anchor expiry to [`Self::observed_at`], and may re-fence
+/// against [`Self::observed_watermark`] before returning.
+#[derive(Debug, Clone)]
+pub struct ObservedStorageGovernance {
+    /// Published projection state.
+    pub published: Arc<PublishedStorageGovernance>,
+    /// Instant at which the published watermark was validated against the
+    /// latest committed ledger watermark.
+    pub observed_at: DateTime<Utc>,
+    /// Latest committed ledger watermark seen by that validation.
+    pub observed_watermark: Option<MetastoreLedgerWatermark>,
+}
+
 /// Cache for published storage-governance projection state.
 #[derive(Debug, Default)]
 pub struct PublishedStorageGovernanceCache {
@@ -189,11 +208,36 @@ impl PublishedStorageGovernanceCache {
     /// Returns `RequestFailed(503)` when the published projection is missing,
     /// stale, unsupported, or corrupt.
     pub async fn load(&self, storage: &ScopedStorage) -> Result<Arc<PublishedStorageGovernance>> {
+        self.load_observed(storage)
+            .await
+            .map(|observed| observed.published)
+    }
+
+    /// Loads the published storage-governance projection together with the
+    /// instant its freshness was observed and the watermark that observation
+    /// saw.
+    ///
+    /// Callers that mint time-bounded authority must use this rather than
+    /// [`Self::load`]: the returned observation is the anchor for expiry
+    /// clamping and for re-fencing the watermark before a credential is
+    /// returned. The observation instant is recorded immediately after
+    /// watermark validation succeeds, including on a cache hit (freshness is
+    /// revalidated on every call, so a hit is still a fresh observation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `RequestFailed(503)` when the published projection is missing,
+    /// stale, unsupported, or corrupt.
+    pub async fn load_observed(
+        &self,
+        storage: &ScopedStorage,
+    ) -> Result<ObservedStorageGovernance> {
         let manifest = load_projection_manifest(storage).await?;
         let latest = MetastoreLedger::new(storage.clone())
             .latest_watermark()
             .await?;
         validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
+        let observed_at = Utc::now();
         let identity = storage_governance_cache_identity(storage, &manifest).await?;
 
         if let Some(current) = self
@@ -206,7 +250,11 @@ impl PublishedStorageGovernanceCache {
         {
             if current.identity == identity {
                 metrics::inc_storage_governance_cache_hit();
-                return Ok(Arc::clone(&current.value));
+                return Ok(ObservedStorageGovernance {
+                    published: Arc::clone(&current.value),
+                    observed_at,
+                    observed_watermark: latest,
+                });
             }
         }
 
@@ -216,6 +264,7 @@ impl PublishedStorageGovernanceCache {
             .latest_watermark()
             .await?;
         validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
+        let observed_at = Utc::now();
         let identity = storage_governance_cache_identity(storage, &manifest).await?;
         if let Some(current) = self
             .current
@@ -227,7 +276,11 @@ impl PublishedStorageGovernanceCache {
         {
             if current.identity == identity {
                 metrics::inc_storage_governance_cache_hit();
-                return Ok(Arc::clone(&current.value));
+                return Ok(ObservedStorageGovernance {
+                    published: Arc::clone(&current.value),
+                    observed_at,
+                    observed_watermark: latest,
+                });
             }
         }
 
@@ -245,7 +298,11 @@ impl PublishedStorageGovernanceCache {
             identity,
             value: Arc::clone(&loaded),
         });
-        Ok(loaded)
+        Ok(ObservedStorageGovernance {
+            published: loaded,
+            observed_at,
+            observed_watermark: latest,
+        })
     }
 }
 
@@ -411,11 +468,15 @@ pub async fn publish_current_metastore_projection(
         .iter()
         .any(|event| event.sequence == latest.sequence && event.event_id == latest.event_id)
     {
+        // Event identifiers and sequences are internal ledger state: correlate
+        // them in logs, return only a stable reason code to callers.
+        tracing::error!(
+            event_id = %latest.event_id,
+            sequence = latest.sequence,
+            "latest metastore watermark is not yet readable from the ledger"
+        );
         return Err(CatalogError::InvariantViolation {
-            message: format!(
-                "latest metastore watermark '{}' (sequence {}) is not yet readable from the ledger",
-                latest.event_id, latest.sequence
-            ),
+            message: "metastore_latest_watermark_not_readable".to_string(),
         });
     }
     let state = replay_events(
@@ -519,24 +580,85 @@ pub async fn validate_governed_location_if_configured(
     let Some(published) = load_published_storage_governance_if_configured(storage).await? else {
         return Ok(());
     };
+    validate_governed_location_against(&published, workspace_id, location, None)
+}
+
+/// Table property keys whose value is a storage location.
+///
+/// Each of these redirects data or metadata writes away from the advertised
+/// table location, so under storage governance they are validated exactly like
+/// the advertised location. This is the single source of truth shared by every
+/// table-creation, registration, and commit surface; adding a key here extends
+/// enforcement everywhere at once.
+pub const LOCATION_BEARING_TABLE_PROPERTIES: [&str; 3] = [
+    "write.data.path",
+    "write.metadata.path",
+    "write.object-storage.path",
+];
+
+/// Validates the location-bearing entries of a table property map against
+/// published storage governance (#358).
+///
+/// Behaves exactly like [`validate_governed_location_if_configured`] for each
+/// [`LOCATION_BEARING_TABLE_PROPERTIES`] key present in `properties`, naming
+/// the offending property in the rejection. Property maps with none of those
+/// keys never load governance state and pass through unchanged.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::Validation`] for denied property locations and
+/// `RequestFailed(503)` when the published projection is stale, unsupported,
+/// or corrupt.
+pub async fn validate_governed_location_properties_if_configured<'a, I>(
+    storage: &ScopedStorage,
+    workspace_id: &str,
+    properties: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let targeted = properties
+        .into_iter()
+        .filter(|(key, _)| LOCATION_BEARING_TABLE_PROPERTIES.contains(key))
+        .collect::<Vec<_>>();
+    if targeted.is_empty() {
+        return Ok(());
+    }
+    let Some(published) = load_published_storage_governance_if_configured(storage).await? else {
+        return Ok(());
+    };
+    for (property, location) in targeted {
+        validate_governed_location_against(&published, workspace_id, location, Some(property))?;
+    }
+    Ok(())
+}
+
+fn validate_governed_location_against(
+    published: &PublishedStorageGovernance,
+    workspace_id: &str,
+    location: &str,
+    property: Option<&str>,
+) -> Result<()> {
+    let described = property.map_or_else(
+        || format!("storage location '{location}'"),
+        |property| format!("table property '{property}' storage location '{location}'"),
+    );
     match published.state.authority_for_path(workspace_id, location) {
         Ok(_) => Ok(()),
         Err(CatalogError::NotFound { .. }) => Err(CatalogError::Validation {
             message: format!(
-                "storage location '{location}' is not governed by any storage-governance path \
-                 authority bound to this workspace"
+                "{described} is not governed by any storage-governance path authority bound to \
+                 this workspace"
             ),
         }),
         Err(CatalogError::PreconditionFailed { .. }) => Err(CatalogError::Validation {
             message: format!(
-                "storage location '{location}' is ambiguously governed by overlapping \
-                 storage-governance path authorities"
+                "{described} is ambiguously governed by overlapping storage-governance path \
+                 authorities"
             ),
         }),
         Err(CatalogError::Validation { message }) => Err(CatalogError::Validation {
-            message: format!(
-                "invalid storage location '{location}' under storage governance: {message}"
-            ),
+            message: format!("invalid {described} under storage governance: {message}"),
         }),
         Err(error) => Err(error),
     }

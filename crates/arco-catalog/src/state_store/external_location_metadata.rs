@@ -929,7 +929,7 @@ mod tests {
         path_writer
             .declare_path(phase6a_declaration(
                 "decl_orders",
-                "gs://Bucket//warehouse/orders",
+                "gs://Bucket/warehouse/orders",
             ))
             .await
             .expect("declare phase6a path");

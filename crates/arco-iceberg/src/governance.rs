@@ -14,6 +14,7 @@
 //! governance it is validated exactly like the advertised table location.
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 use arco_catalog::CatalogError;
 use arco_catalog::metastore::publish::{
@@ -26,11 +27,11 @@ use crate::error::{IcebergError, IcebergResult};
 /// Iceberg table properties that carry storage locations and are therefore
 /// validated against storage governance exactly like the advertised table
 /// location when governance is enabled for the scope.
-pub const LOCATION_BEARING_TABLE_PROPERTIES: [&str; 3] = [
-    "write.data.path",
-    "write.metadata.path",
-    "write.object-storage.path",
-];
+///
+/// Re-exported from the catalog so every enforcement surface (Iceberg REST,
+/// UC, native API) shares one key list; a key added there is enforced here
+/// without a second edit.
+pub use arco_catalog::metastore::publish::LOCATION_BEARING_TABLE_PROPERTIES;
 
 /// Validates a client-supplied table location against published storage
 /// governance.
@@ -50,6 +51,11 @@ pub const LOCATION_BEARING_TABLE_PROPERTIES: [&str; 3] = [
 ///
 /// Server-derived default locations are not routed through this check; the
 /// scope of #358 is the client-controlled location channel.
+///
+/// # Errors
+///
+/// Returns a typed 400 for ungoverned, ambiguously governed, or unparseable
+/// locations, and a 503 when the published projection is stale or corrupt.
 pub async fn validate_client_supplied_location(
     storage: &ScopedStorage,
     workspace: &str,
@@ -70,10 +76,16 @@ pub async fn validate_client_supplied_location(
 /// the advertised table location; violations are denied with a typed 400
 /// naming the offending property. When governance is not configured, the
 /// properties pass through untouched.
-pub async fn validate_location_bearing_table_properties(
+///
+/// # Errors
+///
+/// Returns a typed 400 naming the offending property for ungoverned,
+/// ambiguously governed, or unparseable property locations, and a 503 when the
+/// published projection is stale or corrupt.
+pub async fn validate_location_bearing_table_properties<H: BuildHasher + Sync>(
     storage: &ScopedStorage,
     workspace: &str,
-    properties: &HashMap<String, String>,
+    properties: &HashMap<String, String, H>,
 ) -> IcebergResult<()> {
     let targeted: Vec<(&str, &str)> = LOCATION_BEARING_TABLE_PROPERTIES
         .iter()
@@ -89,6 +101,66 @@ pub async fn validate_location_bearing_table_properties(
         validate_location_against(&published, workspace, location, Some(property))?;
     }
     Ok(())
+}
+
+/// Request-scoped storage-governance enforcement handle.
+///
+/// The route layer is not a sufficient enforcement point for #358: the commit
+/// machinery ([`crate::commit::CommitService`],
+/// [`crate::coordinator::MultiTableTransactionCoordinator`]) is reached from
+/// several routes (single-table commit, one-table `transactions/commit`,
+/// multi-table `transactions/commit`), and each of those can carry
+/// `set-properties` updates that redirect data or metadata writes to a foreign
+/// bucket. Carrying this handle *into* the commit machinery makes the check a
+/// property of the authoritative write path rather than of any one route, so a
+/// new caller cannot reach a metadata write without it.
+#[derive(Clone)]
+pub struct TableLocationGovernance {
+    storage: ScopedStorage,
+    workspace: String,
+}
+
+impl TableLocationGovernance {
+    /// Binds governance enforcement to one request's storage scope.
+    #[must_use]
+    pub fn new(storage: ScopedStorage, workspace: impl Into<String>) -> Self {
+        Self {
+            storage,
+            workspace: workspace.into(),
+        }
+    }
+
+    /// Validates a client-supplied table location for this scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed 400 for ungoverned, ambiguous, or unparseable locations
+    /// and a 503 when the published projection is stale or corrupt.
+    pub async fn validate_location(&self, location: &str) -> IcebergResult<()> {
+        validate_client_supplied_location(&self.storage, &self.workspace, location).await
+    }
+
+    /// Validates the *effective* location-bearing property map for this scope.
+    ///
+    /// "Effective" means the map that will actually be persisted — after
+    /// `set-properties`/`remove-properties` updates have been applied to the
+    /// base metadata, or the property map carried by an imported metadata file
+    /// — not the properties named in the request. A commit that only removes a
+    /// governed property therefore passes, while one that leaves a foreign
+    /// location in place is rejected even if the request itself set no
+    /// property.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed 400 naming the offending property for ungoverned,
+    /// ambiguous, or unparseable property locations, and a 503 when the
+    /// published projection is stale or corrupt.
+    pub async fn validate_effective_properties<H: BuildHasher + Sync>(
+        &self,
+        properties: &HashMap<String, String, H>,
+    ) -> IcebergResult<()> {
+        validate_location_bearing_table_properties(&self.storage, &self.workspace, properties).await
+    }
 }
 
 async fn load_governance_if_configured(
@@ -139,11 +211,19 @@ fn validate_location_against(
     }
 }
 
+/// Maps an unavailable/corrupt governance projection onto a stable public
+/// reason code.
+///
+/// The underlying [`CatalogError`] carries internal state (ledger event IDs,
+/// projection object paths and versions, raw storage errors). It is correlated
+/// in logs; the client sees only the reason code and the retry hint.
 fn governance_state_unavailable(error: &CatalogError) -> IcebergError {
+    tracing::warn!(
+        internal_error = %error,
+        "redacted storage-governance state error for table location validation"
+    );
     IcebergError::ServiceUnavailable {
-        message: format!(
-            "Storage governance state unavailable for table location validation: {error}"
-        ),
+        message: "storage_governance_state_unavailable".to_string(),
         retry_after_seconds: Some(1),
     }
 }

@@ -85,7 +85,11 @@ struct RepairAutomationConfig {
 impl Default for RepairAutomationConfig {
     fn default() -> Self {
         Self {
-            mode: RepairAutomationMode::Enforce,
+            // Destructive automation is opt-in: the default reports findings
+            // without deleting anything. Set
+            // ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce to enable
+            // enforcement deliberately (#357).
+            mode: RepairAutomationMode::DryRun,
             interval: Duration::from_secs(300),
             scope: OrchestrationRepairScope::Full,
         }
@@ -1020,11 +1024,15 @@ mod tests {
     }
 
     #[test]
-    fn repair_automation_config_defaults_to_enforce_full_scope() {
+    fn repair_automation_config_defaults_to_non_destructive_dry_run() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
-        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(
+            config.mode,
+            RepairAutomationMode::DryRun,
+            "destructive repair enforcement must be explicit opt-in (#357)"
+        );
         assert_eq!(config.interval, std::time::Duration::from_secs(300));
         assert_eq!(config.scope, OrchestrationRepairScope::Full);
     }

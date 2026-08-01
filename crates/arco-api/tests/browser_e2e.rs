@@ -120,6 +120,24 @@ async fn test_router() -> Result<axum::Router> {
     Ok(Server::with_storage_backend(test_config(), backend).test_router())
 }
 
+/// Like [`test_router`], but also exposes the underlying storage so tests can
+/// resolve the manifest allowlist. Falls back to the dummy signed-url backend
+/// when the environment forbids binding a local listener.
+async fn test_router_with_fallback_storage() -> Result<(axum::Router, Arc<MemoryBackend>)> {
+    let inner = Arc::new(MemoryBackend::new());
+    let backend: Arc<dyn StorageBackend> = match HttpSignedUrlBackend::new(inner.clone()).await {
+        Ok(backend) => Arc::new(backend),
+        Err(err) if is_local_bind_not_permitted(&err) => {
+            Arc::new(DummyHttpSignedUrlBackend::new(inner.clone()))
+        }
+        Err(err) => return Err(anyhow::Error::new(err)).context("create HttpSignedUrlBackend"),
+    };
+    Ok((
+        Server::with_storage_backend(test_config(), backend).test_router(),
+        inner,
+    ))
+}
+
 async fn test_router_with_storage() -> Result<Option<(axum::Router, Arc<MemoryBackend>)>> {
     let inner = Arc::new(MemoryBackend::new());
     let backend = match HttpSignedUrlBackend::new(inner.clone()).await {
@@ -623,6 +641,84 @@ mod signed_url_security {
         };
         let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    /// Regression for #354: the raw `commits.parquet` artifact carries the
+    /// private commit-authority columns (`manifest_id`,
+    /// `event_witnesses_json`) that the `system.catalog.commits` projection
+    /// deliberately redacts. Minting a signed URL for it defeats that
+    /// projection, so the browser route must refuse it with a typed error even
+    /// though the manifest snapshot file list contains it - while benign
+    /// artifacts from the same snapshot keep minting normally.
+    #[tokio::test]
+    async fn test_commits_parquet_never_mintable_while_benign_artifacts_still_mint() -> Result<()> {
+        use arco_catalog::CatalogReader;
+        use arco_core::CatalogDomain;
+        use arco_core::ScopedStorage;
+
+        let (router, inner) = test_router_with_fallback_storage().await?;
+
+        // Seed a catalog so the manifest allowlist contains real snapshot files.
+        let create_ns = CreateNamespaceRequest {
+            name: "redaction_test_ns".to_string(),
+            description: None,
+        };
+        let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        let commits_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/commits.parquet"))
+            .cloned()
+            .context("commits.parquet must be in the manifest snapshot file list")?;
+        let namespaces_path = mintable
+            .iter()
+            .find(|p| p.ends_with("/namespaces.parquet"))
+            .cloned()
+            .context("namespaces.parquet not mintable")?;
+
+        // The raw commits artifact is refused with the typed projection error.
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![commits_path.clone()],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error: ApiErrorResponse = response_json(response).await?;
+        assert_eq!(error.code, "PROJECTION_ONLY_ARTIFACT");
+        assert!(
+            error.message.contains("system.catalog.commits"),
+            "denial must point at the redacted projection: {}",
+            error.message
+        );
+
+        // A batch containing the internal artifact mints nothing.
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![namespaces_path.clone(), commits_path],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A benign artifact from the same snapshot still mints.
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![namespaces_path.clone()],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mint_response: MintUrlsResponse = response_json(response).await?;
+        assert_eq!(mint_response.urls.len(), 1);
+        assert_eq!(mint_response.urls[0].path, namespaces_path);
+        assert!(!mint_response.urls[0].url.is_empty());
+
         Ok(())
     }
 

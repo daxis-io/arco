@@ -364,36 +364,81 @@ impl GarbageCollector {
         let cutoff = Utc::now() - Duration::hours(i64::from(self.policy.delay_hours));
 
         for dir in orphaned {
-            // Check age before deletion
-            if let Ok(Some(meta)) = self.storage.head_raw(&dir).await {
-                if let Some(last_modified) = meta.last_modified {
-                    if last_modified >= cutoff {
-                        tracing::debug!(
-                            path = %dir,
-                            last_modified = %last_modified,
-                            "skipping orphan (too recent)"
-                        );
-                        continue;
-                    }
-                }
-
-                // Delete all files under the directory
-                match self.delete_prefix(&dir, protection, epoch).await {
-                    Ok((count, bytes)) => {
-                        tracing::info!(path = %dir, count, bytes, "deleted orphaned snapshot");
-                        result.objects_deleted += count;
-                        result.bytes_reclaimed += bytes;
-                        result.orphaned_snapshots_deleted += 1;
-                    }
-                    Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
-                    Err(e) => {
-                        result.errors.push(format!("delete {dir}: {e}"));
-                    }
-                }
-            }
+            self.gc_one_orphaned_directory(&dir, cutoff, protection, epoch, &mut result)
+                .await?;
         }
 
         Ok(result)
+    }
+
+    /// Applies the age guard to one orphaned directory and deletes it when
+    /// eligible.
+    ///
+    /// Age fails closed: a directory whose age cannot be established (empty,
+    /// unlistable, or missing timestamps) is never deleted. Only a CAS
+    /// failure aborts the phase; other errors are recorded in `result`.
+    async fn gc_one_orphaned_directory(
+        &self,
+        dir: &str,
+        cutoff: DateTime<Utc>,
+        protection: &ProtectionSet,
+        epoch: &mut RetentionMutationEpoch,
+        result: &mut GcResult,
+    ) -> Result<()> {
+        let newest = match self.orphan_directory_newest_age(dir).await {
+            Ok(Some(newest)) => newest,
+            Ok(None) => {
+                tracing::debug!(path = %dir, "skipping orphan whose age cannot be established");
+                return Ok(());
+            }
+            Err(e) => {
+                result.errors.push(format!("list {dir}: {e}"));
+                return Ok(());
+            }
+        };
+        if newest >= cutoff {
+            tracing::debug!(path = %dir, last_modified = %newest, "skipping orphan (too recent)");
+            return Ok(());
+        }
+
+        // Delete all files under the directory
+        match self.delete_prefix(dir, protection, epoch).await {
+            Ok((count, bytes)) => {
+                if count > 0 {
+                    tracing::info!(path = %dir, count, bytes, "deleted orphaned snapshot");
+                    result.objects_deleted += count;
+                    result.bytes_reclaimed += bytes;
+                    result.orphaned_snapshots_deleted += 1;
+                }
+                Ok(())
+            }
+            Err(error @ CatalogError::CasFailed { .. }) => Err(error),
+            Err(e) => {
+                result.errors.push(format!("delete {dir}: {e}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Determines an orphan directory's newest object timestamp from a
+    /// listing.
+    ///
+    /// The directory prefix itself is never an object in any backend, so a
+    /// HEAD of the prefix can never succeed; age is derived from the newest
+    /// listed object instead (#344). Returns `Ok(None)` when the directory is
+    /// empty or any object lacks a timestamp, so callers fail closed.
+    async fn orphan_directory_newest_age(&self, dir: &str) -> Result<Option<DateTime<Utc>>> {
+        let entries = self
+            .storage
+            .list_meta(dir)
+            .await
+            .map_err(|e| CatalogError::Storage {
+                message: format!("failed to list orphaned snapshot {dir}: {e}"),
+            })?;
+        if entries.is_empty() || entries.iter().any(|meta| meta.last_modified.is_none()) {
+            return Ok(None);
+        }
+        Ok(entries.iter().filter_map(|meta| meta.last_modified).max())
     }
 
     // =========================================================================
@@ -898,6 +943,24 @@ impl GarbageCollector {
 // =========================================================================
 // Helper Functions
 // =========================================================================
+
+/// Loads the fail-closed protection set shared by every retention-visible
+/// deletion path (the GC phases and the reconciler's Full-scope repair).
+///
+/// The retention policy has no bearing on protection: the set is derived
+/// solely from the current manifest heads and validated retention pins, and
+/// any inventory error aborts before a single candidate may be deleted.
+///
+/// Declared `pub` inside the private `gc::collector` module and re-exported
+/// `pub(crate)` from `gc`: its effective visibility is crate-only.
+pub async fn load_protection_set(
+    storage: &ScopedStorage,
+    now: DateTime<Utc>,
+) -> Result<ProtectionSet> {
+    GarbageCollector::new(storage.clone(), RetentionPolicy::default())
+        .load_protection_set(now)
+        .await
+}
 
 /// Extracts the version directory from a snapshot path.
 ///
@@ -2048,5 +2111,165 @@ mod tests {
                 .await
                 .expect("newly current object must survive")
         );
+    }
+
+    /// Seeds a v2 current head (pointer, manifest, snapshot file) and one
+    /// fully written but unreferenced crashed-attempt directory at v3.
+    async fn seed_v2_head_with_v3_orphan_attempt(storage: &ScopedStorage) -> (String, String) {
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("init");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let pointed_manifest = catalog_manifest_for_version(2, 2, "current.parquet", 2);
+        storage
+            .put_raw(
+                &pointed_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointed_manifest).expect("serialize pointed")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write pointed");
+        let pointer = DomainManifestPointer {
+            manifest_id: "00000000000000000002".to_string(),
+            manifest_path: pointed_manifest_path,
+            epoch: 2,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
+        let current_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet");
+        storage
+            .put_raw(
+                &current_path,
+                Bytes::from_static(b"new"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current");
+
+        let orphan_path =
+            "snapshots/catalog/v3/attempts/00000000000000000009/tables.parquet".to_string();
+        storage
+            .put_raw(
+                &orphan_path,
+                Bytes::from_static(b"orphan"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write orphan");
+        (current_path, orphan_path)
+    }
+
+    /// Regression for #344: the orphan phase must actually delete a genuine
+    /// aged orphan in mutation mode. The old age guard HEADed the directory
+    /// prefix (never an object), so `delete_prefix` was unreachable and
+    /// `orphaned_snapshots_deleted` was structurally always zero.
+    #[tokio::test]
+    async fn mutation_mode_deletes_aged_orphaned_snapshot_directory() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let (current_path, orphan_path) = seed_v2_head_with_v3_orphan_attempt(&storage).await;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+
+        // keep_snapshots is high so phase 3 cannot reclaim the directory:
+        // any deletion observed here is attributable to the orphan phase.
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let result = collector.collect().await.expect("collect");
+
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.orphaned_snapshots_deleted, 1,
+            "the aged orphan directory must actually be deleted"
+        );
+        assert!(result.objects_deleted >= 1);
+        assert!(
+            storage
+                .head_raw(&orphan_path)
+                .await
+                .expect("head orphan")
+                .is_none(),
+            "orphan object must be gone after mutation-mode GC"
+        );
+        storage
+            .get_raw(&current_path)
+            .await
+            .expect("current head snapshot file must survive");
+    }
+
+    /// Regression for #344: the orphan phase must not delete candidates that
+    /// are inside the delay window or protected by an active retention pin.
+    #[tokio::test]
+    async fn mutation_mode_never_deletes_recent_or_retention_pinned_orphan_directories() {
+        // A recent orphan (delay window not elapsed) survives.
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "recent").expect("storage");
+        let (_, orphan_path) = seed_v2_head_with_v3_orphan_attempt(&storage).await;
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let result = collector.collect().await.expect("collect");
+        assert_eq!(result.orphaned_snapshots_deleted, 0);
+        storage
+            .get_raw(&orphan_path)
+            .await
+            .expect("recent orphan must survive the delay window");
+
+        // A retention-pinned orphan survives even with a zero delay window.
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "pinned").expect("storage");
+        let (_, orphan_path) = seed_v2_head_with_v3_orphan_attempt(&storage).await;
+        seed_active_snapshot_pin(
+            &storage,
+            &[(
+                orphan_path.as_str(),
+                u64::try_from(b"orphan".len()).expect("orphan size"),
+            )],
+        )
+        .await;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let result = collector.collect().await.expect("collect");
+        assert_eq!(result.orphaned_snapshots_deleted, 0);
+        storage
+            .get_raw(&orphan_path)
+            .await
+            .expect("retention-pinned orphan must survive mutation-mode GC");
     }
 }

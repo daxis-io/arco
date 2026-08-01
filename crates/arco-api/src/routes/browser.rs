@@ -10,9 +10,12 @@
 //! 1. **Manifest-driven allowlist**: Only paths in `SnapshotInfo.files` are mintable
 //! 2. **No ledger access**: Ledger paths are never mintable (internal)
 //! 3. **No manifest access**: Manifest paths are never mintable (metadata leak)
-//! 4. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
-//! 5. **TTL bounded**: Maximum 1 hour, default 15 minutes
-//! 6. **No data proxying**: Only URLs returned, never actual data
+//! 4. **No internal artifacts**: `commits.parquet` is never mintable — its private
+//!    commit-authority columns are only visible through the redacted
+//!    `system.catalog.commits` projection
+//! 5. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
+//! 6. **TTL bounded**: Maximum 1 hour, default 15 minutes
+//! 7. **No data proxying**: Only URLs returned, never actual data
 //!
 //! ## Log Redaction Policy
 //!
@@ -143,18 +146,7 @@ pub(crate) async fn mint_urls(
     let ttl = Duration::from_secs(ttl_seconds);
 
     // SECURITY: Validate all user-provided paths FIRST (before any I/O)
-    for path in &req.paths {
-        if let Err(err) = arco_core::ScopedStorage::validate_path(path) {
-            crate::audit::emit_url_mint_deny(
-                state.audit(),
-                &ctx,
-                &req.domain,
-                crate::audit::REASON_PATH_TRAVERSAL,
-                &state.config.audit,
-            );
-            return Err(ApiError::forbidden(format!("Invalid path '{path}': {err}")));
-        }
-    }
+    reject_disallowed_paths(&state, &ctx, &req)?;
 
     tracing::info!(
         tenant = %ctx.tenant,
@@ -171,12 +163,18 @@ pub(crate) async fn mint_urls(
     let storage = ctx.scoped_storage(backend)?;
     let reader = arco_catalog::CatalogReader::new(storage);
 
-    // Get mintable paths from manifest
+    // Get mintable paths from manifest. Defense in depth: internal
+    // projection-only artifacts never enter the mint allowlist, so even a
+    // request that slips past the explicit refusal above cannot pass the
+    // membership check.
     let mintable = reader
         .get_mintable_paths(domain)
         .await
         .map_err(ApiError::from)?;
-    let mintable_set: HashSet<String> = mintable.into_iter().collect();
+    let mintable_set: HashSet<String> = mintable
+        .into_iter()
+        .filter(|path| !is_projection_only_artifact(path))
+        .collect();
 
     // Validate ALL requested paths are in allowlist
     for path in &req.paths {
@@ -220,6 +218,62 @@ pub(crate) async fn mint_urls(
         .collect();
 
     Ok((StatusCode::OK, Json(MintUrlsResponse { urls, ttl_seconds })))
+}
+
+/// Rejects traversal attempts and internal projection-only artifacts before
+/// any storage I/O.
+///
+/// The raw `commits.parquet` artifact carries the private commit-authority
+/// columns (`manifest_id`, `event_witnesses_json`) that the
+/// `system.catalog.commits` projection deliberately redacts. Minting a signed
+/// URL for it would hand out the unredacted bytes and defeat that projection,
+/// so it is refused with a typed error pointing readers at the projection.
+fn reject_disallowed_paths(
+    state: &AppState,
+    ctx: &RequestContext,
+    req: &MintUrlsRequest,
+) -> Result<(), ApiError> {
+    for path in &req.paths {
+        if let Err(err) = arco_core::ScopedStorage::validate_path(path) {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                ctx,
+                &req.domain,
+                crate::audit::REASON_PATH_TRAVERSAL,
+                &state.config.audit,
+            );
+            return Err(ApiError::forbidden(format!("Invalid path '{path}': {err}")));
+        }
+    }
+
+    for path in &req.paths {
+        if is_projection_only_artifact(path) {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                ctx,
+                &req.domain,
+                crate::audit::REASON_INTERNAL_ARTIFACT,
+                &state.config.audit,
+            );
+            return Err(ApiError::projection_only_artifact(format!(
+                "'{path}' is an internal artifact with redacted columns; query the \
+                 system.catalog.commits projection via POST /api/v1/query instead"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns true for snapshot artifacts whose raw bytes must never be minted
+/// because a redacted system-table projection is their only public surface.
+///
+/// `commits.parquet` carries the private commit-authority witness columns
+/// that `system.catalog.commits` strips (see `crate::system_tables`).
+fn is_projection_only_artifact(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|file| file == "commits.parquet")
 }
 
 /// Parse domain string to `CatalogDomain`.

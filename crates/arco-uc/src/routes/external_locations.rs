@@ -21,7 +21,8 @@ use arco_catalog::storage_governance::external_locations::ExternalLocation;
 use crate::context::UnityCatalogRequestContext;
 use crate::error::UnityCatalogError;
 use crate::routes::common::{
-    control_plane_scope, map_catalog_error, require_authz, scoped_storage,
+    control_plane_scope, map_catalog_error, publish_storage_governance_projection, require_authz,
+    scoped_storage,
 };
 use crate::state::UnityCatalogState;
 
@@ -50,6 +51,9 @@ async fn create_external_location(
     Json(request): Json<CreateExternalLocationRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
     require_storage_governance_admin(&state, &ctx)?;
+    // Self-heal before validating: republish any projection left stale by an
+    // earlier commit whose synchronous publication failed (#362).
+    publish_storage_governance_projection(&state, &ctx).await?;
     let ledger = ledger(&state, &ctx)?;
     let metastore = ledger.replay().await.map_err(map_catalog_error)?;
     let mut storage_state =
@@ -87,6 +91,10 @@ async fn create_external_location(
         .append_event(&event)
         .await
         .map_err(map_catalog_error)?;
+    // Commit-synchronous publication: the projection freshness rule requires
+    // the published watermark to match the ledger exactly, so every committed
+    // event must republish before vending can serve it (#362).
+    publish_storage_governance_projection(&state, &ctx).await?;
 
     let MetastoreMutation::ExternalLocationUpserted(record) = event.mutation else {
         unreachable!("constructed external location event")

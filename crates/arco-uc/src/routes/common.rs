@@ -122,6 +122,37 @@ pub(crate) fn scoped_storage(
     ctx.scoped_storage(state.storage.clone())
 }
 
+/// Publishes the metastore projection at the current ledger watermark.
+///
+/// This is the production storage-governance projection publisher (#362):
+/// every successful metastore ledger commit made by a UC governance route must
+/// be followed by this call so that credential vending serves from a fresh
+/// published projection instead of denying closed forever. The call is
+/// idempotent and monotonic, so route handlers also invoke it *before*
+/// validating a new mutation: any earlier commit whose publication failed is
+/// healed by the next authorized governance request.
+pub(crate) async fn publish_storage_governance_projection(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+) -> Result<(), UnityCatalogError> {
+    let storage = scoped_storage(state, ctx)?;
+    arco_catalog::metastore::publish::publish_current_metastore_projection(
+        &storage,
+        &arco_catalog::metastore::projections::ProjectionRegistry::default(),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        tracing::warn!(internal_error = %error, "storage governance projection publication failed");
+        UnityCatalogError::ServiceUnavailable {
+            message: "storage_governance_projection_publication_failed: committed metastore \
+                      events remain durable; credential vending stays deny-closed until the \
+                      projection is republished by a retried governance request"
+                .to_string(),
+        }
+    })
+}
+
 pub(crate) fn control_plane_scope(
     ctx: &UnityCatalogRequestContext,
 ) -> Result<ControlPlaneScope, UnityCatalogError> {

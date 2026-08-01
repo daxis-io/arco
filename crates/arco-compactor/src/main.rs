@@ -56,6 +56,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use arco_catalog::reconciler::IssueType;
+use arco_catalog::state_store::projection_outbox_acks::{
+    AckOnlyProjectionHandler, ProjectionOutboxWorker,
+};
+use arco_catalog::state_store::shadow_replay::{
+    ShadowComparisonStatus, ShadowDifferenceClass, import_current_catalog_shadow,
+};
 use arco_catalog::{Compactor, Reconciler, ReconciliationReport, RepairResult, RepairScope};
 use arco_core::repair_backlog::RepairBacklogEntry;
 use arco_core::scoped_storage::ScopedStorage;
@@ -1713,6 +1719,7 @@ mod tests {
             state,
             normalize_metrics_secret(Some("  ".to_string())),
             None,
+            false,
         );
         let response = router
             .oneshot(
@@ -1730,7 +1737,7 @@ mod tests {
     async fn test_metrics_gate_accepts_x_metrics_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(state, Some("topsecret".to_string()), None, false);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1748,7 +1755,7 @@ mod tests {
     async fn test_metrics_gate_accepts_bearer_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(state, Some("topsecret".to_string()), None, false);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1765,7 +1772,12 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
         let state = test_state();
-        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
+        let router = build_router(
+            Arc::clone(&state),
+            Some("topsecret".to_string()),
+            None,
+            false,
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1777,7 +1789,7 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(state, Some("topsecret".to_string()), None, false);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1795,7 +1807,7 @@ mod tests {
     async fn test_metrics_gate_accepts_when_both_headers_present() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(state, Some("topsecret".to_string()), None, false);
         let response = router
             .oneshot(
                 Request::builder()
@@ -1814,7 +1826,7 @@ mod tests {
     async fn test_reconcile_endpoint_defaults_to_full_scope() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
+        let router = build_router(state.clone(), None, None, false);
 
         let response = router
             .oneshot(
@@ -1845,7 +1857,7 @@ mod tests {
     async fn test_reconcile_endpoint_full_scope_repairs_cleanup_items() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
+        let router = build_router(state.clone(), None, None, false);
 
         let response = router
             .oneshot(
@@ -1879,7 +1891,7 @@ mod tests {
             "list-denied-tenant",
             "list-denied-workspace",
         );
-        let router = build_router(state, None, None);
+        let router = build_router(state, None, None, false);
 
         let response = router
             .oneshot(
@@ -1925,7 +1937,7 @@ mod tests {
             "list-denied-workspace",
         );
         let _ = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state, None, None);
+        let router = build_router(state, None, None, false);
 
         let response = router
             .oneshot(
@@ -2004,8 +2016,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_store_endpoints_absent_unless_enabled_and_drain_trim_work_when_enabled() {
+        use arco_catalog::ArcoStateTxn;
+        use arco_catalog::state_store::{
+            ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, TxnOptions,
+        };
+
+        let state = test_state();
+        // Disabled (default): the route does not exist.
+        let disabled = build_router(state.clone(), None, None, false);
+        let response = disabled
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/control-store/projection-outbox")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"sourceDomain":"phase5-source","consumerId":"consumer-a"}"#,
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(StatusCode::NOT_FOUND, response.status());
+
+        // Seed one committed source record with a staged outbox entry.
+        let scope = StateScope::new("acme", "analytics", "phase5-source");
+        let store =
+            ControlMvpStateStore::new(state.storage.clone(), scope.clone()).expect("control store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::new(Some(scope)))
+            .await
+            .expect("begin txn");
+        txn.put(b"row/record-1", Bytes::from_static(b"{}"))
+            .await
+            .expect("stage row");
+        txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "record-1",
+            Bytes::from_static(b"{}"),
+        ));
+        txn.commit().await.expect("commit source record");
+
+        // Enabled: drain + trim through the operator endpoint.
+        let enabled = build_router(state.clone(), None, None, true);
+        let response = enabled
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/control-store/projection-outbox")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"sourceDomain":"phase5-source","consumerId":"consumer-a","drain":true,"trim":true}"#,
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(
+            serde_json::json!(["record-1"]),
+            json["drain"]["drainedRecordIds"],
+            "unexpected body: {json}"
+        );
+        assert_eq!(
+            serde_json::json!(["record-1"]),
+            json["trim"]["trimmedRecordIds"],
+            "unexpected body: {json}"
+        );
+        assert!(
+            json["backlog"]["pendingRecordIds"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "unexpected body: {json}"
+        );
+        // The trim commit itself advances the source-domain sequence past the
+        // consumer's last acknowledged record, so ack-derived freshness
+        // honestly reports staleness while the pending backlog stays empty.
+        assert!(
+            json["freshness"]
+                .as_str()
+                .is_some_and(|value| value.contains("StaleProjection")),
+            "unexpected body: {json}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
-        let router = build_router(test_state(), None, Some(test_internal_auth_state()));
+        let router = build_router(test_state(), None, Some(test_internal_auth_state()), false);
         let response = router
             .oneshot(
                 Request::builder()
@@ -2056,26 +2157,174 @@ fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String>
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlStoreOutboxRequest {
+    source_domain: String,
+    consumer_id: String,
+    /// Operator drain: acknowledge pending records WITHOUT projecting them.
+    #[serde(default)]
+    drain: bool,
+    /// Trim records this consumer already acknowledged from the source outbox.
+    #[serde(default)]
+    trim: bool,
+}
+
+async fn control_store_outbox_handler(
+    State(state): State<Arc<ServiceState>>,
+    Json(request): Json<ControlStoreOutboxRequest>,
+) -> impl IntoResponse {
+    let worker = match ProjectionOutboxWorker::new(
+        state.storage.clone(),
+        &request.source_domain,
+        request.consumer_id.clone(),
+    ) {
+        Ok(worker) => worker,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_projection_outbox_request",
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let drain_report = if request.drain {
+        match worker.drain(&AckOnlyProjectionHandler).await {
+            Ok(report) => Some(report),
+            Err(error) => return control_store_error(&error),
+        }
+    } else {
+        None
+    };
+    let trim_report = if request.trim {
+        match worker.trim_acked().await {
+            Ok(report) => Some(report),
+            Err(error) => return control_store_error(&error),
+        }
+    } else {
+        None
+    };
+    let backlog = match worker.backlog().await {
+        Ok(backlog) => backlog,
+        Err(error) => return control_store_error(&error),
+    };
+    let freshness = match worker.freshness().await {
+        Ok(freshness) => freshness,
+        Err(error) => return control_store_error(&error),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "backlog": backlog,
+            "freshness": format!("{freshness:?}"),
+            "drain": drain_report,
+            "trim": trim_report,
+        })),
+    )
+        .into_response()
+}
+
+async fn control_store_shadow_import_handler(
+    State(state): State<Arc<ServiceState>>,
+) -> impl IntoResponse {
+    match import_current_catalog_shadow(&state.storage).await {
+        Ok(report) => {
+            let comparisons = report
+                .comparisons()
+                .iter()
+                .map(|comparison| {
+                    serde_json::json!({
+                        "domain": format!("{:?}", comparison.domain()),
+                        "status": shadow_status_label(comparison.status()),
+                        "detail": comparison.detail(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let deferred = report
+                .deferred_domains()
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "domain": format!("{:?}", entry.domain()),
+                        "reason": entry.reason(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "sourceManifestId": report.source().manifest_id(),
+                    "snapshotVersion": report.source().snapshot_version(),
+                    "comparisons": comparisons,
+                    "deferred": deferred,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => control_store_error(&error),
+    }
+}
+
+fn shadow_status_label(status: ShadowComparisonStatus) -> &'static str {
+    match status {
+        ShadowComparisonStatus::Equivalent => "equivalent",
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::CurrentStateGap) => {
+            "current_state_gap"
+        }
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::UnsupportedScope) => {
+            "unsupported_scope"
+        }
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::StaleProjection) => {
+            "stale_projection"
+        }
+        ShadowComparisonStatus::Difference(ShadowDifferenceClass::BugDivergentResult) => {
+            "bug_divergent_result"
+        }
+    }
+}
+
+fn control_store_error(error: &arco_catalog::CatalogError) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": "control_store_operation_failed",
+            "message": error.to_string(),
+        })),
+    )
+        .into_response()
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "one-shot router construction; owning Option<Arc> keeps the many call sites simple"
+)]
 fn build_router(
     state: Arc<ServiceState>,
     metrics_secret: Option<String>,
     internal_auth: Option<Arc<InternalAuthState>>,
+    control_store_operator_endpoints: bool,
 ) -> Router {
     // Build HTTP router
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
+    let internal_route =
+        |method_router: axum::routing::MethodRouter<Arc<ServiceState>>| match internal_auth.clone()
+        {
+            None => method_router,
+            Some(auth) => method_router.route_layer(middleware::from_fn_with_state(
                 auth,
                 internal_auth_middleware,
-            ))
-        },
-    );
-    let base_router = Router::new()
+            )),
+        };
+    let reconcile_route = internal_route(post(reconcile_handler));
+    let mut base_router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/compact", post(compact))
@@ -2083,6 +2332,22 @@ fn build_router(
         .route("/internal/sync-compact", post(sync_compact_handler))
         .route("/internal/reconcile", reconcile_route)
         .route("/internal/anti-entropy", post(anti_entropy_handler));
+
+    // Phase 4/5 operator surface (roadmap: "write APIs behind internal or
+    // operator-only access"): disabled unless explicitly enabled. Shadow
+    // import writes only the isolated shadow scope, never authority; the
+    // outbox endpoint acknowledges/trims projection outbox records.
+    if control_store_operator_endpoints {
+        base_router = base_router
+            .route(
+                "/internal/control-store/projection-outbox",
+                internal_route(post(control_store_outbox_handler)),
+            )
+            .route(
+                "/internal/control-store/shadow-import",
+                internal_route(post(control_store_shadow_import_handler)),
+            );
+    }
 
     let router = if let Some(secret) = metrics_secret {
         tracing::info!(
@@ -2225,7 +2490,21 @@ async fn main() -> Result<()> {
                 }
             });
 
-            let router = build_router(Arc::clone(&state), metrics_secret, internal_auth);
+            // Operator-only Phase 4/5 control-store endpoints: explicit opt-in.
+            let control_store_operator_endpoints =
+                std::env::var("ARCO_CONTROL_STORE_OPERATOR_ENDPOINTS")
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            if control_store_operator_endpoints {
+                tracing::info!(
+                    "control-store operator endpoints enabled (/internal/control-store/*)"
+                );
+            }
+            let router = build_router(
+                Arc::clone(&state),
+                metrics_secret,
+                internal_auth,
+                control_store_operator_endpoints,
+            );
 
             // Spawn compaction loop
             let state_clone = Arc::clone(&state);

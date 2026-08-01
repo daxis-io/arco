@@ -1,5 +1,6 @@
 //! Object-store control-state MVP contract tests.
 
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,6 +18,7 @@ use arco_core::{MemoryBackend, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::Value;
+use sha2::Digest;
 
 use chrono::{Duration as ChronoDuration, Utc};
 
@@ -403,9 +405,10 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
         store.get(b"catalog/default").await.expect("current read")
     );
     assert_eq!(
-        vec![ControlMvpProjectionOutboxRecord::new(
+        vec![ControlMvpProjectionOutboxRecord::with_origin_sequence(
             "winning-outbox",
             Bytes::from_static(b"winner"),
+            1,
         )],
         store
             .current_projection_outbox()
@@ -631,9 +634,10 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
     ));
 
     assert_eq!(
-        vec![ControlMvpProjectionOutboxRecord::new(
+        vec![ControlMvpProjectionOutboxRecord::with_origin_sequence(
             "first",
             Bytes::from_static(b"payload-1"),
+            1,
         )],
         store
             .projection_outbox_at(first_token)
@@ -642,8 +646,16 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
     );
     assert_eq!(
         vec![
-            ControlMvpProjectionOutboxRecord::new("first", Bytes::from_static(b"payload-1")),
-            ControlMvpProjectionOutboxRecord::new("second", Bytes::from_static(b"payload-2")),
+            ControlMvpProjectionOutboxRecord::with_origin_sequence(
+                "first",
+                Bytes::from_static(b"payload-1"),
+                1,
+            ),
+            ControlMvpProjectionOutboxRecord::with_origin_sequence(
+                "second",
+                Bytes::from_static(b"payload-2"),
+                2,
+            ),
         ],
         store
             .projection_outbox_at(second_token)
@@ -652,8 +664,16 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
     );
     assert_eq!(
         vec![
-            ControlMvpProjectionOutboxRecord::new("first", Bytes::from_static(b"payload-1")),
-            ControlMvpProjectionOutboxRecord::new("second", Bytes::from_static(b"payload-2")),
+            ControlMvpProjectionOutboxRecord::with_origin_sequence(
+                "first",
+                Bytes::from_static(b"payload-1"),
+                1,
+            ),
+            ControlMvpProjectionOutboxRecord::with_origin_sequence(
+                "second",
+                Bytes::from_static(b"payload-2"),
+                2,
+            ),
         ],
         store
             .current_projection_outbox()
@@ -1235,7 +1255,8 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
 
     for (field, replacement) in [
         ("record_type", Value::String("other_plan".to_string())),
-        ("version", Value::from(2_u64)),
+        ("version", Value::from(1_u64)),
+        ("version", Value::from(3_u64)),
     ] {
         let mut value = serde_json::to_value(&plan).expect("plan json");
         value[field] = replacement;
@@ -1867,4 +1888,412 @@ impl StorageBackend for PointerWriteThenErrorBackend {
     async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
+}
+
+struct CountingGetBackend {
+    inner: Arc<dyn StorageBackend>,
+    get_calls: AtomicUsize,
+}
+
+impl CountingGetBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            get_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::SeqCst)
+    }
+
+    fn reset(&self) {
+        self.get_calls.store(0, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StorageBackend for CountingGetBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+fn interval(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).expect("non-zero checkpoint interval")
+}
+
+async fn commit_value(store: &ControlMvpStateStore, key: &[u8], value: &str) {
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(key, Bytes::from(value.to_string()))
+        .await
+        .expect("stage write");
+    txn.commit().await.expect("commit");
+}
+
+#[tokio::test]
+async fn replay_after_anchor_is_bounded_independent_of_history_length() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(4));
+
+    for index in 0..13 {
+        commit_value(&store, b"catalog/default", &format!("v{index}")).await;
+    }
+
+    backend.reset();
+    assert_eq!(
+        Some(Bytes::from_static(b"v12")),
+        store.get(b"catalog/default").await.expect("bounded read")
+    );
+    let gets_at_short_history = backend.get_calls();
+
+    for index in 13..25 {
+        commit_value(&store, b"catalog/default", &format!("v{index}")).await;
+    }
+
+    backend.reset();
+    assert_eq!(
+        Some(Bytes::from_static(b"v24")),
+        store.get(b"catalog/default").await.expect("bounded read")
+    );
+    let gets_at_long_history = backend.get_calls();
+
+    assert_eq!(
+        gets_at_short_history, gets_at_long_history,
+        "read cost must not grow with pre-anchor history"
+    );
+    assert!(
+        gets_at_long_history <= 3 + 4,
+        "read cost {gets_at_long_history} must stay within pointer + manifest + snapshot + interval"
+    );
+
+    backend.reset();
+    commit_value(&store, b"catalog/default", "v25").await;
+    let gets_for_commit = backend.get_calls();
+    assert!(
+        gets_for_commit <= 3 + 4 + 1,
+        "commit read cost {gets_for_commit} must stay bounded by the checkpoint interval"
+    );
+
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::default())
+        .await
+        .expect("checkpoint after long history");
+    backend.reset();
+    let reader = store
+        .read_checkpoint(checkpoint)
+        .await
+        .expect("bounded checkpoint read");
+    assert_eq!(
+        Some(Bytes::from_static(b"v25")),
+        reader
+            .get(b"catalog/default")
+            .await
+            .expect("checkpoint value")
+    );
+    assert!(
+        backend.get_calls() <= 2,
+        "checkpoint reads must load the checkpoint record and snapshot only"
+    );
+}
+
+#[tokio::test]
+async fn manifest_suffix_and_size_stay_bounded_by_checkpoint_interval() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(4));
+    let paths = ControlMvpPaths::new("catalog");
+
+    let mut boundary_manifest_sizes = Vec::new();
+    for index in 0..20 {
+        commit_value(&store, b"catalog/default", &format!("v{index}")).await;
+        let token = store.current_state_token().await.expect("current token");
+        let manifest_bytes = storage
+            .get_raw(&paths.manifest_object(token.authority_manifest_id()))
+            .await
+            .expect("current manifest object");
+        let manifest_json: Value = serde_json::from_slice(&manifest_bytes).expect("manifest json");
+        let tx_refs = manifest_json["payload"]["tx_refs"]
+            .as_array()
+            .expect("manifest tx refs")
+            .len();
+        assert!(
+            tx_refs <= 4,
+            "manifest suffix {tx_refs} exceeded the checkpoint interval at commit {index}"
+        );
+        if manifest_json["payload"]["anchor_state"].is_object() {
+            boundary_manifest_sizes.push(manifest_bytes.len());
+        }
+    }
+
+    // The genesis boundary carries no base_state reference, so steady-state
+    // size comparison starts at the second boundary.
+    let steady_state = &boundary_manifest_sizes[1..];
+    let first_boundary = steady_state
+        .first()
+        .copied()
+        .expect("steady-state boundary");
+    let last_boundary = steady_state.last().copied().expect("steady-state boundary");
+    assert!(
+        steady_state.len() >= 3,
+        "expected at least three steady-state boundaries, got {steady_state:?}"
+    );
+    assert!(
+        last_boundary <= first_boundary + 64,
+        "boundary manifest size must not grow with history: first {first_boundary}, last {last_boundary}"
+    );
+}
+
+#[tokio::test]
+async fn stale_writer_epoch_cannot_publish_and_fenced_state_survives() {
+    let (_backend, storage) = storage();
+    let store_a = store(storage.clone());
+
+    assert!(
+        matches!(
+            store(storage.clone()).claim_writer_authority().await,
+            Err(CatalogError::Validation { .. })
+        ),
+        "claiming before genesis must fail closed"
+    );
+
+    commit_value(&store_a, b"catalog/default", "genesis").await;
+
+    // Writer A begins before the epoch claim, so its base observes epoch 0.
+    let mut stale_txn = store_a
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin stale-epoch transaction");
+    stale_txn
+        .put(b"catalog/default", Bytes::from_static(b"stale-epoch"))
+        .await
+        .expect("stage stale write");
+
+    let store_b = store(storage.clone())
+        .claim_writer_authority()
+        .await
+        .expect("claim writer epoch");
+    assert_eq!(1, store_b.writer_epoch());
+
+    let error = stale_txn
+        .commit()
+        .await
+        .expect_err("superseded writer must not publish");
+    assert!(
+        matches!(error, CatalogError::StaleWriterEpoch { .. }),
+        "expected typed stale-epoch error, got {error:?}"
+    );
+
+    assert!(
+        matches!(
+            store_a.begin_control_txn(TxnOptions::default()).await,
+            Err(CatalogError::StaleWriterEpoch { .. })
+        ),
+        "superseded writer must fail closed at begin"
+    );
+
+    commit_value(&store_b, b"catalog/fenced", "epoch-1").await;
+    assert_eq!(
+        Some(Bytes::from_static(b"genesis")),
+        store_b
+            .get(b"catalog/default")
+            .await
+            .expect("fenced-out write is invisible")
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"epoch-1")),
+        store_b
+            .get(b"catalog/fenced")
+            .await
+            .expect("fenced writer state survives")
+    );
+
+    let store_c = store(storage.clone())
+        .claim_writer_authority()
+        .await
+        .expect("claim next writer epoch");
+    assert_eq!(2, store_c.writer_epoch(), "epoch claims must be monotone");
+    assert!(matches!(
+        store_b.begin_control_txn(TxnOptions::default()).await,
+        Err(CatalogError::StaleWriterEpoch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(FailOncePathBackend::new(inner, "/states/"));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    commit_value(&store, b"catalog/default", "v1").await;
+
+    backend.arm();
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin boundary transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"crashed"))
+        .await
+        .expect("stage boundary write");
+    assert!(
+        txn.commit().await.is_err(),
+        "injected snapshot crash must interrupt the boundary commit"
+    );
+
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("crashed boundary commit must not be visible")
+    );
+    assert_eq!(
+        1,
+        store
+            .current_state_token()
+            .await
+            .expect("current token")
+            .logical_sequence()
+    );
+
+    commit_value(&store, b"catalog/default", "v2").await;
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("retried boundary commit is visible")
+    );
+    commit_value(&store, b"catalog/default", "v3").await;
+    assert_eq!(
+        Some(Bytes::from_static(b"v3")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("post-anchor commit reads through the recovered anchor")
+    );
+
+    backend.arm();
+    assert!(
+        store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .is_err(),
+        "injected snapshot crash must interrupt the explicit checkpoint"
+    );
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::default())
+        .await
+        .expect("checkpoint retry succeeds");
+    assert_eq!(
+        Some(Bytes::from_static(b"v3")),
+        store
+            .read_checkpoint(checkpoint)
+            .await
+            .expect("checkpoint reader")
+            .get(b"catalog/default")
+            .await
+            .expect("checkpoint value")
+    );
+}
+
+#[tokio::test]
+async fn corrupt_state_snapshot_objects_fail_closed() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(1));
+    let paths = ControlMvpPaths::new("catalog");
+
+    commit_value(&store, b"catalog/default", "v1").await;
+    let anchor_token = store.current_state_token().await.expect("anchor token");
+    commit_value(&store, b"catalog/default", "v2").await;
+
+    let anchor_state_id = anchor_token
+        .authority_manifest_id()
+        .replace("manifest-", "state-");
+    let snapshot_path = paths.state_object(&anchor_state_id);
+    let original = storage
+        .get_raw(&snapshot_path)
+        .await
+        .expect("anchor snapshot exists");
+
+    rewrite_object_pretty(&storage, &snapshot_path).await;
+    let error = store
+        .get(b"catalog/default")
+        .await
+        .expect_err("byte-rewritten snapshot must fail closed");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+
+    let mut tampered: Value = serde_json::from_slice(&original).expect("snapshot json");
+    tampered["payload"]["entries"][0]["value"] = Value::Array(vec![Value::from(0_u64)]);
+    let payload_bytes =
+        serde_json::to_vec(&tampered["payload"]).expect("tampered snapshot payload");
+    tampered["checksum_sha256"] = Value::String(hex::encode(sha2::Sha256::digest(&payload_bytes)));
+    storage
+        .put_raw(
+            &snapshot_path,
+            Bytes::from(serde_json::to_vec(&tampered).expect("tampered snapshot")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("write tampered snapshot");
+    let error = store
+        .get(b"catalog/default")
+        .await
+        .expect_err("value-tampered snapshot must fail closed");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+
+    storage
+        .put_raw(&snapshot_path, original, WritePrecondition::None)
+        .await
+        .expect("restore original snapshot");
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("restored snapshot reads again")
+    );
 }

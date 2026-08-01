@@ -25,9 +25,9 @@ pub mod control_mvp;
 pub(crate) mod external_location_metadata;
 pub mod model;
 pub(crate) mod path_governance_metadata;
-pub(crate) mod projection_outbox_acks;
+pub mod projection_outbox_acks;
 pub mod promotion_gate;
-pub(crate) mod shadow_replay;
+pub mod shadow_replay;
 #[allow(
     dead_code,
     reason = "Phase 6 metadata stays crate-internal until its public activation gate"

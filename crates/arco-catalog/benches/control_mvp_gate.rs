@@ -17,7 +17,10 @@
 #![allow(
     clippy::expect_used,
     clippy::unwrap_used,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "this evidence harness reports human diagnostics and a JSON packet on its streams"
 )]
 
 use std::ops::Range;
@@ -101,7 +104,7 @@ impl StorageBackend for ByteCountingBackend {
 fn p99_micros(mut samples: Vec<u128>) -> u64 {
     samples.sort_unstable();
     let index = (samples.len() * 99).div_ceil(100).saturating_sub(1);
-    samples[index] as u64
+    samples.get(index).copied().unwrap_or(0) as u64
 }
 
 fn scope() -> StateScope {

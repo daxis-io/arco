@@ -2480,10 +2480,7 @@ mod tests {
             .expect("delayed trim opens a fresh source transaction");
         assert_precondition_failed(
             txn.trim_projection_outbox(
-                captured
-                    .iter()
-                    .map(ProjectionOutboxDeliveryId::trim_target)
-                    .collect::<Vec<_>>(),
+                captured.iter().map(ProjectionOutboxDeliveryId::trim_target),
             ),
             "a different incarnation of the same record id",
         );

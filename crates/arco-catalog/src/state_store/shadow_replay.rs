@@ -1685,6 +1685,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the import regression verifies objects and all name indexes as one transaction"
+    )]
     async fn imports_current_catalog_objects_and_name_indexes_into_shadow_scope() {
         let (_backend, storage) = storage();
         let state = fixture_state();
@@ -2139,7 +2143,7 @@ mod tests {
             object_id: Some("schema-1".to_string()),
             object_name: Some("Sales".to_string()),
         }];
-        publish_catalog_fixture(&storage, state).await;
+        publish_catalog_fixture(storage, state).await;
         (event_id.to_string(), payload)
     }
 
@@ -2298,7 +2302,7 @@ mod tests {
             }),
         );
         ledger.append_event(&event).await.expect("append event");
-        let metastore_state = replay_events([event].iter()).expect("replay events");
+        let metastore_state = replay_events(std::iter::once(&event)).expect("replay events");
         let set = build_projection_set(
             &metastore_state,
             &ProjectionRegistry::default(),
@@ -2560,7 +2564,7 @@ mod tests {
         let ledger = MetastoreLedger::new(storage.clone());
         let first = credential_event(&scope, "event_001", 1, "cred_01");
         ledger.append_event(&first).await.expect("append event one");
-        let first_state = replay_events([first.clone()].iter()).expect("replay event one");
+        let first_state = replay_events(std::iter::once(&first)).expect("replay event one");
         publish_metastore_projection_set(
             &storage,
             &build_projection_set(&first_state, &ProjectionRegistry::default(), "event_001")

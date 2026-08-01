@@ -12,13 +12,17 @@ use arco_catalog::state_store::promotion_gate::{
 fn fixture_measurements() -> Vec<PromotionMeasurement> {
     PromotionMeasurementKind::ALL
         .into_iter()
-        .map(|kind| match kind.budget() {
-            Some(budget) => PromotionMeasurement::with_value(
-                kind,
-                MeasurementSource::DeterministicFixture,
-                budget,
-            ),
-            None => PromotionMeasurement::new(kind, MeasurementSource::DeterministicFixture),
+        .map(|kind| {
+            kind.budget().map_or_else(
+                || PromotionMeasurement::new(kind, MeasurementSource::DeterministicFixture),
+                |budget| {
+                    PromotionMeasurement::with_value(
+                        kind,
+                        MeasurementSource::DeterministicFixture,
+                        budget,
+                    )
+                },
+            )
         })
         .collect()
 }

@@ -34,6 +34,27 @@
 //! overflow and wedge the domain permanently, so it is rejected at every
 //! entry point instead.
 //!
+//! Rejecting it on *input* is not enough, because a cooperative writer does
+//! not supply an epoch at all — it copies the published one — and so does
+//! restore-candidate generation. A pointer that already carries `u64::MAX`
+//! (which no claim, publication, or restore can produce, so only corruption or
+//! forgery can install one) is therefore rejected while the pointer is
+//! *validated*, which is the single choke point every one of those paths goes
+//! through: `at_current_writer_epoch`, `begin_control_txn`, publication,
+//! `claim_writer_authority`, current-state reads, and stable restore-base
+//! resolution.
+//!
+//! ## Repair policy for an already-published terminal epoch
+//!
+//! Such a domain is terminal *in place*, deliberately: nothing rewrites the
+//! pointer, because a repair that silently lowered the published epoch would
+//! un-fence writers the pointer says are fenced. The retained history stays
+//! fully readable, because checkpoint and [`StateToken`] reads resolve through
+//! manifest identity and never consult the pointer. Recovery is therefore to
+//! read the retained authority through a checkpoint or state token and restore
+//! it into a fresh domain scope, which begins at epoch 0 with an intact claim
+//! protocol.
+//!
 //! # Format versioning
 //!
 //! Format version 2 is the only supported on-disk format. There is
@@ -1002,6 +1023,29 @@ fn unclaimable_writer_epoch() -> CatalogError {
             "control MVP writer epoch {} is not an acceptable epoch: publishing it would make \
              every later claim_writer_authority increment overflow and wedge the domain \
              permanently, so it is rejected rather than saturated",
+            u64::MAX
+        ),
+    }
+}
+
+/// Returns the fail-closed error for a *published* pointer already carrying the
+/// terminal epoch.
+///
+/// No claim, publication, or restore can produce this pointer, so observing one
+/// means the pointer was corrupted or forged. Refusing it here is what stops
+/// the paths that never supply an epoch — cooperative adoption through
+/// [`ControlMvpStateStore::at_current_writer_epoch`] and restore-candidate
+/// generation, which both copy the published epoch — from spreading a terminal
+/// epoch into transactions, manifests, and new pointers.
+fn terminal_published_writer_epoch() -> CatalogError {
+    CatalogError::InvariantViolation {
+        message: format!(
+            "control MVP pointer publishes writer epoch {}, which no claim, publication, or \
+             restore can produce; the domain is refused in place rather than repaired, because \
+             lowering a published epoch would un-fence writers the pointer says are fenced. \
+             Retained history stays readable through checkpoint and state-token reads, which \
+             resolve by manifest identity and never consult the pointer; recover by restoring \
+             that retained authority into a fresh domain scope",
             u64::MAX
         ),
     }
@@ -2966,6 +3010,9 @@ impl ControlMvpPointer {
         }
         if !self.scope.matches_scope(scope) {
             return Err(validation_failed("control MVP pointer scope mismatch"));
+        }
+        if self.writer_epoch == u64::MAX {
+            return Err(terminal_published_writer_epoch());
         }
         Ok(())
     }

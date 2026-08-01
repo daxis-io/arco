@@ -13,14 +13,42 @@
 //! # Access
 //!
 //! These are roadmap Phase 4/5 operator surfaces ("write APIs behind internal
-//! or operator-only access"), not tenant-facing routes:
+//! or operator-only access"), not tenant-facing routes. Reaching them requires
+//! three independent conditions, and every one of them fails closed:
 //!
 //! - They are mounted only when `control_store_operator_endpoints` is enabled
 //!   (`ARCO_CONTROL_STORE_OPERATOR_ENDPOINTS`, default off). When disabled the
-//!   routes do not exist and requests 404.
+//!   routes do not exist and requests 404. A public posture never mounts them.
 //! - They sit behind the same authentication middleware as every other
 //!   authenticated route, so the tenant/workspace scope they operate on is the
 //!   *verified* request scope, never a caller-supplied one.
+//! - **Authentication is not authorization here.** Every handler additionally
+//!   requires the verified principal to carry the configured operator group
+//!   (`control_store_operator_group` / `ARCO_CONTROL_STORE_OPERATOR_GROUP`).
+//!   An ordinary valid tenant principal is refused with `403`, and when no
+//!   operator group is configured *every* caller is refused — enabling the
+//!   flag alone opens nothing.
+//!
+//! # Why an operator claim rather than a second credential
+//!
+//! `arco-compactor` and `arco-flow` gate their internal surfaces with a
+//! dedicated `InternalOidcVerifier` middleware. That pattern cannot simply be
+//! layered here: it consumes `Authorization`, and so does the tenant JWT
+//! middleware these routes depend on to derive the verified tenant/workspace
+//! scope they act upon. Two middlewares cannot both own that header, and a
+//! service-account-only token carries no tenant scope, so it could not name
+//! the workspace to operate on without reintroducing a caller-supplied scope —
+//! exactly the property these routes must not have.
+//!
+//! The operator authority therefore rides *inside* the same verified token, as
+//! a group claim. It inherits the issuer, audience, signature, and expiry
+//! verification the tenant token already gets, keeps the scope binding
+//! verified, and stays a repository-visible authorization boundary rather than
+//! delegating the decision to network ingress rules. Ingress restrictions
+//! remain useful defence in depth on top of it.
+//!
+//! Every mutation (drain, rebind, trim, shadow import) emits an audit record
+//! naming the operator identity, and every refusal emits a deny record.
 //!
 //! The shadow import writes only the isolated shadow scope and never
 //! authority. The projection-outbox endpoint preserves the single-consumer
@@ -83,11 +111,73 @@ pub struct ControlStoreOutboxRequest {
     force_rebind_consumer: bool,
 }
 
+/// Refuses any principal that does not hold the configured operator authority.
+///
+/// Fails closed in both directions: an authenticated principal without the
+/// group is refused, and so is *every* principal when no group is configured.
+/// The refusal never falls back to "authenticated is good enough", because the
+/// operations behind it (ack-only drain, binding transfer, source trim) can
+/// silently destroy projection data for the legitimate consumer.
+fn authorize_operator(
+    state: &AppState,
+    ctx: &RequestContext,
+    resource: &str,
+) -> Result<(), ApiError> {
+    let configured = state
+        .config
+        .control_store_operator_group
+        .as_deref()
+        .map(str::trim)
+        .filter(|group| !group.is_empty());
+
+    let Some(group) = configured else {
+        crate::audit::emit_control_store_deny(
+            state,
+            ctx,
+            resource,
+            crate::audit::REASON_OPERATOR_AUTHORITY_UNCONFIGURED,
+        );
+        return Err(ApiError::forbidden(
+            "control-store operator endpoints are enabled but no operator authority is \
+             configured, so every caller is refused",
+        )
+        .with_request_id(ctx.request_id.clone())
+        .with_details(serde_json::json!({
+            "hint": "set control_store_operator_group \
+                     (ARCO_CONTROL_STORE_OPERATOR_GROUP) to the group that may drain, \
+                     rebind, and trim; enabling the endpoints alone grants nothing",
+        })));
+    };
+
+    if !ctx.groups.iter().any(|held| held == group) {
+        crate::audit::emit_control_store_deny(
+            state,
+            ctx,
+            resource,
+            crate::audit::REASON_NOT_OPERATOR,
+        );
+        return Err(ApiError::forbidden(
+            "control-store operator endpoints require operator authority; an authenticated \
+             tenant principal is not sufficient",
+        )
+        .with_request_id(ctx.request_id.clone())
+        .with_details(serde_json::json!({
+            "hint": "the principal's verified groups claim must carry the group named by \
+                     control_store_operator_group",
+        })));
+    }
+
+    Ok(())
+}
+
 async fn projection_outbox_handler(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
     Json(request): Json<ControlStoreOutboxRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let resource = format!("control-store/projection-outbox:{}", request.source_domain);
+    authorize_operator(&state, &ctx, &resource)?;
+
     let storage = ctx.scoped_storage(state.storage_backend()?)?;
     let worker =
         ProjectionOutboxWorker::new(storage, &request.source_domain, request.consumer_id.clone())
@@ -103,28 +193,32 @@ async fn projection_outbox_handler(
         None => worker,
     };
 
+    // Each mutation is audited as it lands, so a request that rebinds and
+    // drains but then fails to trim leaves a record of exactly what changed.
     let rebind_report = if request.force_rebind_consumer {
-        Some(
-            worker
-                .rebind_consumer()
-                .await
-                .map_err(control_store_error)?,
-        )
+        let report = worker
+            .rebind_consumer()
+            .await
+            .map_err(control_store_error)?;
+        crate::audit::emit_control_store_mutation(&state, &ctx, &format!("{resource}:rebind"));
+        Some(report)
     } else {
         None
     };
     let drain_report = if request.drain {
-        Some(
-            worker
-                .drain(&AckOnlyProjectionHandler)
-                .await
-                .map_err(control_store_error)?,
-        )
+        let report = worker
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .map_err(control_store_error)?;
+        crate::audit::emit_control_store_mutation(&state, &ctx, &format!("{resource}:drain"));
+        Some(report)
     } else {
         None
     };
     let trim_report = if request.trim {
-        Some(worker.trim_acked().await.map_err(control_store_error)?)
+        let report = worker.trim_acked().await.map_err(control_store_error)?;
+        crate::audit::emit_control_store_mutation(&state, &ctx, &format!("{resource}:trim"));
+        Some(report)
     } else {
         None
     };
@@ -144,10 +238,14 @@ async fn shadow_import_handler(
     State(state): State<Arc<AppState>>,
     ctx: RequestContext,
 ) -> Result<impl IntoResponse, ApiError> {
+    let resource = "control-store/shadow-import".to_string();
+    authorize_operator(&state, &ctx, &resource)?;
+
     let storage = ctx.scoped_storage(state.storage_backend()?)?;
     let report = import_current_catalog_shadow(&storage)
         .await
         .map_err(control_store_error)?;
+    crate::audit::emit_control_store_mutation(&state, &ctx, &resource);
     let comparisons = report
         .comparisons()
         .iter()

@@ -359,7 +359,7 @@ mod tests {
             run_id: "run1".to_string(),
             task_key: task_key.to_string(),
             state,
-            attempt: if state == TaskState::Ready { 0 } else { 1 },
+            attempt: u32::from(state != TaskState::Ready),
             attempt_id: Some("01HQ123ATT".to_string()),
             started_at: None,
             completed_at: None,

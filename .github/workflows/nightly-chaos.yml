@@ -1,6 +1,10 @@
 name: Nightly Chaos Tests
 
 on:
+  # The deterministic suite is hermetic (no cloud credentials), so it can and
+  # must run unattended — a dispatch-only "Nightly" workflow never runs.
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       chaos_seed:
@@ -43,6 +47,6 @@ jobs:
           {
             echo "## Nightly chaos status"
             echo ""
-            echo "This workflow is manual-only and runs the deterministic multi-instance and clock-skew orchestration coverage."
+            echo "This workflow runs nightly (and on manual dispatch) and covers the deterministic multi-instance and clock-skew orchestration suites."
             echo "Full randomized chaos remains opt-in until stable backing suites and Cargo features exist."
           } >> "$GITHUB_STEP_SUMMARY"

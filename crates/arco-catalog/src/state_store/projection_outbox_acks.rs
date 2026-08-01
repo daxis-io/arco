@@ -313,6 +313,9 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::manual_let_else)]
 mod tests {
     use std::ops::Range;
     use std::sync::Arc;

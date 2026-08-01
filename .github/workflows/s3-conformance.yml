@@ -1,0 +1,77 @@
+name: S3 Storage Conformance
+
+# Evidence-integrity companion to adr-034-gcs-conformance.yml (#366).
+#
+# ObjectStoreBackend::s3 exists in crates/arco-core/src/storage.rs, but the
+# only test that exercises the CAS/precondition contract against real S3
+# (s3_backend_satisfies_storage_conformance) is #[ignore]d and, before this
+# workflow, had no runner anywhere. Until this workflow passes against a real
+# bucket, the S3 provider is NOT certified for production use.
+#
+# This workflow only runs on schedule and workflow_dispatch; on both triggers
+# a missing configuration is a loud failure, never a green skip.
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  s3-conformance:
+    name: S3 Storage Conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: "false"
+
+      # Static-key auth only for now: AmazonS3Builder::from_env reads the AWS_*
+      # environment variables directly, so no third-party credentials action is
+      # required. When AWS OIDC infra exists, add a role-assumption mode here
+      # mirroring the GCS workflow's workload-identity path.
+      - name: Check S3 conformance prerequisites
+        id: prereq
+        run: |
+          if [ -n "${{ vars.ARCO_TEST_S3_BUCKET }}" ] && [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && [ -n "${{ vars.AWS_REGION }}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run S3 storage conformance suite
+        if: steps.prereq.outputs.configured == 'true'
+        env:
+          ARCO_TEST_S3_BUCKET: ${{ vars.ARCO_TEST_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          cargo test --locked -p arco-core --test storage_backend_conformance \
+            s3_backend_satisfies_storage_conformance -- --ignored --nocapture
+
+      - name: Fail on missing S3 conformance configuration
+        if: steps.prereq.outputs.configured != 'true'
+        run: |
+          {
+            echo "## S3 conformance: FAILED (unconfigured)"
+            echo ""
+            echo "S3 conformance cannot run: AWS credentials/bucket unconfigured — the provider CAS gate is UNVERIFIED."
+            echo "**S3 is NOT certified**: no CAS conformance evidence exists for this provider."
+            echo ""
+            echo "Configure \`vars.ARCO_TEST_S3_BUCKET\`, \`vars.AWS_REGION\`,"
+            echo "\`secrets.AWS_ACCESS_KEY_ID\`, and \`secrets.AWS_SECRET_ACCESS_KEY\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::S3 conformance cannot run: AWS credentials/bucket unconfigured — the provider CAS gate is UNVERIFIED and S3 is NOT certified"
+          exit 1

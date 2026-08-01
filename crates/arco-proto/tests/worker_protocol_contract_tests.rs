@@ -1,6 +1,9 @@
 //! Generated worker protocol contract tests.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unnecessary_wraps)]
 
 use std::collections::BTreeMap;
 

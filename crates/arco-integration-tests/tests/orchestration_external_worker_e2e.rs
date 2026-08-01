@@ -1,6 +1,9 @@
 //! External worker callback end-to-end orchestration test.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::match_wildcard_for_single_variants, clippy::too_many_lines)]
 
 use std::future::Future;
 use std::sync::Arc;

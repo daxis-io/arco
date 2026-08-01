@@ -1,5 +1,9 @@
 //! Integration tests for Unity Catalog catalog/schema/table CRUD endpoints.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::similar_names, clippy::too_many_lines)]
+
 use std::sync::Arc;
 
 use arco_catalog::CatalogReader;

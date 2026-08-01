@@ -521,6 +521,9 @@ impl OrchestrationReconciler {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::default_trait_access)]
 mod tests {
     use super::*;
 

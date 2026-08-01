@@ -7,12 +7,30 @@
 //! resolve to exactly one active path authority bound to the request
 //! workspace. When storage governance is not enabled, current behavior is
 //! preserved unchanged.
+//!
+//! The same rule covers the location-bearing table properties
+//! ([`LOCATION_BEARING_TABLE_PROPERTIES`]): a property such as
+//! `write.data.path` redirects data files to an arbitrary location, so under
+//! governance it is validated exactly like the advertised table location.
+
+use std::collections::HashMap;
 
 use arco_catalog::CatalogError;
-use arco_catalog::metastore::publish::load_published_storage_governance_if_configured;
+use arco_catalog::metastore::publish::{
+    PublishedStorageGovernance, load_published_storage_governance_if_configured,
+};
 use arco_core::ScopedStorage;
 
 use crate::error::{IcebergError, IcebergResult};
+
+/// Iceberg table properties that carry storage locations and are therefore
+/// validated against storage governance exactly like the advertised table
+/// location when governance is enabled for the scope.
+pub const LOCATION_BEARING_TABLE_PROPERTIES: [&str; 3] = [
+    "write.data.path",
+    "write.metadata.path",
+    "write.object-storage.path",
+];
 
 /// Validates a client-supplied table location against published storage
 /// governance.
@@ -37,35 +55,86 @@ pub async fn validate_client_supplied_location(
     workspace: &str,
     location: &str,
 ) -> IcebergResult<()> {
-    let published = load_published_storage_governance_if_configured(storage)
-        .await
-        .map_err(|error| governance_state_unavailable(&error))?;
-    let Some(published) = published else {
+    let Some(published) = load_governance_if_configured(storage).await? else {
         return Ok(());
     };
+    validate_location_against(&published, workspace, location, None)
+}
 
+/// Validates the known location-bearing table properties against published
+/// storage governance.
+///
+/// When governance is enabled for the scope, each of
+/// [`LOCATION_BEARING_TABLE_PROPERTIES`] present in `properties` must resolve
+/// to a governed path authority bound to the request workspace, exactly like
+/// the advertised table location; violations are denied with a typed 400
+/// naming the offending property. When governance is not configured, the
+/// properties pass through untouched.
+pub async fn validate_location_bearing_table_properties(
+    storage: &ScopedStorage,
+    workspace: &str,
+    properties: &HashMap<String, String>,
+) -> IcebergResult<()> {
+    let targeted: Vec<(&str, &str)> = LOCATION_BEARING_TABLE_PROPERTIES
+        .iter()
+        .filter_map(|key| properties.get(*key).map(|value| (*key, value.as_str())))
+        .collect();
+    if targeted.is_empty() {
+        return Ok(());
+    }
+    let Some(published) = load_governance_if_configured(storage).await? else {
+        return Ok(());
+    };
+    for (property, location) in targeted {
+        validate_location_against(&published, workspace, location, Some(property))?;
+    }
+    Ok(())
+}
+
+async fn load_governance_if_configured(
+    storage: &ScopedStorage,
+) -> IcebergResult<Option<PublishedStorageGovernance>> {
+    load_published_storage_governance_if_configured(storage)
+        .await
+        .map_err(|error| governance_state_unavailable(&error))
+}
+
+fn validate_location_against(
+    published: &PublishedStorageGovernance,
+    workspace: &str,
+    location: &str,
+    property: Option<&str>,
+) -> IcebergResult<()> {
+    let described = property.map_or_else(
+        || format!("Table location '{location}'"),
+        |property| format!("Table property '{property}' location '{location}'"),
+    );
     match published.state.authority_for_path(workspace, location) {
         Ok(_) => Ok(()),
         Err(CatalogError::NotFound { .. }) => Err(IcebergError::BadRequest {
             message: format!(
-                "Table location '{location}' is not governed by any storage-governance path \
-                 authority bound to this workspace"
+                "{described} is not governed by any storage-governance path authority bound to \
+                 this workspace"
             ),
             error_type: "BadRequestException",
         }),
         Err(CatalogError::PreconditionFailed { .. }) => Err(IcebergError::BadRequest {
             message: format!(
-                "Table location '{location}' is ambiguously governed by overlapping \
-                 storage-governance path authorities"
+                "{described} is ambiguously governed by overlapping storage-governance path \
+                 authorities"
             ),
             error_type: "BadRequestException",
         }),
-        Err(CatalogError::Validation { message }) => Err(IcebergError::BadRequest {
-            message: format!(
-                "Invalid table location '{location}' under storage governance: {message}"
-            ),
-            error_type: "BadRequestException",
-        }),
+        Err(CatalogError::Validation { message }) => {
+            let invalid = property.map_or_else(
+                || format!("Invalid table location '{location}'"),
+                |property| format!("Invalid table property '{property}' location '{location}'"),
+            );
+            Err(IcebergError::BadRequest {
+                message: format!("{invalid} under storage governance: {message}"),
+                error_type: "BadRequestException",
+            })
+        }
         Err(error) => Err(governance_state_unavailable(&error)),
     }
 }

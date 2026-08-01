@@ -147,7 +147,8 @@ pub(crate) async fn publish_storage_governance_projection(
         UnityCatalogError::ServiceUnavailable {
             message: "storage_governance_projection_publication_failed: committed metastore \
                       events remain durable; credential vending stays deny-closed until the \
-                      projection is republished by a retried governance request"
+                      projection is republished by a retried governance request or an admin \
+                      POST /storage-governance/projection/republish"
                 .to_string(),
         }
     })

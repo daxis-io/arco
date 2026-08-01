@@ -15,6 +15,10 @@ use arco_catalog::metastore::events::{
     ExternalLocationRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
 };
 use arco_catalog::metastore::ledger::MetastoreLedger;
+use arco_catalog::metastore::projections::ProjectionRegistry;
+use arco_catalog::metastore::publish::{
+    MetastoreProjectionPublication, publish_current_metastore_projection,
+};
 use arco_catalog::storage_governance::StorageGovernanceState;
 use arco_catalog::storage_governance::external_locations::ExternalLocation;
 
@@ -43,6 +47,10 @@ pub fn routes() -> Router<UnityCatalogState> {
             post(create_external_location).get(list_external_locations),
         )
         .route("/external-locations/:name", get(get_external_location))
+        .route(
+            "/storage-governance/projection/republish",
+            post(republish_storage_governance_projection_route),
+        )
 }
 
 async fn create_external_location(
@@ -71,6 +79,15 @@ async fn create_external_location(
         .create_external_location(location.clone())
         .map_err(map_catalog_error)?;
 
+    // Belt-and-suspenders for path canonicalization: never persist a
+    // canonical URL that does not round-trip through `GovernedPath::parse`.
+    // A non-round-trip URL in the append-only ledger would fail every future
+    // replay and leave the scope permanently deny-closed.
+    let canonical_url = location
+        .path
+        .persistable_canonical_uri()
+        .map_err(map_catalog_error)?;
+
     let scope = control_plane_scope(&ctx)?;
     let event = MetastoreEvent::new_scoped(
         &scope,
@@ -79,7 +96,7 @@ async fn create_external_location(
         MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
             location_id: location.location_id,
             name: location.name,
-            url: location.path.canonical_uri(),
+            url: canonical_url,
             credential_id: location.credential_id,
             owner: location.owner,
             lifecycle_state: LifecycleState::Active,
@@ -171,6 +188,44 @@ fn external_location_payload(
         "updated_at": record.updated_at_ms,
         "ledger_watermark": ledger_watermark,
     })
+}
+
+/// Idempotent, non-mutating storage-governance projection republish (#362
+/// recovery path).
+///
+/// Appends **no** ledger event: it only republishes the metastore projection
+/// at the current ledger watermark, so a projection left stale by a failed
+/// commit-synchronous publication can be healed immediately by an
+/// administrator instead of waiting for a future governance POST. Requires
+/// the same METASTORE `Manage` authorization as the other governance routes.
+async fn republish_storage_governance_projection_route(
+    State(state): State<UnityCatalogState>,
+    Extension(ctx): Extension<UnityCatalogRequestContext>,
+) -> Result<(StatusCode, Json<serde_json::Value>), UnityCatalogError> {
+    require_storage_governance_admin(&state, &ctx)?;
+    let storage = scoped_storage(&state, &ctx)?;
+    let publication =
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default())
+            .await
+            .map_err(map_catalog_error)?;
+
+    let payload = match publication {
+        MetastoreProjectionPublication::EmptyLedger => json!({
+            "status": "empty_ledger",
+        }),
+        MetastoreProjectionPublication::AlreadyCurrent {
+            ledger_watermark_sequence,
+        } => json!({
+            "status": "already_current",
+            "ledger_watermark_sequence": ledger_watermark_sequence,
+        }),
+        MetastoreProjectionPublication::Published(manifest) => json!({
+            "status": "published",
+            "ledger_watermark": manifest.ledger_watermark,
+            "ledger_watermark_sequence": manifest.ledger_watermark_sequence,
+        }),
+    };
+    Ok((StatusCode::OK, Json(payload)))
 }
 
 fn ledger(

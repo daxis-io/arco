@@ -30,12 +30,48 @@ impl GovernedPath {
     }
 
     /// Returns the canonical URI.
+    ///
+    /// Path segments are percent-encoded on emission (RFC 3986 `pchar` bytes
+    /// stay literal, everything else — including `%` itself — is escaped), so
+    /// the canonical URI is a fixed point of [`GovernedPath::parse`]: for
+    /// every parse-accepted input, re-parsing the canonical URI succeeds and
+    /// yields an equal `GovernedPath`.
     #[must_use]
     pub fn canonical_uri(&self) -> String {
+        let encoded_path = encode_canonical_path(&self.path);
         self.authority.as_ref().map_or_else(
-            || format!("{}://{}", self.scheme, self.path),
-            |authority| format!("{}://{}{}", self.scheme, authority, self.path),
+            || format!("{}://{}", self.scheme, encoded_path),
+            |authority| format!("{}://{}{}", self.scheme, authority, encoded_path),
         )
+    }
+
+    /// Returns the canonical URI after verifying it round-trips through
+    /// [`GovernedPath::parse`] unchanged.
+    ///
+    /// Persistence boundaries (external-location creation, path-governance
+    /// declarations) must use this instead of [`GovernedPath::canonical_uri`]:
+    /// a canonical string that failed to re-parse would poison every future
+    /// replay of the append-only ledger, so it is rejected before anything is
+    /// persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when re-parsing the canonical URI fails or
+    /// yields a different path. [`GovernedPath::canonical_uri`] is constructed
+    /// so this cannot happen; the guard exists to keep any future
+    /// canonicalization regression from persisting unreadable state.
+    pub fn persistable_canonical_uri(&self) -> Result<String> {
+        let canonical = self.canonical_uri();
+        match Self::parse(&canonical) {
+            Ok(reparsed) if reparsed == *self => Ok(canonical),
+            Ok(_) => Err(validation(format!(
+                "canonical path '{canonical}' does not round-trip to the same governed path and \
+                 cannot be persisted"
+            ))),
+            Err(error) => Err(validation(format!(
+                "canonical path '{canonical}' fails re-parsing and cannot be persisted: {error}"
+            ))),
+        }
     }
 
     /// Returns true when `self` is a prefix authority for `candidate`.
@@ -105,6 +141,54 @@ fn canonical_path(path: &str, absolute: bool) -> Result<String> {
         canonical.insert(0, '/');
     }
     Ok(canonical)
+}
+
+fn encode_canonical_path(path: &str) -> String {
+    // The canonical path shape is "/" or "/segment/.../"; splitting on '/'
+    // preserves the leading and trailing empty pieces, so joining re-creates
+    // exactly the same slash structure around the encoded segments.
+    path.split('/')
+        .map(percent_encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if is_literal_segment_byte(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(hex_digit(byte >> 4));
+            encoded.push(hex_digit(byte & 0x0f));
+        }
+    }
+    encoded
+}
+
+/// RFC 3986 `pchar` bytes that may appear literally in an emitted canonical
+/// segment: unreserved characters, sub-delimiters, `:` and `@`.
+///
+/// Everything else — including `%` itself, whitespace, `?`, `#`, and
+/// non-ASCII bytes — is percent-encoded so that decoding the emitted segment
+/// yields exactly the stored segment.
+const fn is_literal_segment_byte(byte: u8) -> bool {
+    matches!(byte,
+        b'A'..=b'Z'
+        | b'a'..=b'z'
+        | b'0'..=b'9'
+        | b'-' | b'.' | b'_' | b'~'
+        | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+        | b':' | b'@')
+}
+
+fn hex_digit(value: u8) -> char {
+    if value < 10 {
+        char::from(b'0' + value)
+    } else {
+        char::from(b'A' + (value - 10))
+    }
 }
 
 fn percent_decode(value: &str) -> Result<String> {

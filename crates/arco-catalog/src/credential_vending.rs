@@ -15,13 +15,14 @@ pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(3600);
 
 /// Maximum ledger staleness (in seconds) the vending path may serve from.
 ///
-/// The published storage-governance projection is validated against the exact
-/// latest metastore ledger watermark on every credential decision
-/// (`metastore::publish::validate_storage_governance_manifest_freshness`), so a
-/// projection missing even one committed event is rejected and vending denies
-/// closed. The projection-staleness half of the revocation-freshness budget is
-/// therefore zero: no credential decision is ever made from state that predates
-/// a committed revocation.
+/// `metastore::publish::validate_storage_governance_manifest_freshness`
+/// derives its allowed staleness from this constant on every credential
+/// decision: with the value at zero, a projection missing even one committed
+/// event is rejected and vending denies closed, so no credential decision is
+/// ever made from state that predates a committed revocation. Raising this
+/// constant directly widens what that validator accepts (a sequence-behind
+/// manifest published within the budget) and therefore widens the
+/// revocation-freshness budget; see [`REVOCATION_FRESHNESS_BUDGET_SECS`].
 pub const MAX_PROJECTION_STALENESS_SECS: u64 = 0;
 
 /// Maximum ledger staleness the vending path may serve from.

@@ -201,6 +201,89 @@ async fn governed_scope_stale_projection_denies_closed() {
     );
 }
 
+/// F3: a location-bearing table property is a client-controlled location
+/// channel; under governance a foreign `write.data.path` is rejected with a
+/// typed 400 naming the offending property.
+#[tokio::test]
+async fn governed_scope_rejects_foreign_write_data_path_property() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(crud_state(Arc::clone(&backend)));
+
+    let response = app
+        .oneshot(create_table_request_with_properties(
+            "events",
+            Some("gs://bucket/warehouse/orders/events"),
+            serde_json::json!({
+                "write.data.path": "gs://attacker-bucket/exfil/data"
+            }),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(response).await;
+    assert!(
+        body.contains("write.data.path") && body.contains("not governed"),
+        "expected governed-path denial naming the offending property, got: {body}"
+    );
+}
+
+/// F3: benign properties pass through untouched, and location-bearing
+/// properties pointing inside the governed authority are accepted.
+#[tokio::test]
+async fn governed_scope_accepts_benign_and_governed_location_properties() {
+    let backend = setup_catalog().await;
+    seed_and_publish_governance(&backend).await;
+    let app = iceberg_router(crud_state(Arc::clone(&backend)));
+
+    let response = app
+        .oneshot(create_table_request_with_properties(
+            "events",
+            Some("gs://bucket/warehouse/orders/events"),
+            serde_json::json!({
+                "write.parquet.compression-codec": "zstd",
+                "commit.retry.num-retries": "4",
+                "write.data.path": "gs://bucket/warehouse/orders/events/data"
+            }),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "benign properties and governed location-bearing properties must pass: {}",
+        body_string(response).await
+    );
+}
+
+/// F3: when governance is not configured for the scope, location-bearing
+/// properties are untouched and current behavior is preserved.
+#[tokio::test]
+async fn ungoverned_scope_ignores_location_bearing_properties() {
+    let backend = setup_catalog().await;
+    let app = iceberg_router(crud_state(Arc::clone(&backend)));
+
+    let response = app
+        .oneshot(create_table_request_with_properties(
+            "events",
+            None,
+            serde_json::json!({
+                "write.data.path": "gs://attacker-bucket/exfil/data"
+            }),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "without storage governance the properties must pass through unchanged: {}",
+        body_string(response).await
+    );
+}
+
 #[tokio::test]
 async fn governed_scope_register_table_rejects_ungoverned_metadata_location() {
     let backend = setup_catalog().await;
@@ -386,13 +469,22 @@ async fn put_registerable_metadata(backend: &Arc<dyn StorageBackend>, location: 
 }
 
 fn create_table_request(name: &str, location: Option<&str>) -> Request<Body> {
+    create_table_request_with_properties(name, location, serde_json::json!({}))
+}
+
+fn create_table_request_with_properties(
+    name: &str,
+    location: Option<&str>,
+    properties: serde_json::Value,
+) -> Request<Body> {
     let mut body = serde_json::json!({
         "name": name,
         "schema": {
             "schema-id": 0,
             "type": "struct",
             "fields": [{"id": 1, "name": "id", "type": "long", "required": true}]
-        }
+        },
+        "properties": properties
     });
     if let Some(location) = location {
         body["location"] = serde_json::Value::String(location.to_string());

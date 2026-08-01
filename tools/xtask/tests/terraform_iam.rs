@@ -78,6 +78,57 @@ fn flow_worker_dispatch_secret_is_wired_to_producers_and_worker() {
 }
 
 #[test]
+fn state_store_prefix_has_exactly_one_writer() {
+    let terraform = terraform_iam_text();
+
+    assert!(
+        terraform.contains("state_store_object_prefix = \"state-store/\""),
+        "state-store/ object prefix local should be defined"
+    );
+
+    let block = resource_block(
+        &terraform,
+        "google_storage_bucket_iam_member",
+        "api_write_state_store",
+    )
+    .expect("API state-store write binding should exist");
+    assert!(block.contains("roles/storage.objectUser"));
+    assert!(block.contains("serviceAccount:${google_service_account.api.email}"));
+    assert!(block.contains("condition {"));
+    assert!(block.contains("startsWith(\"${local.state_store_object_prefix}\")"));
+    assert!(!block.contains("contains("));
+
+    // Single-writer invariant: exactly one IAM binding may scope write
+    // authority to the state-store/ prefix (the local definition itself does
+    // not use the `local.` reference form).
+    assert_eq!(
+        terraform.matches("local.state_store_object_prefix").count(),
+        1,
+        "exactly one IAM binding may reference the state-store/ write prefix"
+    );
+
+    // No other write prefix may shadow control-store paths: the control store
+    // writes under state-store/control-mvp/..., which must not satisfy any
+    // other startsWith() write condition (notably state/).
+    for other_prefix in [
+        "ledger/",
+        "locks/",
+        "commits/",
+        "manifests/",
+        "snapshots/",
+        "state/",
+        "state/anti_entropy/",
+        "l0/",
+        "warehouse/",
+    ] {
+        assert!(
+            !"state-store/control-mvp/".starts_with(other_prefix),
+            "state-store/ control paths must not match the {other_prefix} write condition"
+        );
+    }
+}
+
+#[test]
 fn api_service_account_can_invoke_sync_compactors() {
     let terraform = terraform_iam_text();
 

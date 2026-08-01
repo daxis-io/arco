@@ -565,9 +565,12 @@ fn run_repo_hygiene_check() -> Result<()> {
         "docs/guide/src/SUMMARY.md",
     ))?);
 
+    let tracked = tracked_files()?;
+    errors.extend(check_dangling_doc_references(&tracked)?);
+
     let forbidden_paths = forbidden_path_markers();
-    for path in tracked_files()? {
-        let bytes = match std::fs::read(&path) {
+    for path in &tracked {
+        let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => {
@@ -682,6 +685,107 @@ fn extract_summary_links(text: &str) -> Vec<String> {
         }
     }
     links
+}
+
+/// Directory prefixes whose citations inside docs must resolve to tracked
+/// paths. Built by concatenation so this file does not trip its own
+/// forbidden-path-marker scan.
+fn doc_citation_prefixes() -> [String; 2] {
+    [
+        format!("{}/{}/", "docs", "plans"),
+        format!("{}/{}/", "docs", "spec"),
+    ]
+}
+
+/// Flags citations of plan/spec paths that do not resolve to tracked files.
+///
+/// Landed plans and guides cite sibling design documents by repository path
+/// (inside backticks, markdown links, or plain prose). A citation that names a
+/// path absent from the repository is a dangling reference: the cited contract
+/// cannot be reviewed from the branch that depends on it.
+fn check_dangling_doc_references(tracked: &[String]) -> Result<Vec<String>> {
+    let docs_prefix = format!("{}/", "docs");
+    let mut errors = Vec::new();
+    for path in tracked {
+        if !path.starts_with(&docs_prefix) || !path.ends_with(".md") {
+            continue;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read tracked doc at {path}"));
+            }
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+
+        for cited in scan_doc_path_citations(&text) {
+            if !cited_doc_path_exists(&cited, tracked) {
+                errors.push(format!("{path}: dangling doc reference '{cited}'"));
+            }
+        }
+    }
+    Ok(errors)
+}
+
+/// Extracts plan/spec path citations from markdown text.
+///
+/// Citations inside backticks and markdown links are included. Citations that
+/// are embedded in a longer token (URLs, absolute filesystem paths, or other
+/// nested path segments) are skipped, as are bare directory mentions without a
+/// concrete name after the prefix. Trailing sentence punctuation is trimmed.
+fn scan_doc_path_citations(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut seen = HashSet::new();
+    let mut cited = Vec::new();
+    for prefix in doc_citation_prefixes() {
+        let mut search_from = 0usize;
+        while let Some(found) = text[search_from..].find(&prefix) {
+            let idx = search_from + found;
+            search_from = idx + prefix.len();
+
+            if idx > 0 {
+                let prev = bytes[idx - 1];
+                if is_word_byte(prev) || matches!(prev, b'/' | b'.' | b'-') {
+                    continue;
+                }
+            }
+
+            let mut end = idx + prefix.len();
+            while end < bytes.len() && is_doc_citation_byte(bytes[end]) {
+                end += 1;
+            }
+            while end > idx + prefix.len()
+                && matches!(bytes[end - 1], b'.' | b',' | b';' | b':' | b'/')
+            {
+                end -= 1;
+            }
+            if end == idx + prefix.len() {
+                continue;
+            }
+
+            let citation = text[idx..end].to_string();
+            if seen.insert(citation.clone()) {
+                cited.push(citation);
+            }
+        }
+    }
+    cited
+}
+
+const fn is_doc_citation_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/')
+}
+
+/// A cited doc path exists when it is a tracked file or a tracked directory
+/// (some tracked file lives under it).
+fn cited_doc_path_exists(cited: &str, tracked: &[String]) -> bool {
+    let dir_prefix = format!("{cited}/");
+    tracked
+        .iter()
+        .any(|path| path == cited || path.starts_with(&dir_prefix))
 }
 
 fn forbidden_path_markers() -> [String; 3] {

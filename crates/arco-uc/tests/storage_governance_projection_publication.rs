@@ -253,6 +253,7 @@ async fn failed_publication_fails_loud_and_next_admin_request_heals() {
     let payload = json_body(response).await;
     assert!(payload["error"]["message"].as_str().is_some_and(|message| {
         message.contains("storage_governance_projection_publication_failed")
+            && message.contains("/storage-governance/projection/republish")
     }));
 
     let scoped = scoped(&backend);
@@ -284,6 +285,207 @@ async fn failed_publication_fails_loud_and_next_admin_request_heals() {
         .expect("healed projection");
     assert_eq!(published.ledger_watermark, events[0].event_id);
     assert_eq!(published.state.list_storage_credentials().len(), 1);
+}
+
+/// Path-canonicalization poison-chain regression: a percent-bearing external
+/// location URL (`100%25-complete`) previously published fine (201) but
+/// persisted a canonical string with a bare `%` that failed every subsequent
+/// projection load and metastore replay — permanent 503 for all vending on
+/// the scope with no API recovery. The canonical form is now a parse fixed
+/// point, so publish → load → replay → vend keeps working.
+#[tokio::test]
+async fn percent_bearing_location_url_round_trips_through_publish_load_and_vend() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let state = governed_state(Arc::clone(&backend), "unpublished");
+    let app = unity_catalog_router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-credentials",
+            credential_body(),
+        ))
+        .await
+        .expect("credential response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // The reviewer's poison input: a location URL with an escaped literal '%'.
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/external-locations",
+            serde_json::json!({
+                "location_id": "loc_orders",
+                "name": "orders",
+                "url": "gs://bucket/warehouse/100%25-complete",
+                "credential_id": "cred_01",
+                "owner": "owner"
+            }),
+        ))
+        .await
+        .expect("location response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let payload = json_body(response).await;
+    // The persisted canonical form re-encodes the literal '%' so it stays a
+    // parse fixed point instead of an unreadable bare escape.
+    assert_eq!(payload["url"], "gs://bucket/warehouse/100%25-complete/");
+
+    // LOAD side of the chain: the published projection re-parses.
+    let scoped = scoped(&backend);
+    let published = load_published_storage_governance(&scoped)
+        .await
+        .expect("projection load must not be poisoned by the percent location");
+    assert_eq!(
+        published
+            .state
+            .get_external_location("loc_orders")
+            .expect("percent-bearing location present")
+            .path
+            .canonical_uri(),
+        "gs://bucket/warehouse/100%25-complete/"
+    );
+
+    // Replay side of the chain: subsequent governance POSTs (which rebuild
+    // state via from_metastore_state) keep working.
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/external-locations",
+            serde_json::json!({
+                "location_id": "loc_customers",
+                "name": "customers",
+                "url": "gs://bucket/warehouse/customers",
+                "credential_id": "cred_01",
+                "owner": "owner"
+            }),
+        ))
+        .await
+        .expect("follow-up location response");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "metastore replay after the percent-bearing commit must keep working"
+    );
+
+    // Vend side of the chain: bind the location, republish, and vend under
+    // the percent-bearing governed path.
+    append_binding_event(&backend, "event_binding_004", 4).await;
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-credentials",
+            credential_body(),
+        ))
+        .await
+        .expect("self-heal request");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    set_permissions_at_watermark(&state, "event_binding_004");
+
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/temporary-path-credentials",
+            serde_json::json!({
+                "url": "gs://bucket/warehouse/100%25-complete/day=1/",
+                "operation": "READ",
+                "requested_ttl_seconds": 300
+            }),
+        ))
+        .await
+        .expect("vending response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = json_body(response).await;
+    assert_eq!(payload["decision"], "allow");
+    assert_eq!(
+        payload["authorized_path_prefixes"][0],
+        "gs://bucket/warehouse/100%25-complete/day=1/"
+    );
+}
+
+/// #362 recovery path: after a failed commit-synchronous publication, the
+/// admin republish route heals the stale projection without appending any
+/// ledger event, so recovery is not contingent on a future governance POST.
+#[tokio::test]
+async fn republish_route_heals_projection_without_appending_ledger_events() {
+    let flaky = Arc::new(PublicationFaultBackend::new(Arc::new(MemoryBackend::new())));
+    let backend: Arc<dyn StorageBackend> = flaky.clone();
+    let state = governed_state(Arc::clone(&backend), "unpublished");
+    let app = unity_catalog_router(state.clone());
+
+    // Durable commit whose synchronous publication fails.
+    flaky.fail_publication_writes(true);
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-credentials",
+            credential_body(),
+        ))
+        .await
+        .expect("credential response");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let scoped = scoped(&backend);
+    let events = MetastoreLedger::new(scoped.clone())
+        .load_events()
+        .await
+        .expect("ledger events");
+    assert_eq!(events.len(), 1, "the metastore commit must remain durable");
+    assert!(
+        load_published_storage_governance(&scoped).await.is_err(),
+        "projection must be stale after the failed publication"
+    );
+
+    // Recovery: the republish route publishes at the current watermark and
+    // appends no ledger event.
+    flaky.fail_publication_writes(false);
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-governance/projection/republish",
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("republish response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = json_body(response).await;
+    assert_eq!(payload["status"], "published");
+    assert_eq!(payload["ledger_watermark"], events[0].event_id.as_str());
+
+    let events_after = MetastoreLedger::new(scoped.clone())
+        .load_events()
+        .await
+        .expect("ledger events after republish");
+    assert_eq!(
+        events_after.len(),
+        1,
+        "the republish route must not append ledger events"
+    );
+    let published = load_published_storage_governance(&scoped)
+        .await
+        .expect("healed projection");
+    assert_eq!(published.ledger_watermark, events[0].event_id);
+    assert_eq!(published.state.list_storage_credentials().len(), 1);
+
+    // Idempotent: a second republish reports the pointer as already current.
+    let response = app
+        .clone()
+        .oneshot(trusted_json_request(
+            "POST",
+            "/storage-governance/projection/republish",
+            serde_json::json!({}),
+        ))
+        .await
+        .expect("second republish response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload = json_body(response).await;
+    assert_eq!(payload["status"], "already_current");
 }
 
 fn scoped(backend: &Arc<dyn StorageBackend>) -> ScopedStorage {

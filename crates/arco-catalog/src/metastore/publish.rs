@@ -1,4 +1,20 @@
 //! Pointer-publication planning for metastore projections.
+//!
+//! # Request amplification (program rule 6)
+//!
+//! [`publish_current_metastore_projection`] runs commit-synchronously on every
+//! UC storage-governance POST. Each invocation performs one full
+//! metastore-ledger LIST ([`MetastoreLedger::latest_watermark`] /
+//! `load_events`) and, whenever the pointer is behind, replays the ledger and
+//! rewrites the *entire* projection set — O(ledger size) work per commit, on
+//! top of the request-time ledger LISTs the governance routes already perform
+//! for replay-based validation. This is a measured, tracked deviation from
+//! program rule 6 ("no listing for request-time correctness"); see the Rule 6
+//! finding on the UC storage-governance routes in
+//! `docs/reports/2026-07-30-design-program-progress-audit.md` (section 4,
+//! rule 6). The follow-up is incremental projection publication (per-watermark
+//! delta projections) so each commit republishes O(delta) instead of
+//! O(ledger).
 
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -472,22 +488,72 @@ pub async fn load_published_storage_governance_if_configured(
     load_published_storage_governance(storage).await.map(Some)
 }
 
+/// Validates a client-supplied storage location against published storage
+/// governance (#358).
+///
+/// Shared by the table-creation surfaces (Iceberg REST, UC `POST /tables`,
+/// and the native API's `register_table_in_schema`) so every client-controlled
+/// location channel enforces the same rules:
+///
+/// - **Governance not configured** (no projection pointer has ever been
+///   published for the scope): returns `Ok(())` and callers preserve
+///   ungoverned behavior unchanged.
+/// - **Governance configured**: the location must resolve to exactly one
+///   active path authority bound to `workspace_id`. Ungoverned, ambiguously
+///   governed, and unparseable locations are rejected with
+///   [`CatalogError::Validation`], which the route layers surface as a typed
+///   400.
+/// - **Configured but stale or corrupt projection**: fails closed with
+///   `RequestFailed(503)`, matching the credential-vending posture.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::Validation`] for denied locations and
+/// `RequestFailed(503)` when the published projection is stale, unsupported,
+/// or corrupt.
+pub async fn validate_governed_location_if_configured(
+    storage: &ScopedStorage,
+    workspace_id: &str,
+    location: &str,
+) -> Result<()> {
+    let Some(published) = load_published_storage_governance_if_configured(storage).await? else {
+        return Ok(());
+    };
+    match published.state.authority_for_path(workspace_id, location) {
+        Ok(_) => Ok(()),
+        Err(CatalogError::NotFound { .. }) => Err(CatalogError::Validation {
+            message: format!(
+                "storage location '{location}' is not governed by any storage-governance path \
+                 authority bound to this workspace"
+            ),
+        }),
+        Err(CatalogError::PreconditionFailed { .. }) => Err(CatalogError::Validation {
+            message: format!(
+                "storage location '{location}' is ambiguously governed by overlapping \
+                 storage-governance path authorities"
+            ),
+        }),
+        Err(CatalogError::Validation { message }) => Err(CatalogError::Validation {
+            message: format!(
+                "invalid storage location '{location}' under storage governance: {message}"
+            ),
+        }),
+        Err(error) => Err(error),
+    }
+}
+
 /// Enforces the projection-staleness half of the revocation-freshness budget.
 ///
-/// [`crate::credential_vending::MAX_PROJECTION_STALENESS_SECS`] is zero: only a
-/// projection at the *exact* latest ledger watermark may serve credential
-/// decisions, so a committed revocation is visible to every subsequent
-/// decision and stale state denies closed (HTTP 503). Relaxing this equality
-/// to any weaker freshness rule widens the revocation-freshness budget and
-/// must update `REVOCATION_FRESHNESS_BUDGET_SECS` and
-/// `docs/guide/src/reference/credential-vending-security.md` together; the
-/// compile-time assertion below pins that coupling.
-const _: () = assert!(
-    crate::credential_vending::MAX_PROJECTION_STALENESS_SECS == 0,
-    "validate_storage_governance_manifest_freshness enforces exact-watermark \
-     equality; a non-zero staleness bound requires changing this validator"
-);
-
+/// The allowed staleness is derived from
+/// [`crate::credential_vending::MAX_PROJECTION_STALENESS`], so changing that
+/// constant changes this validator's behavior directly. With a zero budget
+/// (the current value) only a manifest at the *exact* latest ledger watermark
+/// may serve credential decisions: a committed revocation is visible to every
+/// subsequent decision and stale state denies closed (HTTP 503). A non-zero
+/// budget admits a sequence-behind manifest only while its publication
+/// timestamp is still within the budget. Any widening must update
+/// `REVOCATION_FRESHNESS_BUDGET_SECS` and
+/// `docs/guide/src/reference/credential-vending-security.md` together.
 fn validate_storage_governance_manifest_freshness(
     manifest: &MetastoreProjectionManifest,
     latest: Option<&MetastoreLedgerWatermark>,
@@ -497,9 +563,11 @@ fn validate_storage_governance_manifest_freshness(
             if manifest.ledger_watermark_sequence == latest.sequence
                 && manifest.ledger_watermark == latest.event_id => {}
         Some(_) => {
-            return Err(projection_unavailable(
-                "storage_governance_projection_stale",
-            ));
+            if !manifest_within_staleness_budget(manifest) {
+                return Err(projection_unavailable(
+                    "storage_governance_projection_stale",
+                ));
+            }
         }
         None => {
             if manifest.ledger_watermark_sequence == 0
@@ -508,12 +576,30 @@ fn validate_storage_governance_manifest_freshness(
             {
                 return Ok(());
             }
+            // A manifest claiming events on an empty ledger is corrupt, not
+            // merely stale; no staleness budget can admit it.
             return Err(projection_unavailable(
                 "storage_governance_projection_stale",
             ));
         }
     }
     Ok(())
+}
+
+/// Returns true when a manifest behind the latest ledger watermark is still
+/// inside the projection-staleness budget.
+///
+/// With [`crate::credential_vending::MAX_PROJECTION_STALENESS`] at zero this
+/// is always false, which makes exact-watermark equality the effective rule.
+fn manifest_within_staleness_budget(manifest: &MetastoreProjectionManifest) -> bool {
+    let budget = crate::credential_vending::MAX_PROJECTION_STALENESS;
+    if budget.is_zero() {
+        return false;
+    }
+    Utc::now()
+        .signed_duration_since(manifest.published_at)
+        .to_std()
+        .is_ok_and(|age| age <= budget)
 }
 
 async fn load_published_storage_governance_from_manifest(
@@ -744,5 +830,66 @@ fn projection_unavailable(reason: &str) -> CatalogError {
     CatalogError::RequestFailed {
         http_status: 503,
         message: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_at(sequence: u64, event_id: &str) -> MetastoreProjectionManifest {
+        MetastoreProjectionManifest {
+            manifest_id: format!("{sequence:020}"),
+            ledger_watermark: event_id.to_string(),
+            ledger_watermark_sequence: sequence,
+            files: Vec::new(),
+            published_at: Utc::now(),
+        }
+    }
+
+    fn watermark_at(sequence: u64, event_id: &str) -> MetastoreLedgerWatermark {
+        MetastoreLedgerWatermark {
+            event_id: event_id.to_string(),
+            sequence,
+        }
+    }
+
+    /// The validator's allowed staleness derives from
+    /// `credential_vending::MAX_PROJECTION_STALENESS` (zero today), so a
+    /// freshly published manifest even one sequence behind the ledger is
+    /// rejected.
+    #[test]
+    fn manifest_one_sequence_behind_is_rejected_under_zero_staleness_budget() {
+        assert!(
+            crate::credential_vending::MAX_PROJECTION_STALENESS.is_zero(),
+            "this test pins the exact-match consequence of a zero budget"
+        );
+
+        let manifest = manifest_at(4, "event_004");
+        let latest = watermark_at(5, "event_005");
+        let err = validate_storage_governance_manifest_freshness(&manifest, Some(&latest))
+            .expect_err("a manifest one sequence behind must be rejected");
+        let CatalogError::RequestFailed {
+            http_status,
+            message,
+        } = err
+        else {
+            panic!("expected RequestFailed(503) for stale manifest");
+        };
+        assert_eq!(http_status, 503);
+        assert_eq!(message, "storage_governance_projection_stale");
+    }
+
+    #[test]
+    fn manifest_at_exact_watermark_is_accepted() {
+        let manifest = manifest_at(5, "event_005");
+        let latest = watermark_at(5, "event_005");
+        assert!(validate_storage_governance_manifest_freshness(&manifest, Some(&latest)).is_ok());
+    }
+
+    #[test]
+    fn manifest_claiming_events_on_empty_ledger_is_rejected() {
+        let manifest = manifest_at(3, "event_003");
+        assert!(validate_storage_governance_manifest_freshness(&manifest, None).is_err());
     }
 }

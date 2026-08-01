@@ -375,6 +375,20 @@ pub(crate) async fn post_tables(
         "unity catalog create table on authoritative catalog state"
     );
 
+    // #358 sibling-route closure: the client-supplied storage_location is a
+    // governed-location channel. When a storage-governance projection exists
+    // for this scope it must resolve to a bound path authority
+    // (ungoverned/ambiguous locations are a typed 400; a stale projection
+    // denies closed with 503). Ungoverned scopes preserve current behavior.
+    let scoped = common::scoped_storage(&state, &ctx)?;
+    arco_catalog::metastore::publish::validate_governed_location_if_configured(
+        &scoped,
+        &ctx.workspace,
+        &storage_location,
+    )
+    .await
+    .map_err(common::map_catalog_error)?;
+
     let authoritative_columns = column_definitions(&columns)?;
     let writer = common::initialized_catalog_writer(&state, &ctx).await?;
     let table = writer

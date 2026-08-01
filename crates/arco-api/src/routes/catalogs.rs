@@ -856,6 +856,20 @@ pub(crate) async fn register_table_in_schema(
     let storage = ctx.scoped_storage(backend)?;
     let requested_format = normalize_requested_format(req.format.as_deref())?;
 
+    // #358 sibling-route closure: a client-supplied location must satisfy
+    // storage governance when a governance projection exists for this scope
+    // (ungoverned/ambiguous locations are a typed 400; a stale projection
+    // denies closed with 503). Ungoverned scopes preserve current behavior.
+    if let Some(location) = req.location.as_deref() {
+        arco_catalog::metastore::publish::validate_governed_location_if_configured(
+            &storage,
+            &ctx.workspace,
+            location,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    }
+
     let request_json = serde_json::json!({
         "catalog": &catalog,
         "schema": &schema,

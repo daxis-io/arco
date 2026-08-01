@@ -40,6 +40,83 @@ fn governed_paths_canonicalize_cloud_and_local_uris() {
     assert_eq!(local, "file:///tmp/arco/dev/");
 }
 
+/// Property: for every parse-accepted input, the canonical URI is a fixed
+/// point of `GovernedPath::parse` — re-parsing succeeds, yields an equal
+/// governed path, and canonicalization is idempotent. The corpus is derived
+/// from the grammar `parse` accepts: percent-escaped literals (including `%25`
+/// and attempts around `%2F`), spaces, unicode (raw and encoded), `+`, `?`,
+/// `#`, the full literal `pchar` set, all supported schemes, and degenerate
+/// authority-only shapes.
+#[test]
+fn canonical_uris_are_parse_fixed_points_over_adversarial_corpus() {
+    let corpus = [
+        "gs://bucket/warehouse/orders",
+        "gs://bucket/warehouse/orders/",
+        "gs://bucket/warehouse/100%25-complete",
+        "gs://bucket/warehouse/100%2525-complete",
+        "gs://Bucket//warehouse//%66acts/",
+        "gs://bucket/warehouse/day%3D01",
+        "gs://bucket/warehouse/with%20space",
+        "gs://bucket/warehouse/with space",
+        "gs://bucket/warehouse/a+b",
+        "gs://bucket/warehouse/%C3%BCber",
+        "gs://bucket/warehouse/über",
+        "gs://bucket/warehouse/query?like",
+        "gs://bucket/warehouse/frag#ment",
+        "gs://bucket/warehouse/tilde~_.-!$&'()*,;=:@",
+        "gs://bucket/warehouse/...",
+        "s3://Prod-Bucket//Team//Orders",
+        "abfss://Container@Account.dfs.core.windows.net//root/table",
+        "file:///tmp//arco/dev",
+        "file:///tmp/100%25/space here",
+        "gs://bucket",
+        "gs://bucket/",
+    ];
+
+    for raw in corpus {
+        let parsed = GovernedPath::parse(raw)
+            .unwrap_or_else(|error| panic!("corpus entry {raw:?} must parse: {error:?}"));
+        let canonical = parsed.canonical_uri();
+        let reparsed = GovernedPath::parse(&canonical).unwrap_or_else(|error| {
+            panic!("canonical URI {canonical:?} from {raw:?} must re-parse: {error:?}")
+        });
+        assert_eq!(
+            reparsed, parsed,
+            "canonical URI {canonical:?} from {raw:?} must be a parse fixed point"
+        );
+        assert_eq!(
+            reparsed.canonical_uri(),
+            canonical,
+            "canonicalization must be idempotent for {raw:?}"
+        );
+        // The persistence-boundary guard accepts every well-formed canonical
+        // URI and returns the identical string.
+        assert_eq!(
+            parsed
+                .persistable_canonical_uri()
+                .unwrap_or_else(|error| panic!("persistence guard must accept {raw:?}: {error:?}")),
+            canonical
+        );
+    }
+}
+
+/// Regression for the persistent-poison chain: a location URL carrying a
+/// percent-escaped literal `%` must canonicalize to a string that re-parses
+/// (`%25` re-encoded), never to a bare `%` that fails every future replay.
+#[test]
+fn percent_literals_are_reencoded_into_round_trip_safe_canonical_uris() {
+    let path =
+        GovernedPath::parse("gs://bucket/warehouse/100%25-complete").expect("percent literal");
+    assert_eq!(
+        path.canonical_uri(),
+        "gs://bucket/warehouse/100%25-complete/"
+    );
+    assert_eq!(
+        GovernedPath::parse(&path.canonical_uri()).expect("canonical URI re-parses"),
+        path
+    );
+}
+
 #[test]
 fn governed_paths_reject_dot_segments_and_bad_percent_encoding() {
     assert!(GovernedPath::parse("gs://bucket/root/../escape").is_err());

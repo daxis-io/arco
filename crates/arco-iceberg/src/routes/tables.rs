@@ -33,7 +33,9 @@ use crate::audit::{
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
-use crate::governance::validate_client_supplied_location;
+use crate::governance::{
+    validate_client_supplied_location, validate_location_bearing_table_properties,
+};
 use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
@@ -230,6 +232,13 @@ async fn create_table(
         }
         None => (default_scoped_location, default_relative_location),
     };
+
+    // #358: location-bearing table properties (write.data.path,
+    // write.metadata.path, write.object-storage.path) redirect reads/writes to
+    // arbitrary storage, so under governance they are validated against
+    // governed authorities exactly like the advertised location. Ungoverned
+    // scopes are untouched.
+    validate_location_bearing_table_properties(&storage, &ctx.workspace, &req.properties).await?;
 
     let delegation_header = headers.get("X-Iceberg-Access-Delegation");
     if delegation_header.is_some() && state.credential_provider.is_none() {

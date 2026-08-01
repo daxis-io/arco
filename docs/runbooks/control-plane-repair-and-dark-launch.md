@@ -235,6 +235,91 @@ curl -fsS http://$ARCO_FLOW_COMPACTOR_HOST/internal/reconcile \
 `repairScope=current_head_only` remains accepted for compatibility, but it should no longer find
 new work after legacy mirror and catalog commit-record removal.
 
+## Retention Mutation Epoch Recovery
+
+Every operation that can mutate retention-visible state — catalog GC, reconciler repair, workspace
+snapshot/export publication, and workspace restore — takes the workspace retention lock and then
+claims one durable exclusion record:
+
+```
+gs://$BUCKET/tenant=$TENANT/workspace=$WORKSPACE/retention/coordination/mutation-epoch.json
+```
+
+The record is claimed `IN_FLIGHT` and settled to `IDLE` when the operation returns. This is the
+intended fail-closed boundary: while a record is `IN_FLIGHT`, every other coordinated operation
+aborts without mutating anything.
+
+### Failure mode
+
+If the holder never settles the record — the process crashes between the claim and the settle, or a
+mutation outcome stays uncertain — the record stays `IN_FLIGHT` forever. All five operations then
+fail with:
+
+```
+a retention mutation epoch is already in flight
+```
+
+This is workspace-wide and does not self-heal on its own for the publication kinds: repair
+automation retries every `*_REPAIR_AUTOMATION_INTERVAL_SECS` (default 300) and re-fails on each
+pass, GC deletes nothing, and no snapshot, export, or restore can be published.
+
+### Diagnosis
+
+```bash
+gsutil cat "gs://$BUCKET/tenant=$TENANT/workspace=$WORKSPACE/retention/coordination/mutation-epoch.json" | jq
+```
+
+A wedged workspace shows `"state": "IN_FLIGHT"` with an `operation_kind`, `operation_id`,
+`holder_id`, and a `started_at` that no longer advances. Cross-check the lease:
+
+```bash
+gsutil cat "gs://$BUCKET/tenant=$TENANT/workspace=$WORKSPACE/locks/workspace-retention-gc.lock.json" | jq
+```
+
+An expired or absent lease whose `holderId` matches the epoch's `holder_id` confirms the holder is
+gone rather than slow.
+
+### Recovery
+
+- **`catalog_gc` and `catalog_repair` records recover themselves.** These operations only delete
+  objects that already cleared the fail-closed protection set, so a partially applied pass leaves no
+  half-written state. Once such a record has been in flight for longer than 600 seconds, the next
+  operation that acquires the retention lease adopts and settles it automatically — holding the
+  single-holder lease is the proof that the recorded holder no longer does. The adoption is logged
+  at WARN with `metric = arco_retention_epoch_recovered_total` and the discarded holder identity.
+  Expect enforce-mode automation to clear the wedge within roughly two of its retry intervals; no
+  operator action is required.
+
+- **Publication records (`workspace_snapshot_*`, `workspace_export_*`, `workspace_restore_apply`)
+  require an explicit operator decision.** These can leave a partially published retained root, so
+  they are never adopted automatically. First confirm the holder is dead (the lease check above,
+  plus the owning service's process/pod state), assess the partial publication, then force the
+  settlement, which emits the same loud audit record with your reason attached:
+
+  ```rust
+  // arco_catalog::recover_stale_retention_epoch
+  let recovered = arco_catalog::recover_stale_retention_epoch(
+      &storage,
+      "holder confirmed dead during incident <id>",
+  )
+  .await?;
+  ```
+
+  The call acquires the retention lease itself, so it cannot settle a record whose holder is still
+  running — a live holder makes the lease acquisition fail, which is the intended fail-closed
+  outcome. A non-empty single-line reason is mandatory and is recorded in the audit event.
+
+After recovery, re-run the dry-run reconcile commands above and confirm the epoch record reads
+`"state": "IDLE"` before returning repair automation to `enforce`.
+
+### Related behavior
+
+A repair pass that cannot delete one individual object counts it in `failed_count`, logs it with
+`metric = arco_reconciler_repair_delete_failed_total`, and continues with the remaining candidates;
+it does not abandon the pass and does not leave the epoch in flight. Persistent non-zero
+`failed_count` therefore indicates an object-level problem (permissions, retention hold) rather
+than a wedged workspace.
+
 ## Production Cutover Sequence
 
 1. Deploy `arco-compactor` and `arco-flow-compactor` with explicit PI-3 repair defaults:

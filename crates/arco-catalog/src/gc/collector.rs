@@ -316,13 +316,40 @@ impl GarbageCollector {
     // Phase 1: Orphaned Snapshots
     // =========================================================================
 
-    /// Finds snapshot directories not referenced by any manifest.
+    /// Finds snapshot artifacts that no version of the catalog can ever select.
+    ///
+    /// Candidacy is deliberately **attempt-granular**, not version-granular.
+    /// `get_referenced_snapshots` resolves only the *current* head of each
+    /// domain, so a version-granular rule marks every superseded version
+    /// directory orphaned and reclaims it on nothing but `delay_hours` --
+    /// silently overriding the `keep_snapshots` rollback window that phase 3
+    /// owns. Retention of superseded versions therefore stays exclusively with
+    /// phase 3; this phase only reclaims artifacts that no head, present or
+    /// past, could have published:
+    ///
+    /// - unselected `attempts/<token>/` directories **at** the visible head
+    ///   version (exactly one attempt can win a version, so every other
+    ///   attempt directory at that version is a crashed attempt -- the
+    ///   artifact the attempt-unique directory fix, #368, leaves behind), and
+    /// - everything **above** the visible head version, which by definition
+    ///   was never published.
+    ///
+    /// Versions below the head are left entirely to phase 3, which reclaims
+    /// them (including any crashed attempt directories underneath) once they
+    /// fall out of `keep_snapshots`.
+    ///
+    /// Fails closed per domain: when no head version can be established, that
+    /// domain contributes no candidates at all.
     async fn find_orphaned_snapshots(&self, protection: &ProtectionSet) -> Result<Vec<String>> {
         let referenced = self.get_referenced_snapshots().await?;
         let mut orphaned = Vec::new();
 
         // Check each domain's snapshot directory
         for domain in CatalogDomain::all() {
+            let Some(head_version) = head_snapshot_version(*domain, &referenced) else {
+                continue;
+            };
+
             let prefix = format!("snapshots/{}/", domain.as_str());
             let mut entries =
                 self.storage
@@ -335,14 +362,19 @@ impl GarbageCollector {
 
             for entry in entries {
                 let path = entry.as_str();
-                // Extract the version directory (e.g., "snapshots/catalog/v1/")
-                if let Some(version_dir) = extract_snapshot_version_dir(path) {
-                    if !referenced.contains(&version_dir)
-                        && !protection.protects_prefix(&version_dir)
-                    {
-                        orphaned.push(version_dir);
-                    }
+                let Some(candidate) = orphan_candidate_dir(path, head_version) else {
+                    continue;
+                };
+                // A selected head living inside the candidate disqualifies it,
+                // whatever the manifest's path granularity.
+                if referenced
+                    .iter()
+                    .any(|selected| selected.starts_with(&candidate))
+                    || protection.protects_prefix(&candidate)
+                {
+                    continue;
                 }
+                orphaned.push(candidate);
             }
         }
 
@@ -982,6 +1014,48 @@ fn extract_snapshot_version_dir(path: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Resolves the visible head snapshot version of `domain` from the set of
+/// currently referenced snapshot paths.
+///
+/// Returns `None` when the domain has no snapshot-space head (for example the
+/// Tier-2 executions domain, whose head lives under `state/`), so callers fail
+/// closed and treat nothing in that domain as reclaimable.
+fn head_snapshot_version(domain: CatalogDomain, referenced: &BTreeSet<String>) -> Option<u64> {
+    let prefix = format!("snapshots/{}/", domain.as_str());
+    referenced
+        .iter()
+        .filter(|path| path.starts_with(&prefix))
+        .filter_map(|path| extract_version_number(path))
+        .max()
+}
+
+/// Maps one listed snapshot object to the directory the orphan phase may
+/// reclaim it under, or `None` when the object is not orphan-eligible.
+///
+/// See `find_orphaned_snapshots` for why candidacy is attempt-granular at the
+/// head version and why nothing below the head is ever eligible here.
+fn orphan_candidate_dir(path: &str, head_version: u64) -> Option<String> {
+    let version_dir = extract_snapshot_version_dir(path)?;
+    let version = extract_version_number(&version_dir)?;
+
+    // Above the visible head: never published, reclaimable as a whole.
+    if version > head_version {
+        return Some(version_dir);
+    }
+    // Below the visible head: owned by phase 3 and its `keep_snapshots` window.
+    if version < head_version {
+        return None;
+    }
+
+    // At the visible head: only a losing attempt directory is reclaimable.
+    let attempt = path.strip_prefix(&version_dir)?.strip_prefix("attempts/")?;
+    let (token, remainder) = attempt.split_once('/')?;
+    if token.is_empty() || remainder.is_empty() {
+        return None;
+    }
+    Some(format!("{version_dir}attempts/{token}/"))
 }
 
 /// Extracts the version number from a version directory path.
@@ -2217,6 +2291,264 @@ mod tests {
             .get_raw(&current_path)
             .await
             .expect("current head snapshot file must survive");
+    }
+
+    fn catalog_manifest_for_attempt(
+        version: u64,
+        manifest_id: u64,
+        attempt: &str,
+        file_name: &str,
+        epoch: u64,
+    ) -> CatalogDomainManifest {
+        let mut manifest = catalog_manifest_for_version(version, manifest_id, file_name, epoch);
+        let attempt_dir = format!("snapshots/catalog/v{version}/attempts/{attempt}/");
+        manifest.snapshot_path.clone_from(&attempt_dir);
+        if let Some(snapshot) = manifest.snapshot.as_mut() {
+            snapshot.path.clone_from(&attempt_dir);
+        }
+        manifest
+    }
+
+    async fn publish_catalog_head(storage: &ScopedStorage, manifest: CatalogDomainManifest) {
+        let manifest_id = manifest.manifest_id.clone();
+        let epoch = manifest.epoch;
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).expect("serialize head manifest")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("write head manifest");
+        let pointer = DomainManifestPointer {
+            manifest_id,
+            manifest_path,
+            epoch,
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
+    }
+
+    /// Seeds a v4 catalog head plus superseded v1-v3 version directories.
+    async fn seed_v4_head_with_superseded_versions(storage: &ScopedStorage) -> Vec<String> {
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("init");
+        publish_catalog_head(
+            storage,
+            catalog_manifest_for_version(4, 4, "current.parquet", 4),
+        )
+        .await;
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 4, "current.parquet"),
+                Bytes::from_static(b"head"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write head file");
+
+        let mut superseded = Vec::new();
+        for version in 1..=3u64 {
+            let path =
+                CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
+            storage
+                .put_raw(
+                    &path,
+                    Bytes::from_static(b"superseded"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("write superseded file");
+            superseded.push(path);
+        }
+        superseded
+    }
+
+    /// Reproduction for the rollback-window regression the now-live orphan
+    /// phase introduced.
+    ///
+    /// `get_referenced_snapshots` only resolves the *current* head, so
+    /// version-granular orphan candidacy marked every superseded version
+    /// directory orphaned and reclaimed it on `delay_hours` alone -- preempting
+    /// phase 3 and silently overriding `keep_snapshots`. With head v4 and
+    /// superseded v1-v3, `keep_snapshots: 10, delay_hours: 0` used to report
+    /// `orphaned_snapshots_deleted=3, old_snapshots_deleted=0`, leaving only
+    /// v4: the policy said keep 10, GC kept 1.
+    #[tokio::test]
+    async fn orphan_phase_never_preempts_the_keep_snapshots_rollback_window() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "rollback-window").expect("storage");
+        let superseded = seed_v4_head_with_superseded_versions(&storage).await;
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let report = collector.collect_dry_run().await.expect("dry run");
+        assert!(
+            report.orphaned_snapshots.is_empty(),
+            "no superseded version directory may be an orphan candidate: {:?}",
+            report.orphaned_snapshots
+        );
+
+        let result = collector.collect().await.expect("collect");
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.orphaned_snapshots_deleted, 0,
+            "superseded versions are phase 3's to retain, never the orphan phase's to reclaim"
+        );
+        assert_eq!(
+            result.old_snapshots_deleted, 0,
+            "keep_snapshots=10 must retain every superseded version"
+        );
+        for path in &superseded {
+            assert!(
+                storage.get_raw(path).await.is_ok(),
+                "keep_snapshots=10 must preserve the rollback window, but {path} was deleted"
+            );
+        }
+    }
+
+    /// The attempt-granular rule must not re-deaden the phase: a losing attempt
+    /// directory at the visible head version, and anything above the visible
+    /// head, are still reclaimed -- while the selected head attempt and the
+    /// superseded versions phase 3 owns survive the same pass.
+    #[tokio::test]
+    async fn orphan_phase_reclaims_losing_attempts_and_above_head_versions() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "attempts").expect("storage");
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("init");
+        publish_catalog_head(
+            &storage,
+            catalog_manifest_for_attempt(2, 2, "winner", "tables.parquet", 2),
+        )
+        .await;
+
+        let selected = "snapshots/catalog/v2/attempts/winner/tables.parquet".to_string();
+        let losing_attempt = "snapshots/catalog/v2/attempts/crashed/tables.parquet".to_string();
+        let above_head = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 3, "tables.parquet");
+        let superseded = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet");
+        for path in [&selected, &losing_attempt, &above_head, &superseded] {
+            storage
+                .put_raw(path, Bytes::from_static(b"bytes"), WritePrecondition::None)
+                .await
+                .expect("seed snapshot object");
+        }
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let result = collector.collect().await.expect("collect");
+        assert!(
+            result.errors.is_empty(),
+            "unexpected errors: {:?}",
+            result.errors
+        );
+        assert_eq!(
+            result.orphaned_snapshots_deleted, 2,
+            "the crashed attempt at the head version and the above-head version must both be reclaimed"
+        );
+        assert!(
+            storage
+                .head_raw(&losing_attempt)
+                .await
+                .expect("head losing attempt")
+                .is_none(),
+            "a losing attempt directory at the visible head is a crashed attempt"
+        );
+        assert!(
+            storage
+                .head_raw(&above_head)
+                .await
+                .expect("head above-head object")
+                .is_none(),
+            "a version directory above the visible head was never published"
+        );
+        storage
+            .get_raw(&selected)
+            .await
+            .expect("the selected head attempt must survive");
+        assert!(
+            storage.get_raw(&superseded).await.is_ok(),
+            "a superseded version stays inside the keep_snapshots window"
+        );
+    }
+
+    #[test]
+    fn orphan_candidacy_is_attempt_granular_at_the_head_and_whole_dir_above_it() {
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v4/attempts/losing/tables.parquet", 4),
+            Some("snapshots/catalog/v4/attempts/losing/".to_string())
+        );
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v5/attempts/pending/tables.parquet", 4),
+            Some("snapshots/catalog/v5/".to_string())
+        );
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v5/tables.parquet", 4),
+            Some("snapshots/catalog/v5/".to_string())
+        );
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v3/tables.parquet", 4),
+            None,
+            "superseded versions belong to the keep_snapshots phase"
+        );
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v3/attempts/old/tables.parquet", 4),
+            None,
+            "attempts below the head are reclaimed with their version by phase 3"
+        );
+        assert_eq!(
+            orphan_candidate_dir("snapshots/catalog/v4/tables.parquet", 4),
+            None,
+            "the head version directory itself is never an orphan candidate"
+        );
+
+        let referenced = BTreeSet::from([
+            "snapshots/catalog/v4/attempts/winner/".to_string(),
+            "state/executions/snapshot.parquet".to_string(),
+        ]);
+        assert_eq!(
+            head_snapshot_version(CatalogDomain::Catalog, &referenced),
+            Some(4)
+        );
+        assert_eq!(
+            head_snapshot_version(CatalogDomain::Executions, &referenced),
+            None,
+            "a domain with no snapshot-space head contributes no orphan candidates"
+        );
     }
 
     /// Regression for #344: the orphan phase must not delete candidates that

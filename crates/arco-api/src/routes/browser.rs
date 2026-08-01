@@ -269,11 +269,12 @@ fn reject_disallowed_paths(
 /// because a redacted system-table projection is their only public surface.
 ///
 /// `commits.parquet` carries the private commit-authority witness columns
-/// that `system.catalog.commits` strips (see `crate::system_tables`).
+/// that `system.catalog.commits` strips (see `crate::system_tables`). The
+/// classification itself lives in the catalog reader, which also filters these
+/// artifacts out of every mint allowlist; this route adds the typed refusal
+/// that points callers at the projection.
 fn is_projection_only_artifact(path: &str) -> bool {
-    path.rsplit('/')
-        .next()
-        .is_some_and(|file| file == "commits.parquet")
+    arco_catalog::is_projection_only_artifact(path)
 }
 
 /// Parse domain string to `CatalogDomain`.

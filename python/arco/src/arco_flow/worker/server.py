@@ -354,7 +354,7 @@ class DispatchWorker:
         try:
             self._run_dispatch(payload)
         finally:
-            self._finish_dispatch(payload.dispatch_id)
+            self._release_dispatch(payload.dispatch_id)
 
     def _begin_dispatch(self, dispatch_id: str) -> bool:
         """Atomically claim a dispatch_id for execution.
@@ -373,10 +373,31 @@ class DispatchWorker:
             self._inflight_dispatch_ids.add(dispatch_id)
             return True
 
-    def _finish_dispatch(self, dispatch_id: str) -> None:
-        """Move a dispatch_id from in-flight to the bounded recent set."""
+    def _release_dispatch(self, dispatch_id: str) -> None:
+        """Release a dispatch_id's in-flight claim without recording completion.
+
+        Recording into `_recent_dispatch_ids` happens separately, in
+        `_record_dispatch_completed`, and only once the terminal report was
+        delivered. If `_run_dispatch` raised before that point (for example a
+        transient ApiError from the `task_started` callback), the dispatch_id
+        must NOT enter the recent set: the worker returns HTTP 500, Cloud
+        Tasks redelivers the same deterministic dispatch_id, and the
+        redelivery has to re-execute rather than be duplicate-acked — else
+        the task is stuck in Dispatched forever and the sweeper's repair
+        dispatch (same dispatch_id) cannot rescue it.
+        """
         with self._dedup_lock:
             self._inflight_dispatch_ids.discard(dispatch_id)
+
+    def _record_dispatch_completed(self, dispatch_id: str) -> None:
+        """Record a dispatch_id whose terminal report was delivered.
+
+        Called from `_run_dispatch` immediately after `task_completed`
+        returns (success or failure outcome alike). Only from this point on
+        may a redelivery of the same dispatch_id be acknowledged without
+        re-execution.
+        """
+        with self._dedup_lock:
             self._recent_dispatch_ids[dispatch_id] = None
             self._recent_dispatch_ids.move_to_end(dispatch_id)
             while len(self._recent_dispatch_ids) > RECENT_DISPATCH_LIMIT:
@@ -439,6 +460,9 @@ class DispatchWorker:
                 task_token=task_token,
                 callback_base_url=payload.callback_base_url,
             )
+            # Only now — after the terminal report reached the control plane —
+            # is it safe to duplicate-ack redeliveries of this dispatch_id.
+            self._record_dispatch_completed(payload.dispatch_id)
 
             try:
                 self._client.upload_logs(

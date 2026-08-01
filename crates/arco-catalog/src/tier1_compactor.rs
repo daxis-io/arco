@@ -338,6 +338,9 @@ impl Tier1Compactor {
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let publisher = Publisher::new(&self.storage);
         let mut reserved_commit: Option<ReservedCatalogCommit> = None;
+        // One nonce for this invocation: CAS retries reuse the attempt
+        // directory (byte-identical rewrites), a restarted process never does.
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
@@ -444,17 +447,17 @@ impl Tier1Compactor {
                 commit_metadata,
             )?);
 
-            // The attempt directory embeds the reserved commit ULID so its
+            // The attempt directory embeds the per-invocation nonce so its
             // identity is unique per attempt: a crashed attempt that already
             // wrote snapshot files under a reused manifest id can never collide
-            // with (and permanently wedge) a later attempt, whose fresh
-            // reservation selects a fresh directory. Within one invocation the
-            // reservation is stable for the same parent manifest, so CAS
-            // retries rewrite byte-identical files into the same directory.
+            // with (and permanently wedge) a later attempt, which mints a fresh
+            // nonce. Within one invocation the nonce and the reservation are
+            // both stable, so CAS retries rewrite byte-identical files into the
+            // same directory.
             let snapshot_dir = StateKey::snapshot_attempt_dir(
                 CatalogDomain::Catalog,
                 next_version,
-                &snapshot_attempt_token(&manifest_id, &next_commit.commit_ulid),
+                &snapshot_attempt_token(&manifest_id, &next_commit.commit_ulid, &attempt_nonce),
             );
             let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
                 &self.storage,
@@ -581,6 +584,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
@@ -642,7 +646,7 @@ impl Tier1Compactor {
             let snapshot_dir = StateKey::snapshot_attempt_dir(
                 CatalogDomain::Lineage,
                 next_version,
-                &snapshot_attempt_token(&manifest_id, &commit_ulid),
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
             );
             let snapshot = tier1_snapshot::write_lineage_snapshot_in_dir(
                 &self.storage,
@@ -773,6 +777,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
@@ -843,7 +848,7 @@ impl Tier1Compactor {
             let snapshot_dir = StateKey::snapshot_attempt_dir(
                 CatalogDomain::Search,
                 next_version,
-                &snapshot_attempt_token(&manifest_id, &commit_ulid),
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
             );
             let snapshot = tier1_snapshot::write_search_snapshot_in_dir(
                 &self.storage,
@@ -1910,11 +1915,31 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
 /// manifest put leaves the same manifest id selectable again. Deriving the
 /// attempt directory from the manifest id alone would then re-derive the
 /// crashed attempt's directory, and `put_state_if_absent` would fail closed
-/// forever on the differing `commits.parquet` bytes, wedging all subsequent
-/// DDL. Suffixing the per-invocation commit ULID makes the directory identity
-/// unique per attempt while keeping same-invocation CAS retries idempotent.
-fn snapshot_attempt_token(manifest_id: &str, commit_ulid: &str) -> String {
-    format!("{manifest_id}-{commit_ulid}")
+/// forever on the differing `commits.parquet` bytes (its `published_at` column
+/// carries wall-clock millis), wedging all subsequent DDL.
+///
+/// The commit ULID alone does not carry that uniqueness: `next_commit_ulid`
+/// falls back to `previous.increment()` whenever the fresh candidate does not
+/// sort above the predecessor, which a clock-skewed writer's future-dated
+/// commit ULID forces. A crashed attempt and its restarted successor would
+/// then derive the *same* ULID, the same token, and the same directory --
+/// reinstating the wedge until real time overtook the skewed timestamp. The
+/// per-attempt `nonce` therefore owns directory uniqueness outright, leaving
+/// the commit ULID free to stay deterministic where the protocol requires it.
+fn snapshot_attempt_token(manifest_id: &str, commit_ulid: &str, nonce: &str) -> String {
+    format!("{manifest_id}-{commit_ulid}-{nonce}")
+}
+
+/// Mints the nonce identifying one compaction attempt's snapshot directory.
+///
+/// Every call draws the ULID's 80-bit random component afresh, so uniqueness
+/// holds even when the clock does not advance and regardless of which branch
+/// `next_commit_ulid` takes: two attempts (in one process or across a restart)
+/// can never select the same attempt directory. Callers mint it once per
+/// compaction invocation so that in-invocation CAS retries rewrite
+/// byte-identical files into the same directory.
+fn new_attempt_nonce() -> String {
+    Ulid::new().to_string()
 }
 
 async fn next_available_manifest_id(
@@ -1973,6 +1998,51 @@ mod tests {
     use arco_core::storage::{MemoryBackend, WritePrecondition};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Attempt-directory uniqueness must not depend on `Ulid::new()` winning
+    /// the comparison in `next_commit_ulid`.
+    ///
+    /// A clock-skewed writer leaves a future-dated commit ULID as the
+    /// predecessor, forcing the deterministic `previous.increment()` branch. A
+    /// crashed attempt and its restarted successor then derive the *same*
+    /// commit ULID, so a token built from the manifest id and the ULID alone
+    /// re-derives the crashed attempt's directory. `put_state_if_absent` then
+    /// fails closed forever on the differing `commits.parquet` bytes (its
+    /// `published_at` column carries wall-clock millis) -- the #368 wedge,
+    /// reinstated until real time overtook the skewed timestamp.
+    #[test]
+    fn skewed_predecessor_keeps_the_commit_ulid_deterministic_but_attempt_dirs_unique() {
+        // A far-future predecessor: no fresh ULID can sort above it.
+        const SKEWED_PREDECESSOR: &str = "7ZZZZZZZZZ0000000000000000";
+        const MANIFEST_ID: &str = "00000000000000000003";
+
+        let crashed = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("crashed attempt ulid");
+        let restarted = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("restarted attempt ulid");
+        assert_eq!(
+            crashed, restarted,
+            "a skewed predecessor must take the deterministic successor branch"
+        );
+        assert!(crashed.as_str() > SKEWED_PREDECESSOR);
+
+        let crashed_nonce = new_attempt_nonce();
+        let restarted_nonce = new_attempt_nonce();
+        assert_ne!(
+            crashed_nonce, restarted_nonce,
+            "each attempt must mint its own nonce"
+        );
+        assert_ne!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &restarted, &restarted_nonce),
+            "a restarted attempt must never re-derive a crashed attempt's directory"
+        );
+
+        // Within one invocation the token is stable, so CAS retries rewrite
+        // byte-identical files into the same directory.
+        assert_eq!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce)
+        );
+    }
 
     #[tokio::test]
     async fn sync_compact_search_writes_snapshot() {

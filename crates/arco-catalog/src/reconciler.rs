@@ -378,10 +378,13 @@ impl Reconciler {
     ///
     /// # Errors
     ///
-    /// Returns an error if storage operations fail while attempting repairs,
-    /// if the retention lock or durable mutation epoch cannot be claimed, or
-    /// if the protection inventory cannot be validated (fail closed: nothing
-    /// is deleted in those cases).
+    /// Returns an error if the retention lock or durable mutation epoch cannot
+    /// be claimed, if the protection inventory cannot be validated, or if a
+    /// candidate cannot be inspected (fail closed: nothing is deleted in those
+    /// cases). A failure to delete one authorized candidate is *not* fatal: it
+    /// is counted in `failed_count` and the pass continues, so one unlucky
+    /// object can neither skip the remaining repairs nor strand the durable
+    /// mutation epoch in flight.
     #[allow(clippy::cognitive_complexity)]
     pub async fn repair_with_scope(
         &self,
@@ -502,6 +505,8 @@ impl Reconciler {
     /// inventory error aborts the pass with nothing deleted. Every candidate
     /// is additionally gated on retention-pin protection and a minimum object
     /// age; age fails closed when it cannot be established.
+    ///
+    /// Individual delete failures are counted, not fatal (see the loop below).
     #[allow(clippy::cognitive_complexity)]
     async fn repair_deletions_coordinated(
         &self,
@@ -553,7 +558,13 @@ impl Reconciler {
                 continue;
             }
 
-            match epoch.delete(&issue.path).await {
+            // A per-object delete failure is counted and the pass continues.
+            // Aborting here would abandon every remaining authorized candidate
+            // and -- because the abort propagates before settlement -- strand
+            // the durable epoch IN_FLIGHT, wedging GC, repair, snapshot,
+            // export, and restore until a recovery path runs. Protection,
+            // lock, and epoch errors above still fail the whole pass closed.
+            match epoch.delete_reclaimable(&issue.path).await {
                 Ok(()) => {
                     result.repaired_count += 1;
                     Self::record_repair_metric(report_domain, issue.issue_type, "repaired");
@@ -561,12 +572,13 @@ impl Reconciler {
                 Err(error) => {
                     tracing::error!(
                         path = %issue.path,
+                        domain = %report_domain,
                         error = %error,
-                        "Failed to delete orphaned/old snapshot"
+                        metric = "arco_reconciler_repair_delete_failed_total",
+                        "failed to delete orphaned/old snapshot; continuing with the remaining candidates"
                     );
                     result.failed_count += 1;
                     Self::record_repair_metric(report_domain, issue.issue_type, "failed");
-                    return Err(error);
                 }
             }
         }
@@ -860,7 +872,9 @@ mod tests {
         encode_workspace_snapshot, retention_pin_latest_path, retention_pin_revision_path,
         snapshot_record_path,
     };
-    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use arco_core::storage::{
+        MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
     use bytes::Bytes;
     use chrono::Utc;
 
@@ -1715,6 +1729,241 @@ mod tests {
             .get_raw(&stale_path)
             .await
             .expect("recently written candidate must survive within the minimum age window");
+    }
+
+    /// A backend that fails `delete` for one exact path and otherwise defers.
+    #[derive(Debug)]
+    struct FailingDeleteBackend {
+        inner: MemoryBackend,
+        failing_path: String,
+    }
+
+    impl FailingDeleteBackend {
+        fn new(failing_path: impl Into<String>) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                failing_path: failing_path.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingDeleteBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            if path.ends_with(&self.failing_path) {
+                return Err(arco_core::Error::Storage {
+                    message: format!("injected delete failure for {path}"),
+                    source: None,
+                });
+            }
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: std::time::Duration,
+        ) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    /// One object that will not delete must not abandon the rest of the pass,
+    /// and must never strand the durable epoch IN_FLIGHT.
+    ///
+    /// Aborting on the first delete error left
+    /// `{"state":"IN_FLIGHT","operation_kind":"catalog_repair"}` behind, after
+    /// which every GC pass, repair retry, snapshot, export, and restore failed
+    /// with "a retention mutation epoch is already in flight" -- forever, and
+    /// re-failing on each 300s automation retry.
+    #[tokio::test]
+    async fn repair_counts_a_failed_delete_continues_the_pass_and_settles_the_epoch() {
+        let backend = Arc::new(FailingDeleteBackend::new("undeletable.parquet"));
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let old_paths = seed_current_v2_head_with_old_v1_files(
+            &storage,
+            &["undeletable.parquet", "deletable.parquet"],
+        )
+        .await;
+        let undeletable = old_paths.first().expect("undeletable path").clone();
+        let deletable = old_paths.get(1).expect("deletable path").clone();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let reconciler =
+            Reconciler::new(storage.clone()).with_min_age_before_delete(Duration::zero());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("one failed delete must not fail the whole pass");
+
+        assert_eq!(result.failed_count, 1, "the failure must be counted");
+        assert_eq!(
+            result.repaired_count, 1,
+            "the remaining authorized candidate must still be repaired"
+        );
+        storage
+            .get_raw(&undeletable)
+            .await
+            .expect("the object whose delete failed is still present");
+        assert!(
+            storage
+                .head_raw(&deletable)
+                .await
+                .expect("head deletable")
+                .is_none(),
+            "repairs after the failure must still proceed"
+        );
+
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("durable epoch record"),
+        )
+        .expect("epoch json");
+        assert_eq!(
+            epoch["state"], "IDLE",
+            "a per-object delete failure must not strand the workspace exclusion record"
+        );
+
+        // Nothing is wedged: GC and a repair retry both still claim the epoch.
+        gc::GarbageCollector::new(
+            storage.clone(),
+            gc::RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 24,
+                max_age_days: 1,
+            },
+        )
+        .collect()
+        .await
+        .expect("GC must not be wedged by a failed repair delete");
+        let retry_report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("retry check");
+        reconciler
+            .repair_with_scope(&retry_report, RepairScope::Full)
+            .await
+            .expect("a healthy repair retry must not be wedged");
+    }
+
+    /// A holder that dies between claiming the durable epoch and settling it
+    /// blocks every coordinated operation. The operator recovery path settles
+    /// the stale record after the lease proves the holder is gone, and GC and
+    /// repair work again.
+    #[tokio::test]
+    async fn operator_recovery_unblocks_repair_and_gc_after_a_dead_holder() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let stale_path = seed_current_v2_head_with_old_v1_files(&storage, &["stale.parquet"])
+            .await
+            .into_iter()
+            .next()
+            .expect("stale path");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // A holder claims the epoch and dies: the handle goes away without
+        // settling, exactly as a process crash leaves the durable record.
+        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire(RETENTION_GC_LOCK_TTL, 1)
+            .await
+            .expect("retention lock");
+        let _dead_holder_epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            TEST_SNAPSHOT_ID,
+        )
+        .await
+        .expect("claim epoch");
+        guard.release().await.expect("release retention lock");
+
+        let reconciler =
+            Reconciler::new(storage.clone()).with_min_age_before_delete(Duration::zero());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        assert!(
+            reconciler
+                .repair_with_scope(&report, RepairScope::Full)
+                .await
+                .is_err(),
+            "repair must fail closed until the stale epoch is settled"
+        );
+
+        let recovered = crate::retention_coordination::recover_stale_retention_epoch(
+            &storage,
+            "holder confirmed dead during incident 4711",
+        )
+        .await
+        .expect("recovery")
+        .expect("the stale in-flight epoch must be reported");
+        assert_eq!(
+            recovered.operation_kind,
+            RetentionMutationKind::WorkspaceSnapshotFinalize
+        );
+        assert!(recovered.operator_override);
+
+        gc::GarbageCollector::new(
+            storage.clone(),
+            gc::RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 24,
+                max_age_days: 1,
+            },
+        )
+        .collect()
+        .await
+        .expect("GC must succeed after recovery");
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("repair must succeed after recovery");
+        assert_eq!(result.repaired_count, 1);
+        assert!(
+            storage
+                .head_raw(&stale_path)
+                .await
+                .expect("head stale path")
+                .is_none()
+        );
     }
 
     /// Regression for #343: a Full repair pass fails closed while a foreign

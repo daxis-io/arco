@@ -669,12 +669,19 @@ mod signed_url_security {
 
         let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
         let reader = CatalogReader::new(storage);
-        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
-        let commits_path = mintable
+        let artifacts = reader
+            .get_snapshot_artifact_paths(CatalogDomain::Catalog)
+            .await?;
+        let commits_path = artifacts
             .iter()
             .find(|p| p.ends_with("/commits.parquet"))
             .cloned()
             .context("commits.parquet must be in the manifest snapshot file list")?;
+        let mintable = reader.get_mintable_paths(CatalogDomain::Catalog).await?;
+        assert!(
+            !mintable.iter().any(|p| p == &commits_path),
+            "the reader must keep the internal artifact out of the mint allowlist: {mintable:?}"
+        );
         let namespaces_path = mintable
             .iter()
             .find(|p| p.ends_with("/namespaces.parquet"))

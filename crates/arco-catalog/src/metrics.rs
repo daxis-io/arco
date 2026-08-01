@@ -88,6 +88,47 @@ pub const STORAGE_GOVERNANCE_REFRESH_SECONDS: &str = "arco_storage_governance_re
 pub const AUTHZ_INDEX_CANDIDATE_ROWS: &str = "arco_authz_index_candidate_rows";
 
 // ============================================================================
+// State-Store Control-Plane Metrics (object-store control store, projections)
+// ============================================================================
+//
+// NOTE (2026-07-30 program audit, section 9.2 item 8): none of the
+// arco_state_store_* series below has a production emitter yet. The
+// object-store control store (state_store/control_mvp.rs) commits and replays
+// without recording metrics, and the projection watermark surfaces
+// (state_store/projection_outbox_acks.rs) are hermetic. The names are
+// reserved here so the alert rules in infra/monitoring/alerts.yaml stay tied
+// to code-owned metric names and light up when the emitters are wired.
+
+/// Control-store pointer CAS publish attempts counter (label: domain).
+pub const STATE_STORE_CAS_PUBLISH: &str = "arco_state_store_cas_publish_total";
+
+/// Control-store pointer CAS publish failures counter (labels: domain, reason).
+pub const STATE_STORE_CAS_PUBLISH_FAILURES: &str = "arco_state_store_cas_publish_failures_total";
+
+/// Control-store manifest-reachable replay duration histogram (label: domain).
+pub const STATE_STORE_REPLAY_DURATION: &str = "arco_state_store_replay_duration_seconds";
+
+/// Control-store manifest-reachable replay bytes gauge (label: domain).
+pub const STATE_STORE_REPLAY_BYTES: &str = "arco_state_store_replay_bytes";
+
+/// Control-store fail-closed read integrity failures counter
+/// (labels: domain, artifact).
+pub const STATE_STORE_READ_INTEGRITY_FAILURES: &str =
+    "arco_state_store_read_integrity_failures_total";
+
+/// Projection watermark lag in logical sequences (labels: domain, consumer).
+pub const STATE_STORE_PROJECTION_WATERMARK_LAG: &str =
+    "arco_state_store_projection_watermark_lag_sequences";
+
+/// Projection watermark age in seconds since last publish
+/// (labels: domain, consumer).
+pub const STATE_STORE_PROJECTION_WATERMARK_AGE: &str =
+    "arco_state_store_projection_watermark_age_seconds";
+
+/// Projection publish counter (labels: domain, consumer).
+pub const STATE_STORE_PROJECTION_PUBLISH: &str = "arco_state_store_projection_publish_total";
+
+// ============================================================================
 // ADR-034 Repair Metrics
 // ============================================================================
 
@@ -169,6 +210,38 @@ pub fn register_metrics() {
     describe_counter!(
         IDEMPOTENCY_TAKEOVER,
         "Total idempotency marker takeover attempts by result"
+    );
+    describe_counter!(
+        STATE_STORE_CAS_PUBLISH,
+        "Total control-store pointer CAS publish attempts by domain"
+    );
+    describe_counter!(
+        STATE_STORE_CAS_PUBLISH_FAILURES,
+        "Total control-store pointer CAS publish failures by domain and reason"
+    );
+    describe_histogram!(
+        STATE_STORE_REPLAY_DURATION,
+        "Control-store manifest-reachable replay duration in seconds by domain"
+    );
+    describe_gauge!(
+        STATE_STORE_REPLAY_BYTES,
+        "Control-store manifest-reachable replay bytes by domain"
+    );
+    describe_counter!(
+        STATE_STORE_READ_INTEGRITY_FAILURES,
+        "Total control-store fail-closed read integrity failures by domain and artifact"
+    );
+    describe_gauge!(
+        STATE_STORE_PROJECTION_WATERMARK_LAG,
+        "Projection watermark lag in logical sequences by domain and consumer"
+    );
+    describe_gauge!(
+        STATE_STORE_PROJECTION_WATERMARK_AGE,
+        "Projection watermark age in seconds since last publish by domain and consumer"
+    );
+    describe_counter!(
+        STATE_STORE_PROJECTION_PUBLISH,
+        "Total projection publishes by domain and consumer"
     );
     describe_counter!(
         RECONCILER_ISSUES,

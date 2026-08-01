@@ -788,7 +788,26 @@ impl Server {
         // Authentication is the same middleware every other authenticated
         // route uses, so the tenant/workspace scope they operate on is the
         // verified request scope rather than a caller-supplied one.
+        //
+        // Authentication is NOT the authorization boundary: each handler
+        // additionally requires the verified principal to carry the configured
+        // operator group, and refuses every caller when none is configured.
+        // See `crate::routes::control_store` for why the authority is a claim
+        // inside the tenant token rather than a second `Authorization` header
+        // consumer.
         if state.config.control_store_operator_endpoints && !state.config.posture.is_public() {
+            if state
+                .config
+                .control_store_operator_group
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                tracing::warn!(
+                    "control-store operator endpoints are enabled but \
+                     control_store_operator_group is unset; every request will be refused"
+                );
+            }
             tracing::info!("control-store operator endpoints enabled (/internal/control-store/*)");
             let internal_auth_layer =
                 middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);

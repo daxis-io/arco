@@ -4,6 +4,11 @@
 //! the sole writer of the `state-store/` object prefix. They were previously
 //! mounted on `arco-compactor`, whose service account has no such grant.
 
+#![allow(
+    clippy::expect_used,
+    reason = "operator API contract setup must fail immediately when a fixture or request is invalid"
+)]
+
 use std::sync::Arc;
 
 use arco_api::config::{Config, Posture};
@@ -24,6 +29,7 @@ const TENANT: &str = "acme";
 const WORKSPACE: &str = "analytics";
 const SOURCE_DOMAIN: &str = "phase5-source";
 const OUTBOX_PATH: &str = "/internal/control-store/projection-outbox";
+const OPERATOR_GROUP: &str = "group:control-store-operators";
 
 fn config(operator_endpoints: bool) -> Config {
     let mut config = Config {
@@ -32,6 +38,7 @@ fn config(operator_endpoints: bool) -> Config {
         ..Config::default()
     };
     config.control_store_operator_endpoints = operator_endpoints;
+    config.control_store_operator_group = operator_endpoints.then(|| OPERATOR_GROUP.to_string());
     config
 }
 
@@ -50,6 +57,7 @@ fn post(body: &'static str) -> Request<Body> {
         .header("content-type", "application/json")
         .header("X-Tenant-Id", TENANT)
         .header("X-Workspace-Id", WORKSPACE)
+        .header("X-Groups", OPERATOR_GROUP)
         .body(Body::from(body))
         .expect("request build failed")
 }
@@ -245,6 +253,46 @@ async fn control_store_endpoints_require_authentication_and_are_never_mounted_in
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     seed_source_record(Arc::clone(&backend)).await;
 
+    // Enabling the routes without configuring an operator group grants
+    // nobody access, even when the caller presents some authenticated group.
+    let mut unconfigured = config(true);
+    unconfigured.control_store_operator_group = None;
+    let response = Server::with_storage_backend(unconfigured, Arc::clone(&backend))
+        .test_router()
+        .oneshot(post(
+            r#"{"sourceDomain":"phase5-source","consumerId":"consumer-a","drain":true}"#,
+        ))
+        .await
+        .expect("request failed");
+    assert_eq!(StatusCode::FORBIDDEN, response.status());
+    let json = json_body(response).await;
+    assert!(
+        json["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no operator authority is configured")),
+        "unexpected body: {json}"
+    );
+
+    // Authentication is still insufficient when the verified groups claim
+    // does not carry the configured operator authority.
+    let response = router_with(Arc::clone(&backend), true)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(OUTBOX_PATH)
+                .header("content-type", "application/json")
+                .header("X-Tenant-Id", TENANT)
+                .header("X-Workspace-Id", WORKSPACE)
+                .header("X-Groups", "group:ordinary-tenant")
+                .body(Body::from(
+                    r#"{"sourceDomain":"phase5-source","consumerId":"consumer-a","drain":true}"#,
+                ))
+                .expect("request build failed"),
+        )
+        .await
+        .expect("request failed");
+    assert_eq!(StatusCode::FORBIDDEN, response.status());
+
     // No verified scope, no operation: the endpoint derives the tenant and
     // workspace it acts on from authentication, never from the request body.
     let response = router_with(Arc::clone(&backend), true)
@@ -290,6 +338,7 @@ async fn shadow_import_endpoint_is_gated_and_reports_classified_comparisons() {
                         .uri("/internal/control-store/shadow-import")
                         .header("X-Tenant-Id", TENANT)
                         .header("X-Workspace-Id", WORKSPACE)
+                        .header("X-Groups", OPERATOR_GROUP)
                         .body(Body::empty())
                         .expect("request build failed"),
                 )

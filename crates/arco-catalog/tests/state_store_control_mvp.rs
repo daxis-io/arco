@@ -1,5 +1,11 @@
 //! Object-store control-state MVP contract tests.
 
+#![allow(
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "the contract suite keeps crash sequences and direct JSON fixture assertions explicit"
+)]
+
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1245,10 +1251,7 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     // ACCEPTED: version 1 decodes by explicit migration and stays marked
     // legacy; version 2 decodes normally.
     let PersistedRestoreParticipantPlan::ControlMvp(migrated) =
-        serde_json::from_str(v1).expect("v1 fixture must not fail deserialization")
-    else {
-        panic!("unexpected plan kind")
-    };
+        serde_json::from_str(v1).expect("v1 fixture must not fail deserialization");
     assert_eq!(1, migrated.version());
     assert!(migrated.is_legacy_version());
     assert_eq!(3, migrated.result_logical_sequence());
@@ -1257,10 +1260,7 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
         migrated.transaction_sha256()
     );
     let PersistedRestoreParticipantPlan::ControlMvp(current) =
-        serde_json::from_str(v2).expect("v2 fixture must decode")
-    else {
-        panic!("unexpected plan kind")
-    };
+        serde_json::from_str(v2).expect("v2 fixture must decode");
     assert_eq!(2, current.version());
     assert!(!current.is_legacy_version());
     assert_eq!(
@@ -1272,7 +1272,7 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     // REJECTED: a version 2 record missing the field it is required to carry,
     // and a version 1 record carrying the field it never wrote. Neither may be
     // guessed at, because "absent" and "observed epoch 0" are different facts.
-    let mut truncated_v2 = v2_value.clone();
+    let mut truncated_v2 = v2_value;
     truncated_v2
         .as_object_mut()
         .expect("v2 object")
@@ -3195,7 +3195,7 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
             .await
             .expect("checkpoint value")
     );
-    assert!(backend.list("").await.expect("inventory").len() > 0);
+    assert!(!backend.list("").await.expect("inventory").is_empty());
 }
 
 /// Returns the exact `"checksum_sha256":"…"` fragment inside a checkpoint
@@ -3386,16 +3386,39 @@ async fn writer_epoch_claims_at_the_representable_ceiling_never_wrap_or_panic() 
     );
 
     // Defence in depth: even a pointer forced to u64::MAX — which no claim can
-    // produce — fails closed with a typed error rather than overflowing.
+    // produce — is rejected at the shared pointer-validation seam. Adoption,
+    // reads, transactions, and claims must all refuse the corrupted domain
+    // before the terminal epoch can spread into another artifact.
     force_pointer_writer_epoch(&storage, u64::MAX).await;
-    let error = match store.clone().claim_writer_authority().await {
-        Err(error) => error,
-        Ok(_) => panic!("claiming past u64::MAX must fail closed"),
-    };
-    assert!(
-        matches!(&error, CatalogError::Validation { message } if message.contains("overflow")),
-        "unexpected error: {error:?}"
-    );
+    for error in [
+        store
+            .clone()
+            .at_current_writer_epoch()
+            .await
+            .err()
+            .expect("cooperative adoption must reject the terminal pointer epoch"),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect_err("current-state reads must reject the terminal pointer epoch"),
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .err()
+            .expect("transaction begin must reject the terminal pointer epoch"),
+        store
+            .clone()
+            .claim_writer_authority()
+            .await
+            .err()
+            .expect("claims must reject the terminal pointer epoch"),
+    ] {
+        assert!(
+            matches!(&error, CatalogError::InvariantViolation { message }
+                if message.contains("refused in place")),
+            "unexpected error: {error:?}"
+        );
+    }
     assert_eq!(
         u64::MAX,
         published_writer_epoch(&storage).await,

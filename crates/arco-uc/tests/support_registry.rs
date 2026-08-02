@@ -127,6 +127,7 @@ fn mounted_uc_routes_have_support_registry_metadata() {
         ("GET", "/external-locations"),
         ("POST", "/external-locations"),
         ("GET", "/external-locations/orders"),
+        ("POST", "/storage-governance/projection/republish"),
         ("POST", "/temporary-model-version-credentials"),
         ("POST", "/temporary-table-credentials"),
         ("POST", "/temporary-volume-credentials"),

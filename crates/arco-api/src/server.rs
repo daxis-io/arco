@@ -29,7 +29,7 @@ use arco_iceberg::{
 };
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
-use arco_uc::{UnityCatalogState, unity_catalog_router};
+use arco_uc::{MetastorePermissionSource, UnityCatalogState, unity_catalog_router};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -863,7 +863,16 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
+            // Without an authoritative permission source the UC facade has no
+            // compiled permission view to evaluate, so `require_authz` denies
+            // every principal (including a METASTORE Manage administrator) and
+            // the storage-governance recovery routes are unreachable in a
+            // deployed server. Wire the per-scope metastore-backed source; it
+            // stays fail-closed when a scope's ledger cannot be read.
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+                .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
+                    &state.storage,
+                ))));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(

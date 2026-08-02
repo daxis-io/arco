@@ -114,6 +114,7 @@ pub struct Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 

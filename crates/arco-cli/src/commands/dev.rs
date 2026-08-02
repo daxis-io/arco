@@ -135,6 +135,7 @@ fn print_bullet_section(heading: &str, items: &[&'static str]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

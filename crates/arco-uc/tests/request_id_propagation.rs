@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
+use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
+use arco_catalog::authz::privileges::Privilege;
 use arco_core::storage::MemoryBackend;
+use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -13,8 +16,41 @@ use tower::ServiceExt;
 
 fn test_router() -> axum::Router {
     let backend = Arc::new(MemoryBackend::new());
-    let state = UnityCatalogState::new(backend);
+    let state =
+        UnityCatalogState::new(backend).with_compiled_permissions(create_table_permissions());
     unity_catalog_router(state)
+}
+
+/// Principal that the harness authorizes for table DDL.
+///
+/// `POST /tables` requires `CREATE_TABLE` on the target schema, so every
+/// request the harness sends carries a trusted principal and the state carries
+/// a compiled view granting that principal the privilege on the schemas these
+/// tests use. Requests without both are denied 403 — that is the fail-closed
+/// posture under test, not harness noise.
+const TEST_PRINCIPAL: &str = "user_test";
+
+fn create_table_permissions() -> CompiledPermissionSet {
+    let mut rows = Vec::new();
+    for catalog in ["main", "main2"] {
+        for schema in ["analytics", "default"] {
+            let object_id = format!("{catalog}.{schema}");
+            rows.push(CompiledPermissionRow {
+                principal_id: TEST_PRINCIPAL.to_string(),
+                object_id: object_id.clone(),
+                object_type: "SCHEMA".to_string(),
+                privilege: Privilege::CreateTable,
+                source: "grant".to_string(),
+                source_grant_id: Some(format!("grant_{catalog}_{schema}")),
+                source_principal_id: TEST_PRINCIPAL.to_string(),
+                source_object_id: object_id.clone(),
+                inheritance_path: object_id,
+                grant_option: false,
+                group_snapshot_version: "groups-test".to_string(),
+            });
+        }
+    }
+    CompiledPermissionSet::new("event_test", "groups-test", true, rows)
 }
 
 async fn send(
@@ -36,7 +72,7 @@ async fn send(
             .header("X-Workspace-Id", "workspace1");
     }
 
-    let request = if let Some(body) = body {
+    let mut request = if let Some(body) = body {
         builder
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_string()))
@@ -44,6 +80,15 @@ async fn send(
     } else {
         builder.body(Body::empty()).expect("request")
     };
+    if include_scope {
+        request.extensions_mut().insert(UnityCatalogRequestContext {
+            tenant: "tenant1".to_string(),
+            workspace: "workspace1".to_string(),
+            request_id: request_id.to_string(),
+            user_id: Some(TEST_PRINCIPAL.to_string()),
+            idempotency_key: None,
+        });
+    }
 
     let response = router.clone().oneshot(request).await.expect("response");
     let echoed = response
@@ -131,7 +176,10 @@ async fn request_id_is_echoed_for_uc_route_groups() {
         true,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    // The harness now sends an authenticated principal (table DDL requires
+    // one), so vending gets past the unauthenticated-principal denial and
+    // fails closed on the missing storage-governance projection instead.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
     let status = send(
         &router,

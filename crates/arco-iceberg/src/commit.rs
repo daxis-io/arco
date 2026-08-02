@@ -12,6 +12,7 @@ use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
 use crate::error::{IcebergError, IcebergErrorResponse, IcebergResult};
 use crate::events::{CommittedReceipt, PendingReceipt};
+use crate::governance::TableLocationGovernance;
 use crate::idempotency::{
     ClaimResult, FinalizeResult, IdempotencyMarker, IdempotencyStatus, IdempotencyStore,
     IdempotencyStoreImpl,
@@ -175,15 +176,22 @@ impl From<IcebergError> for CommitError {
 pub struct CommitService<S> {
     storage: Arc<S>,
     in_progress_timeout: Duration,
+    governance: TableLocationGovernance,
 }
 
 impl<S: StorageBackend> CommitService<S> {
     /// Creates a new commit service using the provided storage.
+    ///
+    /// `governance` is required rather than optional: this service is the
+    /// authoritative single-table write path and is reached from more than one
+    /// route, so #358 enforcement has to be a property of the service itself.
+    /// A caller cannot construct a commit service that skips the check.
     #[must_use]
-    pub fn new(storage: Arc<S>) -> Self {
+    pub fn new(storage: Arc<S>, governance: TableLocationGovernance) -> Self {
         Self {
             storage,
             in_progress_timeout: IN_PROGRESS_TIMEOUT,
+            governance,
         }
     }
 
@@ -376,6 +384,24 @@ impl<S: StorageBackend> CommitService<S> {
                 &pointer,
                 base_metadata.last_sequence_number + 1,
             );
+
+            // Step 6b (#358): the guardrails that run at the route only reject
+            // `set-location` and the reserved `arco.` namespace, so a
+            // `set-properties` update carrying `write.data.path`,
+            // `write.metadata.path`, or `write.object-storage.path` would
+            // otherwise redirect data and metadata writes to an
+            // attacker-controlled or foreign bucket. Validate the *effective*
+            // property map — after updates are applied, before any metadata,
+            // pointer, or catalog mutation.
+            if let Err(err) = self
+                .governance
+                .validate_effective_properties(&new_metadata.properties)
+                .await
+            {
+                self.finalize_failed_marker(&idempotency_store, &marker, &marker_version, &err)
+                    .await?;
+                return Err(err.into());
+            }
 
             // Step 7: Write new metadata file
             let metadata_path =

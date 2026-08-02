@@ -783,6 +783,198 @@ mod catalogs {
         Ok(())
     }
 
+    async fn seed_and_publish_governance(
+        backend: &std::sync::Arc<arco_core::storage::MemoryBackend>,
+    ) -> Result<()> {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use arco_catalog::metastore::events::{
+            ExternalLocationRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
+            StorageCredentialRecord, WorkspaceBindingRecord,
+        };
+        use arco_catalog::metastore::ledger::MetastoreLedger;
+        use arco_catalog::metastore::projections::ProjectionRegistry;
+        use arco_catalog::metastore::publish::publish_current_metastore_projection;
+        use arco_core::{ControlPlaneScope, ScopedStorage};
+
+        let scope = ControlPlaneScope::workspace_alias("test-tenant", "test-workspace")
+            .context("control plane scope")?;
+        let backend_dyn: Arc<dyn arco_core::storage::StorageBackend> = backend.clone();
+        let storage = ScopedStorage::new(backend_dyn, "test-tenant", "test-workspace")
+            .context("scoped storage")?;
+        let events = vec![
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_001",
+                1,
+                MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
+                    credential_id: "cred_01".to_string(),
+                    name: "lakehouse-prod".to_string(),
+                    cloud: "gcs".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_000,
+                    properties: BTreeMap::new(),
+                    secret_material_ref: None,
+                    encrypted_payload: None,
+                }),
+            ),
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_002",
+                2,
+                MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
+                    location_id: "loc_orders".to_string(),
+                    name: "orders".to_string(),
+                    url: "gs://bucket/warehouse/orders/".to_string(),
+                    credential_id: "cred_01".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_001,
+                    properties: BTreeMap::new(),
+                }),
+            ),
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_003",
+                3,
+                MetastoreMutation::WorkspaceBindingUpserted(WorkspaceBindingRecord {
+                    binding_id: "binding_orders".to_string(),
+                    workspace_id: "test-workspace".to_string(),
+                    object_id: "loc_orders".to_string(),
+                    object_type: "EXTERNAL_LOCATION".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_002,
+                    properties: BTreeMap::new(),
+                }),
+            ),
+        ];
+        let ledger = MetastoreLedger::new(storage.clone());
+        for event in events {
+            ledger
+                .append_event(&event)
+                .await
+                .map_err(|err| anyhow::anyhow!("append governance event: {err}"))?;
+        }
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("publish governance projection: {err}"))?;
+        Ok(())
+    }
+
+    /// #358 sibling-route closure: `register_table_in_schema` validates a
+    /// client-supplied location against published storage governance —
+    /// foreign locations are a typed 400 while governed locations register.
+    #[tokio::test]
+    async fn test_register_table_in_schema_enforces_governed_locations() -> Result<()> {
+        use std::sync::Arc;
+
+        use arco_core::storage::MemoryBackend;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        seed_and_publish_governance(&backend).await?;
+
+        let foreign = helpers::make_request(
+            Method::POST,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            Some(serde_json::json!({
+                "name": "exfil",
+                "location": "gs://attacker-bucket/warehouse/exfil",
+                "columns": []
+            })),
+        )?;
+        let foreign_resp = router
+            .clone()
+            .oneshot(foreign)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            foreign_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a foreign location must be denied under governance"
+        );
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "orders",
+                "location": "gs://bucket/warehouse/orders/events",
+                "columns": []
+            }),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a governed location must register"
+        );
+        assert_eq!(table.name, "orders");
+        Ok(())
+    }
+
+    /// #358: without a governance projection for the scope, client-supplied
+    /// locations preserve current behavior unchanged.
+    #[tokio::test]
+    async fn test_register_table_in_schema_ungoverned_scope_preserves_location_behavior()
+    -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "events",
+                "location": "gs://any-bucket/warehouse/events",
+                "columns": []
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.name, "events");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_register_delta_table_in_schema_rejects_invalid_location() -> Result<()> {
         let router = test_router();

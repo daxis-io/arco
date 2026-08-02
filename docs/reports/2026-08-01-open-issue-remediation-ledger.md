@@ -11,6 +11,9 @@ proceeds. An issue moves to `closed` only after the repository, migration, CI,
 and deployed evidence required by its dossier is attached to the issue. A
 merged pull request is not, by itself, closure evidence.
 
+Wave 0 closed #233, #235, #236, #239, #247, and #271 on 2026-08-01 after
+posting current-main evidence to each issue. The remaining 62 rows stay open.
+
 ## Execution rules
 
 - Refresh `origin/main` and the live issue set before each remediation branch.
@@ -31,11 +34,11 @@ merged pull request is not, by itself, closure evidence.
 | #221 | Enhancement gap verified | Access redaction | Authorization-safe projection plus allowed/denied UAT | open |
 | #231 | Partially confirmed / scope adjusted | Deployed UAT | Fresh revision exposes authorized system catalog | open |
 | #232 | Partially confirmed / scope adjusted | Deployed UAT | Endpoint and artifact prove exact deployed provenance | open |
-| #233 | Already fixed or superseded | Wave 0 closeout | Reverify #304 absolute evidence paths and tests | verify-close |
+| #233 | Already fixed or superseded | Wave 0 closeout | Reverified #304 absolute evidence paths and tests | closed |
 | #234 | Externally unverified / needs live evidence | Deployed UAT | Fresh coherent deployed success artifact | open |
-| #235 | Already fixed or superseded | Wave 0 closeout | Reverify repository-owned flow worker build path | verify-close |
-| #236 | Already fixed or superseded | Wave 0 closeout | Reverify #304 fail-before-mutation deploy guard | verify-close |
-| #239 | Already fixed or superseded | Wave 0 closeout | Reverify #304 single-owner repository guard | verify-close |
+| #235 | Already fixed or superseded | Wave 0 closeout | Reverified repository-owned flow worker build path | closed |
+| #236 | Already fixed or superseded | Wave 0 closeout | Reverified #304 fail-before-mutation deploy guard | closed |
+| #239 | Already fixed or superseded | Wave 0 closeout | Reverified #304 single-owner repository guard | closed |
 | #240 | Partially confirmed / scope adjusted | Deployed UAT | Internal-only access succeeds in owner window | open |
 | #241 | Partially confirmed / scope adjusted | Deployed UAT | IAM binding and authenticated invocation both succeed | open |
 | #242 | Partially confirmed / scope adjusted | Deployed UAT | Identity-token compactor invocation succeeds | open |
@@ -43,10 +46,10 @@ merged pull request is not, by itself, closure evidence.
 | #244 | Partially confirmed / scope adjusted | Deployed UAT forensics | Immutable capture, offline diagnosis, approved repair proof | open |
 | #245 | Partially confirmed / scope adjusted | Deployed UAT | Catalog compactor scope matches fresh UAT scope | open |
 | #246 | Partially confirmed / scope adjusted | Deployed UAT | Scheduler-to-worker path reaches terminal rows | open |
-| #247 | Already fixed or superseded | Wave 0 closeout | Reverify #304 structured timeout artifact contract | verify-close |
+| #247 | Already fixed or superseded | Wave 0 closeout | Reverified #304 structured timeout artifact contract | closed |
 | #248 | Partially confirmed / scope adjusted | Deployed UAT | Flow service scope matches fresh UAT scope | open |
 | #249 | Enhancement gap verified | Deployed UAT | Published operator-boundary and recovery runbook | open |
-| #271 | Already fixed or superseded | Wave 0 closeout | Reverify #305 pointer-cleanup regression | verify-close |
+| #271 | Already fixed or superseded | Wave 0 closeout | Reverified #305 pointer-cleanup regression | closed |
 | #290 | Enhancement gap verified | Contracts and module boundaries | Behavior-preserving module extraction and parity tests | open |
 | #291 | Enhancement gap verified | Contracts and module boundaries | Contracts-only API-to-flow architecture gate | open |
 | #292 | Partially confirmed / scope adjusted | Replay conformance | Shared invariants and conformance; domain cursors remain | open |

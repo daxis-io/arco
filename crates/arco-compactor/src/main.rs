@@ -542,18 +542,31 @@ struct ReconcileResponse {
     repair_result: Option<RepairResult>,
 }
 
-fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+fn build_internal_auth() -> Result<Arc<InternalAuthState>> {
     let config = InternalOidcConfig::from_env().map_err(|e| anyhow!(e.to_string()))?;
-    let Some(config) = config else {
-        return Ok(None);
-    };
+    build_internal_auth_from_config(config)
+}
+
+fn build_internal_auth_from_config(
+    config: Option<InternalOidcConfig>,
+) -> Result<Arc<InternalAuthState>> {
+    let config = config.ok_or_else(|| {
+        anyhow!(
+            "internal auth is required for compactor mutation routes; configure ARCO_INTERNAL_AUTH_ISSUER, ARCO_INTERNAL_AUTH_AUDIENCE, and an allowed principal"
+        )
+    })?;
+    if !config.enforce {
+        return Err(anyhow!(
+            "compactor internal auth must enforce failures; set ARCO_INTERNAL_AUTH_ENFORCE=true"
+        ));
+    }
 
     let enforce = config.enforce;
     let verifier = InternalOidcVerifier::new(config).map_err(|e| anyhow!(e.to_string()))?;
-    Ok(Some(Arc::new(InternalAuthState {
+    Ok(Arc::new(InternalAuthState {
         verifier: Arc::new(verifier),
         enforce,
-    })))
+    }))
 }
 
 async fn internal_auth_middleware(
@@ -1628,6 +1641,50 @@ mod tests {
         })
     }
 
+    fn test_report_only_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://compactor.internal",
+            "test-secret",
+            BTreeSet::from([String::from("svc-compactor")]),
+            BTreeSet::new(),
+            false,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: false,
+        })
+    }
+
+    #[test]
+    fn startup_rejects_missing_internal_auth_configuration() {
+        let error = build_internal_auth_from_config(None)
+            .err()
+            .expect("catalog compactor must not start without internal auth");
+        assert!(error.to_string().contains("ARCO_INTERNAL_AUTH_ISSUER"));
+    }
+
+    #[test]
+    fn startup_rejects_report_only_internal_auth() {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://compactor.internal",
+            "test-secret",
+            BTreeSet::from([String::from("svc-compactor")]),
+            BTreeSet::new(),
+            false,
+        );
+        let error = build_internal_auth_from_config(Some(config))
+            .err()
+            .expect("catalog compactor must not start in report-only mode");
+        assert!(
+            error
+                .to_string()
+                .contains("ARCO_INTERNAL_AUTH_ENFORCE=true")
+        );
+    }
+
     #[test]
     fn test_normalize_metrics_secret_trims_empty() {
         assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
@@ -1712,7 +1769,7 @@ mod tests {
         let router = build_router(
             state,
             normalize_metrics_secret(Some("  ".to_string())),
-            None,
+            test_report_only_internal_auth_state(),
         );
         let response = router
             .oneshot(
@@ -1730,7 +1787,11 @@ mod tests {
     async fn test_metrics_gate_accepts_x_metrics_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(
+            state,
+            Some("topsecret".to_string()),
+            test_report_only_internal_auth_state(),
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1748,7 +1809,11 @@ mod tests {
     async fn test_metrics_gate_accepts_bearer_secret() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(
+            state,
+            Some("topsecret".to_string()),
+            test_report_only_internal_auth_state(),
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1765,7 +1830,11 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
         let state = test_state();
-        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
+        let router = build_router(
+            Arc::clone(&state),
+            Some("topsecret".to_string()),
+            test_report_only_internal_auth_state(),
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1777,7 +1846,11 @@ mod tests {
             .expect("request failed");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(
+            state,
+            Some("topsecret".to_string()),
+            test_report_only_internal_auth_state(),
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1795,7 +1868,11 @@ mod tests {
     async fn test_metrics_gate_accepts_when_both_headers_present() {
         metrics::init_metrics();
         let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
+        let router = build_router(
+            state,
+            Some("topsecret".to_string()),
+            test_report_only_internal_auth_state(),
+        );
         let response = router
             .oneshot(
                 Request::builder()
@@ -1814,7 +1891,7 @@ mod tests {
     async fn test_reconcile_endpoint_defaults_to_full_scope() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
+        let router = build_router(state.clone(), None, test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1845,7 +1922,7 @@ mod tests {
     async fn test_reconcile_endpoint_full_scope_repairs_cleanup_items() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
+        let router = build_router(state.clone(), None, test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1879,7 +1956,7 @@ mod tests {
             "list-denied-tenant",
             "list-denied-workspace",
         );
-        let router = build_router(state, None, None);
+        let router = build_router(state, None, test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1925,7 +2002,7 @@ mod tests {
             "list-denied-workspace",
         );
         let _ = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state, None, None);
+        let router = build_router(state, None, test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -2004,23 +2081,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
-        let router = build_router(test_state(), None, Some(test_internal_auth_state()));
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/reconcile")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"domain":"catalog","repair":false}"#.to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
+    async fn all_internal_mutation_routes_require_auth() {
+        let router = build_router(test_state(), None, test_internal_auth_state());
+        for path in [
+            "/compact",
+            "/internal/notify",
+            "/internal/sync-compact",
+            "/internal/reconcile",
+            "/internal/anti-entropy",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request build failed"),
+                )
+                .await
+                .expect("request failed");
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must be protected by internal auth"
+            );
+        }
     }
 }
 
@@ -2059,30 +2147,27 @@ fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String>
 fn build_router(
     state: Arc<ServiceState>,
     metrics_secret: Option<String>,
-    internal_auth: Option<Arc<InternalAuthState>>,
+    internal_auth: Arc<InternalAuthState>,
 ) -> Router {
     // Build HTTP router
     // Note: /internal/anti-entropy is separate from /internal/sync-compact
     // because they have different IAM requirements:
     // - sync-compact: compactor-fastpath-sa (NO list)
     // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let base_router = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
+    let mutation_routes = Router::new()
         .route("/compact", post(compact))
         .route("/internal/notify", post(notify_handler))
         .route("/internal/sync-compact", post(sync_compact_handler))
-        .route("/internal/reconcile", reconcile_route)
-        .route("/internal/anti-entropy", post(anti_entropy_handler));
+        .route("/internal/reconcile", post(reconcile_handler))
+        .route("/internal/anti-entropy", post(anti_entropy_handler))
+        .route_layer(middleware::from_fn_with_state(
+            internal_auth,
+            internal_auth_middleware,
+        ));
+    let base_router = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .merge(mutation_routes);
 
     let router = if let Some(secret) = metrics_secret {
         tracing::info!(

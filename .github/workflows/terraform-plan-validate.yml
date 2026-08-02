@@ -128,17 +128,27 @@ jobs:
 
             (env_names("api") | index("ARCO_COMPACTOR_URL")) and
             (env_names("api") | index("ARCO_ORCH_COMPACTOR_URL")) and
+            ((env_values("api").ARCO_COMPACTOR_AUTH_MODE // "") == "gcp_id_token") and
+            ((env_values("api").ARCO_COMPACTOR_AUTH_AUDIENCE // "") == "https://arco-compactor-dev-123456789012.us-central1.run.app") and
             ((env_values("api").ARCO_API_IMAGE // "") == "example.com/arco-api:test") and
             ((env_values("api").ARCO_GIT_SHA // "") == "abc123") and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE")) and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS")) and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE")) and
             (env_names("compactor") | index("ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS")) and
+            ((env_values("compactor").ARCO_INTERNAL_AUTH_ENFORCE // "") == "true") and
+            ((env_values("compactor").ARCO_INTERNAL_AUTH_AUDIENCE // "") == "https://arco-compactor-dev-123456789012.us-central1.run.app") and
+            ((env_values("compactor").ARCO_INTERNAL_AUTH_ALLOWED_EMAILS // "") == "arco-api-dev@test-project.iam.gserviceaccount.com,arco-compactor-dev@test-project.iam.gserviceaccount.com,arco-compactor-ae-dev@test-project.iam.gserviceaccount.com,arco-invoker-dev@test-project.iam.gserviceaccount.com") and
+            ((env_values("compactor").ARCO_COMPACTOR_URL // "") == "https://arco-compactor-dev-123456789012.us-central1.run.app") and
+            ((env_values("compactor").ARCO_COMPACTOR_AUDIENCE // "") == "https://arco-compactor-dev-123456789012.us-central1.run.app") and
             ((env_values("compactor").ARCO_TENANT_ID // "compactor-tenant") == "compactor-tenant") and
             ((env_values("compactor").ARCO_WORKSPACE_ID // "compactor-workspace") == "compactor-workspace") and
             (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE")) and
             (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS")) and
             (env_names("flow_compactor") | index("ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE")) and
+            ((env_values("flow_compactor").ARCO_INTERNAL_AUTH_ENFORCE // "") == "true") and
+            ((env_values("flow_compactor").ARCO_INTERNAL_AUTH_AUDIENCE // "") == "https://arco-flow-compactor-dev-123456789012.us-central1.run.app") and
+            ((env_values("flow_compactor").ARCO_INTERNAL_AUTH_ALLOWED_EMAILS // "") == "arco-api-dev@test-project.iam.gserviceaccount.com,arco-flow-controller-dev@test-project.iam.gserviceaccount.com,arco-flow-timer-dev@test-project.iam.gserviceaccount.com") and
             ((env_values("flow_compactor").ARCO_TENANT_ID // "") == "flow-tenant") and
             ((env_values("flow_compactor").ARCO_WORKSPACE_ID // "") == "flow-workspace") and
             (env_names("flow_dispatcher") | index("ARCO_FLOW_COMPACTOR_URL")) and
@@ -171,6 +181,9 @@ jobs:
             (scheduler_audience("flow_automation_reconciler_run") == "https://arco-flow-automation-reconciler-dev-123456789012.us-central1.run.app") and
             (iam_member("flow_tasks_timer_ingest_invoker") == "serviceAccount:arco-flow-task-invoker-dev@test-project.iam.gserviceaccount.com") and
             (iam_member("flow_tasks_worker_invoker") == "serviceAccount:arco-flow-task-invoker-dev@test-project.iam.gserviceaccount.com") and
+            (iam_member("compactor_self_invoker") == "serviceAccount:arco-compactor-dev@test-project.iam.gserviceaccount.com") and
+            (iam_member("flow_controller_flow_compactor_invoker") == "serviceAccount:arco-flow-controller-dev@test-project.iam.gserviceaccount.com") and
+            (iam_member("flow_timer_ingest_flow_compactor_invoker") == "serviceAccount:arco-flow-timer-dev@test-project.iam.gserviceaccount.com") and
             (resource_count("google_service_account"; "flow_dispatcher") == 0) and
             (resource_count("google_service_account"; "flow_sweeper") == 0)
           ' /tmp/arco-flow.tfplan.json >/dev/null

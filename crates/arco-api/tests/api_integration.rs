@@ -1511,6 +1511,182 @@ mod lineage {
         assert_eq!(first.edge_type, "derives_from");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_lineage_duplicate_posts_converge_on_one_edge() -> Result<()> {
+        let router = test_router();
+        let body = serde_json::json!({
+            "edges": [
+                {
+                    "source_id": "dup-src",
+                    "target_id": "dup-tgt",
+                    "edge_type": "derives_from",
+                    "run_id": "run-dup"
+                }
+            ]
+        });
+
+        for _ in 0..2 {
+            let (status, result): (_, AddEdgesResponse) =
+                helpers::post_json(router.clone(), "/api/v1/lineage/edges", body.clone()).await?;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(result.added, 1);
+        }
+
+        // The fold dedupes by the content-derived id: exactly one edge.
+        let (status, lineage): (_, LineageResponse) =
+            helpers::get_json(router.clone(), "/api/v1/lineage/dup-tgt").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(lineage.upstream.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_within_request_duplicates_dedupe() -> Result<()> {
+        let router = test_router();
+        let edge = serde_json::json!({
+            "source_id": "batch-src",
+            "target_id": "batch-tgt",
+            "edge_type": "copies"
+        });
+        let (status, result): (_, AddEdgesResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/lineage/edges",
+            serde_json::json!({
+                "edges": [
+                    edge,
+                    edge,
+                    {
+                        "source_id": "batch-src-2",
+                        "target_id": "batch-tgt",
+                        "edge_type": "copies"
+                    }
+                ]
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(result.added, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_distinct_run_ids_produce_distinct_edges() -> Result<()> {
+        let router = test_router();
+        for run_id in ["run-a", "run-b"] {
+            let (status, result): (_, AddEdgesResponse) = helpers::post_json(
+                router.clone(),
+                "/api/v1/lineage/edges",
+                serde_json::json!({
+                    "edges": [
+                        {
+                            "source_id": "runs-src",
+                            "target_id": "runs-tgt",
+                            "edge_type": "derives_from",
+                            "run_id": run_id
+                        }
+                    ]
+                }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(result.added, 1);
+        }
+
+        let (_status, lineage): (_, LineageResponse) =
+            helpers::get_json(router.clone(), "/api/v1/lineage/runs-tgt").await?;
+        assert_eq!(lineage.upstream.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_rejects_invalid_edges() -> Result<()> {
+        let router = test_router();
+
+        let oversized_type = "x".repeat(65);
+        let invalid_bodies = [
+            // Empty batch.
+            serde_json::json!({ "edges": [] }),
+            // Empty source_id.
+            serde_json::json!({
+                "edges": [{ "source_id": "", "target_id": "t", "edge_type": "derives_from" }]
+            }),
+            // Whitespace-only target_id.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "   ", "edge_type": "derives_from" }]
+            }),
+            // Oversized edge_type.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "t", "edge_type": oversized_type }]
+            }),
+            // Blank run_id.
+            serde_json::json!({
+                "edges": [{
+                    "source_id": "s",
+                    "target_id": "t",
+                    "edge_type": "derives_from",
+                    "run_id": ""
+                }]
+            }),
+            // NUL in target_id: the separator-injection shape that would have
+            // collided with a NUL in source_id under a separator-only edge-id
+            // encoding.
+            serde_json::json!({
+                "edges": [{ "source_id": "a", "target_id": "b\u{0000}c", "edge_type": "derives_from" }]
+            }),
+            // NUL in source_id: the other half of that pair.
+            serde_json::json!({
+                "edges": [{ "source_id": "a\u{0000}b", "target_id": "c", "edge_type": "derives_from" }]
+            }),
+            // Control character in edge_type.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "t", "edge_type": "derives\u{0001}from" }]
+            }),
+            // Control character in run_id.
+            serde_json::json!({
+                "edges": [{
+                    "source_id": "s",
+                    "target_id": "t",
+                    "edge_type": "derives_from",
+                    "run_id": "run\u{0000}1"
+                }]
+            }),
+        ];
+
+        for body in invalid_bodies {
+            let request = helpers::make_request(Method::POST, "/api/v1/lineage/edges", Some(body))?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Batch above the cap.
+        let too_many: Vec<serde_json::Value> = (0..1001)
+            .map(|i| {
+                serde_json::json!({
+                    "source_id": format!("cap-src-{i}"),
+                    "target_id": "cap-tgt",
+                    "edge_type": "derives_from"
+                })
+            })
+            .collect();
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/lineage/edges",
+            Some(serde_json::json!({ "edges": too_many })),
+        )?;
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
 }
 
 // ============================================================================

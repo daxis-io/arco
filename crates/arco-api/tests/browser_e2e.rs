@@ -11,6 +11,11 @@
 //! - TTL bounding
 //! - Domain validation
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::print_stderr)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +109,7 @@ fn is_local_bind_not_permitted(err: &arco_core::Error) -> bool {
     };
     if !message.contains("failed to bind http signed-url listener") {
         return false;
-    };
+    }
     message.contains("Operation not permitted") || message.contains("Permission denied")
 }
 

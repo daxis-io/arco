@@ -3886,6 +3886,9 @@ pub fn merge_backfill_chunk_rows(rows: Vec<BackfillChunkRow>) -> Option<Backfill
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::cognitive_complexity, clippy::manual_let_else)]
 mod tests {
     use super::*;
     use crate::orchestration::events::{
@@ -4742,7 +4745,7 @@ mod tests {
                 run_id: "run1".into(),
                 task_key: "analytics.daily".into(),
                 attempt: 1,
-                attempt_id: attempt_id.clone(),
+                attempt_id,
                 worker_id: "worker-1".into(),
                 outcome: TaskOutcome::Succeeded,
                 materialization_id: Some("mat_01".into()),
@@ -4937,7 +4940,7 @@ mod tests {
         let delta_row = make_task_row("extract", TaskState::Succeeded, "01B");
 
         // Pass in "wrong" order (newer first)
-        let merged = merge_task_rows(vec![delta_row.clone(), base_row]).unwrap();
+        let merged = merge_task_rows(vec![delta_row, base_row]).unwrap();
 
         // Should pick row with max row_version
         assert_eq!(merged.state, TaskState::Succeeded);

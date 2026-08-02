@@ -347,7 +347,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
     };
 
     let token_config = TaskTokenConfig {
-        hs256_secret: "test-task-secret".to_string(),
+        hs256_secret: "test-task-secret-at-least-32-bytes".to_string(),
         issuer: Some("https://issuer.task".to_string()),
         audience: Some("arco-worker-callback".to_string()),
         ttl_seconds: 900,

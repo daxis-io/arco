@@ -26,7 +26,7 @@ fn make_state() -> Arc<AppState> {
             ..JwtConfig::default()
         },
         task_token: TaskTokenConfig {
-            hs256_secret: "task-secret".to_string(),
+            hs256_secret: "test-task-token-secret-at-least-32-bytes".to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 900,

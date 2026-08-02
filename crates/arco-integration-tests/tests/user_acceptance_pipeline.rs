@@ -3014,7 +3014,7 @@ impl AcceptanceHarness {
         let ledger = LedgerWriter::new(storage.clone());
         let compactor = MicroCompactor::new(storage.clone());
         let token_config = TaskTokenConfig {
-            hs256_secret: "acceptance-task-secret".to_string(),
+            hs256_secret: "acceptance-task-secret-at-least-32-bytes".to_string(),
             issuer: Some("https://issuer.acceptance".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 900,

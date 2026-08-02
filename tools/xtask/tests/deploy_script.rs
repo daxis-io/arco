@@ -41,25 +41,54 @@ fn compactor_cloud_run_service_launches_serve_subcommand() {
 }
 
 #[test]
-fn cloud_run_services_keep_task_token_env() {
+fn cloud_run_services_source_task_token_from_secret_manager() {
     let cloud_run_tf = fs::read_to_string(repo_root().join("infra/terraform/cloud_run.tf"))
         .expect("read cloud_run.tf");
 
     assert!(
-        cloud_run_tf.contains(r#"name  = "ARCO_TASK_TOKEN_SECRET""#)
-            && cloud_run_tf.contains("value = var.task_token_secret"),
-        "API Cloud Run service must keep task-token validation secret"
+        cloud_run_tf.contains(r#"name = "ARCO_TASK_TOKEN_SECRET""#)
+            && cloud_run_tf.contains("google_secret_manager_secret.task_token_secret")
+            && cloud_run_tf.contains("secret_key_ref"),
+        "API Cloud Run service must source its task-token validation secret from Secret Manager"
     );
     assert!(
-        cloud_run_tf.contains(r#"name  = "ARCO_FLOW_TASK_TOKEN_SECRET""#)
-            && cloud_run_tf.contains("value = var.task_token_secret"),
-        "flow dispatcher/sweeper services must keep task-token minting secret"
+        cloud_run_tf.contains(r#"name = "ARCO_FLOW_TASK_TOKEN_SECRET""#)
+            && cloud_run_tf
+                .matches("google_secret_manager_secret.task_token_secret")
+                .count()
+                >= 3,
+        "flow dispatcher/sweeper services must source their task-token minting secret from Secret Manager"
+    );
+    assert!(
+        !cloud_run_tf.contains("value = var.task_token_secret"),
+        "task-token signing material must never be a literal Cloud Run environment value"
     );
     assert!(
         cloud_run_tf.contains(r#"name  = "ARCO_FLOW_TASK_TOKEN_AUDIENCE""#)
             && cloud_run_tf.contains("value = var.task_token_audience"),
         "flow dispatcher/sweeper services must keep task-token audience"
     );
+}
+
+#[test]
+fn deployed_api_debug_is_explicit_false_by_default_and_never_public() {
+    let variables = fs::read_to_string(repo_root().join("infra/terraform/variables.tf"))
+        .expect("read variables.tf");
+    let cloud_run = fs::read_to_string(repo_root().join("infra/terraform/cloud_run.tf"))
+        .expect("read cloud_run.tf");
+    let dev = fs::read_to_string(
+        repo_root().join("infra/terraform/environments/arco-testing-dev.tfvars"),
+    )
+    .expect("read dev tfvars");
+
+    assert!(variables.contains("variable \"api_debug\""));
+    assert!(cloud_run.contains("value = var.api_debug ? \"true\" : \"false\""));
+    assert!(
+        cloud_run.contains("!var.api_debug || (var.environment == \"dev\" && !var.api_public)")
+    );
+    assert!(cloud_run.contains("condition     = var.task_token_secret_name != \"\""));
+    assert!(!cloud_run.contains("var.environment == \"dev\" && !var.api_public ? \"true\""));
+    assert!(dev.contains("api_debug            = false"));
 }
 
 #[test]

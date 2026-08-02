@@ -18,6 +18,9 @@ pub const TASK_TOKEN_CALLBACK_GRACE_SECONDS: u64 = 300;
 /// Maximum supported task-token TTL in seconds.
 pub const MAX_TASK_TOKEN_TTL_SECONDS: u64 = 86_400;
 
+/// Minimum accepted byte length for an HS256 task-token signing key.
+pub const MIN_TASK_TOKEN_SECRET_BYTES: usize = 32;
+
 /// Configuration for task-scoped callback authentication tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +77,11 @@ impl TaskTokenConfig {
             return Err(Error::InvalidInput(
                 "task_token.hs256_secret is required".to_string(),
             ));
+        }
+        if self.hs256_secret.trim().len() < MIN_TASK_TOKEN_SECRET_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "task_token.hs256_secret must be at least {MIN_TASK_TOKEN_SECRET_BYTES} bytes"
+            )));
         }
         if self.ttl_seconds == 0 {
             return Err(Error::InvalidInput(
@@ -322,10 +330,12 @@ pub fn decode_task_token(config: &TaskTokenConfig, token: &str) -> Result<TaskTo
 mod tests {
     use super::*;
 
+    const TEST_TASK_TOKEN_SECRET: &str = "test-task-token-secret-at-least-32-bytes";
+
     #[test]
     fn mint_and_decode_task_token_round_trip() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 60,
@@ -346,7 +356,7 @@ mod tests {
     #[test]
     fn mint_and_decode_scoped_task_token_round_trip() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 60,
@@ -379,7 +389,7 @@ mod tests {
     #[test]
     fn legacy_task_token_decodes_without_scope_claims() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 60,
@@ -403,9 +413,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_short_hs256_secret() {
+        let config = TaskTokenConfig {
+            hs256_secret: "guessable-development-key".to_string(),
+            issuer: Some("https://arco.dev/task-token".to_string()),
+            audience: Some("arco-worker-callback".to_string()),
+            ttl_seconds: DEFAULT_TASK_TOKEN_TTL_SECONDS,
+        };
+
+        let error = config
+            .validate()
+            .expect_err("short secret must fail closed");
+        assert!(error.to_string().contains("at least 32 bytes"));
+    }
+
+    #[test]
     fn validate_for_dispatch_rejects_short_ttl_for_timeout_budget() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 900,
@@ -420,7 +445,7 @@ mod tests {
     #[test]
     fn validate_for_dispatch_requires_issuer_and_audience_when_strict() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: None,
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 3_600,
@@ -435,7 +460,7 @@ mod tests {
     #[test]
     fn validate_for_dispatch_accepts_valid_budget_and_claim_contract() {
         let config = TaskTokenConfig {
-            hs256_secret: "secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 3_600,

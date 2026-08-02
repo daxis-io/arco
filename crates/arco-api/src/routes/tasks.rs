@@ -923,7 +923,7 @@ mod tests {
 
     fn test_task_token_config() -> TaskTokenConfig {
         TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: "test-task-token-secret-at-least-32-bytes".to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,
@@ -1011,7 +1011,7 @@ mod tests {
     #[test]
     fn test_jwt_task_token_validator_accepts_valid_token() {
         let config = TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: "test-task-token-secret-at-least-32-bytes".to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn test_jwt_task_token_validator_rejects_task_id_mismatch() {
         let config = TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: "test-task-token-secret-at-least-32-bytes".to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,

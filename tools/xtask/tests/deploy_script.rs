@@ -80,10 +80,9 @@ fn deployed_api_debug_is_explicit_false_by_default_and_never_public() {
         repo_root().join("infra/terraform/environments/arco-testing-dev.tfvars"),
     )
     .expect("read dev tfvars");
-    let terraform_ci = fs::read_to_string(
-        repo_root().join(".github/workflows/terraform-plan-validate.yml"),
-    )
-    .expect("read Terraform CI workflow");
+    let terraform_ci =
+        fs::read_to_string(repo_root().join(".github/workflows/terraform-plan-validate.yml"))
+            .expect("read Terraform CI workflow");
 
     assert!(variables.contains("variable \"api_debug\""));
     assert!(cloud_run.contains("value = var.api_debug ? \"true\" : \"false\""));

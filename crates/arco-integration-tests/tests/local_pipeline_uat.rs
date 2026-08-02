@@ -399,7 +399,7 @@ async fn request_dispatch(app: &TestApp, task_key: &str) -> (u32, String) {
     let ready_events: Vec<_> = ready_controller
         .reconcile(&manifest, &fold_state)
         .into_iter()
-        .filter_map(|action| action.into_event_data())
+        .filter_map(arco_flow::orchestration::controllers::ReadyDispatchAction::into_event_data)
         .map(|data| OrchestrationEvent::new(TENANT, WORKSPACE, data))
         .collect();
 

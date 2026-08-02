@@ -770,8 +770,10 @@ mod tests {
 
     #[test]
     fn test_watermark_freshness() {
-        let mut watermarks = Watermarks::default();
-        watermarks.last_processed_at = Utc::now() - Duration::seconds(10);
+        let watermarks = Watermarks {
+            last_processed_at: Utc::now() - Duration::seconds(10),
+            ..Default::default()
+        };
 
         // Fresh within 30s
         assert!(watermarks.is_fresh(Duration::seconds(30)));
@@ -875,13 +877,15 @@ mod tests {
 
     #[test]
     fn test_table_paths_all() {
-        let mut tables = TablePaths::default();
-        tables.runs = Some(TableArtifact::legacy("runs/snapshot-01.parquet"));
-        tables.tasks = Some(TableArtifact::new(
-            "tasks/snapshot-01.abcd1234.parquet",
-            "sha256:abcd1234",
-            42,
-        ));
+        let mut tables = TablePaths {
+            runs: Some(TableArtifact::legacy("runs/snapshot-01.parquet")),
+            tasks: Some(TableArtifact::new(
+                "tasks/snapshot-01.abcd1234.parquet",
+                "sha256:abcd1234",
+                42,
+            )),
+            ..Default::default()
+        };
         tables.catalog_run_index_by_org.insert(
             "org_01".to_string(),
             TableArtifact::legacy("catalog_run_index/org_01/snapshot-01.parquet"),

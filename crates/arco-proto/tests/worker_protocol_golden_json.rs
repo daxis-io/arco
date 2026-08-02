@@ -1,6 +1,9 @@
 //! Golden fixture parity between JSON worker contract types and generated proto types.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_wrap)]
 
 use std::fs;
 use std::path::PathBuf;

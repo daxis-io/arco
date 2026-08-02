@@ -1411,7 +1411,7 @@ mod tests {
         let mut builder = ServerBuilder::new();
         configure_non_dev_jwt(&mut builder);
         builder.config.jwt.issuer = Some(" ".to_string());
-        builder.config.jwt.audience = Some("".to_string());
+        builder.config.jwt.audience = Some(String::new());
 
         let server = builder.build();
         let err = server.validate_config().unwrap_err();
@@ -1589,7 +1589,7 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
+        assert!(content_type.is_some_and(|value| value.starts_with("application/json")));
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -1628,7 +1628,7 @@ mod tests {
             Some("UnauthorizedException")
         );
         assert_eq!(
-            error.get("code").and_then(|value| value.as_u64()),
+            error.get("code").and_then(serde_json::Value::as_u64),
             Some(401)
         );
         Ok(())

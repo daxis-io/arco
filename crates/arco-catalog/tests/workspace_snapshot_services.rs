@@ -1,5 +1,13 @@
 //! Contract tests for direct-addressed workspace snapshot and export services.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used, clippy::panic)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines, clippy::unused_async)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -377,10 +385,7 @@ fn export_manifest() -> ExportManifest {
         scope.clone(),
         ts(1_800_000_000),
         ts(1_900_000_000),
-        vec![
-            DomainAuthorityReference::new("catalog", scope.clone(), authority)
-                .expect("domain authority"),
-        ],
+        vec![DomainAuthorityReference::new("catalog", scope, authority).expect("domain authority")],
         Vec::new(),
         vec![DomainEventArchive::empty("catalog").expect("archive")],
         vec![
@@ -3081,7 +3086,7 @@ async fn preflight_reports_sorted_redacted_issue_categories_and_scope() {
         report
             .issues()
             .iter()
-            .map(|issue| issue.kind())
+            .map(arco_catalog::workspace_snapshot_service::RestorePreflightIssue::kind)
             .collect::<Vec<_>>(),
         vec![
             RestorePreflightIssueKind::Missing,

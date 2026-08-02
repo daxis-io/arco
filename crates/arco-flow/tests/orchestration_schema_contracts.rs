@@ -144,7 +144,7 @@ fn current_schemas() -> Vec<(&'static str, Schema)> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "golden-file generator: run manually to regenerate schema fixtures"]
 fn generate_golden_schemas() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let golden_dir = Path::new(manifest_dir)

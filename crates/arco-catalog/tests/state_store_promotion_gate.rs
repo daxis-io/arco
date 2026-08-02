@@ -1,5 +1,9 @@
 //! Deterministic promotion-gate tests for the state-store prototype.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::needless_pass_by_value)]
+
 use arco_catalog::state_store::promotion_gate::{
     FallbackRecommendation, MeasurementSource, PromotionCriterion, PromotionDecision,
     PromotionGateInput, PromotionMeasurement, PromotionMeasurementKind,

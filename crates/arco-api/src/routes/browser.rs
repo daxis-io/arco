@@ -245,8 +245,10 @@ mod tests {
 
     #[tokio::test]
     async fn mint_urls_rejects_encoded_path_traversal_sequences() {
-        let mut config = Config::default();
-        config.debug = true;
+        let config = Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
         let app = routes().with_state(state);
 

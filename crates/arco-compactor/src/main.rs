@@ -1410,7 +1410,313 @@ async fn run_repair_automation_loop(state: Arc<ServiceState>) {
     }
 }
 
+// ============================================================================
+// Main Entry Point
+// ============================================================================
+
+#[tokio::main]
+#[allow(clippy::too_many_lines)]
+async fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .json()
+        .init();
+
+    let args = Args::parse();
+    let scoped = ScopedConfig::from_args(&args)?;
+
+    match args.command {
+        Commands::Serve {
+            port,
+            interval_secs,
+            unhealthy_threshold_secs,
+            compactor_url,
+            compactor_audience,
+            compactor_id_token,
+            anti_entropy_max_objects_per_run,
+            anti_entropy_reprocess_batch_size,
+            anti_entropy_reprocess_timeout_secs,
+            metrics_secret,
+        } => {
+            let scoped_storage = scoped.scoped_storage()?;
+            let metrics_secret = normalize_metrics_secret(metrics_secret);
+            let internal_auth = build_internal_auth()?;
+            let repair_automation = RepairAutomationConfig::from_env()?;
+
+            // Initialize metrics before starting
+            metrics::init_metrics();
+            arco_catalog::metrics::register_metrics();
+
+            tracing::info!(
+                port = port,
+                interval_secs = interval_secs,
+                unhealthy_threshold_secs = unhealthy_threshold_secs,
+                tenant_id = %scoped.tenant_id,
+                workspace_id = %scoped.workspace_id,
+                "Starting compactor service"
+            );
+
+            let compactor_state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
+            let mut notification_config = NotificationConsumerConfig::default();
+            for domain in ["catalog", "lineage", "executions"] {
+                if !notification_config
+                    .domains
+                    .iter()
+                    .any(|value| value == domain)
+                {
+                    notification_config.domains.push(domain.to_string());
+                }
+            }
+            let notification_consumer =
+                NotificationConsumer::new(scoped_storage.clone(), notification_config);
+            let auto_anti_entropy = AutoAntiEntropyConfig {
+                compactor_url: compactor_url.unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
+                compactor_audience,
+                compactor_id_token,
+                max_objects_per_run: anti_entropy_max_objects_per_run,
+                reprocess_batch_size: anti_entropy_reprocess_batch_size,
+                reprocess_timeout_secs: anti_entropy_reprocess_timeout_secs,
+            };
+            let state = Arc::new(ServiceState {
+                compactor: Arc::clone(&compactor_state),
+                storage: scoped_storage,
+                tenant_id: scoped.tenant_id.clone(),
+                workspace_id: scoped.workspace_id.clone(),
+                notification_consumer: Arc::new(Mutex::new(notification_consumer)),
+                auto_anti_entropy,
+                repair_automation: repair_automation.clone(),
+                repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
+            });
+
+            // Update compaction lag gauge periodically using last successful compaction as proxy.
+            let lag_state = Arc::clone(&compactor_state);
+            tokio::spawn(async move {
+                let start = Utc::now();
+                loop {
+                    let now = Utc::now();
+                    let lag_seconds = lag_state.last_successful_compaction().map_or_else(
+                        || (now - start).num_seconds(),
+                        |ts| (now - ts).num_seconds(),
+                    );
+                    let lag_seconds = u64::try_from(lag_seconds.max(0)).unwrap_or(u64::MAX);
+                    #[allow(clippy::cast_precision_loss)]
+                    let lag_seconds = lag_seconds as f64;
+
+                    for domain in COMPACTION_DOMAINS {
+                        metrics::set_compaction_lag(domain, lag_seconds);
+                    }
+
+                    tokio::time::sleep(Duration::from_secs(COMPACTION_LAG_UPDATE_SECS)).await;
+                }
+            });
+
+            let router = build_router(Arc::clone(&state), metrics_secret, internal_auth);
+
+            // Spawn compaction loop
+            let state_clone = Arc::clone(&state);
+            let interval = Duration::from_secs(interval_secs);
+            tokio::spawn(async move {
+                run_compaction_loop(state_clone, interval).await;
+            });
+
+            if repair_automation.mode != RepairAutomationMode::Disabled {
+                let state_clone = Arc::clone(&state);
+                tokio::spawn(async move {
+                    run_repair_automation_loop(state_clone).await;
+                });
+            }
+
+            // Start HTTP server
+            let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            tracing::info!(address = %addr, "Starting health server");
+
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, router).await?;
+        }
+
+        Commands::Compact {
+            ref tenant,
+            all,
+            dry_run,
+            min_events,
+        } => {
+            tracing::info!(
+                tenant = ?tenant,
+                all = all,
+                dry_run = dry_run,
+                min_events = min_events,
+                "Starting manual compaction"
+            );
+
+            let scoped_storage = scoped.scoped_storage()?;
+
+            if dry_run {
+                tracing::info!("Dry run mode - no changes will be made");
+                return Ok(());
+            }
+
+            let compactor = Compactor::new(scoped_storage);
+            let result = compactor.compact_domain(CatalogDomain::Executions).await?;
+
+            tracing::info!(
+                events_processed = result.events_processed,
+                parquet_files_written = result.parquet_files_written,
+                new_watermark = result.new_watermark,
+                "Compaction complete"
+            );
+        }
+
+        Commands::AntiEntropy {
+            ref domain,
+            max_objects_per_run,
+            ref compactor_url,
+            ref compactor_audience,
+            ref compactor_id_token,
+            reprocess_batch_size,
+            reprocess_timeout_secs,
+        } => {
+            let scoped_storage = scoped.scoped_storage()?;
+
+            let default_config = anti_entropy::AntiEntropyConfig::default();
+            let config = anti_entropy::AntiEntropyConfig {
+                domain: domain.clone(),
+                tenant_id: scoped.tenant_id.clone(),
+                workspace_id: scoped.workspace_id.clone(),
+                max_objects_per_run,
+                compactor_url: compactor_url.clone(),
+                compactor_audience: compactor_audience.clone(),
+                compactor_id_token: compactor_id_token.clone(),
+                reprocess_batch_size: reprocess_batch_size
+                    .unwrap_or(default_config.reprocess_batch_size),
+                reprocess_timeout_secs: reprocess_timeout_secs
+                    .unwrap_or(default_config.reprocess_timeout_secs),
+                ..default_config
+            };
+
+            let mut job = anti_entropy::AntiEntropyJob::new(scoped_storage, config);
+
+            let result = job
+                .run_pass()
+                .await
+                .map_err(|err| anyhow!("anti-entropy run failed: {err}"))?;
+
+            tracing::info!(
+                objects_scanned = result.objects_scanned,
+                missed_events = result.missed_events,
+                scan_complete = result.scan_complete,
+                "anti-entropy run completed"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
+    secret.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let left_byte = *left.get(i).unwrap_or(&0);
+        let right_byte = *right.get(i).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+    diff == 0
+}
+
+fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String> {
+    match raw {
+        "catalog" | "core" => Ok(CatalogDomain::Catalog),
+        "lineage" => Ok(CatalogDomain::Lineage),
+        "executions" => Ok(CatalogDomain::Executions),
+        "search" | "governance" => Ok(CatalogDomain::Search),
+        _ => Err(format!("unsupported catalog reconcile domain: {raw}")),
+    }
+}
+
+fn build_router(
+    state: Arc<ServiceState>,
+    metrics_secret: Option<String>,
+    internal_auth: Option<Arc<InternalAuthState>>,
+) -> Router {
+    // Build HTTP router
+    // Note: /internal/anti-entropy is separate from /internal/sync-compact
+    // because they have different IAM requirements:
+    // - sync-compact: compactor-fastpath-sa (NO list)
+    // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
+    let reconcile_route = internal_auth.map_or_else(
+        || post(reconcile_handler),
+        |auth| {
+            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            ))
+        },
+    );
+    let base_router = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/compact", post(compact))
+        .route("/internal/notify", post(notify_handler))
+        .route("/internal/sync-compact", post(sync_compact_handler))
+        .route("/internal/reconcile", reconcile_route)
+        .route("/internal/anti-entropy", post(anti_entropy_handler));
+
+    let router = if let Some(secret) = metrics_secret {
+        tracing::info!(
+            "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
+        );
+        let secret = Arc::<str>::from(secret);
+        base_router.route(
+            "/metrics",
+            get(move |headers: axum::http::HeaderMap| {
+                let secret = Arc::clone(&secret);
+                async move {
+                    let from_custom = headers
+                        .get("X-Metrics-Secret")
+                        .and_then(|v| v.to_str().ok());
+                    let from_bearer = headers
+                        .get("Authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    let secret_bytes = secret.as_bytes();
+                    let matches_custom = from_custom
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    let matches_bearer = from_bearer
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    if matches_custom || matches_bearer {
+                        metrics::serve_metrics().await.into_response()
+                    } else {
+                        StatusCode::FORBIDDEN.into_response()
+                    }
+                }
+            }),
+        )
+    } else {
+        base_router.route("/metrics", get(metrics::serve_metrics))
+    };
+
+    router.with_state(state)
+}
+
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::iter_on_single_items)]
 mod tests {
     use std::collections::BTreeSet;
     use std::ops::Range;
@@ -2022,307 +2328,4 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-}
-
-fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
-    secret.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for i in 0..max_len {
-        let left_byte = *left.get(i).unwrap_or(&0);
-        let right_byte = *right.get(i).unwrap_or(&0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
-}
-
-fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String> {
-    match raw {
-        "catalog" | "core" => Ok(CatalogDomain::Catalog),
-        "lineage" => Ok(CatalogDomain::Lineage),
-        "executions" => Ok(CatalogDomain::Executions),
-        "search" | "governance" => Ok(CatalogDomain::Search),
-        _ => Err(format!("unsupported catalog reconcile domain: {raw}")),
-    }
-}
-
-fn build_router(
-    state: Arc<ServiceState>,
-    metrics_secret: Option<String>,
-    internal_auth: Option<Arc<InternalAuthState>>,
-) -> Router {
-    // Build HTTP router
-    // Note: /internal/anti-entropy is separate from /internal/sync-compact
-    // because they have different IAM requirements:
-    // - sync-compact: compactor-fastpath-sa (NO list)
-    // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let base_router = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/compact", post(compact))
-        .route("/internal/notify", post(notify_handler))
-        .route("/internal/sync-compact", post(sync_compact_handler))
-        .route("/internal/reconcile", reconcile_route)
-        .route("/internal/anti-entropy", post(anti_entropy_handler));
-
-    let router = if let Some(secret) = metrics_secret {
-        tracing::info!(
-            "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
-        );
-        let secret = Arc::<str>::from(secret);
-        base_router.route(
-            "/metrics",
-            get(move |headers: axum::http::HeaderMap| {
-                let secret = Arc::clone(&secret);
-                async move {
-                    let from_custom = headers
-                        .get("X-Metrics-Secret")
-                        .and_then(|v| v.to_str().ok());
-                    let from_bearer = headers
-                        .get("Authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "));
-                    let secret_bytes = secret.as_bytes();
-                    let matches_custom = from_custom
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    let matches_bearer = from_bearer
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    if matches_custom || matches_bearer {
-                        metrics::serve_metrics().await.into_response()
-                    } else {
-                        StatusCode::FORBIDDEN.into_response()
-                    }
-                }
-            }),
-        )
-    } else {
-        base_router.route("/metrics", get(metrics::serve_metrics))
-    };
-
-    router.with_state(state)
-}
-
-// ============================================================================
-// Main Entry Point
-// ============================================================================
-
-#[tokio::main]
-#[allow(clippy::too_many_lines)]
-async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .json()
-        .init();
-
-    let args = Args::parse();
-    let scoped = ScopedConfig::from_args(&args)?;
-
-    match args.command {
-        Commands::Serve {
-            port,
-            interval_secs,
-            unhealthy_threshold_secs,
-            compactor_url,
-            compactor_audience,
-            compactor_id_token,
-            anti_entropy_max_objects_per_run,
-            anti_entropy_reprocess_batch_size,
-            anti_entropy_reprocess_timeout_secs,
-            metrics_secret,
-        } => {
-            let scoped_storage = scoped.scoped_storage()?;
-            let metrics_secret = normalize_metrics_secret(metrics_secret);
-            let internal_auth = build_internal_auth()?;
-            let repair_automation = RepairAutomationConfig::from_env()?;
-
-            // Initialize metrics before starting
-            metrics::init_metrics();
-            arco_catalog::metrics::register_metrics();
-
-            tracing::info!(
-                port = port,
-                interval_secs = interval_secs,
-                unhealthy_threshold_secs = unhealthy_threshold_secs,
-                tenant_id = %scoped.tenant_id,
-                workspace_id = %scoped.workspace_id,
-                "Starting compactor service"
-            );
-
-            let compactor_state = Arc::new(CompactorState::new(unhealthy_threshold_secs));
-            let mut notification_config = NotificationConsumerConfig::default();
-            for domain in ["catalog", "lineage", "executions"] {
-                if !notification_config
-                    .domains
-                    .iter()
-                    .any(|value| value == domain)
-                {
-                    notification_config.domains.push(domain.to_string());
-                }
-            }
-            let notification_consumer =
-                NotificationConsumer::new(scoped_storage.clone(), notification_config);
-            let auto_anti_entropy = AutoAntiEntropyConfig {
-                compactor_url: compactor_url.unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
-                compactor_audience,
-                compactor_id_token,
-                max_objects_per_run: anti_entropy_max_objects_per_run,
-                reprocess_batch_size: anti_entropy_reprocess_batch_size,
-                reprocess_timeout_secs: anti_entropy_reprocess_timeout_secs,
-            };
-            let state = Arc::new(ServiceState {
-                compactor: Arc::clone(&compactor_state),
-                storage: scoped_storage,
-                tenant_id: scoped.tenant_id.clone(),
-                workspace_id: scoped.workspace_id.clone(),
-                notification_consumer: Arc::new(Mutex::new(notification_consumer)),
-                auto_anti_entropy,
-                repair_automation: repair_automation.clone(),
-                repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
-            });
-
-            // Update compaction lag gauge periodically using last successful compaction as proxy.
-            let lag_state = Arc::clone(&compactor_state);
-            tokio::spawn(async move {
-                let start = Utc::now();
-                loop {
-                    let now = Utc::now();
-                    let lag_seconds = lag_state.last_successful_compaction().map_or_else(
-                        || (now - start).num_seconds(),
-                        |ts| (now - ts).num_seconds(),
-                    );
-                    let lag_seconds = u64::try_from(lag_seconds.max(0)).unwrap_or(u64::MAX);
-                    #[allow(clippy::cast_precision_loss)]
-                    let lag_seconds = lag_seconds as f64;
-
-                    for domain in COMPACTION_DOMAINS {
-                        metrics::set_compaction_lag(domain, lag_seconds);
-                    }
-
-                    tokio::time::sleep(Duration::from_secs(COMPACTION_LAG_UPDATE_SECS)).await;
-                }
-            });
-
-            let router = build_router(Arc::clone(&state), metrics_secret, internal_auth);
-
-            // Spawn compaction loop
-            let state_clone = Arc::clone(&state);
-            let interval = Duration::from_secs(interval_secs);
-            tokio::spawn(async move {
-                run_compaction_loop(state_clone, interval).await;
-            });
-
-            if repair_automation.mode != RepairAutomationMode::Disabled {
-                let state_clone = Arc::clone(&state);
-                tokio::spawn(async move {
-                    run_repair_automation_loop(state_clone).await;
-                });
-            }
-
-            // Start HTTP server
-            let addr = SocketAddr::from(([0, 0, 0, 0], port));
-            tracing::info!(address = %addr, "Starting health server");
-
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, router).await?;
-        }
-
-        Commands::Compact {
-            ref tenant,
-            all,
-            dry_run,
-            min_events,
-        } => {
-            tracing::info!(
-                tenant = ?tenant,
-                all = all,
-                dry_run = dry_run,
-                min_events = min_events,
-                "Starting manual compaction"
-            );
-
-            let scoped_storage = scoped.scoped_storage()?;
-
-            if dry_run {
-                tracing::info!("Dry run mode - no changes will be made");
-                return Ok(());
-            }
-
-            let compactor = Compactor::new(scoped_storage);
-            let result = compactor.compact_domain(CatalogDomain::Executions).await?;
-
-            tracing::info!(
-                events_processed = result.events_processed,
-                parquet_files_written = result.parquet_files_written,
-                new_watermark = result.new_watermark,
-                "Compaction complete"
-            );
-        }
-
-        Commands::AntiEntropy {
-            ref domain,
-            max_objects_per_run,
-            ref compactor_url,
-            ref compactor_audience,
-            ref compactor_id_token,
-            reprocess_batch_size,
-            reprocess_timeout_secs,
-        } => {
-            let scoped_storage = scoped.scoped_storage()?;
-
-            let default_config = anti_entropy::AntiEntropyConfig::default();
-            let config = anti_entropy::AntiEntropyConfig {
-                domain: domain.clone(),
-                tenant_id: scoped.tenant_id.clone(),
-                workspace_id: scoped.workspace_id.clone(),
-                max_objects_per_run,
-                compactor_url: compactor_url.clone(),
-                compactor_audience: compactor_audience.clone(),
-                compactor_id_token: compactor_id_token.clone(),
-                reprocess_batch_size: reprocess_batch_size
-                    .unwrap_or(default_config.reprocess_batch_size),
-                reprocess_timeout_secs: reprocess_timeout_secs
-                    .unwrap_or(default_config.reprocess_timeout_secs),
-                ..default_config
-            };
-
-            let mut job = anti_entropy::AntiEntropyJob::new(scoped_storage, config);
-
-            let result = job
-                .run_pass()
-                .await
-                .map_err(|err| anyhow!("anti-entropy run failed: {err}"))?;
-
-            tracing::info!(
-                objects_scanned = result.objects_scanned,
-                missed_events = result.missed_events,
-                scan_complete = result.scan_complete,
-                "anti-entropy run completed"
-            );
-        }
-    }
-
-    Ok(())
 }

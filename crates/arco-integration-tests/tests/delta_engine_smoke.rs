@@ -1,6 +1,9 @@
 //! Engine-style smoke suites for UC facade and Arco-native Delta APIs.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,9 +21,11 @@ use tower::ServiceExt as _;
 use uuid::Uuid;
 
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let mut config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Default::default()
+    };
     config.unity_catalog.enabled = true;
     config
 }

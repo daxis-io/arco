@@ -1,5 +1,9 @@
 //! Minimal embedded worker protocol example.
 
+// Examples print to stdout by design; the print restriction lint targets
+// production code paths (#331).
+#![allow(clippy::print_stdout)]
+
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 

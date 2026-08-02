@@ -21,10 +21,16 @@ yanked = "deny"
 # Use "workspace" to only fail on direct workspace dependencies.
 unmaintained = "workspace"
 ignore = [
-    # quick-xml is pulled through object_store 0.11.x and opendal 0.54.x.
-    # Both upstream constraints currently block quick-xml >=0.41.0 without a broad
-    # DataFusion/Iceberg/object-store dependency upgrade outside this Phase 3 PR.
+    # quick-xml is pulled through object_store 0.11.x (requires ^0.37) and
+    # opendal 0.54.x via iceberg 0.6 (requires ^0.38). Both upstream constraints
+    # block the fixed quick-xml >=0.41.0 (verified 2026-07-30:
+    # `cargo update quick-xml@... --precise 0.41.0 --dry-run` fails on both);
+    # resolving requires a broad DataFusion/Iceberg/object-store major upgrade.
+    # Tracking: #327. Review/expiry: 2026-09-30 — re-check upstream releases and
+    # remove or re-justify these suppressions by that date.
+    # Rationale: quadratic run time checking start tags for duplicate attribute names (DoS-class, fixed in 0.41.0).
     "RUSTSEC-2026-0194",
+    # Rationale: unbounded namespace-declaration allocation in NsReader enables memory-exhaustion DoS (fixed in 0.41.0).
     "RUSTSEC-2026-0195",
 ]
 

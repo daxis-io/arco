@@ -13,7 +13,7 @@
 //! (`source_id`, `target_id`, `edge_type`, `run_id`), and the lineage fold
 //! dedupes by id with first-write-wins, so duplicate POSTs of the same edge
 //! converge to a single projected row (ADR-042 rule 10;
-//! `docs/plans/2026-07-30-lineage-l0-schema-plan.md`). `created_at` records
+//! the L0 golden-schema plan). `created_at` records
 //! the first accepted observation.
 
 use std::sync::Arc;

@@ -50,11 +50,41 @@ fn worker_dispatch_envelope_accepts_legacy_snake_case_fixture() {
     assert_eq!(parsed.task_id, "analytics.daily_sales");
     assert_eq!(parsed.task_key, "analytics.daily_sales");
     assert_eq!(parsed.execution_location_id.as_deref(), Some("local-dev"));
+    assert_eq!(parsed.partition_key, None);
+    assert_eq!(parsed.heartbeat_timeout_sec, None);
 
     let serialized = serde_json::to_value(parsed).expect("serialize canonical envelope");
     assert!(serialized.get("taskId").is_some());
     assert!(serialized.get("callbackBaseUrl").is_some());
     assert!(serialized.get("task_key").is_none());
+    assert!(serialized.get("partitionKey").is_none());
+    assert!(serialized.get("heartbeatTimeoutSec").is_none());
+}
+
+#[test]
+fn worker_dispatch_envelope_accepts_snake_case_partition_scope_aliases() {
+    let payload = json!({
+        "tenant_id": "tenant-a",
+        "workspace_id": "workspace-b",
+        "run_id": "run-123",
+        "task_key": "analytics.daily_sales",
+        "attempt": 1,
+        "attempt_id": "att-123",
+        "dispatch_id": "dispatch:run-123:analytics.daily_sales:1",
+        "partition_key": "date=d:2026-01-01",
+        "heartbeat_timeout_sec": 120,
+        "worker_queue": "default-queue",
+        "callback_base_url": "https://callbacks.example",
+        "task_token": "token",
+        "token_expires_at": "2026-01-01T00:00:00Z",
+        "payload": {}
+    });
+
+    let parsed: WorkerDispatchEnvelope =
+        serde_json::from_value(payload).expect("snake_case aliases should deserialize");
+
+    assert_eq!(parsed.partition_key.as_deref(), Some("date=d:2026-01-01"));
+    assert_eq!(parsed.heartbeat_timeout_sec, Some(120));
 }
 
 #[test]

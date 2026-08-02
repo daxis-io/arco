@@ -124,7 +124,11 @@ struct RepairAutomationConfig {
 impl Default for RepairAutomationConfig {
     fn default() -> Self {
         Self {
-            mode: RepairAutomationMode::Enforce,
+            // Destructive automation is opt-in: the default reports findings
+            // without deleting anything. Set
+            // ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce to enable
+            // enforcement deliberately (#357).
+            mode: RepairAutomationMode::DryRun,
             interval: Duration::from_secs(300),
             scope: RepairScope::Full,
             domains: vec![
@@ -1820,6 +1824,13 @@ mod tests {
     }
 
     async fn seed_catalog_reconcile_state_with_old_snapshot(storage: &ScopedStorage) -> String {
+        // Full-scope repair deletions build the fail-closed GC protection set,
+        // which requires every domain head to be readable.
+        arco_catalog::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize tier1");
+
         let mut root = RootManifest::new();
         root.normalize_paths();
         storage
@@ -1972,11 +1983,15 @@ mod tests {
     }
 
     #[test]
-    fn test_repair_automation_config_defaults_to_enforce_full_scope() {
+    fn test_repair_automation_config_defaults_to_non_destructive_dry_run() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
-        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(
+            config.mode,
+            RepairAutomationMode::DryRun,
+            "destructive repair enforcement must be explicit opt-in (#357)"
+        );
         assert_eq!(config.interval, Duration::from_secs(300));
         assert_eq!(config.scope, RepairScope::Full);
         assert_eq!(
@@ -2142,13 +2157,14 @@ mod tests {
                 .head_raw(&old_snapshot)
                 .await
                 .expect("head old snapshot")
-                .is_none(),
-            "default reconcile repair scope must clean up generic candidates"
+                .is_some(),
+            "repair must not delete candidates younger than the minimum age \
+             (recent objects may back unexpired signed URLs, #343)"
         );
     }
 
     #[tokio::test]
-    async fn test_reconcile_endpoint_full_scope_repairs_cleanup_items() {
+    async fn test_reconcile_endpoint_full_scope_preserves_recent_candidates() {
         let state = test_state();
         let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
         let router = build_router(state.clone(), None, None);
@@ -2173,8 +2189,10 @@ mod tests {
                 .head_raw(&old_snapshot)
                 .await
                 .expect("head old snapshot")
-                .is_none(),
-            "full reconcile repair scope must delete generic cleanup candidates"
+                .is_some(),
+            "full-scope repair must not delete candidates younger than the \
+             minimum age window (#343): aged cleanup is exercised in the \
+             arco-catalog reconciler suite"
         );
     }
 

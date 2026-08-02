@@ -347,7 +347,7 @@ async fn iceberg_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if iceberg_public_path(req.uri().path()) {
+    if iceberg_public_route(req.method(), req.uri().path()) {
         let resource = req.uri().path().to_string();
         let request_id = crate::context::request_id_from_headers(req.headers())
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -401,8 +401,8 @@ async fn iceberg_auth_middleware(
     next.run(Request::from_parts(parts, body)).await
 }
 
-fn iceberg_public_path(path: &str) -> bool {
-    path.ends_with("/v1/config") || path.ends_with("/openapi.json")
+fn iceberg_public_route(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && matches!(path, "/v1/config" | "/openapi.json")
 }
 
 /// Auth middleware for Unity Catalog facade requests.
@@ -414,7 +414,7 @@ async fn unity_catalog_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if unity_catalog_public_path(req.uri().path()) {
+    if unity_catalog_public_route(req.method(), req.uri().path()) {
         let resource = req.uri().path().to_string();
         let request_id = crate::context::request_id_from_headers(req.headers())
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -469,8 +469,48 @@ async fn unity_catalog_auth_middleware(
     next.run(Request::from_parts(parts, body)).await
 }
 
-fn unity_catalog_public_path(path: &str) -> bool {
-    path.ends_with("/openapi.json")
+fn unity_catalog_public_route(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && path == "/openapi.json"
+}
+
+fn normalize_metrics_secret(secret: Option<&str>) -> Option<&str> {
+    secret.map(str::trim).filter(|secret| !secret.is_empty())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = *left.get(index).unwrap_or(&0);
+        let right_byte = *right.get(index).unwrap_or(&0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+fn metrics_request_authorized(headers: &HeaderMap, secret: &str) -> bool {
+    let matches_custom = headers
+        .get("X-Metrics-Secret")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret.as_bytes()));
+    let matches_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim())
+        .filter(|token| !token.is_empty())
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), secret.as_bytes()));
+    matches_custom || matches_bearer
+}
+
+async fn api_metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(secret) = normalize_metrics_secret(state.config.metrics_secret.as_deref())
+        && !metrics_request_authorized(&headers, secret)
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    crate::metrics::serve_metrics().await.into_response()
 }
 
 fn api_error_to_iceberg_response(err: &ApiError) -> Response {
@@ -755,7 +795,7 @@ impl Server {
         let metrics_handler = if state.config.posture.is_public() {
             get(|| async { StatusCode::NOT_FOUND })
         } else {
-            get(crate::metrics::serve_metrics)
+            get(api_metrics)
         };
 
         let mut router = Router::new()
@@ -1064,6 +1104,8 @@ impl Server {
             ));
         }
 
+        self.config.compactor_auth.validate(self.config.debug)?;
+
         // Enforce "no wildcard in production" for CORS.
         if !self.config.debug
             && self
@@ -1345,6 +1387,115 @@ mod tests {
             let err = server.validate_config().unwrap_err();
             assert!(matches!(err, arco_core::Error::InvalidInput(_)));
         }
+    }
+
+    #[test]
+    fn protocol_public_routes_are_exact() {
+        assert!(iceberg_public_route(&Method::GET, "/v1/config"));
+        assert!(iceberg_public_route(&Method::HEAD, "/openapi.json"));
+        assert!(!iceberg_public_route(&Method::POST, "/v1/config"));
+        assert!(!iceberg_public_route(&Method::GET, "/private/v1/config"));
+        assert!(!iceberg_public_route(&Method::GET, "/private/openapi.json"));
+
+        assert!(unity_catalog_public_route(&Method::GET, "/openapi.json"));
+        assert!(unity_catalog_public_route(&Method::HEAD, "/openapi.json"));
+        assert!(!unity_catalog_public_route(&Method::POST, "/openapi.json"));
+        assert!(!unity_catalog_public_route(
+            &Method::GET,
+            "/private/openapi.json"
+        ));
+    }
+
+    #[tokio::test]
+    async fn configured_metrics_secret_enforces_documented_headers() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.metrics_secret = Some("  metrics-test-secret  ".to_string());
+        let router = builder.build().test_router();
+
+        let denied = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .context("build unauthenticated metrics request")?,
+            )
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong_secret = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "wrong-secret")
+                    .body(Body::empty())
+                    .context("build metrics request with wrong secret")?,
+            )
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(wrong_secret.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed_custom_header = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "metrics-test-secret")
+                    .body(Body::empty())
+                    .context("build authenticated metrics request")?,
+            )
+            .await
+            .map_err(|err| match err {})?;
+        assert_ne!(allowed_custom_header.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed_bearer = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header(header::AUTHORIZATION, "Bearer metrics-test-secret")
+                    .body(Body::empty())
+                    .context("build bearer-authenticated metrics request")?,
+            )
+            .await
+            .map_err(|err| match err {})?;
+        assert_ne!(allowed_bearer.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_posture_hides_metrics_even_with_configured_secret() -> Result<()> {
+        let mut builder = ServerBuilder::new();
+        builder.config.posture = Posture::Public;
+        builder.config.metrics_secret = Some("metrics-test-secret".to_string());
+        let router = builder.build().test_router();
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "metrics-test-secret")
+                    .body(Body::empty())
+                    .context("build public metrics request")?,
+            )
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_compactor_auth_fails_server_validation() {
+        let mut builder = ServerBuilder::new();
+        builder.config.compactor_auth.mode = crate::config::CompactorAuthMode::StaticBearer;
+        builder.config.compactor_auth.static_bearer_token = None;
+
+        let error = builder
+            .build()
+            .validate_config()
+            .expect_err("missing static compactor token must fail at startup");
+        assert!(error.to_string().contains("STATIC_BEARER_TOKEN"));
     }
 
     fn configure_non_dev_jwt(builder: &mut ServerBuilder) {

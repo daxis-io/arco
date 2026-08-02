@@ -100,7 +100,7 @@ const LEDGER_FRESHNESS_MAX_DATE_PREFIXES: u64 = 32;
 /// where `date` is derived from the event id's ULID timestamp, so any event
 /// newer than the fold watermark lives in a date prefix at or after the
 /// watermark's date. The function lists those prefixes (bounded by
-/// [`LEDGER_FRESHNESS_MAX_DATE_PREFIXES`], plus one day of forward clock
+/// `LEDGER_FRESHNESS_MAX_DATE_PREFIXES`, plus one day of forward clock
 /// slack) and reports [`LedgerFreshness::Current`] only when every listed
 /// event id is at or below the watermark.
 ///
@@ -133,7 +133,7 @@ const LEDGER_FRESHNESS_MAX_DATE_PREFIXES: u64 = 32;
 ///
 /// # Horizon limitation
 ///
-/// The scan is bounded to [`LEDGER_FRESHNESS_MAX_DATE_PREFIXES`] (32) days of
+/// The scan is bounded to `LEDGER_FRESHNESS_MAX_DATE_PREFIXES` (32) days of
 /// date prefixes. A watermark older than that horizon yields
 /// [`LedgerFreshness::Stale`], deliberately restoring the conservative
 /// wall-clock compaction-lag path instead of listing unbounded prefixes.

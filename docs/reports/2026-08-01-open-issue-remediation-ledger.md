@@ -17,8 +17,10 @@ posting current-main evidence to each issue. The remaining 62 rows stay open.
 ## Execution rules
 
 - Refresh `origin/main` and the live issue set before each remediation branch.
-- Build every remediation branch from a clean `origin/main` worktree. Dirty or
-  stale worktrees and pull requests are patch quarries, never proof or bases.
+- Build every independent remediation branch from a clean `origin/main`
+  worktree. A dependency-ordered child may use the exact reviewed parent branch
+  as its recorded base. Dirty, stale, or user-owned WIP worktrees and pull
+  requests are patch quarries, never proof or bases.
 - Record the red reproduction before porting or writing production code.
 - Keep cloud mutation, secret rotation, IAM changes, deployed UAT, and storage
   repair behind an explicit named-owner approval.
@@ -48,10 +50,12 @@ required, in a fresh deployed artifact.
 | [#397](https://github.com/daxis-io/arco/pull/397) | #249 | The branch adds the operator authority runbook and mocked contract; this documentation issue needs no live-cloud evidence |
 | [#398](https://github.com/daxis-io/arco/pull/398) | #356 | The branch adds fail-closed ordered paging, cursor-bounded anti-entropy, and ignored GCS/S3 conformance; local Rust execution was disk-gated below 40 GiB and CI was pending at publication |
 | [#399](https://github.com/daxis-io/arco/pull/399) | #326 | The branch clears both locked Python advisories and adds a non-mutating consolidated failure status; core, extended, documentation, Python, and deterministic UAT jobs passed, while #326 still requires a green default-branch scheduled run including the separate Rust advisory repair |
-| [#400](https://github.com/daxis-io/arco/pull/400) | #331 | The branch enables strict all-target Clippy with explicit test-only panic allowances; local Rust execution was disk-gated and CI is the executable proof |
-| [#401](https://github.com/daxis-io/arco/pull/401) | #340 | Stacked on #398, the branch bounds each log response by object count and bytes, exposes cursor pagination, and preserves the text response contract; child CI remains required |
-| [#402](https://github.com/daxis-io/arco/pull/402) | #327 | Stacked on #399, the branch gives every Rust advisory exception an owner, tracking issue, review date, and expiry gate; exact-head CI was triggered and the default-branch scheduled run remains closure proof |
-| [#403](https://github.com/daxis-io/arco/pull/403) | #328 | The branch atomically deduplicates in-flight and recent dispatch IDs with bounded retention; 15 focused and all 190 Python unit tests passed locally, while default-branch CI remains required |
+| [#400](https://github.com/daxis-io/arco/pull/400) | #331 | The branch enables strict all-target Clippy with explicit test-only panic policy. Exact-head CI exposed and drove repairs in CLI, xtask, and core test targets; commit `99ed18f0` is the current all-target acceptance rerun, while local Rust execution remains disk-gated |
+| [#401](https://github.com/daxis-io/arco/pull/401) | #340 | Stacked on #398, the branch bounds each log response by object count and bytes, exposes cursor pagination, and preserves the text response contract; exact-head check, Clippy, core/extended tests, and both documentation jobs passed, with only the separately remediated default-branch advisory gate failing |
+| [#402](https://github.com/daxis-io/arco/pull/402) | #327 | Stacked on #399, the branch gives every Rust advisory exception an owner, tracking issue, review date, and expiry gate, and updates `event-listener` past the newly exposed advisory. Exact-head Cargo Deny advisory and policy jobs passed; the default-branch scheduled run remains closure proof |
+| [#403](https://github.com/daxis-io/arco/pull/403) | #328 | The branch atomically deduplicates in-flight and recent dispatch IDs with bounded retention; 15 focused and all 190 Python unit tests passed locally, and exact-head check, Clippy, Python, documentation, protocol, extended, and full Rust test jobs passed. Only the separately remediated default-branch advisory gate failed |
+| [#404](https://github.com/daxis-io/arco/pull/404) | #339, #367 | Stacked on #403, the branch carries canonical partition scope and heartbeat budgets through the existing payload extension, reconstructs worker scope, emits heartbeats, and handles cooperative cancellation and superseded attempts. All 202 Python unit tests passed locally; exact-head check, Clippy, Python, docs, protocol, gates, extended tests, and one documentation suite passed while the full Rust and second documentation jobs remained in progress |
+| [#405](https://github.com/daxis-io/arco/pull/405) | #337 | Stacked on #404, the branch derives replay-stable bounded retry deadlines, honors explicit non-retryable errors, releases attempt N+1 through anti-entropy, and rescues legacy deadline-less rows. Local Rust execution was disk-gated; exact-head CI runs `30741808251` and `30741808267` are the executable acceptance proof |
 
 PR #374 contains this ledger and the Wave 0 closure evidence. User-owned stacked
 PRs #381-#392 overlap several other rows; treat them as patch quarries and

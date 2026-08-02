@@ -2,9 +2,13 @@
 //!
 //! This module validates Google-style OIDC ID tokens for internal HTTP callbacks.
 //! It enforces:
-//! - Signature verification (JWKS or optional HS256 test secret)
+//! - Signature verification (JWKS, or an explicitly enabled HS256 development secret)
 //! - Required issuer and audience checks
 //! - Principal allowlisting via `sub` and/or `email`
+//!
+//! Configuring internal auth enables enforcement by default. Report-only mode and symmetric
+//! verification are deliberately explicit weakened postures and are announced at verifier
+//! construction time.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -20,6 +24,7 @@ use crate::error::Error;
 
 const DEFAULT_GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
 const DEFAULT_JWKS_TTL_SECS: u64 = 300;
+const ALLOW_HS256_ENV: &str = "ARCO_INTERNAL_AUTH_ALLOW_HS256";
 
 #[derive(Debug, Clone)]
 struct CachedJwks {
@@ -54,6 +59,19 @@ pub struct InternalOidcConfig {
     pub jwks_cache_ttl: Duration,
 }
 
+#[derive(Debug, Default, Clone)]
+struct InternalOidcSettings {
+    enforce: Option<bool>,
+    issuer: Option<String>,
+    audience: Option<String>,
+    allowed_subs: BTreeSet<String>,
+    allowed_emails: BTreeSet<String>,
+    jwks_url: Option<String>,
+    hs256_secret: Option<String>,
+    allow_hs256: bool,
+    jwks_cache_ttl_secs: Option<u64>,
+}
+
 impl InternalOidcConfig {
     /// Builds internal OIDC configuration from environment variables.
     ///
@@ -64,26 +82,51 @@ impl InternalOidcConfig {
     /// - `ARCO_INTERNAL_AUTH_AUDIENCE`
     /// - `ARCO_INTERNAL_AUTH_ALLOWED_SUBS` (comma-separated)
     /// - `ARCO_INTERNAL_AUTH_ALLOWED_EMAILS` (comma-separated)
-    /// - `ARCO_INTERNAL_AUTH_ENFORCE` (`true`/`false`)
+    /// - `ARCO_INTERNAL_AUTH_ENFORCE` (`true`/`false`; defaults to `true` when configured)
     /// - `ARCO_INTERNAL_AUTH_JWKS_URL` (optional)
     /// - `ARCO_INTERNAL_AUTH_HS256_SECRET` (optional; tests/dev)
+    /// - `ARCO_INTERNAL_AUTH_ALLOW_HS256` (required when an HS256 secret is configured)
     /// - `ARCO_INTERNAL_AUTH_JWKS_CACHE_TTL_SECS` (optional)
     ///
     /// # Errors
     ///
     /// Returns an error when required variables are missing or malformed.
     pub fn from_env() -> Result<Option<Self>, Error> {
-        let enforce = parse_env_bool("ARCO_INTERNAL_AUTH_ENFORCE", false)?;
-        let issuer = env_string("ARCO_INTERNAL_AUTH_ISSUER");
-        let audience = env_string("ARCO_INTERNAL_AUTH_AUDIENCE");
-        let allowed_subs = parse_csv_set(env_string("ARCO_INTERNAL_AUTH_ALLOWED_SUBS"));
-        let allowed_emails = parse_csv_set(env_string("ARCO_INTERNAL_AUTH_ALLOWED_EMAILS"));
+        Self::from_settings(InternalOidcSettings {
+            enforce: parse_env_opt_bool("ARCO_INTERNAL_AUTH_ENFORCE")?,
+            issuer: env_string("ARCO_INTERNAL_AUTH_ISSUER"),
+            audience: env_string("ARCO_INTERNAL_AUTH_AUDIENCE"),
+            allowed_subs: parse_csv_set(env_string("ARCO_INTERNAL_AUTH_ALLOWED_SUBS")),
+            allowed_emails: parse_csv_set(env_string("ARCO_INTERNAL_AUTH_ALLOWED_EMAILS")),
+            jwks_url: env_string("ARCO_INTERNAL_AUTH_JWKS_URL"),
+            hs256_secret: env_string("ARCO_INTERNAL_AUTH_HS256_SECRET"),
+            allow_hs256: parse_env_opt_bool(ALLOW_HS256_ENV)?.unwrap_or(false),
+            jwks_cache_ttl_secs: parse_env_opt_u64("ARCO_INTERNAL_AUTH_JWKS_CACHE_TTL_SECS")?,
+        })
+    }
 
-        let enabled = enforce
+    fn from_settings(settings: InternalOidcSettings) -> Result<Option<Self>, Error> {
+        let InternalOidcSettings {
+            enforce,
+            issuer,
+            audience,
+            allowed_subs,
+            allowed_emails,
+            jwks_url,
+            hs256_secret,
+            allow_hs256,
+            jwks_cache_ttl_secs,
+        } = settings;
+
+        let enabled = enforce.is_some()
             || issuer.is_some()
             || audience.is_some()
             || !allowed_subs.is_empty()
-            || !allowed_emails.is_empty();
+            || !allowed_emails.is_empty()
+            || jwks_url.is_some()
+            || hs256_secret.is_some()
+            || allow_hs256
+            || jwks_cache_ttl_secs.is_some();
         if !enabled {
             return Ok(None);
         }
@@ -104,23 +147,29 @@ impl InternalOidcConfig {
             ));
         }
 
-        let jwks_url = env_string("ARCO_INTERNAL_AUTH_JWKS_URL")
-            .unwrap_or_else(|| DEFAULT_GOOGLE_JWKS_URL.to_string());
-        let hs256_secret = env_string("ARCO_INTERNAL_AUTH_HS256_SECRET");
-        let jwks_cache_ttl = Duration::from_secs(parse_env_u64(
-            "ARCO_INTERNAL_AUTH_JWKS_CACHE_TTL_SECS",
-            DEFAULT_JWKS_TTL_SECS,
-        )?);
+        if hs256_secret.is_some() && !allow_hs256 {
+            return Err(Error::InvalidInput(format!(
+                "ARCO_INTERNAL_AUTH_HS256_SECRET replaces JWKS verification; set {ALLOW_HS256_ENV}=true only for local development"
+            )));
+        }
+        if hs256_secret.is_some() && jwks_url.is_some() {
+            return Err(Error::InvalidInput(
+                "ARCO_INTERNAL_AUTH_HS256_SECRET and ARCO_INTERNAL_AUTH_JWKS_URL must not be configured together"
+                    .to_string(),
+            ));
+        }
 
         Ok(Some(Self {
             issuer,
             audience,
             allowed_subs,
             allowed_emails,
-            enforce,
-            jwks_url,
+            enforce: enforce.unwrap_or(true),
+            jwks_url: jwks_url.unwrap_or_else(|| DEFAULT_GOOGLE_JWKS_URL.to_string()),
             hs256_secret,
-            jwks_cache_ttl,
+            jwks_cache_ttl: Duration::from_secs(
+                jwks_cache_ttl_secs.unwrap_or(DEFAULT_JWKS_TTL_SECS),
+            ),
         }))
     }
 
@@ -205,6 +254,26 @@ impl InternalOidcVerifier {
             return Err(Error::InvalidInput(
                 "at least one internal oidc allowlist is required".to_string(),
             ));
+        }
+        if config.hs256_secret.is_some() && config.jwks_url != DEFAULT_GOOGLE_JWKS_URL {
+            return Err(Error::InvalidInput(
+                "internal oidc HS256 secret and custom JWKS URL must not be configured together"
+                    .to_string(),
+            ));
+        }
+
+        if !config.enforce {
+            tracing::warn!(
+                issuer = %config.issuer,
+                audience = %config.audience,
+                "internal auth is report-only: requests that fail verification will be served"
+            );
+        }
+        if config.hs256_secret.is_some() {
+            tracing::warn!(
+                audience = %config.audience,
+                "internal auth is using an explicitly enabled HS256 development secret instead of JWKS"
+            );
         }
 
         let http = reqwest::Client::builder()
@@ -425,25 +494,26 @@ fn parse_csv_set(input: Option<String>) -> BTreeSet<String> {
         .collect()
 }
 
-fn parse_env_bool(key: &str, default: bool) -> Result<bool, Error> {
+fn parse_env_opt_bool(key: &str) -> Result<Option<bool>, Error> {
     let Some(value) = std::env::var(key).ok() else {
-        return Ok(default);
+        return Ok(None);
     };
     match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" => Ok(true),
-        "0" | "false" | "no" | "n" => Ok(false),
+        "1" | "true" | "yes" | "y" => Ok(Some(true)),
+        "0" | "false" | "no" | "n" => Ok(Some(false)),
         _ => Err(Error::InvalidInput(format!(
             "{key} must be a boolean (true/false/1/0)"
         ))),
     }
 }
 
-fn parse_env_u64(key: &str, default: u64) -> Result<u64, Error> {
+fn parse_env_opt_u64(key: &str) -> Result<Option<u64>, Error> {
     let Some(value) = std::env::var(key).ok() else {
-        return Ok(default);
+        return Ok(None);
     };
     value
         .parse::<u64>()
+        .map(Some)
         .map_err(|_| Error::InvalidInput(format!("{key} must be an unsigned integer")))
 }
 
@@ -451,6 +521,110 @@ fn parse_env_u64(key: &str, default: u64) -> Result<u64, Error> {
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header};
+
+    fn configured_settings() -> InternalOidcSettings {
+        InternalOidcSettings {
+            issuer: Some("https://accounts.google.com".to_string()),
+            audience: Some("https://internal.run.app".to_string()),
+            allowed_emails: BTreeSet::from([String::from(
+                "caller@example.iam.gserviceaccount.com",
+            )]),
+            ..InternalOidcSettings::default()
+        }
+    }
+
+    #[test]
+    fn enforcement_defaults_on_when_internal_auth_is_configured() {
+        let config = InternalOidcConfig::from_settings(configured_settings())
+            .expect("settings are valid")
+            .expect("internal auth is enabled");
+        assert!(config.enforce);
+    }
+
+    #[test]
+    fn report_only_requires_explicit_false() {
+        let settings = InternalOidcSettings {
+            enforce: Some(false),
+            ..configured_settings()
+        };
+        let config = InternalOidcConfig::from_settings(settings)
+            .expect("settings are valid")
+            .expect("internal auth is enabled");
+        assert!(!config.enforce);
+    }
+
+    #[test]
+    fn enforce_false_alone_is_invalid_partial_configuration() {
+        let settings = InternalOidcSettings {
+            enforce: Some(false),
+            ..InternalOidcSettings::default()
+        };
+        let error = InternalOidcConfig::from_settings(settings)
+            .expect_err("partial internal auth must not silently disable authentication");
+        assert!(error.to_string().contains("ARCO_INTERNAL_AUTH_ISSUER"));
+    }
+
+    #[test]
+    fn hs256_secret_requires_explicit_development_opt_in() {
+        let settings = InternalOidcSettings {
+            hs256_secret: Some("shared-secret".to_string()),
+            ..configured_settings()
+        };
+        let error = InternalOidcConfig::from_settings(settings)
+            .expect_err("hs256 must not silently replace jwks verification");
+        assert!(error.to_string().contains(ALLOW_HS256_ENV));
+    }
+
+    #[test]
+    fn explicit_jwks_and_hs256_sources_are_rejected_as_ambiguous() {
+        let settings = InternalOidcSettings {
+            jwks_url: Some("https://issuer.example/jwks".to_string()),
+            hs256_secret: Some("shared-secret".to_string()),
+            allow_hs256: true,
+            ..configured_settings()
+        };
+        let error = InternalOidcConfig::from_settings(settings)
+            .expect_err("signature-source precedence must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must not be configured together")
+        );
+    }
+
+    #[test]
+    fn hs256_is_accepted_only_with_explicit_opt_in_and_no_explicit_jwks() {
+        let settings = InternalOidcSettings {
+            hs256_secret: Some("shared-secret".to_string()),
+            allow_hs256: true,
+            ..configured_settings()
+        };
+        let config = InternalOidcConfig::from_settings(settings)
+            .expect("settings are valid")
+            .expect("internal auth is enabled");
+        assert_eq!(config.hs256_secret.as_deref(), Some("shared-secret"));
+    }
+
+    #[test]
+    fn verifier_rejects_programmatic_hs256_and_custom_jwks_precedence() {
+        let mut config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://internal.run.app",
+            "shared-secret",
+            BTreeSet::from([String::from("svc-allowed")]),
+            BTreeSet::new(),
+            true,
+        );
+        config.jwks_url = "https://issuer.example/jwks".to_string();
+        let error = InternalOidcVerifier::new(config)
+            .err()
+            .expect("verifier must not choose one configured signature source over another");
+        assert!(
+            error
+                .to_string()
+                .contains("must not be configured together")
+        );
+    }
 
     fn signed_token(secret: &str, claims: Value) -> Result<String, Box<dyn std::error::Error>> {
         let token = jsonwebtoken::encode(

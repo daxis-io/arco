@@ -142,12 +142,22 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "ARCO_COMPACTOR_URL"
-        value = google_cloud_run_v2_service.compactor.uri
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUTH_MODE"
+        value = "gcp_id_token"
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUTH_AUDIENCE"
+        value = local.compactor_service_url
       }
 
       env {
         name  = "ARCO_ORCH_COMPACTOR_URL"
-        value = google_cloud_run_v2_service.flow_compactor.uri
+        value = local.flow_compactor_service_url
       }
 
       env {
@@ -326,6 +336,38 @@ resource "google_cloud_run_v2_service" "compactor" {
         value = var.compactor_repair_automation_domains
       }
 
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ENFORCE"
+        value = "true"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ISSUER"
+        value = "https://accounts.google.com"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_AUDIENCE"
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ALLOWED_EMAILS"
+        value = local.compactor_internal_auth_allowed_emails
+      }
+
+      # Anti-entropy re-enters /internal/notify through Cloud Run. Use the canonical
+      # service URL so the client mints an ID token instead of calling loopback without auth.
+      env {
+        name  = "ARCO_COMPACTOR_URL"
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUDIENCE"
+        value = local.compactor_service_url
+      }
+
       # Compaction interval (seconds)
       env {
         name  = "ARCO_COMPACTOR_INTERVAL_SECS"
@@ -457,6 +499,26 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
       env {
         name  = "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE"
         value = var.flow_compactor_repair_automation_scope
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ENFORCE"
+        value = "true"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ISSUER"
+        value = "https://accounts.google.com"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_AUDIENCE"
+        value = local.flow_compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ALLOWED_EMAILS"
+        value = local.flow_compactor_internal_auth_allowed_emails
       }
 
       env {

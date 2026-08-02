@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::HeaderName;
-use axum::http::{HeaderMap, HeaderValue, Request};
+use axum::http::{HeaderMap, HeaderValue, Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -94,8 +94,30 @@ fn add_request_id_header(response: &mut Response, request_id: &str) {
     }
 }
 
-fn unity_catalog_public_path(path: &str) -> bool {
-    path.ends_with("/openapi.json")
+fn unity_catalog_public_route(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && path == "/openapi.json"
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Method;
+
+    use super::unity_catalog_public_route;
+
+    #[test]
+    fn public_route_matches_only_exact_router_endpoint() {
+        assert!(unity_catalog_public_route(&Method::GET, "/openapi.json"));
+        assert!(unity_catalog_public_route(&Method::HEAD, "/openapi.json"));
+        assert!(!unity_catalog_public_route(&Method::POST, "/openapi.json"));
+        assert!(!unity_catalog_public_route(
+            &Method::GET,
+            "/private/openapi.json"
+        ));
+        assert!(!unity_catalog_public_route(
+            &Method::GET,
+            "/catalog/openapi.json"
+        ));
+    }
 }
 
 /// Middleware that injects a request context and echoes the request ID.
@@ -115,7 +137,7 @@ pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     let request_id =
         request_id_from_headers(&parts.headers).unwrap_or_else(|| ulid::Ulid::new().to_string());
 
-    if unity_catalog_public_path(parts.uri.path()) {
+    if unity_catalog_public_route(&parts.method, parts.uri.path()) {
         let mut response = next.run(Request::from_parts(parts, body)).await;
         add_request_id_header(&mut response, &request_id);
         return response;

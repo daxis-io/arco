@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def test_dispatch_payload_parses_task_token_fields() -> None:
     from arco_flow.worker.server import DispatchPayload
@@ -24,11 +26,13 @@ def test_dispatch_payload_parses_task_token_fields() -> None:
 def test_payload_task_token_takes_precedence() -> None:
     from arco_flow.worker.server import _select_task_token
 
-    assert _select_task_token("payload-token", "fallback-token") == "payload-token"
+    assert _select_task_token("payload-token") == "payload-token"
 
 
-def test_fallback_task_token_used_when_payload_missing() -> None:
+def test_missing_payload_task_token_fails_closed() -> None:
     from arco_flow.worker.server import _select_task_token
 
-    assert _select_task_token(None, "fallback-token") == "fallback-token"
-    assert _select_task_token(" ", "fallback-token") == "fallback-token"
+    with pytest.raises(ValueError, match="task token"):
+        _select_task_token(None)
+    with pytest.raises(ValueError, match="task token"):
+        _select_task_token(" ")

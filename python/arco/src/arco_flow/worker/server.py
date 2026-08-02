@@ -9,7 +9,9 @@ import io
 import json
 import os
 import socket
+import threading
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -30,6 +32,10 @@ console = Console()
 err_console = Console(stderr=True)
 
 DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
+
+# Cloud Tasks redeliveries can arrive before or after the original request
+# finishes. Retain a bounded completed-ID window in addition to active claims.
+DISPATCH_HISTORY_LIMIT = 1024
 
 
 def _now_iso() -> str:
@@ -224,6 +230,9 @@ class DispatchWorker:
         )
         self._client = ArcoFlowApiClient(config)
         self._assets = self._load_assets(root_path)
+        self._dispatch_lock = threading.Lock()
+        self._inflight_dispatches: set[str] = set()
+        self._recent_dispatches: OrderedDict[str, None] = OrderedDict()
 
     def _load_assets(self, root_path: Path) -> dict[str, Any]:
         discovery = AssetDiscovery(root_path=root_path)
@@ -243,6 +252,37 @@ class DispatchWorker:
 
     def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
         self._validate_dispatch_envelope(payload)
+        # The HTTP handler treats this early return as a successful acknowledgement,
+        # so a redelivery cannot execute the same attempt concurrently.
+        if not self._claim_dispatch(payload.dispatch_id):
+            return
+
+        completed = False
+        try:
+            self._run_dispatch(payload)
+            completed = True
+        finally:
+            # Pre-completion transport failures remain retryable; a dispatch whose
+            # lifecycle callback completed is retained for bounded redelivery dedup.
+            self._release_dispatch(payload.dispatch_id, completed=completed)
+
+    def _claim_dispatch(self, dispatch_id: str) -> bool:
+        with self._dispatch_lock:
+            if dispatch_id in self._inflight_dispatches or dispatch_id in self._recent_dispatches:
+                return False
+            self._inflight_dispatches.add(dispatch_id)
+            return True
+
+    def _release_dispatch(self, dispatch_id: str, *, completed: bool) -> None:
+        with self._dispatch_lock:
+            self._inflight_dispatches.discard(dispatch_id)
+            if not completed:
+                return
+            self._recent_dispatches[dispatch_id] = None
+            while len(self._recent_dispatches) > DISPATCH_HISTORY_LIMIT:
+                self._recent_dispatches.popitem(last=False)
+
+    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
         self._client.task_started(

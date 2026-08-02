@@ -9,15 +9,18 @@ import io
 import json
 import os
 import socket
+import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any
+from typing import TYPE_CHECKING, Any, TextIO, cast
 from urllib.parse import urlsplit, urlunsplit
 
+import structlog
 from rich.console import Console
 
 from arco_flow.cli.config import ArcoFlowConfig, get_config
@@ -26,10 +29,89 @@ from arco_flow.context import AssetContext
 from arco_flow.manifest.discovery import AssetDiscovery, AssetDiscoveryError
 from arco_flow.types import AssetOut, PartitionKey
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 console = Console()
 err_console = Console(stderr=True)
+logger = structlog.get_logger()
 
 DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
+
+
+class _ThreadLocalStream:
+    """Delegate writes to a task-local buffer without reassigning global streams."""
+
+    def __init__(self, fallback: TextIO) -> None:
+        self._fallback = fallback
+        self._local = threading.local()
+
+    def _target(self) -> TextIO:
+        target = getattr(self._local, "target", None)
+        return self._fallback if target is None else target
+
+    def __getattr__(self, name: str) -> object:
+        return cast("object", getattr(self._target(), name))
+
+    @contextlib.contextmanager
+    def capture(self, target: TextIO) -> Iterator[None]:
+        previous = getattr(self._local, "target", None)
+        self._local.target = target
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._local.target
+            else:
+                self._local.target = previous
+
+    def write(self, value: str) -> int:
+        return self._target().write(value)
+
+    def flush(self) -> None:
+        self._target().flush()
+
+    def isatty(self) -> bool:
+        return self._target().isatty()
+
+    def fileno(self) -> int:
+        return self._target().fileno()
+
+    @property
+    def encoding(self) -> str | None:
+        return self._fallback.encoding
+
+    @property
+    def errors(self) -> str | None:
+        return self._fallback.errors
+
+
+_STREAM_PROXY_LOCK = threading.Lock()
+
+
+def _install_thread_local_stream_proxies() -> tuple[_ThreadLocalStream, _ThreadLocalStream]:
+    """Install one process-wide proxy per stream, preserving thread-local capture targets."""
+    with _STREAM_PROXY_LOCK:
+        if isinstance(sys.stdout, _ThreadLocalStream):
+            stdout_proxy = sys.stdout
+        else:
+            stdout_proxy = _ThreadLocalStream(sys.stdout)
+            sys.stdout = cast("TextIO", stdout_proxy)
+
+        if isinstance(sys.stderr, _ThreadLocalStream):
+            stderr_proxy = sys.stderr
+        else:
+            stderr_proxy = _ThreadLocalStream(sys.stderr)
+            sys.stderr = cast("TextIO", stderr_proxy)
+
+    return stdout_proxy, stderr_proxy
+
+
+@contextlib.contextmanager
+def _capture_task_output(stdout: TextIO, stderr: TextIO) -> Iterator[None]:
+    stdout_proxy, stderr_proxy = _install_thread_local_stream_proxies()
+    with stdout_proxy.capture(stdout), stderr_proxy.capture(stderr):
+        yield
 
 
 def _now_iso() -> str:
@@ -264,10 +346,7 @@ class DispatchWorker:
         outcome = "SUCCEEDED"
 
         try:
-            with (
-                contextlib.redirect_stdout(stdout_buffer),
-                contextlib.redirect_stderr(stderr_buffer),
-            ):
+            with _capture_task_output(stdout_buffer, stderr_buffer):
                 result = self._execute_asset(payload)
             if isinstance(result, AssetOut):
                 output_payload = {
@@ -305,8 +384,19 @@ class DispatchWorker:
                     attempt=payload.attempt,
                     stdout=stdout_buffer.getvalue(),
                     stderr=stderr_buffer.getvalue(),
+                    task_token=task_token,
+                    callback_base_url=payload.callback_base_url,
                 )
             except ApiError as err:
+                logger.warning(
+                    "worker_log_upload_failed",
+                    tenant_id=payload.tenant_id,
+                    workspace_id=payload.workspace_id,
+                    run_id=payload.run_id,
+                    task_key=payload.task_key,
+                    attempt=payload.attempt,
+                    error=str(err),
+                )
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
 
     def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:

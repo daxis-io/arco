@@ -136,6 +136,13 @@ runtime wiring is owned by the orchestration service layer.
 - Watermark freshness guards prevent stale decisions (ADR-022)
 - Anti-entropy sweeper recovers stuck work
 - Micro-compaction provides near-real-time visibility (~1-5s lag)
+- A retryable failure with attempts remaining folds to `RETRY_WAIT` with a
+  replay-stable deadline derived from the failure event timestamp: five-second
+  exponential backoff, capped at 300 seconds. An explicit non-retryable worker
+  error is terminal.
+- Anti-entropy emits the next deterministic dispatch once that deadline is due.
+  Rows written before the deadline field existed are treated as due immediately
+  so an upgrade cannot preserve a stranded `RETRY_WAIT` task.
 
 ## Related ADRs
 

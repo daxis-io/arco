@@ -361,6 +361,59 @@ def test_dispatch_worker_bounds_completed_dispatch_history() -> None:
     assert f"dispatch-{DISPATCH_HISTORY_LIMIT}" in worker._recent_dispatches
 
 
+def test_worker_dispatch_envelope_reads_partition_key_from_payload() -> None:
+    payload = _sample_canonical_envelope_dict()
+    payload["payload"] = {"partitionKey": "date=d:2026-01-01"}
+
+    envelope = WorkerDispatchEnvelope.from_dict(payload)
+
+    assert envelope.partition_key == "date=d:2026-01-01"
+
+
+def test_dispatch_worker_executes_the_requested_partition() -> None:
+    observed: list[str] = []
+
+    def asset_fn(ctx: AssetContext) -> AssetOut:
+        observed.append(ctx.partition_key.canonical_string())
+        return AssetOut([], row_count=1)
+
+    client = _RecordingClient()
+    worker = _bare_worker(
+        api_url="https://callbacks.example",
+        client=client,
+        assets={"analytics.daily_sales": asset_fn},
+    )
+    payload = _sample_canonical_envelope_dict()
+    payload["payload"] = {"partitionKey": "date=d:2026-01-01"}
+
+    worker.handle_dispatch(WorkerDispatchEnvelope.from_dict(payload))
+
+    assert observed == ["date=d:2026-01-01"]
+    assert client.completed_calls[0]["outcome"] == "SUCCEEDED"
+
+
+def test_dispatch_worker_rejects_malformed_partition_before_asset_execution() -> None:
+    executions: list[str] = []
+
+    def asset_fn(ctx: AssetContext) -> AssetOut:
+        executions.append(ctx.run_id)
+        return AssetOut([], row_count=1)
+
+    client = _RecordingClient()
+    worker = _bare_worker(
+        api_url="https://callbacks.example",
+        client=client,
+        assets={"analytics.daily_sales": asset_fn},
+    )
+    payload = _sample_canonical_envelope_dict()
+    payload["payload"] = {"partitionKey": "not-a-partition"}
+
+    worker.handle_dispatch(WorkerDispatchEnvelope.from_dict(payload))
+
+    assert executions == []
+    assert client.completed_calls[0]["outcome"] == "FAILED"
+
+
 def test_dispatch_http_rejects_missing_dispatch_authorization() -> None:
     class FakeWorker:
         def __init__(self) -> None:

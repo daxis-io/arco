@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use arco_worker_contract::{
     CallbackErrorResponse, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
-    TaskStartedRequest, WorkerDispatchEnvelope, callback_task_id, deterministic_attempt_id,
-    parse_callback_task_id,
+    TaskStartedRequest, WorkerDispatchEnvelope, WorkerEnginePayload, callback_task_id,
+    deterministic_attempt_id, parse_callback_task_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -39,6 +39,35 @@ where
 #[test]
 fn canonical_worker_dispatch_envelope_matches_fixture() {
     assert_fixture_roundtrip::<WorkerDispatchEnvelope>("worker_dispatch_envelope.json");
+}
+
+#[test]
+fn worker_engine_payload_roundtrips_planned_execution_scope() {
+    let payload = WorkerEnginePayload {
+        partition_key: Some("date=d:2026-01-01".to_string()),
+        heartbeat_timeout_sec: Some(600),
+    };
+
+    let value = payload.to_value().expect("serialize engine payload");
+    assert_eq!(value["partitionKey"], "date=d:2026-01-01");
+    assert_eq!(value["heartbeatTimeoutSec"], 600);
+    assert_eq!(
+        WorkerEnginePayload::from_value(&value).expect("parse engine payload"),
+        payload
+    );
+}
+
+#[test]
+fn worker_engine_payload_accepts_legacy_names_and_unknown_members() {
+    let parsed = WorkerEnginePayload::from_value(&json!({
+        "partition_key": "date=d:2026-01-01",
+        "heartbeat_timeout_sec": 300,
+        "engineSpecific": true
+    }))
+    .expect("parse legacy engine payload");
+
+    assert_eq!(parsed.partition_key.as_deref(), Some("date=d:2026-01-01"));
+    assert_eq!(parsed.heartbeat_timeout_sec, Some(300));
 }
 
 #[test]

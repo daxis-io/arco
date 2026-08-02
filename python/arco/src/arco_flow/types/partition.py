@@ -152,6 +152,24 @@ class PartitionKey:
         object.__setattr__(instance, "dimensions", FrozenDict(dims))
         return instance
 
+    @classmethod
+    def from_canonical_string(cls, canonical: str) -> PartitionKey:
+        """Parse the ADR-011 encoding emitted by ``canonical_string``."""
+        if not canonical:
+            return cls()
+
+        proto_dict: dict[str, str] = {}
+        for segment in canonical.split(","):
+            key, separator, tagged = segment.partition("=")
+            if not separator:
+                msg = f"Invalid canonical partition key segment: {segment!r}"
+                raise ValueError(msg)
+            if key in proto_dict:
+                msg = f"Duplicate partition dimension: {key!r}"
+                raise ValueError(msg)
+            proto_dict[key] = tagged
+        return cls.from_proto_dict(proto_dict)
+
     def canonical_string(self) -> str:
         if not self.dimensions:
             return ""

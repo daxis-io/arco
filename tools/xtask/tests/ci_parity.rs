@@ -197,6 +197,29 @@ fn python_ci_uses_locked_uv_resolution() {
 }
 
 #[test]
+fn scheduled_security_audit_publishes_one_non_mutating_failure_signal() {
+    let security_audit =
+        fs::read_to_string(repo_root().join(".github/workflows/security-audit.yml"))
+            .expect("read security audit workflow");
+
+    for required in [
+        "name: Security Audit Status",
+        "if: ${{ always() }}",
+        "GITHUB_STEP_SUMMARY",
+        "::error title=Security Audit failed::",
+    ] {
+        assert!(
+            security_audit.contains(required),
+            "security audit should retain failure-alert lifecycle fragment: {required}"
+        );
+    }
+    assert!(
+        !security_audit.contains("issues: write"),
+        "security audit status must remain non-mutating"
+    );
+}
+
+#[test]
 fn dependabot_version_updates_are_rate_limited() {
     let dependabot = fs::read_to_string(repo_root().join(".github/dependabot.yml"))
         .expect("read dependabot config");

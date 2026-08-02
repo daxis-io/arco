@@ -449,6 +449,30 @@ fn run_ci_parity_check() -> Result<()> {
         &security_audit,
         "pip-audit==${PIP_AUDIT_VERSION}",
     );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "name: Security Audit Status",
+    );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "GITHUB_STEP_SUMMARY",
+    );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "::error title=Security Audit failed::",
+    );
+    require_absent(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "issues: write",
+    );
     require_absent(
         &mut errors,
         "security-audit.yml",

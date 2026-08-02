@@ -26,6 +26,31 @@ posting current-main evidence to each issue. The remaining 62 rows stay open.
 - Track issues opened after this baseline in a separate refresh cohort; do not
   change the 68-issue denominator.
 
+## Published remediation branches
+
+The following pull requests were open on 2026-08-02. They record implementation
+progress, not issue closure. Keep each issue open until its required closure
+proof in the original-cohort table exists on the default branch and, where
+required, in a fresh deployed artifact.
+
+| Pull request | Original-cohort issues | Evidence boundary |
+|---|---|---|
+| [#375](https://github.com/daxis-io/arco/pull/375) | #363, #364 | The branch hardens repository posture; secret rotation and deployed private-debug proof remain external |
+| [#376](https://github.com/daxis-io/arco/pull/376) | #365, #366 | The branch wires CI; GCS and S3 still need successful provider artifacts |
+| [#377](https://github.com/daxis-io/arco/pull/377) | #333, #347-#350 | The branch removes auth/config ambiguity; default-branch CI remains required |
+| [#378](https://github.com/daxis-io/arco/pull/378) | #336, #368 | Branch tests cover catalog publication failure paths |
+| [#379](https://github.com/daxis-io/arco/pull/379) | #324 | Branch tests cover monotonic force-break fencing |
+| [#380](https://github.com/daxis-io/arco/pull/380) | #357 | Repository repair defaults fail safe; deployed posture remains external |
+| [#393](https://github.com/daxis-io/arco/pull/393) | #343, #344 | Branch tests cover age-gated cleanup behavior |
+| [#394](https://github.com/daxis-io/arco/pull/394) | #325, #330 | The branch hardens internal authentication defaults; the known default-branch Cargo advisory remains outside this PR |
+| [#395](https://github.com/daxis-io/arco/pull/395) | #329, #332 | The branch isolates worker output and authenticates log upload; the known default-branch Cargo advisory remains outside this PR |
+| [#396](https://github.com/daxis-io/arco/pull/396) | #355 | The branch caps and deduplicates paths, charges physical-path quota, and counts physical URLs; long CI tests were still running at refresh time |
+| [#397](https://github.com/daxis-io/arco/pull/397) | #249 | The branch adds the operator authority runbook and mocked contract; this documentation issue needs no live-cloud evidence |
+
+PR #374 contains this ledger and the Wave 0 closure evidence. User-owned stacked
+PRs #381-#392 overlap several other rows; treat them as patch quarries and
+pending review, not as frozen-baseline or closure proof.
+
 ## Original cohort
 
 | Issue | Audit verdict | Resolution owner | Required closure proof | State |

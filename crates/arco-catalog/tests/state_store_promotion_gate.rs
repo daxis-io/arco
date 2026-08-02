@@ -5,14 +5,25 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use arco_catalog::state_store::promotion_gate::{
-    FallbackRecommendation, MeasurementSource, PromotionCriterion, PromotionDecision,
-    PromotionGateInput, PromotionMeasurement, PromotionMeasurementKind,
+    FallbackRecommendation, MeasurementSource, MeasurementValue, PromotionCriterion,
+    PromotionDecision, PromotionGateInput, PromotionMeasurement, PromotionMeasurementKind,
 };
 
 fn fixture_measurements() -> Vec<PromotionMeasurement> {
     PromotionMeasurementKind::ALL
         .into_iter()
-        .map(|kind| PromotionMeasurement::new(kind, MeasurementSource::DeterministicFixture))
+        .map(|kind| {
+            kind.budget().map_or_else(
+                || PromotionMeasurement::new(kind, MeasurementSource::DeterministicFixture),
+                |budget| {
+                    PromotionMeasurement::with_value(
+                        kind,
+                        MeasurementSource::DeterministicFixture,
+                        budget,
+                    )
+                },
+            )
+        })
         .collect()
 }
 
@@ -176,4 +187,124 @@ fn complete_evidence_is_only_candidate_complete_not_a_cutover() {
         &FallbackRecommendation::current_synchronous_compactor_authority(),
         report.fallback_recommendation()
     );
+}
+
+#[test]
+fn budgeted_measurement_at_the_budget_boundary_passes() {
+    let report = complete_input().evaluate();
+    assert_eq!(
+        PromotionDecision::CandidateEvidenceComplete,
+        report.decision()
+    );
+    for status in report.measurements() {
+        assert!(
+            status.satisfied(),
+            "boundary-value measurement {:?} should satisfy its budget",
+            status.kind()
+        );
+    }
+}
+
+#[test]
+fn budgeted_measurement_over_budget_rejects_advancement() {
+    let over_budget = [
+        (
+            PromotionMeasurementKind::WarmWriteP99NarrowMetadataMutation,
+            MeasurementValue::DurationMicros(250_001),
+        ),
+        (
+            PromotionMeasurementKind::WarmPointReadP99,
+            MeasurementValue::DurationMicros(50_001),
+        ),
+        (
+            PromotionMeasurementKind::ColdWriterStartupToWriteReady,
+            MeasurementValue::DurationMicros(2_000_001),
+        ),
+        (
+            PromotionMeasurementKind::ManifestReachableReplayBytes,
+            MeasurementValue::Bytes(64 * 1024 * 1024 + 1),
+        ),
+    ];
+    for (kind, value) in over_budget {
+        let measurements = fixture_measurements().into_iter().map(|measurement| {
+            if measurement.kind() == kind {
+                PromotionMeasurement::with_value(kind, MeasurementSource::OptInBenchmark, value)
+            } else {
+                measurement
+            }
+        });
+        let report = PromotionGateInput::new(PromotionCriterion::ALL, measurements).evaluate();
+        assert_eq!(
+            PromotionDecision::RejectAdvancement,
+            report.decision(),
+            "over-budget {kind:?} must reject advancement"
+        );
+        assert!(
+            report
+                .measurements()
+                .iter()
+                .any(|status| status.kind() == kind && !status.satisfied()),
+            "report must mark over-budget {kind:?} unsatisfied"
+        );
+    }
+}
+
+#[test]
+fn budgeted_measurement_without_a_value_or_with_wrong_unit_fails() {
+    let missing_value = fixture_measurements().into_iter().map(|measurement| {
+        if measurement.kind() == PromotionMeasurementKind::WarmWriteP99NarrowMetadataMutation {
+            PromotionMeasurement::new(measurement.kind(), MeasurementSource::OptInBenchmark)
+        } else {
+            measurement
+        }
+    });
+    let report = PromotionGateInput::new(PromotionCriterion::ALL, missing_value).evaluate();
+    assert_eq!(PromotionDecision::RejectAdvancement, report.decision());
+
+    let wrong_unit = fixture_measurements().into_iter().map(|measurement| {
+        if measurement.kind() == PromotionMeasurementKind::ManifestReachableReplayBytes {
+            PromotionMeasurement::with_value(
+                measurement.kind(),
+                MeasurementSource::OptInBenchmark,
+                MeasurementValue::DurationMicros(1),
+            )
+        } else {
+            measurement
+        }
+    });
+    let report = PromotionGateInput::new(PromotionCriterion::ALL, wrong_unit).evaluate();
+    assert_eq!(
+        PromotionDecision::RejectAdvancement,
+        report.decision(),
+        "a unit mismatch must never satisfy a budget"
+    );
+}
+
+#[test]
+fn unavailable_source_discards_typed_values() {
+    let measurement = PromotionMeasurement::with_value(
+        PromotionMeasurementKind::WarmPointReadP99,
+        MeasurementSource::Unavailable,
+        MeasurementValue::DurationMicros(1),
+    );
+    assert_eq!(None, measurement.value());
+}
+
+#[test]
+fn gate_input_and_report_round_trip_through_serde() {
+    let input = complete_input();
+    let input_json = serde_json::to_string(&input).expect("serialize gate input");
+    let input_back: PromotionGateInput =
+        serde_json::from_str(&input_json).expect("deserialize gate input");
+    assert_eq!(input, input_back);
+
+    let report = input.evaluate();
+    let report_json = serde_json::to_string_pretty(&report).expect("serialize gate report");
+    let report_back = serde_json::from_str::<
+        arco_catalog::state_store::promotion_gate::PromotionGateReport,
+    >(&report_json)
+    .expect("deserialize gate report");
+    assert_eq!(report, report_back);
+    assert!(report_json.contains("\"decision\""));
+    assert!(report_json.contains("candidate_evidence_complete"));
 }

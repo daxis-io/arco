@@ -2,6 +2,7 @@
 
 pub mod browser;
 pub mod catalogs;
+pub mod control_store;
 pub mod delta;
 pub mod lineage;
 pub mod manifests;
@@ -35,6 +36,15 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(orchestration::routes())
         .merge(transactions::routes())
         .merge(manifests::routes())
+}
+
+/// Operator-only `/internal` routes (authenticated, default off).
+///
+/// Mounted by the server only when
+/// [`crate::config::Config::control_store_operator_endpoints`] is enabled, so
+/// the routes do not exist — and requests 404 — in the default posture.
+pub fn internal_operator_routes() -> Router<Arc<AppState>> {
+    control_store::routes()
 }
 
 /// `/api/v1` task callback routes (task-authenticated).

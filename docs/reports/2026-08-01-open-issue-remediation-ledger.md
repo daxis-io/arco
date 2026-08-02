@@ -49,6 +49,7 @@ required, in a fresh deployed artifact.
 | [#398](https://github.com/daxis-io/arco/pull/398) | #356 | The branch adds fail-closed ordered paging, cursor-bounded anti-entropy, and ignored GCS/S3 conformance; local Rust execution was disk-gated below 40 GiB and CI was pending at publication |
 | [#399](https://github.com/daxis-io/arco/pull/399) | #326 | The branch clears both locked Python advisories and adds a non-mutating consolidated failure status; #326 still requires a green default-branch scheduled run, including the separate Rust advisory repair |
 | [#400](https://github.com/daxis-io/arco/pull/400) | #331 | The branch enables strict all-target Clippy with explicit test-only panic allowances; local Rust execution was disk-gated and CI is the executable proof |
+| [#401](https://github.com/daxis-io/arco/pull/401) | #340 | Stacked on #398, the branch bounds each log response by object count and bytes, exposes cursor pagination, and preserves the text response contract; child CI remains required |
 
 PR #374 contains this ledger and the Wave 0 closure evidence. User-owned stacked
 PRs #381-#392 overlap several other rows; treat them as patch quarries and
@@ -60,10 +61,11 @@ pending review, not as frozen-baseline or closure proof.
 object or byte cap still calls the unbounded `StorageBackend::list` and truncates
 after enumerating the full prefix.
 
-PR #398 implements the shared contract below from the frozen baseline. #340
-remains queued until that branch has passing CI and can serve as the explicit
-base for a stacked log-response change; the issue is not closed merely because
-the branch exists.
+PR #398 implements the shared contract below from the frozen baseline and its
+core, extended, documentation, and deterministic UAT jobs passed. PR #401 is
+stacked directly on that branch and contains only the bounded log-response
+layer. Neither issue is closed merely because the branches exist; both still
+require default-branch evidence.
 
 The shared pager needs this interface contract:
 

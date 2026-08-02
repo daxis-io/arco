@@ -338,6 +338,9 @@ impl Tier1Compactor {
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let publisher = Publisher::new(&self.storage);
         let mut reserved_commit: Option<ReservedCatalogCommit> = None;
+        // Keep one directory identity across in-process CAS retries, while a
+        // restarted compactor always selects a fresh attempt directory.
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
@@ -444,8 +447,11 @@ impl Tier1Compactor {
                 commit_metadata,
             )?);
 
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Catalog, next_version, &manifest_id);
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Catalog,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &next_commit.commit_ulid, &attempt_nonce),
+            );
             let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -571,6 +577,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
@@ -626,8 +633,11 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Lineage, next_version, &manifest_id);
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Lineage,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
+            );
             let snapshot = tier1_snapshot::write_lineage_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -757,6 +767,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
@@ -821,8 +832,11 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Search, next_version, &manifest_id);
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Search,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
+            );
             let snapshot = tier1_snapshot::write_search_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -1881,6 +1895,21 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
     Ok(next.to_string())
 }
 
+/// Builds the identity of one snapshot attempt directory.
+///
+/// Manifest discovery probes only immutable manifest JSON. If a process dies
+/// after writing snapshot files but before writing that manifest, a restarted
+/// compactor can legitimately select the same manifest id. The per-invocation
+/// nonce prevents it from colliding with the abandoned immutable files. The
+/// nonce is stable within one invocation so CAS retries retain byte identity.
+fn snapshot_attempt_token(manifest_id: &str, commit_ulid: &str, nonce: &str) -> String {
+    format!("{manifest_id}-{commit_ulid}-{nonce}")
+}
+
+fn new_attempt_nonce() -> String {
+    Ulid::new().to_string()
+}
+
 async fn next_available_manifest_id(
     storage: &ScopedStorage,
     domain: CatalogDomain,
@@ -1937,6 +1966,31 @@ mod tests {
     use arco_core::storage::{MemoryBackend, WritePrecondition};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn skewed_predecessor_keeps_commit_ulid_stable_but_attempt_dirs_unique() {
+        // No current clock-derived ULID can sort above this predecessor, so
+        // both invocations take the deterministic increment branch.
+        const SKEWED_PREDECESSOR: &str = "7ZZZZZZZZZ0000000000000000";
+        const MANIFEST_ID: &str = "00000000000000000003";
+
+        let crashed = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("crashed attempt ulid");
+        let restarted = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("restarted attempt ulid");
+        assert_eq!(crashed, restarted);
+
+        let crashed_nonce = new_attempt_nonce();
+        let restarted_nonce = new_attempt_nonce();
+        assert_ne!(crashed_nonce, restarted_nonce);
+        assert_ne!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &restarted, &restarted_nonce)
+        );
+        assert_eq!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            "in-process CAS retries must retain one attempt-directory identity"
+        );
+    }
 
     #[tokio::test]
     async fn sync_compact_search_writes_snapshot() {

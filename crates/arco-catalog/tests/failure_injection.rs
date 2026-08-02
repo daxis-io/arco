@@ -217,6 +217,11 @@ fn scoped_path(tenant: &str, workspace: &str, path: &str) -> String {
 
 /// Read the catalog manifest version from storage.
 async fn read_catalog_manifest_version(storage: &ScopedStorage) -> u64 {
+    read_catalog_manifest(storage).await.snapshot_version
+}
+
+/// Read the visible catalog manifest from storage.
+async fn read_catalog_manifest(storage: &ScopedStorage) -> CatalogDomainManifest {
     let root_bytes = storage
         .get_raw("manifests/root.manifest.json")
         .await
@@ -238,9 +243,7 @@ async fn read_catalog_manifest_version(storage: &ScopedStorage) -> u64 {
             .await
             .expect("read catalog manifest"),
     };
-    let catalog: CatalogDomainManifest =
-        serde_json::from_slice(&catalog_bytes).expect("parse catalog manifest");
-    catalog.snapshot_version
+    serde_json::from_slice(&catalog_bytes).expect("parse catalog manifest")
 }
 
 /// List all files under a prefix in the storage.
@@ -438,6 +441,65 @@ async fn tier1_retry_keeps_visible_commit_projection_in_sync() {
     assert_eq!(latest.published_at, manifest.updated_at.timestamp_millis());
 }
 
+/// A transient catalogs projection read failure must fail compaction closed.
+///
+/// Treating every read error as "catalogs.parquet is absent" publishes a new
+/// snapshot with the complete catalog set silently erased. Only a genuine
+/// not-found response is compatible with snapshots created before the catalog
+/// projection existed.
+#[tokio::test]
+async fn tier1_catalog_projection_read_failure_preserves_visible_catalogs() {
+    let backend = Arc::new(FailingBackend::new());
+    let storage =
+        ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_catalog("default", None, WriteOptions::default())
+        .await
+        .expect("create default catalog");
+
+    let visible_before = read_catalog_manifest(&storage).await;
+    let catalogs_path =
+        StateKey::snapshot_file_in_dir(&visible_before.snapshot_path, "catalogs.parquet");
+    backend.fail_on_read(&scoped_path(
+        TEST_TENANT,
+        TEST_WORKSPACE,
+        catalogs_path.as_ref(),
+    ));
+
+    let result = writer
+        .create_catalog("must-not-publish", None, WriteOptions::default())
+        .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("Injected read failure")),
+        "compaction must surface the transient catalogs projection read error, got {result:?}"
+    );
+
+    let visible_after = read_catalog_manifest(&storage).await;
+    assert_eq!(
+        visible_after.manifest_id, visible_before.manifest_id,
+        "the visible manifest must not advance after the projection read fails"
+    );
+    assert_eq!(
+        visible_after.snapshot_path, visible_before.snapshot_path,
+        "the visible snapshot must remain unchanged"
+    );
+
+    let reader = arco_catalog::CatalogReader::new(storage);
+    let catalogs = reader.list_catalogs().await.expect("list catalogs");
+    assert_eq!(
+        catalogs.len(),
+        1,
+        "the committed catalog must remain visible"
+    );
+    assert_eq!(catalogs[0].name, "default");
+}
+
 /// Test idempotent initialization survives backend hiccups.
 #[tokio::test]
 async fn tier1_initialize_idempotent_after_failure() {
@@ -506,6 +568,77 @@ async fn tier1_lock_failure_does_not_corrupt_state() {
     assert!(
         namespaces.is_empty(),
         "No namespaces should exist after failed lock"
+    );
+}
+
+/// A snapshot attempt that crashes before its immutable manifest is written
+/// must not poison the manifest id selected by a restarted compactor.
+#[tokio::test]
+async fn tier1_crashed_attempt_directory_does_not_wedge_subsequent_ddl() {
+    let backend = Arc::new(FailingBackend::new());
+    let storage =
+        ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("committed-before-crash", None, WriteOptions::default())
+        .await
+        .expect("first namespace commit");
+    let committed_version = read_catalog_manifest_version(&storage).await;
+
+    let crashed_manifest_path = scoped_path(
+        TEST_TENANT,
+        TEST_WORKSPACE,
+        "manifests/catalog/00000000000000000003.json",
+    );
+    backend.fail_on_write(&crashed_manifest_path);
+
+    let crashed = writer
+        .create_namespace("crashed-ddl", None, WriteOptions::default())
+        .await;
+    assert!(
+        crashed.is_err(),
+        "the injected immutable-manifest write failure must abort the DDL"
+    );
+
+    let orphaned_attempt_files = list_files_under(
+        &storage,
+        &format!("snapshots/catalog/v{}/", committed_version + 1),
+    )
+    .await;
+    assert!(
+        !orphaned_attempt_files.is_empty(),
+        "the crash window must leave snapshot files above the visible head"
+    );
+
+    let restarted_compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let restarted_writer =
+        CatalogWriter::new(storage.clone()).with_sync_compactor(restarted_compactor);
+    restarted_writer
+        .create_namespace("after-crash", None, WriteOptions::default())
+        .await
+        .expect("DDL after a crashed attempt must not remain wedged");
+    restarted_writer
+        .create_namespace("after-crash-2", None, WriteOptions::default())
+        .await
+        .expect("later DDL must remain healthy");
+
+    let reader = arco_catalog::CatalogReader::new(storage.clone());
+    let namespaces = reader.list_namespaces().await.expect("list namespaces");
+    let names: Vec<&str> = namespaces
+        .iter()
+        .map(|namespace| namespace.name.as_str())
+        .collect();
+    assert!(names.contains(&"committed-before-crash"));
+    assert!(names.contains(&"after-crash"));
+    assert!(names.contains(&"after-crash-2"));
+
+    let final_version = read_catalog_manifest_version(&storage).await;
+    assert!(
+        final_version > committed_version,
+        "the visible head must advance after restart"
     );
 }
 

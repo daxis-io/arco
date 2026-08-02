@@ -403,6 +403,12 @@ fn run_ci_parity_check() -> Result<()> {
         "cargo xtask parity-matrix-check",
     );
     require_contains(&mut errors, "ci.yml", &ci, "cargo xtask repo-hygiene-check");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "python3 .github/scripts/check_advisory_exceptions.py",
+    );
     require_contains(&mut errors, "ci.yml", &ci, "buf lint proto/");
     require_contains(
         &mut errors,
@@ -448,6 +454,12 @@ fn run_ci_parity_check() -> Result<()> {
         "security-audit.yml",
         &security_audit,
         "pip-audit==${PIP_AUDIT_VERSION}",
+    );
+    require_contains(
+        &mut errors,
+        "security-audit.yml",
+        &security_audit,
+        "check_advisory_exceptions.py --check-expiry",
     );
     require_contains(
         &mut errors,

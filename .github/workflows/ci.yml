@@ -260,6 +260,10 @@ jobs:
       - name: cargo-deny advisories
         # SECURITY: No continue-on-error - PRs with known vulnerabilities must not merge
         run: cargo deny check advisories
+      - name: Advisory exceptions are tracked
+        run: |
+          python3 -m unittest discover --start-directory .github/scripts --pattern 'test_check_advisory_exceptions.py'
+          python3 .github/scripts/check_advisory_exceptions.py
 
   proto-check:
     name: Proto Compatibility

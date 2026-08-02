@@ -47,6 +47,18 @@ Implementation claims on this page should satisfy the evidence policy in `docs/g
 | Temporary credential vending | `Partial` | Table/path credential routes use compiled authorization plus published storage-governance state | Volume/model credentials, provider token material, revocation metadata, and full UC parity remain planned or known-unsupported |
 | Access audit | `Planned` | Tracing/audit hooks exist, but no authoritative catalog access-audit projection | System tables for access audit remain deferred |
 | Storage/system tables beyond initial catalog lineage orchestration surface | `Planned` | None | `system.access.*`, `system.storage.*`, and extended catalog object-family tables are not registered until projections exist |
+| State-store seam + current adapter (Phase 1A) | `Partial` | None; current Tier-1 ledger append -> sync compaction remains sole authority | `ArcoStateReader`/`ArcoStateStore`/`ArcoStateTxn`/`StateToken` seam types exist and are CI-tested (`crates/arco-catalog/src/state_store.rs`); the `CurrentStateStore` adapter intentionally exposes capability discovery only and delegates no production reads or writes |
+| Deterministic state model (Phase 3A) | `Partial` | None | `ModelStateStore` reference backend with point/range/predicate preconditions and replay determinism proven in CI (`crates/arco-catalog/src/state_store/model.rs`); reference model only, zero production callers |
+| Object-store control-store MVP (Phase 3B) | `Partial` | None | `ControlMvpStateStore` txlog + manifest + pointer-CAS prototype (`crates/arco-catalog/src/state_store/control_mvp.rs`); prototype-approved only, not accepted production architecture; replay is unbounded from genesis (#334) and publish has no writer-epoch fencing; zero production callers |
+| Prototype promotion gate (Phase 3C) | `Partial` | None | Advisory evaluator exists and is CI-tested (`crates/arco-catalog/src/state_store/promotion_gate.rs`) but has never run with real measurements; no control-MVP benchmark or recorded evidence packet exists; the control store is NOT promoted |
+| Shadow replay importer (Phase 4A) | `Partial` | None | `state_store/shadow_replay.rs` imports Tier-1 catalog state into an isolated `catalog-shadow` domain; covers 3 of 9 mandated comparison domains; importer has zero non-test callers, so no deployed shadow store is ever populated |
+| Internal comparison reads (Phase 4B) | `Partial` | None | `state_store/comparison_reads.rs` behind `ARCO_CATALOG_SHADOW_COMPARE_READS`; one internal read path (catalog inventory descriptor) compares current vs shadow, diagnostics only; inert while the 4A importer never runs |
+| Projection-outbox-acks writable domain (Phase 5) | `Partial` | None | First control-store writable domain (`state_store/projection_outbox_acks.rs`), idempotent acks + token-pinned reads at unit level; crate-private with zero non-test callers and not wired to the real arco-flow outbox |
+| Storage-governance metadata domains (Phase 6) | `Partial` | None | `path_governance_metadata.rs`, `external_location_metadata.rs`, `workspace_binding_metadata.rs` with ancestor/descendant predicate model and deny-closed readiness helpers, CI-tested; no authority moved; credential vending does not read these domains; the revocation-freshness budget required before any grants migration is undefined |
+| Workspace snapshots + export manifest (Phase 7A) | `Partial` | None | `workspace_snapshot.rs` snapshot/export contracts, GC ProtectionSet, and `system.catalog.snapshots` exact-schema projection, all CI-tested; pins can only reference control-MVP checkpoints, so no production authority is pinnable yet; no producer writes `snapshots.parquet` |
+| Workspace snapshot service (Phase 7B) | `Partial` | None | `workspace_snapshot_service.rs` Create/Get/Export with DistributedLock + retention-mutation-epoch coordination and read-only restore preflight, CI-tested; constructed by zero production code (no route or binary) |
+| Roll-forward restore (Phase 7C) | `Partial` | None | `workspace_restore.rs` deterministic plan/inspect/apply with crash-resume and REPAIR_REQUIRED journal tests; only the control-MVP `StateRestoreParticipant` exists; catalog/orchestration domains have no typed restore operation |
+| Durable transaction handles (Phase 7D) | `Partial` | None | Full OPEN..REPAIR_REQUIRED lifecycle state machine with 94 unit tests (`arco-api/src/control_plane_transactions/handles.rs`); deliberately transport-less (`#![cfg_attr(not(test), allow(dead_code))]`), unreachable in production builds; the legacy-handle identity guard IS live in the production `claim_idempotency` path |
 
 ## Current Thesis, Narrowly Stated
 
@@ -58,12 +70,23 @@ It also contains an initial native metastore replay/projection kernel that
 proves stable-ID folding, projection allowlisting, schema watermarking, and
 redaction for the first generic metastore projection.
 
+It additionally contains the Phase 1A–7D state-store program surfaces
+(seam traits, deterministic model, object-store control-store MVP, promotion
+gate, shadow replay, comparison reads, projection-outbox-acks, storage-
+governance metadata, workspace snapshots/export/restore, durable transaction
+handles). These are landed with CI-run test suites but are deliberately
+non-authoritative: crate-private, with zero production callers, and the
+control-store prototype has not passed its Phase 3C promotion gate. Do not
+describe any of them as production control-plane authority.
+
 The repo does not yet prove this broader statement:
 
 > Every governance and metadata object in the catalog is already managed through the same authoritative immutable control-plane ledger.
 
 ## Related References
 
+- `docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
+- `docs/reports/2026-07-30-design-program-progress-audit.md`
 - `docs/reports/2026-04-20-catalog-control-plane-framing-audit.md`
 - `docs/adr/adr-018-tier1-write-path.md`
 - `docs/adr/adr-032-immutable-manifest-pointers.md`

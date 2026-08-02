@@ -11,15 +11,23 @@
 //! or deletion when used correctly.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
+use arco_core::lock::DistributedLock;
 use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
+use crate::gc::reachability::ProtectionSet;
+use crate::gc::{GarbageCollector, RetentionPolicy};
 use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest, RootManifest,
+};
+use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
+use crate::workspace_snapshot::{
+    RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
 };
 
 // ============================================================================
@@ -176,6 +184,29 @@ pub enum Severity {
 #[derive(Clone)]
 pub struct Reconciler {
     storage: ScopedStorage,
+    retention_policy: RetentionPolicy,
+}
+
+struct CleanupContext {
+    visible_snapshot_version: u64,
+    protected_paths: HashSet<String>,
+    retained_versions: HashSet<u64>,
+    protection: Option<ProtectionSet>,
+}
+
+#[derive(Clone, Copy)]
+enum RepairDisposition {
+    Repaired,
+    Skipped,
+}
+
+impl RepairDisposition {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Repaired => "repaired",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 impl std::fmt::Debug for Reconciler {
@@ -190,7 +221,52 @@ impl Reconciler {
     /// Creates a new reconciler.
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            retention_policy: RetentionPolicy::default(),
+        }
+    }
+
+    /// Uses the supplied retention policy for Full repair cleanup.
+    ///
+    /// The policy controls both the minimum object age and the number of newest
+    /// snapshot versions that repair must preserve.
+    #[must_use]
+    pub fn with_retention_policy(mut self, retention_policy: RetentionPolicy) -> Self {
+        self.retention_policy = retention_policy;
+        self
+    }
+
+    async fn is_within_repair_grace_period(&self, path: &str) -> Result<bool> {
+        let Some(meta) = self.storage.head_raw(path).await? else {
+            return Ok(false);
+        };
+        let Some(last_modified) = meta.last_modified else {
+            // Unknown age never grants destructive authority.
+            return Ok(true);
+        };
+        let age = Utc::now().signed_duration_since(last_modified);
+        // Future timestamps indicate clock skew and fail closed as recent.
+        Ok(age < Duration::hours(i64::from(self.retention_policy.delay_hours)))
+    }
+
+    async fn retained_snapshot_versions(
+        &self,
+        snapshot_prefix: &str,
+        visible_snapshot_version: u64,
+    ) -> Result<HashSet<u64>> {
+        let mut versions = self
+            .storage
+            .list(snapshot_prefix)
+            .await?
+            .iter()
+            .filter_map(|path| Self::extract_snapshot_version(path.as_str()))
+            .filter(|version| *version <= visible_snapshot_version)
+            .collect::<Vec<_>>();
+        versions.sort_unstable_by(|left, right| right.cmp(left));
+        versions.dedup();
+        versions.truncate(self.retention_policy.keep_snapshots as usize);
+        Ok(versions.into_iter().collect())
     }
 
     /// Checks a domain for inconsistencies.
@@ -340,6 +416,59 @@ impl Reconciler {
         report: &ReconciliationReport,
         scope: RepairScope,
     ) -> Result<RepairResult> {
+        let requires_retention_coordination = scope == RepairScope::Full
+            && report.issues.iter().any(|issue| {
+                issue.repairable
+                    && matches!(
+                        issue.issue_type,
+                        IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion
+                    )
+            });
+        if !requires_retention_coordination {
+            return self.repair_while_coordinated(report, scope, None).await;
+        }
+
+        let mut guard =
+            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
+                .acquire_with_operation(
+                    RETENTION_GC_LOCK_TTL,
+                    RETENTION_GC_LOCK_MAX_RETRIES,
+                    Some("catalog-reconciler-repair".to_string()),
+                )
+                .await
+                .map_err(CatalogError::from)?;
+        let operation_id = guard.holder_id().to_string();
+        let mut epoch = match RetentionMutationEpoch::claim(
+            self.storage.clone(),
+            &mut guard,
+            RetentionMutationKind::CatalogGc,
+            operation_id,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                let _ = guard.release().await;
+                return Err(error);
+            }
+        };
+        let repair = self
+            .repair_while_coordinated(report, scope, Some(&mut epoch))
+            .await;
+        let settlement = epoch.settle().await;
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (repair, settlement, release) {
+            (Ok(result), Ok(()), Ok(())) => Ok(result),
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    async fn repair_while_coordinated(
+        &self,
+        report: &ReconciliationReport,
+        scope: RepairScope,
+        mut epoch: Option<&mut RetentionMutationEpoch>,
+    ) -> Result<RepairResult> {
         let mut result = RepairResult {
             domain: report.domain.clone(),
             repaired_at: Utc::now(),
@@ -348,108 +477,135 @@ impl Reconciler {
             failed_count: 0,
         };
 
-        let (visible_snapshot_version, protected_paths): (u64, HashSet<String>) =
-            if let Some(domain) = Self::parse_domain(&report.domain) {
+        let parsed_domain = Self::parse_domain(&report.domain);
+        let (visible_snapshot_version, protected_paths, snapshot_prefix) =
+            if let Some(domain) = parsed_domain {
                 self.load_expected_paths(domain).await?.map_or_else(
-                    || (report.manifest_snapshot_version, HashSet::new()),
-                    |(version, expected, _)| (version, expected.into_iter().collect()),
+                    || (report.manifest_snapshot_version, HashSet::new(), None),
+                    |(version, expected, prefix)| {
+                        (version, expected.into_iter().collect(), Some(prefix))
+                    },
                 )
             } else {
-                (report.manifest_snapshot_version, HashSet::new())
+                (report.manifest_snapshot_version, HashSet::new(), None)
             };
+        let retained_versions = if let Some(prefix) = snapshot_prefix.as_deref() {
+            self.retained_snapshot_versions(prefix, visible_snapshot_version)
+                .await?
+        } else {
+            HashSet::new()
+        };
+        let mut cleanup = CleanupContext {
+            visible_snapshot_version,
+            protected_paths,
+            retained_versions,
+            protection: None,
+        };
 
         for issue in &report.issues {
             if !issue.repairable {
                 result.skipped_count += 1;
                 continue;
             }
-            if !scope.allows_issue(issue.issue_type) {
-                result.skipped_count += 1;
-                if let Some(domain) = Self::parse_domain(&report.domain) {
-                    crate::metrics::record_reconciler_repair(
-                        domain,
-                        issue.issue_type.as_str(),
-                        "skipped",
-                    );
+            let disposition = if scope.allows_issue(issue.issue_type) {
+                match issue.issue_type {
+                    IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
+                        self.repair_cleanup_issue(report, issue, &mut cleanup, &mut epoch)
+                            .await?
+                    }
+                    _ => RepairDisposition::Skipped,
                 }
-                continue;
+            } else {
+                RepairDisposition::Skipped
+            };
+            match disposition {
+                RepairDisposition::Repaired => result.repaired_count += 1,
+                RepairDisposition::Skipped => result.skipped_count += 1,
             }
-
-            match issue.issue_type {
-                IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
-                    if protected_paths.contains(&issue.path) {
-                        tracing::warn!(
-                            path = %issue.path,
-                            domain = %report.domain,
-                            "skipping repair delete for currently referenced snapshot path"
-                        );
-                        result.skipped_count += 1;
-                        if let Some(domain) = Self::parse_domain(&report.domain) {
-                            crate::metrics::record_reconciler_repair(
-                                domain,
-                                issue.issue_type.as_str(),
-                                "skipped",
-                            );
-                        }
-                        continue;
-                    }
-                    if Self::extract_snapshot_version(&issue.path)
-                        .is_some_and(|version| version > visible_snapshot_version)
-                    {
-                        tracing::warn!(
-                            path = %issue.path,
-                            domain = %report.domain,
-                            visible_snapshot_version,
-                            "skipping repair delete for snapshot version newer than visible manifest"
-                        );
-                        result.skipped_count += 1;
-                        if let Some(domain) = Self::parse_domain(&report.domain) {
-                            crate::metrics::record_reconciler_repair(
-                                domain,
-                                issue.issue_type.as_str(),
-                                "skipped",
-                            );
-                        }
-                        continue;
-                    }
-                    match self.storage.delete(&issue.path).await {
-                        Ok(()) => {
-                            result.repaired_count += 1;
-                            if let Some(domain) = Self::parse_domain(&report.domain) {
-                                crate::metrics::record_reconciler_repair(
-                                    domain,
-                                    issue.issue_type.as_str(),
-                                    "repaired",
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(path = %issue.path, error = %e, "Failed to delete orphaned/old snapshot");
-                            result.failed_count += 1;
-                            if let Some(domain) = Self::parse_domain(&report.domain) {
-                                crate::metrics::record_reconciler_repair(
-                                    domain,
-                                    issue.issue_type.as_str(),
-                                    "failed",
-                                );
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    result.skipped_count += 1;
-                    if let Some(domain) = Self::parse_domain(&report.domain) {
-                        crate::metrics::record_reconciler_repair(
-                            domain,
-                            issue.issue_type.as_str(),
-                            "skipped",
-                        );
-                    }
-                }
+            if let Some(domain) = parsed_domain {
+                crate::metrics::record_reconciler_repair(
+                    domain,
+                    issue.issue_type.as_str(),
+                    disposition.metric_label(),
+                );
             }
         }
 
         Ok(result)
+    }
+
+    async fn repair_cleanup_issue(
+        &self,
+        report: &ReconciliationReport,
+        issue: &ReconciliationIssue,
+        cleanup: &mut CleanupContext,
+        epoch: &mut Option<&mut RetentionMutationEpoch>,
+    ) -> Result<RepairDisposition> {
+        if cleanup.protected_paths.contains(&issue.path) {
+            tracing::warn!(
+                path = %issue.path,
+                domain = %report.domain,
+                "skipping repair delete for currently referenced snapshot path"
+            );
+            return Ok(RepairDisposition::Skipped);
+        }
+        let issue_version = Self::extract_snapshot_version(&issue.path);
+        if issue_version.is_some_and(|version| version > cleanup.visible_snapshot_version) {
+            tracing::warn!(
+                path = %issue.path,
+                domain = %report.domain,
+                visible_snapshot_version = cleanup.visible_snapshot_version,
+                "skipping repair delete for snapshot version newer than visible manifest"
+            );
+            return Ok(RepairDisposition::Skipped);
+        }
+        if issue_version.is_some_and(|version| cleanup.retained_versions.contains(&version)) {
+            tracing::debug!(
+                path = %issue.path,
+                domain = %report.domain,
+                keep_snapshots = self.retention_policy.keep_snapshots,
+                "skipping repair delete inside the retained snapshot-version window"
+            );
+            return Ok(RepairDisposition::Skipped);
+        }
+        if self.is_within_repair_grace_period(&issue.path).await? {
+            tracing::debug!(
+                path = %issue.path,
+                domain = %report.domain,
+                min_repair_age_secs = u64::from(self.retention_policy.delay_hours) * 60 * 60,
+                "skipping repair delete inside the snapshot grace period"
+            );
+            return Ok(RepairDisposition::Skipped);
+        }
+
+        if cleanup.protection.is_none() {
+            cleanup.protection = Some(
+                GarbageCollector::new(self.storage.clone(), self.retention_policy.clone())
+                    .load_protection_set(Utc::now())
+                    .await?,
+            );
+        }
+        if cleanup
+            .protection
+            .as_ref()
+            .is_some_and(|set| set.protects_object(&issue.path))
+        {
+            tracing::warn!(
+                path = %issue.path,
+                domain = %report.domain,
+                "skipping repair delete for retention-protected snapshot path"
+            );
+            return Ok(RepairDisposition::Skipped);
+        }
+
+        let coordinated_epoch =
+            epoch
+                .as_deref_mut()
+                .ok_or_else(|| CatalogError::PreconditionFailed {
+                    message: "snapshot repair delete requires retention coordination".to_string(),
+                })?;
+        coordinated_epoch.delete(&issue.path).await?;
+        Ok(RepairDisposition::Repaired)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -740,6 +896,91 @@ mod tests {
             )
             .await
             .expect("write json");
+    }
+
+    async fn initialize_catalog_head(storage: &ScopedStorage, version: u64) -> String {
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize tier-1 state");
+
+        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, version);
+        let current_path =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
+        storage
+            .put_raw(
+                &current_path,
+                Bytes::from_static(b"current catalog snapshot"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current snapshot");
+
+        let mut snapshot = crate::manifest::SnapshotInfo::new(version, snapshot_dir.clone());
+        snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "tables.parquet".to_string(),
+            checksum_sha256: "ab".repeat(32),
+            byte_size: 24,
+            row_count: 1,
+            position_range: None,
+        });
+        let manifest_id = crate::manifest::format_manifest_id(version);
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
+        write_json(
+            storage,
+            &manifest_path,
+            &CatalogDomainManifest {
+                manifest_id: manifest_id.clone(),
+                epoch: version,
+                previous_manifest_path: None,
+                writer_session_id: Some("retention-repair-test".to_string()),
+                snapshot_version: version,
+                snapshot_path: snapshot_dir,
+                snapshot: Some(snapshot),
+                watermark_event_id: None,
+                last_commit_id: None,
+                fencing_token: Some(version),
+                commit_ulid: None,
+                parent_hash: None,
+                updated_at: Utc::now(),
+            },
+            WritePrecondition::DoesNotExist,
+        )
+        .await;
+        write_json(
+            storage,
+            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            &DomainManifestPointer {
+                manifest_id,
+                manifest_path,
+                epoch: version,
+                parent_pointer_hash: None,
+                updated_at: Utc::now(),
+            },
+            WritePrecondition::None,
+        )
+        .await;
+
+        current_path
+    }
+
+    fn cleanup_report(path: String, visible_version: u64) -> ReconciliationReport {
+        ReconciliationReport {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            checked_at: Utc::now(),
+            manifest_snapshot_version: visible_version,
+            manifest_snapshot_count: 1,
+            storage_snapshot_count: 1,
+            ledger_event_count: 0,
+            issues: vec![ReconciliationIssue {
+                issue_type: IssueType::OldSnapshotVersion,
+                path,
+                description: "snapshot file below the visible head".to_string(),
+                severity: Severity::Warning,
+                repairable: true,
+            }],
+        }
     }
 
     #[test]
@@ -1206,6 +1447,136 @@ mod tests {
             .get_raw(&in_flight_file)
             .await
             .expect("newer snapshot file must remain");
+    }
+
+    #[tokio::test]
+    async fn repair_skips_recent_superseded_snapshot_files() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let superseded = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet");
+        storage
+            .put_raw(
+                &superseded,
+                Bytes::from_static(b"superseded snapshot bytes"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write superseded snapshot");
+
+        let report = ReconciliationReport {
+            domain: CatalogDomain::Catalog.as_str().to_string(),
+            checked_at: Utc::now(),
+            manifest_snapshot_version: 2,
+            manifest_snapshot_count: 1,
+            storage_snapshot_count: 1,
+            ledger_event_count: 0,
+            issues: vec![ReconciliationIssue {
+                issue_type: IssueType::OldSnapshotVersion,
+                path: superseded.clone(),
+                description: "snapshot file below the visible head".to_string(),
+                severity: Severity::Warning,
+                repairable: true,
+            }],
+        };
+
+        let result = Reconciler::new(storage.clone())
+            .repair(&report)
+            .await
+            .expect("repair");
+
+        assert_eq!(result.repaired_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        storage
+            .get_raw(&superseded)
+            .await
+            .expect("a recently superseded snapshot must survive repair");
+    }
+
+    #[tokio::test]
+    async fn repair_preserves_versions_inside_the_retention_window() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        initialize_catalog_head(&storage, 12).await;
+        let retained = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 11, "tables.parquet");
+        storage
+            .put_raw(
+                &retained,
+                Bytes::from_static(b"retained snapshot"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write retained snapshot");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let result = Reconciler::new(storage.clone())
+            .with_retention_policy(RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 48,
+                max_age_days: 90,
+            })
+            .repair(&cleanup_report(retained.clone(), 12))
+            .await
+            .expect("repair");
+
+        assert_eq!(result.repaired_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        storage
+            .get_raw(&retained)
+            .await
+            .expect("a retained snapshot version must survive repair");
+    }
+
+    #[tokio::test]
+    async fn repair_deletes_only_through_a_settled_retention_epoch() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        initialize_catalog_head(&storage, 12).await;
+        for version in 1..12 {
+            storage
+                .put_raw(
+                    &CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet"),
+                    Bytes::from_static(b"superseded snapshot"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("write superseded snapshot");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let deletable = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet");
+
+        let result = Reconciler::new(storage.clone())
+            .with_retention_policy(RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 48,
+                max_age_days: 90,
+            })
+            .repair(&cleanup_report(deletable.clone(), 12))
+            .await
+            .expect("repair");
+
+        assert_eq!(result.repaired_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert!(
+            storage
+                .head_raw(&deletable)
+                .await
+                .expect("head deleted snapshot")
+                .is_none()
+        );
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("retention epoch evidence"),
+        )
+        .expect("retention epoch JSON");
+        assert_eq!(epoch["state"], serde_json::Value::from("IDLE"));
+        assert_eq!(
+            epoch["operation_kind"],
+            serde_json::Value::from("catalog_gc")
+        );
     }
 
     #[tokio::test]

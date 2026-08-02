@@ -364,31 +364,51 @@ impl GarbageCollector {
         let cutoff = Utc::now() - Duration::hours(i64::from(self.policy.delay_hours));
 
         for dir in orphaned {
-            // Check age before deletion
-            if let Ok(Some(meta)) = self.storage.head_raw(&dir).await {
-                if let Some(last_modified) = meta.last_modified {
-                    if last_modified >= cutoff {
+            let entries = match self.storage.list_meta(&dir).await {
+                Ok(entries) => entries,
+                Err(error) => {
+                    result.errors.push(format!("list {dir}: {error}"));
+                    continue;
+                }
+            };
+            if entries.is_empty() {
+                continue;
+            }
+
+            let checked_at = Utc::now();
+            let newest_child = entries
+                .iter()
+                // Unknown age never grants destructive authority.
+                .map(|meta| meta.last_modified.unwrap_or(checked_at))
+                .max()
+                .unwrap_or(checked_at);
+            if newest_child >= cutoff {
+                tracing::debug!(
+                    path = %dir,
+                    last_modified = %newest_child,
+                    "skipping orphan (too recent)"
+                );
+                continue;
+            }
+
+            // Delete all files under the directory through the retention epoch.
+            match self.delete_prefix(&dir, protection, epoch).await {
+                Ok((count, bytes)) => {
+                    if count == 0 {
                         tracing::debug!(
                             path = %dir,
-                            last_modified = %last_modified,
-                            "skipping orphan (too recent)"
+                            "orphaned snapshot became protected before deletion"
                         );
                         continue;
                     }
+                    tracing::info!(path = %dir, count, bytes, "deleted orphaned snapshot");
+                    result.objects_deleted += count;
+                    result.bytes_reclaimed += bytes;
+                    result.orphaned_snapshots_deleted += 1;
                 }
-
-                // Delete all files under the directory
-                match self.delete_prefix(&dir, protection, epoch).await {
-                    Ok((count, bytes)) => {
-                        tracing::info!(path = %dir, count, bytes, "deleted orphaned snapshot");
-                        result.objects_deleted += count;
-                        result.bytes_reclaimed += bytes;
-                        result.orphaned_snapshots_deleted += 1;
-                    }
-                    Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
-                    Err(e) => {
-                        result.errors.push(format!("delete {dir}: {e}"));
-                    }
+                Err(error @ CatalogError::CasFailed { .. }) => return Err(error),
+                Err(e) => {
+                    result.errors.push(format!("delete {dir}: {e}"));
                 }
             }
         }
@@ -575,7 +595,7 @@ impl GarbageCollector {
     // Helpers
     // =========================================================================
 
-    async fn load_protection_set(&self, now: DateTime<Utc>) -> Result<ProtectionSet> {
+    pub(crate) async fn load_protection_set(&self, now: DateTime<Utc>) -> Result<ProtectionSet> {
         let current_heads = self.get_referenced_snapshots().await?.into_iter().collect();
         let mut pin_objects = self
             .storage
@@ -1150,6 +1170,101 @@ mod tests {
         assert!(report.orphaned_snapshots.is_empty());
         assert!(report.old_ledger_events.is_empty());
         assert!(report.old_snapshot_versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aged_orphan_snapshot_directory_uses_child_metadata_and_is_reclaimed() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize");
+
+        let orphan_path =
+            "snapshots/catalog/v43/attempts/01ARZ3NDEKTSV4RRFFQ69G5FAV/tables.parquet";
+        storage
+            .put_raw(
+                orphan_path,
+                Bytes::from_static(b"orphan"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write orphan object");
+        assert!(
+            storage
+                .head_raw("snapshots/catalog/v43/")
+                .await
+                .expect("head synthetic prefix")
+                .is_none(),
+            "object stores do not synthesize metadata for directory prefixes"
+        );
+
+        tokio::time::sleep(StdDuration::from_millis(5)).await;
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 1,
+                max_age_days: 1,
+            },
+        );
+        let result = collector.collect().await.expect("garbage collection");
+
+        assert!(result.errors.is_empty(), "GC errors: {:?}", result.errors);
+        assert_eq!(result.orphaned_snapshots_deleted, 1);
+        assert_eq!(result.old_snapshots_deleted, 0);
+        assert_eq!(result.objects_deleted, 1);
+        assert!(
+            storage
+                .head_raw(orphan_path)
+                .await
+                .expect("head orphan object")
+                .is_none(),
+            "the aged orphan child object must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_orphan_snapshot_directory_is_preserved() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize");
+
+        let orphan_path =
+            "snapshots/catalog/v43/attempts/01ARZ3NDEKTSV4RRFFQ69G5FAV/tables.parquet";
+        storage
+            .put_raw(
+                orphan_path,
+                Bytes::from_static(b"recent orphan"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write orphan object");
+
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 1,
+                max_age_days: 1,
+            },
+        );
+        let result = collector.collect().await.expect("garbage collection");
+
+        assert!(result.errors.is_empty(), "GC errors: {:?}", result.errors);
+        assert_eq!(result.orphaned_snapshots_deleted, 0);
+        assert_eq!(result.old_snapshots_deleted, 0);
+        assert_eq!(result.objects_deleted, 0);
+        storage
+            .get_raw(orphan_path)
+            .await
+            .expect("recent orphan child object must survive");
     }
 
     fn catalog_manifest_for_version(

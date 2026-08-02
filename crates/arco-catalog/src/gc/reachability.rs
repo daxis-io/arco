@@ -288,18 +288,18 @@ pub async fn load_selected_retention_pin(
 
 /// Deterministic exact-object and prefix protection computed before deletion.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct ProtectionSet {
+pub struct ProtectionSet {
     exact_objects: BTreeSet<String>,
     prefixes: BTreeSet<String>,
 }
 
 impl ProtectionSet {
-    pub(super) fn protects_object(&self, path: &str) -> bool {
+    pub fn protects_object(&self, path: &str) -> bool {
         self.exact_objects.contains(path)
             || self.prefixes.iter().any(|prefix| path.starts_with(prefix))
     }
 
-    pub(super) fn protects_prefix(&self, prefix: &str) -> bool {
+    pub fn protects_prefix(&self, prefix: &str) -> bool {
         let canonical = canonical_prefix(prefix);
         self.prefixes
             .iter()

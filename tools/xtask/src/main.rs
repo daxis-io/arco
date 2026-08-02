@@ -388,6 +388,12 @@ fn run_ci_parity_check() -> Result<()> {
     let mut errors = Vec::new();
 
     require_contains(&mut errors, "ci.yml", &ci, "Install protoc");
+    require_contains(
+        &mut errors,
+        "ci.yml",
+        &ci,
+        "cargo clippy --workspace --all-features --all-targets -- -D warnings",
+    );
     require_contains(&mut errors, "ci.yml", &ci, "cargo xtask doctor");
     require_contains(&mut errors, "ci.yml", &ci, "cargo xtask verify-integrity");
     require_contains(

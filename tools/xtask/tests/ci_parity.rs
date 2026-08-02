@@ -177,6 +177,17 @@ fn cargo_deny_policy_denies_yanked_crates() {
 }
 
 #[test]
+fn clippy_covers_every_workspace_target() {
+    let ci =
+        fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
+
+    assert!(
+        ci.contains("cargo clippy --workspace --all-features --all-targets -- -D warnings"),
+        "strict Clippy must cover tests, benches, examples, and other non-default targets"
+    );
+}
+
+#[test]
 fn python_ci_uses_locked_uv_resolution() {
     let ci =
         fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");

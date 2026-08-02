@@ -243,9 +243,9 @@ pub async fn serve_metrics() -> impl IntoResponse {
 // Metric Recording Helpers
 // ============================================================================
 
-/// Records a signed URL minting event.
-pub fn record_signed_url_minted() {
-    counter!(SIGNED_URL_MINTED).increment(1);
+/// Records the number of physical signed URLs minted.
+pub fn record_signed_urls_minted(count: usize) {
+    counter!(SIGNED_URL_MINTED).increment(u64::try_from(count).unwrap_or(u64::MAX));
 }
 
 /// Records a rate limit hit.
@@ -307,9 +307,10 @@ mod tests {
     #[test]
     fn test_counters_without_tenant_labels() {
         let handle = init_metrics();
-        record_signed_url_minted();
+        record_signed_urls_minted(3);
         record_rate_limit_hit("/api/v1/test");
         let metrics = handle.render();
+        assert_metric_lines_contain(&metrics, SIGNED_URL_MINTED, " 3");
         assert_metric_lines_do_not_contain(&metrics, SIGNED_URL_MINTED, "tenant=");
         assert_metric_lines_do_not_contain(&metrics, RATE_LIMIT_HITS, "tenant=");
     }

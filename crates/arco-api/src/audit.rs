@@ -17,6 +17,8 @@ pub const REASON_INVALID_TOKEN: &str = "invalid_token";
 pub const REASON_PATH_TRAVERSAL: &str = "path_traversal";
 pub const REASON_NOT_IN_ALLOWLIST: &str = "not_in_allowlist";
 pub const REASON_UNKNOWN_DOMAIN: &str = "unknown_domain";
+pub const REASON_TOO_MANY_PATHS: &str = "too_many_paths";
+pub const REASON_RATE_LIMITED: &str = "rate_limited";
 
 type HmacSha256 = Hmac<Sha256>;
 

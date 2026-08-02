@@ -6218,7 +6218,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Paths to mint URLs for (must be in manifest allowlist)."
+            "description": "Paths to mint URLs for (must be in manifest allowlist).\nAt most 25 paths may be submitted; duplicates yield one URL."
           },
           "ttl_seconds": {
             "type": [

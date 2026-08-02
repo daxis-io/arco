@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use axum::extract::Query as AxumQuery;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -45,7 +45,9 @@ use crate::paths::{
 };
 use crate::routes::manifests::StoredManifest;
 use crate::server::AppState;
-use arco_core::{Error as CoreError, ScopedStorage, WritePrecondition, WriteResult};
+use arco_core::{
+    Error as CoreError, ScopedStorage, StorageBackend, WritePrecondition, WriteResult,
+};
 use arco_flow::error::Error as FlowError;
 use arco_flow::orchestration::compactor::{
     BackfillChunkRow, BackfillRow, FoldState, MicroCompactor, PartitionStatusRow, RunRow,
@@ -519,6 +521,15 @@ fn default_limit() -> u32 {
 const MAX_LIST_LIMIT: u32 = 200;
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LOG_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_LOG_PAGE_LIMIT: u32 = 50;
+const MAX_LOG_PAGE_LIMIT: u32 = 200;
+const MAX_AGGREGATED_LOG_BYTES: usize = 8 * 1024 * 1024;
+const LOG_ENTRY_FRAMING_BYTES: usize = 10;
+const NEXT_LOG_CURSOR_HEADER: &str = "x-arco-next-cursor";
+
+fn default_log_page_limit() -> u32 {
+    DEFAULT_LOG_PAGE_LIMIT
+}
 
 // Input size limits (defense-in-depth; avoid pathological CPU/memory in validation/fingerprinting).
 const MAX_RUN_KEY_LEN: usize = 256;
@@ -617,11 +628,27 @@ pub struct RunLogsResponse {
 }
 
 /// Query parameters for retrieving logs.
-#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+#[derive(Debug, Deserialize, ToSchema, IntoParams)]
 #[serde(rename_all = "camelCase")]
 pub struct RunLogsQuery {
     /// Filter by task key.
     pub task_key: Option<String>,
+    /// Maximum number of log objects to aggregate.
+    #[serde(default = "default_log_page_limit")]
+    #[schema(minimum = 1, maximum = 200, default = 50)]
+    pub limit: u32,
+    /// Opaque cursor returned in the `x-arco-next-cursor` response header.
+    pub cursor: Option<String>,
+}
+
+impl Default for RunLogsQuery {
+    fn default() -> Self {
+        Self {
+            task_key: None,
+            limit: default_log_page_limit(),
+            cursor: None,
+        }
+    }
 }
 
 /// Request to manually evaluate a sensor.
@@ -5436,6 +5463,108 @@ pub(crate) async fn upload_run_logs(
     }
 }
 
+struct ReadRunLogPage {
+    body: String,
+    next_start_after: Option<String>,
+}
+
+fn parse_log_page_limit(limit: u32) -> Result<usize, ApiError> {
+    if limit == 0 || limit > MAX_LOG_PAGE_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_LOG_PAGE_LIMIT}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+fn encode_log_cursor(path: &str) -> Result<String, ApiError> {
+    encode_list_cursor(ListCursorKey::single(path))
+}
+
+fn decode_log_cursor(cursor: &str) -> Result<String, ApiError> {
+    let DecodedListCursor::Key(ListCursorKey(keys)) = decode_list_cursor(cursor)? else {
+        return Err(ApiError::bad_request("invalid log cursor"));
+    };
+    let mut keys = keys.into_iter();
+    let Some(path) = keys.next() else {
+        return Err(ApiError::bad_request("invalid log cursor"));
+    };
+    if keys.next().is_some() {
+        return Err(ApiError::bad_request("invalid log cursor"));
+    }
+    Ok(path)
+}
+
+async fn read_run_log_page(
+    storage: &ScopedStorage,
+    prefix: &str,
+    start_after: Option<&str>,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<ReadRunLogPage, ApiError> {
+    let page = storage
+        .list_page_meta(prefix, start_after, limit)
+        .await
+        .map_err(|e| match e {
+            CoreError::InvalidInput(_) if start_after.is_some() => {
+                ApiError::bad_request("invalid log cursor")
+            }
+            _ => ApiError::internal(format!("failed to list logs: {e}")),
+        })?;
+
+    let mut body = String::new();
+    let mut last_included_path = None;
+    let mut stopped_for_byte_budget = false;
+    for meta in page.objects {
+        let path = meta.path.as_str();
+        let object_bytes = usize::try_from(meta.size).map_err(|_| {
+            ApiError::internal(format!("stored log '{path}' is too large to read safely"))
+        })?;
+        let entry_bytes = path
+            .len()
+            .saturating_add(object_bytes)
+            .saturating_add(LOG_ENTRY_FRAMING_BYTES);
+        if entry_bytes > max_bytes {
+            if body.is_empty() {
+                return Err(ApiError::internal(format!(
+                    "stored log '{path}' exceeds the {max_bytes}-byte response budget"
+                )));
+            }
+            stopped_for_byte_budget = true;
+            break;
+        }
+        if body.len().saturating_add(entry_bytes) > max_bytes {
+            stopped_for_byte_budget = true;
+            break;
+        }
+
+        let bytes = storage
+            .get_range(path, 0..meta.size)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read log: {e}")))?;
+        let chunk = std::str::from_utf8(&bytes)
+            .map_err(|_| ApiError::internal(format!("stored log '{path}' is not valid UTF-8")))?;
+        body.push_str("--- ");
+        body.push_str(path);
+        body.push_str(" ---\n");
+        body.push_str(chunk);
+        if !chunk.ends_with('\n') {
+            body.push('\n');
+        }
+        last_included_path = Some(path.to_string());
+    }
+
+    let next_start_after = if stopped_for_byte_budget {
+        last_included_path
+    } else {
+        page.next_start_after
+    };
+    Ok(ReadRunLogPage {
+        body,
+        next_start_after,
+    })
+}
+
 /// Get logs for a run.
 #[utoipa::path(
     get,
@@ -5443,10 +5572,14 @@ pub(crate) async fn upload_run_logs(
     params(
         ("workspace_id" = String, Path, description = "Workspace ID"),
         ("run_id" = String, Path, description = "Run ID"),
-        ("taskKey" = Option<String>, Query, description = "Filter by task key")
+        ("taskKey" = Option<String>, Query, description = "Filter by task key"),
+        ("limit" = Option<u32>, Query, minimum = 1, maximum = 200, description = "Maximum log objects to aggregate (default 50, maximum 200)"),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor from x-arco-next-cursor")
     ),
     responses(
-        (status = 200, description = "Aggregated logs", body = String, content_type = "text/plain"),
+        (status = 200, description = "Aggregated log page", body = String, content_type = "text/plain",
+            headers(("x-arco-next-cursor" = String, description = "Opaque cursor for the next log page"))
+        ),
         (status = 404, description = "Logs not found", body = ApiErrorBody),
         (status = 400, description = "Invalid request", body = ApiErrorBody),
     ),
@@ -5463,6 +5596,9 @@ pub(crate) async fn get_run_logs(
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_workspace(&ctx, &workspace_id)?;
 
+    let limit = parse_log_page_limit(query.limit)?;
+    let start_after = query.cursor.as_deref().map(decode_log_cursor).transpose()?;
+
     if let Some(ref task_key) = query.task_key {
         if !is_valid_task_key(task_key) {
             return Err(ApiError::bad_request("invalid task_key"));
@@ -5476,34 +5612,31 @@ pub(crate) async fn get_run_logs(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let mut paths = storage
-        .list(&prefix)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to list logs: {e}")))?;
+    let page = read_run_log_page(
+        &storage,
+        &prefix,
+        start_after.as_deref(),
+        limit,
+        MAX_AGGREGATED_LOG_BYTES,
+    )
+    .await?;
 
-    if paths.is_empty() {
+    if page.body.is_empty() && query.cursor.is_none() {
         return Err(ApiError::not_found("logs not found"));
     }
 
-    paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-
-    let mut output = String::new();
-    for path in paths {
-        let bytes = storage
-            .get_raw(path.as_str())
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to read log: {e}")))?;
-        let chunk = String::from_utf8_lossy(&bytes);
-        output.push_str("--- ");
-        output.push_str(path.as_str());
-        output.push_str(" ---\n");
-        output.push_str(&chunk);
-        if !chunk.ends_with('\n') {
-            output.push('\n');
-        }
+    let mut headers = HeaderMap::new();
+    if let Some(next_start_after) = page.next_start_after {
+        let cursor = encode_log_cursor(&next_start_after)?;
+        let value = HeaderValue::from_str(&cursor)
+            .map_err(|e| ApiError::internal(format!("failed to encode log cursor header: {e}")))?;
+        headers.insert(
+            header::HeaderName::from_static(NEXT_LOG_CURSOR_HEADER),
+            value,
+        );
     }
 
-    Ok((StatusCode::OK, output))
+    Ok((StatusCode::OK, headers, page.body))
 }
 
 // ============================================================================
@@ -6623,19 +6756,226 @@ mod tests {
     use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
     use anyhow::{Result, anyhow};
     use arco_core::partition::{PartitionKey, ScalarValue};
-    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend};
+    use arco_core::storage::{ListPage, MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
     use arco_flow::orchestration::LedgerWriter;
+    use async_trait::async_trait;
     use axum::http::StatusCode;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::Duration;
     use serde_json::json;
     use std::ops::Range;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
 
     struct FailLedgerPutsBackend {
         inner: MemoryBackend,
         fail_ledger_puts: AtomicBool,
+    }
+
+    #[derive(Debug, Default)]
+    struct PagedLogsBackend {
+        inner: MemoryBackend,
+        full_list_calls: AtomicUsize,
+        page_calls: AtomicUsize,
+        range_reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StorageBackend for PagedLogsBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.range_reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, _prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.full_list_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::storage(
+                "run-log reads must not use unbounded listing",
+            ))
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.page_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: StdDuration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    fn paged_logs_storage() -> (ScopedStorage, Arc<PagedLogsBackend>) {
+        let backend = Arc::new(PagedLogsBackend::default());
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace")
+            .expect("valid log storage scope");
+        (storage, backend)
+    }
+
+    #[tokio::test]
+    async fn test_read_run_log_page_uses_one_bounded_page() -> Result<()> {
+        let (storage, backend) = paged_logs_storage();
+        for (path, body) in [
+            ("logs/run-1/a/attempt-1.log", "alpha\n"),
+            ("logs/run-1/b/attempt-1.log", "bravo\n"),
+            ("logs/run-1/c/attempt-1.log", "charlie\n"),
+        ] {
+            storage
+                .put_raw(path, Bytes::from(body), WritePrecondition::None)
+                .await?;
+        }
+
+        let first = read_run_log_page(&storage, "logs/run-1/", None, 2, 1024)
+            .await
+            .map_err(|error| anyhow!("{error:?}"))?;
+        assert!(first.body.contains("alpha"));
+        assert!(first.body.contains("bravo"));
+        assert!(!first.body.contains("charlie"));
+        assert_eq!(
+            first.next_start_after.as_deref(),
+            Some("logs/run-1/b/attempt-1.log")
+        );
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 2);
+
+        let second = read_run_log_page(
+            &storage,
+            "logs/run-1/",
+            first.next_start_after.as_deref(),
+            2,
+            1024,
+        )
+        .await
+        .map_err(|error| anyhow!("{error:?}"))?;
+        assert!(second.body.contains("charlie"));
+        assert!(second.next_start_after.is_none());
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_run_log_page_stops_before_byte_budget_read() -> Result<()> {
+        let (storage, backend) = paged_logs_storage();
+        let first_path = "logs/run-1/a/attempt-1.log";
+        let second_path = "logs/run-1/b/attempt-1.log";
+        storage
+            .put_raw(
+                first_path,
+                Bytes::from_static(b"alpha\n"),
+                WritePrecondition::None,
+            )
+            .await?;
+        storage
+            .put_raw(
+                second_path,
+                Bytes::from_static(b"bravo\n"),
+                WritePrecondition::None,
+            )
+            .await?;
+        let first_entry_budget = first_path
+            .len()
+            .saturating_add("alpha\n".len())
+            .saturating_add(LOG_ENTRY_FRAMING_BYTES);
+
+        let page = read_run_log_page(&storage, "logs/run-1/", None, 2, first_entry_budget)
+            .await
+            .map_err(|error| anyhow!("{error:?}"))?;
+
+        assert!(page.body.contains("alpha"));
+        assert!(!page.body.contains("bravo"));
+        assert_eq!(page.next_start_after.as_deref(), Some(first_path));
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_run_log_page_rejects_oversized_first_object_before_read() -> Result<()> {
+        let (storage, backend) = paged_logs_storage();
+        storage
+            .put_raw(
+                "logs/run-1/a/attempt-1.log",
+                Bytes::from_static(b"oversized"),
+                WritePrecondition::None,
+            )
+            .await?;
+
+        let result = read_run_log_page(&storage, "logs/run-1/", None, 1, 8).await;
+
+        assert!(result.is_err());
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_run_log_page_rejects_cursor_outside_prefix_before_listing() -> Result<()> {
+        let (storage, backend) = paged_logs_storage();
+
+        let result = read_run_log_page(
+            &storage,
+            "logs/run-1/",
+            Some("logs/run-2/a/attempt-1.log"),
+            1,
+            1024,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.range_reads.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_cursor_round_trip_rejects_legacy_offsets() -> Result<()> {
+        let path = "logs/run-1/a/attempt-1.log";
+        let encoded = encode_log_cursor(path).map_err(|error| anyhow!("{error:?}"))?;
+
+        assert_eq!(
+            decode_log_cursor(&encoded).map_err(|error| anyhow!("{error:?}"))?,
+            path
+        );
+        assert!(decode_log_cursor("10").is_err());
+        assert!(decode_log_cursor("not-a-cursor").is_err());
+        let multi_key = encode_list_cursor(ListCursorKey(vec![
+            path.to_string(),
+            "unexpected-second-key".to_string(),
+        ]))
+        .map_err(|error| anyhow!("{error:?}"))?;
+        assert!(decode_log_cursor(&multi_key).is_err());
+        Ok(())
     }
 
     impl FailLedgerPutsBackend {

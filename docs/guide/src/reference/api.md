@@ -31,6 +31,20 @@ When changing public API behavior:
 3. Update relevant mdBook docs under `docs/guide/src/`.
 4. Include migration notes in PR/release notes for breaking or behavior-sensitive changes.
 
+## Run Log Pagination
+
+`GET /api/v1/workspaces/{workspace_id}/runs/{run_id}/logs` keeps its
+`text/plain` response body and accepts `limit` (default 50, maximum 200) plus an
+opaque `cursor`. When another page may exist, the response carries
+`x-arco-next-cursor`; pass that value unchanged as the next request's `cursor`.
+The header is exposed through CORS. A full final page can carry a cursor, so an
+exact-multiple scan finishes with one later `200 OK` response containing an
+empty body and no next-cursor header.
+
+Each response is capped at 8 MiB including path framing. If the byte budget is
+reached before the object limit, the next cursor resumes after the last object
+actually included; unread objects are not skipped or fetched speculatively.
+
 ## Public Rust Enum Compatibility Policy
 
 Public error enums exposed by stable crates are non-exhaustive so downstream Rust callers keep a wildcard arm and Arco can add precise variants before 1.0 without making every exhaustive match a source break. Public contract validation enums follow the same rule. The current public Rust enum inventory covered by this policy is `arco_core::Error`, `arco_catalog::CatalogError`, `arco_delta::DeltaError`, `arco_iceberg::IcebergError`, `arco_uc::UnityCatalogError`, `arco_proto::TaskOutputContractError`, `arco_proto::ControlPlaneTransactionContractError`, `arco_proto::CatalogDdlContractError`, `arco_proto::MetastoreMutationContractError`, `arco_proto::CatalogControlPlaneScopeContractError`, `arco_proto::OrchestrationEventContractError`, and `arco_proto::WorkerCallbackContractError`.

@@ -6,7 +6,7 @@
 //! ## Rate Limit Categories
 //!
 //! - **Default**: 500 req/min per tenant
-//! - **URL Minting**: 100 req/min per tenant (expensive operation)
+//! - **URL Minting**: 100 physical-path units/min per tenant (at least one per request)
 //!
 //! ## Response Headers
 //!
@@ -50,7 +50,10 @@ pub struct RateLimitConfig {
     #[serde(default = "default_requests_per_minute")]
     pub default_requests_per_minute: u32,
 
-    /// URL minting requests per minute per tenant (lower limit for expensive operation).
+    /// URL-minting quota units per minute per tenant.
+    ///
+    /// The serialized field name is retained for compatibility. One unit is
+    /// charged per distinct physical path, with a minimum of one per request.
     #[serde(default = "default_url_minting_per_minute")]
     pub url_minting_requests_per_minute: u32,
 
@@ -230,6 +233,35 @@ impl RateLimitState {
 
     /// Checks rate limit for URL minting (lower limit).
     pub async fn check_url_minting(&self, tenant: &str) -> RateLimitResult {
+        self.check_url_minting_tokens(tenant, NonZeroU32::MIN).await
+    }
+
+    /// Reserves URL-minting quota for physical paths beyond the request token
+    /// already consumed by middleware.
+    pub async fn check_url_minting_additional_paths(
+        &self,
+        tenant: &str,
+        additional_paths: u32,
+    ) -> RateLimitResult {
+        if !self.config.enabled {
+            return RateLimitResult::Allowed {
+                limit: 0,
+                remaining: 0,
+            };
+        }
+        let Some(tokens) = NonZeroU32::new(additional_paths) else {
+            return RateLimitResult::Allowed {
+                limit: self.config.url_minting_requests_per_minute,
+                remaining: self
+                    .config
+                    .url_minting_requests_per_minute
+                    .saturating_sub(1),
+            };
+        };
+        self.check_url_minting_tokens(tenant, tokens).await
+    }
+
+    async fn check_url_minting_tokens(&self, tenant: &str, tokens: NonZeroU32) -> RateLimitResult {
         if !self.config.enabled {
             return RateLimitResult::Allowed {
                 limit: 0,
@@ -247,18 +279,26 @@ impl RateLimitState {
         )
         .await;
 
-        Self::check_limiter(&limiter, self.config.url_minting_requests_per_minute)
+        Self::check_limiter_n(
+            &limiter,
+            self.config.url_minting_requests_per_minute,
+            tokens,
+        )
     }
 
     fn check_limiter(limiter: &TenantLimiter, limit: u32) -> RateLimitResult {
-        match limiter.check() {
-            Ok(()) => RateLimitResult::Allowed {
+        Self::check_limiter_n(limiter, limit, NonZeroU32::MIN)
+    }
+
+    fn check_limiter_n(limiter: &TenantLimiter, limit: u32, tokens: NonZeroU32) -> RateLimitResult {
+        match limiter.check_n(tokens) {
+            Ok(Ok(())) => RateLimitResult::Allowed {
                 limit,
                 // Exact remaining is not exposed by governor's direct limiter API.
                 // Report a conservative approximation without consuming another token.
-                remaining: limit.saturating_sub(1),
+                remaining: limit.saturating_sub(tokens.get()),
             },
-            Err(not_until) => {
+            Ok(Err(not_until)) => {
                 let retry_after =
                     not_until.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
                 RateLimitResult::Limited {
@@ -266,6 +306,10 @@ impl RateLimitState {
                     retry_after_secs: retry_after.as_secs(),
                 }
             }
+            Err(_) => RateLimitResult::Limited {
+                limit,
+                retry_after_secs: 60,
+            },
         }
     }
 }
@@ -310,9 +354,10 @@ pub async fn rate_limit_middleware(
 
     let path = req.uri().path();
     let endpoint = crate::metrics::endpoint_label(&req);
+    let is_url_minting = path.contains("/browser/urls");
 
     // Check appropriate rate limit based on endpoint
-    let result = if path.contains("/browser/urls") {
+    let result = if is_url_minting {
         rate_limit.check_url_minting(&tenant).await
     } else {
         rate_limit.check_default(&tenant).await
@@ -347,7 +392,12 @@ pub async fn rate_limit_middleware(
             // Record rate limit metric
             crate::metrics::record_rate_limit_hit(endpoint.as_str());
 
-            rate_limit_response(limit, retry_after_secs)
+            let quota_unit = if is_url_minting {
+                "physical paths"
+            } else {
+                "requests"
+            };
+            rate_limit_response(limit, retry_after_secs, quota_unit)
         }
     }
 }
@@ -361,12 +411,12 @@ fn add_rate_limit_headers(headers: &mut axum::http::HeaderMap, limit: u32, remai
     }
 }
 
-fn rate_limit_response(limit: u32, retry_after_secs: u64) -> Response {
+fn rate_limit_response(limit: u32, retry_after_secs: u64, quota_unit: &str) -> Response {
     let body = serde_json::json!({
         "code": "RATE_LIMITED",
         "message": format!(
-            "Rate limit exceeded. Limit: {} requests per minute. Retry after {} seconds.",
-            limit, retry_after_secs
+            "Rate limit exceeded. Limit: {} {} per minute. Retry after {} seconds.",
+            limit, quota_unit, retry_after_secs
         ),
     });
 
@@ -444,6 +494,11 @@ mod tests {
             let result = state.check_default("tenant-1").await;
             assert!(matches!(result, RateLimitResult::Allowed { limit: 0, .. }));
         }
+
+        let result = state
+            .check_url_minting_additional_paths("tenant-1", 0)
+            .await;
+        assert!(matches!(result, RateLimitResult::Allowed { limit: 0, .. }));
     }
 
     #[tokio::test]
@@ -466,6 +521,42 @@ mod tests {
             result,
             RateLimitResult::Allowed { limit: 100, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn url_minting_reserves_one_token_per_physical_path() {
+        let config = RateLimitConfig {
+            enabled: true,
+            default_requests_per_minute: 100,
+            url_minting_requests_per_minute: 100,
+            burst_size: 10,
+            ..RateLimitConfig::default()
+        };
+        let state = RateLimitState::new(config);
+
+        let request_token = state.check_url_minting("tenant-1").await;
+        let four_additional_paths = state
+            .check_url_minting_additional_paths("tenant-1", 4)
+            .await;
+        let next_request = state.check_url_minting("tenant-1").await;
+
+        assert!(matches!(request_token, RateLimitResult::Allowed { .. }));
+        assert!(matches!(
+            four_additional_paths,
+            RateLimitResult::Allowed { .. }
+        ));
+        assert!(matches!(next_request, RateLimitResult::Limited { .. }));
+    }
+
+    #[tokio::test]
+    async fn url_minting_limit_response_names_physical_path_units() {
+        let response = rate_limit_response(100, 5, "physical paths");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = String::from_utf8(body.to_vec()).expect("UTF-8 response body");
+
+        assert!(body.contains("100 physical paths per minute"));
     }
 
     #[tokio::test]

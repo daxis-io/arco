@@ -13,6 +13,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -49,16 +50,24 @@ fn test_config() -> Config {
 #[derive(Clone)]
 struct DummyHttpSignedUrlBackend {
     inner: Arc<dyn StorageBackend>,
+    signed_url_calls: Arc<AtomicUsize>,
 }
 
 impl DummyHttpSignedUrlBackend {
     fn new(inner: Arc<dyn StorageBackend>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            signed_url_calls: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     fn signed_url_for(path: &str, expiry: Duration) -> String {
         let expires = expiry.as_secs();
         format!("http://signed-url.invalid/objects/{path}?expires={expires}&sig=dummy")
+    }
+
+    fn signed_url_calls(&self) -> usize {
+        self.signed_url_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -94,6 +103,7 @@ impl StorageBackend for DummyHttpSignedUrlBackend {
     }
 
     async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.signed_url_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Self::signed_url_for(path, expiry))
     }
 }
@@ -132,6 +142,28 @@ async fn test_router_with_storage() -> Result<Option<(axum::Router, Arc<MemoryBa
     };
     let router = Server::with_storage_backend(test_config(), backend).test_router();
     Ok(Some((router, inner)))
+}
+
+fn dummy_router_with_storage() -> (
+    axum::Router,
+    Arc<MemoryBackend>,
+    Arc<DummyHttpSignedUrlBackend>,
+) {
+    dummy_router_with_config(test_config())
+}
+
+fn dummy_router_with_config(
+    config: Config,
+) -> (
+    axum::Router,
+    Arc<MemoryBackend>,
+    Arc<DummyHttpSignedUrlBackend>,
+) {
+    let inner = Arc::new(MemoryBackend::new());
+    let signer = Arc::new(DummyHttpSignedUrlBackend::new(inner.clone()));
+    let backend: Arc<dyn StorageBackend> = signer.clone();
+    let router = Server::with_storage_backend(config, backend).test_router();
+    (router, inner, signer)
 }
 
 // ============================================================================
@@ -569,6 +601,127 @@ mod signed_url_security {
 
         let mint_response: MintUrlsResponse = response_json(response).await?;
         assert_eq!(mint_response.ttl_seconds, 900);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_paths_are_signed_once() -> Result<()> {
+        use arco_catalog::CatalogReader;
+        use arco_core::{CatalogDomain, ScopedStorage};
+
+        let (router, inner, signer) = dummy_router_with_storage();
+        let create_ns = CreateNamespaceRequest {
+            name: "dedup_test_ns".to_string(),
+            description: None,
+        };
+        let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let path = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await?
+            .into_iter()
+            .find(|path| path.ends_with("/namespaces.parquet"))
+            .context("namespaces.parquet not mintable")?;
+
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![path.clone(); 25],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mint_response: MintUrlsResponse = response_json(response).await?;
+        assert_eq!(mint_response.urls.len(), 1);
+        let url_entry = mint_response
+            .urls
+            .into_iter()
+            .next()
+            .context("missing signed URL")?;
+        assert_eq!(url_entry.path, path);
+        assert_eq!(signer.signed_url_calls(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submitted_path_count_above_limit_is_rejected_before_signing() -> Result<()> {
+        use arco_catalog::CatalogReader;
+        use arco_core::{CatalogDomain, ScopedStorage};
+
+        let (router, inner, signer) = dummy_router_with_storage();
+        let create_ns = CreateNamespaceRequest {
+            name: "cap_test_ns".to_string(),
+            description: None,
+        };
+        let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let path = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await?
+            .into_iter()
+            .find(|path| path.ends_with("/namespaces.parquet"))
+            .context("namespaces.parquet not mintable")?;
+
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![path; 26],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(signer.signed_url_calls(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn url_minting_rate_limit_charges_each_unique_path() -> Result<()> {
+        use arco_catalog::CatalogReader;
+        use arco_core::{CatalogDomain, ScopedStorage};
+
+        let mut config = test_config();
+        config.rate_limit.url_minting_requests_per_minute = 100;
+        config.rate_limit.burst_size = 8;
+        let (router, inner, _signer) = dummy_router_with_config(config);
+
+        let create_ns = CreateNamespaceRequest {
+            name: "weighted_limit_test_ns".to_string(),
+            description: None,
+        };
+        let response = post_json(&router, "/api/v1/namespaces", &create_ns).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let storage = ScopedStorage::new(inner, "test-tenant", "test-workspace")?;
+        let reader = CatalogReader::new(storage);
+        let paths: Vec<String> = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await?
+            .into_iter()
+            .take(4)
+            .collect();
+        assert_eq!(paths.len(), 4, "fixture must expose four mintable paths");
+        let first_path = paths.first().cloned().context("missing first path")?;
+
+        let mint_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: paths.clone(),
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &mint_req).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let next_req = MintUrlsRequest {
+            domain: "catalog".to_string(),
+            paths: vec![first_path],
+            ttl_seconds: Some(300),
+        };
+        let response = post_json(&router, "/api/v1/browser/urls", &next_req).await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         Ok(())
     }
 

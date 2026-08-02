@@ -85,7 +85,10 @@ struct RepairAutomationConfig {
 impl Default for RepairAutomationConfig {
     fn default() -> Self {
         Self {
-            mode: RepairAutomationMode::Enforce,
+            // Keep reconciliation visibility on by default without allowing
+            // unattended mutation. Enforcement requires an explicit operator
+            // configuration choice.
+            mode: RepairAutomationMode::DryRun,
             interval: Duration::from_secs(300),
             scope: OrchestrationRepairScope::Full,
         }
@@ -1020,11 +1023,11 @@ mod tests {
     }
 
     #[test]
-    fn repair_automation_config_defaults_to_enforce_full_scope() {
+    fn repair_automation_config_defaults_to_dry_run_full_scope() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
-        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.mode, RepairAutomationMode::DryRun);
         assert_eq!(config.interval, std::time::Duration::from_secs(300));
         assert_eq!(config.scope, OrchestrationRepairScope::Full);
     }

@@ -124,7 +124,10 @@ struct RepairAutomationConfig {
 impl Default for RepairAutomationConfig {
     fn default() -> Self {
         Self {
-            mode: RepairAutomationMode::Enforce,
+            // Unattended deletion is opt-in. With no configuration, retain the
+            // same detection coverage while reporting what enforcement would
+            // repair instead of mutating storage.
+            mode: RepairAutomationMode::DryRun,
             interval: Duration::from_secs(300),
             scope: RepairScope::Full,
             domains: vec![
@@ -1666,11 +1669,11 @@ mod tests {
     }
 
     #[test]
-    fn test_repair_automation_config_defaults_to_enforce_full_scope() {
+    fn test_repair_automation_config_defaults_to_dry_run_full_scope() {
         let config =
             RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
 
-        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.mode, RepairAutomationMode::DryRun);
         assert_eq!(config.interval, Duration::from_secs(300));
         assert_eq!(config.scope, RepairScope::Full);
         assert_eq!(

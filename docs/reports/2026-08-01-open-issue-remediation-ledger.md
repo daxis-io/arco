@@ -51,6 +51,35 @@ PR #374 contains this ledger and the Wave 0 closure evidence. User-owned stacked
 PRs #381-#392 overlap several other rows; treat them as patch quarries and
 pending review, not as frozen-baseline or closure proof.
 
+## Queued physical-listing dependency
+
+#356 must land before #340 can claim a paginated log response. A handler-only
+object or byte cap still calls the unbounded `StorageBackend::list` and truncates
+after enumerating the full prefix.
+
+The shared pager needs this interface contract:
+
+- A successful page is lexicographically ordered, starts strictly after its
+  cursor, and returns no more than its logical limit. A full page always
+  returns a resume cursor; a short page signals exhaustion. Exact multiples
+  may require one later empty-page check.
+- The default adapter returns an unsupported error. It must never preserve
+  source compatibility by falling back to the unbounded `list` implementation.
+- GCS and general-purpose S3 adapters may enable path-cursor paging because
+  [GCS](https://docs.cloud.google.com/storage/docs/json_api/v1/objects/list) and
+  [S3](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html)
+  specify lexicographic object order. S3 directory buckets return unsorted
+  listings and do not support `StartAfter`; reject bounded cursor paging for
+  that adapter instead of overstating the invariant.
+- Remote adapters must stop consuming the `object_store` stream at the logical
+  limit and document provider-page overfetch. Do not use a one-object lookahead:
+  it can fetch one full extra provider page before the stream yields that item.
+- Local tests must prove bounded backend calls, exclusive cursor behavior,
+  exact-multiple page termination, empty pages, and concurrent insertion
+  semantics. Provider certification remains part of #366.
+- After #356, #340 can page log objects through the same seam, cap aggregate
+  response bytes, expose a next cursor, and retain the existing task-key filter.
+
 ## Original cohort
 
 | Issue | Audit verdict | Resolution owner | Required closure proof | State |

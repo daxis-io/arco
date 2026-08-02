@@ -13,8 +13,7 @@ under the lineage Tier-1 domain, and sync compaction folds them into
 client-asserted, six fields wide, and carry no version, materialization,
 resolution, or soundness identity.
 
-The lineage observation and projection design
-(`docs/plans/2026-06-26-lineage-observation-projection-design.md`) defines the
+The [lineage observation and projection design](../plans/2026-06-26-lineage-observation-projection-design.md) defines the
 target architecture (lanes L0–L6): lineage as append-only observed fact,
 deterministically projected into catalog, search, governance, and system-table
 views. This ADR records the architectural decisions that bind every future
@@ -70,7 +69,7 @@ Lineage is append-only observed fact projected into derived, read-only views.
     first-write-wins dedup by edge id; the L0 slice makes edge ids
     content-derived so duplicate client POSTs converge to one row. Schema
     evolution for richer projections is additive only, per ADR-006 and the
-    golden-schema plan (`docs/plans/2026-07-30-lineage-l0-schema-plan.md`).
+    [golden-schema plan](../plans/2026-07-30-lineage-l0-schema-plan.md).
 
 ## OpenLineage Compatibility
 

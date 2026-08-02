@@ -85,7 +85,7 @@ The repo does not yet prove this broader statement:
 
 ## Related References
 
-- `docs/plans/2026-06-27-arco-unified-execution-roadmap.md`
+- [Unified execution roadmap](../../../plans/2026-06-27-arco-unified-execution-roadmap.md)
 - `docs/reports/2026-07-30-design-program-progress-audit.md`
 - `docs/reports/2026-04-20-catalog-control-plane-framing-audit.md`
 - `docs/adr/adr-018-tier1-write-path.md`

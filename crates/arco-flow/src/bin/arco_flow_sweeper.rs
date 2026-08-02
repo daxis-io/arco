@@ -39,6 +39,43 @@ use arco_flow::orchestration::worker_contract::{
 };
 use arco_worker_contract::callback_task_id;
 
+#[async_trait::async_trait]
+trait CloudTaskEnqueuer: Send + Sync {
+    async fn enqueue_http(
+        &self,
+        task_id: &str,
+        target_url: &str,
+        body: &[u8],
+        options: EnqueueOptions,
+        audience: Option<&str>,
+        extra_headers: Option<HashMap<String, String>>,
+    ) -> Result<EnqueueResult>;
+}
+
+#[async_trait::async_trait]
+impl CloudTaskEnqueuer for CloudTasksDispatcher {
+    async fn enqueue_http(
+        &self,
+        task_id: &str,
+        target_url: &str,
+        body: &[u8],
+        options: EnqueueOptions,
+        audience: Option<&str>,
+        extra_headers: Option<HashMap<String, String>>,
+    ) -> Result<EnqueueResult> {
+        Self::enqueue_http(
+            self,
+            task_id,
+            target_url,
+            body,
+            options,
+            audience,
+            extra_headers,
+        )
+        .await
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     tenant_id: String,
@@ -47,7 +84,7 @@ struct AppState {
     compactor: MicroCompactor,
     ledger: LedgerWriter,
     orch_compactor_url: Option<String>,
-    cloud_tasks: Arc<CloudTasksDispatcher>,
+    cloud_tasks: Arc<dyn CloudTaskEnqueuer>,
     worker_dispatch_headers: HashMap<String, String>,
     dispatch_target_url: String,
     dispatch_target_audience: String,
@@ -661,7 +698,7 @@ mod tests {
                     run_id: row.run_id.clone(),
                     task_key: row.task_key.clone(),
                     asset_key: row.asset_key.clone(),
-                    partition_key: row.partition_key.clone(),
+                    partition_key: row.partition_key,
                     code_version: None,
                     cancel_requested,
                 }))
@@ -672,25 +709,38 @@ mod tests {
     struct AllowAllTokens;
 
     impl TaskTokenValidator for AllowAllTokens {
-        fn validate_task_token(
+        async fn validate_task_token(
             &self,
             _task_id: &str,
             _run_id: &str,
             _attempt: u32,
             _attempt_id: &str,
             _token: &str,
-        ) -> impl Future<Output = std::result::Result<(), String>> + Send {
-            async { Ok(()) }
+        ) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct EnqueueAllTasks;
+
+    #[async_trait::async_trait]
+    impl CloudTaskEnqueuer for EnqueueAllTasks {
+        async fn enqueue_http(
+            &self,
+            task_id: &str,
+            _target_url: &str,
+            _body: &[u8],
+            _options: EnqueueOptions,
+            _audience: Option<&str>,
+            _extra_headers: Option<HashMap<String, String>>,
+        ) -> Result<EnqueueResult> {
+            Ok(EnqueueResult::Enqueued {
+                message_id: task_id.to_string(),
+            })
         }
     }
 
     fn test_state(storage: ScopedStorage, clock: SweeperClock) -> AppState {
-        let cloud_config = CloudTasksConfig::new(
-            "project",
-            "us-central1",
-            "queue",
-            "https://worker.invalid/dispatch",
-        );
         AppState {
             tenant_id: TENANT.to_string(),
             workspace_id: WORKSPACE.to_string(),
@@ -698,9 +748,7 @@ mod tests {
             compactor: MicroCompactor::new(storage.clone()),
             ledger: LedgerWriter::new(storage),
             orch_compactor_url: None,
-            cloud_tasks: Arc::new(
-                CloudTasksDispatcher::new(cloud_config).expect("cloud tasks config"),
-            ),
+            cloud_tasks: Arc::new(EnqueueAllTasks),
             worker_dispatch_headers: HashMap::new(),
             dispatch_target_url: "https://worker.invalid/dispatch".to_string(),
             dispatch_target_audience: "https://worker.invalid".to_string(),
@@ -826,6 +874,10 @@ mod tests {
     /// deadline the sweeper emits no retry dispatch at all, so this test fails
     /// on the unfixed code rather than on a hand-built event.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the wiring regression keeps the full failure-to-retry sequence visible"
+    )]
     async fn sweeper_route_converges_a_failed_first_attempt_onto_a_dispatched_retry() {
         let storage = memory_storage();
         let state = test_state(storage.clone(), SweeperClock::system());
@@ -950,6 +1002,10 @@ mod tests {
     /// a durable-but-unfolded straggler whose id sits *below* the watermark,
     /// which the freshness scan cannot see.
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the wiring regression compares all three freshness cases in one test"
+    )]
     async fn sweeper_route_reaps_zombie_only_on_evidence_it_can_actually_prove() {
         // (a) Fully folded ledger, stale RUNNING task: the reap happens.
         let storage = memory_storage();

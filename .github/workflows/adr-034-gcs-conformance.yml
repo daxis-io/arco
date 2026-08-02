@@ -59,7 +59,19 @@ jobs:
           cargo test --locked -p arco-core --test storage_backend_conformance \
             gcs_backend_satisfies_storage_conformance -- --ignored --nocapture
 
-      - name: Skip GCS storage conformance suite
+      # Scheduled and manually dispatched green runs must prove that the real
+      # provider CAS suite executed. Missing owner-managed configuration is an
+      # evidence failure, not a successful skip.
+      - name: Fail on missing GCS conformance configuration
         if: steps.prereq.outputs.auth_mode == 'skip'
         run: |
-          echo "Skipping ADR-034 GCS conformance: missing vars.ARCO_TEST_GCS_BUCKET and GCP auth configuration"
+          {
+            echo "## ADR-034 GCS conformance: FAILED (unconfigured)"
+            echo ""
+            echo "The provider CAS gate is UNVERIFIED because GCS credentials or bucket configuration is missing."
+            echo ""
+            echo "Configure \`vars.ARCO_TEST_GCS_BUCKET\` plus either"
+            echo "(\`vars.GCP_WORKLOAD_IDENTITY_PROVIDER\` + \`vars.GCP_SERVICE_ACCOUNT\`) or \`secrets.GCP_SA_KEY_API\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::GCS conformance cannot run: provider credentials or bucket are unconfigured"
+          exit 1

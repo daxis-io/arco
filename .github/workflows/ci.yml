@@ -67,6 +67,7 @@ jobs:
           github_token: ${{ github.token }}
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: bash tools/test_ci_certification_contracts.sh
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity
@@ -184,11 +185,8 @@ jobs:
       - name: Install Python dependencies
         run: uv sync --locked --extra dev
         working-directory: python/arco
-      - name: Run Python unit tests
-        run: uv run python -m pytest tests/unit -v
-        working-directory: python/arco
-      - name: Run Python CLI API tests
-        run: uv run python -m pytest tests/integration/test_cli_api.py -v
+      - name: Run configured Python test tree
+        run: uv run python -m pytest -v
         working-directory: python/arco
 
   docs:
@@ -346,10 +344,18 @@ jobs:
             --features iam-smoke \
             -- --ignored --test-threads=1
 
-      - name: Skip IAM smoke tests (missing config)
+      # A green main workflow does not claim deployed IAM evidence when the
+      # owner-managed credentials are absent. Surface the omission in both the
+      # log and durable job summary so it cannot be mistaken for execution.
+      - name: Report unverified IAM smoke evidence (missing config)
         if: steps.iam_smoke_prereq.outputs.skip == 'true'
         run: |
-          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"
+          echo "::warning::IAM smoke tests SKIPPED (missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV) — sole-writer IAM invariant NOT verified this run"
+          {
+            echo "## IAM smoke tests: SKIPPED (unconfigured)"
+            echo ""
+            echo "The sole-writer IAM invariant was NOT verified this run because \`secrets.GCP_SA_KEY_API\` or \`vars.ARCO_BUCKET_DEV\` is missing."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
   # Compile-Negative Tests (Gate 5 trait separation)

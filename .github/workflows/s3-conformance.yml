@@ -1,0 +1,71 @@
+name: S3 Storage Conformance
+
+# S3 remains uncertified until this workflow passes against a dedicated real
+# bucket. Keep it dispatch-only while no owner-managed AWS test configuration
+# exists; add a schedule in the same change that provisions that configuration.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  s3-conformance:
+    name: S3 Storage Conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: "false"
+
+      # AmazonS3Builder::from_env reads these variables directly. Replace the
+      # temporary static-key contract with OIDC role assumption when that
+      # infrastructure is available.
+      - name: Check S3 conformance prerequisites
+        id: prereq
+        env:
+          BUCKET: ${{ vars.ARCO_TEST_S3_BUCKET }}
+          REGION: ${{ vars.AWS_REGION }}
+          ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "$BUCKET" ] && [ -n "$REGION" ] && [ -n "$ACCESS_KEY_ID" ] && [ -n "$SECRET_ACCESS_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run S3 storage conformance suite
+        if: steps.prereq.outputs.configured == 'true'
+        env:
+          ARCO_TEST_S3_BUCKET: ${{ vars.ARCO_TEST_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          cargo test --locked -p arco-core --test storage_backend_conformance \
+            s3_backend_satisfies_storage_conformance -- --ignored --nocapture
+
+      - name: Fail on missing S3 conformance configuration
+        if: steps.prereq.outputs.configured != 'true'
+        run: |
+          {
+            echo "## S3 conformance: FAILED (unconfigured)"
+            echo ""
+            echo "S3 is NOT certified: no real-provider CAS conformance evidence ran."
+            echo ""
+            echo "Configure \`vars.ARCO_TEST_S3_BUCKET\`, \`vars.AWS_REGION\`,"
+            echo "\`secrets.AWS_ACCESS_KEY_ID\`, and \`secrets.AWS_SECRET_ACCESS_KEY\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::S3 is NOT certified: AWS credentials or bucket are unconfigured"
+          exit 1

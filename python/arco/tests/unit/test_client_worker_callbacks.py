@@ -106,3 +106,24 @@ def test_task_completed_uses_task_id_and_omits_missing_output(
     assert isinstance(body, dict)
     assert "output" not in body
     assert "result" not in body
+
+
+def test_upload_logs_uses_dispatch_token_and_callback_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, captured = _client_with_capture(monkeypatch)
+    dispatch_token = "-".join(("dispatch", "token"))
+
+    client.upload_logs(
+        workspace_id="workspace-b",
+        run_id="run-123",
+        task_key="analytics.daily_sales",
+        attempt=1,
+        stdout="task output",
+        stderr="",
+        task_token=dispatch_token,
+        callback_base_url="https://callbacks.example",
+    )
+
+    assert captured["headers"]["Authorization"] == f"Bearer {dispatch_token}"
+    assert captured["base_url"] == "https://callbacks.example"

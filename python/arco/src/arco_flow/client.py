@@ -284,8 +284,10 @@ class ArcoFlowApiClient:
         attempt: int,
         stdout: str,
         stderr: str,
+        task_token: str | None = None,
+        callback_base_url: str | None = None,
     ) -> ApiResponse:
-        headers = self._build_headers(workspace_id=workspace_id)
+        headers = self._build_headers(workspace_id=workspace_id, task_token=task_token)
         payload = {
             "taskKey": task_key,
             "attempt": attempt,
@@ -297,6 +299,7 @@ class ArcoFlowApiClient:
             f"/workspaces/{workspace_id}/runs/{run_id}/logs",
             json_body=payload,
             headers=headers,
+            base_url=callback_base_url,
         )
         return ApiResponse(payload=response)
 

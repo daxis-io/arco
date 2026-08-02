@@ -46,16 +46,22 @@ required, in a fresh deployed artifact.
 | [#395](https://github.com/daxis-io/arco/pull/395) | #329, #332 | The branch isolates worker output and authenticates log upload; the known default-branch Cargo advisory remains outside this PR |
 | [#396](https://github.com/daxis-io/arco/pull/396) | #355 | The branch caps and deduplicates paths, charges physical-path quota, and counts physical URLs; long CI tests were still running at refresh time |
 | [#397](https://github.com/daxis-io/arco/pull/397) | #249 | The branch adds the operator authority runbook and mocked contract; this documentation issue needs no live-cloud evidence |
+| [#398](https://github.com/daxis-io/arco/pull/398) | #356 | The branch adds fail-closed ordered paging, cursor-bounded anti-entropy, and ignored GCS/S3 conformance; local Rust execution was disk-gated below 40 GiB and CI was pending at publication |
 
 PR #374 contains this ledger and the Wave 0 closure evidence. User-owned stacked
 PRs #381-#392 overlap several other rows; treat them as patch quarries and
 pending review, not as frozen-baseline or closure proof.
 
-## Queued physical-listing dependency
+## Published physical-listing dependency
 
 #356 must land before #340 can claim a paginated log response. A handler-only
 object or byte cap still calls the unbounded `StorageBackend::list` and truncates
 after enumerating the full prefix.
+
+PR #398 implements the shared contract below from the frozen baseline. #340
+remains queued until that branch has passing CI and can serve as the explicit
+base for a stacked log-response change; the issue is not closed merely because
+the branch exists.
 
 The shared pager needs this interface contract:
 

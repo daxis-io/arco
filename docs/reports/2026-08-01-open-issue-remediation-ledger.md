@@ -155,5 +155,7 @@ The shared pager needs this interface contract:
 
 ## Refresh cohort
 
-No post-baseline issues are included here. Add them only after comparing the
-current live issue-number set with the original table above.
+Refreshed on 2026-08-02 with `gh issue list --state open --limit 200`. GitHub
+returned 62 open issues. Their number set equals the original 68-row cohort
+minus the six Wave 0 closures `{233, 235, 236, 239, 247, 271}`. GitHub returned
+no issue created after the baseline, so the refresh cohort remains empty.

@@ -22,6 +22,7 @@ Required env:
 - `ARCO_ORCH_COMPACTOR_URL`
 - User JWT auth config: `ARCO_JWT_*`
 - Task callback token config: `ARCO_TASK_TOKEN_SECRET`, `ARCO_TASK_TOKEN_ISSUER`, `ARCO_TASK_TOKEN_AUDIENCE`, `ARCO_TASK_TOKEN_TTL_SECS`
+- Optional `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS` (default `90`; `0` disables): retention window for terminal orchestration runs in the folded projection. Applies to any process that performs orchestration compaction; set it consistently here and on `arco_flow_compactor`.
 
 Health:
 - `GET /health`
@@ -56,6 +57,8 @@ Required env:
 - `ARCO_TENANT_ID`
 - `ARCO_WORKSPACE_ID`
 - `ARCO_STORAGE_BUCKET`
+- Optional `ARCO_ORCH_DELTA_TOMBSTONES` (default off): enables L0 delta tombstone emission and, with it, orchestration retention. See "Delta tombstone rollout" below — this flag must not be turned on until every process that compacts the workspace understands tombstones, and turning it on does not repair pre-existing history.
+- Optional `ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS` (default `90`; `0` disables): terminal runs (succeeded/failed/cancelled) older than this many days are expired from the orchestration projection via delta tombstones during compaction. Set it consistently on every process that performs orchestration compaction (this service and `arco-api`). Retention only runs when `ARCO_ORCH_DELTA_TOMBSTONES` is enabled, because an expiry that cannot be recorded as a tombstone would resurrect from the delta chain on the next load.
 - Optional internal OIDC for `/compact`, `/rebuild`, and `/internal/reconcile`: `ARCO_INTERNAL_AUTH_ISSUER`, `ARCO_INTERNAL_AUTH_AUDIENCE`, `ARCO_INTERNAL_AUTH_ALLOWED_SUBS` and/or `ARCO_INTERNAL_AUTH_ALLOWED_EMAILS`, `ARCO_INTERNAL_AUTH_ENFORCE`
 
 HTTP:
@@ -135,6 +138,70 @@ Worker dispatch path:
    `taskToken`, and `callbackBaseUrl`.
 3. API validates task token against dedicated `task_token` config, not user JWT config.
 4. API resolves opaque `taskId` back to `(run_id, task_key)` for orchestration state updates.
+
+## Delta Tombstone Rollout (Two Phase)
+
+The orchestration fold removes rows (consumed dispatch outbox entries, expired
+terminal runs, expired run-key index entries). Those removals are durable only
+when the producing L0 delta references a `deletions` artifact — the *delete
+channel*. Enabling that channel changes the manifest in a way an older
+compactor cannot honour: it parses `L0Delta` without the `deletions` fields,
+drops every tombstone, and can republish a manifest — or a merged base snapshot
+— in which every removed row has been resurrected. That is duplicate dispatch,
+returning expired runs, and returning dedup keys, and it becomes irreversible
+once such a writer wins the manifest CAS.
+
+The rollout is therefore two-phase, gated by `ARCO_ORCH_DELTA_TOMBSTONES`.
+
+### Phase 1 — understand only (default; `ARCO_ORCH_DELTA_TOMBSTONES` unset)
+
+Deploy this build to **every** process that compacts the workspace:
+`arco_flow_compactor` and `arco-api` (its sync-compaction path).
+
+In this phase a process:
+
+- reads, applies and preserves tombstones written by any other process;
+- rejects a manifest that declares the delete channel but has lost its
+  artifacts, instead of folding the stripped state forward;
+- emits nothing, so no tombstone-bearing manifest exists for an older binary to
+  strip;
+- does **not** run retention, because an expiry with no tombstone resurrects.
+
+Do not proceed until every compacting process runs a build with phase-1
+support. Verify by rollout revision, not by traffic share: a single old
+revision that still serves `/compact` is enough to corrupt the workspace in
+phase 2.
+
+### Phase 2 — emit (`ARCO_ORCH_DELTA_TOMBSTONES=1` everywhere)
+
+Set the flag on every compacting process at the same time. From then on each
+fold writes a `deletions` artifact for every delta (empty ones included),
+stamps `schema_version = 2` on the manifest and a delete-channel marker on each
+base snapshot, and runs retention.
+
+The flag is effectively one-way per workspace. A process with the flag *off*
+that reads a manifest declaring the channel refuses to compact rather than
+appending tombstone-free deltas to it.
+
+### Detection of a stripping writer
+
+`schema_version` is a scalar an older compactor round-trips verbatim, while the
+`deletions` references and the base-snapshot marker are fields it drops. A
+manifest that declares the channel but lacks those artifacts is therefore
+self-contradictory, and compaction fails closed with an error naming the strip
+and demanding a rebuild. Recover by rebuilding the projections from the ledger
+(`POST /rebuild` on `arco_flow_compactor`) into a clean projection state — do
+not attempt to fold the stripped manifest forward.
+
+### Pre-feature history requires a rebuild
+
+Deltas written before this feature existed, and deltas written during phase 1,
+carry no tombstones. State reconstructed from them can still contain rows a
+fold removed in memory (the resurrection reported as issue #345). **Enabling
+phase 2 does not repair that history.** Issue #345 is only closed for a
+workspace once its projections have been rebuilt from the ledger with emission
+enabled, so that every delta in the surviving chain carries its deletions.
+Until that rebuild has run, treat the workspace as still exposed.
 
 Worker protocol compatibility:
 - Canonical writes use camelCase JSON.

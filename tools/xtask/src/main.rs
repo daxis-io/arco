@@ -856,7 +856,7 @@ fn line_opens_deletion_record(line: &str) -> bool {
 
 /// A deletion record ends at the sentence that opened it. Markdown hard-wraps
 /// prose, so the cited path frequently lands on a continuation line after the
-/// marker (`... with tracked deletion\n  \`<path>\`; root was\n  not modified.`).
+/// marker (`... with tracked deletion\n  path; root was\n  not modified.`).
 /// The record therefore stays open until a blank line or a sentence terminator.
 fn line_closes_deletion_record(line: &str) -> bool {
     let trimmed = line.trim_end();

@@ -21,11 +21,13 @@ pub mod context;
 mod contract;
 pub mod error;
 pub mod openapi;
+pub mod permissions;
 pub mod router;
 pub mod routes;
 pub mod state;
 pub mod support;
 
 pub use openapi::{UnityCatalogApiDoc, openapi, openapi_json};
+pub use permissions::{CompiledPermissionSource, MetastorePermissionSource};
 pub use router::unity_catalog_router;
 pub use state::{UnityCatalogConfig, UnityCatalogState};

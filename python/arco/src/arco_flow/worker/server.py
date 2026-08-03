@@ -14,11 +14,15 @@ import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from rich.console import Console
 
@@ -33,63 +37,182 @@ err_console = Console(stderr=True)
 
 DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
 
-# Cloud Tasks redeliveries can arrive before or after the original request
-# finishes. Retain a bounded completed-ID window in addition to active claims.
-DISPATCH_HISTORY_LIMIT = 1024
-PARTITION_KEY_PAYLOAD_FIELD = "partitionKey"
-PARTITION_KEY_PAYLOAD_FIELD_SNAKE = "partition_key"
-HEARTBEAT_TIMEOUT_PAYLOAD_FIELD = "heartbeatTimeoutSec"
-HEARTBEAT_TIMEOUT_PAYLOAD_FIELD_SNAKE = "heartbeat_timeout_sec"
-DEFAULT_HEARTBEAT_TIMEOUT_SEC = 300
-HEARTBEAT_INTERVAL_DIVISOR = 3
-MIN_HEARTBEAT_INTERVAL_SEC = 1.0
-SUPERSEDED_ATTEMPT_STATUSES = frozenset({409, 410})
+# Heartbeat timing. The control plane force-fails a RUNNING task after
+# `heartbeat_timeout_sec` (300s at the planner default) plus a 30s grace
+# (`RUNNING_TASK_STALENESS_GRACE` in
+# crates/arco-flow/src/orchestration/controllers/anti_entropy.rs). The worker
+# heartbeats at `heartbeat_timeout_sec / HEARTBEAT_INTERVAL_DIVISOR`, clamped
+# to [HEARTBEAT_MIN_INTERVAL_SECONDS, HEARTBEAT_MAX_INTERVAL_SECONDS] — 60s at
+# defaults — so several consecutive heartbeats must be lost before the
+# force-fail window can expire (issue #367).
+DEFAULT_HEARTBEAT_TIMEOUT_SECONDS = 300
+HEARTBEAT_INTERVAL_DIVISOR = 5
+HEARTBEAT_MIN_INTERVAL_SECONDS = 5.0
+HEARTBEAT_MAX_INTERVAL_SECONDS = 60.0
+
+# Smallest heartbeat timeout the control plane will plan, mirroring
+# `MIN_HEARTBEAT_TIMEOUT_SEC` in
+# crates/arco-flow/src/orchestration/controllers/run_request_processor.rs.
+#
+# Zero used to be representable and meant two different things: the control
+# plane read it as "reap after the 30s grace alone", while this worker read
+# `heartbeat_timeout_sec or DEFAULT` and heartbeated as if the timeout were
+# 300s. A task planned with zero was therefore reaped roughly a minute before
+# its worker's first heartbeat. The planner now refuses to emit a value below
+# this floor, and an envelope carrying one is treated as malformed here rather
+# than being silently reinterpreted.
+MIN_HEARTBEAT_TIMEOUT_SECONDS = 30
+
+# Bounded memory for dispatch deduplication (issue #328).
+RECENT_DISPATCH_LIMIT = 1024
+
+# Control-plane error codes that authoritatively say "this attempt is finished".
+#
+# Process-local dedup cannot cover the crash window between a durable
+# `task_completed` and the worker recording it: the replacement process starts
+# with an empty set and would re-execute the asset on redelivery. Only the
+# control plane knows the attempt already reported a terminal result, and it
+# says so on `task_started`.
+TERMINAL_ATTEMPT_CONFLICT_STATUS = 409
+TERMINAL_ATTEMPT_ERROR_CODES = frozenset(
+    {
+        "task_already_terminal",
+        "attempt_already_completed",
+        "attempt_mismatch",
+        "attempt_id_mismatch",
+    }
+)
+
+
+class DispatchClaim(Enum):
+    """Outcome of atomically classifying a dispatch id for execution."""
+
+    CLAIMED = "claimed"
+    """No other delivery holds this dispatch id; this delivery executes."""
+
+    IN_FLIGHT = "in_flight"
+    """Another delivery is executing it right now; its outcome is unknown."""
+
+    COMPLETED = "completed"
+    """A previous delivery reported a terminal result for it."""
+
+
+class DispatchOutcome(Enum):
+    """What the HTTP transport must do after a dispatch delivery."""
+
+    EXECUTED = "executed"
+    """The asset ran and its terminal result was reported."""
+
+    ALREADY_TERMINAL = "already_terminal"
+    """The attempt was already finished; acknowledge without re-executing."""
+
+    RETRY_LATER = "retry_later"
+    """The owner's outcome is not known yet; the delivery must be retried."""
+
+
+def heartbeat_interval_seconds(heartbeat_timeout_sec: int | None) -> float:
+    """Choose the heartbeat interval for a task attempt.
+
+    Args:
+        heartbeat_timeout_sec: Timeout carried by the dispatch envelope, or
+            None for envelopes from older control planes (the planner default
+            of 300s is assumed).
+
+    Returns:
+        Seconds between heartbeats, well under the staleness threshold.
+
+    Raises:
+        ValueError: If the envelope carries a timeout below
+            `MIN_HEARTBEAT_TIMEOUT_SECONDS`. Such a value has no consistent
+            meaning across the control plane and this worker, so it is
+            rejected rather than reinterpreted.
+    """
+    if heartbeat_timeout_sec is None:
+        timeout = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS
+    elif heartbeat_timeout_sec < MIN_HEARTBEAT_TIMEOUT_SECONDS:
+        msg = (
+            f"heartbeat_timeout_sec {heartbeat_timeout_sec} is below the "
+            f"{MIN_HEARTBEAT_TIMEOUT_SECONDS}s floor shared with the control plane; "
+            "refusing to guess an interval the reaper does not agree with"
+        )
+        raise ValueError(msg)
+    else:
+        timeout = heartbeat_timeout_sec
+    interval = timeout / HEARTBEAT_INTERVAL_DIVISOR
+    return min(HEARTBEAT_MAX_INTERVAL_SECONDS, max(HEARTBEAT_MIN_INTERVAL_SECONDS, interval))
+
+
+class HeartbeatSender:
+    """Posts periodic task heartbeats on a daemon thread while an asset runs.
+
+    Heartbeats are advisory: any error is logged and swallowed so a heartbeat
+    failure can never fail the task itself.
+    """
+
+    def __init__(self, post: Callable[[], None], interval_seconds: float) -> None:
+        """Initialize the sender.
+
+        Args:
+            post: Callable that sends one heartbeat.
+            interval_seconds: Seconds between heartbeats.
+        """
+        self._post = post
+        self._interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="arco-task-heartbeat",
+        )
+
+    def start(self) -> None:
+        """Start heartbeating in the background."""
+        self._thread.start()
+
+    def stop(self, timeout_seconds: float = 5.0) -> None:
+        """Stop heartbeating and wait briefly for the thread to exit.
+
+        Args:
+            timeout_seconds: Maximum time to wait for the thread.
+        """
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout_seconds)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval_seconds):
+            try:
+                self._post()
+            except Exception as exc:  # heartbeats are advisory; never fail the task
+                err_console.print(f"[yellow]![/yellow] Task heartbeat failed: {exc}")
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _is_terminal_attempt_conflict(error: ApiError) -> bool:
+    """Whether the control plane says this attempt already finished.
+
+    Args:
+        error: The failure raised by a `task_started` callback.
+
+    Returns:
+        True when the response is a 409 whose error code names a durable
+        terminal or superseded attempt. The worker must then skip execution:
+        the asset already ran, and re-running it would duplicate side effects
+        that the control plane has already recorded as complete.
+    """
+    if error.status_code != TERMINAL_ATTEMPT_CONFLICT_STATUS:
+        return False
+    message = str(error)
+    return any(code in message for code in TERMINAL_ATTEMPT_ERROR_CODES)
+
+
 def _get_field(payload: dict[str, Any], snake: str, camel: str) -> Any:
     if snake in payload:
         return payload[snake]
     return payload.get(camel)
-
-
-def _partition_key_from_payload(worker_payload: object) -> str | None:
-    if not isinstance(worker_payload, dict):
-        return None
-    raw = worker_payload.get(PARTITION_KEY_PAYLOAD_FIELD)
-    if raw is None:
-        raw = worker_payload.get(PARTITION_KEY_PAYLOAD_FIELD_SNAKE)
-    if raw is None:
-        return None
-    partition_key = str(raw)
-    return partition_key or None
-
-
-def _heartbeat_timeout_from_payload(worker_payload: object) -> int | None:
-    if not isinstance(worker_payload, dict):
-        return None
-    raw = worker_payload.get(HEARTBEAT_TIMEOUT_PAYLOAD_FIELD)
-    if raw is None:
-        raw = worker_payload.get(HEARTBEAT_TIMEOUT_PAYLOAD_FIELD_SNAKE)
-    if raw is None or isinstance(raw, bool):
-        return None
-    try:
-        timeout = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return timeout if timeout > 0 else None
-
-
-def _heartbeat_interval_sec(heartbeat_timeout_sec: int | None) -> float:
-    timeout = heartbeat_timeout_sec or DEFAULT_HEARTBEAT_TIMEOUT_SEC
-    return max(timeout / HEARTBEAT_INTERVAL_DIVISOR, MIN_HEARTBEAT_INTERVAL_SEC)
-
-
-def _is_superseded_attempt(err: ApiError) -> bool:
-    return err.status_code in SUPERSEDED_ATTEMPT_STATUSES
 
 
 @dataclass
@@ -186,14 +309,14 @@ class WorkerDispatchEnvelope:
     attempt: int
     attempt_id: str
     dispatch_id: str
+    partition_key: str | None
+    heartbeat_timeout_sec: int | None
     worker_queue: str
     callback_base_url: str
     task_token: str
     token_expires_at: str
     traceparent: str | None
     payload: Any
-    partition_key: str | None = None
-    heartbeat_timeout_sec: int | None = None
 
     @property
     def callback_task_id(self) -> str:
@@ -210,6 +333,8 @@ class WorkerDispatchEnvelope:
         attempt = _get_field(payload, "attempt", "attempt")
         attempt_id = _get_field(payload, "attempt_id", "attemptId")
         dispatch_id = _get_field(payload, "dispatch_id", "dispatchId")
+        partition_key = _get_field(payload, "partition_key", "partitionKey")
+        heartbeat_timeout_sec = _get_field(payload, "heartbeat_timeout_sec", "heartbeatTimeoutSec")
         worker_queue = _get_field(payload, "worker_queue", "workerQueue")
         callback_base_url = _get_field(payload, "callback_base_url", "callbackBaseUrl")
         task_token = _get_field(payload, "task_token", "taskToken")
@@ -250,97 +375,17 @@ class WorkerDispatchEnvelope:
             attempt=int(attempt),
             attempt_id=str(attempt_id),
             dispatch_id=str(dispatch_id),
+            partition_key=str(partition_key) if partition_key else None,
+            heartbeat_timeout_sec=(
+                int(heartbeat_timeout_sec) if heartbeat_timeout_sec is not None else None
+            ),
             worker_queue=str(worker_queue),
             callback_base_url=str(callback_base_url),
             task_token=str(task_token),
             token_expires_at=str(token_expires_at),
             traceparent=str(traceparent) if traceparent else None,
             payload=worker_payload,
-            partition_key=_partition_key_from_payload(worker_payload),
-            heartbeat_timeout_sec=_heartbeat_timeout_from_payload(worker_payload),
         )
-
-
-class _HeartbeatReporter:
-    """Report worker liveness until the dispatched asset returns."""
-
-    def __init__(
-        self,
-        *,
-        client: ArcoFlowApiClient,
-        worker_id: str,
-        envelope: WorkerDispatchEnvelope,
-        task_token: str,
-    ) -> None:
-        self._client = client
-        self._worker_id = worker_id
-        self._envelope = envelope
-        self._task_token = task_token
-        self._interval_sec = _heartbeat_interval_sec(envelope.heartbeat_timeout_sec)
-        self._stop = threading.Event()
-        self._cancel_requested = threading.Event()
-        self._cancel_reason: str | None = None
-        self._thread = threading.Thread(
-            target=self._report_until_stopped,
-            name=f"arco-heartbeat-{envelope.dispatch_id}",
-            daemon=True,
-        )
-
-    @property
-    def cancel_requested(self) -> bool:
-        return self._cancel_requested.is_set()
-
-    @property
-    def cancel_reason(self) -> str:
-        return self._cancel_reason or "cancellation requested by the control plane"
-
-    def __enter__(self) -> _HeartbeatReporter:
-        self._thread.start()
-        return self
-
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        self._stop.set()
-        # The API client has a bounded request timeout. Waiting for the reporter
-        # prevents a heartbeat from racing the terminal callback.
-        self._thread.join()
-
-    def _report_until_stopped(self) -> None:
-        while not self._stop.wait(self._interval_sec):
-            if not self._report_once():
-                return
-
-    def _report_once(self) -> bool:
-        try:
-            response = self._client.task_heartbeat(
-                task_id=self._envelope.callback_task_id,
-                task_key=self._envelope.task_key,
-                attempt=self._envelope.attempt,
-                attempt_id=self._envelope.attempt_id,
-                worker_id=self._worker_id,
-                traceparent=self._envelope.traceparent,
-                task_token=self._task_token,
-                callback_base_url=self._envelope.callback_base_url,
-                heartbeat_at=_now_iso(),
-            )
-        except ApiError as err:
-            if _is_superseded_attempt(err):
-                self._request_cancellation(str(err))
-                return False
-            err_console.print(f"[yellow]![/yellow] Heartbeat failed: {err}")
-            return True
-        except Exception as err:  # noqa: BLE001
-            err_console.print(f"[yellow]![/yellow] Heartbeat failed: {err}")
-            return True
-
-        if response.payload.get("shouldCancel"):
-            reason = response.payload.get("cancelReason")
-            self._request_cancellation(str(reason) if reason else None)
-            return False
-        return True
-
-    def _request_cancellation(self, reason: str | None) -> None:
-        self._cancel_reason = reason or "cancellation requested by the control plane"
-        self._cancel_requested.set()
 
 
 class DispatchWorker:
@@ -359,12 +404,18 @@ class DispatchWorker:
             config.task_token.get_secret_value() or config.api_key.get_secret_value() or "debug"
         )
         self._client = ArcoFlowApiClient(config)
-        self._assets = self._load_assets(root_path)
-        self._dispatch_lock = threading.Lock()
-        self._inflight_dispatches: set[str] = set()
-        self._recent_dispatches: OrderedDict[str, None] = OrderedDict()
+        self._assets: dict[str, Any] = {}
+        self._partitioned_assets: set[str] = set()
+        self._load_assets(root_path)
+        self._init_dispatch_state()
 
-    def _load_assets(self, root_path: Path) -> dict[str, Any]:
+    def _init_dispatch_state(self) -> None:
+        """Initialize the dispatch_id deduplication registry (issue #328)."""
+        self._dedup_lock = threading.Lock()
+        self._inflight_dispatch_ids: set[str] = set()
+        self._recent_dispatch_ids: OrderedDict[str, None] = OrderedDict()
+
+    def _load_assets(self, root_path: Path) -> None:
         discovery = AssetDiscovery(root_path=root_path)
         try:
             assets = discovery.discover(strict=True)
@@ -374,85 +425,140 @@ class DispatchWorker:
                 err_console.print(f"  - {failure.file_path}: {failure.error}")
             raise SystemExit(1) from err
 
-        return {str(asset.key): asset.func for asset in assets}
+        self._assets = {str(asset.key): asset.func for asset in assets}
+        self._partitioned_assets = {
+            str(asset.key) for asset in assets if asset.definition.partitioning.is_partitioned
+        }
 
     def close(self) -> None:
         """Close worker resources."""
         self._client.close()
 
-    def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+    def handle_dispatch(self, payload: WorkerDispatchEnvelope) -> DispatchOutcome:
+        """Execute one dispatch delivery, or explain why it was not executed.
+
+        Returns:
+            The outcome the HTTP transport must translate into a status code.
+            A `RETRY_LATER` outcome must not be acknowledged as success: the
+            executing delivery may still crash before reporting anything.
+        """
         self._validate_dispatch_envelope(payload)
-        # The HTTP handler treats this early return as a successful acknowledgement,
-        # so a redelivery cannot execute the same attempt concurrently.
-        if not self._claim_dispatch(payload.dispatch_id):
-            return
-
-        completed = False
+        claim = self._begin_dispatch(payload.dispatch_id)
+        if claim is DispatchClaim.COMPLETED:
+            console.print(
+                f"[blue]i[/blue] Dispatch {payload.dispatch_id} already reported a "
+                "terminal result; acknowledged without re-execution"
+            )
+            return DispatchOutcome.ALREADY_TERMINAL
+        if claim is DispatchClaim.IN_FLIGHT:
+            console.print(
+                f"[blue]i[/blue] Dispatch {payload.dispatch_id} is still executing; "
+                "asking for redelivery instead of acknowledging an unknown outcome"
+            )
+            return DispatchOutcome.RETRY_LATER
         try:
-            self._run_dispatch(payload)
-            completed = True
+            return self._run_dispatch(payload)
         finally:
-            # Pre-completion transport failures remain retryable; a dispatch whose
-            # lifecycle callback completed is retained for bounded redelivery dedup.
-            self._release_dispatch(payload.dispatch_id, completed=completed)
+            self._release_dispatch(payload.dispatch_id)
 
-    def _claim_dispatch(self, dispatch_id: str) -> bool:
-        with self._dispatch_lock:
-            if dispatch_id in self._inflight_dispatches or dispatch_id in self._recent_dispatches:
-                return False
-            self._inflight_dispatches.add(dispatch_id)
-            return True
+    def _begin_dispatch(self, dispatch_id: str) -> DispatchClaim:
+        """Atomically classify and claim a dispatch_id for execution.
 
-    def _release_dispatch(self, dispatch_id: str, *, completed: bool) -> None:
-        with self._dispatch_lock:
-            self._inflight_dispatches.discard(dispatch_id)
-            if not completed:
-                return
-            self._recent_dispatches[dispatch_id] = None
-            while len(self._recent_dispatches) > DISPATCH_HISTORY_LIMIT:
-                self._recent_dispatches.popitem(last=False)
+        Cloud Tasks delivers at-least-once, so a redelivery can arrive while
+        the first delivery is still executing (issue #328). The two duplicate
+        cases are *not* equivalent and must not share a response:
 
-    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> None:
+        - A completed dispatch has a durable terminal report behind it, so the
+          redelivery can be acknowledged.
+        - An in-flight dispatch has no outcome yet. Acknowledging it tells the
+          queue the work succeeded while the executing request may still crash
+          before reporting anything, stranding the attempt until the sweeper's
+          much slower repair path notices. The redelivery is therefore told to
+          retry, and mirrors whatever the owner ends up reporting.
+        """
+        with self._dedup_lock:
+            if dispatch_id in self._recent_dispatch_ids:
+                return DispatchClaim.COMPLETED
+            if dispatch_id in self._inflight_dispatch_ids:
+                return DispatchClaim.IN_FLIGHT
+            self._inflight_dispatch_ids.add(dispatch_id)
+            return DispatchClaim.CLAIMED
+
+    def _release_dispatch(self, dispatch_id: str) -> None:
+        """Release a dispatch_id's in-flight claim without recording completion.
+
+        Recording into `_recent_dispatch_ids` happens separately, in
+        `_record_dispatch_completed`, and only once the terminal report was
+        delivered. If `_run_dispatch` raised before that point (for example a
+        transient ApiError from the `task_started` callback), the dispatch_id
+        must NOT enter the recent set: the worker returns HTTP 500, Cloud
+        Tasks redelivers the same deterministic dispatch_id, and the
+        redelivery has to re-execute rather than be duplicate-acked — else
+        the task is stuck in Dispatched forever and the sweeper's repair
+        dispatch (same dispatch_id) cannot rescue it.
+        """
+        with self._dedup_lock:
+            self._inflight_dispatch_ids.discard(dispatch_id)
+
+    def _record_dispatch_completed(self, dispatch_id: str) -> None:
+        """Record a dispatch_id whose terminal report was delivered.
+
+        Called from `_run_dispatch` immediately after `task_completed`
+        returns (success or failure outcome alike). Only from this point on
+        may a redelivery of the same dispatch_id be acknowledged without
+        re-execution.
+        """
+        with self._dedup_lock:
+            self._recent_dispatch_ids[dispatch_id] = None
+            self._recent_dispatch_ids.move_to_end(dispatch_id)
+            while len(self._recent_dispatch_ids) > RECENT_DISPATCH_LIMIT:
+                self._recent_dispatch_ids.popitem(last=False)
+
+    def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> DispatchOutcome:
         task_token = _select_task_token(payload.task_token, self._fallback_task_token)
         started_at = _now_iso()
-        self._client.task_started(
-            task_id=payload.callback_task_id,
-            task_key=payload.task_key,
-            attempt=payload.attempt,
-            attempt_id=payload.attempt_id,
-            worker_id=self.worker_id,
-            traceparent=payload.traceparent,
-            started_at=started_at,
-            task_token=task_token,
-            callback_base_url=payload.callback_base_url,
-        )
+        try:
+            self._client.task_started(
+                task_id=payload.callback_task_id,
+                task_key=payload.task_key,
+                attempt=payload.attempt,
+                attempt_id=payload.attempt_id,
+                worker_id=self.worker_id,
+                traceparent=payload.traceparent,
+                started_at=started_at,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
+            )
+        except ApiError as err:
+            if not _is_terminal_attempt_conflict(err):
+                raise
+            # The control plane holds a durable terminal result for this
+            # attempt. This is the only signal that covers the crash window
+            # between an accepted `task_completed` and this process recording
+            # it — a replacement worker has no local memory of the attempt, so
+            # the process-local set below is a fast path, never the guarantee.
+            console.print(
+                f"[blue]i[/blue] Attempt {payload.attempt} of {payload.task_key} is "
+                f"already terminal in the control plane ({err}); skipping execution"
+            )
+            self._record_dispatch_completed(payload.dispatch_id)
+            return DispatchOutcome.ALREADY_TERMINAL
+
+        heartbeat = self._start_heartbeat(payload, task_token)
 
         stdout_buffer = io.StringIO()
         stderr_buffer = io.StringIO()
         output_payload: dict[str, Any] | None = None
         error_payload: dict[str, Any] | None = None
         outcome = "SUCCEEDED"
-        heartbeat = _HeartbeatReporter(
-            client=self._client,
-            worker_id=self.worker_id,
-            envelope=payload,
-            task_token=task_token,
-        )
 
         try:
             with (
-                heartbeat,
                 contextlib.redirect_stdout(stdout_buffer),
                 contextlib.redirect_stderr(stderr_buffer),
             ):
                 result = self._execute_asset(payload)
-            if heartbeat.cancel_requested:
-                outcome = "CANCELLED"
-                error_payload = {
-                    "category": "CANCELLED",
-                    "message": heartbeat.cancel_reason,
-                }
-            elif isinstance(result, AssetOut):
+            if isinstance(result, AssetOut):
                 output_payload = {
                     "rowCount": result.row_count,
                 }
@@ -464,30 +570,25 @@ class DispatchWorker:
                 "stackTrace": traceback.format_exc(),
             }
         finally:
+            heartbeat.stop()
             completed_at = _now_iso()
-            try:
-                self._client.task_completed(
-                    task_id=payload.callback_task_id,
-                    task_key=payload.task_key,
-                    attempt=payload.attempt,
-                    attempt_id=payload.attempt_id,
-                    worker_id=self.worker_id,
-                    traceparent=payload.traceparent,
-                    outcome=outcome,
-                    completed_at=completed_at,
-                    output=output_payload,
-                    error=error_payload,
-                    task_token=task_token,
-                    callback_base_url=payload.callback_base_url,
-                )
-            except ApiError as err:
-                if not _is_superseded_attempt(err):
-                    raise
-                err_console.print(
-                    "[yellow]![/yellow] Completion callback rejected for "
-                    f"run={payload.run_id} task={payload.task_key} "
-                    f"attempt={payload.attempt}: {err}"
-                )
+            self._client.task_completed(
+                task_id=payload.callback_task_id,
+                task_key=payload.task_key,
+                attempt=payload.attempt,
+                attempt_id=payload.attempt_id,
+                worker_id=self.worker_id,
+                traceparent=payload.traceparent,
+                outcome=outcome,
+                completed_at=completed_at,
+                output=output_payload,
+                error=error_payload,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
+            )
+            # Only now — after the terminal report reached the control plane —
+            # is it safe to duplicate-ack redeliveries of this dispatch_id.
+            self._record_dispatch_completed(payload.dispatch_id)
 
             try:
                 self._client.upload_logs(
@@ -500,6 +601,41 @@ class DispatchWorker:
                 )
             except ApiError as err:
                 err_console.print(f"[yellow]![/yellow] Log upload failed: {err}")
+
+        return DispatchOutcome.EXECUTED
+
+    def _start_heartbeat(
+        self,
+        payload: WorkerDispatchEnvelope,
+        task_token: str,
+    ) -> HeartbeatSender:
+        """Start periodic heartbeats for the attempt (issue #367).
+
+        Anti-entropy force-fails a RUNNING task once it has been silent for
+        `heartbeat_timeout_sec` plus grace, so long-running assets must
+        heartbeat well inside that window. Heartbeat failures never fail the
+        task.
+        """
+
+        def post_heartbeat() -> None:
+            self._client.task_heartbeat(
+                task_id=payload.callback_task_id,
+                task_key=payload.task_key,
+                attempt=payload.attempt,
+                attempt_id=payload.attempt_id,
+                worker_id=self.worker_id,
+                traceparent=payload.traceparent,
+                task_token=task_token,
+                callback_base_url=payload.callback_base_url,
+                heartbeat_at=_now_iso(),
+            )
+
+        heartbeat = HeartbeatSender(
+            post=post_heartbeat,
+            interval_seconds=heartbeat_interval_seconds(payload.heartbeat_timeout_sec),
+        )
+        heartbeat.start()
+        return heartbeat
 
     def _execute_asset(self, payload: WorkerDispatchEnvelope) -> object:
         asset_func = self._assets.get(payload.task_key)
@@ -514,14 +650,8 @@ class DispatchWorker:
             msg = "assets with dependencies are not supported by the minimal worker"
             raise RuntimeError(msg)
 
-        partition_key = (
-            PartitionKey.from_canonical_string(payload.partition_key)
-            if payload.partition_key
-            else PartitionKey()
-        )
-
         ctx = AssetContext(
-            partition_key=partition_key,
+            partition_key=self._resolve_partition_key(payload),
             run_id=payload.run_id,
             task_id=payload.task_key,
             tenant_id=self.config.tenant_id,
@@ -533,6 +663,35 @@ class DispatchWorker:
             result = asyncio.run(result)
 
         return result
+
+    def _resolve_partition_key(self, payload: WorkerDispatchEnvelope) -> PartitionKey:
+        """Build the execution partition scope from the dispatch envelope.
+
+        The envelope's `partition_key` is the exact value the control plane
+        records as materialized, so executing with anything else silently
+        corrupts materialization identity (issue #339). A partitioned asset
+        dispatched without a partition key fails loudly instead of executing
+        unpartitioned while the catalog records a partition as materialized.
+
+        Raises:
+            RuntimeError: If a partitioned asset was dispatched without a
+                partition key, or the partition key cannot be parsed.
+        """
+        if payload.partition_key is None:
+            if payload.task_key in self._partitioned_assets:
+                msg = (
+                    f"asset {payload.task_key} is partitioned but the dispatch "
+                    "envelope carried no partition key; refusing to execute "
+                    "unpartitioned"
+                )
+                raise RuntimeError(msg)
+            return PartitionKey()
+
+        try:
+            return PartitionKey.from_canonical_string(payload.partition_key)
+        except ValueError as err:
+            msg = f"invalid partition key in dispatch envelope: {payload.partition_key!r}: {err}"
+            raise RuntimeError(msg) from err
 
     def _validate_dispatch_envelope(self, payload: WorkerDispatchEnvelope) -> None:
         mismatches = []
@@ -601,7 +760,7 @@ class DispatchHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.server.worker.handle_dispatch(dispatch)  # type: ignore[attr-defined]
+            outcome = self.server.worker.handle_dispatch(dispatch)  # type: ignore[attr-defined]
         except ValueError as exc:
             self.send_response(400)
             self.end_headers()
@@ -611,6 +770,18 @@ class DispatchHandler(BaseHTTPRequestHandler):
             self.send_response(500)
             self.end_headers()
             self.wfile.write(str(exc).encode("utf-8"))
+            return
+
+        if outcome is DispatchOutcome.RETRY_LATER:
+            # The owner of this dispatch id is still executing. A 200 here
+            # would tell the queue the work succeeded before anyone knows
+            # whether it did (issue #328); 503 keeps the delivery retryable so
+            # a crashed owner is covered by the queue rather than by the much
+            # slower anti-entropy repair.
+            self.send_response(503)
+            self.send_header("Retry-After", "1")
+            self.end_headers()
+            self.wfile.write(b"dispatch is still executing; retry")
             return
 
         self.send_response(200)

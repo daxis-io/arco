@@ -78,3 +78,7 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "catalog_lookup"
 harness = false
+
+[[bench]]
+name = "control_mvp_gate"
+harness = false

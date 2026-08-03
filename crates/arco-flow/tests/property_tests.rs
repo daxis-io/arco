@@ -4,7 +4,16 @@
 //! randomly generated inputs.
 
 #![cfg(feature = "test-utils")]
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+// Test-target lint scope (#331): property-test strategies index generated
+// vectors; mirrors the allow-*-in-tests policy in clippy.toml.
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::items_after_statements,
+    clippy::match_same_arms
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,13 +34,13 @@ use arco_flow::run::RunState;
 use arco_flow::task::TaskState;
 use arco_flow::task_key::TaskOperation;
 
-/// Generates a random TaskId (diverse, not constant per run).
+/// Generates a random `TaskId` (diverse, not constant per run).
 fn arb_task_id() -> impl Strategy<Value = TaskId> {
     // Use any() to generate diverse IDs, not Just() which is constant per test run
     any::<u64>().prop_map(|_| TaskId::generate())
 }
 
-/// Generates a random AssetId (diverse, not constant per run).
+/// Generates a random `AssetId` (diverse, not constant per run).
 fn arb_asset_id() -> impl Strategy<Value = AssetId> {
     any::<u64>().prop_map(|_| AssetId::generate())
 }
@@ -46,7 +55,7 @@ fn arb_name() -> impl Strategy<Value = String> {
     "[a-z][a-z0-9_]{2,20}".prop_map(|s| s)
 }
 
-/// Generates an arbitrary TaskSpec with varied properties.
+/// Generates an arbitrary `TaskSpec` with varied properties.
 fn arb_task_spec() -> impl Strategy<Value = TaskSpec> {
     (
         arb_task_id(),

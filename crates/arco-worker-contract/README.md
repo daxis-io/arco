@@ -14,10 +14,10 @@ types, but should not redefine dispatch or callback payloads locally.
 - Completed callbacks accept legacy `result` as an alias for `output`.
 - Heartbeat `progressPct` is an integer from `0` through `100`.
 - Callback attempts are one-indexed.
-- The orchestration-owned `payload.partitionKey` is the ADR-011 canonical partition key planned
+- The orchestration-owned `partitionKey` is the ADR-011 canonical partition key planned
   for the task; workers accept `partition_key` while old envelopes without either field remain
   unpartitioned.
-- The orchestration-owned `payload.heartbeatTimeoutSec` is the task's liveness budget; workers
+- The orchestration-owned `heartbeatTimeoutSec` is the task's liveness budget; workers
   accept `heartbeat_timeout_sec` while old envelopes use the worker's documented fallback.
 - Heartbeat cancellation is cooperative. The embedded synchronous Python worker stops publishing
   success after cancellation is observed, but it cannot preempt an asset function that has not
@@ -26,19 +26,11 @@ types, but should not redefine dispatch or callback payloads locally.
 ## Embedded Orchestrator Sketch
 
 ```rust
-use arco_worker_contract::{
-    WorkerDispatchEnvelope, WorkerEnginePayload, callback_task_id,
-};
+use arco_worker_contract::{WorkerDispatchEnvelope, callback_task_id};
 
 let run_id = "run-123";
 let task_key = "analytics.daily_sales";
 let task_id = callback_task_id(run_id, task_key);
-let payload = WorkerEnginePayload {
-    partition_key: Some("date=d:2026-01-01".to_string()),
-    heartbeat_timeout_sec: Some(300),
-}
-.to_value()?;
-
 let envelope = WorkerDispatchEnvelope {
     tenant_id: "tenant-a".to_string(),
     workspace_id: "workspace-b".to_string(),
@@ -49,12 +41,16 @@ let envelope = WorkerDispatchEnvelope {
     attempt_id: "att-123".to_string(),
     dispatch_id: "dispatch:run-123:analytics.daily_sales:1".to_string(),
     execution_location_id: None,
+    partition_key: Some("date=d:2026-01-01".to_string()),
+    heartbeat_timeout_sec: Some(300),
+    partition_key: None,
+    heartbeat_timeout_sec: Some(300),
     worker_queue: "default-queue".to_string(),
     callback_base_url: "https://api.arco.dev".to_string(),
     task_token: "<task-scoped-jwt>".to_string(),
     token_expires_at: chrono::Utc::now(),
     traceparent: None,
-    payload,
+    payload: serde_json::json!({}),
 };
 
 let body = envelope.to_json()?;
@@ -65,11 +61,10 @@ let body = envelope.to_json()?;
 ```rust
 use arco_worker_contract::{
     HeartbeatRequest, TaskCompletedRequest, TaskStartedRequest, WorkerDispatchEnvelope,
-    WorkerEnginePayload, WorkerOutcome,
+    WorkerOutcome,
 };
 
 let envelope = WorkerDispatchEnvelope::from_json(dispatch_body)?;
-let engine_payload = WorkerEnginePayload::from_value(&envelope.payload)?;
 let started_url = format!(
     "{}/api/v1/tasks/{}/started",
     envelope.callback_base_url,
@@ -77,8 +72,8 @@ let started_url = format!(
 );
 let authorization = format!("Bearer {}", envelope.task_token);
 
-// Reconstruct the partition from engine_payload.partition_key before executing the asset.
-// Schedule heartbeats comfortably inside engine_payload.heartbeat_timeout_sec.
+// Reconstruct the partition from envelope.partition_key before executing the asset.
+// Schedule heartbeats comfortably inside envelope.heartbeat_timeout_sec.
 
 let started = TaskStartedRequest {
     attempt: envelope.attempt,

@@ -67,9 +67,9 @@ def test_partition_key_fixture_canonical_strings_round_trip() -> None:
 
 
 def test_partition_key_from_canonical_string_rejects_malformed_input() -> None:
-    with pytest.raises(ValueError, match="Invalid canonical partition key segment"):
+    with pytest.raises(ValueError, match="Invalid partition key segment"):
         PartitionKey.from_canonical_string("date")
-    with pytest.raises(ValueError, match="Duplicate partition dimension"):
+    with pytest.raises(ValueError, match="Duplicate partition dimension key"):
         PartitionKey.from_canonical_string("date=d:2025-01-15,date=d:2025-01-16")
 
 

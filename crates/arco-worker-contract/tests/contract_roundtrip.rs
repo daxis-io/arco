@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use arco_worker_contract::{
     CallbackErrorResponse, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
-    TaskStartedRequest, WorkerDispatchEnvelope, WorkerEnginePayload, callback_task_id,
-    deterministic_attempt_id, parse_callback_task_id,
+    TaskStartedRequest, WorkerDispatchEnvelope, callback_task_id, deterministic_attempt_id,
+    parse_callback_task_id,
 };
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -42,35 +42,6 @@ fn canonical_worker_dispatch_envelope_matches_fixture() {
 }
 
 #[test]
-fn worker_engine_payload_roundtrips_planned_execution_scope() {
-    let payload = WorkerEnginePayload {
-        partition_key: Some("date=d:2026-01-01".to_string()),
-        heartbeat_timeout_sec: Some(600),
-    };
-
-    let value = payload.to_value().expect("serialize engine payload");
-    assert_eq!(value["partitionKey"], "date=d:2026-01-01");
-    assert_eq!(value["heartbeatTimeoutSec"], 600);
-    assert_eq!(
-        WorkerEnginePayload::from_value(&value).expect("parse engine payload"),
-        payload
-    );
-}
-
-#[test]
-fn worker_engine_payload_accepts_legacy_names_and_unknown_members() {
-    let parsed = WorkerEnginePayload::from_value(&json!({
-        "partition_key": "date=d:2026-01-01",
-        "heartbeat_timeout_sec": 300,
-        "engineSpecific": true
-    }))
-    .expect("parse legacy engine payload");
-
-    assert_eq!(parsed.partition_key.as_deref(), Some("date=d:2026-01-01"));
-    assert_eq!(parsed.heartbeat_timeout_sec, Some(300));
-}
-
-#[test]
 fn worker_dispatch_envelope_accepts_legacy_snake_case_fixture() {
     let value = fixture_value("worker_dispatch_envelope_legacy_snake_case.json");
     let parsed: WorkerDispatchEnvelope =
@@ -79,11 +50,41 @@ fn worker_dispatch_envelope_accepts_legacy_snake_case_fixture() {
     assert_eq!(parsed.task_id, "analytics.daily_sales");
     assert_eq!(parsed.task_key, "analytics.daily_sales");
     assert_eq!(parsed.execution_location_id.as_deref(), Some("local-dev"));
+    assert_eq!(parsed.partition_key, None);
+    assert_eq!(parsed.heartbeat_timeout_sec, None);
 
     let serialized = serde_json::to_value(parsed).expect("serialize canonical envelope");
     assert!(serialized.get("taskId").is_some());
     assert!(serialized.get("callbackBaseUrl").is_some());
     assert!(serialized.get("task_key").is_none());
+    assert!(serialized.get("partitionKey").is_none());
+    assert!(serialized.get("heartbeatTimeoutSec").is_none());
+}
+
+#[test]
+fn worker_dispatch_envelope_accepts_snake_case_partition_scope_aliases() {
+    let payload = json!({
+        "tenant_id": "tenant-a",
+        "workspace_id": "workspace-b",
+        "run_id": "run-123",
+        "task_key": "analytics.daily_sales",
+        "attempt": 1,
+        "attempt_id": "att-123",
+        "dispatch_id": "dispatch:run-123:analytics.daily_sales:1",
+        "partition_key": "date=d:2026-01-01",
+        "heartbeat_timeout_sec": 120,
+        "worker_queue": "default-queue",
+        "callback_base_url": "https://callbacks.example",
+        "task_token": "token",
+        "token_expires_at": "2026-01-01T00:00:00Z",
+        "payload": {}
+    });
+
+    let parsed: WorkerDispatchEnvelope =
+        serde_json::from_value(payload).expect("snake_case aliases should deserialize");
+
+    assert_eq!(parsed.partition_key.as_deref(), Some("date=d:2026-01-01"));
+    assert_eq!(parsed.heartbeat_timeout_sec, Some(120));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 This runbook covers production cutover for the published worker protocol contract.
 New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` JSON with opaque
-`taskId`. The generic payload extension carries the ADR-011 canonical `partitionKey` and the
+`taskId`. The envelope carries the ADR-011 canonical `partitionKey` and the
 planned task's `heartbeatTimeoutSec`; readers remain compatible with legacy snake_case dispatch
 payloads and envelopes that predate these members.
 
@@ -32,7 +32,7 @@ payloads and envelopes that predate these members.
 
 2. Deploy external worker runtimes with envelope support.
 - Workers must parse `WorkerDispatchEnvelope`.
-- Workers must parse `WorkerEnginePayload`, reconstruct `partitionKey`, and schedule heartbeats
+- Workers must reconstruct `partitionKey` and schedule heartbeats
   inside `heartbeatTimeoutSec`.
 - Workers must send callbacks using envelope-provided `taskToken`, `callbackBaseUrl`, and `taskId`.
 - Workers may fall back to `taskKey` for callbacks only when processing legacy envelopes that omit
@@ -51,9 +51,9 @@ payloads and envelopes that predate these members.
 
 - Trigger a run from API.
 - Confirm dispatch body is canonical camelCase envelope shape with both `taskId` and `taskKey`.
-- Confirm a partitioned task carries the task row's canonical `payload.partitionKey` and that the
+- Confirm a partitioned task carries the task row's canonical `partitionKey` and that the
   worker's `AssetContext.partition_key` matches it.
-- Confirm `payload.heartbeatTimeoutSec` matches the task row and at least one heartbeat arrives
+- Confirm `heartbeatTimeoutSec` matches the task row and at least one heartbeat arrives
   before that budget expires for a long-running test asset.
 - Confirm worker callbacks (`started`, `heartbeat`, `completed`) are accepted.
 - Confirm `shouldCancel` produces a terminal `CANCELLED` callback without a success output after

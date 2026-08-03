@@ -68,6 +68,29 @@ impl CallbackError {
         }
     }
 
+    /// Creates an "attempt already completed" error (409).
+    ///
+    /// Emitted when durable control-plane state already holds a terminal
+    /// completion for the exact attempt a worker is trying to start. This is
+    /// the authoritative signal a redelivered dispatch needs in order to
+    /// suppress execution: a worker that crashed between its completion
+    /// callback and its own bookkeeping has no local memory of the attempt,
+    /// so only the control plane can tell it the work is already done.
+    #[must_use]
+    pub fn attempt_already_completed(state: &str, attempt: u32) -> Self {
+        Self {
+            error: "attempt_already_completed".to_string(),
+            message: format!(
+                "Attempt {attempt} already reported a terminal result; task state is {state}"
+            ),
+            state: Some(state.to_string()),
+            expected_attempt: Some(attempt),
+            received_attempt: Some(attempt),
+            expected_attempt_id: None,
+            received_attempt_id: None,
+        }
+    }
+
     /// Creates an "attempt mismatch" error (409).
     #[must_use]
     pub fn attempt_mismatch(expected: u32, received: u32) -> Self {

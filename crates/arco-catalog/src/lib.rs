@@ -96,7 +96,7 @@ pub mod parquet_util;
 mod read_model;
 pub mod reader;
 pub mod reconciler;
-mod retention_coordination;
+pub mod retention_coordination;
 pub mod search_tombstone;
 mod state;
 pub mod state_store;
@@ -130,20 +130,27 @@ pub use manifest::{
     LineageManifest, RootManifest, SearchManifest, format_manifest_id, next_manifest_id,
     parse_manifest_id,
 };
-pub use reader::{CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness};
+pub use reader::{
+    CatalogReader, LineageGraph, SignedUrl, SnapshotFreshness, is_projection_only_artifact,
+};
 pub use reconciler::{
     Reconciler, ReconciliationIssue, ReconciliationReport, RepairResult, RepairScope,
+};
+pub use retention_coordination::{
+    RETENTION_MUTATION_EPOCH_PATH, RecoveredRetentionEpoch, RetentionMutationKind,
+    recover_stale_retention_epoch,
 };
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
+    CheckpointToken, ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
     ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
     CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore, ModelWrite,
     PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
     PersistedRestoreParticipantPlan, PredicateInputSet, RestoreAttemptIdentity,
     RestoreParticipantInspection, RestoredAuthorityEvidence, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
+    control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

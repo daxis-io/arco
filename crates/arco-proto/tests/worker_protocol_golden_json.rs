@@ -1,6 +1,9 @@
 //! Golden fixture parity between JSON worker contract types and generated proto types.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_wrap)]
 
 use std::fs;
 use std::path::PathBuf;
@@ -63,6 +66,8 @@ fn canonical_dispatch_fixture_maps_to_generated_proto_shape() {
         attempt_id: json_contract.attempt_id.clone(),
         dispatch_id: json_contract.dispatch_id.clone(),
         execution_location_id: json_contract.execution_location_id.clone(),
+        partition_key: json_contract.partition_key.clone(),
+        heartbeat_timeout_sec: json_contract.heartbeat_timeout_sec,
         worker_queue: json_contract.worker_queue.clone(),
         callback_base_url: json_contract.callback_base_url.clone(),
         task_token: json_contract.task_token.clone(),
@@ -74,6 +79,8 @@ fn canonical_dispatch_fixture_maps_to_generated_proto_shape() {
     assert_eq!(proto.task_id, json_contract.task_id);
     assert_eq!(proto.task_key, "analytics.daily_sales");
     assert_eq!(proto.execution_location_id.as_deref(), Some("local-dev"));
+    assert_eq!(proto.partition_key.as_deref(), Some("date=d:2026-01-01"));
+    assert_eq!(proto.heartbeat_timeout_sec, Some(300));
     assert!(
         proto
             .payload

@@ -54,3 +54,4 @@ Each ADR follows this structure:
 | [039](adr-039-catalog-consistency-model.md) | Catalog Consistency Model | Proposed |
 | [040](adr-040-execution-locations.md) | Execution Locations | Accepted |
 | [041](adr-041-tiered-object-storage-orchestration-event-log.md) | Tiered Object-Storage Orchestration Event Log | Accepted |
+| [042](adr-042-lineage-observation-projection.md) | Lineage Observation And Projection Architecture | Proposed |

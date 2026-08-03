@@ -465,7 +465,7 @@ mod tests {
         assert!(record.is_stale(timeout));
 
         // Committed transaction is never stale (status check)
-        let committed = record.clone().commit();
+        let committed = record.commit();
         assert!(!committed.is_stale(timeout));
     }
 

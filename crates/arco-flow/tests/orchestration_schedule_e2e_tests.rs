@@ -1,8 +1,12 @@
 //! Schedule semantics end-to-end (hermetic, CI-gated).
 //!
 //! This suite proves parity-06 schedule semantics across:
-//! persisted schedule definitions -> controller tick evaluation -> RunRequested/run_key ->
+//! persisted schedule definitions -> controller tick evaluation -> `RunRequested/run_key` ->
 //! durable tick history and run correlation.
+
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -71,7 +71,8 @@ pub async fn get_permissions(
         &object_type,
         Privilege::Manage,
         "get_permissions",
-    )?;
+    )
+    .await?;
 
     let Some(compiled_permissions) = state.compiled_permissions.as_ref() else {
         let payload = json!({

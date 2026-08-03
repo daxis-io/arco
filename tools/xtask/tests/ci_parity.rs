@@ -188,6 +188,24 @@ fn clippy_covers_every_workspace_target() {
 }
 
 #[test]
+fn advisory_exceptions_are_structurally_checked_and_expire_nightly() {
+    let ci =
+        fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
+    let security_audit =
+        fs::read_to_string(repo_root().join(".github/workflows/security-audit.yml"))
+            .expect("read security audit workflow");
+
+    assert!(
+        ci.contains("python3 .github/scripts/check_advisory_exceptions.py"),
+        "PR CI should reject advisory exceptions without lifecycle metadata"
+    );
+    assert!(
+        security_audit.contains("check_advisory_exceptions.py --check-expiry"),
+        "the scheduled audit should fail after an exception review date"
+    );
+}
+
+#[test]
 fn python_ci_uses_locked_uv_resolution() {
     let ci =
         fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
@@ -205,6 +223,29 @@ fn python_ci_uses_locked_uv_resolution() {
             "{name} should not resolve project dependencies with unconstrained pip install"
         );
     }
+}
+
+#[test]
+fn scheduled_security_audit_publishes_one_non_mutating_failure_signal() {
+    let security_audit =
+        fs::read_to_string(repo_root().join(".github/workflows/security-audit.yml"))
+            .expect("read security audit workflow");
+
+    for required in [
+        "name: Security Audit Status",
+        "if: ${{ always() }}",
+        "GITHUB_STEP_SUMMARY",
+        "::error title=Security Audit failed::",
+    ] {
+        assert!(
+            security_audit.contains(required),
+            "security audit should retain failure-alert lifecycle fragment: {required}"
+        );
+    }
+    assert!(
+        !security_audit.contains("issues: write"),
+        "security audit status must remain non-mutating"
+    );
 }
 
 #[test]

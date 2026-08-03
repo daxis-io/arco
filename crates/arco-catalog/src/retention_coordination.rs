@@ -799,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_epoch_advances_after_the_released_lock_record_is_deleted() {
+    async fn durable_epoch_and_fencing_sequence_advance_after_force_break() {
         let storage = storage();
         let mut first_guard = acquire(&storage).await;
         assert_eq!(first_guard.fencing_token().sequence(), 1);
@@ -822,8 +822,8 @@ mod tests {
         let mut recreated_guard = acquire(&storage).await;
         assert_eq!(
             recreated_guard.fencing_token().sequence(),
-            1,
-            "a recreated lease demonstrates why its sequence cannot number durable epochs"
+            2,
+            "force-break must preserve the lock record so fencing tokens never regress"
         );
         let second_epoch = RetentionMutationEpoch::claim(
             storage.clone(),

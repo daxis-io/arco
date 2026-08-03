@@ -2,7 +2,9 @@
 
 This runbook covers production cutover for the published worker protocol contract.
 New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` JSON with opaque
-`taskId`; readers remain compatible with legacy snake_case dispatch payloads during migration.
+`taskId`. The generic payload extension carries the ADR-011 canonical `partitionKey` and the
+planned task's `heartbeatTimeoutSec`; readers remain compatible with legacy snake_case dispatch
+payloads and envelopes that predate these members.
 
 ## Preconditions
 
@@ -12,8 +14,14 @@ New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` J
   - `cargo test -p arco-flow --test worker_dispatch_envelope_tests`
   - `cargo test -p arco-api --test task_token_contract_tests --test openapi_orchestration_routes`
   - `cargo xtask engine-boundary-check`
+  - `uv run python -m pytest tests/unit/test_worker_dispatch_envelope.py tests/unit/test_worker_dispatch_heartbeat.py tests/unit/test_partition_key_vectors.py -v`
 - External worker image accepts canonical camelCase dispatch envelopes and legacy snake_case
   dispatch envelopes.
+- External worker reconstructs the dispatched partition scope before asset execution and treats a
+  missing partition member as an unpartitioned legacy dispatch.
+- External worker emits heartbeats inside the dispatched timeout budget. A synchronous worker's
+  cancellation response is cooperative: it must withhold success after observing cancellation,
+  but it cannot claim to preempt asset code that has not returned.
 - API config includes dedicated `task_token` settings.
 
 ## Deploy Order (Strict)
@@ -24,6 +32,8 @@ New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` J
 
 2. Deploy external worker runtimes with envelope support.
 - Workers must parse `WorkerDispatchEnvelope`.
+- Workers must parse `WorkerEnginePayload`, reconstruct `partitionKey`, and schedule heartbeats
+  inside `heartbeatTimeoutSec`.
 - Workers must send callbacks using envelope-provided `taskToken`, `callbackBaseUrl`, and `taskId`.
 - Workers may fall back to `taskKey` for callbacks only when processing legacy envelopes that omit
   `taskId`.
@@ -32,6 +42,7 @@ New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` J
 - Set `ARCO_FLOW_CALLBACK_BASE_URL` and `ARCO_FLOW_TASK_TOKEN_*` env vars.
 - Ensure `ARCO_FLOW_TASK_TOKEN_TTL_SECS` is at least `ARCO_FLOW_TASK_TIMEOUT_SECS + 300` seconds.
 - Verify `/run` dispatch cycles enqueue tasks successfully.
+- Verify a missing compacted task row fails dispatch instead of executing without partition scope.
 
 4. Enforce production gate for legacy scheduler path.
 - Production artifacts should not include `legacy-scheduler` unless explicitly intended.
@@ -40,7 +51,13 @@ New dispatcher/sweeper writes use canonical camelCase `WorkerDispatchEnvelope` J
 
 - Trigger a run from API.
 - Confirm dispatch body is canonical camelCase envelope shape with both `taskId` and `taskKey`.
+- Confirm a partitioned task carries the task row's canonical `payload.partitionKey` and that the
+  worker's `AssetContext.partition_key` matches it.
+- Confirm `payload.heartbeatTimeoutSec` matches the task row and at least one heartbeat arrives
+  before that budget expires for a long-running test asset.
 - Confirm worker callbacks (`started`, `heartbeat`, `completed`) are accepted.
+- Confirm `shouldCancel` produces a terminal `CANCELLED` callback without a success output after
+  the synchronous asset returns; do not treat this as proof of mid-function preemption.
 - Confirm duplicate `taskKey` values across runs still callback through opaque `taskId`.
 - Confirm orchestration state progresses (`DISPATCHED -> RUNNING -> terminal`).
 - Confirm `/api/v1/workspaces/{workspace}/runs` and task views reflect updated state.

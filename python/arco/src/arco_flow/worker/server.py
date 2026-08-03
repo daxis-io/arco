@@ -36,6 +36,14 @@ DISPATCH_SECRET_HEADER = "X-Arco-Dispatch-Secret"
 # Cloud Tasks redeliveries can arrive before or after the original request
 # finishes. Retain a bounded completed-ID window in addition to active claims.
 DISPATCH_HISTORY_LIMIT = 1024
+PARTITION_KEY_PAYLOAD_FIELD = "partitionKey"
+PARTITION_KEY_PAYLOAD_FIELD_SNAKE = "partition_key"
+HEARTBEAT_TIMEOUT_PAYLOAD_FIELD = "heartbeatTimeoutSec"
+HEARTBEAT_TIMEOUT_PAYLOAD_FIELD_SNAKE = "heartbeat_timeout_sec"
+DEFAULT_HEARTBEAT_TIMEOUT_SEC = 300
+HEARTBEAT_INTERVAL_DIVISOR = 3
+MIN_HEARTBEAT_INTERVAL_SEC = 1.0
+SUPERSEDED_ATTEMPT_STATUSES = frozenset({409, 410})
 
 
 def _now_iso() -> str:
@@ -46,6 +54,42 @@ def _get_field(payload: dict[str, Any], snake: str, camel: str) -> Any:
     if snake in payload:
         return payload[snake]
     return payload.get(camel)
+
+
+def _partition_key_from_payload(worker_payload: object) -> str | None:
+    if not isinstance(worker_payload, dict):
+        return None
+    raw = worker_payload.get(PARTITION_KEY_PAYLOAD_FIELD)
+    if raw is None:
+        raw = worker_payload.get(PARTITION_KEY_PAYLOAD_FIELD_SNAKE)
+    if raw is None:
+        return None
+    partition_key = str(raw)
+    return partition_key or None
+
+
+def _heartbeat_timeout_from_payload(worker_payload: object) -> int | None:
+    if not isinstance(worker_payload, dict):
+        return None
+    raw = worker_payload.get(HEARTBEAT_TIMEOUT_PAYLOAD_FIELD)
+    if raw is None:
+        raw = worker_payload.get(HEARTBEAT_TIMEOUT_PAYLOAD_FIELD_SNAKE)
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        timeout = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 else None
+
+
+def _heartbeat_interval_sec(heartbeat_timeout_sec: int | None) -> float:
+    timeout = heartbeat_timeout_sec or DEFAULT_HEARTBEAT_TIMEOUT_SEC
+    return max(timeout / HEARTBEAT_INTERVAL_DIVISOR, MIN_HEARTBEAT_INTERVAL_SEC)
+
+
+def _is_superseded_attempt(err: ApiError) -> bool:
+    return err.status_code in SUPERSEDED_ATTEMPT_STATUSES
 
 
 @dataclass
@@ -148,6 +192,8 @@ class WorkerDispatchEnvelope:
     token_expires_at: str
     traceparent: str | None
     payload: Any
+    partition_key: str | None = None
+    heartbeat_timeout_sec: int | None = None
 
     @property
     def callback_task_id(self) -> str:
@@ -210,7 +256,91 @@ class WorkerDispatchEnvelope:
             token_expires_at=str(token_expires_at),
             traceparent=str(traceparent) if traceparent else None,
             payload=worker_payload,
+            partition_key=_partition_key_from_payload(worker_payload),
+            heartbeat_timeout_sec=_heartbeat_timeout_from_payload(worker_payload),
         )
+
+
+class _HeartbeatReporter:
+    """Report worker liveness until the dispatched asset returns."""
+
+    def __init__(
+        self,
+        *,
+        client: ArcoFlowApiClient,
+        worker_id: str,
+        envelope: WorkerDispatchEnvelope,
+        task_token: str,
+    ) -> None:
+        self._client = client
+        self._worker_id = worker_id
+        self._envelope = envelope
+        self._task_token = task_token
+        self._interval_sec = _heartbeat_interval_sec(envelope.heartbeat_timeout_sec)
+        self._stop = threading.Event()
+        self._cancel_requested = threading.Event()
+        self._cancel_reason: str | None = None
+        self._thread = threading.Thread(
+            target=self._report_until_stopped,
+            name=f"arco-heartbeat-{envelope.dispatch_id}",
+            daemon=True,
+        )
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested.is_set()
+
+    @property
+    def cancel_reason(self) -> str:
+        return self._cancel_reason or "cancellation requested by the control plane"
+
+    def __enter__(self) -> _HeartbeatReporter:
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._stop.set()
+        # The API client has a bounded request timeout. Waiting for the reporter
+        # prevents a heartbeat from racing the terminal callback.
+        self._thread.join()
+
+    def _report_until_stopped(self) -> None:
+        while not self._stop.wait(self._interval_sec):
+            if not self._report_once():
+                return
+
+    def _report_once(self) -> bool:
+        try:
+            response = self._client.task_heartbeat(
+                task_id=self._envelope.callback_task_id,
+                task_key=self._envelope.task_key,
+                attempt=self._envelope.attempt,
+                attempt_id=self._envelope.attempt_id,
+                worker_id=self._worker_id,
+                traceparent=self._envelope.traceparent,
+                task_token=self._task_token,
+                callback_base_url=self._envelope.callback_base_url,
+                heartbeat_at=_now_iso(),
+            )
+        except ApiError as err:
+            if _is_superseded_attempt(err):
+                self._request_cancellation(str(err))
+                return False
+            err_console.print(f"[yellow]![/yellow] Heartbeat failed: {err}")
+            return True
+        except Exception as err:  # noqa: BLE001
+            err_console.print(f"[yellow]![/yellow] Heartbeat failed: {err}")
+            return True
+
+        if response.payload.get("shouldCancel"):
+            reason = response.payload.get("cancelReason")
+            self._request_cancellation(str(reason) if reason else None)
+            return False
+        return True
+
+    def _request_cancellation(self, reason: str | None) -> None:
+        self._cancel_reason = reason or "cancellation requested by the control plane"
+        self._cancel_requested.set()
 
 
 class DispatchWorker:
@@ -302,14 +432,27 @@ class DispatchWorker:
         output_payload: dict[str, Any] | None = None
         error_payload: dict[str, Any] | None = None
         outcome = "SUCCEEDED"
+        heartbeat = _HeartbeatReporter(
+            client=self._client,
+            worker_id=self.worker_id,
+            envelope=payload,
+            task_token=task_token,
+        )
 
         try:
             with (
+                heartbeat,
                 contextlib.redirect_stdout(stdout_buffer),
                 contextlib.redirect_stderr(stderr_buffer),
             ):
                 result = self._execute_asset(payload)
-            if isinstance(result, AssetOut):
+            if heartbeat.cancel_requested:
+                outcome = "CANCELLED"
+                error_payload = {
+                    "category": "CANCELLED",
+                    "message": heartbeat.cancel_reason,
+                }
+            elif isinstance(result, AssetOut):
                 output_payload = {
                     "rowCount": result.row_count,
                 }
@@ -322,20 +465,29 @@ class DispatchWorker:
             }
         finally:
             completed_at = _now_iso()
-            self._client.task_completed(
-                task_id=payload.callback_task_id,
-                task_key=payload.task_key,
-                attempt=payload.attempt,
-                attempt_id=payload.attempt_id,
-                worker_id=self.worker_id,
-                traceparent=payload.traceparent,
-                outcome=outcome,
-                completed_at=completed_at,
-                output=output_payload,
-                error=error_payload,
-                task_token=task_token,
-                callback_base_url=payload.callback_base_url,
-            )
+            try:
+                self._client.task_completed(
+                    task_id=payload.callback_task_id,
+                    task_key=payload.task_key,
+                    attempt=payload.attempt,
+                    attempt_id=payload.attempt_id,
+                    worker_id=self.worker_id,
+                    traceparent=payload.traceparent,
+                    outcome=outcome,
+                    completed_at=completed_at,
+                    output=output_payload,
+                    error=error_payload,
+                    task_token=task_token,
+                    callback_base_url=payload.callback_base_url,
+                )
+            except ApiError as err:
+                if not _is_superseded_attempt(err):
+                    raise
+                err_console.print(
+                    "[yellow]![/yellow] Completion callback rejected for "
+                    f"run={payload.run_id} task={payload.task_key} "
+                    f"attempt={payload.attempt}: {err}"
+                )
 
             try:
                 self._client.upload_logs(
@@ -362,8 +514,14 @@ class DispatchWorker:
             msg = "assets with dependencies are not supported by the minimal worker"
             raise RuntimeError(msg)
 
+        partition_key = (
+            PartitionKey.from_canonical_string(payload.partition_key)
+            if payload.partition_key
+            else PartitionKey()
+        )
+
         ctx = AssetContext(
-            partition_key=PartitionKey(),
+            partition_key=partition_key,
             run_id=payload.run_id,
             task_id=payload.task_key,
             tenant_id=self.config.tenant_id,

@@ -206,9 +206,7 @@ impl AntiEntropySweeper {
             TaskState::Dispatched => true, // Will check dispatch age
             TaskState::RetryWait => {
                 task.attempt < task.max_attempts
-                    && task
-                        .retry_not_before
-                        .is_some_and(|deadline| now >= deadline)
+                    && task.retry_not_before.is_none_or(|deadline| now >= deadline)
             }
             TaskState::Running => Self::running_task_is_stale(task, now),
             _ => false,
@@ -309,7 +307,9 @@ impl AntiEntropySweeper {
         if task.attempt >= task.max_attempts {
             return None;
         }
-        if task.retry_not_before.is_none_or(|deadline| now < deadline) {
+        // Rows written before retry deadlines were introduced have no deadline.
+        // Treat those legacy rows as due rather than preserving a permanent wedge.
+        if task.retry_not_before.is_some_and(|deadline| now < deadline) {
             return None;
         }
         let next_attempt = task.attempt + 1;
@@ -606,6 +606,29 @@ mod tests {
             }
             _ => panic!("Expected CreateDispatchOutbox repair"),
         }
+    }
+
+    #[test]
+    fn test_anti_entropy_rescues_legacy_retry_wait_without_deadline() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = None;
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert!(matches!(
+            repairs.as_slice(),
+            [Repair::CreateDispatchOutbox {
+                attempt: 2,
+                reason,
+                ..
+            }] if reason == "retry_wait_bootstrap"
+        ));
     }
 
     #[test]

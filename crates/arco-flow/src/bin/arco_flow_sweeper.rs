@@ -23,7 +23,7 @@ use arco_flow::dispatch::cloud_tasks::{
     CloudTasksConfig, CloudTasksDispatcher, resolve_target_audience,
 };
 use arco_flow::dispatch::worker_auth::worker_dispatch_headers;
-use arco_flow::dispatch::{EnqueueOptions, EnqueueResult};
+use arco_flow::dispatch::{EnqueueOptions, EnqueueResult, engine_payload_for_task};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::MicroCompactor;
@@ -198,6 +198,15 @@ async fn run_handler(
                 )
                 .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
 
+                let payload = engine_payload_for_task(&fold_state, &run_id, &task_key)
+                    .ok_or_else(|| {
+                        Error::dispatch(format!(
+                            "refusing unscoped redispatch for missing task row: run={run_id} task={task_key}"
+                        ))
+                    })?
+                    .to_value()
+                    .map_err(|e| Error::serialization(format!("dispatch payload error: {e}")))?;
+
                 let envelope = WorkerDispatchEnvelope {
                     tenant_id: state.tenant_id.clone(),
                     workspace_id: state.workspace_id.clone(),
@@ -213,7 +222,7 @@ async fn run_handler(
                     task_token: minted.token,
                     token_expires_at: minted.expires_at,
                     traceparent: None,
-                    payload: serde_json::Value::Object(serde_json::Map::new()),
+                    payload,
                 };
 
                 let body = envelope

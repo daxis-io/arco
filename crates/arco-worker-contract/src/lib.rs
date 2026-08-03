@@ -17,6 +17,12 @@ use utoipa::ToSchema;
 
 const CALLBACK_TASK_ID_PREFIX: &str = "ct1_";
 
+/// Canonical engine-payload member carrying the planned partition key.
+pub const PARTITION_KEY_PAYLOAD_FIELD: &str = "partitionKey";
+
+/// Canonical engine-payload member carrying the worker heartbeat budget.
+pub const HEARTBEAT_TIMEOUT_PAYLOAD_FIELD: &str = "heartbeatTimeoutSec";
+
 /// Parsed components of an opaque worker callback task identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCallbackTaskId {
@@ -135,8 +141,55 @@ pub struct WorkerDispatchEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
     /// Engine-specific payload for worker execution.
+    ///
+    /// Orchestration-owned members are defined by [`WorkerEnginePayload`].
     #[serde(default)]
     pub payload: Value,
+}
+
+/// Orchestration-owned members of [`WorkerDispatchEnvelope::payload`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerEnginePayload {
+    /// ADR-011 canonical partition key planned for this task.
+    #[serde(
+        default,
+        alias = "partition_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub partition_key: Option<String>,
+    /// Seconds of worker silence after which orchestration reaps the attempt.
+    #[serde(
+        default,
+        alias = "heartbeat_timeout_sec",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub heartbeat_timeout_sec: Option<u32>,
+}
+
+impl WorkerEnginePayload {
+    /// Serializes this orchestration-owned payload into the envelope value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization fails.
+    pub fn to_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    /// Parses orchestration-owned members from an envelope payload.
+    ///
+    /// Unknown engine members are ignored; a null legacy payload is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a known member has an invalid representation.
+    pub fn from_value(payload: &Value) -> Result<Self, serde_json::Error> {
+        if payload.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(payload.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]

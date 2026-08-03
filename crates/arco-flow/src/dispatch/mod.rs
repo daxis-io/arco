@@ -14,10 +14,12 @@
 //! - **Structured payloads**: JSON-serializable task envelopes
 
 pub mod cloud_tasks;
+pub mod engine_payload;
 pub mod memory;
 pub mod worker_auth;
 
 pub use cloud_tasks::CloudTasksDispatcher;
+pub use engine_payload::engine_payload_for_task;
 pub use memory::InMemoryTaskQueue;
 
 use std::time::Duration;

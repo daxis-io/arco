@@ -1,4 +1,13 @@
-#![allow(clippy::expect_used)]
+//! Test-only: explicit panics and indexing make failed conformance invariants
+//! immediately legible, while the ordered end-to-end contract intentionally
+//! remains one long scenario.
+#![allow(
+    clippy::cognitive_complexity,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::too_many_lines
+)]
 #![allow(missing_docs)]
 
 #[path = "support/barrier_backend.rs"]

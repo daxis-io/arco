@@ -53,7 +53,7 @@ impl std::fmt::Debug for SpyBackend {
         f.debug_struct("SpyBackend")
             .field("ops_len", &self.ops.lock().expect("spy ops lock").len())
             .field("fail_on_list", &self.fail_on_list.load(Ordering::SeqCst))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

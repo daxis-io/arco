@@ -1,5 +1,13 @@
 //! Discovery endpoint behavior tests for the Unity Catalog facade.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use std::sync::Arc;
 
 use arco_catalog::{

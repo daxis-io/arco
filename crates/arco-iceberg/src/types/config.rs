@@ -154,8 +154,10 @@ mod tests {
 
     #[test]
     fn test_allow_write_does_not_advertise_namespace_crud() {
-        let mut config = IcebergConfig::default();
-        config.allow_write = true;
+        let config = IcebergConfig {
+            allow_write: true,
+            ..Default::default()
+        };
         let config = ConfigResponse::from_config(&config, false);
         let endpoints = config.endpoints.expect("endpoints should be present");
 
@@ -168,8 +170,10 @@ mod tests {
 
     #[test]
     fn test_namespace_crud_advertises_endpoints() {
-        let mut config = IcebergConfig::default();
-        config.allow_namespace_crud = true;
+        let config = IcebergConfig {
+            allow_namespace_crud: true,
+            ..Default::default()
+        };
         let config = ConfigResponse::from_config(&config, false);
         let endpoints = config.endpoints.expect("endpoints should be present");
 
@@ -182,8 +186,10 @@ mod tests {
 
     #[test]
     fn test_table_crud_advertises_endpoints() {
-        let mut config = IcebergConfig::default();
-        config.allow_table_crud = true;
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            ..Default::default()
+        };
         let config = ConfigResponse::from_config(&config, false);
         let endpoints = config.endpoints.expect("endpoints should be present");
 
@@ -223,8 +229,10 @@ mod tests {
 
     #[test]
     fn test_rename_endpoint_advertised_with_table_crud() {
-        let mut config = IcebergConfig::default();
-        config.allow_table_crud = true;
+        let config = IcebergConfig {
+            allow_table_crud: true,
+            ..Default::default()
+        };
         let response = ConfigResponse::from_config(&config, false);
         let endpoints = response.endpoints.expect("endpoints should be present");
 
@@ -250,9 +258,11 @@ mod tests {
 
     #[test]
     fn test_transactions_commit_not_advertised_without_write() {
-        let mut config = IcebergConfig::default();
-        config.allow_multi_table_transactions = true;
-        config.allow_write = false;
+        let config = IcebergConfig {
+            allow_multi_table_transactions: true,
+            allow_write: false,
+            ..Default::default()
+        };
         let response = ConfigResponse::from_config(&config, false);
         let endpoints = response.endpoints.expect("endpoints should be present");
 
@@ -264,9 +274,11 @@ mod tests {
 
     #[test]
     fn test_transactions_commit_advertised_when_both_flags_enabled() {
-        let mut config = IcebergConfig::default();
-        config.allow_write = true;
-        config.allow_multi_table_transactions = true;
+        let config = IcebergConfig {
+            allow_write: true,
+            allow_multi_table_transactions: true,
+            ..Default::default()
+        };
         let response = ConfigResponse::from_config(&config, false);
         let endpoints = response.endpoints.expect("endpoints should be present");
 

@@ -69,6 +69,14 @@ Repo-grounded outcome:
 
 ## Production Cutover Packet
 
+> **Note (2026-08-01):** the repair-automation *code defaults* changed after this report was
+> written. `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE` and
+> `ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE` now default to `dry_run`, not `enforce`, so
+> destructive enforcement is explicit opt-in (#357). The `=enforce` values listed below remain the
+> correct *cutover instruction* — they must now be set explicitly rather than relied on as
+> defaults. This section is the historical PI-3 exit record and is left otherwise unchanged; see
+> `docs/runbooks/control-plane-repair-and-dark-launch.md` for the current defaults.
+
 Required runtime controls:
 
 - `ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce`

@@ -177,6 +177,24 @@ fn cargo_deny_policy_denies_yanked_crates() {
 }
 
 #[test]
+fn advisory_exceptions_are_structurally_checked_and_expire_nightly() {
+    let ci =
+        fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");
+    let security_audit =
+        fs::read_to_string(repo_root().join(".github/workflows/security-audit.yml"))
+            .expect("read security audit workflow");
+
+    assert!(
+        ci.contains("python3 .github/scripts/check_advisory_exceptions.py"),
+        "PR CI should reject advisory exceptions without lifecycle metadata"
+    );
+    assert!(
+        security_audit.contains("check_advisory_exceptions.py --check-expiry"),
+        "the scheduled audit should fail after an exception review date"
+    );
+}
+
+#[test]
 fn python_ci_uses_locked_uv_resolution() {
     let ci =
         fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).expect("read CI workflow");

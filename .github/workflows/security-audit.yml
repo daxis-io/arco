@@ -31,6 +31,8 @@ jobs:
           tool: cargo-deny@0.18.9
       - name: cargo-deny advisories
         run: cargo deny check advisories --hide-inclusion-graph
+      - name: Advisory exceptions are tracked and unexpired
+        run: python3 .github/scripts/check_advisory_exceptions.py --check-expiry
       - name: cargo-deny policy
         run: cargo deny check bans licenses sources --hide-inclusion-graph
 

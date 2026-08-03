@@ -62,6 +62,34 @@ fn list_history_endpoints_do_not_document_404() -> Result<()> {
 }
 
 #[test]
+fn run_logs_documents_bounded_cursor_pagination() -> Result<()> {
+    let json = arco_api::openapi::openapi_json()?;
+    let spec: serde_json::Value = serde_json::from_str(&json)?;
+    let operation = &spec["paths"]["/api/v1/workspaces/{workspace_id}/runs/{run_id}/logs"]["get"];
+    let params = operation["parameters"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing run-log GET parameters"))?;
+
+    let limit = params
+        .iter()
+        .find(|param| param["name"] == "limit")
+        .ok_or_else(|| anyhow::anyhow!("run logs must document the object limit"))?;
+    ensure!(limit["schema"]["minimum"] == 1);
+    ensure!(limit["schema"]["maximum"] == 200);
+    ensure!(
+        params.iter().any(|param| param["name"] == "cursor"),
+        "run logs must document the cursor"
+    );
+    ensure!(
+        operation["responses"]["200"]["headers"]
+            .as_object()
+            .is_some_and(|headers| headers.contains_key("x-arco-next-cursor")),
+        "run logs must document the next-cursor response header"
+    );
+    Ok(())
+}
+
+#[test]
 fn worker_callback_endpoints_use_contract_schemas() -> Result<()> {
     let json = arco_api::openapi::openapi_json()?;
     let spec: serde_json::Value = serde_json::from_str(&json)?;

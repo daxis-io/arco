@@ -3390,11 +3390,40 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Maximum log objects to aggregate (default 50, maximum 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "maximum": 200,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor from x-arco-next-cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Aggregated logs",
+            "description": "Aggregated log page",
+            "headers": {
+              "x-arco-next-cursor": {
+                "description": "Opaque cursor for the next log page",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
             "content": {
               "text/plain": {
                 "schema": {
@@ -6917,6 +6946,21 @@
         "type": "object",
         "description": "Query parameters for retrieving logs.",
         "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque cursor returned in the `x-arco-next-cursor` response header."
+          },
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Maximum number of log objects to aggregate.",
+            "default": 50,
+            "maximum": 200,
+            "minimum": 1
+          },
           "taskKey": {
             "type": [
               "string",

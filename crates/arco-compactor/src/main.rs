@@ -1733,7 +1733,7 @@ mod tests {
     use super::*;
     use arco_catalog::{CatalogDomainManifest, RootManifest};
     use arco_core::error::Error as CoreError;
-    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
+    use arco_core::storage::{ListPage, MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
     use arco_core::{CatalogPaths, WritePrecondition};
     use async_trait::async_trait;
     use axum::body::Body;
@@ -1774,6 +1774,17 @@ mod tests {
         }
 
         async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            Err(CoreError::storage(format!(
+                "list() is reserved for anti-entropy smoke tests: {prefix}"
+            )))
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            _start_after: Option<&str>,
+            _limit: usize,
+        ) -> arco_core::Result<ListPage> {
             Err(CoreError::storage(format!(
                 "list() is reserved for anti-entropy smoke tests: {prefix}"
             )))

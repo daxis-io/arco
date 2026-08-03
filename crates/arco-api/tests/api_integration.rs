@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::http::{Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
 use arco_api::config::{Config, CorsConfig, Posture};
@@ -197,12 +197,16 @@ mod helpers {
         Ok((status, json))
     }
 
-    pub async fn get_text(router: axum::Router, uri: &str) -> Result<(StatusCode, String)> {
+    pub async fn get_text_with_headers(
+        router: axum::Router,
+        uri: &str,
+    ) -> Result<(StatusCode, HeaderMap, String)> {
         let request = make_request(Method::GET, uri, None)?;
         let response = send(router, request).await?;
+        let headers = response.headers().clone();
         let (status, body) = response_body(response).await?;
         let text = String::from_utf8(body.to_vec()).context("parse text response")?;
-        Ok((status, text))
+        Ok((status, headers, text))
     }
 
     pub async fn post_json<T: DeserializeOwned>(
@@ -2156,19 +2160,30 @@ mod orchestration {
                 .is_some_and(|value| !value.is_empty())
         );
 
-        let (status, logs_text) = helpers::get_text(
-            router,
-            &format!(
-                "/api/v1/workspaces/test-workspace/runs/{}/logs",
-                trigger.run_id
-            ),
-        )
-        .await?;
+        let logs_path = format!(
+            "/api/v1/workspaces/test-workspace/runs/{}/logs",
+            trigger.run_id
+        );
+        let first_page_path = format!("{logs_path}?limit=1");
+        let (status, headers, logs_text) =
+            helpers::get_text_with_headers(router.clone(), &first_page_path).await?;
         assert_eq!(status, StatusCode::OK);
         assert!(logs_text.contains("=== stdout ==="));
         assert!(logs_text.contains("hello stdout"));
         assert!(logs_text.contains("=== stderr ==="));
         assert!(logs_text.contains("hello stderr"));
+
+        let next_cursor = headers
+            .get("x-arco-next-cursor")
+            .context("full log page must carry a resume cursor")?
+            .to_str()
+            .context("log cursor header must be text")?;
+        let exhaustion_path = format!("{logs_path}?limit=1&cursor={next_cursor}");
+        let (status, headers, logs_text) =
+            helpers::get_text_with_headers(router, &exhaustion_path).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(logs_text.is_empty());
+        assert!(!headers.contains_key("x-arco-next-cursor"));
 
         Ok(())
     }
@@ -2739,6 +2754,16 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
             response
                 .headers()
                 .contains_key("access-control-allow-origin")
+        );
+        let exposed_headers = response
+            .headers()
+            .get("access-control-expose-headers")
+            .context("expected exposed CORS headers")?
+            .to_str()
+            .context("exposed CORS headers must be text")?;
+        assert!(
+            exposed_headers.contains("x-arco-next-cursor"),
+            "browser clients must be able to read the log pagination cursor"
         );
         Ok(())
     }

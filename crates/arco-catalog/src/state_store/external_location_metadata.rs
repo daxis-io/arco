@@ -63,8 +63,11 @@ impl ExternalLocationMetadataWriter {
     ) -> Result<ExternalLocationMetadataReceipt> {
         input.validate()?;
         let governed_path = GovernedPath::parse(&input.raw_uri)?;
-        let record =
-            ExternalLocationMetadataRecord::from_input(input, governed_path.canonical_uri());
+        // Belt-and-suspenders (path canonicalization round-trip): only a
+        // canonical URI that re-parses to the same governed path may be
+        // persisted.
+        let canonical_uri = governed_path.persistable_canonical_uri()?;
+        let record = ExternalLocationMetadataRecord::from_input(input, canonical_uri);
         let credential_key = credential_reference_key(record.credential_id());
         let location_key = external_location_key(record.location_id());
         let path_declaration = PathGovernanceDeclaration::active_from_governed_path(
@@ -815,8 +818,10 @@ mod tests {
             .await
             .expect("create percent-bearing external location");
 
+        // The escape is decoded exactly once and re-encoded on emission so the
+        // persisted canonical URI is a parse fixed point.
         assert_eq!(
-            "gs://bucket/warehouse/100%-complete/",
+            "gs://bucket/warehouse/100%25-complete/",
             receipt.record().canonical_uri()
         );
         assert_eq!(
@@ -924,7 +929,7 @@ mod tests {
         path_writer
             .declare_path(phase6a_declaration(
                 "decl_orders",
-                "gs://Bucket//warehouse/orders",
+                "gs://Bucket/warehouse/orders",
             ))
             .await
             .expect("declare phase6a path");

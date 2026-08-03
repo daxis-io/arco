@@ -1,5 +1,13 @@
 //! Task 5 coverage for UC credential vending over native storage governance.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::needless_pass_by_value)]
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
@@ -64,7 +72,16 @@ async fn temporary_path_credentials_are_governed_scoped_redacted_and_audited() {
     assert_eq!(payload["reason_code"], "allowed");
     assert_eq!(payload["provider"], "gcs");
     assert_eq!(payload["credential_kind"], "scoped_bearer");
-    assert_eq!(payload["max_ttl_seconds"], 3600);
+    // TTL is clamped to MAX_CREDENTIAL_TTL measured from the freshness
+    // observation, so the whole-second value is 3600 minus the sub-second
+    // request latency.
+    assert!(
+        payload["max_ttl_seconds"]
+            .as_u64()
+            .is_some_and(|ttl| (3599..=3600).contains(&ttl)),
+        "expected an observation-clamped TTL, got {}",
+        payload["max_ttl_seconds"]
+    );
     assert_eq!(
         payload["authorized_path_prefixes"][0],
         "gs://bucket/warehouse/orders/day=1/"
@@ -118,10 +135,25 @@ async fn temporary_path_credentials_deny_when_published_storage_governance_is_mi
         .expect("response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let payload = json_body(response).await;
-    assert!(payload["error"]["message"].as_str().is_some_and(|message| {
-        message.contains("credential_scope_unavailable")
-            && message.contains("storage_governance_projection_unavailable")
-    }));
+    // The public body is a stable reason code only: the internal projection
+    // failure detail (which manifest/object was unavailable) is logged, never
+    // returned.
+    let message = payload["error"]["message"]
+        .as_str()
+        .expect("error message")
+        .to_string();
+    assert_eq!(message, "credential_scope_unavailable");
+    for internal in [
+        "storage_governance_projection_unavailable",
+        "manifests/",
+        "snapshots/metastore",
+        "tenant=",
+    ] {
+        assert!(
+            !message.contains(internal),
+            "public 503 body leaked internal detail {internal:?}: {message}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -552,7 +584,16 @@ async fn temporary_table_credentials_resolve_table_location_through_native_catal
     assert_eq!(payload["reason_code"], "allowed");
     assert_eq!(payload["provider"], "gcs");
     assert_eq!(payload["credential_kind"], "scoped_bearer");
-    assert_eq!(payload["max_ttl_seconds"], 3600);
+    // TTL is clamped to MAX_CREDENTIAL_TTL measured from the freshness
+    // observation, so the whole-second value is 3600 minus the sub-second
+    // request latency.
+    assert!(
+        payload["max_ttl_seconds"]
+            .as_u64()
+            .is_some_and(|ttl| (3599..=3600).contains(&ttl)),
+        "expected an observation-clamped TTL, got {}",
+        payload["max_ttl_seconds"]
+    );
     assert_eq!(
         payload["authorized_path_prefixes"][0],
         "gs://bucket/warehouse/orders/"

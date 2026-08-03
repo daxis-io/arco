@@ -1,4 +1,9 @@
-//! OpenAPI compliance tests against the official Iceberg REST spec.
+//! `OpenAPI` compliance tests against the official Iceberg REST spec.
+
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
 
 use std::collections::HashSet;
 
@@ -54,7 +59,7 @@ fn collect_response_codes(operation: &serde_json::Value) -> HashSet<String> {
             responses
                 .keys()
                 .filter(|code| code.chars().all(|c| c.is_ascii_digit()))
-                .map(|code| code.to_string())
+                .map(ToString::to_string)
                 .collect()
         })
         .unwrap_or_default()

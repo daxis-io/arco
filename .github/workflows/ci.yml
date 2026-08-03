@@ -112,7 +112,8 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --workspace --all-features -- -D warnings
+      # --all-targets keeps integration-test code inside the lint gate (#331)
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -189,6 +190,11 @@ jobs:
         working-directory: python/arco
       - name: Run Python CLI API tests
         run: uv run python -m pytest tests/integration/test_cli_api.py -v
+        working-directory: python/arco
+      # test_e2e.py is hermetic (tmp_path + CliRunner, no deployed environment);
+      # it was previously executed by no workflow (#365).
+      - name: Run Python e2e integration tests
+        run: uv run python -m pytest tests/integration/test_e2e.py -v
         working-directory: python/arco
 
   docs:
@@ -346,10 +352,17 @@ jobs:
             --features iam-smoke \
             -- --ignored --test-threads=1
 
+      # Evidence-integrity (#366): this skip must be loud. A green job with
+      # this step means the Gate 5 sole-writer IAM invariant was NOT exercised.
       - name: Skip IAM smoke tests (missing config)
         if: steps.iam_smoke_prereq.outputs.skip == 'true'
         run: |
-          echo "Skipping IAM smoke tests: missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV"
+          echo "::warning::IAM smoke tests SKIPPED (missing secrets.GCP_SA_KEY_API or vars.ARCO_BUCKET_DEV) — sole-writer IAM invariant NOT verified this run"
+          {
+            echo "## IAM smoke tests: SKIPPED (unconfigured)"
+            echo ""
+            echo "sole-writer IAM invariant NOT verified this run — missing \`secrets.GCP_SA_KEY_API\` or \`vars.ARCO_BUCKET_DEV\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
   # Compile-Negative Tests (Gate 5 trait separation)

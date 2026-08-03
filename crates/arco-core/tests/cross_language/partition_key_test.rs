@@ -1,4 +1,4 @@
-//! Cross-language PartitionKey canonical encoding tests.
+//! Cross-language `PartitionKey` canonical encoding tests.
 //!
 //! These tests use shared fixtures to ensure Rust and Python
 //! produce identical canonical strings.

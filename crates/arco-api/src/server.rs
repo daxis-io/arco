@@ -29,7 +29,7 @@ use arco_iceberg::{
 };
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
-use arco_uc::{UnityCatalogState, unity_catalog_router};
+use arco_uc::{MetastorePermissionSource, UnityCatalogState, unity_catalog_router};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -778,6 +778,45 @@ impl Server {
                     .layer(task_auth_layer),
             );
 
+        // Operator-only control-store surface (roadmap Phase 4/5: "write APIs
+        // behind internal or operator-only access"). Default off: when the
+        // flag is clear the routes are never mounted, so they 404 rather than
+        // existing and refusing. A public posture never mounts them at all,
+        // mirroring how `/metrics` is withheld there. They are hosted here
+        // because platform IAM makes this service the sole writer of the
+        // `state-store/` prefix, so no other service account may run them.
+        // Authentication is the same middleware every other authenticated
+        // route uses, so the tenant/workspace scope they operate on is the
+        // verified request scope rather than a caller-supplied one.
+        //
+        // Authentication is NOT the authorization boundary: each handler
+        // additionally requires the verified principal to carry the configured
+        // operator group, and refuses every caller when none is configured.
+        // See `crate::routes::control_store` for why the authority is a claim
+        // inside the tenant token rather than a second `Authorization` header
+        // consumer.
+        if state.config.control_store_operator_endpoints && !state.config.posture.is_public() {
+            if state
+                .config
+                .control_store_operator_group
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                tracing::warn!(
+                    "control-store operator endpoints are enabled but \
+                     control_store_operator_group is unset; every request will be refused"
+                );
+            }
+            tracing::info!("control-store operator endpoints enabled (/internal/control-store/*)");
+            let internal_auth_layer =
+                middleware::from_fn_with_state(Arc::clone(&state), crate::context::auth_middleware);
+            router = router.nest(
+                "/internal",
+                crate::routes::internal_operator_routes().layer(internal_auth_layer),
+            );
+        }
+
         // Mount Iceberg REST Catalog if enabled
         // Uses nest_service since Iceberg router has its own state type
         if state.config.iceberg.enabled {
@@ -824,7 +863,16 @@ impl Server {
 
         // Mount Unity Catalog facade if enabled
         if state.config.unity_catalog.enabled {
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage));
+            // Without an authoritative permission source the UC facade has no
+            // compiled permission view to evaluate, so `require_authz` denies
+            // every principal (including a METASTORE Manage administrator) and
+            // the storage-governance recovery routes are unreachable in a
+            // deployed server. Wire the per-scope metastore-backed source; it
+            // stays fail-closed when a scope's ledger cannot be read.
+            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+                .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
+                    &state.storage,
+                ))));
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(
@@ -1411,7 +1459,7 @@ mod tests {
         let mut builder = ServerBuilder::new();
         configure_non_dev_jwt(&mut builder);
         builder.config.jwt.issuer = Some(" ".to_string());
-        builder.config.jwt.audience = Some("".to_string());
+        builder.config.jwt.audience = Some(String::new());
 
         let server = builder.build();
         let err = server.validate_config().unwrap_err();
@@ -1589,7 +1637,7 @@ mod tests {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        assert!(content_type.map_or(false, |value| value.starts_with("application/json")));
+        assert!(content_type.is_some_and(|value| value.starts_with("application/json")));
 
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
@@ -1628,7 +1676,7 @@ mod tests {
             Some("UnauthorizedException")
         );
         assert_eq!(
-            error.get("code").and_then(|value| value.as_u64()),
+            error.get("code").and_then(serde_json::Value::as_u64),
             Some(401)
         );
         Ok(())

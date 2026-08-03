@@ -7269,7 +7269,8 @@ mod tests {
             .get(&("run1".to_string(), "extract".to_string()))
             .expect("retry task row")
             .clone();
-        let retry_at = failed_at + chrono::Duration::seconds(5);
+        let retry_at = FoldState::retry_deadline(&failed.event_id, failed_at, 1)
+            .expect("retry deadline should be representable");
         assert_eq!(retry_task.retry_not_before, Some(retry_at));
 
         let watermarks = Watermarks {

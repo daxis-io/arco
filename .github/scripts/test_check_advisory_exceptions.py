@@ -19,7 +19,7 @@ TODAY = dt.date(2026, 8, 2)
 ANNOTATED = """
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; tracking #327; granted 2026-07-05; review-by 2026-10-31" },
+    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; tracking #327; granted 2026-07-05; review-by 2026-09-30" },
 ]
 """
 
@@ -31,14 +31,21 @@ ignore = ["RUSTSEC-2026-0194"]
 NO_TRACKING = """
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; granted 2026-07-05; review-by 2026-10-31" },
+    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; granted 2026-07-05; review-by 2026-09-30" },
 ]
 """
 
 LAPSED = """
 [advisories]
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; tracking #327; granted 2026-01-05; review-by 2026-04-30" },
+    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; tracking #327; granted 2026-02-01; review-by 2026-04-30" },
+]
+"""
+
+OVERLONG = """
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "blocked upstream; tracking #327; granted 2026-07-05; review-by 2026-10-31" },
 ]
 """
 
@@ -64,6 +71,11 @@ class CheckAdvisoryExceptionsTest(unittest.TestCase):
         problems = check_exceptions(LAPSED, today=TODAY, check_expiry=True)
         self.assertEqual(len(problems), 1)
         self.assertIn("lapsed on 2026-04-30", problems[0])
+
+    def test_exception_window_cannot_exceed_ninety_days(self) -> None:
+        problems = check_exceptions(OVERLONG, today=TODAY, check_expiry=False)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("exceeds 90 days", problems[0])
 
     def test_no_ignore_section_is_allowed(self) -> None:
         self.assertEqual(

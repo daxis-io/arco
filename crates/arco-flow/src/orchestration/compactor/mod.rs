@@ -22,4 +22,6 @@ pub use reconciler::{
     OrchestrationReconciler, OrchestrationReconciliationPolicy, OrchestrationReconciliationReport,
     OrchestrationRepairResult, OrchestrationRepairScope,
 };
-pub use service::{CompactionResult, CompactionVisibility, DurabilityMode, MicroCompactor};
+pub use service::{
+    CompactionResult, CompactionVisibility, DurabilityMode, MicroCompactor, RetentionLimits,
+};

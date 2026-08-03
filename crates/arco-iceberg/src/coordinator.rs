@@ -5,6 +5,7 @@
 
 use bytes::Bytes;
 use chrono::{Duration, Utc};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -13,6 +14,7 @@ use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
 use crate::commit::{prune_snapshot_log_after_snapshot_removal, validate_requirements};
 use crate::error::{IcebergError, IcebergResult};
+use crate::governance::TableLocationGovernance;
 use crate::idempotency::IdempotencyMarker;
 use crate::pointer::{
     CasResult, IcebergTablePointer, PendingPointerUpdate, PointerStore, UpdateSource,
@@ -127,30 +129,44 @@ pub struct MultiTableTransactionCoordinator<S, P> {
     pointer_store: Arc<P>,
     tx_store: TransactionStoreImpl<S>,
     config: CoordinatorConfig,
+    governance: TableLocationGovernance,
 }
 
 impl<S: StorageBackend, P: PointerStore> MultiTableTransactionCoordinator<S, P> {
     /// Creates a new coordinator with default configuration.
+    ///
+    /// `governance` is required: the multi-table prepare phase is a second
+    /// authoritative write path into table metadata, so #358 enforcement must
+    /// be structural here too rather than left to the calling route.
     #[must_use]
-    pub fn new(storage: Arc<S>, pointer_store: Arc<P>) -> Self {
-        let tx_store = TransactionStoreImpl::new(Arc::clone(&storage));
-        Self {
+    pub fn new(
+        storage: Arc<S>,
+        pointer_store: Arc<P>,
+        governance: TableLocationGovernance,
+    ) -> Self {
+        Self::with_config(
             storage,
             pointer_store,
-            tx_store,
-            config: CoordinatorConfig::default(),
-        }
+            governance,
+            CoordinatorConfig::default(),
+        )
     }
 
     /// Creates a new coordinator with custom configuration.
     #[must_use]
-    pub fn with_config(storage: Arc<S>, pointer_store: Arc<P>, config: CoordinatorConfig) -> Self {
+    pub fn with_config(
+        storage: Arc<S>,
+        pointer_store: Arc<P>,
+        governance: TableLocationGovernance,
+        config: CoordinatorConfig,
+    ) -> Self {
         let tx_store = TransactionStoreImpl::new(Arc::clone(&storage));
         Self {
             storage,
             pointer_store,
             tx_store,
             config,
+            governance,
         }
     }
 
@@ -202,6 +218,17 @@ impl<S: StorageBackend, P: PointerStore> MultiTableTransactionCoordinator<S, P> 
                 error_type: "BadRequestException",
             }
             .into());
+        }
+
+        // Step 1b (#358): reject a transaction that *requests* an ungoverned
+        // location-bearing property before anything is prepared, so a denied
+        // transaction writes no metadata file and creates no transaction
+        // record. `prepare_table` still validates the effective map per table;
+        // this pass only moves the common case ahead of the first write.
+        for table_input in &tables {
+            self.governance
+                .validate_effective_properties(&requested_location_properties(&table_input.request))
+                .await?;
         }
 
         // Step 2: Check idempotency
@@ -490,6 +517,14 @@ impl<S: StorageBackend, P: PointerStore> MultiTableTransactionCoordinator<S, P> 
         apply_updates(&mut new_metadata, &input.request.updates)?;
         let new_sequence = new_metadata.last_sequence_number + 1;
         finalize_metadata(&mut new_metadata, &base_metadata, &pointer, new_sequence);
+
+        // #358: validate the effective location-bearing property map before
+        // any metadata write or pointer CAS in the prepare phase. A
+        // multi-table transaction is otherwise an equivalent bypass of the
+        // single-table check.
+        self.governance
+            .validate_effective_properties(&new_metadata.properties)
+            .await?;
 
         // Build metadata location
         let new_metadata_location = build_metadata_location(
@@ -856,6 +891,23 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
         }
     }
     Ok(())
+}
+
+/// Collects the property map a commit request asks to set.
+///
+/// This is the request's own view, not the effective post-apply map, and is
+/// only used for the pre-prepare rejection pass; the authoritative check runs
+/// on the effective map inside `prepare_table`.
+fn requested_location_properties(request: &CommitTableRequest) -> HashMap<String, String> {
+    let mut properties = HashMap::new();
+    for update in &request.updates {
+        if let TableUpdate::SetProperties { updates } = update {
+            for (key, value) in updates {
+                properties.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    properties
 }
 
 fn finalize_metadata(

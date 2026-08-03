@@ -24,8 +24,8 @@ unmaintained = "workspace"
 # tracking issue, granted date, and review-by date. CI enforces the shape and
 # the scheduled audit enforces expiry; see docs/runbooks/advisory-exceptions.md.
 ignore = [
-    { id = "RUSTSEC-2026-0194", reason = "quadratic duplicate-attribute check in quick-xml <0.41; reachable through authenticated object-store response XML, not direct end-user input; frozen object_store/DataFusion constraints block the patched line; tracking #327; granted 2026-07-05; review-by 2026-10-31" },
-    { id = "RUSTSEC-2026-0195", reason = "unbounded namespace allocation in quick-xml <0.41; same authenticated object-store response boundary and frozen upstream constraint; tracking #327; granted 2026-07-05; review-by 2026-10-31" },
+    { id = "RUSTSEC-2026-0194", reason = "quadratic duplicate-attribute check in quick-xml <0.41; reachable through authenticated object-store response XML, not direct end-user input; frozen object_store/DataFusion constraints block the patched line; tracking #327; granted 2026-07-05; review-by 2026-09-30" },
+    { id = "RUSTSEC-2026-0195", reason = "unbounded namespace allocation in quick-xml <0.41; same authenticated object-store response boundary and frozen upstream constraint; tracking #327; granted 2026-07-05; review-by 2026-09-30" },
 ]
 
 [licenses]

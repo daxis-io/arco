@@ -64,18 +64,28 @@ def check_exceptions(
                 f"{advisory_id}: reason must name the tracking issue as "
                 "'tracking #<number>'"
             )
-        if granted is None or _parse_date(granted.group(1)) is None:
+        granted_date = None if granted is None else _parse_date(granted.group(1))
+        if granted_date is None:
             problems.append(
                 f"{advisory_id}: reason must record 'granted <YYYY-MM-DD>'"
             )
-        if review_by is None or _parse_date(review_by.group(1)) is None:
+        deadline = None if review_by is None else _parse_date(review_by.group(1))
+        if deadline is None:
             problems.append(
                 f"{advisory_id}: reason must record 'review-by <YYYY-MM-DD>'"
             )
             continue
 
-        deadline = _parse_date(review_by.group(1))
-        if check_expiry and deadline is not None and deadline < today:
+        if granted_date is not None and deadline < granted_date:
+            problems.append(
+                f"{advisory_id}: review-by date must not precede the granted date"
+            )
+        elif granted_date is not None and (deadline - granted_date).days > 90:
+            problems.append(
+                f"{advisory_id}: exception window exceeds 90 days"
+            )
+
+        if check_expiry and deadline < today:
             problems.append(
                 f"{advisory_id}: exception lapsed on {deadline.isoformat()}. "
                 "Re-check the upstream constraint, then drop the entry or "

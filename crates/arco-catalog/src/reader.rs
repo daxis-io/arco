@@ -182,6 +182,21 @@ fn join_snapshot_path(dir: &str, file: &str) -> String {
     }
 }
 
+/// Returns true for snapshot artifacts whose raw bytes must never leave the
+/// control plane because a redacted projection is their only public surface.
+///
+/// `commits.parquet` carries the private commit-authority columns
+/// (`manifest_id`, `event_witnesses_json`) that the `system.catalog.commits`
+/// projection strips. Handing out a signed URL for the raw file would defeat
+/// that redaction, so the artifact is filtered out of every mint allowlist
+/// here, in the reader, rather than only at an individual route.
+#[must_use]
+pub fn is_projection_only_artifact(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|file| file == "commits.parquet")
+}
+
 impl std::fmt::Debug for CatalogReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogReader")
@@ -844,6 +859,12 @@ impl CatalogReader {
     /// Browser clients call this to discover available snapshot files,
     /// then request signed URLs for specific files.
     ///
+    /// Projection-only artifacts are excluded: they exist in the snapshot but
+    /// may never be handed out as raw bytes (see
+    /// [`is_projection_only_artifact`]). Callers that need to *load* such an
+    /// artifact in order to serve its redacted projection must use
+    /// [`CatalogReader::get_snapshot_artifact_paths`] instead.
+    ///
     /// # Arguments
     ///
     /// * `domain` - The catalog domain to get paths for
@@ -856,6 +877,26 @@ impl CatalogReader {
     ///
     /// Returns an error if the manifest cannot be read.
     pub async fn get_mintable_paths(&self, domain: CatalogDomain) -> Result<Vec<String>> {
+        Ok(self
+            .get_snapshot_artifact_paths(domain)
+            .await?
+            .into_iter()
+            .filter(|path| !is_projection_only_artifact(path))
+            .collect())
+    }
+
+    /// Gets every snapshot artifact path a domain's current manifest names,
+    /// including artifacts that are never mintable.
+    ///
+    /// This is the *load* enumeration: server-side readers that project an
+    /// artifact into a redacted system table need the path even though no
+    /// signed URL may ever be minted for it. Anything that could hand bytes to
+    /// a client must go through [`CatalogReader::get_mintable_paths`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be read.
+    pub async fn get_snapshot_artifact_paths(&self, domain: CatalogDomain) -> Result<Vec<String>> {
         let manifest = self.read_manifest().await?;
 
         let paths = match domain {
@@ -1007,6 +1048,17 @@ impl CatalogReader {
 
         // Validate all requested paths are in allowlist
         for path in &paths {
+            // Defense in depth: a caller-supplied allowlist (a pinned root's
+            // file list, say) may still name a projection-only artifact. The
+            // refusal lives here so no future caller can re-expose the raw
+            // bytes by assembling its own allowlist.
+            if is_projection_only_artifact(path) {
+                return Err(CatalogError::Validation {
+                    message: format!(
+                        "path is an internal projection-only artifact and is never mintable: {path}"
+                    ),
+                });
+            }
             if !allowlist.contains(path) {
                 return Err(CatalogError::Validation {
                     message: format!("path not in manifest allowlist: {}", path),
@@ -1189,6 +1241,9 @@ fn emit_catalog_shadow_comparison_diagnostic(read: &CatalogInventoryComparisonRe
 // ============================================================================
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use crate::manifest::{DomainManifestPointer, SnapshotFile};
@@ -1546,6 +1601,75 @@ mod tests {
             .await;
         // Should error because no manifest exists
         assert!(result.is_err());
+    }
+
+    /// Defense in depth for #354: the deny must live in the reader, not only in
+    /// the `/browser/urls` route, so no future caller can re-expose the raw
+    /// artifact -- while the redacted `system.catalog.commits` projection, which
+    /// has to *load* the same file, keeps working.
+    #[tokio::test]
+    async fn commits_parquet_is_never_mintable_but_stays_loadable_for_the_projection() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend, "test-tenant", "test-workspace").expect("storage");
+        let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+        let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+        writer.initialize().await.expect("initialize");
+        writer
+            .create_namespace("mint_deny_ns", None, WriteOptions::default())
+            .await
+            .expect("create namespace");
+
+        let reader = CatalogReader::new(storage);
+        let artifacts = reader
+            .get_snapshot_artifact_paths(CatalogDomain::Catalog)
+            .await
+            .expect("artifact paths");
+        let commits_path = artifacts
+            .iter()
+            .find(|path| path.ends_with("/commits.parquet"))
+            .cloned()
+            .expect("the load enumeration must still expose commits.parquet");
+
+        let mintable = reader
+            .get_mintable_paths(CatalogDomain::Catalog)
+            .await
+            .expect("mintable paths");
+        assert!(
+            !mintable.iter().any(|path| path == &commits_path),
+            "commits.parquet must never enter the mint allowlist: {mintable:?}"
+        );
+        assert!(
+            mintable
+                .iter()
+                .any(|path| path.ends_with("/tables.parquet")),
+            "benign artifacts must still be mintable: {mintable:?}"
+        );
+
+        assert!(
+            reader
+                .mint_signed_urls(vec![commits_path.clone()], Duration::from_secs(300))
+                .await
+                .is_err(),
+            "minting the raw commit artifact must be refused"
+        );
+
+        // Even an allowlist assembled by a caller (a pinned root's file list,
+        // say) cannot re-admit it.
+        let mut allowlist = HashSet::new();
+        allowlist.insert(commits_path.clone());
+        let error = reader
+            .mint_signed_urls_with_allowlist(
+                vec![commits_path],
+                &allowlist,
+                Duration::from_secs(300),
+            )
+            .await
+            .expect_err("a caller-supplied allowlist must not re-expose the artifact");
+        assert!(
+            format!("{error}").contains("projection-only"),
+            "refusal must name the reason: {error}"
+        );
     }
 
     #[tokio::test]

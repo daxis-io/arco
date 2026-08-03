@@ -43,7 +43,7 @@ configuration uses the GCS JSON API. The direct end-user reachability is
 therefore low, while a hostile or compromised storage endpoint remains the
 residual risk.
 
-Tracking issue: #327. Granted: 2026-07-05. Review by: 2026-10-31.
+Tracking issue: #327. Granted: 2026-07-05. Review by: 2026-09-30.
 
 At review time, try upgrading each locked quick-xml line to 0.41 or later and
 inspect the constraint Cargo reports. Retire this exception when the relevant

@@ -328,6 +328,13 @@ const REGISTRY: &[UcOperationSupport] = &[
         "update/delete lifecycle and broader binding support remain planned",
         false,
     ),
+    partial_arco_native(
+        "POST",
+        "/storage-governance/projection/republish",
+        "External Locations",
+        "idempotent metastore projection republication at the current ledger watermark; appends no ledger event",
+        "recovery-only surface for storage-governance projections left stale by a failed commit-synchronous publication (#362); not part of the pinned UC spec",
+    ),
     known_unsupported(
         "PATCH",
         "/external-locations/{name}",

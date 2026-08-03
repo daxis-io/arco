@@ -1,4 +1,12 @@
-//! OpenAPI coverage for orchestration read endpoints.
+//! `OpenAPI` coverage for orchestration read endpoints.
+
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::indexing_slicing)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::literal_string_with_formatting_args)]
 
 use anyhow::{Result, ensure};
 
@@ -50,6 +58,34 @@ fn list_history_endpoints_do_not_document_404() -> Result<()> {
         "unexpected 404 in evals responses"
     );
 
+    Ok(())
+}
+
+#[test]
+fn run_logs_documents_bounded_cursor_pagination() -> Result<()> {
+    let json = arco_api::openapi::openapi_json()?;
+    let spec: serde_json::Value = serde_json::from_str(&json)?;
+    let operation = &spec["paths"]["/api/v1/workspaces/{workspace_id}/runs/{run_id}/logs"]["get"];
+    let params = operation["parameters"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing run-log GET parameters"))?;
+
+    let limit = params
+        .iter()
+        .find(|param| param["name"] == "limit")
+        .ok_or_else(|| anyhow::anyhow!("run logs must document the object limit"))?;
+    ensure!(limit["schema"]["minimum"] == 1);
+    ensure!(limit["schema"]["maximum"] == 200);
+    ensure!(
+        params.iter().any(|param| param["name"] == "cursor"),
+        "run logs must document the cursor"
+    );
+    ensure!(
+        operation["responses"]["200"]["headers"]
+            .as_object()
+            .is_some_and(|headers| headers.contains_key("x-arco-next-cursor")),
+        "run logs must document the next-cursor response header"
+    );
     Ok(())
 }
 

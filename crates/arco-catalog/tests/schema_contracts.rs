@@ -195,7 +195,7 @@ fn current_metastore_objects_schema() -> GoldenSchema {
 // ============================================================================
 
 #[test]
-#[ignore]
+#[ignore = "golden-file generator: run manually to regenerate schema fixtures"]
 fn generate_golden_schemas() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let golden_dir = Path::new(manifest_dir).join("tests").join("golden_schemas");

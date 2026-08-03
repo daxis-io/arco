@@ -86,9 +86,9 @@ pub mod prelude {
     };
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
-    pub use crate::scoped_storage::ScopedStorage;
+    pub use crate::scoped_storage::{ScopedListPage, ScopedStorage};
     pub use crate::storage::{
-        MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
+        ListPage, MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
         WriteResult,
     };
     pub use crate::storage_keys::{
@@ -132,9 +132,10 @@ pub use orchestration_compaction::{
     OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
 };
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
-pub use scoped_storage::ScopedStorage;
+pub use scoped_storage::{ScopedListPage, ScopedStorage};
 pub use storage::{
-    MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
+    ListPage, MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
+    WriteResult,
 };
 pub use sync_compact::{SyncCompactRequest, SyncCompactResponse, VisibilityStatus};
 pub use table_format::TableFormat;

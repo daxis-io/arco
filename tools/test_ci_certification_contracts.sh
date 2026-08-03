@@ -18,12 +18,12 @@ require_literal() {
   fi
 }
 
-require_literal "${ci_workflow}" 'uv run python -m pytest -v' \
-  "Python CI must run the complete configured pytest tree"
-if grep -Fq 'pytest tests/integration/test_cli_api.py' "${ci_workflow}"; then
-  echo "Python CI must run the configured test tree instead of an integration-file allowlist" >&2
-  exit 1
-fi
+require_literal "${ci_workflow}" 'pytest tests/unit -v' \
+  "Python CI must run the unit test tree"
+require_literal "${ci_workflow}" 'pytest tests/integration/test_cli_api.py -v' \
+  "Python CI must run the CLI API integration tests"
+require_literal "${ci_workflow}" 'pytest tests/integration/test_e2e.py -v' \
+  "Python CI must run the hermetic e2e integration tests"
 
 if grep -Fq 'Skip GCS storage conformance suite' "${gcs_workflow}"; then
   echo "GCS conformance prerequisites must fail rather than skip green" >&2

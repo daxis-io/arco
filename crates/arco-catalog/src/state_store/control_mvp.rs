@@ -1,6 +1,76 @@
 //! Object-store-backed control-state MVP.
+//!
+//! # Replay model (format version 2)
+//!
+//! Every manifest anchors its replay on an optional immutable state-snapshot
+//! object (`states/{state_id}.json`) and carries only the transaction suffix
+//! committed since that anchor. Loading current state therefore costs one
+//! snapshot read plus at most `checkpoint_interval` transaction reads,
+//! independent of total history length. Commits that fill the interval write a
+//! snapshot of their resulting state and record it as `anchor_state` so
+//! successors start a fresh suffix; explicit checkpoints materialize (or
+//! reuse) the same snapshot objects so `read_checkpoint` never replays
+//! history. Snapshot objects are envelope-checksummed and additionally bound
+//! by raw-byte checksums in every reference to them; corrupt or substituted
+//! snapshots fail closed.
+//!
+//! # Writer fencing
+//!
+//! Publication uses the strategy's two-condition protocol: the current-pointer
+//! CAS must succeed **and** the writer's fencing epoch must be **exactly** the
+//! epoch recorded in the current pointer. Only [the CAS-protected
+//! claim][`ControlMvpStateStore::claim_writer_authority`] advances the epoch,
+//! so an arbitrary future epoch supplied from outside can never publish and
+//! can never drag the pointer epoch forward without a claim. A writer whose
+//! epoch has been superseded fails closed with
+//! [`CatalogError::StaleWriterEpoch`]; a writer holding an unclaimed future
+//! epoch fails closed with [`CatalogError::PreconditionFailed`]. Both happen
+//! before any state becomes visible. Store-maintenance writers that must
+//! survive epoch claims (rather than fence competitors) adopt the published
+//! epoch via [`ControlMvpStateStore::at_current_writer_epoch`].
+//!
+//! [`u64::MAX`] is never an acceptable epoch: accepting it (or saturating an
+//! out-of-range input down to it) would make the next claim's increment
+//! overflow and wedge the domain permanently, so it is rejected at every
+//! entry point instead.
+//!
+//! Rejecting it on *input* is not enough, because a cooperative writer does
+//! not supply an epoch at all — it copies the published one — and so does
+//! restore-candidate generation. A pointer that already carries `u64::MAX`
+//! (which no claim, publication, or restore can produce, so only corruption or
+//! forgery can install one) is therefore rejected while the pointer is
+//! *validated*, which is the single choke point every one of those paths goes
+//! through: `at_current_writer_epoch`, `begin_control_txn`, publication,
+//! `claim_writer_authority`, current-state reads, and stable restore-base
+//! resolution.
+//!
+//! ## Repair policy for an already-published terminal epoch
+//!
+//! Such a domain is terminal *in place*, deliberately: nothing rewrites the
+//! pointer, because a repair that silently lowered the published epoch would
+//! un-fence writers the pointer says are fenced. The retained history stays
+//! fully readable, because checkpoint and [`StateToken`] reads resolve through
+//! manifest identity and never consult the pointer. Recovery is therefore to
+//! read the retained authority through a checkpoint or state token and restore
+//! it into a fresh domain scope, which begins at epoch 0 with an intact claim
+//! protocol.
+//!
+//! # Format versioning
+//!
+//! Format version 2 is the only supported on-disk format. There is
+//! deliberately no migration path from format version 1: no production
+//! deployment ever wrote v1 artifacts, so v1 (or any other) `format_version`
+//! values fail closed at artifact validation instead of being migrated.
+//!
+//! Restore *plans* are versioned separately from on-disk state artifacts,
+//! because an in-flight restore attempt written by an older revision must
+//! still be readable by the recovery path that has to supersede it. Plan
+//! version 1 (which predates `observed_writer_epoch`) is therefore decoded by
+//! an explicit migration into a legacy-marked plan that can be inspected and
+//! superseded but can never be applied. See [`ControlMvpRestorePlan`].
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 
 use arco_core::ScopedStorage;
 use arco_core::storage::{WritePrecondition, WriteResult};
@@ -23,7 +93,11 @@ use crate::error::{CatalogError, Result};
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 1;
+const RESTORE_PLAN_VERSION: u32 = 2;
+/// Plan version written before `observed_writer_epoch` existed. Decoded by an
+/// explicit migration (see [`ControlMvpRestorePlan`]) and never applied.
+const RESTORE_PLAN_VERSION_LEGACY: u32 = 1;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 2;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
@@ -33,11 +107,16 @@ pub struct ControlMvpStateStore {
     storage: ScopedStorage,
     scope: StateScope,
     paths: ControlMvpPaths,
+    checkpoint_interval: u64,
+    writer_epoch: u64,
 }
 
 impl ControlMvpStateStore {
     /// Stable implementation identifier for this MVP backend.
     pub const IMPLEMENTATION: &'static str = IMPLEMENTATION;
+
+    /// Default number of committed transactions between automatic replay anchors.
+    pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 32;
 
     /// Creates a control-state MVP store over workspace-scoped storage.
     ///
@@ -62,7 +141,122 @@ impl ControlMvpStateStore {
             storage,
             scope,
             paths,
+            checkpoint_interval: Self::DEFAULT_CHECKPOINT_INTERVAL,
+            writer_epoch: 0,
         })
+    }
+
+    /// Sets the automatic replay-anchor interval in committed transactions.
+    #[must_use]
+    pub const fn with_checkpoint_interval(mut self, interval: NonZeroU64) -> Self {
+        self.checkpoint_interval = interval.get();
+        self
+    }
+
+    /// Pins the writer fencing epoch this store publishes with.
+    ///
+    /// The epoch is *not* an authority grant: publication additionally
+    /// requires it to equal the epoch recorded in the published pointer, so a
+    /// pinned future epoch fails closed instead of advancing the pointer
+    /// without a [`Self::claim_writer_authority`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for [`u64::MAX`], which is never an
+    /// acceptable epoch: publishing it would make the next claim's increment
+    /// overflow and wedge the domain permanently. Out-of-range input is
+    /// rejected rather than saturated, because saturating `u64::MAX` to
+    /// `u64::MAX - 1` publishes the one epoch after which exactly one further
+    /// claim is possible, which is the same wedge one step later.
+    pub fn with_writer_epoch(mut self, writer_epoch: u64) -> Result<Self> {
+        if writer_epoch == u64::MAX {
+            return Err(unclaimable_writer_epoch());
+        }
+        self.writer_epoch = writer_epoch;
+        Ok(self)
+    }
+
+    /// Returns this store bound to the writer epoch currently recorded in the
+    /// published pointer (cooperative fencing), or unchanged when the domain
+    /// has no published state yet.
+    ///
+    /// Store-maintenance writers (for example the projection outbox worker)
+    /// use this to keep functioning after another writer advanced the epoch
+    /// through [`Self::claim_writer_authority`]: they adopt the published
+    /// epoch instead of failing [`CatalogError::StaleWriterEpoch`] forever.
+    /// The adopted epoch equals the published one, so cooperative writers can
+    /// never regress fencing nor fence other writers out.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or corrupt-pointer errors other than a missing pointer.
+    pub async fn at_current_writer_epoch(mut self) -> Result<Self> {
+        match self.load_pointer().await {
+            Ok(pointer) => {
+                self.writer_epoch = pointer.writer_epoch;
+                Ok(self)
+            }
+            Err(CatalogError::NotFound { .. }) => Ok(self),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the writer fencing epoch this store publishes with.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> u64 {
+        self.writer_epoch
+    }
+
+    /// Claims the next writer fencing epoch and returns a store bound to it.
+    ///
+    /// The claim is durably published through the current-pointer CAS, so
+    /// every writer holding an older epoch fails closed on its next begin or
+    /// publish attempt. This is the **only** operation that advances the
+    /// published epoch: ordinary publication requires exact equality with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error before any state exists (there is no
+    /// authority to fence yet), a validation error when the claim would
+    /// publish [`u64::MAX`] (which no later claim could supersede), and a CAS
+    /// error when another writer moved the pointer concurrently.
+    pub async fn claim_writer_authority(mut self) -> Result<Self> {
+        let pointer_meta = self.storage.head_raw(&self.paths.current_pointer()).await?;
+        let Some(pointer_meta) = pointer_meta else {
+            return Err(validation_failed(
+                "cannot claim a control MVP writer epoch before the first commit",
+            ));
+        };
+        let pointer = self.load_pointer().await?;
+        let claimed_epoch = pointer
+            .writer_epoch
+            .checked_add(1)
+            .ok_or_else(|| validation_failed("control MVP writer epoch overflow during claim"))?;
+        if claimed_epoch == u64::MAX {
+            return Err(unclaimable_writer_epoch());
+        }
+        let claimed = ControlMvpPointer {
+            writer_epoch: claimed_epoch,
+            ..pointer
+        };
+        let claimed_bytes = encode_json(&claimed, "control MVP epoch-claim pointer")?;
+        match self
+            .storage
+            .put_raw(
+                &self.paths.current_pointer(),
+                claimed_bytes,
+                WritePrecondition::MatchesVersion(pointer_meta.version),
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => {
+                self.writer_epoch = claimed_epoch;
+                Ok(self)
+            }
+            WriteResult::PreconditionFailed { .. } => Err(CatalogError::CasFailed {
+                message: "control MVP writer epoch claim lost a pointer race".to_string(),
+            }),
+        }
     }
 
     /// Returns the scope-relative paths used by this store.
@@ -87,6 +281,7 @@ impl ControlMvpStateStore {
         }
 
         let base = self.load_current_base_state().await?;
+        validate_publication_epoch(self.writer_epoch, base.writer_epoch)?;
         let next_sequence = base.state.logical_sequence + 1;
         let request_id = opts.request_id().map(ToOwned::to_owned);
         let suffix = Ulid::new().to_string().to_ascii_lowercase();
@@ -105,6 +300,7 @@ impl ControlMvpStateStore {
             preconditions: Vec::new(),
             writes: BTreeMap::new(),
             outbox: Vec::new(),
+            outbox_trim: Vec::new(),
         })
     }
 
@@ -136,7 +332,9 @@ impl ControlMvpStateStore {
             return Ok(ControlMvpBase {
                 pointer_version: None,
                 manifest_id: None,
+                writer_epoch: 0,
                 state: ReplayState::default(),
+                base_state: None,
                 tx_refs: Vec::new(),
             });
         };
@@ -144,12 +342,15 @@ impl ControlMvpStateStore {
         let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
         let state = self.replay_manifest(&manifest).await?;
+        let (base_state, tx_refs) = manifest.successor_anchor();
 
         Ok(ControlMvpBase {
             pointer_version: Some(pointer_meta.version),
             manifest_id: Some(pointer.manifest_id),
-            tx_refs: manifest.tx_refs,
+            writer_epoch: pointer.writer_epoch,
             state,
+            base_state,
+            tx_refs,
         })
     }
 
@@ -222,7 +423,10 @@ impl ControlMvpStateStore {
     }
 
     async fn replay_manifest(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
-        let mut state = ReplayState::default();
+        let mut state = match manifest.base_state.as_ref() {
+            Some(reference) => self.load_state_snapshot(reference).await?,
+            None => ReplayState::default(),
+        };
         for tx_ref in &manifest.tx_refs {
             let tx = self.load_tx(tx_ref).await?;
             state.apply_tx(&tx)?;
@@ -235,6 +439,52 @@ impl ControlMvpStateStore {
             ));
         }
         Ok(state)
+    }
+
+    async fn load_state_snapshot(&self, reference: &ControlMvpStateRef) -> Result<ReplayState> {
+        let bytes = self
+            .storage
+            .get_raw(&self.paths.state_object(&reference.state_id))
+            .await?;
+        validate_raw_checksum(
+            &bytes,
+            Some(&reference.checksum_sha256),
+            "control MVP state snapshot reference checksum",
+        )?;
+        let snapshot: ControlMvpStateObject =
+            decode_envelope(&bytes, "control-mvp-state", "control MVP state snapshot")?;
+        snapshot.validate(&self.scope, reference)?;
+        Ok(snapshot.into_replay_state())
+    }
+
+    async fn write_state_snapshot(
+        &self,
+        snapshot: &ControlMvpStateObject,
+    ) -> Result<ControlMvpStateRef> {
+        let bytes = encode_envelope("control-mvp-state", snapshot)?;
+        let reference = ControlMvpStateRef {
+            state_id: snapshot.state_id.clone(),
+            logical_sequence: snapshot.logical_sequence,
+            checksum_sha256: sha256_hex(&bytes),
+        };
+        let path = self.paths.state_object(&snapshot.state_id);
+        match self
+            .storage
+            .put_raw(&path, bytes.clone(), WritePrecondition::DoesNotExist)
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(reference),
+            WriteResult::PreconditionFailed { .. } => {
+                let existing = self.storage.get_raw(&path).await?;
+                if existing == bytes {
+                    Ok(reference)
+                } else {
+                    Err(precondition_failed(
+                        "control MVP state snapshot already exists with different bytes",
+                    ))
+                }
+            }
+        }
     }
 
     async fn load_tx(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
@@ -297,6 +547,64 @@ impl ControlMvpStateStore {
         }
     }
 
+    /// Determines whether a planned restore transaction is part of the
+    /// visible lineage, independent of how many replay anchors have been
+    /// committed since the restore.
+    ///
+    /// The bounded transaction suffix resets at every anchor, so a suffix-only
+    /// scan would misreport an applied restore as absent (and therefore
+    /// Superseded) once `checkpoint_interval` commits pass. This walk starts
+    /// at the current suffix and follows the anchor chain backwards — each
+    /// anchor's `base_state` names the snapshot written by exactly one
+    /// producing manifest, whose own `anchor_state` must byte-match the
+    /// followed reference (binding the snapshot's raw checksum) — until the
+    /// planned sequence is covered or genesis is reached. Every hop loads an
+    /// envelope-checksummed manifest and the anchor sequence strictly
+    /// decreases, so the walk is deterministic, fail-closed, and bounded by
+    /// the number of anchors, not by history length.
+    async fn restore_tx_in_lineage(
+        &self,
+        parent: &ControlMvpBase,
+        planned: &ControlMvpTxRef,
+    ) -> Result<bool> {
+        if planned.sequence > parent.state.logical_sequence {
+            return Ok(false);
+        }
+        let mut tx_refs = parent.tx_refs.clone();
+        let mut base_state = parent.base_state.clone();
+        loop {
+            if let Some(found) = tx_refs
+                .iter()
+                .find(|reference| reference.sequence == planned.sequence)
+            {
+                return Ok(found == planned);
+            }
+            let Some(anchor) = base_state else {
+                // Genesis reached without covering the planned sequence.
+                return Ok(false);
+            };
+            if planned.sequence > anchor.logical_sequence {
+                // The suffix covered the planned sequence's range but a
+                // different, contiguous set of transactions occupies it.
+                return Ok(false);
+            }
+            let producing_manifest_id =
+                manifest_id_for_anchor_state(&anchor.state_id).ok_or_else(|| {
+                    invariant_violation(
+                        "control MVP anchor snapshot id does not name a producing manifest",
+                    )
+                })?;
+            let manifest = self.load_manifest(&producing_manifest_id).await?;
+            if manifest.anchor_state.as_ref() != Some(&anchor) {
+                return Err(invariant_violation(
+                    "control MVP anchor chain producing manifest does not carry the referenced anchor snapshot",
+                ));
+            }
+            tx_refs = manifest.tx_refs;
+            base_state = manifest.base_state;
+        }
+    }
+
     async fn load_restore_source_lineage(
         &self,
         source: &PersistedAuthorityReference,
@@ -324,11 +632,14 @@ impl ControlMvpStateStore {
             ));
         }
         let state = self.replay_manifest(&manifest).await?;
+        let (base_state, tx_refs) = manifest.successor_anchor();
         Ok(ControlMvpBase {
             pointer_version: None,
             manifest_id: Some(manifest.manifest_id),
+            writer_epoch: 0,
             state,
-            tx_refs: manifest.tx_refs,
+            base_state,
+            tx_refs,
         })
     }
 
@@ -352,11 +663,14 @@ impl ControlMvpStateStore {
                     current: ControlMvpBase {
                         pointer_version: None,
                         manifest_id: None,
+                        writer_epoch: 0,
                         state: ReplayState::default(),
+                        base_state: None,
                         tx_refs: Vec::new(),
                     },
                     candidate_parent,
                     current_base_kind: ControlMvpRestoreCurrentBaseKind::Empty,
+                    writer_epoch: 0,
                     pointer_bytes: Bytes::from_static(EMPTY_CURRENT_BASE_MARKER),
                 });
             };
@@ -377,16 +691,20 @@ impl ControlMvpStateStore {
                 ));
             }
             let state = self.replay_manifest(&manifest).await?;
+            let (base_state, tx_refs) = manifest.successor_anchor();
             let current = ControlMvpBase {
                 pointer_version: Some(before.version),
                 manifest_id: Some(pointer.manifest_id),
+                writer_epoch: pointer.writer_epoch,
                 state,
-                tx_refs: manifest.tx_refs,
+                base_state,
+                tx_refs,
             };
             return Ok(StableRestoreBase {
                 candidate_parent: current.clone(),
                 current,
                 current_base_kind: ControlMvpRestoreCurrentBaseKind::Pointer,
+                writer_epoch: pointer.writer_epoch,
                 pointer_bytes,
             });
         }
@@ -500,6 +818,7 @@ impl ControlMvpStateStore {
             tx_id: transaction_id.clone(),
             base_manifest_id: Some(base_manifest_id.to_string()),
             sequence: result_sequence,
+            writer_epoch: stable.writer_epoch,
             request_id: Some(format!(
                 "restore:{}:{}:{}",
                 identity.restore_id(),
@@ -514,6 +833,7 @@ impl ControlMvpStateStore {
                 record_id: outbox_record_id.clone(),
                 payload: encode_json_vec(&notice, "Control MVP restore notice")?,
             }],
+            outbox_trim: Vec::new(),
         };
         let transaction_bytes = encode_envelope("control-mvp-tx", &tx)?;
         let transaction_checksum = sha256_hex(&transaction_bytes);
@@ -526,22 +846,28 @@ impl ControlMvpStateStore {
             checksum_sha256: transaction_checksum,
         });
         let manifest = ControlMvpManifest {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
             manifest_id: candidate_manifest_id.clone(),
             logical_sequence: result_sequence,
             base_manifest_id: Some(base_manifest_id.to_string()),
+            writer_epoch: stable.writer_epoch,
+            base_state: stable.candidate_parent.base_state.clone(),
+            anchor_state: None,
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
         };
         let manifest_bytes = encode_envelope("control-mvp-manifest", &manifest)?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
         let pointer = ControlMvpPointer {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
             manifest_id: candidate_manifest_id.clone(),
             logical_sequence: result_sequence,
             manifest_checksum_sha256: manifest_checksum,
+            writer_epoch: stable.writer_epoch,
         };
         let pointer_bytes = encode_json(&pointer, "Control MVP restore pointer")?;
 
@@ -578,6 +904,7 @@ impl ControlMvpStateStore {
             current_base_kind: stable.current_base_kind,
             base_pointer_version: stable.current.pointer_version.clone(),
             observed_base_pointer_sha256: prefixed_sha256(&stable.pointer_bytes),
+            observed_writer_epoch: stable.writer_epoch,
             base_manifest_id: stable
                 .candidate_parent
                 .manifest_id
@@ -643,13 +970,176 @@ impl ControlMvpPaths {
     pub fn checkpoint_object(&self, checkpoint_id: &str) -> String {
         format!("{}/checkpoints/{checkpoint_id}.json", self.base_prefix())
     }
+
+    /// Returns the immutable state-snapshot object path.
+    #[must_use]
+    pub fn state_object(&self, state_id: &str) -> String {
+        format!("{}/states/{state_id}.json", self.base_prefix())
+    }
+}
+
+/// Returns the deterministic state-snapshot id anchored to a manifest.
+fn state_id_for_manifest(manifest_id: &str) -> String {
+    format!(
+        "state-{}",
+        manifest_id.strip_prefix("manifest-").unwrap_or(manifest_id)
+    )
+}
+
+/// Returns the manifest id that produced a deterministic anchor snapshot.
+///
+/// Inverse of [`state_id_for_manifest`] for anchor snapshots, which are only
+/// ever written under the producing manifest's identity.
+fn manifest_id_for_anchor_state(state_id: &str) -> Option<String> {
+    state_id
+        .strip_prefix("state-")
+        .map(|suffix| format!("manifest-{suffix}"))
+}
+
+fn stale_writer_epoch(held: u64, current: u64) -> CatalogError {
+    CatalogError::StaleWriterEpoch {
+        message: format!(
+            "control MVP writer epoch {held} is superseded by published epoch {current}; \
+             retry with an explicit epoch of exactly {current}, or resolve the published \
+             epoch cooperatively before writing"
+        ),
+    }
+}
+
+fn unclaimed_writer_epoch(held: u64, current: u64) -> CatalogError {
+    CatalogError::PreconditionFailed {
+        message: format!(
+            "control MVP writer epoch {held} is ahead of published epoch {current} but was \
+             never claimed; publication requires exact equality with the published epoch and \
+             only claim_writer_authority may advance it, so a future epoch supplied from \
+             outside is refused instead of silently becoming authority"
+        ),
+    }
+}
+
+fn unclaimable_writer_epoch() -> CatalogError {
+    CatalogError::Validation {
+        message: format!(
+            "control MVP writer epoch {} is not an acceptable epoch: publishing it would make \
+             every later claim_writer_authority increment overflow and wedge the domain \
+             permanently, so it is rejected rather than saturated",
+            u64::MAX
+        ),
+    }
+}
+
+/// Returns the fail-closed error for a *published* pointer already carrying the
+/// terminal epoch.
+///
+/// No claim, publication, or restore can produce this pointer, so observing one
+/// means the pointer was corrupted or forged. Refusing it here is what stops
+/// the paths that never supply an epoch — cooperative adoption through
+/// [`ControlMvpStateStore::at_current_writer_epoch`] and restore-candidate
+/// generation, which both copy the published epoch — from spreading a terminal
+/// epoch into transactions, manifests, and new pointers.
+fn terminal_published_writer_epoch() -> CatalogError {
+    CatalogError::InvariantViolation {
+        message: format!(
+            "control MVP pointer publishes writer epoch {}, which no claim, publication, or \
+             restore can produce; the domain is refused in place rather than repaired, because \
+             lowering a published epoch would un-fence writers the pointer says are fenced. \
+             Retained history stays readable through checkpoint and state-token reads, which \
+             resolve by manifest identity and never consult the pointer; recover by restoring \
+             that retained authority into a fresh domain scope",
+            u64::MAX
+        ),
+    }
+}
+
+/// Enforces the publication epoch condition: the held epoch must equal the
+/// epoch recorded in the published pointer. A lower epoch has been fenced out;
+/// a higher one was never claimed and must not become authority by publishing.
+fn validate_publication_epoch(held: u64, published: u64) -> Result<()> {
+    if held < published {
+        return Err(stale_writer_epoch(held, published));
+    }
+    if held > published {
+        return Err(unclaimed_writer_epoch(held, published));
+    }
+    Ok(())
 }
 
 /// MVP projection outbox record staged inside a control transaction.
+///
+/// A staged record has no `origin_sequence`; replay stamps the committing
+/// transaction's logical sequence so consumers can acknowledge and derive
+/// projection watermarks from the record's provenance.
+///
+/// # Delivery identity
+///
+/// The `record_id` is a **business** identifier and is deliberately reusable:
+/// once a record has been trimmed, a producer may stage the same id again.
+/// Delivery identity is therefore [`Self::event_id`] — the immutable
+/// *incarnation* of one staging, derived from the committing transaction's
+/// logical sequence plus the record id. Record ids are unique across the
+/// retained outbox and the logical sequence increases strictly, so every
+/// staging that ever happens in a domain has a distinct event id, and a
+/// re-staged record id can never be mistaken for the incarnation that was
+/// consumed before it. The derivation is a pure function of committed
+/// transaction data, so replay is deterministic and the state-checksum chain
+/// is unchanged (event ids are derived, never stored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlMvpProjectionOutboxRecord {
     record_id: String,
     payload: Bytes,
+    origin_sequence: Option<u64>,
+}
+
+/// Returns the immutable outbox-event id for one staging incarnation.
+///
+/// Deterministic from committed transaction data only: `origin_sequence` is
+/// the committing transaction's logical sequence (fixed width, so the
+/// encoding is unambiguous) and `record_id` is unique within it.
+#[must_use]
+pub fn control_mvp_outbox_event_id(origin_sequence: u64, record_id: &str) -> String {
+    format!("evt-{origin_sequence:020}-{record_id}")
+}
+
+/// Exact outbox event one trim removes from the source domain.
+///
+/// Trims are conditional on this identity, not on the reusable record id
+/// alone: an observation captured before a concurrent trim/re-stage cycle
+/// names an incarnation that no longer exists, and staging it fails closed
+/// with [`CatalogError::PreconditionFailed`] instead of deleting whatever
+/// record currently happens to carry that id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpOutboxTrimTarget {
+    record_id: String,
+    origin_sequence: u64,
+}
+
+impl ControlMvpOutboxTrimTarget {
+    /// Names the exact outbox event incarnation to remove.
+    #[must_use]
+    pub fn new(record_id: impl Into<String>, origin_sequence: u64) -> Self {
+        Self {
+            record_id: record_id.into(),
+            origin_sequence,
+        }
+    }
+
+    /// Returns the business record id.
+    #[must_use]
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    /// Returns the observed origin sequence.
+    #[must_use]
+    pub const fn origin_sequence(&self) -> u64 {
+        self.origin_sequence
+    }
+
+    /// Returns the immutable event id this target names.
+    #[must_use]
+    pub fn event_id(&self) -> String {
+        control_mvp_outbox_event_id(self.origin_sequence, &self.record_id)
+    }
 }
 
 /// Durable deterministic evidence for one Control MVP restore participant.
@@ -670,7 +1160,23 @@ impl ControlMvpRestoreCurrentBaseKind {
 }
 
 /// Durable deterministic evidence for one Control MVP restore participant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Plan versioning
+///
+/// Version 2 is the version this revision plans in. Version 1 predates
+/// `observed_writer_epoch` and is still **decodable**, by explicit migration
+/// rather than by Serde defaults: an in-flight attempt written by an older
+/// revision has to be readable by the recovery path whose job is to supersede
+/// it, and a plan that cannot be deserialized cannot be inspected, superseded,
+/// or safely replanned — recovery would degrade into a serialization failure.
+///
+/// The migration is fail-closed. A decoded v1 plan records
+/// `observed_writer_epoch = 0` as "not observed", is marked legacy by keeping
+/// `version == 1`, and reaches exactly one terminal outcome at inspection:
+/// [`RestoreParticipantInspection::Superseded`]. It is never Ready and is
+/// never applied, so the missing epoch observation can never be mistaken for
+/// an observation of epoch 0. The driver replans it as a version 2 plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     record_type: String,
     version: u32,
@@ -681,6 +1187,7 @@ pub struct ControlMvpRestorePlan {
     current_base_kind: ControlMvpRestoreCurrentBaseKind,
     base_pointer_version: Option<String>,
     observed_base_pointer_sha256: String,
+    observed_writer_epoch: u64,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -694,7 +1201,102 @@ pub struct ControlMvpRestorePlan {
     restore_outbox_record_id: String,
 }
 
+/// Wire shape used to decode any supported restore-plan version.
+///
+/// `observed_writer_epoch` is optional here **only** so a version 1 record can
+/// be read at all; the migration below decides what its absence means per
+/// version instead of letting Serde silently default it.
+#[derive(Deserialize)]
+struct ControlMvpRestorePlanWire {
+    record_type: String,
+    version: u32,
+    implementation: String,
+    scope: StateScope,
+    identity: RestoreAttemptIdentity,
+    source: PersistedAuthorityReference,
+    current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    base_pointer_version: Option<String>,
+    observed_base_pointer_sha256: String,
+    #[serde(default)]
+    observed_writer_epoch: Option<u64>,
+    base_manifest_id: String,
+    base_logical_sequence: u64,
+    transaction_id: String,
+    transaction_path: String,
+    transaction_sha256: String,
+    candidate_manifest_id: String,
+    candidate_manifest_path: String,
+    candidate_manifest_sha256: String,
+    candidate_pointer_sha256: String,
+    result_logical_sequence: u64,
+    restore_outbox_record_id: String,
+}
+
+impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ControlMvpRestorePlanWire::deserialize(deserializer)?;
+        let observed_writer_epoch = if wire.version == RESTORE_PLAN_VERSION_LEGACY {
+            // Version 1 never carried the field. Present means the record is
+            // malformed for its declared version, absent means "not observed",
+            // which apply-time handling treats as fail-closed (never Ready).
+            match wire.observed_writer_epoch {
+                None => 0,
+                Some(_) => {
+                    return Err(serde::de::Error::custom(
+                        "control MVP restore plan version 1 must not carry observed_writer_epoch",
+                    ));
+                }
+            }
+        } else {
+            wire.observed_writer_epoch.ok_or_else(|| {
+                serde::de::Error::custom(
+                    "control MVP restore plan is missing observed_writer_epoch",
+                )
+            })?
+        };
+        Ok(Self {
+            record_type: wire.record_type,
+            version: wire.version,
+            implementation: wire.implementation,
+            scope: wire.scope,
+            identity: wire.identity,
+            source: wire.source,
+            current_base_kind: wire.current_base_kind,
+            base_pointer_version: wire.base_pointer_version,
+            observed_base_pointer_sha256: wire.observed_base_pointer_sha256,
+            observed_writer_epoch,
+            base_manifest_id: wire.base_manifest_id,
+            base_logical_sequence: wire.base_logical_sequence,
+            transaction_id: wire.transaction_id,
+            transaction_path: wire.transaction_path,
+            transaction_sha256: wire.transaction_sha256,
+            candidate_manifest_id: wire.candidate_manifest_id,
+            candidate_manifest_path: wire.candidate_manifest_path,
+            candidate_manifest_sha256: wire.candidate_manifest_sha256,
+            candidate_pointer_sha256: wire.candidate_pointer_sha256,
+            result_logical_sequence: wire.result_logical_sequence,
+            restore_outbox_record_id: wire.restore_outbox_record_id,
+        })
+    }
+}
+
 impl ControlMvpRestorePlan {
+    /// Returns the durable plan version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns whether this plan was migrated from the pre-`observed_writer_epoch`
+    /// version and therefore may only be superseded, never applied.
+    #[must_use]
+    pub const fn is_legacy_version(&self) -> bool {
+        self.version == RESTORE_PLAN_VERSION_LEGACY
+    }
+
     /// Returns the exact source authority reference.
     #[must_use]
     pub const fn source(&self) -> &PersistedAuthorityReference {
@@ -780,6 +1382,7 @@ impl ControlMvpRestorePlan {
                 self.base_pointer_version.is_none()
                     && self.observed_base_pointer_sha256
                         == prefixed_sha256(EMPTY_CURRENT_BASE_MARKER)
+                    && self.observed_writer_epoch == 0
                     && self.base_manifest_id == self.source.manifest_id()
                     && self.base_logical_sequence == self.source.logical_sequence()
             }
@@ -788,8 +1391,18 @@ impl ControlMvpRestorePlan {
                 .as_ref()
                 .is_some_and(|version| !version.is_empty()),
         };
+        // Legacy plans are structurally validated exactly like current ones —
+        // the deterministic identity derivation never included the writer
+        // epoch, so every identity check below still binds. What a legacy plan
+        // may not do is become authority; `inspect_restore` refuses to report
+        // it Ready.
+        let version_supported =
+            self.version == RESTORE_PLAN_VERSION || self.version == RESTORE_PLAN_VERSION_LEGACY;
+        let legacy_epoch_valid =
+            self.version != RESTORE_PLAN_VERSION_LEGACY || self.observed_writer_epoch == 0;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
-            || self.version != RESTORE_PLAN_VERSION
+            || !version_supported
+            || !legacy_epoch_valid
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -938,11 +1551,13 @@ impl ControlMvpRestoreParticipant {
         )?;
         manifest.validate(&self.store.scope, &plan.candidate_manifest_id)?;
         let base_manifest = self.store.load_manifest(&plan.base_manifest_id).await?;
+        let (expected_base_state, expected_prefix) = base_manifest.successor_anchor();
         if manifest.logical_sequence != plan.result_logical_sequence
             || manifest.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
-            || manifest.tx_refs.len() != base_manifest.tx_refs.len() + 1
-            || manifest.tx_refs.get(..base_manifest.tx_refs.len())
-                != Some(base_manifest.tx_refs.as_slice())
+            || manifest.base_state != expected_base_state
+            || manifest.anchor_state.is_some()
+            || manifest.tx_refs.len() != expected_prefix.len() + 1
+            || manifest.tx_refs.get(..expected_prefix.len()) != Some(expected_prefix.as_slice())
             || manifest.tx_refs.last() != Some(&planned_tx_ref)
         {
             return Err(invariant_violation(
@@ -951,11 +1566,13 @@ impl ControlMvpRestoreParticipant {
         }
         self.store.replay_manifest(&manifest).await?;
         let candidate_pointer = ControlMvpPointer {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             manifest_id: plan.candidate_manifest_id.clone(),
             logical_sequence: plan.result_logical_sequence,
             manifest_checksum_sha256: sha256_hex(&manifest_bytes),
+            writer_epoch: plan.observed_writer_epoch,
         };
         if prefixed_sha256(&encode_json(
             &candidate_pointer,
@@ -987,12 +1604,13 @@ impl ControlMvpRestoreParticipant {
 }
 
 impl ControlMvpProjectionOutboxRecord {
-    /// Creates a projection outbox record.
+    /// Creates a projection outbox record for staging in a transaction.
     #[must_use]
     pub fn new(record_id: impl Into<String>, payload: Bytes) -> Self {
         Self {
             record_id: record_id.into(),
             payload,
+            origin_sequence: None,
         }
     }
 
@@ -1007,6 +1625,49 @@ impl ControlMvpProjectionOutboxRecord {
     pub const fn payload(&self) -> &Bytes {
         &self.payload
     }
+
+    /// Returns the logical sequence of the commit that produced this record.
+    ///
+    /// `None` only for records that have been staged but not yet committed.
+    #[must_use]
+    pub const fn origin_sequence(&self) -> Option<u64> {
+        self.origin_sequence
+    }
+
+    /// Returns this staging incarnation's immutable event id — the delivery
+    /// identity consumers acknowledge and trim by.
+    ///
+    /// `None` only for records that have been staged but not yet committed,
+    /// because the event id is derived from the committing sequence.
+    #[must_use]
+    pub fn event_id(&self) -> Option<String> {
+        self.origin_sequence
+            .map(|sequence| control_mvp_outbox_event_id(sequence, &self.record_id))
+    }
+
+    /// Returns the trim target naming exactly this staging incarnation.
+    ///
+    /// `None` only for records that have been staged but not yet committed.
+    #[must_use]
+    pub fn trim_target(&self) -> Option<ControlMvpOutboxTrimTarget> {
+        self.origin_sequence
+            .map(|sequence| ControlMvpOutboxTrimTarget::new(self.record_id.clone(), sequence))
+    }
+
+    /// Creates a record as it appears when read back from committed state,
+    /// carrying the producing commit's logical sequence.
+    #[must_use]
+    pub fn with_origin_sequence(
+        record_id: impl Into<String>,
+        payload: Bytes,
+        origin_sequence: u64,
+    ) -> Self {
+        Self {
+            record_id: record_id.into(),
+            payload,
+            origin_sequence: Some(origin_sequence),
+        }
+    }
 }
 
 /// Concrete control-MVP transaction with MVP-only staging helpers.
@@ -1019,6 +1680,7 @@ pub struct ControlMvpTxn {
     preconditions: Vec<Precondition>,
     writes: BTreeMap<Vec<u8>, StagedWrite>,
     outbox: Vec<ControlMvpProjectionOutboxRecord>,
+    outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
 impl ControlMvpTxn {
@@ -1035,8 +1697,110 @@ impl ControlMvpTxn {
     }
 
     /// Stages a projection outbox record in this MVP transaction.
-    pub fn stage_projection_outbox(&mut self, record: ControlMvpProjectionOutboxRecord) {
+    ///
+    /// Record ids are unique across the retained outbox: staging an id that
+    /// is currently retained, staged for trimming, or already staged in this
+    /// transaction fails with a typed duplicate-id error, so a duplicate can
+    /// never wedge acknowledgement or trimming of the original record. Ack
+    /// retirement is ordered before source trims (see the projection outbox
+    /// worker), so an id absent from the retained outbox has no live
+    /// acknowledgement bound to it and re-staging it produces a fresh record.
+    /// Concurrent staging of the same id is resolved by the single-writer
+    /// pointer CAS: the losing commit fails and any retry begins from the
+    /// winning state, where this validation rejects the duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::AlreadyExists`] when the record id is already
+    /// retained in the transaction's base outbox or staged in this
+    /// transaction.
+    pub fn stage_projection_outbox(
+        &mut self,
+        record: ControlMvpProjectionOutboxRecord,
+    ) -> Result<()> {
+        let duplicate = self
+            .base
+            .state
+            .outbox
+            .iter()
+            .map(|existing| existing.record_id.as_str())
+            .chain(self.outbox.iter().map(|staged| staged.record_id.as_str()))
+            .any(|existing| existing == record.record_id);
+        if duplicate {
+            return Err(CatalogError::AlreadyExists {
+                entity: "projection outbox record".to_string(),
+                name: record.record_id,
+            });
+        }
         self.outbox.push(record);
+        Ok(())
+    }
+
+    /// Stages removal of already-consumed projection outbox events.
+    ///
+    /// Trimming bounds outbox growth through snapshots: trimmed records leave
+    /// the replayed state from this commit forward, while token-pinned reads of
+    /// retained history still observe them. Callers must trim only events the
+    /// consuming projection has durably acknowledged — the store enforces that
+    /// each named *event incarnation* currently exists, not that it was
+    /// acknowledged.
+    ///
+    /// Targets name `(record_id, origin_sequence)`, and that identity is
+    /// validated against the transaction's base state — i.e. inside the
+    /// transaction that will publish the trim. A caller whose observation
+    /// predates a concurrent trim-and-re-stage cycle therefore fails closed
+    /// instead of deleting the fresh incarnation that inherited the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a precondition failure when a record id is not present in the
+    /// transaction's base outbox, when it is present under a different origin
+    /// sequence than the target observed, or when it is trimmed twice.
+    pub fn trim_projection_outbox(
+        &mut self,
+        targets: impl IntoIterator<Item = ControlMvpOutboxTrimTarget>,
+    ) -> Result<()> {
+        for target in targets {
+            let Some(present) = self
+                .base
+                .state
+                .outbox
+                .iter()
+                .find(|record| record.record_id == target.record_id)
+            else {
+                return Err(precondition_failed(&format!(
+                    "cannot trim projection outbox record {}: not present in current state",
+                    target.record_id
+                )));
+            };
+            if present.origin_sequence != Some(target.origin_sequence) {
+                return Err(precondition_failed(&format!(
+                    "cannot trim projection outbox event {}: record {} is currently retained as \
+                     event {} (a different incarnation of the same record id)",
+                    target.event_id(),
+                    target.record_id,
+                    present
+                        .event_id()
+                        .unwrap_or_else(|| "<uncommitted>".to_string()),
+                )));
+            }
+            if self
+                .outbox_trim
+                .iter()
+                .any(|staged| staged.record_id() == target.record_id)
+            {
+                return Err(precondition_failed(&format!(
+                    "projection outbox record {} is already staged for trimming",
+                    target.record_id
+                )));
+            }
+            self.outbox_trim
+                .push(ControlMvpOutboxTrimEntry::Identified {
+                    record_id: target.record_id,
+                    origin_sequence: target.origin_sequence,
+                });
+        }
+        Ok(())
     }
 
     /// Commits the transaction and returns the resulting state token.
@@ -1139,10 +1903,12 @@ impl ControlMvpTxn {
         self.base.state.range_witness(range)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn commit_inner(self) -> Result<StateToken> {
         for precondition in &self.preconditions {
             self.base.state.validate_precondition(precondition)?;
         }
+        validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
 
         let next_sequence = self.base.state.logical_sequence + 1;
         let tx = ControlMvpTxObject {
@@ -1151,6 +1917,7 @@ impl ControlMvpTxn {
             tx_id: self.tx_id.clone(),
             base_manifest_id: self.base.manifest_id.clone(),
             sequence: next_sequence,
+            writer_epoch: self.store.writer_epoch,
             request_id: self.request_id.clone(),
             writes: self
                 .writes
@@ -1162,6 +1929,7 @@ impl ControlMvpTxn {
                 .iter()
                 .map(ControlMvpOutboxEntry::from_record)
                 .collect(),
+            outbox_trim: self.outbox_trim,
         };
         let tx_bytes = encode_envelope("control-mvp-tx", &tx)?;
         let tx_checksum = sha256_hex(&tx_bytes);
@@ -1183,12 +1951,29 @@ impl ControlMvpTxn {
             checksum_sha256: tx_checksum,
         });
 
+        // Anchor the resulting state as an immutable snapshot when this commit
+        // fills the checkpoint interval, so successors replay a bounded suffix.
+        let anchor_state = if tx_refs.len() as u64 >= self.store.checkpoint_interval {
+            let snapshot = ControlMvpStateObject::from_replay(
+                &candidate_state,
+                state_id_for_manifest(&self.manifest_id),
+                &self.store.scope,
+            );
+            Some(self.store.write_state_snapshot(&snapshot).await?)
+        } else {
+            None
+        };
+
         let manifest = ControlMvpManifest {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             manifest_id: self.manifest_id.clone(),
             logical_sequence: next_sequence,
             base_manifest_id: self.base.manifest_id,
+            writer_epoch: self.store.writer_epoch,
+            base_state: self.base.base_state,
+            anchor_state,
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
         };
@@ -1203,11 +1988,13 @@ impl ControlMvpTxn {
         .await?;
 
         let pointer = ControlMvpPointer {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             manifest_id: self.manifest_id.clone(),
             logical_sequence: next_sequence,
             manifest_checksum_sha256: manifest_checksum,
+            writer_epoch: self.store.writer_epoch,
         };
         let pointer_bytes = encode_json(&pointer, "control MVP pointer")?;
         let precondition = self.base.pointer_version.map_or(
@@ -1225,9 +2012,21 @@ impl ControlMvpTxn {
             .await?
         {
             WriteResult::Success { .. } => Ok(self.store.token(self.manifest_id, next_sequence)),
-            WriteResult::PreconditionFailed { .. } => Err(CatalogError::CasFailed {
-                message: "control MVP pointer CAS lost to a newer manifest".to_string(),
-            }),
+            WriteResult::PreconditionFailed { .. } => {
+                // Distinguish an epoch supersession from an ordinary CAS race
+                // so fenced-out writers get the typed fail-closed error.
+                if let Ok(current) = self.store.load_pointer().await
+                    && current.writer_epoch > self.store.writer_epoch
+                {
+                    return Err(stale_writer_epoch(
+                        self.store.writer_epoch,
+                        current.writer_epoch,
+                    ));
+                }
+                Err(CatalogError::CasFailed {
+                    message: "control MVP pointer CAS lost to a newer manifest".to_string(),
+                })
+            }
         }
     }
 }
@@ -1261,15 +2060,37 @@ impl ArcoStateReader for ControlMvpStateStore {
             ));
         }
         let checkpoint = self.load_checkpoint(token.checkpoint_id()).await?;
+        if checkpoint.state.logical_sequence != checkpoint.logical_sequence {
+            return Err(invariant_violation(
+                "control MVP checkpoint state sequence does not match checkpoint",
+            ));
+        }
+        // Sequence agreement alone does not prove the snapshot is the state
+        // the checkpoint's authority manifest names. Concurrent losing anchor
+        // commits leave valid, same-scope, same-sequence orphan snapshots
+        // behind, so a coherently substituted state reference would otherwise
+        // select a losing fork. Load the named manifest under the
+        // checkpoint's own manifest checksum and require the snapshot's
+        // semantic state checksum to equal the manifest's. This stays bounded
+        // (checkpoint + manifest + snapshot) and never replays history.
         let manifest = self
             .load_manifest_with_expected_checksum(
                 &checkpoint.manifest_id,
                 Some(&checkpoint.manifest_checksum_sha256),
             )
             .await?;
-        Ok(Box::new(ControlMvpRetainedReader {
-            state: self.replay_manifest(&manifest).await?,
-        }))
+        if manifest.logical_sequence != checkpoint.logical_sequence {
+            return Err(invariant_violation(
+                "control MVP checkpoint sequence does not match its authority manifest",
+            ));
+        }
+        let state = self.load_state_snapshot(&checkpoint.state).await?;
+        if state.checksum()? != manifest.state_checksum_sha256 {
+            return Err(invariant_violation(
+                "control MVP checkpoint snapshot is not the state named by its authority manifest",
+            ));
+        }
+        Ok(Box::new(ControlMvpRetainedReader { state }))
     }
 }
 
@@ -1293,18 +2114,35 @@ impl ArcoStateAdmin for ControlMvpStateStore {
             ));
         }
         let pointer = self.load_pointer().await?;
+        let manifest = self.load_manifest_for_pointer(&pointer).await?;
+        // Reuse the manifest's own anchored snapshot when it has one;
+        // otherwise materialize the replay state as a new immutable snapshot
+        // so checkpoint reads never replay history.
+        let state_ref = if let Some(reference) = manifest.anchor_state.clone() {
+            reference
+        } else {
+            let state = self.replay_manifest(&manifest).await?;
+            let snapshot = ControlMvpStateObject::from_replay(
+                &state,
+                state_id_for_manifest(&manifest.manifest_id),
+                &self.scope,
+            );
+            self.write_state_snapshot(&snapshot).await?
+        };
         let checkpoint_id = format!(
             "checkpoint-{:020}-{}",
             pointer.logical_sequence,
             Ulid::new().to_string().to_ascii_lowercase()
         );
         let checkpoint = ControlMvpCheckpoint {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
             checkpoint_id: checkpoint_id.clone(),
             manifest_id: pointer.manifest_id,
             logical_sequence: pointer.logical_sequence,
             manifest_checksum_sha256: pointer.manifest_checksum_sha256,
+            state: state_ref,
             min_retention_seconds: opts.min_retention_seconds(),
         };
         self.write_checkpoint(&checkpoint).await?;
@@ -1542,22 +2380,36 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
     ) -> Result<RestoreParticipantInspection> {
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
         plan.validate(&self.store)?;
+        if plan.is_legacy_version() {
+            // Defined terminal outcome for a migrated pre-`observed_writer_epoch`
+            // plan: it never observed the epoch it would have to publish under,
+            // so it can never be reproduced as deterministic candidate bytes
+            // and must not be applied. Reporting Superseded drives the restore
+            // driver to replan the domain at the current version instead of
+            // failing recovery outright.
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         let planned_checksum = plan
             .transaction_sha256
             .strip_prefix("sha256:")
             .ok_or_else(|| validation_failed("restore transaction digest is malformed"))?;
-        let in_lineage = stable.candidate_parent.tx_refs.iter().any(|reference| {
-            reference.tx_id == plan.transaction_id
-                && reference.sequence == plan.result_logical_sequence
-                && reference.checksum_sha256 == planned_checksum
-        });
+        let planned_tx_ref = ControlMvpTxRef {
+            tx_id: plan.transaction_id.clone(),
+            sequence: plan.result_logical_sequence,
+            checksum_sha256: planned_checksum.to_string(),
+        };
+        let in_lineage = self
+            .store
+            .restore_tx_in_lineage(&stable.candidate_parent, &planned_tx_ref)
+            .await?;
         if in_lineage {
             return self.inspect_visible_restore(plan, planned_checksum).await;
         }
 
         let version_matches = stable.current_base_kind == plan.current_base_kind
-            && stable.current.pointer_version.as_deref() == plan.base_pointer_version.as_deref();
+            && stable.current.pointer_version.as_deref() == plan.base_pointer_version.as_deref()
+            && stable.writer_epoch == plan.observed_writer_epoch;
         let bytes_match =
             prefixed_sha256(&stable.pointer_bytes) == plan.observed_base_pointer_sha256;
         let manifest_matches =
@@ -1791,7 +2643,9 @@ impl ArcoStateTxn for ControlMvpTxn {
 struct ControlMvpBase {
     pointer_version: Option<String>,
     manifest_id: Option<String>,
+    writer_epoch: u64,
     state: ReplayState,
+    base_state: Option<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
 }
 
@@ -1799,6 +2653,7 @@ struct StableRestoreBase {
     current: ControlMvpBase,
     candidate_parent: ControlMvpBase,
     current_base_kind: ControlMvpRestoreCurrentBaseKind,
+    writer_epoch: u64,
     pointer_bytes: Bytes,
 }
 
@@ -1853,8 +2708,50 @@ impl ReplayState {
                 },
             );
         }
-        self.outbox
-            .extend(tx.outbox.iter().map(ControlMvpOutboxEntry::to_record));
+        for trimmed in &tx.outbox_trim {
+            let record_id = trimmed.record_id();
+            let retained = self
+                .outbox
+                .iter()
+                .enumerate()
+                .find(|(_, record)| record.record_id == record_id)
+                .map(|(position, record)| (position, record.origin_sequence, record.event_id()));
+            let Some((position, retained_sequence, retained_event)) = retained else {
+                return Err(invariant_violation(format!(
+                    "control MVP outbox trim names record {record_id} that is not present in replayed state"
+                )));
+            };
+            // Identified trims are conditional on the exact event
+            // incarnation, so a forged or stale trim cannot delete a record id
+            // that was re-staged after the observation it was built from.
+            if let Some(expected) = trimmed.origin_sequence()
+                && retained_sequence != Some(expected)
+            {
+                return Err(invariant_violation(format!(
+                    "control MVP outbox trim names event {} but record {record_id} is retained as \
+                     event {}",
+                    control_mvp_outbox_event_id(expected, record_id),
+                    retained_event.unwrap_or_else(|| "<uncommitted>".to_string()),
+                )));
+            }
+            self.outbox.remove(position);
+        }
+        for entry in &tx.outbox {
+            // Mirror of the stage-time uniqueness validation: honestly
+            // produced histories can never contain a duplicate id, so a
+            // duplicate observed at replay is a corrupt or forged artifact.
+            if self
+                .outbox
+                .iter()
+                .any(|record| record.record_id == entry.record_id)
+            {
+                return Err(invariant_violation(format!(
+                    "control MVP outbox stages record {} that is already present in replayed state",
+                    entry.record_id
+                )));
+            }
+            self.outbox.push(entry.to_record_with_sequence(tx.sequence));
+        }
         self.logical_sequence = tx.sequence;
         Ok(())
     }
@@ -2004,7 +2901,7 @@ impl ReplayState {
             outbox: self
                 .outbox
                 .iter()
-                .map(ControlMvpOutboxEntry::from_record)
+                .map(ControlMvpOutboxStateEntry::from_record)
                 .collect(),
         };
         let bytes = encode_json_vec(&digest, "control MVP replay digest")?;
@@ -2090,15 +2987,22 @@ impl From<&StateScope> for ControlMvpScopeDoc {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpPointer {
+    format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
     manifest_id: String,
     logical_sequence: u64,
     manifest_checksum_sha256: String,
+    writer_epoch: u64,
 }
 
 impl ControlMvpPointer {
     fn validate(&self, scope: &StateScope) -> Result<()> {
+        if self.format_version != CONTROL_MVP_FORMAT_VERSION {
+            return Err(invariant_violation(
+                "control MVP pointer format version mismatch",
+            ));
+        }
         if self.implementation != IMPLEMENTATION {
             return Err(invariant_violation(
                 "control MVP pointer implementation mismatch",
@@ -2107,23 +3011,136 @@ impl ControlMvpPointer {
         if !self.scope.matches_scope(scope) {
             return Err(validation_failed("control MVP pointer scope mismatch"));
         }
+        if self.writer_epoch == u64::MAX {
+            return Err(terminal_published_writer_epoch());
+        }
         Ok(())
+    }
+}
+
+/// Reference to an immutable state-snapshot object, bound by raw-byte checksum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlMvpStateRef {
+    state_id: String,
+    logical_sequence: u64,
+    checksum_sha256: String,
+}
+
+/// Immutable materialized replay state anchored to one manifest.
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlMvpStateObject {
+    format_version: u32,
+    implementation: String,
+    scope: ControlMvpScopeDoc,
+    state_id: String,
+    logical_sequence: u64,
+    entries: Vec<ReplayStateDigestEntry>,
+    outbox: Vec<ControlMvpOutboxStateEntry>,
+}
+
+impl ControlMvpStateObject {
+    fn from_replay(state: &ReplayState, state_id: String, scope: &StateScope) -> Self {
+        Self {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(scope),
+            state_id,
+            logical_sequence: state.logical_sequence,
+            entries: state
+                .kv
+                .iter()
+                .map(|(key, value)| ReplayStateDigestEntry {
+                    key: key.clone(),
+                    generation: value.generation,
+                    value: (!value.tombstone).then(|| value.bytes.to_vec()),
+                })
+                .collect(),
+            outbox: state
+                .outbox
+                .iter()
+                .map(ControlMvpOutboxStateEntry::from_record)
+                .collect(),
+        }
+    }
+
+    fn validate(&self, scope: &StateScope, reference: &ControlMvpStateRef) -> Result<()> {
+        if self.format_version != CONTROL_MVP_FORMAT_VERSION {
+            return Err(invariant_violation(
+                "control MVP state snapshot format version mismatch",
+            ));
+        }
+        if self.implementation != IMPLEMENTATION {
+            return Err(invariant_violation(
+                "control MVP state snapshot implementation mismatch",
+            ));
+        }
+        if !self.scope.matches_scope(scope) {
+            return Err(validation_failed(
+                "control MVP state snapshot scope mismatch",
+            ));
+        }
+        if self.state_id != reference.state_id {
+            return Err(invariant_violation(
+                "control MVP state snapshot id does not match reference",
+            ));
+        }
+        if self.logical_sequence != reference.logical_sequence {
+            return Err(invariant_violation(
+                "control MVP state snapshot sequence does not match reference",
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_replay_state(self) -> ReplayState {
+        ReplayState {
+            logical_sequence: self.logical_sequence,
+            kv: self
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    let tombstone = entry.value.is_none();
+                    (
+                        entry.key,
+                        StoredValue {
+                            bytes: Bytes::from(entry.value.unwrap_or_default()),
+                            generation: entry.generation,
+                            tombstone,
+                        },
+                    )
+                })
+                .collect(),
+            outbox: self
+                .outbox
+                .iter()
+                .map(ControlMvpOutboxStateEntry::to_record)
+                .collect(),
+        }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpManifest {
+    format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
     manifest_id: String,
     logical_sequence: u64,
     base_manifest_id: Option<String>,
+    writer_epoch: u64,
+    base_state: Option<ControlMvpStateRef>,
+    anchor_state: Option<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
     state_checksum_sha256: String,
 }
 
 impl ControlMvpManifest {
     fn validate(&self, scope: &StateScope, expected_manifest_id: &str) -> Result<()> {
+        if self.format_version != CONTROL_MVP_FORMAT_VERSION {
+            return Err(invariant_violation(
+                "control MVP manifest format version mismatch",
+            ));
+        }
         if self.implementation != IMPLEMENTATION {
             return Err(invariant_violation(
                 "control MVP manifest implementation mismatch",
@@ -2137,12 +3154,45 @@ impl ControlMvpManifest {
                 "control MVP manifest id does not match requested path",
             ));
         }
+        if self.tx_refs.is_empty() {
+            return Err(invariant_violation(
+                "control MVP manifest carries no transaction suffix",
+            ));
+        }
+        let expected_first = self
+            .base_state
+            .as_ref()
+            .map_or(1, |anchor| anchor.logical_sequence + 1);
+        if self.tx_refs.first().map_or(0, |tx_ref| tx_ref.sequence) != expected_first {
+            return Err(invariant_violation(
+                "control MVP manifest suffix does not start at its replay anchor",
+            ));
+        }
         if self.tx_refs.last().map_or(0, |tx_ref| tx_ref.sequence) != self.logical_sequence {
             return Err(invariant_violation(
                 "control MVP manifest sequence does not match selected tx refs",
             ));
         }
+        if let Some(anchor) = &self.anchor_state {
+            if anchor.logical_sequence != self.logical_sequence
+                || anchor.state_id != state_id_for_manifest(&self.manifest_id)
+            {
+                return Err(invariant_violation(
+                    "control MVP manifest anchor snapshot does not match manifest identity",
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Returns the replay anchor and transaction suffix a successor manifest
+    /// must extend: a fresh suffix on this manifest's own snapshot when one
+    /// was anchored, otherwise this manifest's anchor and suffix.
+    fn successor_anchor(&self) -> (Option<ControlMvpStateRef>, Vec<ControlMvpTxRef>) {
+        self.anchor_state.as_ref().map_or_else(
+            || (self.base_state.clone(), self.tx_refs.clone()),
+            |anchor| (Some(anchor.clone()), Vec::new()),
+        )
     }
 }
 
@@ -2160,9 +3210,50 @@ struct ControlMvpTxObject {
     tx_id: String,
     base_manifest_id: Option<String>,
     sequence: u64,
+    writer_epoch: u64,
     request_id: Option<String>,
     writes: Vec<ControlMvpWriteEntry>,
     outbox: Vec<ControlMvpOutboxEntry>,
+    /// Outbox events removed from replayed state by this transaction.
+    /// Consumers trim only events they have durably acknowledged; the store
+    /// enforces that every trimmed event incarnation exists at apply time and
+    /// fails closed otherwise.
+    #[serde(default)]
+    outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
+}
+
+/// Trim entry as persisted in a transaction object.
+///
+/// New transactions always write the identified form, which pins the exact
+/// event incarnation removed. The bare-string form is only ever *read*: it is
+/// how transactions committed before delivery identity existed encoded a
+/// trim, and replaying them by record id reproduces exactly the state those
+/// commits produced, so retained histories stay deterministic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ControlMvpOutboxTrimEntry {
+    Identified {
+        record_id: String,
+        origin_sequence: u64,
+    },
+    Legacy(String),
+}
+
+impl ControlMvpOutboxTrimEntry {
+    fn record_id(&self) -> &str {
+        match self {
+            Self::Identified { record_id, .. } | Self::Legacy(record_id) => record_id,
+        }
+    }
+
+    const fn origin_sequence(&self) -> Option<u64> {
+        match self {
+            Self::Identified {
+                origin_sequence, ..
+            } => Some(*origin_sequence),
+            Self::Legacy(_) => None,
+        }
+    }
 }
 
 impl ControlMvpTxObject {
@@ -2222,11 +3313,40 @@ impl ControlMvpOutboxEntry {
         }
     }
 
+    fn to_record_with_sequence(&self, origin_sequence: u64) -> ControlMvpProjectionOutboxRecord {
+        ControlMvpProjectionOutboxRecord {
+            record_id: self.record_id.clone(),
+            payload: Bytes::from(self.payload.clone()),
+            origin_sequence: Some(origin_sequence),
+        }
+    }
+}
+
+/// Sequenced outbox entry as persisted in state snapshots and hashed into
+/// replay-state digests. Unlike the transaction wire entry, it carries the
+/// provenance sequence stamped at replay time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlMvpOutboxStateEntry {
+    record_id: String,
+    payload: Vec<u8>,
+    origin_sequence: Option<u64>,
+}
+
+impl ControlMvpOutboxStateEntry {
+    fn from_record(record: &ControlMvpProjectionOutboxRecord) -> Self {
+        Self {
+            record_id: record.record_id.clone(),
+            payload: record.payload.to_vec(),
+            origin_sequence: record.origin_sequence,
+        }
+    }
+
     fn to_record(&self) -> ControlMvpProjectionOutboxRecord {
-        ControlMvpProjectionOutboxRecord::new(
-            self.record_id.clone(),
-            Bytes::from(self.payload.clone()),
-        )
+        ControlMvpProjectionOutboxRecord {
+            record_id: self.record_id.clone(),
+            payload: Bytes::from(self.payload.clone()),
+            origin_sequence: self.origin_sequence,
+        }
     }
 }
 
@@ -2234,7 +3354,7 @@ impl ControlMvpOutboxEntry {
 struct ReplayStateDigest {
     logical_sequence: u64,
     entries: Vec<ReplayStateDigestEntry>,
-    outbox: Vec<ControlMvpOutboxEntry>,
+    outbox: Vec<ControlMvpOutboxStateEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2246,17 +3366,24 @@ struct ReplayStateDigestEntry {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpCheckpoint {
+    format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
     checkpoint_id: String,
     manifest_id: String,
     logical_sequence: u64,
     manifest_checksum_sha256: String,
+    state: ControlMvpStateRef,
     min_retention_seconds: Option<u64>,
 }
 
 impl ControlMvpCheckpoint {
     fn validate(&self, scope: &StateScope, expected_checkpoint_id: &str) -> Result<()> {
+        if self.format_version != CONTROL_MVP_FORMAT_VERSION {
+            return Err(invariant_violation(
+                "control MVP checkpoint format version mismatch",
+            ));
+        }
         if self.implementation != IMPLEMENTATION {
             return Err(invariant_violation(
                 "control MVP checkpoint implementation mismatch",

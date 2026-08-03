@@ -1,0 +1,47 @@
+{
+  "plan_kind": "control_mvp",
+  "record_type": "control_mvp_restore_plan",
+  "version": 2,
+  "implementation": "arco-state-control-mvp",
+  "scope": {
+    "tenant_id": "tenant",
+    "workspace_id": "workspace",
+    "domain": "catalog"
+  },
+  "identity": {
+    "restore_id": "rst_00000000000000000000000001",
+    "attempt": 1,
+    "domain": "catalog"
+  },
+  "source": {
+    "implementation": "arco-state-control-mvp",
+    "scope": {
+      "tenant_id": "tenant",
+      "workspace_id": "workspace",
+      "domain": "catalog"
+    },
+    "reference_kind": "checkpoint",
+    "manifest_id": "manifest-00000000000000000001-01kyysnbzw8bxq4yp3v5s80sax",
+    "logical_sequence": 1,
+    "manifest_path": "state-store/control-mvp/catalog/manifests/manifest-00000000000000000001-01kyysnbzw8bxq4yp3v5s80sax.json",
+    "manifest_sha256": "sha256:68d16ec222467687acab942a781a2a47ac1743a04d519bc5097123679a19e854",
+    "checkpoint_path": "state-store/control-mvp/catalog/checkpoints/checkpoint-00000000000000000001-01kyysnbzxphmqzheyc69bg4x8.json",
+    "checkpoint_sha256": "sha256:7410f2d7cc9450421b7e2fd0aead9c4945bf8cae7954ff20f6928e86775e3686",
+    "retention_deadline": "2026-08-01T14:54:19.261847Z"
+  },
+  "current_base_kind": "pointer",
+  "base_pointer_version": "8",
+  "observed_base_pointer_sha256": "sha256:8f7f4c1a30c9258a8b823b0d55124b60a6146e56333a455c94e171812baed54e",
+  "observed_writer_epoch": 0,
+  "base_manifest_id": "manifest-00000000000000000002-01kyysnbzyrk9krac8008ssc17",
+  "base_logical_sequence": 2,
+  "transaction_id": "tx-restore-00000000000000000003-f19b72aeaedc86f1af5f4ef04bdc6ac8",
+  "transaction_path": "state-store/control-mvp/catalog/txlog/tx-restore-00000000000000000003-f19b72aeaedc86f1af5f4ef04bdc6ac8.json",
+  "transaction_sha256": "sha256:1193f69c41dccf7cc6693a2ad70a991ef5213c5ab7ac331c55129fed51791e7e",
+  "candidate_manifest_id": "manifest-00000000000000000003-restore-f19b72aeaedc86f1af5f4ef04bdc6ac8",
+  "candidate_manifest_path": "state-store/control-mvp/catalog/manifests/manifest-00000000000000000003-restore-f19b72aeaedc86f1af5f4ef04bdc6ac8.json",
+  "candidate_manifest_sha256": "sha256:ffdb50f64a859a957f1457d96c46bfc41488b4e43c5f37a6c3c4f2d2aca879ba",
+  "candidate_pointer_sha256": "sha256:da06d88d32ed419c873b5d644177f3610e10055f603357f579f98378f73af89a",
+  "result_logical_sequence": 3,
+  "restore_outbox_record_id": "restore:rst_00000000000000000000000001:1:catalog"
+}

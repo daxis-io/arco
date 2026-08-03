@@ -287,19 +287,22 @@ pub async fn load_selected_retention_pin(
 }
 
 /// Deterministic exact-object and prefix protection computed before deletion.
+///
+/// Declared `pub` inside the crate-visible `gc::reachability` module: its
+/// effective visibility is crate-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct ProtectionSet {
+pub struct ProtectionSet {
     exact_objects: BTreeSet<String>,
     prefixes: BTreeSet<String>,
 }
 
 impl ProtectionSet {
-    pub(super) fn protects_object(&self, path: &str) -> bool {
+    pub(crate) fn protects_object(&self, path: &str) -> bool {
         self.exact_objects.contains(path)
             || self.prefixes.iter().any(|prefix| path.starts_with(prefix))
     }
 
-    pub(super) fn protects_prefix(&self, prefix: &str) -> bool {
+    pub(crate) fn protects_prefix(&self, prefix: &str) -> bool {
         let canonical = canonical_prefix(prefix);
         self.prefixes
             .iter()
@@ -544,7 +547,7 @@ fn validate_digest(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn sha256_digest(bytes: &[u8]) -> String {
+pub fn sha256_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))

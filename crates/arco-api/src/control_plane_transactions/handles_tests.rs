@@ -1,3 +1,12 @@
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::default_trait_access,
+    clippy::manual_let_else,
+    clippy::significant_drop_tightening,
+    clippy::similar_names
+)]
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5065,12 +5074,13 @@ async fn concurrent_orchestration_repair_adopts_one_immutable_visible_receipt() 
             now + chrono::Duration::seconds(5),
         );
         tokio::pin!(second);
-        let result = match tokio::time::timeout(Duration::from_millis(200), &mut second).await {
-            Ok(result) => result,
-            Err(_) => {
-                release.notify_one();
-                return second.await;
-            }
+        let result = if let Ok(result) =
+            tokio::time::timeout(Duration::from_millis(200), &mut second).await
+        {
+            result
+        } else {
+            release.notify_one();
+            return second.await;
         };
         release.notify_one();
         result

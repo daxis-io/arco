@@ -73,6 +73,9 @@ Optional env vars:
   REGION                   Default: us-central1
   ARCO_UAT_RUN_TIMEOUT_SECS
   ARCO_UAT_EVIDENCE_DIR     Default: target/uat-evidence
+
+Operator authority and evidence rules:
+  docs/runbooks/deployed-uat-operator-boundaries.md
 EOF
 }
 

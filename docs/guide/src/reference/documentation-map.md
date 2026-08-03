@@ -12,6 +12,7 @@ source of truth quickly.
 ## Architecture and Design
 
 - ADR index and records: `docs/adr/README.md`
+- Draft contract scaffolds: `docs/spec/README.md`
 - Architecture concepts in mdBook:
   - `docs/guide/src/concepts/architecture.md`
   - `docs/guide/src/concepts/catalog.md`

@@ -33,6 +33,10 @@ use crate::audit::{
 use crate::commit::{CommitError, CommitService};
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
+use crate::governance::{
+    TableLocationGovernance, validate_client_supplied_location,
+    validate_location_bearing_table_properties,
+};
 use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
@@ -214,6 +218,10 @@ async fn create_table(
 
     let (table_location, storage_relative_location) = match &req.location {
         Some(loc) => {
+            // #358: when storage governance is enabled for this scope, a
+            // client-supplied location must resolve to a governed path
+            // authority before it can be advertised or written.
+            validate_client_supplied_location(&storage, &ctx.workspace, loc).await?;
             let resolved =
                 resolve_metadata_path(loc, &ctx.tenant, &ctx.workspace).map_err(|e| {
                     IcebergError::BadRequest {
@@ -225,6 +233,13 @@ async fn create_table(
         }
         None => (default_scoped_location, default_relative_location),
     };
+
+    // #358: location-bearing table properties (write.data.path,
+    // write.metadata.path, write.object-storage.path) redirect reads/writes to
+    // arbitrary storage, so under governance they are validated against
+    // governed authorities exactly like the advertised location. Ungoverned
+    // scopes are untouched.
+    validate_location_bearing_table_properties(&storage, &ctx.workspace, &req.properties).await?;
 
     let delegation_header = headers.get("X-Iceberg-Access-Delegation");
     if delegation_header.is_some() && state.credential_provider.is_none() {
@@ -718,7 +733,8 @@ async fn commit_table(
         principal: None,
     };
 
-    let commit_service = CommitService::new(Arc::new(storage));
+    let governance = TableLocationGovernance::new(storage.clone(), ctx.workspace.clone());
+    let commit_service = CommitService::new(Arc::new(storage), governance);
 
     let result = commit_service
         .commit_table(
@@ -1115,6 +1131,14 @@ async fn register_table(
         });
     }
 
+    // #358: a registered metadata file is entirely client-controlled and is
+    // persisted wholesale, so both of its location channels must satisfy
+    // storage governance when it is enabled for this scope. Validating only
+    // `metadata.location` left a bypass: a metadata file whose advertised
+    // location is governed but whose properties name a foreign bucket.
+    validate_client_supplied_location(&storage, &ctx.workspace, &metadata.location).await?;
+    validate_location_bearing_table_properties(&storage, &ctx.workspace, &metadata.properties)
+        .await?;
     let storage_relative_location =
         resolve_metadata_path(&metadata.location, &ctx.tenant, &ctx.workspace).map_err(|e| {
             IcebergError::BadRequest {
@@ -1350,6 +1374,9 @@ async fn maybe_vended_credentials(
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::too_many_lines, clippy::unreadable_literal)]
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;

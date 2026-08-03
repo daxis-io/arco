@@ -3,6 +3,14 @@
 //! Focus: controller emission semantics (atomic batches), bounded catchup, CAS-friendly
 //! poll sensors, and backfill chunk planning invariants.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::manual_let_else,
+    clippy::too_many_lines,
+    clippy::unreadable_literal
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,18 +111,12 @@ fn parity_m2_schedule_reconcile_emits_tick_and_run_requested_in_same_batch() {
 
     let tick = events
         .iter()
-        .find_map(|e| match &e.data {
-            OrchestrationEventData::ScheduleTicked { .. } => Some(e),
-            _ => None,
-        })
+        .find(|e| matches!(&e.data, OrchestrationEventData::ScheduleTicked { .. }))
         .expect("expected ScheduleTicked");
 
     let run_req = events
         .iter()
-        .find_map(|e| match &e.data {
-            OrchestrationEventData::RunRequested { .. } => Some(e),
-            _ => None,
-        })
+        .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
         .expect("expected RunRequested");
 
     // Atomic batch: both events returned together.

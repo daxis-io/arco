@@ -165,6 +165,9 @@ impl SyncCompactor for CompactorClient {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::significant_drop_in_scrutinee)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

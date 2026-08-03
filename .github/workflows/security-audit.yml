@@ -31,6 +31,8 @@ jobs:
           tool: cargo-deny@0.18.9
       - name: cargo-deny advisories
         run: cargo deny check advisories --hide-inclusion-graph
+      - name: Advisory exceptions are tracked and unexpired
+        run: python3 .github/scripts/check_advisory_exceptions.py --check-expiry
       - name: cargo-deny policy
         run: cargo deny check bans licenses sources --hide-inclusion-graph
 
@@ -59,3 +61,34 @@ jobs:
       - name: Run pip-audit
         run: uv run --locked --extra dev --with "pip-audit==${PIP_AUDIT_VERSION}" pip-audit
         working-directory: ${{ matrix.project }}
+
+  audit-status:
+    name: Security Audit Status
+    if: ${{ always() }}
+    needs:
+      - cargo-deny
+      - python-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Publish consolidated security audit status
+        env:
+          CARGO_DENY_RESULT: ${{ needs.cargo-deny.result }}
+          PYTHON_AUDIT_RESULT: ${{ needs.python-audit.result }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Security Audit Status"
+            echo
+            echo "- cargo-deny: ${CARGO_DENY_RESULT}"
+            echo "- python-audit: ${PYTHON_AUDIT_RESULT}"
+            echo "- run: ${RUN_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CARGO_DENY_RESULT" != "success" ] || [ "$PYTHON_AUDIT_RESULT" != "success" ]; then
+            echo "::error title=Security Audit failed::cargo-deny=${CARGO_DENY_RESULT}, python-audit=${PYTHON_AUDIT_RESULT}; ${RUN_URL}"
+            exit 1
+          fi

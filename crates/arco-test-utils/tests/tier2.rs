@@ -435,9 +435,16 @@ async fn tier2_incremental_compaction() {
 
     let event_writer = EventWriter::new(storage.clone());
     let compactor = Compactor::new(storage.clone());
+    let event_ids: [EventId; 5] = [
+        "01ARZ3NDEKTSV4RRFFQ69G5FAA".parse().expect("event id"),
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().expect("event id"),
+        "01ARZ3NDEKTSV4RRFFQ69G5FAZ".parse().expect("event id"),
+        "01ARZ3NDEKTSV4RRFFQ69G5FB0".parse().expect("event id"),
+        "01ARZ3NDEKTSV4RRFFQ69G5FB1".parse().expect("event id"),
+    ];
 
     // Batch 1: 3 events
-    for i in 0..3 {
+    for (i, event_id) in event_ids.iter().take(3).enumerate() {
         let event = MaterializationRecord {
             materialization_id: format!("mat_{i:03}"),
             asset_id: format!("asset_{i:03}"),
@@ -445,7 +452,7 @@ async fn tier2_incremental_compaction() {
             byte_size: 50000,
         };
         event_writer
-            .append(CatalogDomain::Executions, &event)
+            .append_with_id(CatalogDomain::Executions, &event, event_id)
             .await
             .expect("append");
     }
@@ -461,7 +468,7 @@ async fn tier2_incremental_compaction() {
     assert_eq!(records1.len(), 3, "snapshot should contain full state");
 
     // Batch 2: 2 more events
-    for i in 3..5 {
+    for (i, event_id) in event_ids.iter().enumerate().skip(3) {
         let event = MaterializationRecord {
             materialization_id: format!("mat_{i:03}"),
             asset_id: format!("asset_{i:03}"),
@@ -469,7 +476,7 @@ async fn tier2_incremental_compaction() {
             byte_size: 50000,
         };
         event_writer
-            .append(CatalogDomain::Executions, &event)
+            .append_with_id(CatalogDomain::Executions, &event, event_id)
             .await
             .expect("append");
     }

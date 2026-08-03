@@ -12,6 +12,9 @@
 
 #![allow(missing_docs)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 
@@ -253,7 +256,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: empty catalog list
     group.bench_function("empty_catalog_list_namespaces", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 0, 0));
+        let storage = rt.block_on(setup_catalog(backend, 0, 0));
         let reader = CatalogReader::new(storage);
 
         b.iter(|| {
@@ -264,7 +267,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("cold_list_namespaces", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 5));
+        let storage = rt.block_on(setup_catalog(backend, 10, 5));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -280,7 +283,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &ns_count,
             |b, &ns_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), ns_count, 5));
+                let storage = rt.block_on(setup_catalog(backend, ns_count, 5));
 
                 b.iter(|| {
                     let reader = CatalogReader::new(storage.clone());
@@ -294,7 +297,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &ns_count,
             |b, &ns_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), ns_count, 5));
+                let storage = rt.block_on(setup_catalog(backend, ns_count, 5));
                 let reader = CatalogReader::new(storage);
                 rt.block_on(reader.list_namespaces()).expect("warm read");
 
@@ -313,7 +316,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &tables_count,
             |b, &tables_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+                let storage = rt.block_on(setup_catalog(backend, 5, tables_count));
 
                 b.iter(|| {
                     let reader = CatalogReader::new(storage.clone());
@@ -327,7 +330,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &tables_count,
             |b, &tables_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+                let storage = rt.block_on(setup_catalog(backend, 5, tables_count));
                 let reader = CatalogReader::new(storage);
                 rt.block_on(reader.list_tables("namespace_0"))
                     .expect("warm read");
@@ -347,7 +350,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &tables_count,
             |b, &tables_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+                let storage = rt.block_on(setup_catalog(backend, 5, tables_count));
 
                 b.iter(|| {
                     let reader = CatalogReader::new(storage.clone());
@@ -362,7 +365,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
             &tables_count,
             |b, &tables_count| {
                 let backend = Arc::new(MemoryBackend::new());
-                let storage = rt.block_on(setup_catalog(backend.clone(), 5, tables_count));
+                let storage = rt.block_on(setup_catalog(backend, 5, tables_count));
                 let reader = CatalogReader::new(storage);
                 rt.block_on(reader.list_tables_in_schema("default", "namespace_0"))
                     .expect("warm read");
@@ -379,7 +382,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: get single table
     group.bench_function("cold_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -390,7 +393,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("warm_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -401,7 +404,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("hot_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
         let reader = CatalogReader::new(storage);
         rt.block_on(reader.get_table("namespace_5", "table_5"))
             .expect("warm read");
@@ -414,7 +417,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("large_hot_get_table_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 100, 100));
+        let storage = rt.block_on(setup_catalog(backend, 100, 100));
         let reader = CatalogReader::new(storage);
         rt.block_on(reader.get_table("namespace_50", "table_50"))
             .expect("warm read");
@@ -428,7 +431,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: get single table in schema
     group.bench_function("warm_get_table_in_schema_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -440,7 +443,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("hot_get_table_in_schema_single", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
         let reader = CatalogReader::new(storage);
         rt.block_on(reader.get_table_in_schema("default", "namespace_5", "table_5"))
             .expect("warm read");
@@ -455,7 +458,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: get single table by ID
     group.bench_function("warm_get_table_by_id", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -466,7 +469,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("hot_get_table_by_id", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
         let reader = CatalogReader::new(storage);
         rt.block_on(reader.get_table_by_id("ns-0005-tbl-0005"))
             .expect("warm read");
@@ -480,7 +483,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: get columns for table
     group.bench_function("warm_get_columns", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
 
         b.iter(|| {
             let reader = CatalogReader::new(storage.clone());
@@ -491,7 +494,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
 
     group.bench_function("hot_get_columns", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
         let reader = CatalogReader::new(storage);
         rt.block_on(reader.get_columns("ns-0005-tbl-0005"))
             .expect("warm read");
@@ -505,7 +508,7 @@ fn catalog_lookup_benchmark(c: &mut Criterion) {
     // Benchmark: full manifest read
     group.bench_function("read_manifest", |b| {
         let backend = Arc::new(MemoryBackend::new());
-        let storage = rt.block_on(setup_catalog(backend.clone(), 10, 10));
+        let storage = rt.block_on(setup_catalog(backend, 10, 10));
         let reader = CatalogReader::new(storage);
 
         b.iter(|| {

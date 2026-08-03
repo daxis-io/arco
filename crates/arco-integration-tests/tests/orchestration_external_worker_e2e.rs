@@ -1,6 +1,9 @@
 //! External worker callback end-to-end orchestration test.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::match_wildcard_for_single_variants, clippy::too_many_lines)]
 
 use std::future::Future;
 use std::sync::Arc;
@@ -374,6 +377,8 @@ async fn run_dispatch_callback_path_advances_task_state() {
         attempt_id: attempt_id.clone(),
         dispatch_id: dispatch_id.clone(),
         execution_location_id: None,
+        partition_key: None,
+        heartbeat_timeout_sec: Some(300),
         worker_queue: "default-queue".to_string(),
         callback_base_url: "https://api.arco.dev".to_string(),
         task_token: minted.token.clone(),

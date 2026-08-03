@@ -63,6 +63,8 @@ def _worker(
     worker._fallback_task_token = worker.worker_id
     worker._client = client
     worker._assets = assets
+    worker._partitioned_assets = set()
+    worker._init_dispatch_state()
     return worker
 
 

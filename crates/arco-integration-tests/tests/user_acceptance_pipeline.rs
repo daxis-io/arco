@@ -3699,6 +3699,8 @@ impl AcceptanceHarness {
             attempt_id: dispatch.attempt_id.clone(),
             dispatch_id: dispatch.dispatch_id.clone(),
             execution_location_id: None,
+            partition_key: None,
+            heartbeat_timeout_sec: Some(300),
             worker_queue: dispatch.worker_queue.clone(),
             callback_base_url: self.identity.callback_base_url.clone(),
             task_token: minted.token,

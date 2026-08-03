@@ -1,4 +1,10 @@
 //! Phase 4B internal read-only comparison reads.
+//!
+//! Diagnostics surfaced here re-expose the shadow-replay comparisons; the
+//! row-level domain checks verify control-store round-trip fidelity (both
+//! sides derive from the same functions over the same in-memory source), not
+//! independent derivations — see `shadow_replay` module docs for the honest
+//! scope of each comparison.
 
 use std::future::Future;
 
@@ -226,18 +232,18 @@ const fn comparison_domain_name(domain: ShadowComparisonDomain) -> &'static str 
         ShadowComparisonDomain::Objects => "catalog_objects",
         ShadowComparisonDomain::NameIndexes => "catalog_name_indexes",
         ShadowComparisonDomain::ManifestWatermark => "catalog_manifest_watermark",
+        ShadowComparisonDomain::TableCurrentPointers => "table_current_pointers",
+        ShadowComparisonDomain::GrantsOwnership => "grants_ownership",
+        ShadowComparisonDomain::StorageGovernance => "storage_governance",
+        ShadowComparisonDomain::IdempotencyRecords => "idempotency_records",
+        ShadowComparisonDomain::EventReplayHashes => "event_replay_hashes",
+        ShadowComparisonDomain::ParquetProjectionEquality => "parquet_projection_equality",
     }
 }
 
 const fn deferred_domain_name(domain: ShadowDeferredDomain) -> &'static str {
     match domain {
-        ShadowDeferredDomain::TableCurrentPointers => "table_current_pointers",
-        ShadowDeferredDomain::GrantsOwnership => "grants_ownership",
-        ShadowDeferredDomain::StorageGovernanceEquivalence => "storage_governance_equivalence",
-        ShadowDeferredDomain::IdempotencyRecords => "idempotency_records",
         ShadowDeferredDomain::FullProjectionWatermarks => "full_projection_watermarks",
-        ShadowDeferredDomain::EventReplayHashes => "event_replay_hashes",
-        ShadowDeferredDomain::ParquetProjectionEquality => "parquet_projection_equality",
     }
 }
 
@@ -467,7 +473,7 @@ mod tests {
                 .iter()
                 .any(|detail| detail.status()
                     == CatalogInventoryComparisonStatus::UnsupportedScope
-                    && detail.domain() == "table_current_pointers")
+                    && detail.domain() == "full_projection_watermarks")
         );
     }
 

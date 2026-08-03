@@ -14,6 +14,7 @@ files in repository root.
 ## Documentation Areas
 
 - Architecture decisions: `docs/adr/`
+- Draft contract scaffolds: `docs/spec/`
 - Operations runbooks: `docs/runbooks/`
 - Parity program tracking: `docs/parity/`
 - Active audits: `docs/audits/`

@@ -2,6 +2,9 @@
 
 #![cfg(feature = "legacy-scheduler")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
 
 use arco_core::{AssetId, TaskId};
 use arco_flow::error::{Error, Result};

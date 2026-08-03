@@ -1,9 +1,17 @@
-//! Parity gate suite M1 (API): selection + run_key semantics.
+//! Parity gate suite M1 (API): selection + `run_key` semantics.
 //!
 //! These tests are intended to be:
 //! - hermetic (no external services)
 //! - fast (integration-style)
 //! - hard to “cheat” via doc-only changes
+
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::needless_collect,
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

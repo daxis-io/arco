@@ -1054,6 +1054,8 @@ mod tests {
             attempt_id: "attempt-1".to_string(),
             dispatch_id: "dispatch:run-1:pipeline.orders_smoke:1".to_string(),
             execution_location_id: None,
+            partition_key: None,
+            heartbeat_timeout_sec: Some(300),
             worker_queue: "default-queue".to_string(),
             callback_base_url: "https://api.example".to_string(),
             task_token: "token".to_string(),

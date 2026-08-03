@@ -362,7 +362,9 @@ impl From<&Column> for ColumnRecord {
 /// A lineage edge representing data flow between entities.
 #[derive(Debug, Clone)]
 pub struct LineageEdge {
-    /// Unique edge ID (ULID).
+    /// Unique edge ID. Mixed identity: content-derived SHA-256 hex for edges
+    /// minted by the L0 route, ULID for rows written before it. Opaque to
+    /// readers.
     pub id: String,
     /// Source entity ID.
     pub source_id: String,

@@ -521,6 +521,9 @@ impl OrchestrationReconciler {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::default_trait_access)]
 mod tests {
     use super::*;
 
@@ -596,6 +599,7 @@ mod tests {
                     runs: Some(artifact(&base_path)),
                     ..Default::default()
                 },
+                delete_channel_version: 0,
             },
             l0_deltas: vec![L0Delta {
                 delta_id: delta_id.to_string(),
@@ -613,6 +617,8 @@ mod tests {
                     runs: 1,
                     ..Default::default()
                 },
+                deletions: None,
+                deletion_count: 0,
             }],
             l0_count: 1,
             l0_limits: Default::default(),

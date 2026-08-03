@@ -18,6 +18,7 @@
 #   tenant={tenant}/workspace={workspace}/snapshots/  <- Compactor writes (Tier-1 Parquet)
 #   tenant={tenant}/workspace={workspace}/state/      <- Compactor writes (Tier-2 Parquet)
 #   tenant={tenant}/workspace={workspace}/l0/         <- Compactor writes (L0 tier)
+#   tenant={tenant}/workspace={workspace}/state-store/ <- API only (object-store control store; sole writer, not yet wired in production)
 
 locals {
   # Base path pattern for all bucket objects
@@ -37,10 +38,19 @@ locals {
   anti_entropy_state_prefix = "state/anti_entropy/"
   l0_object_prefix          = "l0/"
   warehouse_object_prefix   = "warehouse/"
+
+  # Object-store control store (ControlMvpPaths::base_prefix() in
+  # crates/arco-catalog/src/state_store/control_mvp.rs lays out
+  # state-store/control-mvp/{domain}/... under the tenant/workspace root; the
+  # store has no production construction site yet, see api_write_state_store).
+  # NOTE: startsWith("state/") does NOT match "state-store/" (the 6th character
+  # differs), so this prefix needs its own binding and the compactor's state/
+  # conditions intentionally never cover it.
+  state_store_object_prefix = "state-store/"
 }
 
 # ============================================================================
-# API Service Account: ledger/, locks/, commits/, manifests/ (read all)
+# API Service Account: ledger/, locks/, commits/, warehouse/, state-store/ (read all)
 # ============================================================================
 
 # API can create ledger events (immutable, append-only)
@@ -103,6 +113,50 @@ resource "google_storage_bucket_iam_member" "api_write_warehouse_delta" {
     expression  = <<-EOT
       resource.type == "storage.googleapis.com/Object" &&
       resource.name.extract("${local.object_path_extract_template}").startsWith("${local.warehouse_object_prefix}")
+    EOT
+  }
+}
+
+# API is the SOLE writer of the object-store control store under state-store/.
+#
+# PROVISIONED AHEAD OF THE PRODUCTION WIRING (2026-07-30 program audit,
+# sections 5.4 and 9.2 item 8). As of this change ControlMvpStateStore /
+# ControlMvpTxn (crates/arco-catalog/src/state_store/control_mvp.rs) are
+# constructed only from crates/arco-catalog/tests/*; there is no production
+# construction site, so nothing writes under state-store/ in a deployed
+# environment yet. The intended writer is the arco-api service, which will
+# commit control-store transactions in-process, which is why the grant is
+# attached to google_service_account.api and to no other account.
+#
+# The invariant is enforced now, before the first byte is written, precisely so
+# the prefix can never acquire a second writer later: adding the binding
+# together with the exclusivity test means any future service that wants to
+# write here must make a deliberate single-writer decision instead of
+# discovering an already-shared prefix.
+#
+# The publish protocol creates immutable txlog/, manifests/, and checkpoints/
+# objects and then CAS-overwrites current.pointer.json with a
+# generation-matched precondition; the pointer overwrite requires
+# storage.objects.delete in addition to create, hence objectUser rather than
+# objectCreator (same reasoning as api_write_locks above).
+#
+# Do NOT grant any other service account a condition matching state-store/.
+# The compactor's startsWith("state/") conditions do not match "state-store/",
+# and tools/xtask/tests/terraform_iam.rs enforces that exactly one binding
+# references this prefix. If a control-store compactor/GC ever needs to clean
+# orphan state-store artifacts, that authority must be granted deliberately
+# with a new single-writer decision, not by widening an existing prefix.
+resource "google_storage_bucket_iam_member" "api_write_state_store" {
+  bucket = google_storage_bucket.catalog.name
+  role   = "roles/storage.objectUser"
+  member = "serviceAccount:${google_service_account.api.email}"
+
+  condition {
+    title       = "ApiWriteStateStore"
+    description = "Sole writer: API commits object-store control state under state-store/"
+    expression  = <<-EOT
+      resource.type == "storage.googleapis.com/Object" &&
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_store_object_prefix}")
     EOT
   }
 }

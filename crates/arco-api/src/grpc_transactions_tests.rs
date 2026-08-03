@@ -1,5 +1,9 @@
 //! Round-trip tests for gRPC control-plane transaction transport.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::default_trait_access)]
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -271,8 +275,10 @@ async fn spawn_grpc_client(
     ControlPlaneTransactionServiceClient<Channel>,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 )> {
-    let mut config = crate::config::Config::default();
-    config.debug = true;
+    let config = crate::config::Config {
+        debug: true,
+        ..Default::default()
+    };
     spawn_grpc_client_with_config(config, backend).await
 }
 

@@ -3,6 +3,11 @@
 //! This suite proves dagster-parity-07 sensor semantics across:
 //! controller evaluation -> ledger events -> compactor fold -> durable projections.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -106,7 +111,7 @@ impl SensorEvaluator for PushSingleRunEvaluator {
         cursor_before: Option<&str>,
     ) -> Result<PollSensorResult, SensorEvaluationError> {
         Ok(PollSensorResult {
-            cursor_after: cursor_before.map(|c| c.to_string()),
+            cursor_after: cursor_before.map(ToString::to_string),
             run_requests: Vec::new(),
         })
     }

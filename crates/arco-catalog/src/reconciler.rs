@@ -537,46 +537,67 @@ impl Reconciler {
             if !Self::is_deletion_candidate(report, scope, issue, result) {
                 continue;
             }
-
-            if protected_paths.contains(&issue.path) {
-                tracing::warn!(
-                    path = %issue.path,
-                    domain = %report.domain,
-                    "skipping repair delete for currently referenced snapshot path"
-                );
-                result.skipped_count += 1;
-                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                continue;
-            }
-            if Self::extract_snapshot_version(&issue.path)
-                .is_some_and(|version| version > visible_snapshot_version)
-            {
-                tracing::warn!(
-                    path = %issue.path,
-                    domain = %report.domain,
-                    visible_snapshot_version,
-                    "skipping repair delete for snapshot version newer than visible manifest"
-                );
-                result.skipped_count += 1;
-                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                continue;
-            }
-            if Self::extract_snapshot_version(&issue.path)
-                .is_some_and(|version| retained_versions.contains(&version))
-            {
-                tracing::debug!(
-                    path = %issue.path,
-                    domain = %report.domain,
-                    retained_snapshot_versions = self.retained_snapshot_versions,
-                    "skipping repair delete inside the retained snapshot-version window"
-                );
-                result.skipped_count += 1;
-                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+            if self.is_retention_protected(
+                report,
+                issue,
+                visible_snapshot_version,
+                protected_paths,
+                retained_versions,
+                result,
+            ) {
                 continue;
             }
             deletions.push(issue);
         }
         deletions
+    }
+
+    fn is_retention_protected(
+        &self,
+        report: &ReconciliationReport,
+        issue: &ReconciliationIssue,
+        visible_snapshot_version: u64,
+        protected_paths: &HashSet<String>,
+        retained_versions: &HashSet<u64>,
+        result: &mut RepairResult,
+    ) -> bool {
+        if protected_paths.contains(&issue.path) {
+            tracing::warn!(
+                path = %issue.path,
+                domain = %report.domain,
+                "skipping repair delete for currently referenced snapshot path"
+            );
+            result.skipped_count += 1;
+            Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+            return true;
+        }
+        if Self::extract_snapshot_version(&issue.path)
+            .is_some_and(|version| version > visible_snapshot_version)
+        {
+            tracing::warn!(
+                path = %issue.path,
+                domain = %report.domain,
+                visible_snapshot_version,
+                "skipping repair delete for snapshot version newer than visible manifest"
+            );
+            result.skipped_count += 1;
+            Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+            return true;
+        }
+        if Self::extract_snapshot_version(&issue.path)
+            .is_some_and(|version| retained_versions.contains(&version))
+        {
+            tracing::debug!(
+                path = %issue.path,
+                domain = %report.domain,
+                retained_snapshot_versions = self.retained_snapshot_versions,
+                "skipping repair delete inside the retained snapshot-version window"
+            );
+            result.skipped_count += 1;
+            Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+            return true;
+        }
+        false
     }
 
     fn is_deletion_candidate(

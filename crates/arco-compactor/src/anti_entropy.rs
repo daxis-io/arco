@@ -128,7 +128,9 @@ impl Default for AntiEntropyConfig {
 /// Persisted to storage so scans survive restarts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AntiEntropyCursor {
-    /// Opaque continuation token from last list operation.
+    /// Exclusive path cursor from the last bounded list operation.
+    ///
+    /// The field name is retained for compatibility with persisted cursors.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 
@@ -354,40 +356,39 @@ impl AntiEntropyJob {
         let start = Instant::now();
         let domain = parse_domain(&self.config.domain)?;
 
+        if self.config.max_objects_per_run == 0 {
+            return Ok(AntiEntropyResult {
+                objects_scanned: 0,
+                missed_events: 0,
+                scan_complete: false,
+                missed_paths: Vec::new(),
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+
         self.load_cursor().await?;
 
         let watermark = self.read_domain_watermark(domain).await?;
 
         let prefix = CatalogPaths::ledger_dir(domain);
-        let mut metas =
-            self.storage
-                .list_meta(&prefix)
-                .await
-                .map_err(|e| AntiEntropyError::ListError {
-                    prefix: prefix.clone(),
-                    message: e.to_string(),
-                })?;
-        metas.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
-
-        let total = metas.len();
-        let start_index = self.cursor.last_path.as_deref().map_or(0, |last_path| {
-            match metas.binary_search_by(|meta| meta.path.as_str().cmp(last_path)) {
-                Ok(index) => index + 1,
-                Err(index) => index,
-            }
-        });
-
         let limit = self.config.max_objects_per_run;
-        let page: Vec<_> = if limit == 0 {
-            Vec::new()
-        } else {
-            metas.into_iter().skip(start_index).take(limit).collect()
-        };
-
-        let scan_complete = start_index + page.len() >= total;
+        let start_after = self
+            .cursor
+            .token
+            .as_deref()
+            .or(self.cursor.last_path.as_deref());
+        let page = self
+            .storage
+            .list_page_meta(&prefix, start_after, limit)
+            .await
+            .map_err(|e| AntiEntropyError::ListError {
+                prefix: prefix.clone(),
+                message: e.to_string(),
+            })?;
+        let scan_complete = page.next_start_after.is_none();
         let mut missed_paths = Vec::new();
 
-        for meta in &page {
+        for meta in &page.objects {
             let path = meta.path.as_str();
             if !std::path::Path::new(path)
                 .extension()
@@ -409,24 +410,21 @@ impl AntiEntropyJob {
             self.enqueue_for_reprocessing(&missed_paths).await?;
         }
 
-        if !page.is_empty() || scan_complete {
-            self.cursor.objects_scanned = self
-                .cursor
-                .objects_scanned
-                .saturating_add(page.len() as u64);
-            let last_path = page.last().map(|meta| meta.path.to_string());
-            if scan_complete {
-                self.cursor.complete_scan();
-            } else if let Some(last_path) = last_path.clone() {
-                self.cursor
-                    .advance(Some(last_path.clone()), Some(last_path));
-            }
-            self.save_cursor().await?;
+        self.cursor.objects_scanned = self
+            .cursor
+            .objects_scanned
+            .saturating_add(page.objects.len() as u64);
+        if scan_complete {
+            self.cursor.complete_scan();
+        } else if let Some(next_start_after) = page.next_start_after {
+            self.cursor
+                .advance(Some(next_start_after.clone()), Some(next_start_after));
         }
+        self.save_cursor().await?;
 
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(AntiEntropyResult {
-            objects_scanned: page.len(),
+            objects_scanned: page.objects.len(),
             missed_events: missed_paths.len(),
             scan_complete,
             missed_paths,
@@ -810,12 +808,78 @@ mod tests {
     use super::*;
     use arco_catalog::Tier1Writer;
     use arco_core::scoped_storage::ScopedStorage;
-    use arco_core::storage::MemoryBackend;
+    use arco_core::storage::{ListPage, MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
+    use async_trait::async_trait;
+    use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct PagedOnlyBackend {
+        inner: MemoryBackend,
+        full_list_calls: AtomicUsize,
+        page_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StorageBackend for PagedOnlyBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, _prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.full_list_calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::storage(
+                "unbounded list must not be used by anti-entropy",
+            ))
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.page_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     fn test_storage() -> ScopedStorage {
         let backend = Arc::new(MemoryBackend::new());
         ScopedStorage::new(backend, "acme", "prod").expect("valid storage")
+    }
+
+    fn paged_only_storage() -> (ScopedStorage, Arc<PagedOnlyBackend>) {
+        let backend = Arc::new(PagedOnlyBackend::default());
+        let storage =
+            ScopedStorage::new(backend.clone(), "acme", "prod").expect("valid paged-only storage");
+        (storage, backend)
     }
 
     #[test]
@@ -889,7 +953,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_anti_entropy_uses_bounded_scan_cursor()
     -> Result<(), Box<dyn std::error::Error>> {
-        let storage = test_storage();
+        let (storage, backend) = paged_only_storage();
         let writer = Tier1Writer::new(storage.clone());
         writer.initialize().await?;
 
@@ -945,8 +1009,35 @@ mod tests {
         let second = job.run_pass().await?;
         assert_eq!(second.objects_scanned, 1);
         assert_eq!(second.missed_events, 0);
-        assert!(second.scan_complete);
+        assert!(!second.scan_complete);
 
+        // The exact-multiple case is proven exhausted by a later empty page;
+        // no lookahead request is hidden inside either full page.
+        let third = job.run_pass().await?;
+        assert_eq!(third.objects_scanned, 0);
+        assert_eq!(third.missed_events, 0);
+        assert!(third.scan_complete);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_zero_object_budget_performs_no_storage_io() -> Result<(), AntiEntropyError> {
+        let (storage, backend) = paged_only_storage();
+        let config = AntiEntropyConfig {
+            max_objects_per_run: 0,
+            ..Default::default()
+        };
+        let mut job = AntiEntropyJob::new(storage, config);
+
+        let result = job.run_pass().await?;
+
+        assert_eq!(result.objects_scanned, 0);
+        assert!(!result.scan_complete);
+        assert_eq!(backend.page_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.full_list_calls.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -994,9 +1085,8 @@ mod tests {
 
         // A full scan completes over multiple runs
         // With 10,000 events and 500 per run, it takes 20 runs
-        let total_events = 10_000;
-        let runs_needed =
-            (total_events + config.max_objects_per_run - 1) / config.max_objects_per_run;
+        let total_events: usize = 10_000;
+        let runs_needed = total_events.div_ceil(config.max_objects_per_run);
         assert_eq!(runs_needed, 20);
     }
 }

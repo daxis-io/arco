@@ -24,7 +24,7 @@ use std::time::Duration;
 use crate::catalog_paths::{CatalogDomain, CatalogPaths};
 use crate::control_plane_scope::ControlPlaneScope;
 use crate::error::{Error, Result};
-use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use crate::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use async_trait::async_trait;
 
 /// Tenant + workspace scoped storage wrapper.
@@ -52,6 +52,15 @@ pub struct ScopedObjectMeta {
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
     /// Entity tag for cache validation.
     pub etag: Option<String>,
+}
+
+/// One bounded page of metadata relative to a tenant/workspace scope.
+#[derive(Debug, Clone)]
+pub struct ScopedListPage {
+    /// Objects in strictly increasing scope-relative path order.
+    pub objects: Vec<ScopedObjectMeta>,
+    /// Exclusive scope-relative path cursor for the next page.
+    pub next_start_after: Option<String>,
 }
 
 fn scoped_list_boundary(prefix: &str) -> String {
@@ -600,6 +609,92 @@ impl ScopedStorage {
             .collect())
     }
 
+    /// Lists one bounded metadata page at a scope-relative prefix.
+    ///
+    /// `start_after` is an exclusive scope-relative path cursor returned by the
+    /// previous page. The bound is delegated to the backend; this method never
+    /// falls back to [`Self::list_meta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a path is unsafe, the cursor is outside `prefix`,
+    /// or the backend cannot provide bounded ordered listing.
+    pub async fn list_page_meta(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ScopedListPage> {
+        Self::validate_path(prefix)?;
+        if let Some(start_after) = start_after {
+            Self::validate_path(start_after)?;
+            let boundary = scoped_list_boundary(prefix);
+            if !prefix.is_empty() && start_after != prefix && !start_after.starts_with(&boundary) {
+                return Err(Error::InvalidInput(format!(
+                    "list cursor '{start_after}' is outside prefix '{prefix}'"
+                )));
+            }
+        }
+
+        let full_prefix = self.scoped_path(prefix);
+        let scope_prefix = format!("{}/", self.scope_prefix());
+        let boundary_prefix = scoped_list_boundary(&full_prefix);
+        let full_start_after = start_after.map(|path| self.scoped_path(path));
+        let page = self
+            .backend
+            .list_page(&full_prefix, full_start_after.as_deref(), limit)
+            .await?;
+
+        let mut objects = Vec::with_capacity(page.objects.len());
+        for meta in page.objects {
+            if !prefix.is_empty()
+                && meta.path != full_prefix
+                && !meta.path.starts_with(&boundary_prefix)
+            {
+                return Err(Error::storage(format!(
+                    "bounded list returned path '{}' outside prefix '{full_prefix}'",
+                    meta.path
+                )));
+            }
+            let relative =
+                meta.path
+                    .strip_prefix(&scope_prefix)
+                    .ok_or_else(|| Error::TenantIsolation {
+                        message: format!(
+                            "bounded list returned path '{}' outside scope '{}'",
+                            meta.path,
+                            self.scope_prefix()
+                        ),
+                    })?;
+            objects.push(ScopedObjectMeta {
+                path: ScopedPath(relative.to_string()),
+                size: meta.size,
+                version: meta.version,
+                last_modified: meta.last_modified,
+                etag: meta.etag,
+            });
+        }
+        let next_start_after = page
+            .next_start_after
+            .map(|cursor| {
+                cursor
+                    .strip_prefix(&scope_prefix)
+                    .map(ToString::to_string)
+                    .ok_or_else(|| Error::TenantIsolation {
+                        message: format!(
+                            "bounded list cursor '{cursor}' is outside scope '{}'",
+                            self.scope_prefix()
+                        ),
+                    })
+            })
+            .transpose()?;
+
+        Ok(ScopedListPage {
+            objects,
+            next_start_after,
+        })
+    }
+
     /// Gets metadata at a scope-relative path.
     ///
     /// # Errors
@@ -679,6 +774,29 @@ impl StorageBackend for ScopedStorage {
                 etag: meta.etag,
             })
             .collect())
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        let page = self.list_page_meta(prefix, start_after, limit).await?;
+        Ok(ListPage {
+            objects: page
+                .objects
+                .into_iter()
+                .map(|meta| ObjectMeta {
+                    path: meta.path.to_string(),
+                    size: meta.size,
+                    version: meta.version,
+                    last_modified: meta.last_modified,
+                    etag: meta.etag,
+                })
+                .collect(),
+            next_start_after: page.next_start_after,
+        })
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
@@ -1032,6 +1150,64 @@ mod tests {
                 .all(|m| !m.path.as_str().contains("manifests_backup")),
             "same-scope sibling metadata must not leak through scoped listing"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_page_meta_keeps_cursor_scope_relative() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        for index in 0..3 {
+            storage
+                .put_raw(
+                    &format!("ledger/catalog/evt-{index:02}.json"),
+                    Bytes::from_static(b"event"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("seed scoped page");
+        }
+
+        let first = storage
+            .list_page_meta("ledger/catalog/", None, 2)
+            .await
+            .expect("first scoped page");
+        let paths: Vec<&str> = first
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["ledger/catalog/evt-00.json", "ledger/catalog/evt-01.json"]
+        );
+        assert_eq!(
+            first.next_start_after.as_deref(),
+            Some("ledger/catalog/evt-01.json")
+        );
+
+        let second = storage
+            .list_page_meta("ledger/catalog/", first.next_start_after.as_deref(), 2)
+            .await
+            .expect("second scoped page");
+        assert_eq!(second.objects.len(), 1);
+        assert_eq!(
+            second.objects.first().map(|meta| meta.path.as_str()),
+            Some("ledger/catalog/evt-02.json")
+        );
+        assert!(second.next_start_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_page_meta_rejects_cursor_outside_prefix() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        let error = storage
+            .list_page_meta("ledger/catalog/", Some("ledger/lineage/evt-00.json"), 2)
+            .await
+            .expect_err("cursor outside prefix must fail");
+
+        assert!(error.to_string().contains("outside prefix"));
     }
 
     #[tokio::test]

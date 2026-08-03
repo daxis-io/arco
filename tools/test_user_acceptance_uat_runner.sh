@@ -6,6 +6,7 @@ cd "${REPO_ROOT}"
 
 RUNNER="scripts/run_user_acceptance_pipeline_uat.sh"
 CI_WORKFLOW=".github/workflows/ci.yml"
+OPERATOR_BOUNDARY_RUNBOOK="docs/runbooks/deployed-uat-operator-boundaries.md"
 DEFAULT_EVIDENCE_DIR="${REPO_ROOT}/target/uat-evidence"
 DEFAULT_EVIDENCE_MARKER="${DEFAULT_EVIDENCE_DIR}/.uat-validation-start"
 EXPECTED_API_CODE_VERSION="uat-live"
@@ -22,6 +23,28 @@ run_with_expected_api() {
 
 if [[ ! -f "${RUNNER}" ]]; then
   echo "missing ${RUNNER}" >&2
+  exit 1
+fi
+if [[ ! -f "${OPERATOR_BOUNDARY_RUNBOOK}" ]]; then
+  echo "missing ${OPERATOR_BOUNDARY_RUNBOOK}" >&2
+  exit 1
+fi
+for required_text in \
+  "Local Cloud SDK access is not cloud-mutation authority." \
+  "~/.config/gcloud" \
+  "lsof -nP -iTCP:18080 -sTCP:LISTEN" \
+  "--require-live-deployed-ready" \
+  "initial-status.txt" \
+  "final-status.txt" \
+  "Concurrent or ad hoc cloud mutation outside the declared owner window"; do
+  if ! grep -Fq -- "${required_text}" "${OPERATOR_BOUNDARY_RUNBOOK}"; then
+    echo "${OPERATOR_BOUNDARY_RUNBOOK} must document: ${required_text}" >&2
+    exit 1
+  fi
+done
+help_output="$(bash "${RUNNER}" --help)"
+if ! grep -Fq "${OPERATOR_BOUNDARY_RUNBOOK}" <<<"${help_output}"; then
+  echo "${RUNNER} help must link ${OPERATOR_BOUNDARY_RUNBOOK}" >&2
   exit 1
 fi
 if ! grep -Fq "scripts/run_user_acceptance_pipeline_uat.sh --deterministic" "${CI_WORKFLOW}"; then

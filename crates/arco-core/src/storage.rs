@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http::Method;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
@@ -86,6 +86,28 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
+/// One bounded, lexicographically ordered page of object metadata.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    /// Objects in strictly increasing path order.
+    pub objects: Vec<ObjectMeta>,
+    /// Exclusive path cursor for the next page.
+    ///
+    /// A full page carries a cursor even when it was the final page. In that
+    /// exact-multiple case, the following request returns an empty page with no
+    /// cursor and establishes exhaustion without reading ahead.
+    pub next_start_after: Option<String>,
+}
+
+impl ListPage {
+    fn empty() -> Self {
+        Self {
+            objects: Vec::new(),
+            next_start_after: None,
+        }
+    }
+}
+
 /// Storage backend trait for object storage.
 ///
 /// All storage backends (GCS, S3, memory) implement this trait.
@@ -129,6 +151,32 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// the results (e.g., by `path` or `last_modified`).
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
+    /// Lists one bounded page under `prefix`, starting strictly after
+    /// `start_after` in lexicographic path order.
+    ///
+    /// Implementations must return at most `limit` objects. A full page returns
+    /// the final path as [`ListPage::next_start_after`]; a short page proves
+    /// exhaustion and returns no cursor. A zero limit performs no listing and
+    /// returns an empty exhausted page.
+    ///
+    /// The default deliberately fails closed. Falling back to [`Self::list`]
+    /// would make a nominally bounded scan enumerate the entire prefix.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        validate_page_cursor(prefix, start_after)?;
+        if limit == 0 {
+            return Ok(ListPage::empty());
+        }
+        let _ = (prefix, start_after);
+        Err(Error::storage(
+            "bounded ordered listing is not supported by this storage backend",
+        ))
+    }
+
     /// Gets object metadata without reading content.
     ///
     /// Returns `None` if object doesn't exist.
@@ -157,13 +205,29 @@ pub trait StorageBackend: Send + Sync + 'static {
 pub struct ObjectStoreBackend {
     store: Arc<DynObjectStore>,
     signer: Option<Arc<dyn ObjectStoreSigner>>,
+    ordered_listing: bool,
 }
 
 impl ObjectStoreBackend {
     /// Creates a new backend adapter.
     #[must_use]
     pub fn new(store: Arc<DynObjectStore>, signer: Option<Arc<dyn ObjectStoreSigner>>) -> Self {
-        Self { store, signer }
+        Self {
+            store,
+            signer,
+            ordered_listing: false,
+        }
+    }
+
+    fn new_with_ordered_listing(
+        store: Arc<DynObjectStore>,
+        signer: Option<Arc<dyn ObjectStoreSigner>>,
+    ) -> Self {
+        Self {
+            store,
+            signer,
+            ordered_listing: true,
+        }
     }
 
     /// Creates a Google Cloud Storage backend for the given bucket.
@@ -192,13 +256,23 @@ impl ObjectStoreBackend {
         let gcs = Arc::new(gcs);
         let store: Arc<DynObjectStore> = gcs.clone();
         let signer: Arc<dyn ObjectStoreSigner> = gcs;
-        Ok(Self::new(store, Some(signer)))
+        Ok(Self::new_with_ordered_listing(store, Some(signer)))
     }
 
     /// Creates an Amazon S3 backend for the given bucket.
     ///
     /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
     /// `s3://` prefix (`s3://my-bucket`).
+    ///
+    /// # Certification status
+    ///
+    /// **NOT certified for production use.** This provider has no CAS
+    /// conformance evidence: the only test exercising the CAS/precondition
+    /// contract against real S3 (`s3_backend_satisfies_storage_conformance` in
+    /// `tests/storage_backend_conformance.rs`) is `#[ignore]`d, and the
+    /// scheduled runner (`.github/workflows/s3-conformance.yml`) has never
+    /// passed against a real bucket. Until it does, the version-fenced CAS
+    /// semantics the publish protocol depends on are UNVERIFIED on S3.
     ///
     /// # Errors
     ///
@@ -221,7 +295,12 @@ impl ObjectStoreBackend {
         let s3 = Arc::new(s3);
         let store: Arc<DynObjectStore> = s3.clone();
         let signer: Arc<dyn ObjectStoreSigner> = s3;
-        Ok(Self::new(store, Some(signer)))
+        let mut backend = Self::new(store, Some(signer));
+        // S3 directory buckets (S3 Express) neither support StartAfter nor
+        // guarantee lexicographic ListObjectsV2 ordering. Keep their pager
+        // disabled instead of silently reverting to a full client-side scan.
+        backend.ordered_listing = supports_ordered_s3_listing(&bucket);
+        Ok(backend)
     }
 
     /// Creates a storage backend from a bucket string, inferring the provider.
@@ -260,6 +339,10 @@ fn normalize_bucket(prefix: &str, raw: &str) -> String {
         .map_or(no_prefix, |(bucket, _)| bucket)
         .trim()
         .to_string()
+}
+
+fn supports_ordered_s3_listing(bucket: &str) -> bool {
+    !bucket.ends_with("--x-s3")
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -352,6 +435,63 @@ fn object_store_meta_to_meta(meta: object_store::ObjectMeta) -> ObjectMeta {
         version,
         last_modified: Some(meta.last_modified),
         etag: meta.e_tag,
+    }
+}
+
+fn validate_page_cursor(prefix: &str, start_after: Option<&str>) -> Result<()> {
+    let Some(start_after) = start_after else {
+        return Ok(());
+    };
+    let boundary = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    };
+    if !prefix.is_empty() && start_after != prefix && !start_after.starts_with(&boundary) {
+        return Err(Error::InvalidInput(format!(
+            "list cursor '{start_after}' is outside prefix '{prefix}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ordered_page(
+    prefix: &str,
+    start_after: Option<&str>,
+    limit: usize,
+    objects: &[ObjectMeta],
+) -> Result<()> {
+    if objects.len() > limit {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' returned {} objects for limit {limit}",
+            objects.len()
+        )));
+    }
+    if let (Some(start_after), Some(first)) = (start_after, objects.first())
+        && first.path.as_str() <= start_after
+    {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' returned non-exclusive path '{}' after '{start_after}'",
+            first.path
+        )));
+    }
+    if let Some((left, right)) = objects.windows(2).find_map(|window| match window {
+        [left, right] if left.path >= right.path => Some((left, right)),
+        _ => None,
+    }) {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' was not strictly ordered: '{}' then '{}'",
+            left.path, right.path
+        )));
+    }
+    Ok(())
+}
+
+fn next_start_after(objects: &[ObjectMeta], limit: usize) -> Option<String> {
+    if objects.len() == limit {
+        objects.last().map(|meta| meta.path.clone())
+    } else {
+        None
     }
 }
 
@@ -454,6 +594,51 @@ impl StorageBackend for ObjectStoreBackend {
             .map_err(map_object_store_error)?;
 
         Ok(metas.into_iter().map(object_store_meta_to_meta).collect())
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        validate_page_cursor(prefix, start_after)?;
+        if limit == 0 {
+            return Ok(ListPage::empty());
+        }
+        if !self.ordered_listing {
+            return Err(Error::storage(
+                "bounded ordered listing is unsupported for this object-store adapter",
+            ));
+        }
+
+        let prefix = ObjectStorePath::from(prefix);
+        // `object_store` 0.11 can push the exclusive offset into standard GCS
+        // and S3 requests, but it does not expose a per-request max-keys knob.
+        // `take(limit)` therefore bounds objects emitted and additional network
+        // pages; the provider's first response may still contain its default
+        // page size (currently at most 1,000 objects).
+        let stream = start_after.map_or_else(
+            || self.store.list(Some(&prefix)),
+            |start_after| {
+                let offset = ObjectStorePath::from(start_after);
+                self.store.list_with_offset(Some(&prefix), &offset)
+            },
+        );
+        let metas = stream
+            .take(limit)
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_object_store_error)?;
+        let objects: Vec<ObjectMeta> = metas.into_iter().map(object_store_meta_to_meta).collect();
+
+        validate_ordered_page(prefix.as_ref(), start_after, limit, &objects)?;
+        let next_start_after = next_start_after(&objects, limit);
+
+        Ok(ListPage {
+            objects,
+            next_start_after,
+        })
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
@@ -623,6 +808,33 @@ impl StorageBackend for MemoryBackend {
             .collect())
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        validate_page_cursor(prefix, start_after)?;
+        if limit == 0 {
+            return Ok(ListPage::empty());
+        }
+
+        let mut objects = self.list(prefix).await?;
+        objects.sort_by(|left, right| left.path.cmp(&right.path));
+        if let Some(start_after) = start_after {
+            let first = objects.partition_point(|meta| meta.path.as_str() <= start_after);
+            objects.drain(..first);
+        }
+        objects.truncate(limit);
+        validate_ordered_page(prefix, start_after, limit, &objects)?;
+
+        let next_start_after = next_start_after(&objects, limit);
+        Ok(ListPage {
+            objects,
+            next_start_after,
+        })
+    }
+
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
         let objects = self.objects.read().map_err(|_| Error::Internal {
             message: "lock poisoned".into(),
@@ -647,6 +859,9 @@ impl StorageBackend for MemoryBackend {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::manual_let_else, clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
 
@@ -815,6 +1030,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The reversed range is the point of this test: get_range must reject
+    // end-before-start as an error instead of panicking.
+    #[allow(clippy::reversed_empty_ranges)]
     async fn test_get_range_invalid_end_before_start() {
         let backend = MemoryBackend::new();
         backend
@@ -935,6 +1153,152 @@ mod tests {
 
         let list_b = backend.list("b/").await.expect("should succeed");
         assert_eq!(list_b.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_page_is_exclusive_and_exact_multiples_end_empty() {
+        let backend = MemoryBackend::new();
+        for index in 0..6 {
+            backend
+                .put(
+                    &format!("ledger/evt-{index:02}.json"),
+                    Bytes::from_static(b"event"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("seed page object");
+        }
+
+        let first = backend
+            .list_page("ledger/", None, 3)
+            .await
+            .expect("first page");
+        let first_paths: Vec<&str> = first
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            first_paths,
+            [
+                "ledger/evt-00.json",
+                "ledger/evt-01.json",
+                "ledger/evt-02.json"
+            ]
+        );
+        assert_eq!(
+            first.next_start_after.as_deref(),
+            Some("ledger/evt-02.json")
+        );
+
+        let second = backend
+            .list_page("ledger/", first.next_start_after.as_deref(), 3)
+            .await
+            .expect("second page");
+        let second_paths: Vec<&str> = second
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            second_paths,
+            [
+                "ledger/evt-03.json",
+                "ledger/evt-04.json",
+                "ledger/evt-05.json"
+            ]
+        );
+        assert_eq!(
+            second.next_start_after.as_deref(),
+            Some("ledger/evt-05.json")
+        );
+
+        let exhausted = backend
+            .list_page("ledger/", second.next_start_after.as_deref(), 3)
+            .await
+            .expect("exhaustion page");
+        assert!(exhausted.objects.is_empty());
+        assert!(exhausted.next_start_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_generic_object_store_adapter_fails_closed_for_bounded_listing() {
+        let backend =
+            ObjectStoreBackend::new(Arc::new(object_store::memory::InMemory::new()), None);
+        let empty = backend
+            .list_page("ledger/", None, 0)
+            .await
+            .expect("zero limit performs no provider call");
+        assert!(empty.objects.is_empty());
+        assert!(empty.next_start_after.is_none());
+        let error = backend
+            .list_page("ledger/", None, 10)
+            .await
+            .expect_err("generic object stores do not promise ordered listing");
+        assert!(error.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn test_s3_directory_buckets_do_not_enable_ordered_paging() {
+        assert!(supports_ordered_s3_listing("standard-bucket"));
+        assert!(!supports_ordered_s3_listing("events--usw2-az1--x-s3"));
+    }
+
+    #[tokio::test]
+    async fn test_ordered_object_store_pager_defers_insertions_before_cursor() {
+        let backend = ObjectStoreBackend::new_with_ordered_listing(
+            Arc::new(object_store::memory::InMemory::new()),
+            None,
+        );
+        for path in ["ledger/a.json", "ledger/c.json"] {
+            backend
+                .put(path, Bytes::from_static(b"event"), WritePrecondition::None)
+                .await
+                .expect("seed ordered store");
+        }
+
+        let first = backend
+            .list_page("ledger/", None, 2)
+            .await
+            .expect("first ordered page");
+        assert_eq!(first.next_start_after.as_deref(), Some("ledger/c.json"));
+
+        for path in ["ledger/b.json", "ledger/d.json"] {
+            backend
+                .put(path, Bytes::from_static(b"event"), WritePrecondition::None)
+                .await
+                .expect("insert during scan");
+        }
+        let second = backend
+            .list_page("ledger/", first.next_start_after.as_deref(), 2)
+            .await
+            .expect("second ordered page");
+        let paths: Vec<&str> = second
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(paths, ["ledger/d.json"]);
+        assert!(second.next_start_after.is_none());
+
+        let next_scan = backend
+            .list_page("ledger/", None, 4)
+            .await
+            .expect("next full scan");
+        let next_paths: Vec<&str> = next_scan
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            next_paths,
+            [
+                "ledger/a.json",
+                "ledger/b.json",
+                "ledger/c.json",
+                "ledger/d.json"
+            ]
+        );
     }
 
     #[tokio::test]

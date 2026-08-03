@@ -1,5 +1,9 @@
 //! Task 3 coverage for compiled catalog permissions.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_wrap)]
+
 use std::collections::BTreeMap;
 
 use arco_catalog::authz::compiler::{PermissionCompileInput, SecurableObject, compile_permissions};
@@ -289,6 +293,9 @@ fn principal(
     )
 }
 
+// Test-event builder: each argument mirrors one field of the grant event
+// contract; bundling them into a struct would obscure the call sites (#331).
+#[allow(clippy::too_many_arguments)]
 fn grant(
     event_id: &str,
     sequence: u64,

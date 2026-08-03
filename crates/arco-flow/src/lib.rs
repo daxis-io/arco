@@ -99,6 +99,9 @@ pub(crate) mod paths;
 pub mod compaction_client;
 pub use arco_core::orchestration_compaction;
 
+/// Application-level orchestration services.
+pub mod application;
+
 pub mod dispatch;
 
 pub mod error;
@@ -109,6 +112,8 @@ pub mod metrics;
 pub mod orchestration;
 pub mod outbox;
 pub mod plan;
+/// Planner-owned run compilation semantics.
+pub mod planning;
 pub mod quota;
 pub mod run;
 #[cfg(feature = "legacy-scheduler")]

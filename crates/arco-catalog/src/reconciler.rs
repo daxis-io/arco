@@ -9,8 +9,16 @@
 //! This reconciler operates on [`arco_core::ScopedStorage`], meaning all reads/writes
 //! are constrained to a tenant/workspace scope. This prevents cross-tenant listing
 //! or deletion when used correctly.
+//!
+//! # Deletion Safety
+//!
+//! Full-scope repair deletions are coordinated with the retention machinery:
+//! they hold the workspace retention lock, claim the durable
+//! [`RetentionMutationEpoch`], consult the same fail-closed GC protection set
+//! (current manifest heads plus validated retention pins), and honor a
+//! minimum object age covering the longest outstanding signed-URL TTL.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arco_core::lock::DistributedLock;
@@ -20,8 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
-use crate::gc::reachability::ProtectionSet;
-use crate::gc::{GarbageCollector, RetentionPolicy};
+use crate::gc;
 use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest, RootManifest,
 };
@@ -29,6 +36,15 @@ use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKin
 use crate::workspace_snapshot::{
     RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
 };
+
+/// Minimum object age before a repair delete may proceed.
+///
+/// This must cover the maximum signed-URL TTL (3600 seconds): a correctly
+/// authorized signed URL minted against the previous snapshot version must
+/// not start returning 404 because an unrelated commit advanced the head.
+const DEFAULT_MIN_AGE_BEFORE_DELETE_SECS: i64 = 3600;
+const DEFAULT_RETAINED_SNAPSHOT_VERSIONS: usize = 10;
+const RETENTION_SCAN_PAGE_SIZE: usize = 256;
 
 // ============================================================================
 // Reconciliation Report
@@ -184,35 +200,19 @@ pub enum Severity {
 #[derive(Clone)]
 pub struct Reconciler {
     storage: ScopedStorage,
-    retention_policy: RetentionPolicy,
-}
-
-struct CleanupContext {
-    visible_snapshot_version: u64,
-    protected_paths: HashSet<String>,
-    retained_versions: HashSet<u64>,
-    protection: Option<ProtectionSet>,
-}
-
-#[derive(Clone, Copy)]
-enum RepairDisposition {
-    Repaired,
-    Skipped,
-}
-
-impl RepairDisposition {
-    const fn metric_label(self) -> &'static str {
-        match self {
-            Self::Repaired => "repaired",
-            Self::Skipped => "skipped",
-        }
-    }
+    min_age_before_delete: Duration,
+    retained_snapshot_versions: usize,
 }
 
 impl std::fmt::Debug for Reconciler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Reconciler")
             .field("storage", &"ScopedStorage")
+            .field("min_age_before_delete", &self.min_age_before_delete)
+            .field(
+                "retained_snapshot_versions",
+                &self.retained_snapshot_versions,
+            )
             .finish()
     }
 }
@@ -223,50 +223,65 @@ impl Reconciler {
     pub fn new(storage: ScopedStorage) -> Self {
         Self {
             storage,
-            retention_policy: RetentionPolicy::default(),
+            min_age_before_delete: Duration::seconds(DEFAULT_MIN_AGE_BEFORE_DELETE_SECS),
+            retained_snapshot_versions: DEFAULT_RETAINED_SNAPSHOT_VERSIONS,
         }
+    }
+
+    /// Overrides the minimum object age required before a repair delete.
+    ///
+    /// The default covers the maximum signed-URL TTL. Lowering it below that
+    /// TTL re-opens the reader race this guard exists to prevent; primarily
+    /// intended for tests.
+    #[must_use]
+    pub fn with_min_age_before_delete(mut self, min_age: Duration) -> Self {
+        self.min_age_before_delete = min_age;
+        self
     }
 
     /// Uses the supplied retention policy for Full repair cleanup.
     ///
-    /// The policy controls both the minimum object age and the number of newest
-    /// snapshot versions that repair must preserve.
+    /// Repair keeps the newest `keep_snapshots` numeric versions and applies
+    /// the same minimum-age window as the garbage collector.
     #[must_use]
-    pub fn with_retention_policy(mut self, retention_policy: RetentionPolicy) -> Self {
-        self.retention_policy = retention_policy;
+    pub fn with_retention_policy(mut self, retention_policy: &gc::RetentionPolicy) -> Self {
+        self.retained_snapshot_versions = retention_policy.keep_snapshots as usize;
+        self.min_age_before_delete = Duration::hours(i64::from(retention_policy.delay_hours));
         self
     }
 
-    async fn is_within_repair_grace_period(&self, path: &str) -> Result<bool> {
-        let Some(meta) = self.storage.head_raw(path).await? else {
-            return Ok(false);
-        };
-        let Some(last_modified) = meta.last_modified else {
-            // Unknown age never grants destructive authority.
-            return Ok(true);
-        };
-        let age = Utc::now().signed_duration_since(last_modified);
-        // Future timestamps indicate clock skew and fail closed as recent.
-        Ok(age < Duration::hours(i64::from(self.retention_policy.delay_hours)))
-    }
-
-    async fn retained_snapshot_versions(
+    async fn retained_versions(
         &self,
         snapshot_prefix: &str,
         visible_snapshot_version: u64,
     ) -> Result<HashSet<u64>> {
-        let mut versions = self
-            .storage
-            .list(snapshot_prefix)
-            .await?
-            .iter()
-            .filter_map(|path| Self::extract_snapshot_version(path.as_str()))
-            .filter(|version| *version <= visible_snapshot_version)
-            .collect::<Vec<_>>();
-        versions.sort_unstable_by(|left, right| right.cmp(left));
-        versions.dedup();
-        versions.truncate(self.retention_policy.keep_snapshots as usize);
-        Ok(versions.into_iter().collect())
+        let mut retained = BTreeSet::new();
+        let mut cursor = None;
+
+        loop {
+            let page = self
+                .storage
+                .list_page_meta(snapshot_prefix, cursor.as_deref(), RETENTION_SCAN_PAGE_SIZE)
+                .await?;
+            for object in page.objects {
+                let Some(version) = Self::extract_snapshot_version(object.path.as_str()) else {
+                    continue;
+                };
+                if version > visible_snapshot_version {
+                    continue;
+                }
+                retained.insert(version);
+                while retained.len() > self.retained_snapshot_versions {
+                    retained.pop_first();
+                }
+            }
+            let Some(next) = page.next_start_after else {
+                break;
+            };
+            cursor = Some(next);
+        }
+
+        Ok(retained.into_iter().collect())
     }
 
     /// Checks a domain for inconsistencies.
@@ -407,27 +422,70 @@ impl Reconciler {
     ///
     /// Only issues marked as `repairable: true` and allowed by `scope` will be addressed.
     ///
+    /// Deletions are coordinated with the retention machinery: candidates that
+    /// survive the current-head and in-flight-publish guards are only deleted
+    /// while holding the workspace retention lock and the durable retention
+    /// mutation epoch, after the fail-closed GC protection set (current heads
+    /// plus validated retention pins) has been built, and only when the object
+    /// is older than the configured minimum age.
+    ///
     /// # Errors
     ///
-    /// Returns an error if storage operations fail while attempting repairs.
-    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    /// Returns an error if the retention lock or durable mutation epoch cannot
+    /// be claimed, if the protection inventory cannot be validated, or if a
+    /// candidate cannot be inspected (fail closed: nothing is deleted in those
+    /// cases). A failure to delete one authorized candidate is *not* fatal: it
+    /// is counted in `failed_count` and the pass continues, so one unlucky
+    /// object can neither skip the remaining repairs nor strand the durable
+    /// mutation epoch in flight.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn repair_with_scope(
         &self,
         report: &ReconciliationReport,
         scope: RepairScope,
     ) -> Result<RepairResult> {
-        let requires_retention_coordination = scope == RepairScope::Full
-            && report.issues.iter().any(|issue| {
-                issue.repairable
-                    && matches!(
-                        issue.issue_type,
-                        IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion
-                    )
-            });
-        if !requires_retention_coordination {
-            return self.repair_while_coordinated(report, scope, None).await;
+        let mut result = RepairResult {
+            domain: report.domain.clone(),
+            repaired_at: Utc::now(),
+            repaired_count: 0,
+            skipped_count: 0,
+            failed_count: 0,
+        };
+
+        let (visible_snapshot_version, protected_paths, snapshot_prefix) =
+            if let Some(domain) = Self::parse_domain(&report.domain) {
+                self.load_expected_paths(domain).await?.map_or_else(
+                    || (report.manifest_snapshot_version, HashSet::new(), None),
+                    |(version, expected, prefix)| {
+                        (version, expected.into_iter().collect(), Some(prefix))
+                    },
+                )
+            } else {
+                (report.manifest_snapshot_version, HashSet::new(), None)
+            };
+        let retained_versions = if let Some(prefix) = snapshot_prefix.as_deref() {
+            self.retained_versions(prefix, visible_snapshot_version)
+                .await?
+        } else {
+            HashSet::new()
+        };
+
+        let deletions = self.eligible_deletions(
+            report,
+            scope,
+            visible_snapshot_version,
+            &protected_paths,
+            &retained_versions,
+            &mut result,
+        );
+
+        if deletions.is_empty() {
+            return Ok(result);
         }
 
+        // Coordinated deletion: the same distributed lock and durable mutation
+        // epoch that `GarbageCollector::collect` takes, so repair can never
+        // race a retained-root publication or a concurrent GC pass.
         let mut guard =
             DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
                 .acquire_with_operation(
@@ -441,7 +499,7 @@ impl Reconciler {
         let mut epoch = match RetentionMutationEpoch::claim(
             self.storage.clone(),
             &mut guard,
-            RetentionMutationKind::CatalogGc,
+            RetentionMutationKind::CatalogRepair,
             operation_id,
         )
         .await
@@ -453,159 +511,179 @@ impl Reconciler {
             }
         };
         let repair = self
-            .repair_while_coordinated(report, scope, Some(&mut epoch))
+            .repair_deletions_coordinated(&report.domain, &deletions, &mut epoch, &mut result)
             .await;
         let settlement = epoch.settle().await;
         let release = guard.release().await.map_err(CatalogError::from);
         match (repair, settlement, release) {
-            (Ok(result), Ok(()), Ok(())) => Ok(result),
-            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(()), Ok(())) => Ok(result),
+            (Err(error), _, _) | (Ok(()), Err(error), _) | (Ok(()), Ok(()), Err(error)) => {
+                Err(error)
+            }
         }
     }
 
-    async fn repair_while_coordinated(
+    fn eligible_deletions<'a>(
         &self,
-        report: &ReconciliationReport,
+        report: &'a ReconciliationReport,
         scope: RepairScope,
-        mut epoch: Option<&mut RetentionMutationEpoch>,
-    ) -> Result<RepairResult> {
-        let mut result = RepairResult {
-            domain: report.domain.clone(),
-            repaired_at: Utc::now(),
-            repaired_count: 0,
-            skipped_count: 0,
-            failed_count: 0,
-        };
-
-        let parsed_domain = Self::parse_domain(&report.domain);
-        let (visible_snapshot_version, protected_paths, snapshot_prefix) =
-            if let Some(domain) = parsed_domain {
-                self.load_expected_paths(domain).await?.map_or_else(
-                    || (report.manifest_snapshot_version, HashSet::new(), None),
-                    |(version, expected, prefix)| {
-                        (version, expected.into_iter().collect(), Some(prefix))
-                    },
-                )
-            } else {
-                (report.manifest_snapshot_version, HashSet::new(), None)
-            };
-        let retained_versions = if let Some(prefix) = snapshot_prefix.as_deref() {
-            self.retained_snapshot_versions(prefix, visible_snapshot_version)
-                .await?
-        } else {
-            HashSet::new()
-        };
-        let mut cleanup = CleanupContext {
-            visible_snapshot_version,
-            protected_paths,
-            retained_versions,
-            protection: None,
-        };
-
+        visible_snapshot_version: u64,
+        protected_paths: &HashSet<String>,
+        retained_versions: &HashSet<u64>,
+        result: &mut RepairResult,
+    ) -> Vec<&'a ReconciliationIssue> {
+        let mut deletions = Vec::new();
         for issue in &report.issues {
             if !issue.repairable {
                 result.skipped_count += 1;
                 continue;
             }
-            let disposition = if scope.allows_issue(issue.issue_type) {
-                match issue.issue_type {
-                    IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
-                        self.repair_cleanup_issue(report, issue, &mut cleanup, &mut epoch)
-                            .await?
-                    }
-                    _ => RepairDisposition::Skipped,
-                }
-            } else {
-                RepairDisposition::Skipped
-            };
-            match disposition {
-                RepairDisposition::Repaired => result.repaired_count += 1,
-                RepairDisposition::Skipped => result.skipped_count += 1,
+            if !scope.allows_issue(issue.issue_type) {
+                result.skipped_count += 1;
+                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                continue;
             }
-            if let Some(domain) = parsed_domain {
-                crate::metrics::record_reconciler_repair(
-                    domain,
-                    issue.issue_type.as_str(),
-                    disposition.metric_label(),
-                );
+
+            match issue.issue_type {
+                IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
+                    if protected_paths.contains(&issue.path) {
+                        tracing::warn!(
+                            path = %issue.path,
+                            domain = %report.domain,
+                            "skipping repair delete for currently referenced snapshot path"
+                        );
+                        result.skipped_count += 1;
+                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                        continue;
+                    }
+                    if Self::extract_snapshot_version(&issue.path)
+                        .is_some_and(|version| version > visible_snapshot_version)
+                    {
+                        tracing::warn!(
+                            path = %issue.path,
+                            domain = %report.domain,
+                            visible_snapshot_version,
+                            "skipping repair delete for snapshot version newer than visible manifest"
+                        );
+                        result.skipped_count += 1;
+                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                        continue;
+                    }
+                    if Self::extract_snapshot_version(&issue.path)
+                        .is_some_and(|version| retained_versions.contains(&version))
+                    {
+                        tracing::debug!(
+                            path = %issue.path,
+                            domain = %report.domain,
+                            retained_snapshot_versions = self.retained_snapshot_versions,
+                            "skipping repair delete inside the retained snapshot-version window"
+                        );
+                        result.skipped_count += 1;
+                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                        continue;
+                    }
+                    deletions.push(issue);
+                }
+                _ => {
+                    result.skipped_count += 1;
+                    Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                }
             }
         }
-
-        Ok(result)
+        deletions
     }
 
-    async fn repair_cleanup_issue(
+    /// Applies the surviving deletion candidates under retention coordination.
+    ///
+    /// Builds the fail-closed protection set before the first delete; any
+    /// inventory error aborts the pass with nothing deleted. Every candidate
+    /// is additionally gated on retention-pin protection and a minimum object
+    /// age; age fails closed when it cannot be established.
+    ///
+    /// Individual delete failures are counted, not fatal (see the loop below).
+    #[allow(clippy::cognitive_complexity)]
+    async fn repair_deletions_coordinated(
         &self,
-        report: &ReconciliationReport,
-        issue: &ReconciliationIssue,
-        cleanup: &mut CleanupContext,
-        epoch: &mut Option<&mut RetentionMutationEpoch>,
-    ) -> Result<RepairDisposition> {
-        if cleanup.protected_paths.contains(&issue.path) {
-            tracing::warn!(
-                path = %issue.path,
-                domain = %report.domain,
-                "skipping repair delete for currently referenced snapshot path"
-            );
-            return Ok(RepairDisposition::Skipped);
-        }
-        let issue_version = Self::extract_snapshot_version(&issue.path);
-        if issue_version.is_some_and(|version| version > cleanup.visible_snapshot_version) {
-            tracing::warn!(
-                path = %issue.path,
-                domain = %report.domain,
-                visible_snapshot_version = cleanup.visible_snapshot_version,
-                "skipping repair delete for snapshot version newer than visible manifest"
-            );
-            return Ok(RepairDisposition::Skipped);
-        }
-        if issue_version.is_some_and(|version| cleanup.retained_versions.contains(&version)) {
-            tracing::debug!(
-                path = %issue.path,
-                domain = %report.domain,
-                keep_snapshots = self.retention_policy.keep_snapshots,
-                "skipping repair delete inside the retained snapshot-version window"
-            );
-            return Ok(RepairDisposition::Skipped);
-        }
-        if self.is_within_repair_grace_period(&issue.path).await? {
-            tracing::debug!(
-                path = %issue.path,
-                domain = %report.domain,
-                min_repair_age_secs = u64::from(self.retention_policy.delay_hours) * 60 * 60,
-                "skipping repair delete inside the snapshot grace period"
-            );
-            return Ok(RepairDisposition::Skipped);
+        report_domain: &str,
+        deletions: &[&ReconciliationIssue],
+        epoch: &mut RetentionMutationEpoch,
+        result: &mut RepairResult,
+    ) -> Result<()> {
+        let protection = gc::load_protection_set(&self.storage, Utc::now()).await?;
+        let min_age_cutoff = Utc::now() - self.min_age_before_delete;
+
+        for issue in deletions {
+            if protection.protects_object(&issue.path) {
+                tracing::warn!(
+                    path = %issue.path,
+                    domain = %report_domain,
+                    "skipping repair delete for retention-protected path"
+                );
+                result.skipped_count += 1;
+                Self::record_repair_metric(report_domain, issue.issue_type, "skipped");
+                continue;
+            }
+
+            let Some(meta) = self.storage.head_raw(&issue.path).await? else {
+                // Already gone; nothing to repair.
+                result.skipped_count += 1;
+                Self::record_repair_metric(report_domain, issue.issue_type, "skipped");
+                continue;
+            };
+            let Some(last_modified) = meta.last_modified else {
+                tracing::warn!(
+                    path = %issue.path,
+                    domain = %report_domain,
+                    "skipping repair delete because object age cannot be established"
+                );
+                result.skipped_count += 1;
+                Self::record_repair_metric(report_domain, issue.issue_type, "skipped");
+                continue;
+            };
+            if last_modified >= min_age_cutoff {
+                tracing::debug!(
+                    path = %issue.path,
+                    domain = %report_domain,
+                    last_modified = %last_modified,
+                    "skipping repair delete for object younger than the minimum age"
+                );
+                result.skipped_count += 1;
+                Self::record_repair_metric(report_domain, issue.issue_type, "skipped");
+                continue;
+            }
+
+            // A per-object delete failure is counted and the pass continues.
+            // Aborting here would abandon every remaining authorized candidate
+            // and -- because the abort propagates before settlement -- strand
+            // the durable epoch IN_FLIGHT, wedging GC, repair, snapshot,
+            // export, and restore until a recovery path runs. Protection,
+            // lock, and epoch errors above still fail the whole pass closed.
+            match epoch.delete_reclaimable(&issue.path).await {
+                Ok(()) => {
+                    result.repaired_count += 1;
+                    Self::record_repair_metric(report_domain, issue.issue_type, "repaired");
+                }
+                Err(error) => {
+                    tracing::error!(
+                        path = %issue.path,
+                        domain = %report_domain,
+                        error = %error,
+                        metric = "arco_reconciler_repair_delete_failed_total",
+                        "failed to delete orphaned/old snapshot; continuing with the remaining candidates"
+                    );
+                    result.failed_count += 1;
+                    Self::record_repair_metric(report_domain, issue.issue_type, "failed");
+                }
+            }
         }
 
-        if cleanup.protection.is_none() {
-            cleanup.protection = Some(
-                GarbageCollector::new(self.storage.clone(), self.retention_policy.clone())
-                    .load_protection_set(Utc::now())
-                    .await?,
-            );
-        }
-        if cleanup
-            .protection
-            .as_ref()
-            .is_some_and(|set| set.protects_object(&issue.path))
-        {
-            tracing::warn!(
-                path = %issue.path,
-                domain = %report.domain,
-                "skipping repair delete for retention-protected snapshot path"
-            );
-            return Ok(RepairDisposition::Skipped);
-        }
+        Ok(())
+    }
 
-        let coordinated_epoch =
-            epoch
-                .as_deref_mut()
-                .ok_or_else(|| CatalogError::PreconditionFailed {
-                    message: "snapshot repair delete requires retention coordination".to_string(),
-                })?;
-        coordinated_epoch.delete(&issue.path).await?;
-        Ok(RepairDisposition::Repaired)
+    fn record_repair_metric(report_domain: &str, issue_type: IssueType, outcome: &'static str) {
+        if let Some(domain) = Self::parse_domain(report_domain) {
+            crate::metrics::record_reconciler_repair(domain, issue_type.as_str(), outcome);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -873,14 +951,41 @@ pub struct RepairResult {
 // ============================================================================
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::future_not_send, clippy::similar_names, clippy::too_many_lines)]
 mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::gc::reachability::sha256_digest;
     use crate::manifest::DomainManifestPointer;
-    use arco_core::storage::{MemoryBackend, WritePrecondition};
+    use crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH;
+    use crate::state_store::{PersistedAuthorityKind, PersistedAuthorityReference, StateScope};
+    use crate::workspace_snapshot::{
+        DomainAuthorityReference, DomainEventArchive, RequiredObject, RequiredObjectKind,
+        RetentionPinLatest, RetentionPinRevision, RetentionTarget, WorkspaceScope,
+        WorkspaceSnapshot, encode_retention_pin_latest, encode_retention_pin_revision,
+        encode_workspace_snapshot, retention_pin_latest_path, retention_pin_revision_path,
+        snapshot_record_path,
+    };
+    use arco_core::storage::{
+        ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    };
     use bytes::Bytes;
     use chrono::Utc;
+
+    const TEST_SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const TEST_PIN_ID: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAY";
+
+    fn reconciler_without_retention_window(storage: ScopedStorage) -> Reconciler {
+        Reconciler::new(storage).with_retention_policy(&gc::RetentionPolicy {
+            keep_snapshots: 0,
+            delay_hours: 0,
+            ledger_retention_hours: 48,
+            max_age_days: 90,
+        })
+    }
 
     async fn write_json<T: Serialize>(
         storage: &ScopedStorage,
@@ -898,91 +1003,6 @@ mod tests {
             .expect("write json");
     }
 
-    async fn initialize_catalog_head(storage: &ScopedStorage, version: u64) -> String {
-        crate::Tier1Writer::new(storage.clone())
-            .initialize()
-            .await
-            .expect("initialize tier-1 state");
-
-        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, version);
-        let current_path =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet");
-        storage
-            .put_raw(
-                &current_path,
-                Bytes::from_static(b"current catalog snapshot"),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write current snapshot");
-
-        let mut snapshot = crate::manifest::SnapshotInfo::new(version, snapshot_dir.clone());
-        snapshot.add_file(crate::manifest::SnapshotFile {
-            path: "tables.parquet".to_string(),
-            checksum_sha256: "ab".repeat(32),
-            byte_size: 24,
-            row_count: 1,
-            position_range: None,
-        });
-        let manifest_id = crate::manifest::format_manifest_id(version);
-        let manifest_path =
-            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
-        write_json(
-            storage,
-            &manifest_path,
-            &CatalogDomainManifest {
-                manifest_id: manifest_id.clone(),
-                epoch: version,
-                previous_manifest_path: None,
-                writer_session_id: Some("retention-repair-test".to_string()),
-                snapshot_version: version,
-                snapshot_path: snapshot_dir,
-                snapshot: Some(snapshot),
-                watermark_event_id: None,
-                last_commit_id: None,
-                fencing_token: Some(version),
-                commit_ulid: None,
-                parent_hash: None,
-                updated_at: Utc::now(),
-            },
-            WritePrecondition::DoesNotExist,
-        )
-        .await;
-        write_json(
-            storage,
-            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
-            &DomainManifestPointer {
-                manifest_id,
-                manifest_path,
-                epoch: version,
-                parent_pointer_hash: None,
-                updated_at: Utc::now(),
-            },
-            WritePrecondition::None,
-        )
-        .await;
-
-        current_path
-    }
-
-    fn cleanup_report(path: String, visible_version: u64) -> ReconciliationReport {
-        ReconciliationReport {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            checked_at: Utc::now(),
-            manifest_snapshot_version: visible_version,
-            manifest_snapshot_count: 1,
-            storage_snapshot_count: 1,
-            ledger_event_count: 0,
-            issues: vec![ReconciliationIssue {
-                issue_type: IssueType::OldSnapshotVersion,
-                path,
-                description: "snapshot file below the visible head".to_string(),
-                severity: Severity::Warning,
-                repairable: true,
-            }],
-        }
-    }
-
     #[test]
     fn extract_snapshot_version_parses_tier1_and_tier2() {
         assert_eq!(
@@ -997,6 +1017,36 @@ mod tests {
             Reconciler::extract_snapshot_version("snapshots/catalog/invalid/file.parquet"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn retained_versions_are_numeric_bounded_and_paged() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        for version in 1..=300 {
+            storage
+                .put_raw(
+                    &CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet"),
+                    Bytes::from_static(b"snapshot"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("write snapshot");
+        }
+
+        let retained = Reconciler::new(storage)
+            .with_retention_policy(&gc::RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 0,
+                ledger_retention_hours: 48,
+                max_age_days: 90,
+            })
+            .retained_versions("snapshots/catalog/", 300)
+            .await
+            .expect("scan retained versions");
+
+        assert_eq!(retained.len(), 10);
+        assert_eq!(retained, (291..=300).collect());
     }
 
     #[tokio::test]
@@ -1450,136 +1500,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repair_skips_recent_superseded_snapshot_files() {
-        let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
-        let superseded = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet");
-        storage
-            .put_raw(
-                &superseded,
-                Bytes::from_static(b"superseded snapshot bytes"),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write superseded snapshot");
-
-        let report = ReconciliationReport {
-            domain: CatalogDomain::Catalog.as_str().to_string(),
-            checked_at: Utc::now(),
-            manifest_snapshot_version: 2,
-            manifest_snapshot_count: 1,
-            storage_snapshot_count: 1,
-            ledger_event_count: 0,
-            issues: vec![ReconciliationIssue {
-                issue_type: IssueType::OldSnapshotVersion,
-                path: superseded.clone(),
-                description: "snapshot file below the visible head".to_string(),
-                severity: Severity::Warning,
-                repairable: true,
-            }],
-        };
-
-        let result = Reconciler::new(storage.clone())
-            .repair(&report)
-            .await
-            .expect("repair");
-
-        assert_eq!(result.repaired_count, 0);
-        assert_eq!(result.skipped_count, 1);
-        storage
-            .get_raw(&superseded)
-            .await
-            .expect("a recently superseded snapshot must survive repair");
-    }
-
-    #[tokio::test]
-    async fn repair_preserves_versions_inside_the_retention_window() {
-        let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
-        initialize_catalog_head(&storage, 12).await;
-        let retained = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 11, "tables.parquet");
-        storage
-            .put_raw(
-                &retained,
-                Bytes::from_static(b"retained snapshot"),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write retained snapshot");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-
-        let result = Reconciler::new(storage.clone())
-            .with_retention_policy(RetentionPolicy {
-                keep_snapshots: 10,
-                delay_hours: 0,
-                ledger_retention_hours: 48,
-                max_age_days: 90,
-            })
-            .repair(&cleanup_report(retained.clone(), 12))
-            .await
-            .expect("repair");
-
-        assert_eq!(result.repaired_count, 0);
-        assert_eq!(result.skipped_count, 1);
-        storage
-            .get_raw(&retained)
-            .await
-            .expect("a retained snapshot version must survive repair");
-    }
-
-    #[tokio::test]
-    async fn repair_deletes_only_through_a_settled_retention_epoch() {
-        let backend = Arc::new(MemoryBackend::new());
-        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
-        initialize_catalog_head(&storage, 12).await;
-        for version in 1..12 {
-            storage
-                .put_raw(
-                    &CatalogPaths::snapshot_file(CatalogDomain::Catalog, version, "tables.parquet"),
-                    Bytes::from_static(b"superseded snapshot"),
-                    WritePrecondition::None,
-                )
-                .await
-                .expect("write superseded snapshot");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        let deletable = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "tables.parquet");
-
-        let result = Reconciler::new(storage.clone())
-            .with_retention_policy(RetentionPolicy {
-                keep_snapshots: 10,
-                delay_hours: 0,
-                ledger_retention_hours: 48,
-                max_age_days: 90,
-            })
-            .repair(&cleanup_report(deletable.clone(), 12))
-            .await
-            .expect("repair");
-
-        assert_eq!(result.repaired_count, 1);
-        assert_eq!(result.skipped_count, 0);
-        assert!(
-            storage
-                .head_raw(&deletable)
-                .await
-                .expect("head deleted snapshot")
-                .is_none()
-        );
-        let epoch: serde_json::Value = serde_json::from_slice(
-            &storage
-                .get_raw(crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH)
-                .await
-                .expect("retention epoch evidence"),
-        )
-        .expect("retention epoch JSON");
-        assert_eq!(epoch["state"], serde_json::Value::from("IDLE"));
-        assert_eq!(
-            epoch["operation_kind"],
-            serde_json::Value::from("catalog_gc")
-        );
-    }
-
-    #[tokio::test]
     async fn repair_with_current_head_scope_skips_generic_cleanup_issues() {
         let backend = Arc::new(MemoryBackend::new());
         let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
@@ -1683,5 +1603,554 @@ mod tests {
             .get_raw(&old_snapshot)
             .await
             .expect("current-head-only repair must not delete generic cleanup candidates");
+    }
+
+    /// Seeds an initialized Tier-1 workspace whose catalog head is v2 and
+    /// writes the given files under the superseded v1 snapshot directory.
+    async fn seed_current_v2_head_with_old_v1_files(
+        storage: &ScopedStorage,
+        old_files: &[&str],
+    ) -> Vec<String> {
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize tier1");
+
+        let pointed_manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, "00000000000000000002");
+        let snapshot_dir = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 2);
+        let mut snapshot = crate::manifest::SnapshotInfo::new(2, snapshot_dir.clone());
+        snapshot.add_file(crate::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "22".repeat(32),
+            byte_size: 1,
+            row_count: 0,
+            position_range: None,
+        });
+        let pointed = CatalogDomainManifest {
+            manifest_id: crate::manifest::format_manifest_id(2),
+            epoch: 2,
+            previous_manifest_path: Some("manifests/catalog/00000000000000000001.json".to_string()),
+            writer_session_id: Some("repair-safety-test".to_string()),
+            snapshot_version: 2,
+            snapshot_path: snapshot_dir,
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(2),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        write_json(
+            storage,
+            &pointed_manifest_path,
+            &pointed,
+            WritePrecondition::DoesNotExist,
+        )
+        .await;
+        write_json(
+            storage,
+            &CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog),
+            &DomainManifestPointer {
+                manifest_id: "00000000000000000002".to_string(),
+                manifest_path: pointed_manifest_path,
+                epoch: 2,
+                parent_pointer_hash: None,
+                updated_at: Utc::now(),
+            },
+            WritePrecondition::None,
+        )
+        .await;
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 2, "current.parquet"),
+                Bytes::from_static(b"current"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current snapshot file");
+
+        let mut old_paths = Vec::new();
+        for file in old_files {
+            let path = CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, file);
+            storage
+                .put_raw(&path, Bytes::from_static(b"old"), WritePrecondition::None)
+                .await
+                .expect("write old snapshot file");
+            old_paths.push(path);
+        }
+        old_paths
+    }
+
+    /// Seeds an active retention pin whose snapshot record requires the given
+    /// exact object paths, mirroring the GC reachability test fixtures.
+    async fn seed_active_pin_over(storage: &ScopedStorage, pinned_paths: &[String]) {
+        let created_at = Utc::now() - Duration::hours(1);
+        let deadline = Utc::now() + Duration::days(1);
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let workspace_scope = WorkspaceScope::new(storage.tenant_id(), storage.workspace_id())
+            .expect("workspace scope");
+        let authority = PersistedAuthorityReference::new(
+            "arco-state-control-mvp",
+            StateScope::new(storage.tenant_id(), storage.workspace_id(), "catalog"),
+            PersistedAuthorityKind::StateToken,
+            "manifest-1",
+            1,
+            "state-store/control-mvp/catalog/manifests/manifest-1.json",
+            &digest,
+            None,
+            None,
+            deadline,
+        )
+        .expect("authority reference");
+        let required_objects = pinned_paths
+            .iter()
+            .map(|path| {
+                RequiredObject::new(path, 3, RequiredObjectKind::Other, &digest)
+                    .expect("required retained object")
+            })
+            .collect();
+        let snapshot = WorkspaceSnapshot::new(
+            TEST_SNAPSHOT_ID,
+            TEST_PIN_ID,
+            workspace_scope.clone(),
+            created_at,
+            deadline,
+            None,
+            vec![
+                DomainAuthorityReference::new("catalog", workspace_scope, authority)
+                    .expect("domain authority"),
+            ],
+            vec![],
+            vec![DomainEventArchive::empty("catalog").expect("archive")],
+            required_objects,
+            vec![],
+        )
+        .expect("snapshot");
+        storage
+            .put_raw(
+                &snapshot_record_path(TEST_SNAPSHOT_ID).expect("snapshot record path"),
+                Bytes::from(encode_workspace_snapshot(&snapshot).expect("snapshot bytes")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write snapshot record");
+
+        let revision = RetentionPinRevision::new(
+            TEST_PIN_ID,
+            1,
+            RetentionTarget::snapshot(TEST_SNAPSHOT_ID).expect("target"),
+            created_at,
+            deadline,
+            None,
+        )
+        .expect("pin revision");
+        let revision_bytes = encode_retention_pin_revision(&revision).expect("revision bytes");
+        let revision_digest = sha256_digest(&revision_bytes);
+        let revision_path = retention_pin_revision_path(TEST_PIN_ID, 1).expect("pin revision path");
+        storage
+            .put_raw(
+                &revision_path,
+                Bytes::from(revision_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write revision");
+        let selector = RetentionPinLatest::new(TEST_PIN_ID, 1, revision_path, revision_digest)
+            .expect("selector");
+        storage
+            .put_raw(
+                &retention_pin_latest_path(TEST_PIN_ID).expect("pin latest path"),
+                Bytes::from(encode_retention_pin_latest(&selector).expect("selector bytes")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write selector");
+    }
+
+    /// Regression for #343: a snapshot version pinned by a retention record
+    /// with an unexpired `retained_until` must survive a Full repair pass,
+    /// while an aged unpinned candidate in the same superseded version is
+    /// deleted, and the pass settles the durable retention mutation epoch.
+    #[tokio::test]
+    async fn repair_full_scope_preserves_retention_pinned_paths_and_deletes_aged_unpinned() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let mut old_paths =
+            seed_current_v2_head_with_old_v1_files(&storage, &["pinned.parquet", "stale.parquet"])
+                .await
+                .into_iter();
+        let pinned_path = old_paths.next().expect("pinned path");
+        let stale_path = old_paths.next().expect("stale path");
+        seed_active_pin_over(&storage, std::slice::from_ref(&pinned_path)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let reconciler = reconciler_without_retention_window(storage.clone());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        assert_eq!(
+            report.issues_of_type(IssueType::OldSnapshotVersion).len(),
+            2,
+            "both superseded v1 files must be flagged"
+        );
+
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("repair");
+        assert_eq!(result.repaired_count, 1, "only the unpinned candidate");
+        assert!(result.skipped_count >= 1, "the pinned candidate is skipped");
+        assert_eq!(result.failed_count, 0);
+
+        storage
+            .get_raw(&pinned_path)
+            .await
+            .expect("retention-pinned path must survive a Full repair pass");
+        assert!(
+            storage
+                .head_raw(&stale_path)
+                .await
+                .expect("head stale path")
+                .is_none(),
+            "aged unpinned candidate must be deleted"
+        );
+
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("durable epoch record must exist after a deleting repair"),
+        )
+        .expect("epoch json");
+        assert_eq!(epoch["state"], "IDLE", "epoch must settle after repair");
+        assert_eq!(epoch["operation_kind"], "catalog_repair");
+    }
+
+    /// Regression for #343/#357: candidates younger than the minimum age
+    /// (default: the maximum signed-URL TTL) are never deleted, so an
+    /// unexpired signed URL for the previous version cannot start returning
+    /// 404 within seconds of an unrelated commit.
+    #[tokio::test]
+    async fn repair_full_scope_skips_candidates_younger_than_minimum_age() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let stale_path = seed_current_v2_head_with_old_v1_files(&storage, &["stale.parquet"])
+            .await
+            .into_iter()
+            .next()
+            .expect("stale path");
+
+        let reconciler = Reconciler::new(storage.clone());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        assert_eq!(
+            report.issues_of_type(IssueType::OldSnapshotVersion).len(),
+            1
+        );
+
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("repair");
+        assert_eq!(result.repaired_count, 0);
+        assert!(result.skipped_count >= 1);
+
+        storage
+            .get_raw(&stale_path)
+            .await
+            .expect("recently written candidate must survive within the minimum age window");
+    }
+
+    /// A backend that fails `delete` for one exact path and otherwise defers.
+    #[derive(Debug)]
+    struct FailingDeleteBackend {
+        inner: MemoryBackend,
+        failing_path: String,
+    }
+
+    impl FailingDeleteBackend {
+        fn new(failing_path: impl Into<String>) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                failing_path: failing_path.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FailingDeleteBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            if path.ends_with(&self.failing_path) {
+                return Err(arco_core::Error::Storage {
+                    message: format!("injected delete failure for {path}"),
+                    source: None,
+                });
+            }
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: std::time::Duration,
+        ) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    /// One object that will not delete must not abandon the rest of the pass,
+    /// and must never strand the durable epoch IN_FLIGHT.
+    ///
+    /// Aborting on the first delete error left
+    /// `{"state":"IN_FLIGHT","operation_kind":"catalog_repair"}` behind, after
+    /// which every GC pass, repair retry, snapshot, export, and restore failed
+    /// with "a retention mutation epoch is already in flight" -- forever, and
+    /// re-failing on each 300s automation retry.
+    #[tokio::test]
+    async fn repair_counts_a_failed_delete_continues_the_pass_and_settles_the_epoch() {
+        let backend = Arc::new(FailingDeleteBackend::new("undeletable.parquet"));
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let old_paths = seed_current_v2_head_with_old_v1_files(
+            &storage,
+            &["undeletable.parquet", "deletable.parquet"],
+        )
+        .await;
+        let undeletable = old_paths.first().expect("undeletable path").clone();
+        let deletable = old_paths.get(1).expect("deletable path").clone();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let reconciler = reconciler_without_retention_window(storage.clone());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("one failed delete must not fail the whole pass");
+
+        assert_eq!(result.failed_count, 1, "the failure must be counted");
+        assert_eq!(
+            result.repaired_count, 1,
+            "the remaining authorized candidate must still be repaired"
+        );
+        storage
+            .get_raw(&undeletable)
+            .await
+            .expect("the object whose delete failed is still present");
+        assert!(
+            storage
+                .head_raw(&deletable)
+                .await
+                .expect("head deletable")
+                .is_none(),
+            "repairs after the failure must still proceed"
+        );
+
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("durable epoch record"),
+        )
+        .expect("epoch json");
+        assert_eq!(
+            epoch["state"], "IDLE",
+            "a per-object delete failure must not strand the workspace exclusion record"
+        );
+
+        // Nothing is wedged: GC and a repair retry both still claim the epoch.
+        gc::GarbageCollector::new(
+            storage.clone(),
+            gc::RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 24,
+                max_age_days: 1,
+            },
+        )
+        .collect()
+        .await
+        .expect("GC must not be wedged by a failed repair delete");
+        let retry_report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("retry check");
+        reconciler
+            .repair_with_scope(&retry_report, RepairScope::Full)
+            .await
+            .expect("a healthy repair retry must not be wedged");
+    }
+
+    /// A holder that dies between claiming the durable epoch and settling it
+    /// blocks every coordinated operation. The operator recovery path settles
+    /// the stale record after the lease proves the holder is gone, and GC and
+    /// repair work again.
+    #[tokio::test]
+    async fn operator_recovery_unblocks_repair_and_gc_after_a_dead_holder() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let stale_path = seed_current_v2_head_with_old_v1_files(&storage, &["stale.parquet"])
+            .await
+            .into_iter()
+            .next()
+            .expect("stale path");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // A holder claims the epoch and dies: the handle goes away without
+        // settling, exactly as a process crash leaves the durable record.
+        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire(RETENTION_GC_LOCK_TTL, 1)
+            .await
+            .expect("retention lock");
+        let _dead_holder_epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            TEST_SNAPSHOT_ID,
+        )
+        .await
+        .expect("claim epoch");
+        guard.release().await.expect("release retention lock");
+
+        let reconciler = reconciler_without_retention_window(storage.clone());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        assert!(
+            reconciler
+                .repair_with_scope(&report, RepairScope::Full)
+                .await
+                .is_err(),
+            "repair must fail closed until the stale epoch is settled"
+        );
+
+        let recovered = crate::retention_coordination::recover_stale_retention_epoch(
+            &storage,
+            "holder confirmed dead during incident 4711",
+        )
+        .await
+        .expect("recovery")
+        .expect("the stale in-flight epoch must be reported");
+        assert_eq!(
+            recovered.operation_kind,
+            RetentionMutationKind::WorkspaceSnapshotFinalize
+        );
+        assert!(recovered.operator_override);
+
+        gc::GarbageCollector::new(
+            storage.clone(),
+            gc::RetentionPolicy {
+                keep_snapshots: 10,
+                delay_hours: 24,
+                ledger_retention_hours: 24,
+                max_age_days: 1,
+            },
+        )
+        .collect()
+        .await
+        .expect("GC must succeed after recovery");
+        let result = reconciler
+            .repair_with_scope(&report, RepairScope::Full)
+            .await
+            .expect("repair must succeed after recovery");
+        assert_eq!(result.repaired_count, 1);
+        assert!(
+            storage
+                .head_raw(&stale_path)
+                .await
+                .expect("head stale path")
+                .is_none()
+        );
+    }
+
+    /// Regression for #343: a Full repair pass fails closed while a foreign
+    /// retention mutation epoch is in flight, deleting nothing.
+    #[tokio::test]
+    async fn repair_full_scope_fails_closed_while_a_retention_epoch_is_in_flight() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
+        let stale_path = seed_current_v2_head_with_old_v1_files(&storage, &["stale.parquet"])
+            .await
+            .into_iter()
+            .next()
+            .expect("stale path");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // Leave a foreign epoch in flight (a crashed snapshot finalize).
+        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire(RETENTION_GC_LOCK_TTL, 1)
+            .await
+            .expect("retention lock");
+        let _in_flight = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            TEST_SNAPSHOT_ID,
+        )
+        .await
+        .expect("claim foreign epoch");
+        guard.release().await.expect("release retention lock");
+
+        let reconciler = reconciler_without_retention_window(storage.clone());
+        let report = reconciler
+            .check(CatalogDomain::Catalog)
+            .await
+            .expect("check");
+        assert!(
+            reconciler
+                .repair_with_scope(&report, RepairScope::Full)
+                .await
+                .is_err(),
+            "repair must fail closed while a foreign retention epoch is in flight"
+        );
+        storage
+            .get_raw(&stale_path)
+            .await
+            .expect("no candidate may be deleted while a foreign epoch is in flight");
     }
 }

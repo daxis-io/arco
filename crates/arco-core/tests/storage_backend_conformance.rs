@@ -1,5 +1,11 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
+// Test-target lint scope (#331): conformance helpers signal failure by
+// panicking, mirroring the allow-*-in-tests policy in clippy.toml.
+#![allow(clippy::panic, clippy::indexing_slicing)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 
 #[path = "support/barrier_backend.rs"]
 mod barrier_backend;
@@ -271,6 +277,51 @@ async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>
     assert_exact_one_cas_winner(name, backend, &path, &recreated_version).await;
 }
 
+async fn assert_bounded_list_conformance(name: &str, backend: &Arc<dyn StorageBackend>) {
+    const LIMIT: usize = 3;
+    let prefix = format!("conformance/{name}/{}/paged/", Ulid::new());
+    let expected: Vec<String> = (0..6)
+        .map(|index| format!("{prefix}object-{index:02}.json"))
+        .collect();
+    for path in &expected {
+        let result = backend
+            .put(
+                path,
+                Bytes::from_static(b"page"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("seed bounded-list conformance object");
+        assert!(matches!(result, WriteResult::Success { .. }));
+    }
+
+    let mut cursor: Option<String> = None;
+    let mut seen = Vec::new();
+    loop {
+        let page = backend
+            .list_page(&prefix, cursor.as_deref(), LIMIT)
+            .await
+            .expect("bounded list page");
+        assert!(page.objects.len() <= LIMIT);
+        if let Some(cursor) = cursor.as_deref() {
+            assert!(page.objects.iter().all(|meta| meta.path.as_str() > cursor));
+        }
+        seen.extend(page.objects.into_iter().map(|meta| meta.path));
+        let Some(next) = page.next_start_after else {
+            break;
+        };
+        cursor = Some(next);
+    }
+
+    assert_eq!(seen, expected);
+    for path in &expected {
+        backend
+            .delete(path)
+            .await
+            .expect("delete bounded-list conformance object");
+    }
+}
+
 fn assert_head_version(head: &ObjectMeta, expected_version: &str) {
     assert_eq!(head.version, expected_version);
     assert!(!head.version.is_empty(), "head version must be non-empty");
@@ -509,7 +560,8 @@ async fn gcs_backend_satisfies_storage_conformance() {
         .expect("ARCO_TEST_GCS_BUCKET must be set for the GCS conformance test");
     let backend: Arc<dyn StorageBackend> =
         Arc::new(ObjectStoreBackend::gcs(&bucket).expect("gcs backend"));
-    assert_storage_conformance("gcs", backend).await;
+    assert_storage_conformance("gcs", backend.clone()).await;
+    assert_bounded_list_conformance("gcs", &backend).await;
 }
 
 #[tokio::test]
@@ -519,5 +571,6 @@ async fn s3_backend_satisfies_storage_conformance() {
         .expect("ARCO_TEST_S3_BUCKET must be set for the S3 conformance test");
     let backend: Arc<dyn StorageBackend> =
         Arc::new(ObjectStoreBackend::s3(&bucket).expect("s3 backend"));
-    assert_storage_conformance("s3", backend).await;
+    assert_storage_conformance("s3", backend.clone()).await;
+    assert_bounded_list_conformance("s3", &backend).await;
 }

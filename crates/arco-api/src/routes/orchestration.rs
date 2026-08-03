@@ -6751,6 +6751,9 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::large_futures, clippy::too_many_lines)]
 mod tests {
     use super::*;
     use crate::routes::manifests::{AssetEntry, AssetKey, GitContext};
@@ -7450,7 +7453,7 @@ mod tests {
         let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
             .map_err(|err| anyhow!("{err:?}"))?;
 
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15".as_bytes());
+        let encoded = URL_SAFE_NO_PAD.encode(b"2024-01-15");
         let legacy_partition_key = format!("date=s:{encoded}");
         let legacy_fingerprint =
             hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
@@ -7482,7 +7485,7 @@ mod tests {
         let (_primary, variants) = build_request_fingerprint_variants(&request, &resolved)
             .map_err(|err| anyhow!("{err:?}"))?;
 
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T15:00:00Z".as_bytes());
+        let encoded = URL_SAFE_NO_PAD.encode(b"2024-01-15T15:00:00Z");
         let legacy_partition_key = format!("hour=s:{encoded}");
         let legacy_fingerprint =
             hash_trigger_fingerprint_payload(&request, Some(legacy_partition_key))?;
@@ -7498,7 +7501,7 @@ mod tests {
     #[test]
     fn test_resolve_partition_key_normalizes_hour_time_string() -> Result<()> {
         let partitioning = partitioning_spec(vec![time_dimension("hour", Some("hour"))]);
-        let encoded = URL_SAFE_NO_PAD.encode("2024-01-15T10:00:00-05:00".as_bytes());
+        let encoded = URL_SAFE_NO_PAD.encode(b"2024-01-15T10:00:00-05:00");
         let request = TriggerRunRequest {
             selection: vec!["analytics/users".to_string()],
             include_upstream: false,
@@ -7567,7 +7570,7 @@ mod tests {
             include_upstream: false,
             include_downstream: false,
             partitions: vec![],
-            partition_key: Some("".to_string()),
+            partition_key: Some(String::new()),
             run_key: None,
             labels: HashMap::new(),
         };
@@ -8247,8 +8250,10 @@ mod tests {
             Ok(hex::encode(Sha256::digest(&json)))
         }
 
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -8311,8 +8316,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_backfill_accepts_range_selector() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -8350,8 +8357,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_backfill_accepts_filter_selector() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -8390,8 +8399,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_backfill_created_event_replays_existing_after_claim_race() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -8469,8 +8480,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_backfill_retries_after_idempotency_claim_without_visible_event()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let backend = Arc::new(FailLedgerPutsBackend::new());
         let storage_backend: Arc<dyn StorageBackend> = backend.clone();
         let state = Arc::new(AppState::new(config, storage_backend));
@@ -8846,8 +8859,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_reemits_when_reservation_exists() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9033,8 +9048,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_uses_idempotency_header_when_run_key_is_absent() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9106,8 +9123,10 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_rejects_overlong_idempotency_header_when_run_key_is_absent()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
         let overlong_key = "x".repeat(MAX_RUN_KEY_LEN + 1);
 
@@ -9157,8 +9176,10 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_normalizes_reserve_run_key_fingerprint_mismatch_for_equivalent_variants()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9250,8 +9271,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_trigger_run_conflicts_on_fingerprint_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9325,8 +9348,10 @@ mod tests {
     #[tokio::test]
     async fn test_trigger_run_falls_back_to_scan_when_index_points_to_missing_manifest()
     -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9421,9 +9446,11 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_run_key_updates_missing_fingerprint() -> Result<()> {
         let cutoff = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.run_key_fingerprint_cutoff = Some(cutoff);
+        let config = crate::config::Config {
+            debug: true,
+            run_key_fingerprint_cutoff: Some(cutoff),
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {
@@ -9501,8 +9528,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_backfill_run_key_conflicts_on_mismatch() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let ctx = RequestContext {

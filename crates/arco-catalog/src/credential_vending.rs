@@ -2,16 +2,76 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ulid::Ulid;
 
 use crate::authz::privileges::Privilege;
 use crate::error::Result;
 use crate::metastore::events::LifecycleState;
+use crate::storage_governance::path_normalization::GovernedPath;
 use crate::storage_governance::{PathAuthorityKind, StorageGovernanceState};
 
 /// Default requested credential TTL when the client omits one.
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(3600);
+
+/// Maximum ledger staleness (in seconds) the vending path may serve from.
+///
+/// `metastore::publish::validate_storage_governance_manifest_freshness`
+/// derives its allowed staleness from this constant on every credential
+/// decision: with the value at zero, a projection missing even one committed
+/// event is rejected and vending denies closed, so no credential decision is
+/// ever made from state that predates a committed revocation. Raising this
+/// constant directly widens what that validator accepts (a sequence-behind
+/// manifest published within the budget) and therefore widens the
+/// revocation-freshness budget; see [`REVOCATION_FRESHNESS_BUDGET_SECS`].
+pub const MAX_PROJECTION_STALENESS_SECS: u64 = 0;
+
+/// Maximum ledger staleness the vending path may serve from.
+///
+/// See [`MAX_PROJECTION_STALENESS_SECS`].
+pub const MAX_PROJECTION_STALENESS: Duration = Duration::from_secs(MAX_PROJECTION_STALENESS_SECS);
+
+/// Maximum TTL (in seconds) any vended credential may carry.
+///
+/// [`CredentialVendingEngine`] clamps every allow decision to this bound
+/// regardless of the requested TTL.
+pub const MAX_CREDENTIAL_TTL_SECS: u64 = 3600;
+
+/// Maximum TTL any vended credential may carry.
+///
+/// See [`MAX_CREDENTIAL_TTL_SECS`].
+pub const MAX_CREDENTIAL_TTL: Duration = Duration::from_secs(MAX_CREDENTIAL_TTL_SECS);
+
+/// Revocation-freshness budget (in seconds): the worst-case duration a revoked
+/// authorization can still be honored by storage access.
+///
+/// The budget is the sum of the two exposure windows:
+///
+/// 1. **Projection staleness** ([`MAX_PROJECTION_STALENESS_SECS`], 0s): how far
+///    behind the ledger the state used for a new credential decision may be.
+///    The vending read path enforces exact-watermark equality, so a committed
+///    revocation is visible to every subsequent decision (stale state denies
+///    closed with HTTP 503 rather than serving).
+/// 2. **Maximum vended credential TTL** ([`MAX_CREDENTIAL_TTL_SECS`], 3600s):
+///    how long a credential minted immediately *before* the revocation
+///    committed can remain valid. The bound is anchored to the freshness
+///    *observation* rather than the decision instant
+///    ([`CredentialVendingRequest::freshness_observed_at`]): a request delayed
+///    between watermark validation and minting has that delay subtracted from
+///    the vended TTL, so a slow request cannot push expiry past
+///    `observation + 3600s`.
+///
+/// Worst case: `0s + 3600s = 3600s`. Any change to either half must update
+/// this constant and the "Revocation freshness budget" section of
+/// `docs/guide/src/reference/credential-vending-security.md` together.
+pub const REVOCATION_FRESHNESS_BUDGET_SECS: u64 =
+    MAX_PROJECTION_STALENESS_SECS + MAX_CREDENTIAL_TTL_SECS;
+
+/// Revocation-freshness budget as a [`Duration`].
+///
+/// See [`REVOCATION_FRESHNESS_BUDGET_SECS`].
+pub const REVOCATION_FRESHNESS_BUDGET: Duration =
+    Duration::from_secs(REVOCATION_FRESHNESS_BUDGET_SECS);
 
 /// Credential vending operation requested by a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +156,20 @@ pub struct CredentialVendingRequest {
     pub catalog_snapshot_version: String,
     /// Successful authorization evidence for this credential request.
     pub authorization: Option<CredentialVendingAuthorization>,
+    /// Trusted instant at which the projection watermark was observed to be at
+    /// the latest committed ledger watermark.
+    ///
+    /// Freshness validation is an *observation*, not a lock: an arbitrary
+    /// amount of work (cache identity revalidation, catalog reads, provider
+    /// minting) can run between the observation and the decision, during which
+    /// a revocation may commit. The engine therefore clamps every allow
+    /// decision to `freshness_observed_at + MAX_CREDENTIAL_TTL` rather than
+    /// `now + MAX_CREDENTIAL_TTL`, so elapsed time is subtracted from the
+    /// vended lifetime and the revocation-freshness budget
+    /// ([`REVOCATION_FRESHNESS_BUDGET_SECS`]) is measured from state
+    /// observation. Callers must set this from the loader that validated the
+    /// watermark, never from decision time.
+    pub freshness_observed_at: DateTime<Utc>,
 }
 
 /// Authorization evidence required before credentials can be minted.
@@ -149,13 +223,41 @@ pub struct CredentialVendingEngine {
 impl Default for CredentialVendingEngine {
     fn default() -> Self {
         Self {
-            max_ttl: Duration::from_secs(3600),
+            max_ttl: MAX_CREDENTIAL_TTL,
         }
     }
 }
 
 impl CredentialVendingEngine {
+    /// Returns the maximum TTL this engine clamps allow decisions to.
+    #[must_use]
+    pub const fn max_ttl(&self) -> Duration {
+        self.max_ttl
+    }
+
+    /// Returns the worst-case duration a revoked authorization can still be
+    /// honored under this engine: the enforced projection-staleness bound plus
+    /// the maximum vended credential TTL.
+    ///
+    /// For the default engine this equals [`REVOCATION_FRESHNESS_BUDGET`].
+    #[must_use]
+    pub fn revocation_exposure_budget(&self) -> Duration {
+        MAX_PROJECTION_STALENESS.saturating_add(self.max_ttl)
+    }
+
     /// Decides whether to vend temporary credentials for a governed path.
+    ///
+    /// Allow decisions are anchored to
+    /// [`CredentialVendingRequest::freshness_observed_at`]: the vended TTL is
+    /// clamped to the time remaining in `freshness_observed_at + max_ttl`, so
+    /// time spent between observing a fresh watermark and reaching this
+    /// decision is subtracted from the credential lifetime instead of
+    /// extending the revocation-freshness budget.
+    ///
+    /// The returned `authorized_path_prefixes` is the canonical
+    /// [`GovernedPath`] form of the requested path, never the raw request
+    /// string, so the prefix advertised to (and scoped into) a provider is the
+    /// same representation that was authorized.
     ///
     /// # Errors
     ///
@@ -194,6 +296,14 @@ impl CredentialVendingEngine {
             ));
         }
 
+        // The prefix that is authorized, advertised, and later scoped into a
+        // provider credential must be one canonical representation of the
+        // request. Parsing here (rather than reusing the raw request string)
+        // keeps the returned prefix byte-identical to the governed identity
+        // that `authority_for_path` matched.
+        let Ok(canonical_requested_path) = GovernedPath::parse(&request.requested_path) else {
+            return Ok(deny("path_not_governed", request.requested_ttl));
+        };
         let Ok(path_decision) =
             state.authority_for_path(&request.workspace_id, &request.requested_path)
         else {
@@ -225,18 +335,44 @@ impl CredentialVendingEngine {
             PathAuthorityKind::ManagedRoot => None,
         };
 
+        // TOCTOU clamp: the watermark was validated at
+        // `freshness_observed_at`, so the honored lifetime of this credential
+        // must end no later than that observation plus the maximum TTL.
+        let Some(remaining_freshness) =
+            remaining_freshness_ttl(request.freshness_observed_at, self.max_ttl)
+        else {
+            return Ok(deny("freshness_observation_expired", request.requested_ttl));
+        };
+        let granted_ttl = request
+            .requested_ttl
+            .min(self.max_ttl)
+            .min(remaining_freshness);
+
         Ok(CredentialVendingDecision {
             decision: CredentialDecision::Allow,
             reason_code: "allowed".to_string(),
             provider,
             credential_kind: Some("scoped_bearer".to_string()),
             authorized_object_id: Some(path_decision.object_id),
-            authorized_path_prefixes: vec![normalize_prefix(&request.requested_path)],
-            max_ttl: request.requested_ttl.min(self.max_ttl),
-            expires_at: expires_at_ms(request.requested_ttl.min(self.max_ttl)),
+            authorized_path_prefixes: vec![canonical_requested_path.canonical_uri()],
+            max_ttl: granted_ttl,
+            expires_at: expires_at_ms(granted_ttl),
             audit_event_id: Ulid::new().to_string(),
         })
     }
+}
+
+/// Returns the credential lifetime still available inside the
+/// observation-anchored bound `observed_at + max_ttl`, or `None` when that
+/// bound has already elapsed and no credential may be minted from the
+/// observation.
+fn remaining_freshness_ttl(observed_at: DateTime<Utc>, max_ttl: Duration) -> Option<Duration> {
+    let elapsed = Utc::now()
+        .signed_duration_since(observed_at)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let remaining = max_ttl.saturating_sub(elapsed);
+    (!remaining.is_zero()).then_some(remaining)
 }
 
 fn supports_operation(operation: CredentialOperation) -> bool {
@@ -297,12 +433,4 @@ fn deny(reason_code: &str, max_ttl: Duration) -> CredentialVendingDecision {
 fn expires_at_ms(ttl: Duration) -> i64 {
     let millis = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
     Utc::now().timestamp_millis().saturating_add(millis)
-}
-
-fn normalize_prefix(path: &str) -> String {
-    if path.ends_with('/') {
-        path.to_string()
-    } else {
-        format!("{path}/")
-    }
 }

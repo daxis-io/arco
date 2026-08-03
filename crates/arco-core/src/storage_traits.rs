@@ -361,6 +361,9 @@ impl<S: StorageBackend> SignedUrlStore for S {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::manual_let_else, clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
     use crate::storage::MemoryBackend;

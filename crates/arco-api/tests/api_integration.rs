@@ -2,6 +2,10 @@
 //!
 //! Tests the complete request flow: HTTP → routes → catalog → storage.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
@@ -788,6 +792,198 @@ mod catalogs {
         Ok(())
     }
 
+    async fn seed_and_publish_governance(
+        backend: &std::sync::Arc<arco_core::storage::MemoryBackend>,
+    ) -> Result<()> {
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        use arco_catalog::metastore::events::{
+            ExternalLocationRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
+            StorageCredentialRecord, WorkspaceBindingRecord,
+        };
+        use arco_catalog::metastore::ledger::MetastoreLedger;
+        use arco_catalog::metastore::projections::ProjectionRegistry;
+        use arco_catalog::metastore::publish::publish_current_metastore_projection;
+        use arco_core::{ControlPlaneScope, ScopedStorage};
+
+        let scope = ControlPlaneScope::workspace_alias("test-tenant", "test-workspace")
+            .context("control plane scope")?;
+        let backend_dyn: Arc<dyn arco_core::storage::StorageBackend> = backend.clone();
+        let storage = ScopedStorage::new(backend_dyn, "test-tenant", "test-workspace")
+            .context("scoped storage")?;
+        let events = vec![
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_001",
+                1,
+                MetastoreMutation::StorageCredentialUpserted(StorageCredentialRecord {
+                    credential_id: "cred_01".to_string(),
+                    name: "lakehouse-prod".to_string(),
+                    cloud: "gcs".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_000,
+                    properties: BTreeMap::new(),
+                    secret_material_ref: None,
+                    encrypted_payload: None,
+                }),
+            ),
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_002",
+                2,
+                MetastoreMutation::ExternalLocationUpserted(ExternalLocationRecord {
+                    location_id: "loc_orders".to_string(),
+                    name: "orders".to_string(),
+                    url: "gs://bucket/warehouse/orders/".to_string(),
+                    credential_id: "cred_01".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_001,
+                    properties: BTreeMap::new(),
+                }),
+            ),
+            MetastoreEvent::new_scoped(
+                &scope,
+                "event_003",
+                3,
+                MetastoreMutation::WorkspaceBindingUpserted(WorkspaceBindingRecord {
+                    binding_id: "binding_orders".to_string(),
+                    workspace_id: "test-workspace".to_string(),
+                    object_id: "loc_orders".to_string(),
+                    object_type: "EXTERNAL_LOCATION".to_string(),
+                    owner: "owner".to_string(),
+                    lifecycle_state: LifecycleState::Active,
+                    updated_at_ms: 1_800_000_000_002,
+                    properties: BTreeMap::new(),
+                }),
+            ),
+        ];
+        let ledger = MetastoreLedger::new(storage.clone());
+        for event in events {
+            ledger
+                .append_event(&event)
+                .await
+                .map_err(|err| anyhow::anyhow!("append governance event: {err}"))?;
+        }
+        publish_current_metastore_projection(&storage, &ProjectionRegistry::default())
+            .await
+            .map_err(|err| anyhow::anyhow!("publish governance projection: {err}"))?;
+        Ok(())
+    }
+
+    /// #358 sibling-route closure: `register_table_in_schema` validates a
+    /// client-supplied location against published storage governance —
+    /// foreign locations are a typed 400 while governed locations register.
+    #[tokio::test]
+    async fn test_register_table_in_schema_enforces_governed_locations() -> Result<()> {
+        use std::sync::Arc;
+
+        use arco_core::storage::MemoryBackend;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend.clone())
+            .build()
+            .test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        seed_and_publish_governance(&backend).await?;
+
+        let foreign = helpers::make_request(
+            Method::POST,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            Some(serde_json::json!({
+                "name": "exfil",
+                "location": "gs://attacker-bucket/warehouse/exfil",
+                "columns": []
+            })),
+        )?;
+        let foreign_resp = router
+            .clone()
+            .oneshot(foreign)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(
+            foreign_resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a foreign location must be denied under governance"
+        );
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "orders",
+                "location": "gs://bucket/warehouse/orders/events",
+                "columns": []
+            }),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a governed location must register"
+        );
+        assert_eq!(table.name, "orders");
+        Ok(())
+    }
+
+    /// #358: without a governance projection for the scope, client-supplied
+    /// locations preserve current behavior unchanged.
+    #[tokio::test]
+    async fn test_register_table_in_schema_ungoverned_scope_preserves_location_behavior()
+    -> Result<()> {
+        let router = test_router();
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs",
+            serde_json::json!({ "name": "analytics" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json(
+            router.clone(),
+            "/api/v1/catalogs/analytics/schemas",
+            serde_json::json!({ "name": "sales" }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, table): (_, SchemaTableResponse) = helpers::post_json(
+            router,
+            "/api/v1/catalogs/analytics/schemas/sales/tables",
+            serde_json::json!({
+                "name": "events",
+                "location": "gs://any-bucket/warehouse/events",
+                "columns": []
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(table.name, "events");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_register_delta_table_in_schema_rejects_invalid_location() -> Result<()> {
         let router = test_router();
@@ -1324,6 +1520,182 @@ mod lineage {
         assert_eq!(first.edge_type, "derives_from");
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_lineage_duplicate_posts_converge_on_one_edge() -> Result<()> {
+        let router = test_router();
+        let body = serde_json::json!({
+            "edges": [
+                {
+                    "source_id": "dup-src",
+                    "target_id": "dup-tgt",
+                    "edge_type": "derives_from",
+                    "run_id": "run-dup"
+                }
+            ]
+        });
+
+        for _ in 0..2 {
+            let (status, result): (_, AddEdgesResponse) =
+                helpers::post_json(router.clone(), "/api/v1/lineage/edges", body.clone()).await?;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(result.added, 1);
+        }
+
+        // The fold dedupes by the content-derived id: exactly one edge.
+        let (status, lineage): (_, LineageResponse) =
+            helpers::get_json(router.clone(), "/api/v1/lineage/dup-tgt").await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(lineage.upstream.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_within_request_duplicates_dedupe() -> Result<()> {
+        let router = test_router();
+        let edge = serde_json::json!({
+            "source_id": "batch-src",
+            "target_id": "batch-tgt",
+            "edge_type": "copies"
+        });
+        let (status, result): (_, AddEdgesResponse) = helpers::post_json(
+            router.clone(),
+            "/api/v1/lineage/edges",
+            serde_json::json!({
+                "edges": [
+                    edge,
+                    edge,
+                    {
+                        "source_id": "batch-src-2",
+                        "target_id": "batch-tgt",
+                        "edge_type": "copies"
+                    }
+                ]
+            }),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(result.added, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_distinct_run_ids_produce_distinct_edges() -> Result<()> {
+        let router = test_router();
+        for run_id in ["run-a", "run-b"] {
+            let (status, result): (_, AddEdgesResponse) = helpers::post_json(
+                router.clone(),
+                "/api/v1/lineage/edges",
+                serde_json::json!({
+                    "edges": [
+                        {
+                            "source_id": "runs-src",
+                            "target_id": "runs-tgt",
+                            "edge_type": "derives_from",
+                            "run_id": run_id
+                        }
+                    ]
+                }),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(result.added, 1);
+        }
+
+        let (_status, lineage): (_, LineageResponse) =
+            helpers::get_json(router.clone(), "/api/v1/lineage/runs-tgt").await?;
+        assert_eq!(lineage.upstream.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lineage_rejects_invalid_edges() -> Result<()> {
+        let router = test_router();
+
+        let oversized_type = "x".repeat(65);
+        let invalid_bodies = [
+            // Empty batch.
+            serde_json::json!({ "edges": [] }),
+            // Empty source_id.
+            serde_json::json!({
+                "edges": [{ "source_id": "", "target_id": "t", "edge_type": "derives_from" }]
+            }),
+            // Whitespace-only target_id.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "   ", "edge_type": "derives_from" }]
+            }),
+            // Oversized edge_type.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "t", "edge_type": oversized_type }]
+            }),
+            // Blank run_id.
+            serde_json::json!({
+                "edges": [{
+                    "source_id": "s",
+                    "target_id": "t",
+                    "edge_type": "derives_from",
+                    "run_id": ""
+                }]
+            }),
+            // NUL in target_id: the separator-injection shape that would have
+            // collided with a NUL in source_id under a separator-only edge-id
+            // encoding.
+            serde_json::json!({
+                "edges": [{ "source_id": "a", "target_id": "b\u{0000}c", "edge_type": "derives_from" }]
+            }),
+            // NUL in source_id: the other half of that pair.
+            serde_json::json!({
+                "edges": [{ "source_id": "a\u{0000}b", "target_id": "c", "edge_type": "derives_from" }]
+            }),
+            // Control character in edge_type.
+            serde_json::json!({
+                "edges": [{ "source_id": "s", "target_id": "t", "edge_type": "derives\u{0001}from" }]
+            }),
+            // Control character in run_id.
+            serde_json::json!({
+                "edges": [{
+                    "source_id": "s",
+                    "target_id": "t",
+                    "edge_type": "derives_from",
+                    "run_id": "run\u{0000}1"
+                }]
+            }),
+        ];
+
+        for body in invalid_bodies {
+            let request = helpers::make_request(Method::POST, "/api/v1/lineage/edges", Some(body))?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Batch above the cap.
+        let too_many: Vec<serde_json::Value> = (0..1001)
+            .map(|i| {
+                serde_json::json!({
+                    "source_id": format!("cap-src-{i}"),
+                    "target_id": "cap-tgt",
+                    "edge_type": "derives_from"
+                })
+            })
+            .collect();
+        let request = helpers::make_request(
+            Method::POST,
+            "/api/v1/lineage/edges",
+            Some(serde_json::json!({ "edges": too_many })),
+        )?;
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -1687,7 +2059,7 @@ mod orchestration {
         let ready_actions = ready_controller.reconcile(&manifest, &fold_state);
         let ready_events: Vec<_> = ready_actions
             .into_iter()
-            .filter_map(|action| action.into_event_data())
+            .filter_map(arco_flow::orchestration::controllers::ReadyDispatchAction::into_event_data)
             .map(|data| OrchestrationEvent::new("test-tenant", "test-workspace", data))
             .collect();
 
@@ -1871,7 +2243,7 @@ mod cross_cutting {
     use super::*;
     use serde::Deserialize;
 
-    const TEST_RSA_PRIVATE_KEY_PEM: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+    const TEST_RSA_PRIVATE_KEY_PEM: &str = r"-----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTL
 UTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2V
 rUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8H
@@ -1897,16 +2269,16 @@ QOLMyUqqMUILxdthHyFmiGkCgYEAn9+PjpjGMPHxL0gj8Q8VbzsFtou6b1deIRRA
 PYPeRz0CgYALHCj/Ji8XSsDoF/MhVhnGdIs2P99NNdmo3R2Pv0CuZbDKMU559LJH
 UvrKS8WkuWRDuKrz1W/EQKApFjDGpdqToZqriUFQzwy7mR3ayIiogzNtHcvbDHx8
 oFnGY0OFksX/ye0/XGpy2SFxYRwGU98HPYeBvAQQrVjdkzfy7BmXQQ==
------END RSA PRIVATE KEY-----"#;
+-----END RSA PRIVATE KEY-----";
 
-    const TEST_RSA_PUBLIC_KEY_PEM: &str = r#"-----BEGIN RSA PUBLIC KEY-----
+    const TEST_RSA_PUBLIC_KEY_PEM: &str = r"-----BEGIN RSA PUBLIC KEY-----
 MIIBCgKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4
 l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2VrUyW
 yj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG
 /AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4l
 QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
 3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQIDAQAB
------END RSA PUBLIC KEY-----"#;
+-----END RSA PUBLIC KEY-----";
 
     const TEST_USER_ID: &str = "test-user";
 

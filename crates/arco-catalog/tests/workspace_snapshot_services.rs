@@ -1,5 +1,13 @@
 //! Contract tests for direct-addressed workspace snapshot and export services.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used, clippy::panic)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines, clippy::unused_async)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -377,10 +385,7 @@ fn export_manifest() -> ExportManifest {
         scope.clone(),
         ts(1_800_000_000),
         ts(1_900_000_000),
-        vec![
-            DomainAuthorityReference::new("catalog", scope.clone(), authority)
-                .expect("domain authority"),
-        ],
+        vec![DomainAuthorityReference::new("catalog", scope, authority).expect("domain authority")],
         Vec::new(),
         vec![DomainEventArchive::empty("catalog").expect("archive")],
         vec![
@@ -899,6 +904,17 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
     assert!(checkpoint_paths[0].contains("/control-mvp/catalog/"));
     assert!(checkpoint_paths[1].contains("/control-mvp/search/"));
 
+    // Checkpoint materialization writes exactly one immutable state-snapshot
+    // object per domain (the bounded-replay anchor), and nothing else.
+    let state_paths = put_paths
+        .iter()
+        .copied()
+        .filter(|path| path.contains("/states/"))
+        .collect::<Vec<_>>();
+    assert_eq!(state_paths.len(), 2);
+    assert!(state_paths[0].contains("/control-mvp/catalog/"));
+    assert!(state_paths[1].contains("/control-mvp/search/"));
+
     assert_eq!(
         put_paths
             .iter()
@@ -917,6 +933,7 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
     );
     assert!(put_paths.iter().all(|path| {
         path.contains("/checkpoints/")
+            || path.contains("/states/")
             || path.contains("/retention/")
             || path.ends_with("/locks/workspace-retention-gc.lock.json")
     }));
@@ -3081,7 +3098,7 @@ async fn preflight_reports_sorted_redacted_issue_categories_and_scope() {
         report
             .issues()
             .iter()
-            .map(|issue| issue.kind())
+            .map(arco_catalog::workspace_snapshot_service::RestorePreflightIssue::kind)
             .collect::<Vec<_>>(),
         vec![
             RestorePreflightIssueKind::Missing,

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
+
+use crate::permissions::CompiledPermissionSource;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
 
@@ -25,8 +27,18 @@ pub struct UnityCatalogState {
     pub storage: Arc<dyn StorageBackend>,
     /// Server-side configuration.
     pub config: UnityCatalogConfig,
-    /// Optional compiled Arco permission view used by compatibility adapters.
-    pub compiled_permissions: Option<Arc<RwLock<CompiledPermissionSet>>>,
+    /// Optional statically supplied compiled permission view.
+    ///
+    /// Used by harnesses that pin an exact view. Production wiring supplies
+    /// [`Self::permission_source`] instead, which resolves a scope-correct view
+    /// per request; when both are present the source wins.
+    pub compiled_permissions: Option<Arc<RwLock<Arc<CompiledPermissionSet>>>>,
+    /// Authoritative per-scope compiled permission source.
+    ///
+    /// This is what the production server wires: without it (and without a
+    /// static view) every authorized route denies closed with
+    /// `permissions_unavailable`.
+    pub permission_source: Option<Arc<dyn CompiledPermissionSource>>,
     /// Published storage-governance projection cache for credential decisions.
     pub storage_governance_cache: Arc<PublishedStorageGovernanceCache>,
     /// Optional security audit event emitter.
@@ -41,6 +53,7 @@ impl UnityCatalogState {
             storage,
             config: UnityCatalogConfig::default(),
             compiled_permissions: None,
+            permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
         }
@@ -53,6 +66,7 @@ impl UnityCatalogState {
             storage,
             config,
             compiled_permissions: None,
+            permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
         }
@@ -61,7 +75,18 @@ impl UnityCatalogState {
     /// Adds a compiled permission view for UC compatibility routes.
     #[must_use]
     pub fn with_compiled_permissions(mut self, permissions: CompiledPermissionSet) -> Self {
-        self.compiled_permissions = Some(Arc::new(RwLock::new(permissions)));
+        self.compiled_permissions = Some(Arc::new(RwLock::new(Arc::new(permissions))));
+        self
+    }
+
+    /// Wires the authoritative per-scope compiled permission source.
+    ///
+    /// Required for a deployed server: without it, authorization has no
+    /// permission view to evaluate and fails closed for every principal,
+    /// including administrators.
+    #[must_use]
+    pub fn with_permission_source(mut self, source: Arc<dyn CompiledPermissionSource>) -> Self {
+        self.permission_source = Some(source);
         self
     }
 

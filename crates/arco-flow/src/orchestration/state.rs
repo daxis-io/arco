@@ -2755,11 +2755,18 @@ mod tests {
         event
     }
 
+    /// Mints a deterministic ULID event id whose embedded timestamp matches
+    /// the event's `ts(10_000 + offset)` producer timestamp. Retention derives
+    /// its reference from event-id ULID timestamps, so fixture ids must agree
+    /// with the times their events intend; the discriminator hash keeps ids
+    /// unique while preserving offset ordering.
     fn test_event_id(timestamp_offset_seconds: i64, discriminator: &str) -> String {
         let suffix = discriminator.bytes().fold(0_u64, |acc, byte| {
             acc.wrapping_mul(131).wrapping_add(u64::from(byte))
-        }) % 1_000_000_000_000;
-        format!("01KSTATE{timestamp_offset_seconds:06}{suffix:012}")
+        });
+        let ms = u64::try_from(ts(10_000 + timestamp_offset_seconds).timestamp_millis())
+            .unwrap_or_default();
+        ulid::Ulid::from_parts(ms, u128::from(suffix)).to_string()
     }
 
     fn task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {

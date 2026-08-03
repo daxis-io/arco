@@ -2,6 +2,10 @@
 //!
 //! Focus: deterministic staleness computation and core “at-least-once” safety properties.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use std::collections::HashMap;
 
 use arco_flow::orchestration::callbacks::TaskOutput as CallbackTaskOutput;

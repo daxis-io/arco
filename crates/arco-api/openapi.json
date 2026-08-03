@@ -4375,7 +4375,9 @@
             "items": {
               "$ref": "#/components/schemas/EdgeDefinition"
             },
-            "description": "List of edges to add."
+            "description": "List of edges to add.",
+            "maxItems": 1000,
+            "minItems": 1
           }
         }
       },
@@ -4388,7 +4390,7 @@
         "properties": {
           "added": {
             "type": "integer",
-            "description": "Number of edges added.",
+            "description": "Number of unique edges accepted (duplicates within the request and\nacross retries converge on the same content-derived edge id).",
             "minimum": 0
           }
         }
@@ -5323,7 +5325,7 @@
       },
       "EdgeDefinition": {
         "type": "object",
-        "description": "Edge definition for lineage.",
+        "description": "Edge definition for lineage.\n\nThe `maxLength` bounds published here are the same bounds\n`validate_edges` enforces server-side; they are advertised so clients see\nthe contract rather than discovering it through a 400.",
         "required": [
           "source_id",
           "target_id"
@@ -5331,22 +5333,26 @@
         "properties": {
           "edge_type": {
             "type": "string",
-            "description": "Edge type (e.g., `derives_from`, `copies`, `transforms`)."
+            "description": "Edge type (e.g., `derives_from`, `copies`, `transforms`).",
+            "maxLength": 64
           },
           "run_id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Optional run ID that created this edge."
+            "description": "Optional run ID that created this edge.",
+            "maxLength": 256
           },
           "source_id": {
             "type": "string",
-            "description": "Source table ID (upstream)."
+            "description": "Source table ID (upstream).",
+            "maxLength": 256
           },
           "target_id": {
             "type": "string",
-            "description": "Target table ID (downstream)."
+            "description": "Target table ID (downstream).",
+            "maxLength": 256
           }
         }
       },

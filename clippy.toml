@@ -1,0 +1,15 @@
+# Clippy configuration for the Arco workspace.
+#
+# The workspace lint policy (Cargo.toml [workspace.lints.clippy]) denies
+# unwrap_used / expect_used / panic so production code cannot silently fail.
+# Test code is a different regime: tests communicate failure BY panicking
+# (assert!, unwrap on fixtures), so once CI lints test targets via
+# `cargo clippy --all-targets` (#331) these restriction lints must not fire
+# in test contexts. These knobs scope the restriction lints to production
+# code only; they do not relax any lint for non-test code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true

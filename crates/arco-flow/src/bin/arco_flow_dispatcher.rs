@@ -30,8 +30,9 @@ use arco_flow::orchestration::controllers::{
 };
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use arco_flow::orchestration::flow_service::append_events_and_compact;
-use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
-use arco_worker_contract::callback_task_id;
+use arco_flow::orchestration::worker_contract::{
+    DispatchEnvelopeSpec, dispatch_envelope_for_attempt,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -192,10 +193,10 @@ async fn run_handler(
             continue;
         };
 
-        let callback_task_id = callback_task_id(run_id, task_key);
+        let callback_task_id = arco_worker_contract::callback_task_id(run_id, task_key);
         let minted = mint_task_token_for_attempt(
             &state.task_token_config,
-            callback_task_id.clone(),
+            callback_task_id,
             state.tenant_id.clone(),
             state.workspace_id.clone(),
             run_id.clone(),
@@ -205,23 +206,23 @@ async fn run_handler(
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
 
-        let envelope = WorkerDispatchEnvelope {
-            tenant_id: state.tenant_id.clone(),
-            workspace_id: state.workspace_id.clone(),
-            run_id: run_id.clone(),
-            task_id: callback_task_id,
-            task_key: task_key.clone(),
-            attempt: *attempt,
-            attempt_id: attempt_id.clone(),
-            dispatch_id: dispatch_id.clone(),
-            execution_location_id: None,
-            worker_queue: worker_queue.clone(),
-            callback_base_url: state.callback_base_url.clone(),
-            task_token: minted.token,
-            token_expires_at: minted.expires_at,
-            traceparent: None,
-            payload: serde_json::Value::Object(serde_json::Map::new()),
-        };
+        let task_row = fold_state.tasks.get(&(run_id.clone(), task_key.clone()));
+        let envelope = dispatch_envelope_for_attempt(
+            DispatchEnvelopeSpec {
+                tenant_id: state.tenant_id.clone(),
+                workspace_id: state.workspace_id.clone(),
+                run_id: run_id.clone(),
+                task_key: task_key.clone(),
+                attempt: *attempt,
+                attempt_id: attempt_id.clone(),
+                dispatch_id: dispatch_id.clone(),
+                worker_queue: worker_queue.clone(),
+                callback_base_url: state.callback_base_url.clone(),
+                task_token: minted.token,
+                token_expires_at: minted.expires_at,
+            },
+            task_row,
+        );
         let body = envelope
             .to_json()
             .map_err(|e| Error::serialization(format!("dispatch envelope error: {e}")))?;

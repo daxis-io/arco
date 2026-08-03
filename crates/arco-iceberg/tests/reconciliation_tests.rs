@@ -3,6 +3,14 @@
 //! These tests verify the full reconciliation and GC flows with
 //! memory-backed storage.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unreadable_literal
+)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -37,7 +45,7 @@ async fn test_full_reconciliation_flow_with_memory_backend() {
     let v1_json = format!(
         r#"{{
             "format-version": 2,
-            "table-uuid": "{}",
+            "table-uuid": "{table_uuid}",
             "location": "gs://bucket/table",
             "last-sequence-number": 1,
             "last-updated-ms": 1704067200000,
@@ -53,8 +61,7 @@ async fn test_full_reconciliation_flow_with_memory_backend() {
             "last-partition-id": 0,
             "default-sort-order-id": 0,
             "sort-orders": []
-        }}"#,
-        table_uuid
+        }}"#
     );
 
     storage
@@ -70,7 +77,7 @@ async fn test_full_reconciliation_flow_with_memory_backend() {
     let v2_json = format!(
         r#"{{
             "format-version": 2,
-            "table-uuid": "{}",
+            "table-uuid": "{table_uuid}",
             "location": "gs://bucket/table",
             "last-sequence-number": 2,
             "last-updated-ms": 1704153600000,
@@ -88,8 +95,7 @@ async fn test_full_reconciliation_flow_with_memory_backend() {
             "last-partition-id": 0,
             "default-sort-order-id": 0,
             "sort-orders": []
-        }}"#,
-        table_uuid
+        }}"#
     );
 
     storage
@@ -170,7 +176,7 @@ async fn test_reconcile_all_multiple_tables() {
             1704067200000_i64 + (i as i64 * 86400000)
         );
 
-        let path = format!("metadata/table{}/v1.json", i);
+        let path = format!("metadata/table{i}/v1.json");
         storage
             .put(&path, Bytes::from(metadata_json), WritePrecondition::None)
             .await
@@ -493,7 +499,7 @@ fn test_type_mapper_all_primitive_types() {
 
     for (iceberg_type, expected) in mappings {
         let result = IcebergTypeMapper::map_primitive(&iceberg_type);
-        assert_eq!(result, expected, "Failed for {:?}", iceberg_type);
+        assert_eq!(result, expected, "Failed for {iceberg_type:?}");
     }
 }
 
@@ -512,7 +518,7 @@ async fn test_concurrent_reconciliation_safety() {
     let metadata_json = format!(
         r#"{{
             "format-version": 2,
-            "table-uuid": "{}",
+            "table-uuid": "{table_uuid}",
             "location": "gs://bucket/table",
             "last-sequence-number": 1,
             "last-updated-ms": 1704067200000,
@@ -528,8 +534,7 @@ async fn test_concurrent_reconciliation_safety() {
             "last-partition-id": 0,
             "default-sort-order-id": 0,
             "sort-orders": []
-        }}"#,
-        table_uuid
+        }}"#
     );
 
     storage

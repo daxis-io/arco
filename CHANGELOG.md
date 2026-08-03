@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Phase 3 state-store prototype gates: the `ArcoStateReader`/`ArcoStateStore`/`ArcoStateTxn` seam with capability-discovery-only current adapter, the deterministic `ModelStateStore` reference backend, the object-store control-store MVP (txlog + manifest + pointer-CAS), and the advisory prototype promotion gate (#316).
+- Phase 4 shadow replay importer into an isolated `catalog-shadow` control-store domain plus opt-in internal comparison reads behind `ARCO_CATALOG_SHADOW_COMPARE_READS` (#317).
+- Control-store projection outbox acknowledgements: first low-risk writable control-store domain with idempotent acks, token-pinned reads, and freshness/watermark-lag reporting (#319).
+- Phase 6A path-governance metadata domain with canonical ancestor/descendant predicate model and deny-closed compiled-state readiness helpers (#318).
+- External location and workspace/metastore binding metadata domains with atomic companion-path declarations and secret-free credential references (#320).
+- Workspace snapshot export, roll-forward restore with REPAIR_REQUIRED journaling, and durable control-plane transaction handles with review-token workflow (#322).
+
+All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: crate-private with zero production callers, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
+
+### Changed
+- deps(rust): bumped `serde_with` from 3.16.1 to 3.21.0 (#321).
 
 ## [0.2.1] - 2026-06-27
 ### Added

@@ -1,5 +1,32 @@
 name: ADR-034 GCS Conformance
 
+# This workflow fails loudly instead of skipping green when its configuration
+# is missing (#366): a green run must mean the CAS gate actually executed.
+# Until the configuration below is provisioned, that means a red run every
+# night — intentional, but only useful if someone owns provisioning it. Whoever
+# is on that hook should either configure the workflow or, if GCS conformance
+# is not being certified right now, drop the `schedule:` trigger and run it on
+# dispatch, the way s3-conformance.yml does.
+#
+# HOW TO CONFIGURE
+#
+#   vars.ARCO_TEST_GCS_BUCKET  — a dedicated, disposable test bucket. Required
+#                                for both auth modes.
+#
+#   Then EITHER (preferred, keyless):
+#     vars.GCP_WORKLOAD_IDENTITY_PROVIDER — full resource name of the workload
+#         identity pool provider, e.g.
+#         projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+#     vars.GCP_SERVICE_ACCOUNT            — the service account email the
+#         provider is allowed to impersonate
+#     The pool provider must trust this repository, and the service account
+#     needs object read/write/delete on the bucket only. `id-token: write` is
+#     already granted below.
+#
+#   OR (fallback, long-lived credential):
+#     secrets.GCP_SA_KEY_API — JSON service-account key with the same bucket
+#         scope. Retained only for environments without workload identity.
+
 on:
   schedule:
     - cron: '0 5 * * *'
@@ -27,12 +54,20 @@ jobs:
         with:
           cache-targets: "false"
 
+      # Secrets and vars are passed through env: rather than interpolated into
+      # the script text, so their values never appear in the generated shell
+      # command.
       - name: Check GCS conformance prerequisites
         id: prereq
+        env:
+          BUCKET: ${{ vars.ARCO_TEST_GCS_BUCKET }}
+          WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          SA_KEY: ${{ secrets.GCP_SA_KEY_API }}
         run: |
-          if [ -n "${{ vars.ARCO_TEST_GCS_BUCKET }}" ] && [ -n "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}" ] && [ -n "${{ vars.GCP_SERVICE_ACCOUNT }}" ]; then
+          if [ -n "$BUCKET" ] && [ -n "$WORKLOAD_IDENTITY_PROVIDER" ] && [ -n "$SERVICE_ACCOUNT" ]; then
             echo "auth_mode=oidc" >> "$GITHUB_OUTPUT"
-          elif [ -n "${{ vars.ARCO_TEST_GCS_BUCKET }}" ] && [ -n "${{ secrets.GCP_SA_KEY_API }}" ]; then
+          elif [ -n "$BUCKET" ] && [ -n "$SA_KEY" ]; then
             echo "auth_mode=key" >> "$GITHUB_OUTPUT"
           else
             echo "auth_mode=skip" >> "$GITHUB_OUTPUT"
@@ -59,7 +94,19 @@ jobs:
           cargo test --locked -p arco-core --test storage_backend_conformance \
             gcs_backend_satisfies_storage_conformance -- --ignored --nocapture
 
-      - name: Skip GCS storage conformance suite
+      # This workflow only runs on schedule and workflow_dispatch; on both
+      # triggers a missing configuration is an evidence-integrity failure, not
+      # a skip (#366). A green run must mean the CAS gate actually executed.
+      - name: Fail on missing GCS conformance configuration
         if: steps.prereq.outputs.auth_mode == 'skip'
         run: |
-          echo "Skipping ADR-034 GCS conformance: missing vars.ARCO_TEST_GCS_BUCKET and GCP auth configuration"
+          {
+            echo "## ADR-034 GCS conformance: FAILED (unconfigured)"
+            echo ""
+            echo "GCS conformance cannot run: secrets unconfigured — the provider CAS gate is UNVERIFIED."
+            echo ""
+            echo "Configure \`vars.ARCO_TEST_GCS_BUCKET\` plus either"
+            echo "(\`vars.GCP_WORKLOAD_IDENTITY_PROVIDER\` + \`vars.GCP_SERVICE_ACCOUNT\`) or \`secrets.GCP_SA_KEY_API\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::GCS conformance cannot run: secrets unconfigured — the provider CAS gate is UNVERIFIED"
+          exit 1

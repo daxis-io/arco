@@ -34,6 +34,8 @@ let envelope = WorkerDispatchEnvelope {
     attempt_id: "att-123".to_string(),
     dispatch_id: "dispatch:run-123:analytics.daily_sales:1".to_string(),
     execution_location_id: None,
+    partition_key: None,
+    heartbeat_timeout_sec: Some(300),
     worker_queue: "default-queue".to_string(),
     callback_base_url: "https://api.arco.dev".to_string(),
     task_token: "<task-scoped-jwt>".to_string(),

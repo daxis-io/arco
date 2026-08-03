@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::missing_fields_in_debug)]
 
 use std::ops::Range;
 use std::sync::Arc;

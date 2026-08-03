@@ -1,5 +1,9 @@
 //! Tests for Layer 2 automation events and controllers.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unreadable_literal)]
+
 use arco_flow::orchestration::events::{
     BackfillState, OrchestrationEvent, OrchestrationEventData, PartitionSelector, RunRequest,
     SensorEvalStatus, TickStatus, TriggerSource, sha256_hex,
@@ -82,7 +86,7 @@ fn test_schedule_ticked_uses_stable_ulid() {
     if let OrchestrationEventData::ScheduleTicked { schedule_id, .. } = &event.data {
         // Should be alphanumeric ULID-style, not "daily-etl"
         assert!(
-            schedule_id.chars().all(|c| c.is_alphanumeric()),
+            schedule_id.chars().all(char::is_alphanumeric),
             "schedule_id should be ULID format"
         );
     }

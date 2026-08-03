@@ -1,5 +1,11 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
+// Test-target lint scope (#331): conformance helpers signal failure by
+// panicking, mirroring the allow-*-in-tests policy in clippy.toml.
+#![allow(clippy::panic, clippy::indexing_slicing)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 
 #[path = "support/barrier_backend.rs"]
 mod barrier_backend;

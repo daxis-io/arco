@@ -71,6 +71,13 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// A writer with a superseded fencing epoch attempted to publish state.
+    #[error("stale writer epoch: {message}")]
+    StaleWriterEpoch {
+        /// Description of the fencing failure.
+        message: String,
+    },
+
     /// Replayed terminal request failure with a preserved HTTP status code.
     #[error("{message}")]
     RequestFailed {
@@ -109,7 +116,9 @@ impl CatalogError {
     pub const fn http_status_code(&self) -> Option<u16> {
         match self {
             Self::Validation { .. } => Some(400),
-            Self::AlreadyExists { .. } | Self::CasFailed { .. } => Some(409),
+            Self::AlreadyExists { .. } | Self::CasFailed { .. } | Self::StaleWriterEpoch { .. } => {
+                Some(409)
+            }
             Self::NotFound { .. } => Some(404),
             Self::PreconditionFailed { .. } => Some(412),
             Self::RequestFailed { http_status, .. } => Some(*http_status),

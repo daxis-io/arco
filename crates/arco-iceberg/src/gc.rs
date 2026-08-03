@@ -1525,6 +1525,12 @@ pub struct ReceiptCleanupResult {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+// Test doubles in this module intentionally stub trait methods that the
+// covered scenarios never call (#331).
+#[allow(clippy::unimplemented)]
 mod tests {
     use super::*;
     use arco_core::storage::MemoryBackend;
@@ -1694,14 +1700,8 @@ mod tests {
 
         assert_eq!(result.total_count, 5);
         assert_eq!(result.by_table.len(), 2);
-        assert_eq!(
-            result.by_table.get(&table1).map(|v| v.len()).unwrap_or(0),
-            2
-        );
-        assert_eq!(
-            result.by_table.get(&table2).map(|v| v.len()).unwrap_or(0),
-            3
-        );
+        assert_eq!(result.by_table.get(&table1).map_or(0, Vec::len), 2);
+        assert_eq!(result.by_table.get(&table2).map_or(0, Vec::len), 3);
     }
 
     #[tokio::test]
@@ -2127,7 +2127,7 @@ mod tests {
         assert!(storage.head(&path).await.expect("head").is_none());
     }
 
-    /// Mock PointerStore that returns a specific pointer.
+    /// Mock `PointerStore` that returns a specific pointer.
     struct MockPointerStoreWithPointer {
         table_uuid: Uuid,
         metadata_location: String,

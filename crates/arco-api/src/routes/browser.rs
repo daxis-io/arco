@@ -10,10 +10,13 @@
 //! 1. **Manifest-driven allowlist**: Only paths in `SnapshotInfo.files` are mintable
 //! 2. **No ledger access**: Ledger paths are never mintable (internal)
 //! 3. **No manifest access**: Manifest paths are never mintable (metadata leak)
-//! 4. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
-//! 5. **TTL bounded**: Maximum 1 hour, default 15 minutes
-//! 6. **No data proxying**: Only URLs returned, never actual data
-//! 7. **Work bounded**: At most 25 submitted paths, deduplicated before signing
+//! 4. **No internal artifacts**: `commits.parquet` is never mintable — its private
+//!    commit-authority columns are only visible through the redacted
+//!    `system.catalog.commits` projection
+//! 5. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
+//! 6. **TTL bounded**: Maximum 1 hour, default 15 minutes
+//! 7. **No data proxying**: Only URLs returned, never actual data
+//! 8. **Work bounded**: At most 25 submitted paths, deduplicated before signing
 //!
 //! ## Log Redaction Policy
 //!
@@ -170,12 +173,18 @@ pub(crate) async fn mint_urls(
     let storage = ctx.scoped_storage(backend)?;
     let reader = arco_catalog::CatalogReader::new(storage);
 
-    // Get mintable paths from manifest
+    // Get mintable paths from manifest. Defense in depth: internal
+    // projection-only artifacts never enter the mint allowlist, so even a
+    // request that slips past the explicit refusal above cannot pass the
+    // membership check.
     let mintable = reader
         .get_mintable_paths(domain)
         .await
         .map_err(ApiError::from)?;
-    let mintable_set: HashSet<String> = mintable.into_iter().collect();
+    let mintable_set: HashSet<String> = mintable
+        .into_iter()
+        .filter(|path| !is_projection_only_artifact(path))
+        .collect();
 
     // Validate ALL requested paths are in allowlist
     for path in &paths {
@@ -251,6 +260,21 @@ fn prepare_mint_paths(
             return Err(ApiError::forbidden(format!("Invalid path '{path}': {err}")));
         }
     }
+    for path in &paths {
+        if is_projection_only_artifact(path) {
+            crate::audit::emit_url_mint_deny(
+                state.audit(),
+                ctx,
+                &req.domain,
+                crate::audit::REASON_INTERNAL_ARTIFACT,
+                &state.config.audit,
+            );
+            return Err(ApiError::projection_only_artifact(format!(
+                "'{path}' is an internal artifact with redacted columns; query the \
+                 system.catalog.commits projection via POST /api/v1/query instead"
+            )));
+        }
+    }
     Ok(paths)
 }
 
@@ -297,7 +321,17 @@ fn dedup_paths(paths: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
-
+/// Returns true for snapshot artifacts whose raw bytes must never be minted
+/// because a redacted system-table projection is their only public surface.
+///
+/// `commits.parquet` carries the private commit-authority witness columns
+/// that `system.catalog.commits` strips (see `crate::system_tables`). The
+/// classification itself lives in the catalog reader, which also filters these
+/// artifacts out of every mint allowlist; this route adds the typed refusal
+/// that points callers at the projection.
+fn is_projection_only_artifact(path: &str) -> bool {
+    arco_catalog::is_projection_only_artifact(path)
+}
 /// Parse domain string to `CatalogDomain`.
 fn parse_domain(domain: &str) -> Result<CatalogDomain, ApiError> {
     match domain.to_lowercase().as_str() {
@@ -321,8 +355,10 @@ mod tests {
 
     #[tokio::test]
     async fn mint_urls_rejects_encoded_path_traversal_sequences() {
-        let mut config = Config::default();
-        config.debug = true;
+        let config = Config {
+            debug: true,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
         let app = routes().with_state(state);
 
@@ -352,8 +388,10 @@ mod tests {
 
     #[tokio::test]
     async fn mint_urls_rejects_bodies_over_explicit_limit() {
-        let mut config = Config::default();
-        config.debug = true;
+        let config = Config {
+            debug: true,
+            ..Config::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
         let app = routes().with_state(state);
 

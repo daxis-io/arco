@@ -258,6 +258,39 @@ pub struct Config {
     /// Default: 300 (5 minutes).
     #[serde(default = "default_idempotency_stale_timeout_secs")]
     pub idempotency_stale_timeout_secs: u64,
+
+    /// Enable the operator-only control-store endpoints at
+    /// `/internal/control-store/*`.
+    ///
+    /// Default off. These are Phase 4/5 operator surfaces, not tenant-facing
+    /// routes; when disabled the routes are not mounted at all, so they 404.
+    ///
+    /// They live in this service because platform IAM makes `arco-api` the
+    /// sole writer of the `state-store/` object prefix — no other service
+    /// account may mutate it, so no other service can host them.
+    ///
+    /// Enabling the routes is not enough to use them: every request must also
+    /// carry the operator authority named by
+    /// [`Self::control_store_operator_group`], which is unset by default.
+    #[serde(default)]
+    pub control_store_operator_endpoints: bool,
+
+    /// Group membership a verified principal must carry to invoke the
+    /// operator-only control-store endpoints.
+    ///
+    /// The value names a group in the principal's verified groups claim (JWT
+    /// `groups` by default, see [`JwtConfig::groups_claim`]). Authentication
+    /// alone is **not** authorization here: the outbox endpoint can drain
+    /// events without projecting them, transfer the single-consumer binding,
+    /// and trim source records, so an ordinary tenant principal reaching the
+    /// route must be refused.
+    ///
+    /// `None` (the default) means no operator authority is configured, and
+    /// the endpoints **fail closed**: they answer `403` for every caller
+    /// rather than falling back to plain authentication. Turning the flag on
+    /// without naming a group therefore opens nothing.
+    #[serde(default)]
+    pub control_store_operator_group: Option<String>,
 }
 
 const MIN_IDEMPOTENCY_STALE_TIMEOUT_SECS: u64 = 10;
@@ -371,6 +404,8 @@ impl Default for Config {
             unity_catalog: UnityCatalogApiConfig::default(),
             audit: AuditConfig::default(),
             idempotency_stale_timeout_secs: default_idempotency_stale_timeout_secs(),
+            control_store_operator_endpoints: false,
+            control_store_operator_group: None,
         }
     }
 }
@@ -691,6 +726,12 @@ impl Config {
         }
 
         // Unity Catalog facade configuration
+        if let Some(enabled) = env_bool("ARCO_CONTROL_STORE_OPERATOR_ENDPOINTS")? {
+            config.control_store_operator_endpoints = enabled;
+        }
+        if let Some(group) = env_string("ARCO_CONTROL_STORE_OPERATOR_GROUP") {
+            config.control_store_operator_group = Some(group);
+        }
         if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_ENABLED")? {
             config.unity_catalog.enabled = enabled;
         }

@@ -200,6 +200,16 @@ impl ObjectStoreBackend {
     /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
     /// `s3://` prefix (`s3://my-bucket`).
     ///
+    /// # Certification status
+    ///
+    /// **NOT certified for production use.** This provider has no CAS
+    /// conformance evidence: the only test exercising the CAS/precondition
+    /// contract against real S3 (`s3_backend_satisfies_storage_conformance` in
+    /// `tests/storage_backend_conformance.rs`) is `#[ignore]`d, and the
+    /// scheduled runner (`.github/workflows/s3-conformance.yml`) has never
+    /// passed against a real bucket. Until it does, the version-fenced CAS
+    /// semantics the publish protocol depends on are UNVERIFIED on S3.
+    ///
     /// # Errors
     ///
     /// Returns an error if the S3 client cannot be configured.
@@ -647,6 +657,9 @@ impl StorageBackend for MemoryBackend {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::manual_let_else, clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
 
@@ -815,6 +828,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // The reversed range is the point of this test: get_range must reject
+    // end-before-start as an error instead of panicking.
+    #[allow(clippy::reversed_empty_ranges)]
     async fn test_get_range_invalid_end_before_start() {
         let backend = MemoryBackend::new();
         backend

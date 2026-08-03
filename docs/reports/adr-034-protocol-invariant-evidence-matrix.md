@@ -61,7 +61,8 @@ Observed results:
 | Lane | Command / workflow |
 |---|---|
 | Core backend conformance in PR CI | `cargo test -p arco-core --test storage_backend_conformance -- --nocapture` |
-| Live-cloud GCS gate | `.github/workflows/adr-034-gcs-conformance.yml` |
+| Live-cloud GCS gate | `.github/workflows/adr-034-gcs-conformance.yml` (nightly) |
+| Live-cloud S3 gate | `.github/workflows/s3-conformance.yml` (manual dispatch only) |
 | Catalog invariants | `cargo test -p arco-catalog --test protocol_invariants -- --nocapture` |
 | Orchestration invariants | `cargo test -p arco-flow --test orchestration_protocol_invariants -- --nocapture` |
 | API root protocol | `cargo test -p arco-api --test root_transaction_protocol -- --nocapture` |
@@ -77,3 +78,19 @@ Observed results:
 - The GCS lane is intentionally scheduled/manual and not part of blocking PR CI.
 - The GCS workflow now prefers OIDC via `vars.GCP_WORKLOAD_IDENTITY_PROVIDER` and
   `vars.GCP_SERVICE_ACCOUNT`, with the legacy JSON key path retained only as a fallback.
+- Both live-cloud lanes fail loudly rather than skipping green when unconfigured: a green run
+  must mean the CAS gate actually executed. Until the configuration below is provisioned, the
+  nightly GCS lane is therefore red every night and needs an owner. The S3 lane is
+  `workflow_dispatch`-only for the same reason — a nightly job that is red by design trains
+  everyone to ignore scheduled failures, including the ones that are actionable. Add its
+  `schedule:` trigger in the same change that provisions its configuration.
+- Provisioning required to make these lanes green:
+  - GCS: `vars.ARCO_TEST_GCS_BUCKET`, plus either
+    (`vars.GCP_WORKLOAD_IDENTITY_PROVIDER` + `vars.GCP_SERVICE_ACCOUNT`) for keyless OIDC, or
+    `secrets.GCP_SA_KEY_API` as the fallback JSON key.
+  - S3: `vars.ARCO_TEST_S3_BUCKET`, `vars.AWS_REGION`, `secrets.AWS_ACCESS_KEY_ID`, and
+    `secrets.AWS_SECRET_ACCESS_KEY`. Both buckets should be dedicated and disposable, with the
+    principal scoped to object read/write/delete on that bucket only.
+- `ObjectStoreBackend::s3` is NOT certified for production use until the S3 lane passes against a
+  real bucket: the only test exercising its CAS/precondition contract
+  (`s3_backend_satisfies_storage_conformance`) is `#[ignore]`d and has never run against S3.

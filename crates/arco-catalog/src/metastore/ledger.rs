@@ -247,11 +247,15 @@ impl MetastoreLedger {
             {
                 return Ok(Some(marker.watermark));
             }
+            // The event ID is internal ledger state; correlate it in logs
+            // rather than returning it in an error that reaches clients.
+            tracing::error!(
+                event_id = %marker.watermark.event_id,
+                sequence = marker.watermark.sequence,
+                "latest metastore watermark points at a missing event"
+            );
             return Err(CatalogError::InvariantViolation {
-                message: format!(
-                    "latest metastore watermark '{}' points at a missing event",
-                    marker.watermark.event_id
-                ),
+                message: "metastore_latest_watermark_missing_event".to_string(),
             });
         }
         if pending.is_some() {

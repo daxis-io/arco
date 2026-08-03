@@ -79,6 +79,9 @@ impl CommittedReceipt {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 mod tests {
     use super::*;
     use crate::paths::{iceberg_committed_receipt_prefix, iceberg_pending_receipt_prefix};

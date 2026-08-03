@@ -1,5 +1,10 @@
 //! Current state-store adapter contract tests.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::panic)]
+
 use std::sync::Arc;
 
 use bytes::Bytes;

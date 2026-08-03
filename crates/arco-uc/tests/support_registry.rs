@@ -1,5 +1,10 @@
 //! Contract tests for the Unity Catalog support registry.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -122,6 +127,7 @@ fn mounted_uc_routes_have_support_registry_metadata() {
         ("GET", "/external-locations"),
         ("POST", "/external-locations"),
         ("GET", "/external-locations/orders"),
+        ("POST", "/storage-governance/projection/republish"),
         ("POST", "/temporary-model-version-credentials"),
         ("POST", "/temporary-table-credentials"),
         ("POST", "/temporary-volume-credentials"),

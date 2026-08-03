@@ -20,6 +20,26 @@
 //! Like all controllers, the sweeper checks watermark freshness before
 //! creating repair actions. This prevents false positives when compaction
 //! is behind and the Parquet state doesn't reflect recent events.
+//!
+//! The wall-clock watermark (`Watermarks::last_processed_at`) only advances
+//! when a new ledger event is compacted, so an idle-but-healthy workspace
+//! looks identical to a broken compactor. Callers that have checked the ledger
+//! for unprocessed events (see [`LedgerFreshness::Current`]) bypass the
+//! wall-clock guard for **non-destructive** repairs, which keeps dispatch
+//! re-drive reachable in an idle workspace (issue #338): the task-staleness
+//! threshold (300s heartbeat timeout + 30s grace = 330s) is larger than the
+//! 300s compaction-lag guard, and a dead worker stops the event flow that
+//! would keep the watermark fresh.
+//!
+//! That check compares event ids against the fold watermark; it cannot prove
+//! the folded prefix is contiguous, so it is not a warrant for destroying
+//! evidence. `FailStaleRunningTask` therefore still requires the wall-clock
+//! guard — see [`AntiEntropySweeper::scan_with_ledger_freshness`]. Making the
+//! zombie reaper reachable in a genuinely idle workspace needs the compactor
+//! to refresh `last_processed_at` on idle ticks so that "idle" stops looking
+//! like "lagging"; until then a stale-watermark workspace reports
+//! [`Repair::SkippedDueToLag`] for its stale RUNNING tasks instead of
+//! force-failing them on unproven evidence.
 
 use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
@@ -82,6 +102,52 @@ pub enum Repair {
     },
 }
 
+impl Repair {
+    /// Whether executing this repair destroys evidence that cannot be recovered.
+    ///
+    /// [`Repair::FailStaleRunningTask`] writes a terminal failure over an
+    /// attempt that may still be running, or that may already have completed
+    /// durably without the projection showing it. Nothing undoes that.
+    ///
+    /// The dispatch repairs are re-drives: they route work through
+    /// deterministic dispatch ids that the control plane and the worker both
+    /// deduplicate, so a repair issued on incomplete evidence costs at most a
+    /// redundant delivery.
+    #[must_use]
+    pub const fn is_destructive(&self) -> bool {
+        matches!(self, Self::FailStaleRunningTask { .. })
+    }
+}
+
+/// What a caller has established about unfolded orchestration ledger events.
+///
+/// The three states are deliberately distinct: "checked and looks current",
+/// "checked and found behind", and "not checked". Collapsing the last two lets
+/// an unchecked caller inherit the permissions of a checked one, or the
+/// reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerFreshness {
+    /// No ledger event id exceeds the fold watermark, as far as a bounded scan
+    /// of the ledger's date prefixes can tell.
+    ///
+    /// This is a maximum-id comparison, **not** a contiguous-frontier proof: an
+    /// event that is durable but unfolded and whose id sits at or below the
+    /// watermark is invisible to it. Non-destructive repairs may run on this
+    /// evidence; destructive ones may not.
+    Current,
+    /// The check ran and did **not** find the ledger current: an appended
+    /// event is missing from the projections, or the scan could not complete.
+    ///
+    /// This is positive evidence that the projection is behind, so it blocks
+    /// destructive repair outright — the stale RUNNING row the sweeper is
+    /// about to overwrite may be contradicted by the very event that has not
+    /// been folded.
+    Stale,
+    /// The caller did not check. Only the wall-clock compaction-lag guard
+    /// applies, which is the behaviour that predates the ledger scan.
+    Unchecked,
+}
+
 /// Anti-entropy sweeper for detecting stuck work.
 ///
 /// The sweeper scans tasks and dispatch outbox to find work that may have
@@ -96,6 +162,27 @@ pub struct AntiEntropySweeper {
 }
 
 const DEFAULT_MAX_COMPACTION_LAG: Duration = Duration::minutes(5);
+
+/// Grace added on top of a task's `heartbeat_timeout_sec` before a RUNNING
+/// task is considered stale.
+///
+/// Constant relationships (issues #338 and #367):
+///
+/// - The force-fail window for a RUNNING task is
+///   `heartbeat_timeout_sec + RUNNING_TASK_STALENESS_GRACE` — 300s + 30s =
+///   330s at the planner default
+///   (`RunRequestProcessor::default_heartbeat_timeout_sec`).
+/// - The Python reference worker heartbeats every
+///   `heartbeat_timeout_sec / 5` seconds, clamped to at most 60s
+///   (`python/arco/src/arco_flow/worker/server.py`), so several consecutive
+///   heartbeats must be lost before the window can expire.
+/// - `DEFAULT_MAX_COMPACTION_LAG` (300s) is *smaller* than the 330s force-fail
+///   window, so a workspace whose watermark has gone stale reports
+///   [`Repair::SkippedDueToLag`] for its stale RUNNING tasks.
+///   [`LedgerFreshness::Current`] does not lift that guard for the force-fail,
+///   because a maximum-id ledger scan cannot exclude a durable-but-unfolded
+///   straggler carrying the task's terminal result.
+pub const RUNNING_TASK_STALENESS_GRACE: Duration = Duration::seconds(30);
 
 impl AntiEntropySweeper {
     /// Creates a new anti-entropy sweeper.
@@ -129,6 +216,10 @@ impl AntiEntropySweeper {
 
     /// Scans for stuck work and returns repair actions.
     ///
+    /// Equivalent to [`Self::scan_with_ledger_freshness`] with
+    /// [`LedgerFreshness::Unchecked`]: the wall-clock compaction-lag guard
+    /// applies unconditionally.
+    ///
     /// # Arguments
     ///
     /// * `watermarks` - Current compaction watermarks
@@ -147,6 +238,44 @@ impl AntiEntropySweeper {
         outbox: &[DispatchOutboxRow],
         now: DateTime<Utc>,
     ) -> Vec<Repair> {
+        self.scan_with_ledger_freshness(watermarks, LedgerFreshness::Unchecked, tasks, outbox, now)
+    }
+
+    /// Scans for stuck work with explicit knowledge of ledger freshness.
+    ///
+    /// When `ledger_freshness` is [`LedgerFreshness::Current`], the caller has
+    /// checked that no ledger event id exceeds the fold watermark, so the
+    /// wall-clock compaction-lag guard is bypassed for **non-destructive**
+    /// repairs. This keeps the dispatch re-drive reachable in an idle
+    /// workspace whose only worker died (issue #338): with no event flow the
+    /// watermark cannot stay fresh, and a redundant re-dispatch is bounded by
+    /// deterministic dispatch ids.
+    ///
+    /// # Why freshness does not authorize destructive repair
+    ///
+    /// [`LedgerFreshness::Current`] is a maximum-id comparison, not a proof
+    /// that the ledger prefix is contiguous. A straggler event `E1` that is
+    /// durable but unfolded, and whose id is at or below the watermark
+    /// (because a concurrent writer appended and folded a higher `E2` first),
+    /// is invisible to that check. If `E1` carries the terminal completion or
+    /// a protective heartbeat for a task the projection still shows as
+    /// RUNNING, force-failing that task overwrites durable evidence with a
+    /// fabricated failure.
+    ///
+    /// A re-dispatch made on the same incomplete evidence is recoverable; a
+    /// force-fail is not. Destructive repairs therefore still require the
+    /// wall-clock guard, and are reported as
+    /// [`Repair::SkippedDueToLag`] when only freshness would have allowed
+    /// them, so the condition is observable rather than silent.
+    #[must_use]
+    pub fn scan_with_ledger_freshness(
+        &self,
+        watermarks: &Watermarks,
+        ledger_freshness: LedgerFreshness,
+        tasks: &[TaskRow],
+        outbox: &[DispatchOutboxRow],
+        now: DateTime<Utc>,
+    ) -> Vec<Repair> {
         let _guard = TimingGuard::new(|duration| {
             histogram!(
                 metrics_names::ORCH_CONTROLLER_RECONCILE_SECONDS,
@@ -155,9 +284,18 @@ impl AntiEntropySweeper {
             .record(duration.as_secs_f64());
         });
 
-        // Check watermark freshness first
+        // Check watermark freshness first. A current ledger scan lets
+        // non-destructive repairs proceed despite wall-clock staleness;
+        // destructive ones still need the wall-clock guard, because the scan
+        // cannot prove a lower-id straggler was folded.
         let compaction_lag = now - watermarks.last_processed_at;
-        let repairs = if compaction_lag > self.max_compaction_lag {
+        let lag_exceeded = compaction_lag > self.max_compaction_lag;
+        let skip_for_lag = ledger_freshness != LedgerFreshness::Current && lag_exceeded;
+        // Destructive repair needs the wall-clock guard *and* the absence of
+        // positive evidence that the ledger is behind. Freshness can only
+        // withhold that permission, never grant it.
+        let block_destructive = lag_exceeded || ledger_freshness == LedgerFreshness::Stale;
+        let repairs = if skip_for_lag {
             // Skip all repairs when compaction is lagging
             tasks
                 .iter()
@@ -180,6 +318,14 @@ impl AntiEntropySweeper {
 
             for task in tasks {
                 if let Some(repair) = self.check_task(task, &dispatched_tasks, outbox, now) {
+                    if block_destructive && repair.is_destructive() {
+                        repairs.push(Repair::SkippedDueToLag {
+                            run_id: task.run_id.clone(),
+                            task_key: task.task_key.clone(),
+                            compaction_lag_secs: compaction_lag.num_seconds(),
+                        });
+                        continue;
+                    }
                     repairs.push(repair);
                 }
             }
@@ -206,9 +352,7 @@ impl AntiEntropySweeper {
             TaskState::Dispatched => true, // Will check dispatch age
             TaskState::RetryWait => {
                 task.attempt < task.max_attempts
-                    && task
-                        .retry_not_before
-                        .is_some_and(|deadline| now >= deadline)
+                    && task.retry_not_before.is_none_or(|deadline| now >= deadline)
             }
             TaskState::Running => Self::running_task_is_stale(task, now),
             _ => false,
@@ -309,7 +453,11 @@ impl AntiEntropySweeper {
         if task.attempt >= task.max_attempts {
             return None;
         }
-        if task.retry_not_before.is_none_or(|deadline| now < deadline) {
+        // A missing deadline means the task predates the fold-time retry
+        // scheduling introduced for issue #337 (nothing else ever set
+        // `retry_not_before`). Such a task is already wedged, so bootstrap it
+        // immediately; only a deadline still in the future defers the retry.
+        if task.retry_not_before.is_some_and(|deadline| now < deadline) {
             return None;
         }
         let next_attempt = task.attempt + 1;
@@ -344,8 +492,7 @@ impl AntiEntropySweeper {
             return false;
         };
         let timeout = Duration::seconds(i64::from(task.heartbeat_timeout_sec));
-        let grace = Duration::seconds(30);
-        now - reference_time > timeout + grace
+        now - reference_time > timeout + RUNNING_TASK_STALENESS_GRACE
     }
 }
 
@@ -359,7 +506,7 @@ mod tests {
             run_id: "run1".to_string(),
             task_key: task_key.to_string(),
             state,
-            attempt: if state == TaskState::Ready { 0 } else { 1 },
+            attempt: u32::from(state != TaskState::Ready),
             attempt_id: Some("01HQ123ATT".to_string()),
             started_at: None,
             completed_at: None,
@@ -647,15 +794,55 @@ mod tests {
         ));
     }
 
+    /// The bootstrap PR #303 intended (issue #337): a RetryWait task with no
+    /// retry deadline at all — folded before fold-time retry scheduling
+    /// existed — must be rescued immediately, not skipped forever.
     #[test]
-    fn test_anti_entropy_fails_stale_running_tasks() {
+    fn test_anti_entropy_bootstraps_retry_wait_without_deadline() {
         let now = Utc::now();
         let sweeper = AntiEntropySweeper::with_defaults();
         let watermarks = fresh_watermarks(now);
 
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = None;
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert_eq!(repairs.len(), 1);
+        match &repairs[0] {
+            Repair::CreateDispatchOutbox {
+                task_key,
+                attempt,
+                reason,
+                ..
+            } => {
+                assert_eq!(task_key, "extract");
+                assert_eq!(*attempt, 2);
+                assert_eq!(reason, "retry_wait_bootstrap");
+            }
+            _ => panic!("Expected CreateDispatchOutbox repair"),
+        }
+    }
+
+    #[test]
+    fn test_anti_entropy_fails_stale_running_tasks() {
+        // Single coherent clock: the task's last heartbeat was also the last
+        // compacted event, so the watermark froze at the same instant the
+        // task went silent. The 3-minute silence exceeds the 60s + 30s
+        // staleness window while compaction lag (3 minutes) is still inside
+        // the 5-minute guard.
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let silence_started = now - Duration::minutes(3);
+
+        let mut watermarks = fresh_watermarks(now);
+        watermarks.last_processed_at = silence_started;
+
         let mut task = make_task_row("extract", TaskState::Running, None);
         task.attempt = 1;
-        task.last_heartbeat_at = Some(now - Duration::minutes(3));
+        task.last_heartbeat_at = Some(silence_started);
 
         let repairs = sweeper.scan(&watermarks, &[task], &[], now);
 
@@ -675,6 +862,151 @@ mod tests {
             }
             _ => panic!("Expected FailStaleRunningTask repair"),
         }
+    }
+
+    /// Issue #338 regression: at default configuration
+    /// (`heartbeat_timeout_sec` = 300 from the planner default, 30s grace,
+    /// 5-minute compaction-lag guard) a zombie task in an idle workspace MUST
+    /// be reaped. The task's own last heartbeat is the last workspace event,
+    /// so the watermark is exactly as old as the silence — the wall-clock
+    /// guard alone would skip forever (330s staleness > 300s guard), which is
+    /// why a proven-current ledger bypasses it.
+    #[test]
+    fn test_anti_entropy_reaps_zombie_task_at_default_configuration() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+
+        // Default staleness window: 300s timeout + 30s grace.
+        let silence_started = now - Duration::seconds(331);
+
+        // Coherent clock: the dead worker's heartbeat was the last event the
+        // compactor processed, so watermark age == task silence.
+        let mut watermarks = fresh_watermarks(now);
+        watermarks.last_processed_at = silence_started;
+
+        let mut task = make_task_row("extract", TaskState::Running, None);
+        task.attempt = 1;
+        task.heartbeat_timeout_sec = 300;
+        task.last_heartbeat_at = Some(silence_started);
+
+        // Without any freshness signal the wall-clock guard skips.
+        let unproven = sweeper.scan(&watermarks, std::slice::from_ref(&task), &[], now);
+        assert_eq!(unproven.len(), 1);
+        assert!(matches!(unproven[0], Repair::SkippedDueToLag { .. }));
+
+        // A current ledger scan is a maximum-id comparison, not a proof that
+        // the folded prefix is contiguous, so it must NOT authorise the
+        // destructive reap while the watermark is stale.
+        let with_freshness = sweeper.scan_with_ledger_freshness(
+            &watermarks,
+            LedgerFreshness::Current,
+            std::slice::from_ref(&task),
+            &[],
+            now,
+        );
+        assert_eq!(with_freshness.len(), 1);
+        assert!(
+            matches!(with_freshness[0], Repair::SkippedDueToLag { .. }),
+            "ledger freshness must not authorise force-failing a RUNNING task \
+             on evidence that cannot exclude a lower-id straggler: {:?}",
+            with_freshness[0]
+        );
+
+        // Once compaction is demonstrably current by wall clock, the reaper runs.
+        let repairs = sweeper.scan_with_ledger_freshness(
+            &fresh_watermarks(now),
+            LedgerFreshness::Current,
+            &[task],
+            &[],
+            now,
+        );
+
+        assert_eq!(repairs.len(), 1);
+        match &repairs[0] {
+            Repair::FailStaleRunningTask {
+                task_key, reason, ..
+            } => {
+                assert_eq!(task_key, "extract");
+                assert_eq!(reason, "heartbeat_timeout_anti_entropy");
+            }
+            _ => panic!("Expected FailStaleRunningTask repair"),
+        }
+    }
+
+    /// H4: a durable-but-unfolded straggler below the watermark makes the
+    /// projection's RUNNING row untrustworthy. Freshness must not turn that
+    /// row into a fabricated terminal failure, while the non-destructive
+    /// dispatch re-drive that issue #338 needs stays reachable.
+    #[test]
+    fn ledger_freshness_bypass_covers_redrive_but_not_force_fail() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+
+        // Compaction looks stale by wall clock (idle workspace).
+        let mut watermarks = fresh_watermarks(now);
+        watermarks.last_processed_at = now - Duration::seconds(3_600);
+
+        let mut running = make_task_row("publish", TaskState::Running, None);
+        running.attempt = 1;
+        running.heartbeat_timeout_sec = 300;
+        running.last_heartbeat_at = Some(now - Duration::seconds(3_600));
+
+        let mut ready = make_task_row("extract", TaskState::Ready, Some(now - Duration::hours(1)));
+        ready.attempt = 0;
+
+        let repairs = sweeper.scan_with_ledger_freshness(
+            &watermarks,
+            LedgerFreshness::Current,
+            &[ready, running],
+            &[],
+            now,
+        );
+
+        assert!(
+            repairs.iter().any(|repair| matches!(
+                repair,
+                Repair::CreateDispatchOutbox { task_key, .. } if task_key == "extract"
+            )),
+            "non-destructive re-drive must still bypass the wall-clock guard: {repairs:?}"
+        );
+        assert!(
+            !repairs.iter().any(Repair::is_destructive),
+            "no destructive repair may be emitted on freshness alone: {repairs:?}"
+        );
+        assert!(
+            repairs.iter().any(|repair| matches!(
+                repair,
+                Repair::SkippedDueToLag { task_key, .. } if task_key == "publish"
+            )),
+            "the suppressed force-fail must be reported, not silently dropped: {repairs:?}"
+        );
+    }
+
+    /// A RUNNING task inside its staleness window must not be reaped even
+    /// when the ledger is proven current.
+    #[test]
+    fn test_anti_entropy_keeps_live_running_task_with_current_ledger() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+
+        let heartbeat_at = now - Duration::seconds(329);
+        let mut watermarks = fresh_watermarks(now);
+        watermarks.last_processed_at = heartbeat_at;
+
+        let mut task = make_task_row("extract", TaskState::Running, None);
+        task.attempt = 1;
+        task.heartbeat_timeout_sec = 300;
+        task.last_heartbeat_at = Some(heartbeat_at);
+
+        let repairs = sweeper.scan_with_ledger_freshness(
+            &watermarks,
+            LedgerFreshness::Current,
+            &[task],
+            &[],
+            now,
+        );
+
+        assert!(repairs.is_empty(), "329s silence is inside the 330s window");
     }
 
     #[test]

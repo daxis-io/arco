@@ -197,11 +197,6 @@ mod helpers {
         Ok((status, json))
     }
 
-    pub async fn get_text(router: axum::Router, uri: &str) -> Result<(StatusCode, String)> {
-        let (status, _, text) = get_text_with_headers(router, uri).await?;
-        Ok((status, text))
-    }
-
     pub async fn get_text_with_headers(
         router: axum::Router,
         uri: &str,

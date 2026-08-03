@@ -534,63 +534,72 @@ impl Reconciler {
     ) -> Vec<&'a ReconciliationIssue> {
         let mut deletions = Vec::new();
         for issue in &report.issues {
-            if !issue.repairable {
-                result.skipped_count += 1;
+            if !Self::is_deletion_candidate(report, scope, issue, result) {
                 continue;
             }
-            if !scope.allows_issue(issue.issue_type) {
+
+            if protected_paths.contains(&issue.path) {
+                tracing::warn!(
+                    path = %issue.path,
+                    domain = %report.domain,
+                    "skipping repair delete for currently referenced snapshot path"
+                );
                 result.skipped_count += 1;
                 Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
                 continue;
             }
-
-            match issue.issue_type {
-                IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion => {
-                    if protected_paths.contains(&issue.path) {
-                        tracing::warn!(
-                            path = %issue.path,
-                            domain = %report.domain,
-                            "skipping repair delete for currently referenced snapshot path"
-                        );
-                        result.skipped_count += 1;
-                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                        continue;
-                    }
-                    if Self::extract_snapshot_version(&issue.path)
-                        .is_some_and(|version| version > visible_snapshot_version)
-                    {
-                        tracing::warn!(
-                            path = %issue.path,
-                            domain = %report.domain,
-                            visible_snapshot_version,
-                            "skipping repair delete for snapshot version newer than visible manifest"
-                        );
-                        result.skipped_count += 1;
-                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                        continue;
-                    }
-                    if Self::extract_snapshot_version(&issue.path)
-                        .is_some_and(|version| retained_versions.contains(&version))
-                    {
-                        tracing::debug!(
-                            path = %issue.path,
-                            domain = %report.domain,
-                            retained_snapshot_versions = self.retained_snapshot_versions,
-                            "skipping repair delete inside the retained snapshot-version window"
-                        );
-                        result.skipped_count += 1;
-                        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                        continue;
-                    }
-                    deletions.push(issue);
-                }
-                _ => {
-                    result.skipped_count += 1;
-                    Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
-                }
+            if Self::extract_snapshot_version(&issue.path)
+                .is_some_and(|version| version > visible_snapshot_version)
+            {
+                tracing::warn!(
+                    path = %issue.path,
+                    domain = %report.domain,
+                    visible_snapshot_version,
+                    "skipping repair delete for snapshot version newer than visible manifest"
+                );
+                result.skipped_count += 1;
+                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                continue;
             }
+            if Self::extract_snapshot_version(&issue.path)
+                .is_some_and(|version| retained_versions.contains(&version))
+            {
+                tracing::debug!(
+                    path = %issue.path,
+                    domain = %report.domain,
+                    retained_snapshot_versions = self.retained_snapshot_versions,
+                    "skipping repair delete inside the retained snapshot-version window"
+                );
+                result.skipped_count += 1;
+                Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+                continue;
+            }
+            deletions.push(issue);
         }
         deletions
+    }
+
+    fn is_deletion_candidate(
+        report: &ReconciliationReport,
+        scope: RepairScope,
+        issue: &ReconciliationIssue,
+        result: &mut RepairResult,
+    ) -> bool {
+        if !issue.repairable {
+            result.skipped_count += 1;
+            return false;
+        }
+        if scope.allows_issue(issue.issue_type)
+            && matches!(
+                issue.issue_type,
+                IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion
+            )
+        {
+            return true;
+        }
+        result.skipped_count += 1;
+        Self::record_repair_metric(&report.domain, issue.issue_type, "skipped");
+        false
     }
 
     /// Applies the surviving deletion candidates under retention coordination.

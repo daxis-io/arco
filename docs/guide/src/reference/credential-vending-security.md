@@ -112,6 +112,61 @@ revocation class in the safe response metadata, and audit the limitation without
 logging credential material. A route that requires revocation must deny with a
 stable safe reason when the provider only offers weaker revocation.
 
+## Revocation Freshness Budget
+
+The revocation freshness budget is the tested worst-case duration a revoked
+authorization can still be honored by storage access:
+
+```text
+worst_case_revocation_exposure
+  = MAX_PROJECTION_STALENESS + MAX_CREDENTIAL_TTL
+  = 0 s + 3600 s
+  = 3600 s (1 hour)
+```
+
+The budget is defined as typed constants in
+`arco_catalog::credential_vending` (`MAX_PROJECTION_STALENESS_SECS = 0`,
+`MAX_CREDENTIAL_TTL_SECS = 3600`, `REVOCATION_FRESHNESS_BUDGET_SECS = 3600`)
+and exposed at runtime by
+`CredentialVendingEngine::revocation_exposure_budget()`.
+
+Proof sketch, for a revocation committed to the metastore ledger at time `T`:
+
+1. **No new credential is minted from pre-revocation state (staleness half =
+   0 s).** Every credential decision loads the published storage-governance
+   projection through
+   `metastore::publish::load_published_storage_governance`, which validates
+   the projection manifest against the *exact* latest ledger watermark
+   (`validate_storage_governance_manifest_freshness`; a compile-time
+   assertion pins the validator to `MAX_PROJECTION_STALENESS_SECS == 0`).
+   After `T` the projection either already contains the revocation, in which
+   case the revoked scope no longer resolves to a path authority and vending
+   denies, or it is stale and the request denies closed with HTTP 503
+   `credential_scope_unavailable`. Pending or unreadable watermark markers
+   also deny closed. There is therefore no window in which a decision is made
+   from state that predates the revocation.
+2. **Credentials minted before `T` expire within `MAX_CREDENTIAL_TTL`.**
+   `CredentialVendingEngine` clamps every allow decision to
+   `min(requested_ttl, MAX_CREDENTIAL_TTL)` and stamps the corresponding
+   `expires_at`, so a credential minted at `T - ε` is invalid by
+   `T + 3600 s - ε`.
+3. Therefore all storage access under authorizations revoked at `T` ends by
+   `T + REVOCATION_FRESHNESS_BUDGET = T + 3600 s`.
+
+Assumption: minted credentials actually expire at their advertised
+`expires_at`. Providers classified `best_effort` or `unsupported` for
+revocation satisfy the budget through this expiry bound alone; providers with
+`provider_confirmed` revocation can end exposure earlier but the budget does
+not rely on it.
+
+Tests: `credential_vending_decisions.rs`
+(`revocation_freshness_budget_is_projection_staleness_plus_max_ttl`,
+`revoked_external_location_with_fresh_state_cannot_be_vended`),
+`metastore_replay_publication.rs`
+(`revocation_with_stale_projection_denies_closed_until_republished`), and the
+UC route test `storage_governance_projection_publication.rs`
+(`revocation_denies_closed_while_stale_and_cannot_vend_once_fresh`).
+
 ## Redaction
 
 Secret exclusion should happen by type and schema. Route filtering is only a

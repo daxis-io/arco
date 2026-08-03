@@ -509,12 +509,8 @@ mod tests {
         let canonical = pk.canonical_string();
 
         // Must not contain URL-unsafe characters in the value part
-        let value_part = match canonical.split_once('=') {
-            Some((_key, value)) => value,
-            None => {
-                assert!(false, "canonical string should contain '=': {canonical}");
-                ""
-            }
+        let Some((_key, value_part)) = canonical.split_once('=') else {
+            panic!("canonical string should contain '=': {canonical}");
         };
         assert!(!value_part.contains('/'));
         assert!(!value_part.contains('?'));
@@ -607,10 +603,7 @@ mod tests {
         let canonical = pk.canonical_string();
         let parsed = match PartitionKey::parse(&canonical) {
             Ok(value) => value,
-            Err(err) => {
-                assert!(false, "partition key should roundtrip: {err}");
-                return;
-            }
+            Err(err) => panic!("partition key should roundtrip: {err}"),
         };
 
         assert_eq!(pk, parsed);

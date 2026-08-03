@@ -1,5 +1,9 @@
 //! Schedule E2E tests from manifest deploy through tick history.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -933,7 +937,9 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
         .context("expected run task row")?;
 
     assert_eq!(
-        run_task.get("deltaVersion").and_then(|v| v.as_i64()),
+        run_task
+            .get("deltaVersion")
+            .and_then(serde_json::Value::as_i64),
         Some(17)
     );
     assert_eq!(
@@ -963,7 +969,9 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
         .context("expected partition status row")?;
 
     assert_eq!(
-        partition.get("deltaVersion").and_then(|v| v.as_i64()),
+        partition
+            .get("deltaVersion")
+            .and_then(serde_json::Value::as_i64),
         Some(17)
     );
     assert_eq!(

@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_redacted_debug_hides_value() {
         let secret = Redacted::new("super_secret_token");
-        let debug_output = format!("{:?}", secret);
+        let debug_output = format!("{secret:?}");
 
         assert_eq!(debug_output, "Redacted([REDACTED])");
         assert!(!debug_output.contains("super_secret_token"));
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_redacted_display_hides_value() {
         let secret = Redacted::new("https://storage.example.com?sig=abc123");
-        let display_output = format!("{}", secret);
+        let display_output = format!("{secret}");
 
         assert_eq!(display_output, "[REDACTED]");
         assert!(!display_output.contains("sig="));

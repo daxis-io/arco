@@ -152,6 +152,51 @@ class PartitionKey:
         object.__setattr__(instance, "dimensions", FrozenDict(dims))
         return instance
 
+    @classmethod
+    def from_canonical_string(cls, value: str) -> PartitionKey:
+        """Parse a partition key from its canonical ``dim=value`` encoding.
+
+        Inverts :meth:`canonical_string` (``key=tagged,key=tagged`` with
+        ADR-011 tagged values such as ``date=d:2026-01-01``). Untagged values
+        (``date=2026-01-01``), as accepted by the run-trigger API, are treated
+        as plain string dimension values so the worker can still execute with
+        the partition scope the control plane recorded.
+
+        Args:
+            value: Canonical partition key string. An empty string produces an
+                empty (unpartitioned) key.
+
+        Returns:
+            The parsed partition key.
+
+        Raises:
+            ValueError: If the string is not ``dim=value`` pairs joined by
+                commas, or a dimension key is invalid.
+        """
+        if not value:
+            return cls()
+
+        dims: dict[str, ScalarValue] = {}
+        for pair in value.split(","):
+            key, separator, raw = pair.partition("=")
+            if not separator or not key:
+                msg = f"Invalid partition key segment: {pair!r}"
+                raise ValueError(msg)
+            if not _is_valid_dimension_key(key):
+                msg = f"Invalid partition dimension key: {key!r}"
+                raise ValueError(msg)
+            if key in dims:
+                msg = f"Duplicate partition dimension key: {key!r}"
+                raise ValueError(msg)
+            try:
+                dims[key] = ScalarValue.from_tagged_string(raw)
+            except ValueError:
+                dims[key] = ScalarValue.from_value(raw)
+
+        instance = cls.__new__(cls)
+        object.__setattr__(instance, "dimensions", FrozenDict(dims))
+        return instance
+
     def canonical_string(self) -> str:
         if not self.dimensions:
             return ""

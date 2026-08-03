@@ -29,6 +29,7 @@ use crate::coordinator::{
     MultiTableCommitError, MultiTableTransactionCoordinator, TableCommitInput,
 };
 use crate::error::{IcebergError, IcebergResult};
+use crate::governance::TableLocationGovernance;
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::pointer::{PointerStoreImpl, UpdateSource};
 use crate::routes::utils::{
@@ -267,7 +268,8 @@ async fn commit_transaction(
         principal: None,
     };
 
-    let commit_service = CommitService::new(Arc::new(storage));
+    let governance = TableLocationGovernance::new(storage.clone(), ctx.workspace.clone());
+    let commit_service = CommitService::new(Arc::new(storage), governance);
 
     let result = commit_service
         .commit_table(
@@ -445,7 +447,9 @@ async fn handle_multi_table_commit(
     };
 
     let pointer_store = Arc::new(PointerStoreImpl::new(Arc::new(storage.clone())));
-    let coordinator = MultiTableTransactionCoordinator::new(Arc::new(storage), pointer_store);
+    let governance = TableLocationGovernance::new(storage.clone(), ctx.workspace.clone());
+    let coordinator =
+        MultiTableTransactionCoordinator::new(Arc::new(storage), pointer_store, governance);
 
     match coordinator
         .commit(

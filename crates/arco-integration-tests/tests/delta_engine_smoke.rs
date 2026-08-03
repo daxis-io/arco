@@ -1,6 +1,9 @@
 //! Engine-style smoke suites for UC facade and Arco-native Delta APIs.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -8,8 +11,13 @@ use std::sync::Arc;
 use arco_api::config::{Config, Posture};
 use arco_api::server::ServerBuilder;
 use arco_catalog::CatalogReader;
-use arco_core::ScopedStorage;
-use arco_core::storage::MemoryBackend;
+use arco_catalog::metastore::events::{
+    CatalogObjectRecord, GrantRecord, LifecycleState, MetastoreEvent, MetastoreMutation,
+    PrincipalKind, PrincipalRecord,
+};
+use arco_catalog::metastore::ledger::MetastoreLedger;
+use arco_core::storage::{MemoryBackend, StorageBackend};
+use arco_core::{ControlPlaneScope, ScopedStorage};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use serde::Deserialize;
@@ -17,12 +25,79 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
+const SMOKE_PRINCIPAL: &str = "user_engine_smoke";
+
 fn test_config() -> Config {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let mut config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Default::default()
+    };
     config.unity_catalog.enabled = true;
     config
+}
+
+/// Seeds the production permission source with the exact schema authority the
+/// smoke flow exercises. The table route is intentionally fail-closed now, so
+/// an authenticated test principal must not inherit DDL authority implicitly.
+async fn seed_create_table_authority(
+    backend: &Arc<dyn StorageBackend>,
+    tenant: &str,
+    workspace: &str,
+    schema_id: &str,
+) {
+    let scope = ControlPlaneScope::workspace_alias(tenant, workspace).expect("control scope");
+    let storage = ScopedStorage::new(Arc::clone(backend), tenant, workspace)
+        .expect("scoped metastore storage");
+    let ledger = MetastoreLedger::new(storage);
+    for event in [
+        MetastoreEvent::new_scoped(
+            &scope,
+            "event_engine_smoke_principal",
+            1,
+            MetastoreMutation::PrincipalUpserted(PrincipalRecord {
+                principal_id: SMOKE_PRINCIPAL.to_string(),
+                name: SMOKE_PRINCIPAL.to_string(),
+                principal_kind: PrincipalKind::User,
+                owner: "test-owner".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: 1,
+                properties: BTreeMap::new(),
+            }),
+        ),
+        MetastoreEvent::new_scoped(
+            &scope,
+            "event_engine_smoke_schema",
+            2,
+            MetastoreMutation::CatalogObjectUpserted(CatalogObjectRecord {
+                object_id: schema_id.to_string(),
+                object_type: "SCHEMA".to_string(),
+                qualified_name: schema_id.to_string(),
+                owner: "test-owner".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: 2,
+                properties: BTreeMap::new(),
+            }),
+        ),
+        MetastoreEvent::new_scoped(
+            &scope,
+            "event_engine_smoke_grant",
+            3,
+            MetastoreMutation::GrantUpserted(GrantRecord {
+                grant_id: "grant_engine_smoke_create_table".to_string(),
+                object_id: schema_id.to_string(),
+                object_type: "SCHEMA".to_string(),
+                principal_id: SMOKE_PRINCIPAL.to_string(),
+                privilege: "CREATE_TABLE".to_string(),
+                owner: "test-owner".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: 3,
+                properties: BTreeMap::new(),
+            }),
+        ),
+    ] {
+        ledger.append_event(&event).await.expect("seed authority");
+    }
 }
 
 #[derive(Debug)]
@@ -45,7 +120,8 @@ async fn send_json(
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
-        .header("X-Workspace-Id", workspace);
+        .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", SMOKE_PRINCIPAL);
 
     if let Some(extra_headers) = extra_headers {
         for (key, value) in extra_headers {
@@ -91,20 +167,22 @@ struct NativeTable {
 }
 
 async fn run_engine_flow(engine: &str) {
-    let backend = Arc::new(MemoryBackend::new());
+    let tenant = "acme";
+    let workspace = "analytics";
+    let catalog_name = format!("{engine}_catalog");
+    let schema_name = format!("{engine}_schema");
+    let schema_id = format!("{catalog_name}.{schema_name}");
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    seed_create_table_authority(&backend, tenant, workspace, &schema_id).await;
     let server = ServerBuilder::new()
         .config(test_config())
         .storage_backend(backend.clone())
         .build();
     let router = server.test_router();
 
-    let tenant = "acme";
-    let workspace = "analytics";
     let uc_prefix = "/api/2.1/unity-catalog";
     let native_prefix = "/api/v1";
 
-    let catalog_name = format!("{engine}_catalog");
-    let schema_name = format!("{engine}_schema");
     let table_name = format!("{engine}_events");
     let full_table_name = format!("{catalog_name}.{schema_name}.{table_name}");
     let storage_location = format!("gs://smoke/{tenant}/{workspace}/{engine}/events");

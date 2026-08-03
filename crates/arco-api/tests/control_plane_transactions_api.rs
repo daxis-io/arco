@@ -1,5 +1,13 @@
 //! Integration tests for control-plane transaction commit and lookup APIs.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -2288,11 +2296,6 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
     .await?;
     assert!(current_catalog_response.receipt.is_some());
 
-    let current_orchestration = orchestration_request(
-        "idem-root-read-orch-current-01",
-        "req-root-read-orch-current-01",
-        "run-current-read-01",
-    );
     let current_orchestration = CommitOrchestrationBatchRequest {
         events: orchestration_request_with_event_id(
             "idem-root-read-orch-current-01",
@@ -2301,7 +2304,6 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
             "01JTXORCH000000000000000002",
         )
         .events,
-        ..current_orchestration
     };
     let (_status, current_orchestration_response): (_, CommitOrchestrationBatchResponse) =
         post_protobuf(
@@ -2779,8 +2781,10 @@ async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implem
 async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
-    let mut config = arco_api::config::Config::default();
-    config.idempotency_stale_timeout_secs = 0;
+    let config = arco_api::config::Config {
+        idempotency_stale_timeout_secs: 0,
+        ..Default::default()
+    };
     let router = test_router_with_config_backend(config, backend.clone());
 
     let first = catalog_create_default_schema_request(
@@ -2830,8 +2834,10 @@ async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_sam
 {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/ledger/orchestration/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
-    let mut config = arco_api::config::Config::default();
-    config.idempotency_stale_timeout_secs = 0;
+    let config = arco_api::config::Config {
+        idempotency_stale_timeout_secs: 0,
+        ..Default::default()
+    };
     let router = test_router_with_config_backend(config, backend.clone());
 
     let first = orchestration_request(

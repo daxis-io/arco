@@ -648,6 +648,14 @@ pub fn routes() -> Router<Arc<AppState>> {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::needless_pass_by_value,
+    clippy::unreadable_literal
+)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1186,8 +1194,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_missing_token() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = false;
+        let mut config = crate::config::Config {
+            debug: false,
+            ..Default::default()
+        };
         config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
@@ -1213,8 +1223,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_accepts_valid_token() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = false;
+        let mut config = crate::config::Config {
+            debug: false,
+            ..Default::default()
+        };
         config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
@@ -1249,7 +1261,7 @@ mod tests {
                 iss: None,
                 aud: None,
             },
-            &EncodingKey::from_secret("test-secret".as_bytes()),
+            &EncodingKey::from_secret(b"test-secret"),
         )?;
 
         let request = AxumRequest::builder()
@@ -1268,9 +1280,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_accepts_debug_headers_in_dev() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.posture = Posture::Dev;
+        let config = crate::config::Config {
+            debug: true,
+            posture: Posture::Dev,
+            ..Default::default()
+        };
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1307,9 +1321,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_task_auth_middleware_rejects_debug_headers_outside_dev() -> Result<()> {
-        let mut config = crate::config::Config::default();
-        config.debug = true;
-        config.posture = Posture::Private;
+        let mut config = crate::config::Config {
+            debug: true,
+            posture: Posture::Private,
+            ..Default::default()
+        };
         config.task_token.hs256_secret = "test-secret".to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 

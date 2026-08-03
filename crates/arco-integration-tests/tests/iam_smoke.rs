@@ -18,6 +18,10 @@
 //! - API CAN write to `ledger/` prefix (API-allowed)
 //! - Prefix-scoped IAM enforces Gate 5 sole-writer invariant
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
 #![cfg(feature = "iam-smoke")]
 
 use arco_core::storage_keys::{LedgerKey, StateKey};

@@ -620,8 +620,7 @@ mod tests {
         );
         config.jwks_url = "https://issuer.example/jwks".to_string();
         let error = InternalOidcVerifier::new(config)
-            .err()
-            .expect("verifier must not choose one configured signature source over another");
+            .expect_err("verifier must not choose one configured signature source over another");
         assert!(
             error
                 .to_string()

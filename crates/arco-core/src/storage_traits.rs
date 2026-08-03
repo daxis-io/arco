@@ -17,7 +17,7 @@
 //! | [`LedgerPutStore`] | put to ledger/ | API only |
 //! | [`StatePutStore`] | put to state/, snapshots/ | Compactor only |
 //! | [`CasStore`] | CAS to manifests/ | Compactor only |
-//! | [`ListStore`] | list | Anti-entropy only |
+//! | [`ListStore`] | list, `list_page` | Anti-entropy only |
 //! | [`MetaStore`] | head | Artifact verification |
 //!
 //! # Example
@@ -48,7 +48,7 @@ use bytes::Bytes;
 use std::ops::Range;
 
 use crate::error::Result;
-use crate::storage::{ObjectMeta, WritePrecondition, WriteResult};
+use crate::storage::{ListPage, ObjectMeta, WritePrecondition, WriteResult};
 use crate::storage_keys::{CommitKey, LedgerKey, LockKey, ManifestKey, StateKey};
 
 // ============================================================================
@@ -219,6 +219,14 @@ pub trait ListStore: Send + Sync + 'static {
     ///
     /// Results are returned in arbitrary order.
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+
+    /// Lists one bounded, lexicographically ordered page.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage>;
 }
 
 // ============================================================================
@@ -326,6 +334,15 @@ impl<S: StorageBackend> CommitPutStore for S {
 impl<S: StorageBackend> ListStore for S {
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         StorageBackend::list(self, prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        StorageBackend::list_page(self, prefix, start_after, limit).await
     }
 }
 

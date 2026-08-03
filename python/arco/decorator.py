@@ -1,7 +1,10 @@
 """Asset decorator for defining data assets."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from functools import wraps
-from typing import Callable, TypeVar
+from typing import TypeVar
 
 F = TypeVar("F", bound=Callable[..., object])
 

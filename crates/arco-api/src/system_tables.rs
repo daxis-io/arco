@@ -201,7 +201,10 @@ async fn register_domain_specs(
         return Ok(0);
     }
 
-    let paths = match reader.get_mintable_paths(domain).await {
+    // The load enumeration, not the mint allowlist: `commits.parquet` is never
+    // mintable, but `system.catalog.commits` exists precisely to serve its
+    // redacted projection, so the projection must still be able to read it.
+    let paths = match reader.get_snapshot_artifact_paths(domain).await {
         Ok(paths) => paths,
         Err(CatalogError::NotFound { .. }) => return Ok(0),
         Err(err) => return Err(ApiError::from(err)),

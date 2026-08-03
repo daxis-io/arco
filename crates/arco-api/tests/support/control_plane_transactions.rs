@@ -1,4 +1,11 @@
 #![allow(dead_code)]
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used, clippy::panic)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::default_trait_access)]
 
 use std::ops::Range;
 use std::sync::Arc;

@@ -157,6 +157,10 @@ impl PathGovernanceDeclaration {
         W: Into<String>,
     {
         let governed_path = GovernedPath::parse(raw_uri.as_ref())?;
+        // Belt-and-suspenders (path canonicalization round-trip): reject any
+        // canonical form that fails re-parsing before it can be staged for
+        // persistence.
+        governed_path.persistable_canonical_uri()?;
         Ok(Self::active_from_governed_path(
             declaration_id,
             authority_object_id,
@@ -719,7 +723,7 @@ mod tests {
     async fn exact_canonical_conflict_is_rejected() {
         let writer = writer(storage());
         writer
-            .declare_path(declaration("decl_orders", "gs://Bucket//warehouse/orders"))
+            .declare_path(declaration("decl_orders", "gs://Bucket/warehouse/orders"))
             .await
             .expect("declare first canonical path");
 
@@ -747,8 +751,17 @@ mod tests {
             .expect("declare percent-bearing canonical path");
 
         assert_eq!("decl_percent", receipt.declaration().declaration_id());
+        // One canonicalization pass: the escape is decoded exactly once and
+        // the emitted canonical URI re-encodes the literal '%' so it is a
+        // parse fixed point instead of an unreadable bare escape.
         assert_eq!(
-            "gs://bucket/warehouse/100%-complete/",
+            "gs://bucket/warehouse/100%25-complete/",
+            receipt.declaration().canonical_uri()
+        );
+        assert_eq!(
+            GovernedPath::parse(receipt.declaration().canonical_uri())
+                .expect("persisted canonical URI must re-parse")
+                .canonical_uri(),
             receipt.declaration().canonical_uri()
         );
     }
@@ -967,6 +980,151 @@ mod tests {
                 Some(&compiled)
             )
         );
+    }
+
+    /// Equivalence between the production UC conflict model
+    /// (`GovernedPath::overlaps`, used by
+    /// `storage_governance::StorageGovernanceState::validate_no_overlap`) and
+    /// the Phase 6 metadata predicate model (exact/ancestor/descendant keys
+    /// over canonical URIs staged by `stage_path_governance_declaration`).
+    ///
+    /// Over a corpus of path pairs — nested, siblings, prefix-similar names
+    /// (`orders/` vs `orders-archive/`), trailing-slash variants, bucket-name
+    /// prefixes, multi-scheme URIs, percent-encoded and repeated-slash
+    /// spellings, and `file://` paths — declaring the first path and then
+    /// attempting the second must conflict in the metadata model exactly when
+    /// the two governed paths overlap in the in-memory model.
+    #[tokio::test]
+    async fn overlap_model_and_metadata_predicate_model_agree_on_conflicts() {
+        let corpus = [
+            "gs://bucket/warehouse/orders",
+            "gs://bucket/warehouse/orders/",
+            "gs://bucket/warehouse/orders/2026",
+            "gs://bucket/warehouse/orders/2026/day=01",
+            "gs://bucket/warehouse/orders-archive",
+            "gs://bucket/warehouse/ord",
+            "gs://bucket/warehouse",
+            "gs://bucket",
+            "gs://bucket/other",
+            "gs://buck/warehouse/orders",
+            "gs://bucket-archive/warehouse/orders",
+            "s3://bucket/warehouse/orders",
+            "abfss://container/warehouse/orders",
+            "gs://Bucket/Warehouse/Orders",
+            "gs://bucket/warehouse/100%25-complete",
+            "gs://bucket/warehouse/orders%20archive",
+            "file:///data/warehouse/orders",
+            "file:///data",
+        ];
+
+        // Round-trip fixed-point property: every accepted corpus entry's
+        // canonical URI must re-parse to an equal governed path and an
+        // identical canonical URI.
+        for uri in corpus {
+            let parsed = GovernedPath::parse(uri).expect("corpus URI parses");
+            let canonical = parsed.canonical_uri();
+            let reparsed = GovernedPath::parse(&canonical).unwrap_or_else(|error| {
+                panic!("canonical URI {canonical:?} from {uri:?} must re-parse: {error:?}")
+            });
+            assert_eq!(
+                reparsed, parsed,
+                "canonical URI {canonical:?} from {uri:?} must be a parse fixed point"
+            );
+            assert_eq!(
+                reparsed.canonical_uri(),
+                canonical,
+                "canonicalization must be idempotent for {uri:?}"
+            );
+        }
+
+        let mut divergences = Vec::new();
+        for (first_index, first_uri) in corpus.iter().enumerate() {
+            for (second_index, second_uri) in corpus.iter().enumerate() {
+                let first_path = GovernedPath::parse(first_uri).expect("corpus URI parses");
+                let second_path = GovernedPath::parse(second_uri).expect("corpus URI parses");
+                let overlap_verdict = first_path.overlaps(&second_path);
+                assert_eq!(
+                    overlap_verdict,
+                    second_path.overlaps(&first_path),
+                    "GovernedPath::overlaps must be symmetric for {first_uri} / {second_uri}"
+                );
+
+                let writer = writer(storage());
+                writer
+                    .declare_path(declaration(&format!("decl_first_{first_index}"), first_uri))
+                    .await
+                    .expect("first corpus declaration must succeed on a fresh store");
+                let metadata_verdict = match writer
+                    .declare_path(declaration(
+                        &format!("decl_second_{second_index}"),
+                        second_uri,
+                    ))
+                    .await
+                {
+                    Ok(_) => false,
+                    Err(CatalogError::PreconditionFailed { .. }) => true,
+                    Err(error) => {
+                        panic!(
+                            "unexpected metadata error for {first_uri} then {second_uri}: {error:?}"
+                        )
+                    }
+                };
+
+                if overlap_verdict != metadata_verdict {
+                    divergences.push(format!(
+                        "declared {first_uri:?} then {second_uri:?}: overlaps={overlap_verdict} \
+                         metadata_conflict={metadata_verdict}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            divergences.is_empty(),
+            "GovernedPath::overlaps and the ancestor/descendant predicate model diverge:\n{}",
+            divergences.join("\n")
+        );
+    }
+
+    /// Rejection parity between the two models: URIs that `GovernedPath`
+    /// refuses to parse must be refused identically by the metadata model's
+    /// input boundary (`PathGovernanceDeclaration::active`), so neither model
+    /// can ever accept a spelling the other denies.
+    #[test]
+    fn rejection_corpus_is_denied_identically_by_both_models() {
+        let rejection_corpus = [
+            ("https://bucket/warehouse/orders", "unsupported scheme"),
+            ("gs:///warehouse/orders", "empty authority"),
+            ("gs://bucket/warehouse/../orders", "dot-dot traversal"),
+            ("gs://bucket/warehouse/%2e%2e/orders", "encoded traversal"),
+            ("gs://bucket/warehouse/%zz", "bad percent encoding"),
+            ("gs://bucket/warehouse/100%", "truncated percent escape"),
+            ("gs://bucket/warehouse/a%2Fb", "encoded path separator"),
+            ("gs://bucket/warehouse/a%5Cb", "encoded backslash separator"),
+            ("//bucket/warehouse/orders", "scheme-relative"),
+            ("warehouse/orders", "no scheme"),
+        ];
+
+        for (uri, reason) in rejection_corpus {
+            let parse_result = GovernedPath::parse(uri);
+            assert!(
+                matches!(parse_result, Err(CatalogError::Validation { .. })),
+                "GovernedPath must reject {uri:?} ({reason}), got {parse_result:?}"
+            );
+
+            let declaration_result = PathGovernanceDeclaration::active(
+                "decl_rejected",
+                "authority_rejected",
+                "EXTERNAL_LOCATION",
+                Some("workspace"),
+                uri,
+                "owner",
+            );
+            assert!(
+                matches!(declaration_result, Err(CatalogError::Validation { .. })),
+                "metadata model must reject {uri:?} ({reason}), got {declaration_result:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Delta commit coordination integration tests.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::similar_names, clippy::too_many_lines)]
 
 use std::sync::Arc;
 
@@ -89,6 +92,9 @@ async fn create_catalog_and_schema(
     assert_eq!(schema_resp.status(), StatusCode::CREATED);
 }
 
+// Test fixture helper: the arguments mirror the table-creation API surface;
+// a params struct would obscure the call sites (#331).
+#[allow(clippy::too_many_arguments)]
 async fn create_table_in_schema(
     app: &axum::Router,
     tenant: &str,

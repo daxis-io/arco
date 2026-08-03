@@ -955,6 +955,9 @@ fn compute_request_fingerprint(partition_keys: &[String]) -> String {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
     use super::*;
     use crate::paths::orchestration_event_path;

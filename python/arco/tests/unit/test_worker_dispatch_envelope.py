@@ -90,6 +90,35 @@ def test_worker_dispatch_envelope_accepts_legacy_without_task_id() -> None:
     assert envelope.task_key == "analytics.daily_sales"
 
 
+def test_worker_dispatch_envelope_parses_partition_scope_fields() -> None:
+    payload = _sample_canonical_envelope_dict()
+    payload["partitionKey"] = "date=d:2026-01-01"
+    payload["heartbeatTimeoutSec"] = 300
+
+    envelope = WorkerDispatchEnvelope.from_dict(payload)
+
+    assert envelope.partition_key == "date=d:2026-01-01"
+    assert envelope.heartbeat_timeout_sec == 300
+
+
+def test_worker_dispatch_envelope_parses_snake_case_partition_scope_fields() -> None:
+    payload = _sample_envelope_dict()
+    payload["partition_key"] = "date=d:2026-01-01"
+    payload["heartbeat_timeout_sec"] = 120
+
+    envelope = WorkerDispatchEnvelope.from_dict(payload)
+
+    assert envelope.partition_key == "date=d:2026-01-01"
+    assert envelope.heartbeat_timeout_sec == 120
+
+
+def test_worker_dispatch_envelope_tolerates_legacy_without_partition_scope() -> None:
+    envelope = WorkerDispatchEnvelope.from_dict(_sample_envelope_dict())
+
+    assert envelope.partition_key is None
+    assert envelope.heartbeat_timeout_sec is None
+
+
 def test_worker_dispatch_envelope_requires_new_fields() -> None:
     payload = _sample_envelope_dict()
     payload.pop("callback_base_url")
@@ -138,6 +167,8 @@ def test_dispatch_worker_uses_envelope_token_and_callback_url() -> None:
     worker._fallback_task_token = "fallback-token"
     worker._client = fake_client
     worker._assets = {"analytics.daily_sales": asset_fn}
+    worker._partitioned_assets = set()
+    worker._init_dispatch_state()
 
     envelope = WorkerDispatchEnvelope.from_dict(_sample_envelope_dict())
 
@@ -183,6 +214,8 @@ def _worker_for_scope_validation(*, api_url: str) -> DispatchWorker:
     worker._fallback_task_token = "fallback-token"
     worker._client = _RejectingClient()
     worker._assets = {}
+    worker._partitioned_assets = set()
+    worker._init_dispatch_state()
     return worker
 
 

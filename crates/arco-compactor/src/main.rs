@@ -124,9 +124,10 @@ struct RepairAutomationConfig {
 impl Default for RepairAutomationConfig {
     fn default() -> Self {
         Self {
-            // Unattended deletion is opt-in. With no configuration, retain the
-            // same detection coverage while reporting what enforcement would
-            // repair instead of mutating storage.
+            // Destructive automation is opt-in: the default reports findings
+            // without deleting anything. Set
+            // ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE=enforce to enable
+            // enforcement deliberately (#357).
             mode: RepairAutomationMode::DryRun,
             interval: Duration::from_secs(300),
             scope: RepairScope::Full,
@@ -1413,717 +1414,6 @@ async fn run_repair_automation_loop(state: Arc<ServiceState>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-    use std::ops::Range;
-
-    use super::*;
-    use arco_catalog::{CatalogDomainManifest, RootManifest};
-    use arco_core::error::Error as CoreError;
-    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
-    use arco_core::{CatalogPaths, WritePrecondition};
-    use async_trait::async_trait;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use bytes::Bytes;
-    use tower::util::ServiceExt;
-
-    fn test_state() -> Arc<ServiceState> {
-        test_state_with_scope("acme", "analytics")
-    }
-
-    #[derive(Debug, Default)]
-    struct ListDeniedBackend {
-        inner: MemoryBackend,
-    }
-
-    #[async_trait]
-    impl StorageBackend for ListDeniedBackend {
-        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
-            self.inner.get(path).await
-        }
-
-        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
-            self.inner.get_range(path, range).await
-        }
-
-        async fn put(
-            &self,
-            path: &str,
-            data: Bytes,
-            precondition: WritePrecondition,
-        ) -> arco_core::Result<WriteResult> {
-            self.inner.put(path, data, precondition).await
-        }
-
-        async fn delete(&self, path: &str) -> arco_core::Result<()> {
-            self.inner.delete(path).await
-        }
-
-        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
-            Err(CoreError::storage(format!(
-                "list() is reserved for anti-entropy smoke tests: {prefix}"
-            )))
-        }
-
-        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
-            self.inner.head(path).await
-        }
-
-        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
-            self.inner.signed_url(path, expiry).await
-        }
-    }
-
-    fn test_state_with_scope(tenant_id: &str, workspace_id: &str) -> Arc<ServiceState> {
-        let storage = Arc::new(MemoryBackend::new());
-        test_state_with_backend_and_scope(storage, tenant_id, workspace_id)
-    }
-
-    fn test_state_with_backend_and_scope<B>(
-        storage: Arc<B>,
-        tenant_id: &str,
-        workspace_id: &str,
-    ) -> Arc<ServiceState>
-    where
-        B: StorageBackend,
-    {
-        let scoped_storage =
-            ScopedStorage::new(storage, tenant_id, workspace_id).expect("scoped storage");
-        let compactor_state = Arc::new(CompactorState::new(60));
-        let notification_consumer = NotificationConsumer::new(
-            scoped_storage.clone(),
-            NotificationConsumerConfig::default(),
-        );
-        let auto_anti_entropy = AutoAntiEntropyConfig {
-            compactor_url: "http://127.0.0.1:8081".to_string(),
-            compactor_audience: None,
-            compactor_id_token: None,
-            max_objects_per_run: 0,
-            reprocess_batch_size: 0,
-            reprocess_timeout_secs: 30,
-        };
-        Arc::new(ServiceState {
-            compactor: compactor_state,
-            storage: scoped_storage,
-            tenant_id: tenant_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            notification_consumer: Arc::new(Mutex::new(notification_consumer)),
-            auto_anti_entropy,
-            repair_automation: RepairAutomationConfig::default(),
-            repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
-        })
-    }
-
-    async fn seed_catalog_reconcile_state_with_old_snapshot(storage: &ScopedStorage) -> String {
-        let mut root = RootManifest::new();
-        root.normalize_paths();
-        storage
-            .put_raw(
-                CatalogPaths::ROOT_MANIFEST,
-                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write root");
-
-        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
-        let mut snapshot = arco_catalog::manifest::SnapshotInfo::new(1, snapshot_path);
-        snapshot.add_file(arco_catalog::manifest::SnapshotFile {
-            path: "current.parquet".to_string(),
-            checksum_sha256: "ab".repeat(32),
-            byte_size: 1,
-            row_count: 1,
-            position_range: None,
-        });
-        let manifest = CatalogDomainManifest {
-            manifest_id: arco_catalog::manifest::format_manifest_id(1),
-            epoch: 1,
-            previous_manifest_path: None,
-            writer_session_id: Some("route-test".to_string()),
-            snapshot_version: 1,
-            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
-            snapshot: Some(snapshot),
-            watermark_event_id: None,
-            last_commit_id: None,
-            fencing_token: Some(1),
-            commit_ulid: None,
-            parent_hash: None,
-            updated_at: Utc::now(),
-        };
-        let manifest_path =
-            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest.manifest_id);
-        storage
-            .put_raw(
-                &manifest_path,
-                Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write manifest");
-        let pointer = arco_catalog::manifest::DomainManifestPointer {
-            manifest_id: manifest.manifest_id.clone(),
-            manifest_path,
-            epoch: manifest.fencing_token.unwrap_or(manifest.epoch),
-            parent_pointer_hash: None,
-            updated_at: Utc::now(),
-        };
-        storage
-            .put_raw(
-                &root.catalog_manifest_path,
-                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write pointer");
-        storage
-            .put_raw(
-                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "current.parquet"),
-                Bytes::from_static(b"current"),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write current snapshot");
-
-        let old_snapshot =
-            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 0, "old-route-test.parquet");
-        storage
-            .put_raw(
-                &old_snapshot,
-                Bytes::from_static(b"old"),
-                WritePrecondition::None,
-            )
-            .await
-            .expect("write old snapshot");
-
-        old_snapshot
-    }
-
-    fn rendered_metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
-        rendered.lines().find_map(|line| {
-            if !line.starts_with(name)
-                || !labels
-                    .iter()
-                    .all(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
-            {
-                return None;
-            }
-            line.rsplit_once(' ')?.1.parse::<f64>().ok()
-        })
-    }
-
-    fn test_internal_auth_state() -> Arc<InternalAuthState> {
-        let config = InternalOidcConfig::hs256_for_tests(
-            "https://accounts.google.com",
-            "https://compactor.internal",
-            "test-secret",
-            [String::from("svc-compactor")]
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::new(),
-            true,
-        );
-        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
-        Arc::new(InternalAuthState {
-            verifier: Arc::new(verifier),
-            enforce: true,
-        })
-    }
-
-    #[test]
-    fn test_normalize_metrics_secret_trims_empty() {
-        assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
-        assert_eq!(
-            normalize_metrics_secret(Some("  secret  ".to_string())),
-            Some("secret".to_string())
-        );
-    }
-
-    #[test]
-    fn test_parse_catalog_domain_accepts_supported_values() {
-        assert_eq!(
-            parse_catalog_domain("catalog").unwrap(),
-            CatalogDomain::Catalog
-        );
-        assert_eq!(
-            parse_catalog_domain("lineage").unwrap(),
-            CatalogDomain::Lineage
-        );
-        assert_eq!(
-            parse_catalog_domain("executions").unwrap(),
-            CatalogDomain::Executions
-        );
-        assert_eq!(
-            parse_catalog_domain("search").unwrap(),
-            CatalogDomain::Search
-        );
-    }
-
-    #[test]
-    fn test_reconcile_request_defaults_to_full_scope() {
-        let request: ReconcileRequest =
-            serde_json::from_str(r#"{"domain":"catalog","repair":true}"#)
-                .expect("parse reconcile request");
-        assert_eq!(request.effective_repair_scope(), RepairScope::Full);
-    }
-
-    #[test]
-    fn test_repair_automation_config_defaults_to_dry_run_full_scope() {
-        let config =
-            RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
-
-        assert_eq!(config.mode, RepairAutomationMode::DryRun);
-        assert_eq!(config.interval, Duration::from_secs(300));
-        assert_eq!(config.scope, RepairScope::Full);
-        assert_eq!(
-            config.domains,
-            vec![
-                CatalogDomain::Catalog,
-                CatalogDomain::Lineage,
-                CatalogDomain::Search,
-            ]
-        );
-    }
-
-    #[test]
-    fn test_repair_automation_config_parses_enforce_full_scope_and_domains() {
-        let config = RepairAutomationConfig::from_env_reader(|key| match key {
-            "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE" => Some("enforce".to_string()),
-            "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS" => Some("42".to_string()),
-            "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE" => Some("full".to_string()),
-            "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS" => {
-                Some("search, catalog, search".to_string())
-            }
-            _ => None,
-        })
-        .expect("parse repair automation config");
-
-        assert_eq!(config.mode, RepairAutomationMode::Enforce);
-        assert_eq!(config.interval, Duration::from_secs(42));
-        assert_eq!(config.scope, RepairScope::Full);
-        assert_eq!(
-            config.domains,
-            vec![CatalogDomain::Search, CatalogDomain::Catalog]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_metrics_gate_disabled_when_secret_empty() {
-        metrics::init_metrics();
-        let state = test_state();
-        let router = build_router(
-            state,
-            normalize_metrics_secret(Some("  ".to_string())),
-            None,
-        );
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_gate_accepts_x_metrics_secret() {
-        metrics::init_metrics();
-        let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("X-Metrics-Secret", "topsecret")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_gate_accepts_bearer_secret() {
-        metrics::init_metrics();
-        let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("Authorization", "Bearer topsecret")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
-        let state = test_state();
-        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        let router = build_router(state, Some("topsecret".to_string()), None);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("X-Metrics-Secret", "wrong")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_gate_accepts_when_both_headers_present() {
-        metrics::init_metrics();
-        let state = test_state();
-        let router = build_router(state, Some("topsecret".to_string()), None);
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("X-Metrics-Secret", "wrong")
-                    .header("Authorization", "Bearer topsecret")
-                    .body(Body::empty())
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_endpoint_defaults_to_full_scope() {
-        let state = test_state();
-        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/reconcile")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"domain":"catalog","repair":true}"#.to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            state
-                .storage
-                .head_raw(&old_snapshot)
-                .await
-                .expect("head old snapshot")
-                .is_none(),
-            "default reconcile repair scope must clean up generic candidates"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_endpoint_full_scope_repairs_cleanup_items() {
-        let state = test_state();
-        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state.clone(), None, None);
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/reconcile")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"domain":"catalog","repair":true,"repairScope":"full"}"#.to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            state
-                .storage
-                .head_raw(&old_snapshot)
-                .await
-                .expect("head old snapshot")
-                .is_none(),
-            "full reconcile repair scope must delete generic cleanup candidates"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_sync_compact_handler_does_not_require_list_permission() {
-        let state = test_state_with_backend_and_scope(
-            Arc::new(ListDeniedBackend::default()),
-            "list-denied-tenant",
-            "list-denied-workspace",
-        );
-        let router = build_router(state, None, None);
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/sync-compact")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "domain": "catalog",
-                            "event_paths": ["ledger/catalog/01JFXYZ.json"],
-                            "fencing_token": 1,
-                            "lock_path": "locks/not-the-canonical-lock.json"
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("read response body");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse sync-compact response");
-        assert_eq!(json["error"], "validation_error");
-        assert!(
-            !json["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list() is reserved"),
-            "sync-compact smoke should not depend on bucket list permission: {json}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_anti_entropy_handler_is_the_only_list_authorized_path() {
-        let state = test_state_with_backend_and_scope(
-            Arc::new(ListDeniedBackend::default()),
-            "list-denied-tenant",
-            "list-denied-workspace",
-        );
-        let _ = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
-        let router = build_router(state, None, None);
-
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/anti-entropy")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "domain": "catalog",
-                            "tenant_id": "list-denied-tenant",
-                            "workspace_id": "list-denied-workspace",
-                            "max_objects_per_run": 1
-                        })
-                        .to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .expect("read response body");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).expect("parse anti-entropy response");
-        assert_eq!(json["error"], "anti_entropy_failed");
-        assert!(
-            json["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("list() is reserved"),
-            "anti-entropy smoke should fail specifically on list permission boundary: {json}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_repair_automation_busy_refreshes_backlog_age_metrics() {
-        let handle = metrics::init_metrics();
-        let state = test_state_with_scope("busy-metrics-tenant", "busy-metrics-workspace");
-
-        {
-            let mut backlog = state.repair_backlog.lock().await;
-            let _ = backlog
-                .domains
-                .entry(CatalogDomain::Catalog)
-                .or_default()
-                .update(
-                    1,
-                    Some("missing_current_head_commit_record:state/catalog/commits/00000000000000000001.json".to_string()),
-                    Utc::now() - chrono::Duration::minutes(20),
-                );
-        }
-
-        let compaction_guard = state.compactor.compaction_lock.lock().await;
-        run_repair_automation_once(&state).await;
-        drop(compaction_guard);
-
-        let rendered = handle.render();
-        let labels = [
-            ("domain", CatalogDomain::Catalog.as_str()),
-            ("tenant_id", "busy-metrics-tenant"),
-            ("workspace_id", "busy-metrics-workspace"),
-        ];
-        let age_seconds = rendered_metric_value(
-            &rendered,
-            "arco_catalog_repair_backlog_age_seconds",
-            &labels,
-        )
-        .expect("backlog age metric");
-        assert!(
-            age_seconds >= 60.0,
-            "busy repair automation should refresh backlog age metrics, got {age_seconds} from {rendered}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
-        let router = build_router(test_state(), None, Some(test_internal_auth_state()));
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/internal/reconcile")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"domain":"catalog","repair":false}"#.to_string(),
-                    ))
-                    .expect("request build failed"),
-            )
-            .await
-            .expect("request failed");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-}
-
-fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
-    secret.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for i in 0..max_len {
-        let left_byte = *left.get(i).unwrap_or(&0);
-        let right_byte = *right.get(i).unwrap_or(&0);
-        diff |= (left_byte ^ right_byte) as usize;
-    }
-    diff == 0
-}
-
-fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String> {
-    match raw {
-        "catalog" | "core" => Ok(CatalogDomain::Catalog),
-        "lineage" => Ok(CatalogDomain::Lineage),
-        "executions" => Ok(CatalogDomain::Executions),
-        "search" | "governance" => Ok(CatalogDomain::Search),
-        _ => Err(format!("unsupported catalog reconcile domain: {raw}")),
-    }
-}
-
-fn build_router(
-    state: Arc<ServiceState>,
-    metrics_secret: Option<String>,
-    internal_auth: Option<Arc<InternalAuthState>>,
-) -> Router {
-    // Build HTTP router
-    // Note: /internal/anti-entropy is separate from /internal/sync-compact
-    // because they have different IAM requirements:
-    // - sync-compact: compactor-fastpath-sa (NO list)
-    // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let base_router = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/compact", post(compact))
-        .route("/internal/notify", post(notify_handler))
-        .route("/internal/sync-compact", post(sync_compact_handler))
-        .route("/internal/reconcile", reconcile_route)
-        .route("/internal/anti-entropy", post(anti_entropy_handler));
-
-    let router = if let Some(secret) = metrics_secret {
-        tracing::info!(
-            "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
-        );
-        let secret = Arc::<str>::from(secret);
-        base_router.route(
-            "/metrics",
-            get(move |headers: axum::http::HeaderMap| {
-                let secret = Arc::clone(&secret);
-                async move {
-                    let from_custom = headers
-                        .get("X-Metrics-Secret")
-                        .and_then(|v| v.to_str().ok());
-                    let from_bearer = headers
-                        .get("Authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "));
-                    let secret_bytes = secret.as_bytes();
-                    let matches_custom = from_custom
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    let matches_bearer = from_bearer
-                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
-                    if matches_custom || matches_bearer {
-                        metrics::serve_metrics().await.into_response()
-                    } else {
-                        StatusCode::FORBIDDEN.into_response()
-                    }
-                }
-            }),
-        )
-    } else {
-        base_router.route("/metrics", get(metrics::serve_metrics))
-    };
-
-    router.with_state(state)
-}
-
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -2328,4 +1618,737 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn normalize_metrics_secret(secret: Option<String>) -> Option<String> {
+    secret.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for i in 0..max_len {
+        let left_byte = *left.get(i).unwrap_or(&0);
+        let right_byte = *right.get(i).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+    diff == 0
+}
+
+fn parse_catalog_domain(raw: &str) -> std::result::Result<CatalogDomain, String> {
+    match raw {
+        "catalog" | "core" => Ok(CatalogDomain::Catalog),
+        "lineage" => Ok(CatalogDomain::Lineage),
+        "executions" => Ok(CatalogDomain::Executions),
+        "search" | "governance" => Ok(CatalogDomain::Search),
+        _ => Err(format!("unsupported catalog reconcile domain: {raw}")),
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "one-shot router construction; owning Option<Arc> keeps the many call sites simple"
+)]
+fn build_router(
+    state: Arc<ServiceState>,
+    metrics_secret: Option<String>,
+    internal_auth: Option<Arc<InternalAuthState>>,
+) -> Router {
+    // Build HTTP router
+    // Note: /internal/anti-entropy is separate from /internal/sync-compact
+    // because they have different IAM requirements:
+    // - sync-compact: compactor-fastpath-sa (NO list)
+    // - anti-entropy: compactor-antientropy-sa (WITH bucket-level list)
+    let internal_route =
+        |method_router: axum::routing::MethodRouter<Arc<ServiceState>>| match internal_auth.clone()
+        {
+            None => method_router,
+            Some(auth) => method_router.route_layer(middleware::from_fn_with_state(
+                auth,
+                internal_auth_middleware,
+            )),
+        };
+    let reconcile_route = internal_route(post(reconcile_handler));
+    let base_router = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/compact", post(compact))
+        .route("/internal/notify", post(notify_handler))
+        .route("/internal/sync-compact", post(sync_compact_handler))
+        .route("/internal/reconcile", reconcile_route)
+        .route("/internal/anti-entropy", post(anti_entropy_handler));
+
+    let router = if let Some(secret) = metrics_secret {
+        tracing::info!(
+            "Metrics endpoint protected (accepts X-Metrics-Secret or Authorization: Bearer)"
+        );
+        let secret = Arc::<str>::from(secret);
+        base_router.route(
+            "/metrics",
+            get(move |headers: axum::http::HeaderMap| {
+                let secret = Arc::clone(&secret);
+                async move {
+                    let from_custom = headers
+                        .get("X-Metrics-Secret")
+                        .and_then(|v| v.to_str().ok());
+                    let from_bearer = headers
+                        .get("Authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    let secret_bytes = secret.as_bytes();
+                    let matches_custom = from_custom
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    let matches_bearer = from_bearer
+                        .is_some_and(|value| constant_time_eq(value.as_bytes(), secret_bytes));
+                    if matches_custom || matches_bearer {
+                        metrics::serve_metrics().await.into_response()
+                    } else {
+                        StatusCode::FORBIDDEN.into_response()
+                    }
+                }
+            }),
+        )
+    } else {
+        base_router.route("/metrics", get(metrics::serve_metrics))
+    };
+
+    router.with_state(state)
+}
+
+#[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::iter_on_single_items)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::ops::Range;
+
+    use super::*;
+    use arco_catalog::{CatalogDomainManifest, RootManifest};
+    use arco_core::error::Error as CoreError;
+    use arco_core::storage::{MemoryBackend, ObjectMeta, StorageBackend, WriteResult};
+    use arco_core::{CatalogPaths, WritePrecondition};
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
+    use tower::util::ServiceExt;
+
+    fn test_state() -> Arc<ServiceState> {
+        test_state_with_scope("acme", "analytics")
+    }
+
+    #[derive(Debug, Default)]
+    struct ListDeniedBackend {
+        inner: MemoryBackend,
+    }
+
+    #[async_trait]
+    impl StorageBackend for ListDeniedBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            Err(CoreError::storage(format!(
+                "list() is reserved for anti-entropy smoke tests: {prefix}"
+            )))
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    fn test_state_with_scope(tenant_id: &str, workspace_id: &str) -> Arc<ServiceState> {
+        let storage = Arc::new(MemoryBackend::new());
+        test_state_with_backend_and_scope(storage, tenant_id, workspace_id)
+    }
+
+    fn test_state_with_backend_and_scope<B>(
+        storage: Arc<B>,
+        tenant_id: &str,
+        workspace_id: &str,
+    ) -> Arc<ServiceState>
+    where
+        B: StorageBackend,
+    {
+        let scoped_storage =
+            ScopedStorage::new(storage, tenant_id, workspace_id).expect("scoped storage");
+        let compactor_state = Arc::new(CompactorState::new(60));
+        let notification_consumer = NotificationConsumer::new(
+            scoped_storage.clone(),
+            NotificationConsumerConfig::default(),
+        );
+        let auto_anti_entropy = AutoAntiEntropyConfig {
+            compactor_url: "http://127.0.0.1:8081".to_string(),
+            compactor_audience: None,
+            compactor_id_token: None,
+            max_objects_per_run: 0,
+            reprocess_batch_size: 0,
+            reprocess_timeout_secs: 30,
+        };
+        Arc::new(ServiceState {
+            compactor: compactor_state,
+            storage: scoped_storage,
+            tenant_id: tenant_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            notification_consumer: Arc::new(Mutex::new(notification_consumer)),
+            auto_anti_entropy,
+            repair_automation: RepairAutomationConfig::default(),
+            repair_backlog: Arc::new(Mutex::new(RepairBacklogTracker::default())),
+        })
+    }
+
+    async fn seed_catalog_reconcile_state_with_old_snapshot(storage: &ScopedStorage) -> String {
+        // Full-scope repair deletions build the fail-closed GC protection set,
+        // which requires every domain head to be readable.
+        arco_catalog::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .expect("initialize tier1");
+
+        let mut root = RootManifest::new();
+        root.normalize_paths();
+        storage
+            .put_raw(
+                CatalogPaths::ROOT_MANIFEST,
+                Bytes::from(serde_json::to_vec(&root).expect("serialize root")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write root");
+
+        let snapshot_path = CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1);
+        let mut snapshot = arco_catalog::manifest::SnapshotInfo::new(1, snapshot_path);
+        snapshot.add_file(arco_catalog::manifest::SnapshotFile {
+            path: "current.parquet".to_string(),
+            checksum_sha256: "ab".repeat(32),
+            byte_size: 1,
+            row_count: 1,
+            position_range: None,
+        });
+        let manifest = CatalogDomainManifest {
+            manifest_id: arco_catalog::manifest::format_manifest_id(1),
+            epoch: 1,
+            previous_manifest_path: None,
+            writer_session_id: Some("route-test".to_string()),
+            snapshot_version: 1,
+            snapshot_path: CatalogPaths::snapshot_dir(CatalogDomain::Catalog, 1),
+            snapshot: Some(snapshot),
+            watermark_event_id: None,
+            last_commit_id: None,
+            fencing_token: Some(1),
+            commit_ulid: None,
+            parent_hash: None,
+            updated_at: Utc::now(),
+        };
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest.manifest_id);
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).expect("serialize manifest")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write manifest");
+        let pointer = arco_catalog::manifest::DomainManifestPointer {
+            manifest_id: manifest.manifest_id.clone(),
+            manifest_path,
+            epoch: manifest.fencing_token.unwrap_or(manifest.epoch),
+            parent_pointer_hash: None,
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &root.catalog_manifest_path,
+                Bytes::from(serde_json::to_vec(&pointer).expect("serialize pointer")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write pointer");
+        storage
+            .put_raw(
+                &CatalogPaths::snapshot_file(CatalogDomain::Catalog, 1, "current.parquet"),
+                Bytes::from_static(b"current"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write current snapshot");
+
+        let old_snapshot =
+            CatalogPaths::snapshot_file(CatalogDomain::Catalog, 0, "old-route-test.parquet");
+        storage
+            .put_raw(
+                &old_snapshot,
+                Bytes::from_static(b"old"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("write old snapshot");
+
+        old_snapshot
+    }
+
+    fn rendered_metric_value(rendered: &str, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            if !line.starts_with(name)
+                || !labels
+                    .iter()
+                    .all(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
+            {
+                return None;
+            }
+            line.rsplit_once(' ')?.1.parse::<f64>().ok()
+        })
+    }
+
+    fn test_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://compactor.internal",
+            "test-secret",
+            [String::from("svc-compactor")]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::new(),
+            true,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: true,
+        })
+    }
+
+    #[test]
+    fn test_normalize_metrics_secret_trims_empty() {
+        assert!(normalize_metrics_secret(Some("  ".to_string())).is_none());
+        assert_eq!(
+            normalize_metrics_secret(Some("  secret  ".to_string())),
+            Some("secret".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_catalog_domain_accepts_supported_values() {
+        assert_eq!(
+            parse_catalog_domain("catalog").unwrap(),
+            CatalogDomain::Catalog
+        );
+        assert_eq!(
+            parse_catalog_domain("lineage").unwrap(),
+            CatalogDomain::Lineage
+        );
+        assert_eq!(
+            parse_catalog_domain("executions").unwrap(),
+            CatalogDomain::Executions
+        );
+        assert_eq!(
+            parse_catalog_domain("search").unwrap(),
+            CatalogDomain::Search
+        );
+    }
+
+    #[test]
+    fn test_reconcile_request_defaults_to_full_scope() {
+        let request: ReconcileRequest =
+            serde_json::from_str(r#"{"domain":"catalog","repair":true}"#)
+                .expect("parse reconcile request");
+        assert_eq!(request.effective_repair_scope(), RepairScope::Full);
+    }
+
+    #[test]
+    fn test_repair_automation_config_defaults_to_non_destructive_dry_run() {
+        let config =
+            RepairAutomationConfig::from_env_reader(|_| None).expect("default repair config");
+
+        assert_eq!(
+            config.mode,
+            RepairAutomationMode::DryRun,
+            "destructive repair enforcement must be explicit opt-in (#357)"
+        );
+        assert_eq!(config.interval, Duration::from_secs(300));
+        assert_eq!(config.scope, RepairScope::Full);
+        assert_eq!(
+            config.domains,
+            vec![
+                CatalogDomain::Catalog,
+                CatalogDomain::Lineage,
+                CatalogDomain::Search,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_repair_automation_config_parses_enforce_full_scope_and_domains() {
+        let config = RepairAutomationConfig::from_env_reader(|key| match key {
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_MODE" => Some("enforce".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_INTERVAL_SECS" => Some("42".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_SCOPE" => Some("full".to_string()),
+            "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS" => {
+                Some("search, catalog, search".to_string())
+            }
+            _ => None,
+        })
+        .expect("parse repair automation config");
+
+        assert_eq!(config.mode, RepairAutomationMode::Enforce);
+        assert_eq!(config.interval, Duration::from_secs(42));
+        assert_eq!(config.scope, RepairScope::Full);
+        assert_eq!(
+            config.domains,
+            vec![CatalogDomain::Search, CatalogDomain::Catalog]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_disabled_when_secret_empty() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(
+            state,
+            normalize_metrics_secret(Some("  ".to_string())),
+            None,
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_x_metrics_secret() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_bearer_secret() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("Authorization", "Bearer topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_rejects_missing_or_wrong_secret() {
+        let state = test_state();
+        let router = build_router(Arc::clone(&state), Some("topsecret".to_string()), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let router = build_router(state, Some("topsecret".to_string()), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "wrong")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_gate_accepts_when_both_headers_present() {
+        metrics::init_metrics();
+        let state = test_state();
+        let router = build_router(state, Some("topsecret".to_string()), None);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("X-Metrics-Secret", "wrong")
+                    .header("Authorization", "Bearer topsecret")
+                    .body(Body::empty())
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_defaults_to_full_scope() {
+        let state = test_state();
+        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state.clone(), None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":true}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .storage
+                .head_raw(&old_snapshot)
+                .await
+                .expect("head old snapshot")
+                .is_some(),
+            "repair must not delete candidates younger than the minimum age \
+             (recent objects may back unexpired signed URLs, #343)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_full_scope_preserves_recent_candidates() {
+        let state = test_state();
+        let old_snapshot = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state.clone(), None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":true,"repairScope":"full"}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .storage
+                .head_raw(&old_snapshot)
+                .await
+                .expect("head old snapshot")
+                .is_some(),
+            "full-scope repair must not delete candidates younger than the \
+             minimum age window (#343): aged cleanup is exercised in the \
+             arco-catalog reconciler suite"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sync_compact_handler_does_not_require_list_permission() {
+        let state = test_state_with_backend_and_scope(
+            Arc::new(ListDeniedBackend::default()),
+            "list-denied-tenant",
+            "list-denied-workspace",
+        );
+        let router = build_router(state, None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/sync-compact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "domain": "catalog",
+                            "event_paths": ["ledger/catalog/01JFXYZ.json"],
+                            "fencing_token": 1,
+                            "lock_path": "locks/not-the-canonical-lock.json"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse sync-compact response");
+        assert_eq!(json["error"], "validation_error");
+        assert!(
+            !json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("list() is reserved"),
+            "sync-compact smoke should not depend on bucket list permission: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_anti_entropy_handler_is_the_only_list_authorized_path() {
+        let state = test_state_with_backend_and_scope(
+            Arc::new(ListDeniedBackend::default()),
+            "list-denied-tenant",
+            "list-denied-workspace",
+        );
+        let _ = seed_catalog_reconcile_state_with_old_snapshot(&state.storage).await;
+        let router = build_router(state, None, None);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/anti-entropy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "domain": "catalog",
+                            "tenant_id": "list-denied-tenant",
+                            "workspace_id": "list-denied-workspace",
+                            "max_objects_per_run": 1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse anti-entropy response");
+        assert_eq!(json["error"], "anti_entropy_failed");
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("list() is reserved"),
+            "anti-entropy smoke should fail specifically on list permission boundary: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repair_automation_busy_refreshes_backlog_age_metrics() {
+        let handle = metrics::init_metrics();
+        let state = test_state_with_scope("busy-metrics-tenant", "busy-metrics-workspace");
+
+        {
+            let mut backlog = state.repair_backlog.lock().await;
+            let _ = backlog
+                .domains
+                .entry(CatalogDomain::Catalog)
+                .or_default()
+                .update(
+                    1,
+                    Some("missing_current_head_commit_record:state/catalog/commits/00000000000000000001.json".to_string()),
+                    Utc::now() - chrono::Duration::minutes(20),
+                );
+        }
+
+        let compaction_guard = state.compactor.compaction_lock.lock().await;
+        run_repair_automation_once(&state).await;
+        drop(compaction_guard);
+
+        let rendered = handle.render();
+        let labels = [
+            ("domain", CatalogDomain::Catalog.as_str()),
+            ("tenant_id", "busy-metrics-tenant"),
+            ("workspace_id", "busy-metrics-workspace"),
+        ];
+        let age_seconds = rendered_metric_value(
+            &rendered,
+            "arco_catalog_repair_backlog_age_seconds",
+            &labels,
+        )
+        .expect("backlog age metric");
+        assert!(
+            age_seconds >= 60.0,
+            "busy repair automation should refresh backlog age metrics, got {age_seconds} from {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_endpoint_requires_internal_auth_when_enforced() {
+        let router = build_router(test_state(), None, Some(test_internal_auth_state()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/reconcile")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"catalog","repair":false}"#.to_string(),
+                    ))
+                    .expect("request build failed"),
+            )
+            .await
+            .expect("request failed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }

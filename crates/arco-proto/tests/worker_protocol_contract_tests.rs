@@ -1,6 +1,9 @@
 //! Generated worker protocol contract tests.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unnecessary_wraps)]
 
 use std::collections::BTreeMap;
 
@@ -39,6 +42,8 @@ fn worker_dispatch_envelope_proto_roundtrips_wire_format() {
         attempt_id: "att-123".to_string(),
         dispatch_id: "dispatch:run-123:analytics.daily_sales:1".to_string(),
         execution_location_id: Some("local-dev".to_string()),
+        partition_key: Some("date=d:2026-01-01".to_string()),
+        heartbeat_timeout_sec: Some(300),
         worker_queue: "default-queue".to_string(),
         callback_base_url: "https://callbacks.example".to_string(),
         task_token: "token".to_string(),

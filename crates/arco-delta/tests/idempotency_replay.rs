@@ -1,6 +1,9 @@
 //! Regression tests for idempotency replay around transient write failures.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::significant_drop_tightening)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;

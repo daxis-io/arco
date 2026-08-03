@@ -203,7 +203,7 @@ variable "background_automation_enabled" {
 }
 
 variable "compactor_repair_automation_mode" {
-  description = "Catalog compactor repair automation mode; enforce is an explicit opt-in to storage mutation"
+  description = "Catalog compactor repair automation mode (destructive enforcement is explicit opt-in; the default reports findings without deleting)"
   type        = string
   default     = "dry_run"
 
@@ -242,7 +242,7 @@ variable "compactor_repair_automation_domains" {
 }
 
 variable "flow_compactor_repair_automation_mode" {
-  description = "Orchestration compactor repair automation mode; enforce is an explicit opt-in to storage mutation"
+  description = "Orchestration compactor repair automation mode (destructive enforcement is explicit opt-in; the default reports findings without deleting)"
   type        = string
   default     = "dry_run"
 

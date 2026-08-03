@@ -98,28 +98,6 @@ fn unity_catalog_public_route(method: &Method, path: &str) -> bool {
     matches!(*method, Method::GET | Method::HEAD) && path == "/openapi.json"
 }
 
-#[cfg(test)]
-mod tests {
-    use axum::http::Method;
-
-    use super::unity_catalog_public_route;
-
-    #[test]
-    fn public_route_matches_only_exact_router_endpoint() {
-        assert!(unity_catalog_public_route(&Method::GET, "/openapi.json"));
-        assert!(unity_catalog_public_route(&Method::HEAD, "/openapi.json"));
-        assert!(!unity_catalog_public_route(&Method::POST, "/openapi.json"));
-        assert!(!unity_catalog_public_route(
-            &Method::GET,
-            "/private/openapi.json"
-        ));
-        assert!(!unity_catalog_public_route(
-            &Method::GET,
-            "/catalog/openapi.json"
-        ));
-    }
-}
-
 /// Middleware that injects a request context and echoes the request ID.
 pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     if let Some(ctx) = req
@@ -156,4 +134,26 @@ pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     let mut response = next.run(Request::from_parts(parts, body)).await;
     add_request_id_header(&mut response, &ctx.request_id);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Method;
+
+    use super::unity_catalog_public_route;
+
+    #[test]
+    fn public_route_matches_only_exact_router_endpoint() {
+        assert!(unity_catalog_public_route(&Method::GET, "/openapi.json"));
+        assert!(unity_catalog_public_route(&Method::HEAD, "/openapi.json"));
+        assert!(!unity_catalog_public_route(&Method::POST, "/openapi.json"));
+        assert!(!unity_catalog_public_route(
+            &Method::GET,
+            "/private/openapi.json"
+        ));
+        assert!(!unity_catalog_public_route(
+            &Method::GET,
+            "/catalog/openapi.json"
+        ));
+    }
 }

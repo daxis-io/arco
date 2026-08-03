@@ -1,5 +1,13 @@
 //! Roll-forward workspace restore contracts.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -7151,5 +7159,196 @@ async fn final_read_manifest_conflicting_immutable_bytes_fail_closed() {
             .get_raw(&manifest_path)
             .await
             .expect("conflicting winner remains")
+    );
+}
+
+/// R6: an in-flight restore attempt written by an older revision embeds a
+/// version 1 participant plan (no `observed_writer_epoch`). Recovery has to be
+/// able to read it in order to supersede it; a decoder that rejects it turns
+/// recovery into a serialization failure with no way forward. The plan must
+/// therefore migrate, reach the defined terminal outcome of Superseded, and be
+/// replanned at the current version — never applied.
+#[tokio::test]
+async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_it() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(SupersedeNextDomainPointerBackend::new(inner, "b"));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let stores = ["a", "b", "c"]
+        .into_iter()
+        .map(|domain| {
+            Arc::new(
+                ControlMvpStateStore::new(
+                    storage.clone(),
+                    StateScope::new("tenant", "workspace", domain),
+                )
+                .expect("store"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for store in &stores {
+        committed_value(store, b"v1").await;
+    }
+    let now = Utc::now();
+    let snapshot_id = snapshot_id();
+    let pin_id = pin_id();
+    WorkspaceSnapshotService::new(
+        storage.clone(),
+        multi_domain_registry(&stores, &["a", "b", "c"], false),
+    )
+    .expect("snapshot service")
+    .create_snapshot(
+        &CreateWorkspaceSnapshotRequest::new(
+            &snapshot_id,
+            &pin_id,
+            now,
+            now + ChronoDuration::hours(1),
+            None,
+        )
+        .expect("snapshot request"),
+    )
+    .await
+    .expect("snapshot");
+    for store in &stores {
+        committed_value(store, b"v2").await;
+    }
+
+    let restore_id = restore_id();
+    let service = WorkspaceRestoreService::new(
+        storage.clone(),
+        multi_domain_registry(&stores, &["a", "b", "c"], true),
+    )
+    .expect("restore service");
+    let request = RestoreWorkspaceToSnapshot::new(
+        &restore_id,
+        RestoreSource::snapshot(snapshot_id, pin_id).expect("source"),
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        now,
+        OmittedDomainPolicy::Reject,
+    )
+    .expect("restore request");
+    backend.arm();
+    let partial = service
+        .restore_workspace_to_snapshot(&request)
+        .await
+        .expect("partial restore is durably repairable");
+    assert_eq!(WorkspaceRestoreStatus::RepairRequired, partial.status());
+
+    // Rewrite the untouched participant's durable plan into the exact shape an
+    // older revision wrote: version 1, with no `observed_writer_epoch`.
+    let attempt_path = restore_attempt_plan_path(&restore_id, 1).expect("attempt path");
+    let mut attempt: serde_json::Value =
+        serde_json::from_slice(&storage.get_raw(&attempt_path).await.expect("attempt one"))
+            .expect("attempt json");
+    let plan = attempt["participants"][2]["plan"]
+        .as_object_mut()
+        .expect("participant plan object");
+    assert_eq!(
+        Some(serde_json::Value::from(0_u64)),
+        plan.remove("observed_writer_epoch"),
+        "the current plan version carries the field version 1 lacked"
+    );
+    plan.insert("version".to_string(), serde_json::Value::from(1_u64));
+
+    // The downgraded plan must match the checked-in canonical v1 field set, so
+    // this test cannot drift away from the fixture the decoder is pinned to.
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
+    ))
+    .expect("v1 fixture json");
+    let mut fixture_fields = fixture
+        .as_object()
+        .expect("fixture object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    fixture_fields.sort();
+    let mut downgraded_fields = attempt["participants"][2]["plan"]
+        .as_object()
+        .expect("downgraded plan object")
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    downgraded_fields.sort();
+    assert_eq!(fixture_fields, downgraded_fields);
+
+    let downgraded_plan = attempt["participants"][2]["plan"].clone();
+    let downgraded_sha = format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&downgraded_plan).expect("downgraded plan bytes")
+        ))
+    );
+    attempt["participants"][2]["plan_sha256"] = serde_json::Value::String(downgraded_sha.clone());
+    let attempt_bytes = serde_jcs::to_vec(&attempt).expect("downgraded attempt bytes");
+    let attempt_sha = format!("sha256:{}", hex::encode(Sha256::digest(&attempt_bytes)));
+    let mut journal: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get_raw(&restore_journal_path(&restore_id).expect("journal path"))
+            .await
+            .expect("journal"),
+    )
+    .expect("journal json");
+    journal["attempt_sha256"] = serde_json::Value::String(attempt_sha);
+    journal["participants"][2]["plan_sha256"] = serde_json::Value::String(downgraded_sha);
+    storage
+        .put_raw(
+            &attempt_path,
+            Bytes::from(attempt_bytes),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("install the v1 participant plan");
+    storage
+        .put_raw(
+            &restore_journal_path(&restore_id).expect("journal path"),
+            Bytes::from(serde_jcs::to_vec(&journal).expect("updated journal bytes")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("bind journal to the v1 participant plan");
+
+    // Recovery reads the v1 plan (rather than failing to deserialize it),
+    // supersedes it, and replans the domain at the current version.
+    let recovered = service
+        .recover_restore(&restore_id)
+        .await
+        .expect("a v1 in-flight plan must not turn recovery into a serialization failure");
+    assert_eq!(WorkspaceRestoreStatus::Visible, recovered.status());
+    for store in &stores {
+        assert_eq!(
+            Some(Bytes::from_static(b"v1")),
+            arco_catalog::ArcoStateReader::get(store.as_ref(), b"catalog/default")
+                .await
+                .expect("restored value")
+        );
+    }
+
+    let attempt_two: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get_raw(&restore_attempt_plan_path(&restore_id, 2).expect("attempt path"))
+            .await
+            .expect("attempt two"),
+    )
+    .expect("attempt json");
+    let participants = attempt_two["participants"]
+        .as_array()
+        .expect("participants");
+    let replanned = participants
+        .iter()
+        .find(|participant| participant["domain"] == "c")
+        .expect("domain c is replanned rather than carried");
+    assert_eq!(
+        serde_json::Value::from(2_u64),
+        replanned["plan"]["version"],
+        "a superseded v1 plan must be replaced by a current-version plan"
+    );
+    assert!(
+        replanned["plan"]["observed_writer_epoch"].is_u64(),
+        "the replacement plan must carry an actual epoch observation"
+    );
+    assert_eq!(
+        serde_json::Value::from(2_u64),
+        replanned["participant_attempt"],
+        "the superseded participant must advance its attempt"
     );
 }

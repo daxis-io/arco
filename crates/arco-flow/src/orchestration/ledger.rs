@@ -40,6 +40,21 @@ pub trait OrchestrationLedgerWriter: Send + Sync {
     ) -> impl Future<Output = std::result::Result<(), String>> + Send;
 }
 
+/// Largest forward clock slack accepted in an appended event id.
+///
+/// The ledger's on-disk layout derives each object's date prefix from the
+/// event id's ULID timestamp, and readers that need to prove "no unfolded
+/// event exists" scan a bounded window of those prefixes. An id whose ULID
+/// timestamp is arbitrarily far in the future would land in a prefix outside
+/// any such window, so the event would be durable and simultaneously invisible
+/// to the freshness scan. Rejecting out-of-policy ids at append is what makes
+/// the scan's bounded forward horizon sound.
+///
+/// The bound is generous enough to absorb real clock skew between control
+/// plane replicas while being far smaller than the one-day forward slack the
+/// freshness scan already covers.
+pub const MAX_EVENT_ID_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
 /// Writes orchestration events to the ledger (append-only JSON files).
 ///
 /// Events are written idempotently - duplicate writes are no-ops.
@@ -59,6 +74,46 @@ impl LedgerWriter {
     #[must_use]
     pub fn storage(&self) -> ScopedStorage {
         self.storage.clone()
+    }
+
+    /// Rejects event ids whose ULID timestamp is beyond the append horizon.
+    ///
+    /// See [`MAX_EVENT_ID_FUTURE_SKEW`]: an id further in the future than the
+    /// tolerated skew would place the event in a ledger date prefix that
+    /// bounded freshness scans never list, making a durable event invisible to
+    /// the check that decides whether repairs may run.
+    ///
+    /// Ids that are not ULIDs are left to the existing path-derivation
+    /// fallback; only a parseable, out-of-policy ULID is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the id's ULID timestamp exceeds
+    /// `now + MAX_EVENT_ID_FUTURE_SKEW`.
+    fn validate_event_id_horizon(event_id: &str, now: chrono::DateTime<Utc>) -> Result<()> {
+        let Ok(ulid) = Ulid::from_string(event_id) else {
+            return Ok(());
+        };
+        let event_time = i64::try_from(ulid.timestamp_ms())
+            .ok()
+            .and_then(chrono::DateTime::from_timestamp_millis);
+        let Some(event_time) = event_time else {
+            return Err(Error::from(arco_core::Error::InvalidInput(format!(
+                "orchestration event id '{event_id}' has an unrepresentable ULID timestamp"
+            ))));
+        };
+        let Some(horizon) = now.checked_add_signed(MAX_EVENT_ID_FUTURE_SKEW) else {
+            return Ok(());
+        };
+        if event_time > horizon {
+            return Err(Error::from(arco_core::Error::InvalidInput(format!(
+                "orchestration event id '{event_id}' is {}s beyond the append horizon; \
+                 ledger event ids must be minted within {}s of server time",
+                event_time.signed_duration_since(now).num_seconds(),
+                MAX_EVENT_ID_FUTURE_SKEW.num_seconds()
+            ))));
+        }
+        Ok(())
     }
 
     /// Appends an event to the ledger.
@@ -81,6 +136,8 @@ impl LedgerWriter {
         )
     )]
     pub async fn append(&self, event: OrchestrationEvent) -> Result<()> {
+        Self::validate_event_id_horizon(&event.event_id, Utc::now())?;
+
         // Derive date from event timestamp (or fallback to event_id ULID)
         let date = Ulid::from_string(&event.event_id).map_or_else(
             |_| event.timestamp.format("%Y-%m-%d").to_string(),

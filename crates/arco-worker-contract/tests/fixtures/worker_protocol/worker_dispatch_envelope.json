@@ -8,6 +8,8 @@
   "attemptId": "att-123",
   "dispatchId": "dispatch:run-123:analytics.daily_sales:1",
   "executionLocationId": "local-dev",
+  "partitionKey": "date=d:2026-01-01",
+  "heartbeatTimeoutSec": 300,
   "workerQueue": "default-queue",
   "callbackBaseUrl": "https://callbacks.example",
   "taskToken": "token",

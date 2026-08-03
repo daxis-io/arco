@@ -1,5 +1,13 @@
 //! Dedicated task-token contract tests.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,6 +23,8 @@ use arco_api::context::RequestContext;
 use arco_api::routes::tasks::task_auth_middleware;
 use arco_api::server::AppState;
 
+const TEST_TASK_TOKEN_SECRET: &str = "test-task-token-secret-at-least-32-bytes";
+
 fn make_state() -> Arc<AppState> {
     let config = Config {
         debug: false,
@@ -26,7 +36,7 @@ fn make_state() -> Arc<AppState> {
             ..JwtConfig::default()
         },
         task_token: TaskTokenConfig {
-            hs256_secret: "test-task-token-secret-at-least-32-bytes".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 900,
@@ -50,7 +60,7 @@ fn token_with_claims(tenant: &str, workspace: &str, task_id: &str, exp: usize) -
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret("task-secret".as_bytes()),
+        &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
     )
     .expect("token")
 }

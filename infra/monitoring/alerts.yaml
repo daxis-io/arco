@@ -339,6 +339,12 @@ groups:
             This indicates a caller is still using PI-2 compatibility behavior and writes are failing.
           runbook_url: "https://docs.arco.dev/runbooks/control-plane-repair-and-dark-launch"
 
+  # NOTE (2026-07-30 program audit, section 9.2 item 8): the arco_gc_* series
+  # below are recorded in code (crates/arco-catalog/src/metrics.rs, called from
+  # crates/arco-catalog/src/gc/collector.rs), but no deployed production job
+  # currently runs the GC collector with a metrics exporter, so these series
+  # have no production emitter yet. The rules are kept so wiring a production
+  # GC runner lights them up without renaming.
   - name: arco.gc
     rules:
       # GC Not Running Alert
@@ -369,6 +375,208 @@ groups:
             Garbage collection encountered {{ $value | printf "%.0f" }} errors in the last hour.
             Phase: {{ $labels.phase }}
           runbook_url: "https://docs.arco.dev/runbooks/gc-failure"
+
+  # State-store control-plane alerts (object-store control store, projections).
+  #
+  # Metric names are reserved in crates/arco-catalog/src/metrics.rs
+  # (STATE_STORE_*). NOTE (2026-07-30 program audit, section 9.2 item 8): as of
+  # this change NONE of the arco_state_store_* series below has a production
+  # emitter. The control store (crates/arco-catalog/src/state_store/
+  # control_mvp.rs) commits in-process without recording metrics, and the
+  # projection watermark surfaces (projection_outbox_acks.rs) have no
+  # production callers yet. These rules are honest scaffolding tied to the
+  # code-owned metric names so that wiring the emitters lights the alerts
+  # without renaming anything.
+  - name: arco.state_store
+    rules:
+      # Control-Store CAS Publication Failure Rate Alert
+      # ControlMvpTxn::commit() publishes current.pointer.json with a
+      # generation-matched precondition; a failure means the pointer CAS lost
+      # to a newer manifest and orphan txlog/manifest artifacts may remain.
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoControlStoreCasPublishFailureRateHigh
+        expr: |
+          sum by (domain) (increase(arco_state_store_cas_publish_failures_total[5m]))
+          /
+          clamp_min(sum by (domain) (increase(arco_state_store_cas_publish_total[5m])), 1)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "Control-store pointer CAS failure rate > 10% for domain {{ $labels.domain }}"
+          description: |
+            More than 10% of control-store pointer CAS publications failed in the
+            last 5 minutes for domain {{ $labels.domain }}. This indicates
+            competing writers or a stuck retry loop; orphan txlog/manifest
+            artifacts may be accumulating.
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-cas-publish-failure"
+
+      # Control-Store Replay Latency Alert
+      # The MVP replays every transaction reachable from the current manifest
+      # on cold start; the promotion budget is <= 2s cold start to write-ready.
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoControlStoreReplayLatencyHigh
+        expr: |
+          histogram_quantile(0.95, sum(rate(arco_state_store_replay_duration_seconds_bucket[15m])) by (le, domain))
+          > 2.0
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "Control-store replay p95 > 2s for domain {{ $labels.domain }}"
+          description: |
+            Manifest-reachable replay for domain {{ $labels.domain }} exceeded
+            the 2 second cold-start promotion budget at p95. Compaction backlog
+            is growing faster than checkpoints are being taken.
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-replay-budget"
+
+      # Control-Store Replay Bytes Near Budget Alert
+      # Promotion budget: <= 64 MiB (67108864 bytes) manifest-reachable replay.
+      # Alerts at 48 MiB (75%) so operators act before the budget is breached.
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoControlStoreReplayBytesNearBudget
+        expr: |
+          max by (domain) (arco_state_store_replay_bytes) > 50331648
+        for: 15m
+        labels:
+          severity: warning
+          service: arco-api
+        annotations:
+          summary: "Control-store replay bytes > 75% of 64 MiB budget for domain {{ $labels.domain }}"
+          description: |
+            Manifest-reachable replay for domain {{ $labels.domain }} is above
+            48 MiB, approaching the 64 MiB promotion budget. Once the budget is
+            breached, cold writer startup is out of contract.
+            Current bytes: {{ $value | printf "%.0f" }}
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-replay-budget"
+
+      # Control-Store Read Integrity Failure Alert
+      # Control reads fail closed: pointer -> manifest -> transaction checksum
+      # validation rejects any corrupt artifact instead of serving stale state.
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoControlStoreReadIntegrityFailures
+        expr: |
+          sum by (domain, artifact) (increase(arco_state_store_read_integrity_failures_total[15m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: arco-api
+        annotations:
+          summary: "Control-store fail-closed read integrity failure (domain={{ $labels.domain }}, artifact={{ $labels.artifact }})"
+          description: |
+            A control-store read rejected a corrupt or checksum-mismatched
+            artifact in the last 15 minutes for domain {{ $labels.domain }}.
+            Reads for the affected scope are failing closed until the artifact
+            chain is repaired.
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-corrupt-artifact"
+
+      # Projection Watermark Lag Alert
+      # Lag in logical sequences between the committed control-store sequence
+      # and the latest projected sequence.
+      #
+      # Budget rationale: the Tier-1 control-store strategy states a TIME
+      # budget (<= 60s), enforced by ArcoProjectionWatermarkStale below; it
+      # states no sequence budget. A non-zero sequence gap is the normal
+      # steady state -- every commit opens a gap that the next publish closes
+      # -- so a `> 0` threshold pages on a single in-flight sequence and on
+      # any low-volume domain whose publisher happens to be mid-cycle. This
+      # rule therefore alerts on backlog DEPTH: a consumer holding more than
+      # 1000 unprojected sequences for 10 minutes is not keeping up, however
+      # recent its last publish looked. It is the counterpart of the
+      # age-based rule below, which catches the opposite shape (a small gap
+      # that is not advancing at all).
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoProjectionWatermarkLagHigh
+        expr: |
+          max by (domain, consumer) (arco_state_store_projection_watermark_lag_sequences) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Projection watermark backlog > 1000 sequences for domain {{ $labels.domain }} (consumer={{ $labels.consumer }})"
+          description: |
+            The projection for domain {{ $labels.domain }} has held a backlog of
+            more than 1000 unprojected control-store sequences for 10 minutes,
+            so the consumer is falling behind rather than briefly trailing.
+            Pending sequences: {{ $value | printf "%.0f" }}
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-projection-lag"
+
+      # Projection Watermark Staleness Alert
+      # Strategy budget: <= 60s projection watermark lag for low-volume Tier-1
+      # domains; beyond that, system tables must expose stale metadata
+      # explicitly. Metric has no production emitter yet (see group note).
+      - alert: ArcoProjectionWatermarkStale
+        expr: |
+          max by (domain, consumer) (arco_state_store_projection_watermark_age_seconds) > 60
+        for: 5m
+        labels:
+          severity: warning
+          service: arco-control-plane
+        annotations:
+          summary: "Projection watermark stale > 60s for domain {{ $labels.domain }} (consumer={{ $labels.consumer }})"
+          description: |
+            The projection watermark for domain {{ $labels.domain }} has not
+            advanced within the 60 second freshness budget. Readers relying on
+            projections are seeing explicitly stale metadata.
+            Current age: {{ $value | printf "%.0f" }}s
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-projection-lag"
+
+      # Projection Publish Absence Alert
+      #
+      # The obvious form -- `sum by (domain) (increase(publish_total[1h])) == 0`
+      # -- cannot fire for the failure it exists to catch. When the publisher
+      # dies its counter goes stale and drops out of the index, so `increase()`
+      # yields no samples and `== 0` has nothing to match; the same form is
+      # also blind to a domain that has never published, because that domain
+      # has no series to evaluate at all. (The pre-existing
+      # ArcoCompactorNotRunning rule in the arco.catalog group has this same
+      # weakness. It is deliberately left alone here.)
+      #
+      # Instead, anchor on a series that exists whenever a projection consumer
+      # is configured -- the watermark age gauge -- and subtract the domains
+      # that did publish. That fires for a dead publisher (anchor present,
+      # counter stale) and for a never-published domain (anchor present,
+      # counter absent), and stays quiet for healthy domains. The second arm
+      # covers the total-outage case in which even the anchor stops being
+      # exported; it carries no domain label, which is itself the signal that
+      # nothing at all is reporting.
+      #
+      # `for:` is 10m rather than 1h on purpose: the [1h] range already
+      # supplies the "an hour with no publish" semantics, so stacking a 1h
+      # `for:` on top pushed time-to-fire on a critical page to roughly two
+      # hours.
+      # Metric has no production emitter yet (see group note).
+      - alert: ArcoProjectionPublishAbsent
+        expr: |
+          (
+            max by (domain) (arco_state_store_projection_watermark_age_seconds)
+            unless
+            (sum by (domain) (increase(arco_state_store_projection_publish_total[1h])) > 0)
+          )
+          or
+          (
+            absent(arco_state_store_projection_watermark_age_seconds)
+            and absent(arco_state_store_projection_publish_total)
+          )
+        for: 10m
+        labels:
+          severity: critical
+          service: arco-control-plane
+        annotations:
+          summary: "No projection publish in 1 hour (domain={{ $labels.domain }})"
+          description: |
+            No projection publish completed in the last hour for domain
+            {{ $labels.domain }}. The projection compactor is down, wedged, or
+            was never started for this domain; control writes continue but
+            projections and system tables are falling behind.
+            An empty domain label means neither the watermark gauge nor the
+            publish counter is being exported at all: the projection metrics
+            pipeline itself is down, so treat every domain as unprojected.
+          runbook_url: "https://docs.arco.dev/runbooks/state-store-projection-lag"
 
   - name: arco.orchestration
     rules:

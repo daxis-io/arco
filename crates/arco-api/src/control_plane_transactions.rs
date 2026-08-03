@@ -310,17 +310,16 @@ impl<'a> ControlPlaneTransactionService<'a> {
         };
         let tx_id = prepared.tx_id.clone();
 
-        let result = self
-            .execute_claimed_root(
-                &meta,
-                mutations,
-                &tx_id,
-                &idempotency_path,
-                &prepared.request_hash,
-                false,
-                claim_policy.is_frozen(),
-            )
-            .await;
+        let result = Box::pin(self.execute_claimed_root(
+            &meta,
+            mutations,
+            &tx_id,
+            &idempotency_path,
+            &prepared.request_hash,
+            false,
+            claim_policy.is_frozen(),
+        ))
+        .await;
 
         match result {
             Ok(outcome) => Ok(CommitRootTransactionResponse {
@@ -522,7 +521,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             ));
         }
 
-        self.execute_claimed_root(
+        Box::pin(self.execute_claimed_root(
             &meta,
             mutations,
             expected_tx_id,
@@ -530,7 +529,7 @@ impl<'a> ControlPlaneTransactionService<'a> {
             expected_request_hash,
             true,
             true,
-        )
+        ))
         .await
     }
 

@@ -1,5 +1,9 @@
 //! Minimal embedded worker protocol example.
 
+// Examples print to stdout by design; the print restriction lint targets
+// production code paths (#331).
+#![allow(clippy::print_stdout)]
+
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 
@@ -27,6 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         attempt_id: "att-123".to_string(),
         dispatch_id: "dispatch:run-123:analytics.daily_sales:1".to_string(),
         execution_location_id: None,
+        partition_key: Some("date=d:2026-01-01".to_string()),
+        heartbeat_timeout_sec: Some(300),
         worker_queue: "default-queue".to_string(),
         callback_base_url: "https://api.arco.dev".to_string(),
         task_token: "<task-scoped-jwt>".to_string(),

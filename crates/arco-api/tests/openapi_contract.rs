@@ -1,6 +1,6 @@
-//! OpenAPI contract tests.
+//! `OpenAPI` contract tests.
 //!
-//! Ensures the checked-in OpenAPI spec matches the implementation.
+//! Ensures the checked-in `OpenAPI` spec matches the implementation.
 
 use anyhow::{Context, Result};
 

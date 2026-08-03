@@ -1,5 +1,10 @@
 //! Public API source-shape contract tests.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::panic)]
+
 #[test]
 fn core_error_enum_is_non_exhaustive_and_not_found_variants_are_documented() {
     let source = include_str!("../src/error.rs");

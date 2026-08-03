@@ -1,5 +1,13 @@
 //! Dedicated task-token contract tests.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -50,7 +58,7 @@ fn token_with_claims(tenant: &str, workspace: &str, task_id: &str, exp: usize) -
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret("task-secret".as_bytes()),
+        &EncodingKey::from_secret(b"task-secret"),
     )
     .expect("token")
 }

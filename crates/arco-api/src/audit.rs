@@ -16,7 +16,15 @@ pub const REASON_MISSING_TOKEN: &str = "missing_token";
 pub const REASON_INVALID_TOKEN: &str = "invalid_token";
 pub const REASON_PATH_TRAVERSAL: &str = "path_traversal";
 pub const REASON_NOT_IN_ALLOWLIST: &str = "not_in_allowlist";
+pub const REASON_INTERNAL_ARTIFACT: &str = "internal_artifact";
 pub const REASON_UNKNOWN_DOMAIN: &str = "unknown_domain";
+/// The principal carried the configured control-store operator group.
+pub const REASON_OPERATOR_GROUP: &str = "operator_group_match";
+/// The principal authenticated but carried no operator group.
+pub const REASON_NOT_OPERATOR: &str = "not_operator";
+/// The operator endpoints are mounted but no operator authority is
+/// configured, so every caller is refused.
+pub const REASON_OPERATOR_AUTHORITY_UNCONFIGURED: &str = "operator_authority_unconfigured";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -65,6 +73,54 @@ pub fn emit_auth_deny(state: &AppState, request_id: &str, resource: &str, reason
         .resource(resource)
         .decision_reason(reason)
         .request_id(request_id)
+        .try_build()
+    {
+        state.audit().emit(event);
+    }
+}
+
+/// Records one completed operator-authorized control-store mutation.
+///
+/// Called once per state change (drain, rebind, trim) rather than once per
+/// request, so a request that drains and then fails to trim leaves exactly the
+/// record of what it actually changed. The actor is the verified operator
+/// identity under the service's pseudonymization policy.
+pub fn emit_control_store_mutation(state: &AppState, ctx: &RequestContext, resource: &str) {
+    let actor = actor_from_ctx(ctx, &state.config.audit);
+
+    if let Ok(event) = AuditEvent::builder()
+        .action(AuditAction::ControlStoreMutate)
+        .actor(actor)
+        .tenant_id(&ctx.tenant)
+        .workspace_id(&ctx.workspace)
+        .resource(resource)
+        .decision_reason(REASON_OPERATOR_GROUP)
+        .request_id(&ctx.request_id)
+        .try_build()
+    {
+        state.audit().emit(event);
+    }
+}
+
+/// Records an authenticated principal being refused an operator control-store
+/// operation, including the refusal that happens when no operator authority is
+/// configured at all.
+pub fn emit_control_store_deny(
+    state: &AppState,
+    ctx: &RequestContext,
+    resource: &str,
+    reason: &str,
+) {
+    let actor = actor_from_ctx(ctx, &state.config.audit);
+
+    if let Ok(event) = AuditEvent::builder()
+        .action(AuditAction::ControlStoreDeny)
+        .actor(actor)
+        .tenant_id(&ctx.tenant)
+        .workspace_id(&ctx.workspace)
+        .resource(resource)
+        .decision_reason(reason)
+        .request_id(&ctx.request_id)
         .try_build()
     {
         state.audit().emit(event);
@@ -148,7 +204,7 @@ mod tests {
         assert_eq!(hash1, hash2);
         assert!(hash1.starts_with("user:"));
         assert!(!hash1.contains("alice"));
-        assert!(!hash1.contains("@"));
+        assert!(!hash1.contains('@'));
     }
 
     #[test]

@@ -1,5 +1,8 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unused_async)]
 
 #[path = "support/barrier_backend.rs"]
 mod barrier_backend;

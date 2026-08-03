@@ -885,6 +885,7 @@ impl Server {
                 header::CONTENT_LENGTH,
                 header::ETAG,
                 header::HeaderName::from_static("x-request-id"),
+                header::HeaderName::from_static("x-arco-next-cursor"),
                 header::HeaderName::from_static("retry-after"),
             ])
             // Set max age for preflight caching

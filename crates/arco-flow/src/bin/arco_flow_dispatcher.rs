@@ -206,7 +206,14 @@ async fn run_handler(
         )
         .map_err(|e| Error::configuration(format!("task token minting failed: {e}")))?;
 
-        let task_row = fold_state.tasks.get(&(run_id.clone(), task_key.clone()));
+        let task_row = fold_state
+            .tasks
+            .get(&(run_id.clone(), task_key.clone()))
+            .ok_or_else(|| {
+                Error::dispatch(format!(
+                    "refusing unscoped dispatch for missing task row: run={run_id} task={task_key}"
+                ))
+            })?;
         let envelope = dispatch_envelope_for_attempt(
             DispatchEnvelopeSpec {
                 tenant_id: state.tenant_id.clone(),
@@ -221,7 +228,7 @@ async fn run_handler(
                 task_token: minted.token,
                 token_expires_at: minted.expires_at,
             },
-            task_row,
+            Some(task_row),
         );
         let body = envelope
             .to_json()

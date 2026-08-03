@@ -756,6 +756,29 @@ mod tests {
     }
 
     #[test]
+    fn test_anti_entropy_rescues_legacy_retry_wait_without_deadline() {
+        let now = Utc::now();
+        let sweeper = AntiEntropySweeper::with_defaults();
+        let watermarks = fresh_watermarks(now);
+
+        let mut task = make_task_row("extract", TaskState::RetryWait, None);
+        task.attempt = 1;
+        task.max_attempts = 3;
+        task.retry_not_before = None;
+
+        let repairs = sweeper.scan(&watermarks, &[task], &[], now);
+
+        assert!(matches!(
+            repairs.as_slice(),
+            [Repair::CreateDispatchOutbox {
+                attempt: 2,
+                reason,
+                ..
+            }] if reason == "retry_wait_bootstrap"
+        ));
+    }
+
+    #[test]
     fn test_anti_entropy_does_not_bootstrap_retry_wait_before_deadline() {
         let now = Utc::now();
         let sweeper = AntiEntropySweeper::with_defaults();

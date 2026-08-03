@@ -219,6 +219,7 @@ fn grpc_status_label(code: GrpcCode) -> &'static str {
 /// Handler for the `/metrics` endpoint.
 ///
 /// Returns Prometheus-formatted metrics text.
+#[must_use]
 pub fn serve_metrics() -> impl IntoResponse {
     prometheus_handle().map_or_else(
         || {

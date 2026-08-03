@@ -20,18 +20,12 @@ yanked = "deny"
 # In cargo-deny 0.18+, all advisories are denied by default.
 # Use "workspace" to only fail on direct workspace dependencies.
 unmaintained = "workspace"
+# Advisory exceptions are granted, never permanent. Each entry must carry a
+# tracking issue, granted date, and review-by date. CI enforces the shape and
+# the scheduled audit enforces expiry; see docs/runbooks/advisory-exceptions.md.
 ignore = [
-    # quick-xml is pulled through object_store 0.11.x (requires ^0.37) and
-    # opendal 0.54.x via iceberg 0.6 (requires ^0.38). Both upstream constraints
-    # block the fixed quick-xml >=0.41.0 (verified 2026-07-30:
-    # `cargo update quick-xml@... --precise 0.41.0 --dry-run` fails on both);
-    # resolving requires a broad DataFusion/Iceberg/object-store major upgrade.
-    # Tracking: #327. Review/expiry: 2026-09-30 — re-check upstream releases and
-    # remove or re-justify these suppressions by that date.
-    # Rationale: quadratic run time checking start tags for duplicate attribute names (DoS-class, fixed in 0.41.0).
-    "RUSTSEC-2026-0194",
-    # Rationale: unbounded namespace-declaration allocation in NsReader enables memory-exhaustion DoS (fixed in 0.41.0).
-    "RUSTSEC-2026-0195",
+    { id = "RUSTSEC-2026-0194", reason = "quadratic duplicate-attribute check in quick-xml <0.41; reachable through authenticated object-store response XML, not direct end-user input; frozen object_store/DataFusion constraints block the patched line; tracking #327; granted 2026-07-05; review-by 2026-09-30" },
+    { id = "RUSTSEC-2026-0195", reason = "unbounded namespace allocation in quick-xml <0.41; same authenticated object-store response boundary and frozen upstream constraint; tracking #327; granted 2026-07-05; review-by 2026-09-30" },
 ]
 
 [licenses]

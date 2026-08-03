@@ -509,6 +509,97 @@ async fn tier1_lock_failure_does_not_corrupt_state() {
     );
 }
 
+/// Adversarial regression for the crashed-attempt-directory wedge (#368).
+///
+/// Scenario:
+/// 1. Commit one namespace normally (visible head advances).
+/// 2. Crash the next DDL after the snapshot attempt directory is fully written
+///    but before the immutable manifest JSON is put (single-shot write failure
+///    on the manifest path simulates the process dying in that window).
+/// 3. A fresh writer/compactor (simulating a restarted process, which loses the
+///    in-memory `reserved_commit` and mints a fresh commit ULID) must be able
+///    to commit subsequent DDL: the crashed attempt's immutable snapshot files
+///    must never collide with the new attempt.
+/// 4. No committed state may be lost.
+#[tokio::test]
+async fn tier1_crashed_attempt_directory_does_not_wedge_subsequent_ddl() {
+    let backend = Arc::new(FailingBackend::new());
+    let storage =
+        ScopedStorage::new(backend.clone(), TEST_TENANT, TEST_WORKSPACE).expect("scoped storage");
+    let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+
+    writer.initialize().await.expect("initialize");
+    writer
+        .create_namespace("committed-before-crash", None, WriteOptions::default())
+        .await
+        .expect("first namespace commit");
+    let committed_version = read_catalog_manifest_version(&storage).await;
+
+    // The next compaction will claim manifest id ...0003. Fail its immutable
+    // manifest JSON put: the snapshot attempt directory is already fully
+    // written at that point, which is exactly the crash window.
+    let crashed_manifest_path = scoped_path(
+        TEST_TENANT,
+        TEST_WORKSPACE,
+        "manifests/catalog/00000000000000000003.json",
+    );
+    backend.fail_on_write(&crashed_manifest_path);
+
+    let crashed = writer
+        .create_namespace("crashed-ddl", None, WriteOptions::default())
+        .await;
+    assert!(
+        crashed.is_err(),
+        "create_namespace must fail when the manifest put is injected to fail"
+    );
+
+    // The poison artifact exists: snapshot files above the visible head.
+    let orphaned_attempt_files = list_files_under(
+        &storage,
+        &format!("snapshots/catalog/v{}/", committed_version + 1),
+    )
+    .await;
+    assert!(
+        !orphaned_attempt_files.is_empty(),
+        "crashed attempt must leave snapshot files above the visible head"
+    );
+
+    // A restarted process starts with a fresh writer and compactor (no
+    // in-memory reserved commit). Subsequent DDL must commit.
+    let restarted_compactor = Arc::new(Tier1Compactor::new(storage.clone()));
+    let restarted_writer =
+        CatalogWriter::new(storage.clone()).with_sync_compactor(restarted_compactor);
+    restarted_writer
+        .create_namespace("after-crash", None, WriteOptions::default())
+        .await
+        .expect("DDL after a crashed attempt must succeed, not wedge permanently");
+    restarted_writer
+        .create_namespace("after-crash-2", None, WriteOptions::default())
+        .await
+        .expect("further DDL must also succeed");
+
+    // No committed state was lost, and the new commits are visible.
+    let reader = arco_catalog::CatalogReader::new(storage.clone());
+    let namespaces = reader.list_namespaces().await.expect("list namespaces");
+    let names: Vec<&str> = namespaces.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.contains(&"committed-before-crash"),
+        "previously committed namespace must survive: {names:?}"
+    );
+    assert!(
+        names.contains(&"after-crash") && names.contains(&"after-crash-2"),
+        "post-crash namespaces must be visible: {names:?}"
+    );
+
+    let final_version = read_catalog_manifest_version(&storage).await;
+    assert!(
+        final_version > committed_version,
+        "visible head must advance past the crashed attempt \
+         (committed: {committed_version}, final: {final_version})"
+    );
+}
+
 /// Test that visible sync compaction no longer writes the legacy mutable manifest mirror.
 #[tokio::test]
 async fn sync_compact_does_not_create_legacy_manifest_mirror_or_report_repair_pending() {
@@ -538,7 +629,7 @@ async fn sync_compact_does_not_create_legacy_manifest_mirror_or_report_repair_pe
         .append_ledger_event(&guard, CatalogDomain::Catalog, &event, "test")
         .await
         .expect("append event");
-    let event_path = format!("ledger/catalog/{}.json", event_id);
+    let event_path = format!("ledger/catalog/{event_id}.json");
 
     let compactor = Tier1Compactor::new(storage.clone());
     let result = compactor

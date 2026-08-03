@@ -1,6 +1,9 @@
 //! Remote orchestration compaction client tests.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::used_underscore_binding)]
 
 use std::net::SocketAddr;
 use std::time::Duration;

@@ -318,7 +318,7 @@ fn handle_lifecycle_timestamps_are_monotonic_and_respect_expiry_boundaries() {
         "accepted COMMITTING at the exclusive expiry boundary"
     );
 
-    let mut visible = committing.clone();
+    let mut visible = committing;
     visible.revision += 1;
     visible.status = ControlPlaneHandleStatus::Visible;
     visible.updated_at = Utc.with_ymd_and_hms(2026, 7, 16, 13, 1, 0).unwrap();
@@ -408,7 +408,7 @@ fn handle_lifecycle_exposes_only_the_legal_transition_graph() {
 fn handle_record_lifecycle_evidence_fails_closed_and_counts_visibility() {
     let prepared = prepared_handle_record();
 
-    let mut committing = prepared.clone();
+    let mut committing = prepared;
     committing.revision += 1;
     committing.status = ControlPlaneHandleStatus::Committing;
     committing.updated_at = Utc.with_ymd_and_hms(2026, 7, 16, 12, 6, 0).unwrap();

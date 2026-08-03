@@ -15,6 +15,9 @@ use arco_core::Error as CoreError;
 /// API result type.
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Fixed client-visible message for errors whose detail is internal state.
+const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
+
 /// Standard JSON error response body.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +83,17 @@ impl ApiError {
     /// Returns an error response for authorization failures.
     pub fn forbidden(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "FORBIDDEN", message)
+    }
+
+    /// Returns an error response for internal artifacts that are only
+    /// readable through their redacted system-table projection.
+    ///
+    /// Raw artifacts carrying private columns (for example `commits.parquet`
+    /// with its commit-authority witness columns) must never be handed out as
+    /// signed URLs; the redacted `system.*` projection is their only public
+    /// surface.
+    pub fn projection_only_artifact(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "PROJECTION_ONLY_ARTIFACT", message)
     }
 
     /// Returns an error response for missing resources.
@@ -286,17 +300,29 @@ impl From<CatalogError> for ApiError {
                 Self::not_found(format!("{entity} not found: {name}"))
             }
             CatalogError::PreconditionFailed { message } => Self::precondition_failed(message),
-            CatalogError::CasFailed { message } => Self::conflict(message),
+            CatalogError::CasFailed { message } | CatalogError::StaleWriterEpoch { message } => {
+                Self::conflict(message)
+            }
             CatalogError::RequestFailed {
                 http_status,
                 message,
             } => Self::from_status_and_message(http_status, message),
+            // Storage, serialization, and invariant failures carry internal
+            // detail (object paths, ledger event IDs, object versions, raw
+            // provider errors). Correlate them in logs; expose only the stable
+            // `INTERNAL` code and a fixed message.
             CatalogError::Storage { message }
             | CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
-            | CatalogError::InvariantViolation { message } => Self::internal(message),
+            | CatalogError::InvariantViolation { message } => {
+                tracing::warn!(internal_error = %message, "redacted internal catalog error");
+                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+            }
             CatalogError::UnsupportedOperation { message } => Self::not_acceptable(message),
-            error => Self::internal(error.to_string()),
+            error => {
+                tracing::warn!(internal_error = %error, "redacted unknown catalog error");
+                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+            }
         }
     }
 }

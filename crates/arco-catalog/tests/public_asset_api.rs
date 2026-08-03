@@ -45,7 +45,7 @@ fn prelude_asset_exports_and_namespace_alias_remain_public() {
         created_at: 1,
         updated_at: 2,
     };
-    let schema: Schema = namespace.clone();
+    let schema: Schema = namespace;
 
     assert_eq!(asset.format, PreludeAssetFormat::Parquet);
     assert_eq!(request.format, PreludeAssetFormat::Parquet);

@@ -63,6 +63,14 @@ pub enum AuditAction {
     IcebergCommit,
     /// Iceberg table commit failed.
     IcebergCommitDeny,
+    /// An operator-authorized control-store mutation was performed.
+    ///
+    /// Emitted once per mutating control-store operation (outbox drain,
+    /// consumer rebind, source trim) so every state change made through the
+    /// operator surface is attributable to the principal that made it.
+    ControlStoreMutate,
+    /// A control-store operator request was refused by authorization.
+    ControlStoreDeny,
 }
 
 impl AuditAction {
@@ -71,7 +79,11 @@ impl AuditAction {
     pub const fn is_deny(&self) -> bool {
         matches!(
             self,
-            Self::AuthDeny | Self::UrlMintDeny | Self::CredVendDeny | Self::IcebergCommitDeny
+            Self::AuthDeny
+                | Self::UrlMintDeny
+                | Self::CredVendDeny
+                | Self::IcebergCommitDeny
+                | Self::ControlStoreDeny
         )
     }
 
@@ -83,6 +95,7 @@ impl AuditAction {
             Self::UrlMintAllow | Self::UrlMintDeny => "url_mint",
             Self::CredVendAllow | Self::CredVendDeny => "cred_vend",
             Self::IcebergCommit | Self::IcebergCommitDeny => "iceberg_commit",
+            Self::ControlStoreMutate | Self::ControlStoreDeny => "control_store",
         }
     }
 }
@@ -98,6 +111,8 @@ impl std::fmt::Display for AuditAction {
             Self::CredVendDeny => "CRED_VEND_DENY",
             Self::IcebergCommit => "ICEBERG_COMMIT",
             Self::IcebergCommitDeny => "ICEBERG_COMMIT_DENY",
+            Self::ControlStoreMutate => "CONTROL_STORE_MUTATE",
+            Self::ControlStoreDeny => "CONTROL_STORE_DENY",
         };
         write!(f, "{s}")
     }

@@ -1,5 +1,12 @@
 #![allow(clippy::expect_used)]
 #![allow(missing_docs)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::assigning_clones,
+    clippy::needless_collect,
+    clippy::too_many_lines
+)]
 
 #[path = "../../arco-core/tests/support/scripted_backend.rs"]
 mod scripted_backend;

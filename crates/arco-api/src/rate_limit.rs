@@ -393,6 +393,9 @@ fn rate_limit_response(limit: u32, retry_after_secs: u64) -> Response {
 // ============================================================================
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
 

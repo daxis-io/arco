@@ -994,9 +994,8 @@ mod tests {
 
         // A full scan completes over multiple runs
         // With 10,000 events and 500 per run, it takes 20 runs
-        let total_events = 10_000;
-        let runs_needed =
-            (total_events + config.max_objects_per_run - 1) / config.max_objects_per_run;
+        let total_events: usize = 10_000;
+        let runs_needed = total_events.div_ceil(config.max_objects_per_run);
         assert_eq!(runs_needed, 20);
     }
 }

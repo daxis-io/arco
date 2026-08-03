@@ -448,6 +448,9 @@ fn parse_env_u64(key: &str, default: u64) -> Result<u64, Error> {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::iter_on_single_items, clippy::needless_pass_by_value)]
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header};

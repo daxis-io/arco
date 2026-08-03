@@ -9,9 +9,11 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt as _;
 
 fn uc_enabled_config() -> Config {
-    let mut config = Config::default();
-    config.debug = true;
-    config.posture = Posture::Dev;
+    let mut config = Config {
+        debug: true,
+        posture: Posture::Dev,
+        ..Default::default()
+    };
     config.unity_catalog.enabled = true;
     config
 }

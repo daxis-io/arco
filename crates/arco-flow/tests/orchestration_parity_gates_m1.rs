@@ -5,6 +5,10 @@
 //! - fast (unit/integration style)
 //! - hard to “cheat” via doc-only changes
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unnecessary_wraps)]
+
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
@@ -263,7 +267,7 @@ fn task_finished_event(
 fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
     TaskDef {
         key: key.to_string(),
-        depends_on: depends_on.into_iter().map(|dep| dep.to_string()).collect(),
+        depends_on: depends_on.into_iter().map(ToString::to_string).collect(),
         asset_key: None,
         partition_key: None,
         max_attempts: 3,

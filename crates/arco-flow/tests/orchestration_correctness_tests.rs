@@ -1,5 +1,9 @@
 //! Correctness regression tests for orchestration invariants.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::similar_names, clippy::unnecessary_wraps)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -112,7 +116,7 @@ fn task_finished_event(
 fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
     TaskDef {
         key: key.to_string(),
-        depends_on: depends_on.into_iter().map(|dep| dep.to_string()).collect(),
+        depends_on: depends_on.into_iter().map(ToString::to_string).collect(),
         asset_key: None,
         partition_key: None,
         max_attempts: 3,
@@ -316,7 +320,7 @@ fn test_controller_determinism_dispatcher() -> Result<()> {
             run_id: run_id.to_string(),
             task_key: "extract".to_string(),
             attempt: 1,
-            attempt_id: attempt_id.clone(),
+            attempt_id,
             worker_queue: "default-queue".to_string(),
             dispatch_id: format!("dispatch:{run_id}:extract:1"),
         },

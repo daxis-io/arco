@@ -121,7 +121,10 @@ pub struct ColumnRecord {
 /// Record stored in `lineage_edges.parquet`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineageEdgeRecord {
-    /// Edge ID (ULID).
+    /// Edge ID. Mixed identity: rows written by the L0 route carry a
+    /// content-derived SHA-256 hex digest; rows written before it carry the
+    /// per-request ULID that route used to mint. Readers must treat this as
+    /// an opaque string and never parse a timestamp out of it.
     pub id: String,
     /// Source entity ID.
     pub source_id: String,

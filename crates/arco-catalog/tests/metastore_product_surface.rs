@@ -4,6 +4,9 @@
 //! state, routes, or compatibility adapters depend on them.
 
 #![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::default_trait_access, clippy::too_many_lines)]
 
 use arco_proto::arco::catalog::v1::{
     CatalogObjectLifecycleState, ExternalServiceConnection, GroupMembership, ManagedStorageRoot,

@@ -9,13 +9,11 @@ use chrono::Duration;
 use metrics::{counter, histogram};
 use sha2::{Digest, Sha256};
 
+use crate::application::{RunPlanner, RunPlannerRequest};
 use crate::metrics::{TimingGuard, labels as metrics_labels, names as metrics_names};
 use crate::orchestration::compactor::fold::FoldState;
 use crate::orchestration::compactor::manifest::OrchestrationManifest;
-use crate::orchestration::events::{OrchestrationEventData, TaskDef, TriggerInfo};
-use crate::orchestration::{
-    AssetGraph, SelectionOptions, build_task_defs_for_selection, canonicalize_asset_key,
-};
+use crate::orchestration::events::{OrchestrationEventData, TriggerInfo};
 
 /// Action returned by run request bridge reconciliation.
 #[derive(Debug, Clone)]
@@ -184,13 +182,18 @@ impl RunRequestLookup {
 pub struct RunBridgeController {
     /// Maximum compaction lag before skipping.
     max_compaction_lag: Duration,
+    /// Application-level planner for compatibility task lowering.
+    run_planner: RunPlanner,
 }
 
 impl RunBridgeController {
     /// Creates a new run bridge controller.
     #[must_use]
     pub fn new(max_compaction_lag: Duration) -> Self {
-        Self { max_compaction_lag }
+        Self {
+            max_compaction_lag,
+            run_planner: RunPlanner::new(),
+        }
     }
 
     /// Creates a run bridge with default settings.
@@ -222,7 +225,7 @@ impl RunBridgeController {
         {
             run_keys
                 .into_iter()
-                .filter_map(|run_key| Self::reconcile_run_key(run_key, state, &lookup))
+                .filter_map(|run_key| self.reconcile_run_key(run_key, state, &lookup))
                 .collect()
         } else {
             run_keys
@@ -245,6 +248,7 @@ impl RunBridgeController {
     }
 
     fn reconcile_run_key(
+        &self,
         run_key: &str,
         state: &FoldState,
         lookup: &RunRequestLookup,
@@ -266,10 +270,25 @@ impl RunBridgeController {
         };
 
         let plan_id = format!("plan:{}", index.run_id);
-        let tasks = build_tasks(
-            &request.asset_selection,
-            request.partition_selection.as_deref(),
-        );
+        let planned_run =
+            match self
+                .run_planner
+                .plan_run(RunPlannerRequest::run_bridge_compatibility(
+                    format!("run_bridge:{run_key}:{}", index.request_fingerprint),
+                    index.run_id.clone(),
+                    plan_id.clone(),
+                    request.asset_selection.clone(),
+                    request.partition_selection.clone(),
+                    index.row_version.clone(),
+                )) {
+                Ok(planned_run) => planned_run,
+                Err(error) => {
+                    return Some(RunBridgeAction::Skip {
+                        run_key: run_key.to_string(),
+                        reason: format!("plan_compile_failed:{}", error.message),
+                    });
+                }
+            };
 
         let run_triggered = OrchestrationEventData::RunTriggered {
             run_id: index.run_id.clone(),
@@ -284,7 +303,7 @@ impl RunBridgeController {
         let plan_created = OrchestrationEventData::PlanCreated {
             run_id: index.run_id.clone(),
             plan_id,
-            tasks,
+            tasks: planned_run.tasks,
         };
 
         Some(RunBridgeAction::EmitRunEvents {
@@ -316,46 +335,4 @@ fn compute_backfill_request_fingerprint(partition_keys: &[String]) -> String {
         .and_then(|slice| slice.try_into().ok())
         .unwrap_or([0_u8; 16]);
     hex::encode(bytes)
-}
-
-fn build_tasks(asset_selection: &[String], partition_selection: Option<&[String]>) -> Vec<TaskDef> {
-    let mut graph = AssetGraph::new();
-    let mut roots = Vec::new();
-    for asset in asset_selection {
-        if let Ok(canonical) = canonicalize_asset_key(asset) {
-            graph.insert_asset(canonical.clone(), Vec::new());
-            roots.push(canonical);
-        }
-    }
-
-    let partition_key = partition_selection.and_then(|keys| match keys {
-        [single] => Some(single.as_str()),
-        _ => None,
-    });
-
-    if !roots.is_empty() {
-        let mut sorted_roots = roots.clone();
-        sorted_roots.sort();
-        sorted_roots.dedup();
-        if let Ok(tasks) = build_task_defs_for_selection(
-            &graph,
-            &sorted_roots,
-            SelectionOptions::none(),
-            partition_key,
-        ) {
-            if !tasks.is_empty() {
-                return tasks;
-            }
-        }
-    }
-
-    vec![TaskDef {
-        key: "materialize".to_string(),
-        depends_on: Vec::new(),
-        asset_key: None,
-        partition_key: None,
-        max_attempts: 3,
-        heartbeat_timeout_sec: 300,
-        requires_visible_output: false,
-    }]
 }

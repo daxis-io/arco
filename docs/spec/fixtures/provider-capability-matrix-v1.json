@@ -1,0 +1,125 @@
+{
+  "schema_version": "arco.provider-capability-matrix.v1",
+  "providers": [
+    {
+      "id": "memory-backend",
+      "production_provider": false,
+      "certification_state": "test-only",
+      "write_enabled": true,
+      "semantics": {
+        "conditional_create": true,
+        "pointer_cas": true,
+        "stable_version_token": true,
+        "addressed_read_after_write": true,
+        "checksum_or_corruption_detection": true,
+        "retry_timeout_policy": true,
+        "request_time_correctness_uses_listing": false,
+        "cas_semantics": "native"
+      },
+      "evidence": {
+        "conditional_create": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "pointer_cas": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "stable_version_token": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "addressed_read_after_write": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "checksum_or_corruption_detection": ["in-memory fixture bytes are process-local"],
+        "retry_timeout_policy": ["test-only backend does not perform network retries"]
+      }
+    },
+    {
+      "id": "object-store-memory-backend",
+      "production_provider": false,
+      "certification_state": "test-only",
+      "write_enabled": true,
+      "semantics": {
+        "conditional_create": true,
+        "pointer_cas": true,
+        "stable_version_token": true,
+        "addressed_read_after_write": true,
+        "checksum_or_corruption_detection": true,
+        "retry_timeout_policy": true,
+        "request_time_correctness_uses_listing": false,
+        "cas_semantics": "proven-safe"
+      },
+      "evidence": {
+        "conditional_create": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "pointer_cas": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "stable_version_token": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "addressed_read_after_write": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "checksum_or_corruption_detection": ["object_store memory fixture has exact addressed reads"],
+        "retry_timeout_policy": ["test-only backend does not perform network retries"]
+      }
+    },
+    {
+      "id": "gcs-production",
+      "production_provider": true,
+      "certification_state": "not-certified",
+      "write_enabled": false,
+      "semantics": {
+        "conditional_create": false,
+        "pointer_cas": false,
+        "stable_version_token": false,
+        "addressed_read_after_write": false,
+        "checksum_or_corruption_detection": false,
+        "retry_timeout_policy": false,
+        "request_time_correctness_uses_listing": false,
+        "cas_semantics": "ambiguous"
+      },
+      "evidence": {
+        "conditional_create": [],
+        "pointer_cas": [],
+        "stable_version_token": [],
+        "addressed_read_after_write": [],
+        "checksum_or_corruption_detection": [],
+        "retry_timeout_policy": []
+      }
+    },
+    {
+      "id": "s3-production",
+      "production_provider": true,
+      "certification_state": "not-certified",
+      "write_enabled": false,
+      "semantics": {
+        "conditional_create": false,
+        "pointer_cas": false,
+        "stable_version_token": false,
+        "addressed_read_after_write": false,
+        "checksum_or_corruption_detection": false,
+        "retry_timeout_policy": false,
+        "request_time_correctness_uses_listing": false,
+        "cas_semantics": "unsupported"
+      },
+      "evidence": {
+        "conditional_create": [],
+        "pointer_cas": [],
+        "stable_version_token": [],
+        "addressed_read_after_write": [],
+        "checksum_or_corruption_detection": [],
+        "retry_timeout_policy": []
+      }
+    },
+    {
+      "id": "azure-blob-production",
+      "production_provider": true,
+      "certification_state": "not-certified",
+      "write_enabled": false,
+      "semantics": {
+        "conditional_create": false,
+        "pointer_cas": false,
+        "stable_version_token": false,
+        "addressed_read_after_write": false,
+        "checksum_or_corruption_detection": false,
+        "retry_timeout_policy": false,
+        "request_time_correctness_uses_listing": false,
+        "cas_semantics": "ambiguous"
+      },
+      "evidence": {
+        "conditional_create": [],
+        "pointer_cas": [],
+        "stable_version_token": [],
+        "addressed_read_after_write": [],
+        "checksum_or_corruption_detection": [],
+        "retry_timeout_policy": []
+      }
+    }
+  ]
+}

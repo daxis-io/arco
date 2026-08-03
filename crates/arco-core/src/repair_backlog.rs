@@ -78,6 +78,9 @@ fn elapsed_seconds(now: DateTime<Utc>, first_detected_at: DateTime<Utc>) -> f64 
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::float_cmp)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
 

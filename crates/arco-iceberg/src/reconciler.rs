@@ -840,6 +840,13 @@ enum BackfillEntryResult {
 // ============================================================================
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines,
+    clippy::unreadable_literal
+)]
 mod tests {
     use super::*;
     use crate::paths::iceberg_committed_receipt_path;
@@ -1592,11 +1599,7 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).expect("valid date");
         let expected_path = iceberg_committed_receipt_path(date, &commit_key);
         let result = storage.head(&expected_path).await.expect("head");
-        assert!(
-            result.is_some(),
-            "Receipt should exist at {}",
-            expected_path
-        );
+        assert!(result.is_some(), "Receipt should exist at {expected_path}");
     }
 
     #[tokio::test]
@@ -1673,7 +1676,7 @@ mod tests {
         let metadata_json = format!(
             r#"{{
             "format-version": 2,
-            "table-uuid": "{}",
+            "table-uuid": "{table_uuid}",
             "location": "gs://bucket/table",
             "last-sequence-number": 1,
             "last-updated-ms": 1704067200000,
@@ -1689,8 +1692,7 @@ mod tests {
             "last-partition-id": 0,
             "default-sort-order-id": 0,
             "sort-orders": []
-        }}"#,
-            table_uuid
+        }}"#
         );
 
         storage
@@ -1763,7 +1765,7 @@ mod tests {
                 1704067200000_i64 + (i as i64 * 86400000)
             );
 
-            let path = format!("metadata/table{}/v1.json", i);
+            let path = format!("metadata/table{i}/v1.json");
             storage
                 .put(&path, Bytes::from(metadata_json), WritePrecondition::None)
                 .await

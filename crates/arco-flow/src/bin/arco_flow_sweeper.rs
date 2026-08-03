@@ -754,7 +754,7 @@ mod tests {
             dispatch_target_audience: "https://worker.invalid".to_string(),
             callback_base_url: "https://api.invalid".to_string(),
             task_token_config: task_token_config_from_parts(
-                "secret".to_string(),
+                "test-task-token-secret-32-bytes!!".to_string(),
                 Some("issuer".to_string()),
                 Some("audience".to_string()),
                 3_600,

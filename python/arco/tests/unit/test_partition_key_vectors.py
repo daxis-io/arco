@@ -56,6 +56,23 @@ def test_partition_key_fixture_parity() -> None:
         assert pk.canonical_string() == case["expected_canonical"], case["name"]
 
 
+def test_partition_key_fixture_canonical_strings_round_trip() -> None:
+    fixture_path = _repo_root() / "crates/arco-core/tests/fixtures/partition_key_cases.json"
+    data = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    for case in data:
+        canonical = case["expected_canonical"]
+        parsed = PartitionKey.from_canonical_string(canonical)
+        assert parsed.canonical_string() == canonical, case["name"]
+
+
+def test_partition_key_from_canonical_string_rejects_malformed_input() -> None:
+    with pytest.raises(ValueError, match="Invalid partition key segment"):
+        PartitionKey.from_canonical_string("date")
+    with pytest.raises(ValueError, match="Duplicate partition dimension key"):
+        PartitionKey.from_canonical_string("date=d:2025-01-15,date=d:2025-01-16")
+
+
 def test_partition_key_fixture_rejects_invalid_key() -> None:
     with pytest.raises(ValueError, match="Invalid partition dimension key"):
         PartitionKey({"Date": "2025-01-01"})

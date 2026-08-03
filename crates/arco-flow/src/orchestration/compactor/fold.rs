@@ -19,7 +19,9 @@ use metrics::counter;
 use ulid::Ulid;
 
 use crate::metrics::{labels as metrics_labels, names as metrics_names};
-use crate::orchestration::callbacks::TaskOutput as CallbackTaskOutput;
+use crate::orchestration::callbacks::{
+    TaskError as CallbackTaskError, TaskOutput as CallbackTaskOutput,
+};
 use crate::orchestration::events::{
     BackfillState, ChunkState, OrchestrationEvent, OrchestrationEventData, OutputVisibilityState,
     PartitionSelector, RunRequest, SensorEvalStatus, SensorStatus, SourceRef, TaskDef, TaskOutcome,
@@ -1372,6 +1374,7 @@ impl FoldState {
                 materialization_id,
                 error_message,
                 output,
+                error,
                 asset_key,
                 partition_key,
                 code_version,
@@ -1383,6 +1386,7 @@ impl FoldState {
                     *attempt,
                     attempt_id,
                     *outcome,
+                    error.as_ref().map(CallbackTaskError::effective_retryable),
                     materialization_id.as_deref(),
                     error_message.clone(),
                     output.as_ref(),
@@ -1413,6 +1417,7 @@ impl FoldState {
                 materialization_id,
                 error_message,
                 output,
+                error,
                 asset_key,
                 partition_key,
                 code_version,
@@ -1425,6 +1430,7 @@ impl FoldState {
                     *attempt,
                     attempt_id,
                     *outcome,
+                    error.as_ref().map(CallbackTaskError::effective_retryable),
                     materialization_id.as_deref(),
                     error_message.clone(),
                     output.as_ref(),
@@ -2158,6 +2164,7 @@ impl FoldState {
         attempt: u32,
         attempt_id: &str,
         outcome: TaskOutcome,
+        failure_retryable: Option<bool>,
         materialization_id: Option<&str>,
         error_message: Option<String>,
         output: Option<&CallbackTaskOutput>,
@@ -2198,7 +2205,9 @@ impl FoldState {
             let new_state = match outcome {
                 TaskOutcome::Succeeded => TaskState::Succeeded,
                 TaskOutcome::Failed => {
-                    if task.attempt < task.max_attempts {
+                    // Legacy and controller-authored failure facts have no
+                    // structured error, so preserve their retryable behavior.
+                    if failure_retryable.unwrap_or(true) && task.attempt < task.max_attempts {
                         TaskState::RetryWait
                     } else {
                         TaskState::Failed
@@ -3957,6 +3966,9 @@ pub fn merge_backfill_chunk_rows(rows: Vec<BackfillChunkRow>) -> Option<Backfill
 #[allow(clippy::cognitive_complexity, clippy::manual_let_else)]
 mod tests {
     use super::*;
+    use crate::orchestration::callbacks::{ErrorCategory, TaskError};
+    use crate::orchestration::compactor::manifest::Watermarks;
+    use crate::orchestration::controllers::{AntiEntropySweeper, Repair};
     use crate::orchestration::events::{
         OrchestrationEventData, OutputVisibilityState, OutputVisibilityUpdate, SourceRef,
         TimerType as EventTimerType, TriggerInfo, TriggerSource,
@@ -3965,6 +3977,51 @@ mod tests {
 
     fn make_event(data: OrchestrationEventData) -> OrchestrationEvent {
         OrchestrationEvent::new("tenant-test", "workspace-test", data)
+    }
+
+    #[test]
+    fn non_retryable_failure_is_terminal() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "extract".into(),
+                depends_on: vec![],
+                asset_key: None,
+                partition_key: None,
+                max_attempts: 3,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: false,
+            }],
+        ));
+        state.fold_event(&task_started_event("run1", "extract", 1, &attempt_id));
+
+        let mut failed =
+            task_finished_event("run1", "extract", 1, &attempt_id, TaskOutcome::Failed);
+        if let OrchestrationEventData::TaskFinished { error, .. } = &mut failed.data {
+            *error = Some(TaskError {
+                category: ErrorCategory::DataQuality,
+                message: "invalid input".to_string(),
+                stack_trace: None,
+                retryable: Some(false),
+            });
+        }
+
+        state.fold_event(&failed);
+
+        let task = state
+            .tasks
+            .get(&("run1".to_string(), "extract".to_string()))
+            .expect("task row");
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.retry_not_before, None);
+        assert_eq!(
+            state.runs.get("run1").expect("run row").state,
+            RunState::Failed
+        );
     }
 
     fn run_triggered_event(run_id: &str) -> OrchestrationEvent {
@@ -7183,7 +7240,7 @@ mod tests {
             &attempt_1_id,
         ));
         state.fold_event(&task_started_event("run1", "extract", 1, &attempt_1_id));
-        state.fold_event(&task_finished_event_with_asset(
+        let failed = task_finished_event_with_asset(
             "run1",
             "extract",
             1,
@@ -7191,7 +7248,9 @@ mod tests {
             TaskOutcome::Failed,
             Some("analytics.daily"),
             Some("2026-05-26"),
-        ));
+        );
+        let failed_at = failed.timestamp;
+        state.fold_event(&failed);
 
         let retry_wait_row = state
             .catalog_run_index
@@ -7205,10 +7264,46 @@ mod tests {
         assert_eq!(retry_wait_row.task_status, TaskState::RetryWait);
         assert_eq!(retry_wait_row.attempt, 1);
 
+        let retry_task = state
+            .tasks
+            .get(&("run1".to_string(), "extract".to_string()))
+            .expect("retry task row")
+            .clone();
+        let retry_at = FoldState::retry_deadline(&failed.event_id, failed_at, 1)
+            .expect("retry deadline should be representable");
+        assert_eq!(retry_task.retry_not_before, Some(retry_at));
+
+        let watermarks = Watermarks {
+            last_committed_event_id: Some(failed.event_id.clone()),
+            last_visible_event_id: Some(failed.event_id.clone()),
+            events_processed_through: Some(failed.event_id.clone()),
+            last_processed_file: None,
+            last_processed_at: failed_at,
+        };
+        let repairs = AntiEntropySweeper::with_defaults().scan(
+            &watermarks,
+            std::slice::from_ref(&retry_task),
+            &[],
+            retry_at,
+        );
+        let [
+            Repair::CreateDispatchOutbox {
+                run_id,
+                task_key,
+                attempt,
+                reason,
+            },
+        ] = repairs.as_slice()
+        else {
+            panic!("expected retry dispatch repair, got {repairs:?}");
+        };
+        assert_eq!(*attempt, 2);
+        assert_eq!(reason, "retry_wait_bootstrap");
+
         state.fold_event(&dispatch_requested_event(
-            "run1",
-            "extract",
-            2,
+            run_id,
+            task_key,
+            *attempt,
             &attempt_2_id,
         ));
 

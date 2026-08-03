@@ -15,6 +15,7 @@ use futures::TryStreamExt;
 use futures::stream;
 use ulid::Ulid;
 
+use arco_core::canonical_json::to_canonical_bytes;
 use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
 
 use super::events::OrchestrationEvent;
@@ -39,6 +40,21 @@ pub trait OrchestrationLedgerWriter: Send + Sync {
     ) -> impl Future<Output = std::result::Result<(), String>> + Send;
 }
 
+/// Largest forward clock slack accepted in an appended event id.
+///
+/// The ledger's on-disk layout derives each object's date prefix from the
+/// event id's ULID timestamp, and readers that need to prove "no unfolded
+/// event exists" scan a bounded window of those prefixes. An id whose ULID
+/// timestamp is arbitrarily far in the future would land in a prefix outside
+/// any such window, so the event would be durable and simultaneously invisible
+/// to the freshness scan. Rejecting out-of-policy ids at append is what makes
+/// the scan's bounded forward horizon sound.
+///
+/// The bound is generous enough to absorb real clock skew between control
+/// plane replicas while being far smaller than the one-day forward slack the
+/// freshness scan already covers.
+pub const MAX_EVENT_ID_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
 /// Writes orchestration events to the ledger (append-only JSON files).
 ///
 /// Events are written idempotently - duplicate writes are no-ops.
@@ -58,6 +74,46 @@ impl LedgerWriter {
     #[must_use]
     pub fn storage(&self) -> ScopedStorage {
         self.storage.clone()
+    }
+
+    /// Rejects event ids whose ULID timestamp is beyond the append horizon.
+    ///
+    /// See [`MAX_EVENT_ID_FUTURE_SKEW`]: an id further in the future than the
+    /// tolerated skew would place the event in a ledger date prefix that
+    /// bounded freshness scans never list, making a durable event invisible to
+    /// the check that decides whether repairs may run.
+    ///
+    /// Ids that are not ULIDs are left to the existing path-derivation
+    /// fallback; only a parseable, out-of-policy ULID is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the id's ULID timestamp exceeds
+    /// `now + MAX_EVENT_ID_FUTURE_SKEW`.
+    fn validate_event_id_horizon(event_id: &str, now: chrono::DateTime<Utc>) -> Result<()> {
+        let Ok(ulid) = Ulid::from_string(event_id) else {
+            return Ok(());
+        };
+        let event_time = i64::try_from(ulid.timestamp_ms())
+            .ok()
+            .and_then(chrono::DateTime::from_timestamp_millis);
+        let Some(event_time) = event_time else {
+            return Err(Error::from(arco_core::Error::InvalidInput(format!(
+                "orchestration event id '{event_id}' has an unrepresentable ULID timestamp"
+            ))));
+        };
+        let Some(horizon) = now.checked_add_signed(MAX_EVENT_ID_FUTURE_SKEW) else {
+            return Ok(());
+        };
+        if event_time > horizon {
+            return Err(Error::from(arco_core::Error::InvalidInput(format!(
+                "orchestration event id '{event_id}' is {}s beyond the append horizon; \
+                 ledger event ids must be minted within {}s of server time",
+                event_time.signed_duration_since(now).num_seconds(),
+                MAX_EVENT_ID_FUTURE_SKEW.num_seconds()
+            ))));
+        }
+        Ok(())
     }
 
     /// Appends an event to the ledger.
@@ -80,6 +136,8 @@ impl LedgerWriter {
         )
     )]
     pub async fn append(&self, event: OrchestrationEvent) -> Result<()> {
+        Self::validate_event_id_horizon(&event.event_id, Utc::now())?;
+
         // Derive date from event timestamp (or fallback to event_id ULID)
         let date = Ulid::from_string(&event.event_id).map_or_else(
             |_| event.timestamp.format("%Y-%m-%d").to_string(),
@@ -95,13 +153,14 @@ impl LedgerWriter {
         let path = orchestration_event_path(&date, &event.event_id);
         tracing::Span::current().record("path", tracing::field::display(&path));
 
-        let json = serde_json::to_string(&event).map_err(|e| Error::Serialization {
+        let json = to_canonical_bytes(&event).map_err(|e| Error::Serialization {
             message: format!("failed to serialize orchestration event: {e}"),
         })?;
+        let payload = Bytes::from(json);
 
         let result = self
             .storage
-            .put_raw(&path, Bytes::from(json), WritePrecondition::DoesNotExist)
+            .put_raw(&path, payload.clone(), WritePrecondition::DoesNotExist)
             .await?;
 
         match result {
@@ -110,8 +169,24 @@ impl LedgerWriter {
                 Ok(())
             }
             WriteResult::PreconditionFailed { .. } => {
-                tracing::debug!("duplicate orchestration event delivery - no-op");
-                Ok(())
+                let existing = self.storage.get_raw(&path).await?;
+                let canonically_equivalent_legacy =
+                    serde_json::from_slice::<serde_json::Value>(existing.as_ref())
+                        .ok()
+                        .and_then(|value| to_canonical_bytes(&value).ok())
+                        .is_some_and(|canonical| canonical.as_slice() == payload.as_ref());
+                if existing == payload || canonically_equivalent_legacy {
+                    tracing::debug!("duplicate orchestration event delivery - no-op");
+                    Ok(())
+                } else {
+                    Err(Error::Storage {
+                        message: format!(
+                            "orchestration event '{}' already exists with a different payload",
+                            event.event_id
+                        ),
+                        source: None,
+                    })
+                }
             }
         }
     }
@@ -235,6 +310,92 @@ mod tests {
 
         // Duplicate write should also succeed (no-op)
         writer.append(event).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_bytes_are_canonical_across_multi_entry_label_maps() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage.clone());
+        let mut event = make_test_event("tenant", "workspace");
+        let OrchestrationEventData::RunTriggered { labels, .. } = &mut event.data else {
+            panic!("run-triggered fixture");
+        };
+        labels.extend([
+            ("zeta".to_string(), "last".to_string()),
+            ("alpha".to_string(), "first".to_string()),
+            ("middle".to_string(), "between".to_string()),
+        ]);
+        let expected = to_canonical_bytes(&event).expect("canonical orchestration event");
+        let path = LedgerWriter::event_path(&event);
+
+        writer.append(event).await?;
+
+        assert_eq!(
+            storage.get_raw(&path).await?.as_ref(),
+            expected.as_slice(),
+            "durable same-ID comparisons require one canonical event encoding"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_retry_accepts_an_equivalent_legacy_json_encoding() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage.clone());
+        let mut event = make_test_event("tenant", "workspace");
+        let OrchestrationEventData::RunTriggered { labels, .. } = &mut event.data else {
+            panic!("run-triggered fixture");
+        };
+        labels.extend([
+            ("zeta".to_string(), "last".to_string()),
+            ("alpha".to_string(), "first".to_string()),
+            ("middle".to_string(), "between".to_string()),
+        ]);
+        let legacy = serde_json::to_vec(&event).expect("legacy orchestration event JSON");
+        let canonical = to_canonical_bytes(&event).expect("canonical orchestration event");
+        assert_ne!(
+            legacy, canonical,
+            "fixture must exercise legacy key ordering"
+        );
+        let path = LedgerWriter::event_path(&event);
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(legacy.clone()),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        writer.append(event).await?;
+
+        assert_eq!(
+            storage.get_raw(&path).await?.as_ref(),
+            legacy.as_slice(),
+            "an equivalent legacy winner remains immutable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_event_id_with_different_bytes_fails_closed() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
+        let writer = LedgerWriter::new(storage);
+
+        let event = make_test_event("tenant", "workspace");
+        writer.append(event.clone()).await?;
+
+        let mut conflicting = event;
+        conflicting.correlation_id = Some("different-reviewed-correlation".to_string());
+        let error = writer
+            .append(conflicting)
+            .await
+            .expect_err("same event ID with different bytes must fail");
+        assert!(error.to_string().contains("different payload"));
 
         Ok(())
     }

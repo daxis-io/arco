@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -23,7 +24,10 @@ use crate::manifest::{
     CatalogDomainManifest, DomainManifestPointer, LineageManifest, SearchManifest,
     compute_manifest_hash, next_manifest_id,
 };
-use crate::parquet_util::{CatalogCommitRecord, SearchPostingRecord};
+use crate::parquet_util::{
+    CatalogCommitEventWitness, CatalogCommitRecord, SearchPostingRecord,
+    encode_catalog_commit_event_witnesses,
+};
 use crate::sync_compact_permit_issuer;
 use crate::tier1_events::{
     CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, CatalogDdlEventV4, LineageDdlEvent,
@@ -334,6 +338,9 @@ impl Tier1Compactor {
     ) -> Result<Tier1CompactionResult, Tier1CompactionError> {
         let publisher = Publisher::new(&self.storage);
         let mut reserved_commit: Option<ReservedCatalogCommit> = None;
+        // One nonce for this invocation: CAS retries reuse the attempt
+        // directory (byte-identical rewrites), a restarted process never does.
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
@@ -398,13 +405,17 @@ impl Tier1Compactor {
                 .map_err(map_processing_error)?;
 
             let mut commit_metadata = CatalogCommitMetadata::default();
+            let mut event_witnesses = Vec::with_capacity(unapplied_event_paths.len());
             for path in &unapplied_event_paths {
                 let event = read_catalog_event(&self.storage, path).await?;
                 if unapplied_event_paths.len() == 1 {
-                    commit_metadata = catalog_commit_metadata(&event);
+                    commit_metadata = catalog_commit_metadata(&event.value);
                 }
-                apply_catalog_event(&mut state, event)?;
+                event_witnesses.push(event.witness);
+                apply_catalog_event(&mut state, event.value)?;
             }
+            let event_witnesses_json = encode_catalog_commit_event_witnesses(event_witnesses)
+                .map_err(map_processing_error)?;
 
             let next_version = manifest.snapshot_version + 1;
             let next_commit = reserved_commit
@@ -427,16 +438,27 @@ impl Tier1Compactor {
                 CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
 
             state.commits.push(build_catalog_commit_record(
-                &next_commit.commit_ulid,
+                &next_commit,
+                &manifest_id,
                 next_version,
-                next_commit.published_at.timestamp_millis(),
                 fencing_token,
                 last_event_id.clone(),
+                event_witnesses_json,
                 commit_metadata,
             )?);
 
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Catalog, next_version, &manifest_id);
+            // The attempt directory embeds the per-invocation nonce so its
+            // identity is unique per attempt: a crashed attempt that already
+            // wrote snapshot files under a reused manifest id can never collide
+            // with (and permanently wedge) a later attempt, which mints a fresh
+            // nonce. Within one invocation the nonce and the reservation are
+            // both stable, so CAS retries rewrite byte-identical files into the
+            // same directory.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Catalog,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &next_commit.commit_ulid, &attempt_nonce),
+            );
             let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -562,6 +584,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Lineage);
@@ -617,8 +640,14 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Lineage, next_version, &manifest_id);
+            // Unique per attempt (see the catalog compaction path above): a
+            // crashed attempt must never wedge later attempts on immutable
+            // snapshot files it already wrote under a reused manifest id.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Lineage,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
+            );
             let snapshot = tier1_snapshot::write_lineage_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -748,6 +777,7 @@ impl Tier1Compactor {
         let events_processed = event_paths.len();
         let last_event_id = max_event_id_from_paths(&event_paths);
         let publisher = Publisher::new(&self.storage);
+        let attempt_nonce = new_attempt_nonce();
 
         for attempt in 1..=self.cas_max_retries {
             let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Search);
@@ -812,8 +842,14 @@ impl Tier1Compactor {
                 &prev_manifest.manifest_id,
             )
             .await?;
-            let snapshot_dir =
-                StateKey::snapshot_attempt_dir(CatalogDomain::Search, next_version, &manifest_id);
+            // Unique per attempt (see the catalog compaction path above): a
+            // crashed attempt must never wedge later attempts on immutable
+            // snapshot files it already wrote under a reused manifest id.
+            let snapshot_dir = StateKey::snapshot_attempt_dir(
+                CatalogDomain::Search,
+                next_version,
+                &snapshot_attempt_token(&manifest_id, &commit_ulid, &attempt_nonce),
+            );
             let snapshot = tier1_snapshot::write_search_snapshot_in_dir(
                 &self.storage,
                 next_version,
@@ -1036,6 +1072,11 @@ enum ParsedCatalogDdlEvent {
     V4(CatalogDdlEventV4),
 }
 
+struct ReadCatalogDdlEvent {
+    value: ParsedCatalogDdlEvent,
+    witness: CatalogCommitEventWitness,
+}
+
 fn catalog_commit_metadata(event: &ParsedCatalogDdlEvent) -> CatalogCommitMetadata {
     match event {
         ParsedCatalogDdlEvent::V1(event) => match event {
@@ -1134,11 +1175,12 @@ fn catalog_commit_metadata(event: &ParsedCatalogDdlEvent) -> CatalogCommitMetada
 }
 
 fn build_catalog_commit_record(
-    commit_ulid: &str,
+    reserved_commit: &ReservedCatalogCommit,
+    manifest_id: &str,
     snapshot_version: u64,
-    published_at: i64,
     fencing_token: u64,
     watermark_event_id: Option<String>,
+    event_witnesses_json: String,
     metadata: CatalogCommitMetadata,
 ) -> Result<CatalogCommitRecord, Tier1CompactionError> {
     let snapshot_version =
@@ -1151,9 +1193,11 @@ fn build_catalog_commit_record(
         })?;
 
     Ok(CatalogCommitRecord {
-        commit_ulid: commit_ulid.to_string(),
+        commit_ulid: reserved_commit.commit_ulid.clone(),
+        manifest_id: Some(manifest_id.to_string()),
+        event_witnesses_json: Some(event_witnesses_json),
         snapshot_version,
-        published_at,
+        published_at: reserved_commit.published_at.timestamp_millis(),
         fencing_token,
         watermark_event_id,
         operation: metadata.operation,
@@ -1166,7 +1210,7 @@ fn build_catalog_commit_record(
 async fn read_catalog_event(
     storage: &ScopedStorage,
     path: &str,
-) -> Result<ParsedCatalogDdlEvent, Tier1CompactionError> {
+) -> Result<ReadCatalogDdlEvent, Tier1CompactionError> {
     let data = storage
         .get_raw(path)
         .await
@@ -1193,34 +1237,47 @@ async fn read_catalog_event(
             message: format!("invalid catalog event envelope: {e}"),
         })?;
 
-    match envelope.event_version {
+    let value = match envelope.event_version {
         CatalogDdlEvent::EVENT_VERSION => {
             let payload: CatalogDdlEvent =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V1(payload))
+            ParsedCatalogDdlEvent::V1(payload)
         }
         CatalogDdlEventV2::EVENT_VERSION => {
             let payload: CatalogDdlEventV2 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V2(payload))
+            ParsedCatalogDdlEvent::V2(payload)
         }
         CatalogDdlEventV3::EVENT_VERSION => {
             let payload: CatalogDdlEventV3 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V3(payload))
+            ParsedCatalogDdlEvent::V3(payload)
         }
         CatalogDdlEventV4::EVENT_VERSION => {
             let payload: CatalogDdlEventV4 =
                 serde_json::from_value(envelope.payload).map_err(map_processing_error)?;
-            Ok(ParsedCatalogDdlEvent::V4(payload))
+            ParsedCatalogDdlEvent::V4(payload)
         }
-        other => Err(Tier1CompactionError::ProcessingError {
-            message: format!(
-                "unexpected catalog event type {} v{other}",
-                envelope.event_type
-            ),
-        }),
-    }
+        other => {
+            return Err(Tier1CompactionError::ProcessingError {
+                message: format!(
+                    "unexpected catalog event type {} v{other}",
+                    envelope.event_type
+                ),
+            });
+        }
+    };
+    let event_id =
+        event_id_from_path(path).ok_or_else(|| Tier1CompactionError::ProcessingError {
+            message: format!("catalog event path '{path}' has no event ID"),
+        })?;
+    Ok(ReadCatalogDdlEvent {
+        value,
+        witness: CatalogCommitEventWitness {
+            event_id: event_id.to_string(),
+            event_sha256: format!("sha256:{}", hex::encode(Sha256::digest(&data))),
+        },
+    })
 }
 
 async fn read_lineage_event(
@@ -1851,6 +1908,40 @@ fn next_commit_ulid(previous: Option<&str>) -> Result<String, Tier1CompactionErr
     Ok(next.to_string())
 }
 
+/// Builds the attempt-unique token naming one snapshot attempt directory.
+///
+/// `next_available_manifest_id` probes only the immutable manifest JSON path,
+/// so a compaction that crashes after writing snapshot files but before the
+/// manifest put leaves the same manifest id selectable again. Deriving the
+/// attempt directory from the manifest id alone would then re-derive the
+/// crashed attempt's directory, and `put_state_if_absent` would fail closed
+/// forever on the differing `commits.parquet` bytes (its `published_at` column
+/// carries wall-clock millis), wedging all subsequent DDL.
+///
+/// The commit ULID alone does not carry that uniqueness: `next_commit_ulid`
+/// falls back to `previous.increment()` whenever the fresh candidate does not
+/// sort above the predecessor, which a clock-skewed writer's future-dated
+/// commit ULID forces. A crashed attempt and its restarted successor would
+/// then derive the *same* ULID, the same token, and the same directory --
+/// reinstating the wedge until real time overtook the skewed timestamp. The
+/// per-attempt `nonce` therefore owns directory uniqueness outright, leaving
+/// the commit ULID free to stay deterministic where the protocol requires it.
+fn snapshot_attempt_token(manifest_id: &str, commit_ulid: &str, nonce: &str) -> String {
+    format!("{manifest_id}-{commit_ulid}-{nonce}")
+}
+
+/// Mints the nonce identifying one compaction attempt's snapshot directory.
+///
+/// Every call draws the ULID's 80-bit random component afresh, so uniqueness
+/// holds even when the clock does not advance and regardless of which branch
+/// `next_commit_ulid` takes: two attempts (in one process or across a restart)
+/// can never select the same attempt directory. Callers mint it once per
+/// compaction invocation so that in-invocation CAS retries rewrite
+/// byte-identical files into the same directory.
+fn new_attempt_nonce() -> String {
+    Ulid::new().to_string()
+}
+
 async fn next_available_manifest_id(
     storage: &ScopedStorage,
     domain: CatalogDomain,
@@ -1899,6 +1990,9 @@ fn map_publish_error<E: std::fmt::Display>(err: E) -> Tier1CompactionError {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
     use crate::parquet_util::{ColumnRecord, NamespaceRecord, TableRecord};
@@ -1907,6 +2001,51 @@ mod tests {
     use arco_core::storage::{MemoryBackend, WritePrecondition};
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// Attempt-directory uniqueness must not depend on `Ulid::new()` winning
+    /// the comparison in `next_commit_ulid`.
+    ///
+    /// A clock-skewed writer leaves a future-dated commit ULID as the
+    /// predecessor, forcing the deterministic `previous.increment()` branch. A
+    /// crashed attempt and its restarted successor then derive the *same*
+    /// commit ULID, so a token built from the manifest id and the ULID alone
+    /// re-derives the crashed attempt's directory. `put_state_if_absent` then
+    /// fails closed forever on the differing `commits.parquet` bytes (its
+    /// `published_at` column carries wall-clock millis) -- the #368 wedge,
+    /// reinstated until real time overtook the skewed timestamp.
+    #[test]
+    fn skewed_predecessor_keeps_the_commit_ulid_deterministic_but_attempt_dirs_unique() {
+        // A far-future predecessor: no fresh ULID can sort above it.
+        const SKEWED_PREDECESSOR: &str = "7ZZZZZZZZZ0000000000000000";
+        const MANIFEST_ID: &str = "00000000000000000003";
+
+        let crashed = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("crashed attempt ulid");
+        let restarted = next_commit_ulid(Some(SKEWED_PREDECESSOR)).expect("restarted attempt ulid");
+        assert_eq!(
+            crashed, restarted,
+            "a skewed predecessor must take the deterministic successor branch"
+        );
+        assert!(crashed.as_str() > SKEWED_PREDECESSOR);
+
+        let crashed_nonce = new_attempt_nonce();
+        let restarted_nonce = new_attempt_nonce();
+        assert_ne!(
+            crashed_nonce, restarted_nonce,
+            "each attempt must mint its own nonce"
+        );
+        assert_ne!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &restarted, &restarted_nonce),
+            "a restarted attempt must never re-derive a crashed attempt's directory"
+        );
+
+        // Within one invocation the token is stable, so CAS retries rewrite
+        // byte-identical files into the same directory.
+        assert_eq!(
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce),
+            snapshot_attempt_token(MANIFEST_ID, &crashed, &crashed_nonce)
+        );
+    }
 
     #[tokio::test]
     async fn sync_compact_search_writes_snapshot() {

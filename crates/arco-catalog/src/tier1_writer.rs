@@ -13,6 +13,7 @@ use std::{collections::HashSet, time::Duration};
 
 use bytes::Bytes;
 use chrono::Utc;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -20,7 +21,7 @@ use arco_core::publish::{
     SnapshotPointerDurability, SnapshotPointerPublishOutcome, publish_snapshot_pointer_transaction,
 };
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
-use arco_core::storage_keys::LedgerKey;
+use arco_core::storage_keys::{LedgerKey, StateKey};
 use arco_core::storage_traits::LedgerPutStore;
 use arco_core::{
     CatalogDomain, CatalogEvent, CatalogEventPayload, CatalogPaths, EventId, ScopedStorage,
@@ -32,11 +33,101 @@ use crate::lock::{DEFAULT_LOCK_TTL, DEFAULT_MAX_RETRIES, DistributedLock};
 use crate::manifest::{
     CatalogDomainManifest, CatalogManifest, CommitRecord, DomainManifestPointer,
     ExecutionsManifest, INITIAL_MANIFEST_ID, LineageManifest, RootManifest, SearchManifest,
-    compute_manifest_hash, next_manifest_id,
+    compute_manifest_hash, next_manifest_id, parse_manifest_id,
 };
+use crate::parquet_util::{CatalogCommitEventWitness, decode_catalog_commit_event_witnesses};
+use crate::tier1_state;
+use crate::write_options::CatalogTransactionIdentity;
 
 /// Maximum CAS retries for manifest writes.
 const DEFAULT_MAX_CAS_RETRIES: u32 = 10;
+
+const CATALOG_TRANSACTION_INTENT_RECORD_TYPE: &str = "catalog_transaction_event_intent";
+const CATALOG_TRANSACTION_INTENT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CatalogTransactionEventIntent {
+    record_type: String,
+    version: u32,
+    tx_id: String,
+    request_hash: String,
+    base_manifest_id: String,
+    base_manifest_path: String,
+    base_manifest_sha256: String,
+    event_binding_sha256: String,
+    source: String,
+    revision: u64,
+    event_ids: Vec<String>,
+    active_event_id: String,
+    active_event_path: String,
+    event_json: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishedCatalogTransactionEvent {
+    pub event_id: String,
+    pub manifest: CatalogDomainManifest,
+    pub authority_version: String,
+    pub is_current_pointer: bool,
+}
+
+pub(crate) struct CatalogTransactionPublication<'a> {
+    pub event_id: &'a str,
+    pub commit_id: &'a str,
+    pub manifest_id: &'a str,
+    pub snapshot_version: u64,
+    pub authority_version: &'a str,
+    pub fencing_token: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum CatalogTransactionEventRecovery {
+    Published(Box<PublishedCatalogTransactionEvent>),
+    Ready(EventId),
+    RetryUnlocked,
+}
+
+pub(crate) enum CatalogTransactionEventInspection {
+    Published(Box<PublishedCatalogTransactionEvent>),
+    Unpublished(CatalogTransactionRecoveryInspection),
+}
+
+pub(crate) struct CatalogTransactionRecoveryInspection {
+    intent_version: String,
+    head_manifest_id: String,
+    pointer_version: String,
+}
+
+enum SelectedCatalogTransactionPublication {
+    Published(Box<PublishedCatalogTransactionEvent>),
+    Unpublished,
+    RequiresHistoryScan,
+}
+
+#[derive(Debug)]
+struct VersionedCatalogTransactionIntent {
+    value: CatalogTransactionEventIntent,
+    version: String,
+}
+
+struct StableCatalogManifest {
+    value: CatalogDomainManifest,
+    bytes: Bytes,
+    version: String,
+}
+
+struct SelectedCatalogCommitHistory {
+    current: StableCatalogManifest,
+    pointer_version: String,
+    commits: Vec<crate::parquet_util::CatalogCommitRecord>,
+}
+
+enum SelectedCatalogCommitHistoryAvailability {
+    Available(Box<SelectedCatalogCommitHistory>),
+    Unpublished,
+    RequiresHistoryScan,
+}
 
 /// Tier 1 writer for catalog manifests.
 ///
@@ -290,6 +381,1129 @@ impl Tier1Writer {
 
     fn map_lock(err: arco_core::Error) -> CatalogError {
         CatalogError::from(err)
+    }
+
+    fn catalog_transaction_intent_path(identity: &CatalogTransactionIdentity) -> Result<String> {
+        let tx_id =
+            Ulid::from_string(&identity.tx_id).map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog transaction identity must use a canonical ULID".to_string(),
+            })?;
+        if tx_id.to_string() != identity.tx_id
+            || !identity.request_hash.starts_with("sha256:")
+            || identity.request_hash.len() != "sha256:".len() + 64
+            || !identity.request_hash["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction identity is non-canonical".to_string(),
+            });
+        }
+        Ok(format!(
+            "transactions/catalog/{}.intent.json",
+            identity.tx_id
+        ))
+    }
+
+    fn validate_catalog_transaction_intent_envelope(
+        identity: &CatalogTransactionIdentity,
+        source: Option<&str>,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<CatalogEvent<serde_json::Value>> {
+        let canonical_sha256 = |value: &str| {
+            value.starts_with("sha256:")
+                && value.len() == "sha256:".len() + 64
+                && value["sha256:".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        };
+        let active = intent.event_ids.last().map(String::as_str);
+        let event_ids = intent
+            .event_ids
+            .iter()
+            .map(|event_id| {
+                event_id
+                    .parse::<EventId>()
+                    .ok()
+                    .filter(|parsed| parsed.to_string() == *event_id)
+            })
+            .collect::<Option<Vec<_>>>();
+        let event_history_is_canonical = event_ids.as_ref().is_some_and(|event_ids| {
+            usize::try_from(intent.revision).ok() == Some(event_ids.len())
+                && event_ids
+                    .windows(2)
+                    .all(|pair| matches!(pair, [left, right] if left < right))
+        });
+        if intent.record_type != CATALOG_TRANSACTION_INTENT_RECORD_TYPE
+            || intent.version != CATALOG_TRANSACTION_INTENT_VERSION
+            || intent.tx_id != identity.tx_id
+            || intent.request_hash != identity.request_hash
+            || intent.base_manifest_id.len() != 20
+            || !intent
+                .base_manifest_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            || intent.base_manifest_path
+                != CatalogPaths::domain_manifest_snapshot(
+                    CatalogDomain::Catalog,
+                    &intent.base_manifest_id,
+                )
+            || !canonical_sha256(&intent.base_manifest_sha256)
+            || !canonical_sha256(&intent.event_binding_sha256)
+            || source.is_some_and(|source| source != intent.source)
+            || intent.revision == 0
+            || intent.event_ids.is_empty()
+            || active != Some(intent.active_event_id.as_str())
+            || !event_history_is_canonical
+            || intent.active_event_path
+                != LedgerKey::event(CatalogDomain::Catalog, &intent.active_event_id).as_ref()
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction event intent is corrupt or out of scope".to_string(),
+            });
+        }
+        let event: CatalogEvent<serde_json::Value> = serde_json::from_str(&intent.event_json)
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog transaction event intent contains invalid event JSON".to_string(),
+            })?;
+        event
+            .validate()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog transaction event intent contains an invalid event envelope"
+                    .to_string(),
+            })?;
+        let expected_idempotency_key = CatalogEvent::<()>::generate_idempotency_key(
+            &event.event_type,
+            event.event_version,
+            &event.payload,
+        )
+        .map_err(|_| CatalogError::InvariantViolation {
+            message: "catalog transaction event intent idempotency binding is invalid".to_string(),
+        })?;
+        if event.source != intent.source || event.idempotency_key != expected_idempotency_key {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction event intent envelope binding is invalid".to_string(),
+            });
+        }
+        Ok(event)
+    }
+
+    fn catalog_transaction_event_binding(
+        identity: &CatalogTransactionIdentity,
+        intent: &CatalogTransactionEventIntent,
+        event: &CatalogEvent<serde_json::Value>,
+        event_semantics: &serde_json::Value,
+    ) -> Result<String> {
+        let value = serde_json::json!({
+            "recordType": "catalog_transaction_event_binding",
+            "version": 1,
+            "txId": identity.tx_id,
+            "requestHash": identity.request_hash,
+            "stagedSha256": identity.staged_sha256,
+            "baseManifestId": intent.base_manifest_id,
+            "baseManifestPath": intent.base_manifest_path,
+            "baseManifestSha256": intent.base_manifest_sha256,
+            "source": intent.source,
+            "eventType": event.event_type,
+            "eventVersion": event.event_version,
+            "eventSemantics": event_semantics,
+        });
+        let bytes = arco_core::canonical_json::to_canonical_bytes(&value).map_err(|error| {
+            CatalogError::Serialization {
+                message: format!(
+                    "failed to canonicalize catalog transaction event binding: {error}"
+                ),
+            }
+        })?;
+        Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+    }
+
+    async fn validate_catalog_transaction_intent(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        source: Option<&str>,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<()> {
+        if identity.reviewed_request.request_hash()? != identity.request_hash {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction capability lost its reviewed request binding"
+                    .to_string(),
+            });
+        }
+        let event = Self::validate_catalog_transaction_intent_envelope(identity, source, intent)?;
+        let base = self
+            .load_stable_catalog_manifest(&intent.base_manifest_path)
+            .await?;
+        if base.value.manifest_id != intent.base_manifest_id
+            || compute_manifest_hash(&base.bytes) != intent.base_manifest_sha256
+        {
+            return Err(CatalogError::InvariantViolation {
+                message:
+                    "catalog transaction event intent diverges from its immutable base manifest"
+                        .to_string(),
+            });
+        }
+        let base_state =
+            tier1_state::load_catalog_state(&self.storage, &base.value.snapshot_path).await?;
+        let event_semantics = identity.reviewed_request.validate_event_realization(
+            &event.event_type,
+            event.event_version,
+            &event.payload,
+            &base_state,
+            &identity.tenant_id,
+            &identity.workspace_id,
+        )?;
+        let binding =
+            Self::catalog_transaction_event_binding(identity, intent, &event, &event_semantics)?;
+        if binding != intent.event_binding_sha256 {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction event intent has a divergent operation binding"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_catalog_transaction_intent_collision(
+        candidate: &CatalogTransactionEventIntent,
+        winner: &CatalogTransactionEventIntent,
+    ) -> Result<()> {
+        if winner.base_manifest_id != candidate.base_manifest_id
+            || winner.base_manifest_path != candidate.base_manifest_path
+            || winner.base_manifest_sha256 != candidate.base_manifest_sha256
+            || winner.event_binding_sha256 != candidate.event_binding_sha256
+        {
+            return Err(CatalogError::InvariantViolation {
+                message:
+                    "catalog transaction event intent collision diverges from the current execution base"
+                        .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn load_catalog_transaction_intent(
+        &self,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<Option<VersionedCatalogTransactionIntent>> {
+        let path = Self::catalog_transaction_intent_path(identity)?;
+        let Some(metadata) = self.storage.head_raw(&path).await? else {
+            return Ok(None);
+        };
+        let bytes = self.storage.get_raw(&path).await?;
+        let value: CatalogTransactionEventIntent =
+            serde_json::from_slice(bytes.as_ref()).map_err(|_| {
+                CatalogError::InvariantViolation {
+                    message: "catalog transaction event intent is corrupt".to_string(),
+                }
+            })?;
+        let canonical =
+            serde_json::to_vec(&value).map_err(|error| CatalogError::Serialization {
+                message: format!(
+                    "failed to canonicalize catalog transaction event intent: {error}"
+                ),
+            })?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction event intent is not canonical JSON".to_string(),
+            });
+        }
+        self.validate_catalog_transaction_intent(identity, None, &value)
+            .await?;
+        Ok(Some(VersionedCatalogTransactionIntent {
+            value,
+            version: metadata.version,
+        }))
+    }
+
+    async fn ensure_catalog_transaction_event(
+        &self,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<()> {
+        let payload = Bytes::from(intent.event_json.clone());
+        match self
+            .storage
+            .put_raw(
+                &intent.active_event_path,
+                payload.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(()),
+            WriteResult::PreconditionFailed { .. } => {
+                let existing = self.storage.get_raw(&intent.active_event_path).await?;
+                if existing == payload {
+                    Ok(())
+                } else {
+                    Err(CatalogError::InvariantViolation {
+                        message: "catalog transaction event path contains different bytes"
+                            .to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    async fn build_catalog_transaction_event_intent<
+        T: CatalogEventPayload + serde::Serialize + Sync,
+    >(
+        &self,
+        payload: &T,
+        source: &str,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<CatalogTransactionEventIntent> {
+        let idempotency_key =
+            CatalogEvent::<()>::generate_idempotency_key(T::EVENT_TYPE, T::EVENT_VERSION, payload)
+                .map_err(|error| CatalogError::Serialization {
+                    message: format!("failed to generate idempotency key: {error}"),
+                })?;
+        let envelope = CatalogEvent {
+            event_type: T::EVENT_TYPE.to_string(),
+            event_version: T::EVENT_VERSION,
+            idempotency_key,
+            occurred_at: Utc::now(),
+            source: source.to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload,
+        };
+        envelope
+            .validate()
+            .map_err(|error| CatalogError::InvariantViolation {
+                message: format!("invalid event envelope: {error}"),
+            })?;
+        let event_json =
+            String::from_utf8(serde_json::to_vec_pretty(&envelope).map_err(|error| {
+                CatalogError::Serialization {
+                    message: format!("failed to serialize event: {error}"),
+                }
+            })?)
+            .map_err(|error| CatalogError::Serialization {
+                message: format!("catalog event JSON was not UTF-8: {error}"),
+            })?;
+        let base = self.load_current_catalog_manifest().await?;
+        let base_state =
+            tier1_state::load_catalog_state(&self.storage, &base.value.snapshot_path).await?;
+        let event_value: CatalogEvent<serde_json::Value> = serde_json::from_str(&event_json)
+            .map_err(|error| CatalogError::Serialization {
+                message: format!("failed to decode catalog transaction event: {error}"),
+            })?;
+        let event_semantics = identity.reviewed_request.validate_event_realization(
+            &event_value.event_type,
+            event_value.event_version,
+            &event_value.payload,
+            &base_state,
+            &identity.tenant_id,
+            &identity.workspace_id,
+        )?;
+        let base_manifest_id = base.value.manifest_id.clone();
+        let base_watermark = base
+            .value
+            .watermark_event_id
+            .as_deref()
+            .map(str::parse::<EventId>)
+            .transpose()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog manifest has an invalid watermark event ID".to_string(),
+            })?;
+        let event_id = EventId::generate_after(base_watermark).map_err(CatalogError::from)?;
+        let mut intent = CatalogTransactionEventIntent {
+            record_type: CATALOG_TRANSACTION_INTENT_RECORD_TYPE.to_string(),
+            version: CATALOG_TRANSACTION_INTENT_VERSION,
+            tx_id: identity.tx_id.clone(),
+            request_hash: identity.request_hash.clone(),
+            base_manifest_path: CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &base_manifest_id,
+            ),
+            base_manifest_id,
+            base_manifest_sha256: compute_manifest_hash(&base.bytes),
+            event_binding_sha256: String::new(),
+            source: source.to_string(),
+            revision: 1,
+            event_ids: vec![event_id.to_string()],
+            active_event_id: event_id.to_string(),
+            active_event_path: LedgerKey::event(CatalogDomain::Catalog, &event_id.to_string())
+                .as_ref()
+                .to_string(),
+            event_json,
+        };
+        intent.event_binding_sha256 = Self::catalog_transaction_event_binding(
+            identity,
+            &intent,
+            &event_value,
+            &event_semantics,
+        )?;
+        Ok(intent)
+    }
+
+    /// Appends one ledger event through a durable transaction-owned event intent.
+    ///
+    /// The intent is published before the event, so recovery can address and
+    /// recreate an interrupted append without listing the ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity or event is invalid, or when the
+    /// durable intent and exact event object cannot be published or reconciled.
+    pub(crate) async fn append_ledger_event_for_transaction<
+        T: CatalogEventPayload + serde::Serialize + Sync,
+    >(
+        &self,
+        _guard: &LockGuard<dyn StorageBackend>,
+        domain: CatalogDomain,
+        payload: &T,
+        source: &str,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<EventId> {
+        if domain != CatalogDomain::Catalog {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction event intent used for a non-catalog domain"
+                    .to_string(),
+            });
+        }
+        let intent_path = Self::catalog_transaction_intent_path(identity)?;
+        let candidate = self
+            .build_catalog_transaction_event_intent(payload, source, identity)
+            .await?;
+        let bytes =
+            serde_json::to_vec(&candidate).map_err(|error| CatalogError::Serialization {
+                message: format!("failed to encode catalog transaction event intent: {error}"),
+            })?;
+        let intent = match self
+            .storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(bytes),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => candidate,
+            WriteResult::PreconditionFailed { .. } => {
+                let winner = self
+                    .load_catalog_transaction_intent(identity)
+                    .await?
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: "catalog transaction event intent disappeared".to_string(),
+                    })?
+                    .value;
+                Self::validate_catalog_transaction_intent_collision(&candidate, &winner)?;
+                winner
+            }
+        };
+        self.ensure_catalog_transaction_event(&intent).await?;
+        intent
+            .active_event_id
+            .parse::<EventId>()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog transaction event intent has an invalid active event ID"
+                    .to_string(),
+            })
+    }
+
+    pub(crate) async fn has_catalog_transaction_intent(
+        &self,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<bool> {
+        let path = Self::catalog_transaction_intent_path(identity)?;
+        Ok(self.storage.head_raw(&path).await?.is_some())
+    }
+
+    async fn load_stable_catalog_manifest_pointer(
+        &self,
+    ) -> Result<(DomainManifestPointer, String)> {
+        let path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let metadata_before = self.storage.head_raw(&path).await?.ok_or_else(|| {
+            CatalogError::InvariantViolation {
+                message: "catalog manifest pointer is missing during transaction recovery"
+                    .to_string(),
+            }
+        })?;
+        let bytes = self.storage.get_raw(&path).await?;
+        let metadata_after = self.storage.head_raw(&path).await?.ok_or_else(|| {
+            CatalogError::InvariantViolation {
+                message: "catalog manifest pointer disappeared during transaction recovery"
+                    .to_string(),
+            }
+        })?;
+        if metadata_before.version != metadata_after.version {
+            return Err(CatalogError::PreconditionFailed {
+                message: "catalog manifest pointer changed during transaction recovery".to_string(),
+            });
+        }
+        let pointer: DomainManifestPointer =
+            serde_json::from_slice(bytes.as_ref()).map_err(|_| {
+                CatalogError::InvariantViolation {
+                    message: "catalog manifest pointer is corrupt during transaction recovery"
+                        .to_string(),
+                }
+            })?;
+        if pointer.manifest_path
+            != CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &pointer.manifest_id)
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog manifest pointer names a non-canonical manifest".to_string(),
+            });
+        }
+        Ok((pointer, metadata_after.version))
+    }
+
+    async fn load_stable_catalog_manifest(&self, path: &str) -> Result<StableCatalogManifest> {
+        let metadata_before =
+            self.storage
+                .head_raw(path)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog manifest is missing during transaction recovery".to_string(),
+                })?;
+        let bytes = self.storage.get_raw(path).await?;
+        let metadata_after =
+            self.storage
+                .head_raw(path)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog manifest disappeared during transaction recovery".to_string(),
+                })?;
+        if metadata_before.version != metadata_after.version {
+            return Err(CatalogError::PreconditionFailed {
+                message: "catalog manifest changed during transaction recovery".to_string(),
+            });
+        }
+        let value: CatalogDomainManifest =
+            serde_json::from_slice(bytes.as_ref()).map_err(|_| {
+                CatalogError::InvariantViolation {
+                    message: "catalog manifest is corrupt during transaction recovery".to_string(),
+                }
+            })?;
+        if path
+            != CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &value.manifest_id)
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog manifest chain contains a non-canonical path".to_string(),
+            });
+        }
+        Ok(StableCatalogManifest {
+            value,
+            bytes,
+            version: metadata_after.version,
+        })
+    }
+
+    async fn load_current_catalog_manifest(&self) -> Result<StableCatalogManifest> {
+        Ok(self.load_selected_catalog_manifest().await?.0)
+    }
+
+    async fn load_selected_catalog_manifest(&self) -> Result<(StableCatalogManifest, String)> {
+        let (pointer, pointer_version) = self.load_stable_catalog_manifest_pointer().await?;
+        let stored = self
+            .load_stable_catalog_manifest(&pointer.manifest_path)
+            .await?;
+        if stored.value.manifest_id != pointer.manifest_id || stored.value.epoch != pointer.epoch {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog pointer and immutable base manifest diverge".to_string(),
+            });
+        }
+        Ok((stored, pointer_version))
+    }
+
+    async fn load_selected_catalog_commit_history(
+        &self,
+    ) -> Result<SelectedCatalogCommitHistoryAvailability> {
+        let (current, pointer_version) = self.load_selected_catalog_manifest().await?;
+        let Some(snapshot) = current.value.snapshot.as_ref() else {
+            return if current.value.snapshot_version == 0
+                && current
+                    .value
+                    .snapshot_path
+                    .split('/')
+                    .any(|segment| segment == "v0")
+            {
+                Ok(SelectedCatalogCommitHistoryAvailability::Unpublished)
+            } else {
+                Ok(SelectedCatalogCommitHistoryAvailability::RequiresHistoryScan)
+            };
+        };
+        if snapshot.version != current.value.snapshot_version
+            || snapshot.path != current.value.snapshot_path
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "selected catalog snapshot metadata diverges from its manifest"
+                    .to_string(),
+            });
+        }
+        let mut commit_files = snapshot
+            .files
+            .iter()
+            .filter(|file| file.path == "commits.parquet");
+        let Some(commit_file) = commit_files.next() else {
+            return Ok(SelectedCatalogCommitHistoryAvailability::RequiresHistoryScan);
+        };
+        if commit_files.next().is_some() {
+            return Err(CatalogError::InvariantViolation {
+                message: "selected catalog snapshot contains duplicate commit history".to_string(),
+            });
+        }
+        let commit_path =
+            StateKey::snapshot_file_in_dir(&current.value.snapshot_path, "commits.parquet");
+        let commit_bytes = self.storage.get_raw(commit_path.as_ref()).await?;
+        if u64::try_from(commit_bytes.len()).ok() != Some(commit_file.byte_size)
+            || hex::encode(Sha256::digest(&commit_bytes)) != commit_file.checksum_sha256
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "selected catalog commit history fails its manifest checksum".to_string(),
+            });
+        }
+        let commits = crate::parquet_util::read_commits(&commit_bytes)?;
+        if u64::try_from(commits.len()).ok() != Some(commit_file.row_count) {
+            return Err(CatalogError::InvariantViolation {
+                message: "selected catalog commit history fails its manifest row count".to_string(),
+            });
+        }
+        Ok(SelectedCatalogCommitHistoryAvailability::Available(
+            Box::new(SelectedCatalogCommitHistory {
+                current,
+                pointer_version,
+                commits,
+            }),
+        ))
+    }
+
+    async fn validate_selected_catalog_transaction_commit(
+        &self,
+        intent: &CatalogTransactionEventIntent,
+        history: &SelectedCatalogCommitHistory,
+        commit: &crate::parquet_util::CatalogCommitRecord,
+        witness: &CatalogCommitEventWitness,
+    ) -> Result<SelectedCatalogTransactionPublication> {
+        let Some(manifest_id) = commit.manifest_id.as_deref() else {
+            return Ok(SelectedCatalogTransactionPublication::RequiresHistoryScan);
+        };
+        parse_manifest_id(manifest_id).map_err(|_| CatalogError::InvariantViolation {
+            message: "selected catalog commit names a non-canonical manifest".to_string(),
+        })?;
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, manifest_id);
+        let stored = if manifest_path
+            == CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &history.current.value.manifest_id,
+            ) {
+            StableCatalogManifest {
+                value: history.current.value.clone(),
+                bytes: history.current.bytes.clone(),
+                version: history.current.version.clone(),
+            }
+        } else {
+            self.load_stable_catalog_manifest(&manifest_path).await?
+        };
+        let manifest = &stored.value;
+        let snapshot_version = i64::try_from(manifest.snapshot_version).map_err(|_| {
+            CatalogError::InvariantViolation {
+                message: "catalog publication snapshot version exceeds commit history".to_string(),
+            }
+        })?;
+        let fencing_token = manifest
+            .fencing_token
+            .and_then(|token| i64::try_from(token).ok());
+        let watermark_event_id = commit.watermark_event_id.as_deref().ok_or_else(|| {
+            CatalogError::InvariantViolation {
+                message: "selected catalog transaction commit has no watermark event ID"
+                    .to_string(),
+            }
+        })?;
+        if manifest.manifest_id != manifest_id
+            || snapshot_version != commit.snapshot_version
+            || manifest.updated_at.timestamp_millis() != commit.published_at
+            || fencing_token != Some(commit.fencing_token)
+            || i64::try_from(manifest.epoch).ok() != Some(commit.fencing_token)
+            || manifest.watermark_event_id.as_deref() != Some(watermark_event_id)
+            || manifest.last_commit_id.as_deref() != Some(commit.commit_ulid.as_str())
+            || manifest.commit_ulid.as_deref() != Some(commit.commit_ulid.as_str())
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "selected catalog commit diverges from immutable publication authority"
+                    .to_string(),
+            });
+        }
+        if !intent.event_ids.contains(&witness.event_id)
+            || witness.event_sha256 != sha256_prefixed(intent.event_json.as_bytes())
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "published catalog transaction event differs from its intent".to_string(),
+            });
+        }
+        let is_current_pointer = manifest_id == history.current.value.manifest_id;
+        let authority_version = if is_current_pointer {
+            history.pointer_version.clone()
+        } else {
+            stored.version
+        };
+        Ok(SelectedCatalogTransactionPublication::Published(Box::new(
+            PublishedCatalogTransactionEvent {
+                event_id: witness.event_id.clone(),
+                manifest: stored.value,
+                authority_version,
+                is_current_pointer,
+            },
+        )))
+    }
+
+    async fn find_selected_catalog_transaction_event(
+        &self,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<SelectedCatalogTransactionPublication> {
+        let history = match self.load_selected_catalog_commit_history().await? {
+            SelectedCatalogCommitHistoryAvailability::Available(history) => *history,
+            SelectedCatalogCommitHistoryAvailability::Unpublished => {
+                return Ok(SelectedCatalogTransactionPublication::Unpublished);
+            }
+            SelectedCatalogCommitHistoryAvailability::RequiresHistoryScan => {
+                return Ok(SelectedCatalogTransactionPublication::RequiresHistoryScan);
+            }
+        };
+        let mut witnessed_match = None;
+        let mut legacy_match = false;
+        for (commit_index, commit) in history.commits.iter().enumerate() {
+            if let Some(encoded) = commit.event_witnesses_json.as_deref() {
+                let witnesses = decode_catalog_commit_event_witnesses(encoded)?;
+                if commit.watermark_event_id.as_deref()
+                    != witnesses.last().map(|witness| witness.event_id.as_str())
+                {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "catalog commit event witnesses diverge from the commit watermark"
+                            .to_string(),
+                    });
+                }
+                for witness in witnesses {
+                    if intent.event_ids.contains(&witness.event_id) {
+                        if witnessed_match.is_some() || legacy_match {
+                            return Err(CatalogError::InvariantViolation {
+                                message:
+                                    "catalog transaction intent has multiple selected publications"
+                                        .to_string(),
+                            });
+                        }
+                        witnessed_match = Some((commit_index, witness));
+                    }
+                }
+            } else if commit
+                .watermark_event_id
+                .as_ref()
+                .is_some_and(|event_id| intent.event_ids.contains(event_id))
+            {
+                if witnessed_match.is_some() || legacy_match {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "catalog transaction intent has multiple selected publications"
+                            .to_string(),
+                    });
+                }
+                legacy_match = true;
+            }
+        }
+        if let Some((commit_index, witness)) = witnessed_match {
+            let commit = history.commits.get(commit_index).ok_or_else(|| {
+                CatalogError::InvariantViolation {
+                    message: "selected catalog commit witness has no commit row".to_string(),
+                }
+            })?;
+            return self
+                .validate_selected_catalog_transaction_commit(intent, &history, commit, &witness)
+                .await;
+        }
+        if legacy_match {
+            Ok(SelectedCatalogTransactionPublication::RequiresHistoryScan)
+        } else {
+            Ok(SelectedCatalogTransactionPublication::Unpublished)
+        }
+    }
+
+    async fn find_published_catalog_transaction_event_in_history(
+        &self,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<Option<PublishedCatalogTransactionEvent>> {
+        let (pointer, pointer_version) = self.load_stable_catalog_manifest_pointer().await?;
+        let mut path = pointer.manifest_path.clone();
+        let mut visited = HashSet::new();
+        let mut successor: Option<CatalogDomainManifest> = None;
+        loop {
+            if !visited.insert(path.clone()) {
+                return Err(CatalogError::InvariantViolation {
+                    message: "catalog manifest chain cycles during transaction recovery"
+                        .to_string(),
+                });
+            }
+            let stored = self.load_stable_catalog_manifest(&path).await?;
+            let manifest = stored.value;
+            if let Some(successor) = &successor {
+                successor
+                    .validate_succession(&manifest, &compute_manifest_hash(&stored.bytes))
+                    .map_err(|message| CatalogError::InvariantViolation {
+                        message: format!(
+                            "catalog manifest chain is invalid during transaction recovery: {message}"
+                        ),
+                    })?;
+            } else if manifest.manifest_id != pointer.manifest_id || manifest.epoch != pointer.epoch
+            {
+                return Err(CatalogError::InvariantViolation {
+                    message:
+                        "catalog pointer and immutable manifest diverge during transaction recovery"
+                            .to_string(),
+                });
+            }
+            if let Some(event_id) = manifest
+                .watermark_event_id
+                .as_ref()
+                .filter(|event_id| intent.event_ids.contains(event_id))
+            {
+                let event_path = LedgerKey::event(CatalogDomain::Catalog, event_id)
+                    .as_ref()
+                    .to_string();
+                let event_bytes = self.storage.get_raw(&event_path).await?;
+                if event_bytes.as_ref() != intent.event_json.as_bytes() {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "published catalog transaction event differs from its intent"
+                            .to_string(),
+                    });
+                }
+                let is_current_pointer = path == pointer.manifest_path;
+                let authority_version = if is_current_pointer {
+                    pointer_version.clone()
+                } else {
+                    stored.version
+                };
+                return Ok(Some(PublishedCatalogTransactionEvent {
+                    event_id: event_id.clone(),
+                    manifest,
+                    authority_version,
+                    is_current_pointer,
+                }));
+            }
+            if path == intent.base_manifest_path {
+                return Ok(None);
+            }
+            let Some(previous) = manifest.previous_manifest_path.clone() else {
+                return Err(CatalogError::InvariantViolation {
+                    message: "catalog manifest chain does not reach the transaction intent base"
+                        .to_string(),
+                });
+            };
+            successor = Some(manifest);
+            path = previous;
+        }
+    }
+
+    async fn find_published_catalog_transaction_event(
+        &self,
+        intent: &CatalogTransactionEventIntent,
+    ) -> Result<Option<PublishedCatalogTransactionEvent>> {
+        match self.find_selected_catalog_transaction_event(intent).await? {
+            SelectedCatalogTransactionPublication::Published(published) => Ok(Some(*published)),
+            SelectedCatalogTransactionPublication::Unpublished => Ok(None),
+            SelectedCatalogTransactionPublication::RequiresHistoryScan => {
+                self.find_published_catalog_transaction_event_in_history(intent)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) async fn inspect_catalog_transaction_event(
+        &self,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<CatalogTransactionEventInspection> {
+        let intent_path = Self::catalog_transaction_intent_path(identity)?;
+        for _ in 0..8 {
+            let (pointer_before, pointer_version_before) =
+                self.load_stable_catalog_manifest_pointer().await?;
+            let intent = self
+                .load_catalog_transaction_intent(identity)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog transaction event intent is missing".to_string(),
+                })?;
+            if let Some(published) = self
+                .find_published_catalog_transaction_event(&intent.value)
+                .await?
+            {
+                return Ok(CatalogTransactionEventInspection::Published(Box::new(
+                    published,
+                )));
+            }
+            let (pointer_after, pointer_version_after) =
+                self.load_stable_catalog_manifest_pointer().await?;
+            let intent_version_after = self
+                .storage
+                .head_raw(&intent_path)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog transaction event intent disappeared".to_string(),
+                })?
+                .version;
+            if pointer_before.manifest_id == pointer_after.manifest_id
+                && pointer_version_before == pointer_version_after
+                && intent.version == intent_version_after
+            {
+                return Ok(CatalogTransactionEventInspection::Unpublished(
+                    CatalogTransactionRecoveryInspection {
+                        intent_version: intent.version,
+                        head_manifest_id: pointer_after.manifest_id,
+                        pointer_version: pointer_version_after,
+                    },
+                ));
+            }
+        }
+        Err(CatalogError::PreconditionFailed {
+            message: "catalog transaction publication inspection did not stabilize".to_string(),
+        })
+    }
+
+    pub(crate) async fn validate_catalog_transaction_publication(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        publication: &CatalogTransactionPublication<'_>,
+    ) -> Result<chrono::DateTime<Utc>> {
+        let intent = self
+            .load_catalog_transaction_intent(identity)
+            .await?
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "catalog transaction event intent is missing".to_string(),
+            })?;
+        if !intent
+            .value
+            .event_ids
+            .iter()
+            .any(|candidate| candidate == publication.event_id)
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction receipt names an event outside its intent"
+                    .to_string(),
+            });
+        }
+        let published = self
+            .find_published_catalog_transaction_event(&intent.value)
+            .await?
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "catalog transaction event has no immutable manifest authority"
+                    .to_string(),
+            })?;
+        let manifest = &published.manifest;
+        if published.event_id != publication.event_id
+            || manifest.manifest_id != publication.manifest_id
+            || manifest.snapshot_version != publication.snapshot_version
+            || manifest.last_commit_id.as_deref() != Some(publication.commit_id)
+            || manifest.commit_ulid.as_deref() != Some(publication.commit_id)
+            || manifest.fencing_token != Some(publication.fencing_token)
+            || manifest.epoch != publication.fencing_token
+            || published.is_current_pointer
+                && published.authority_version != publication.authority_version
+        {
+            return Err(CatalogError::InvariantViolation {
+                message:
+                    "catalog transaction receipt diverges from immutable publication authority"
+                        .to_string(),
+            });
+        }
+        Ok(manifest.updated_at)
+    }
+
+    async fn rebind_catalog_transaction_intent_base(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        current: &StableCatalogManifest,
+        current_manifest_sha256: &str,
+        intent: &mut CatalogTransactionEventIntent,
+    ) -> Result<()> {
+        let event = Self::validate_catalog_transaction_intent_envelope(identity, None, intent)?;
+        let current_state =
+            tier1_state::load_catalog_state(&self.storage, &current.value.snapshot_path).await?;
+        let event_semantics = identity.reviewed_request.validate_event_realization(
+            &event.event_type,
+            event.event_version,
+            &event.payload,
+            &current_state,
+            &identity.tenant_id,
+            &identity.workspace_id,
+        )?;
+        intent
+            .base_manifest_id
+            .clone_from(&current.value.manifest_id);
+        intent.base_manifest_path = CatalogPaths::domain_manifest_snapshot(
+            CatalogDomain::Catalog,
+            &current.value.manifest_id,
+        );
+        intent.base_manifest_sha256 = current_manifest_sha256.to_string();
+        intent.event_binding_sha256 =
+            Self::catalog_transaction_event_binding(identity, intent, &event, &event_semantics)?;
+        Ok(())
+    }
+
+    fn advance_catalog_transaction_intent_event(
+        intent: &mut CatalogTransactionEventIntent,
+        watermark: EventId,
+    ) -> Result<()> {
+        let next = EventId::generate_after(Some(watermark)).map_err(CatalogError::from)?;
+        intent.revision =
+            intent
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog transaction event intent revision overflowed".to_string(),
+                })?;
+        intent.event_ids.push(next.to_string());
+        intent.active_event_id = next.to_string();
+        intent.active_event_path = LedgerKey::event(CatalogDomain::Catalog, &next.to_string())
+            .as_ref()
+            .to_string();
+        Ok(())
+    }
+
+    async fn reconcile_catalog_transaction_intent_for_current_base(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        stored: VersionedCatalogTransactionIntent,
+        current: &StableCatalogManifest,
+    ) -> Result<Option<CatalogTransactionEventIntent>> {
+        let active = stored
+            .value
+            .active_event_id
+            .parse::<EventId>()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog transaction event intent has invalid active event ID".to_string(),
+            })?;
+        let watermark = current
+            .value
+            .watermark_event_id
+            .as_deref()
+            .map(str::parse::<EventId>)
+            .transpose()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "catalog manifest has an invalid watermark event ID".to_string(),
+            })?;
+        let current_manifest_sha256 = compute_manifest_hash(&current.bytes);
+        let base_changed = stored.value.base_manifest_id != current.value.manifest_id
+            || stored.value.base_manifest_path
+                != CatalogPaths::domain_manifest_snapshot(
+                    CatalogDomain::Catalog,
+                    &current.value.manifest_id,
+                )
+            || stored.value.base_manifest_sha256 != current_manifest_sha256;
+        let event_id_is_stale = watermark.is_some_and(|watermark| active <= watermark);
+        if !base_changed && !event_id_is_stale {
+            return Ok(Some(stored.value));
+        }
+
+        let mut next_intent = stored.value;
+        if base_changed {
+            self.rebind_catalog_transaction_intent_base(
+                identity,
+                current,
+                &current_manifest_sha256,
+                &mut next_intent,
+            )
+            .await?;
+        }
+        if event_id_is_stale {
+            Self::advance_catalog_transaction_intent_event(
+                &mut next_intent,
+                watermark.ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "stale catalog transaction event has no manifest watermark"
+                        .to_string(),
+                })?,
+            )?;
+        }
+        let bytes =
+            serde_json::to_vec(&next_intent).map_err(|error| CatalogError::Serialization {
+                message: format!(
+                    "failed to encode revised catalog transaction event intent: {error}"
+                ),
+            })?;
+        let path = Self::catalog_transaction_intent_path(identity)?;
+        match self
+            .storage
+            .put_raw(
+                &path,
+                Bytes::from(bytes),
+                WritePrecondition::MatchesVersion(stored.version),
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(Some(next_intent)),
+            WriteResult::PreconditionFailed { .. } => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn recover_catalog_transaction_event(
+        &self,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<CatalogTransactionEventRecovery> {
+        self.recover_catalog_transaction_event_inner(identity, None)
+            .await
+    }
+
+    pub(crate) async fn recover_catalog_transaction_event_after_inspection(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        inspection: &CatalogTransactionRecoveryInspection,
+    ) -> Result<CatalogTransactionEventRecovery> {
+        self.recover_catalog_transaction_event_inner(identity, Some(inspection))
+            .await
+    }
+
+    async fn recover_catalog_transaction_event_inner(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        inspection: Option<&CatalogTransactionRecoveryInspection>,
+    ) -> Result<CatalogTransactionEventRecovery> {
+        for _ in 0..8 {
+            let stored = self
+                .load_catalog_transaction_intent(identity)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "catalog transaction event intent is missing".to_string(),
+                })?;
+            match self
+                .find_selected_catalog_transaction_event(&stored.value)
+                .await?
+            {
+                SelectedCatalogTransactionPublication::Published(published) => {
+                    return Ok(CatalogTransactionEventRecovery::Published(published));
+                }
+                SelectedCatalogTransactionPublication::Unpublished => {}
+                SelectedCatalogTransactionPublication::RequiresHistoryScan => {
+                    let Some(inspection) = inspection else {
+                        return Ok(CatalogTransactionEventRecovery::RetryUnlocked);
+                    };
+                    let (pointer, pointer_version) =
+                        self.load_stable_catalog_manifest_pointer().await?;
+                    if stored.version != inspection.intent_version
+                        || pointer.manifest_id != inspection.head_manifest_id
+                        || pointer_version != inspection.pointer_version
+                    {
+                        return Ok(CatalogTransactionEventRecovery::RetryUnlocked);
+                    }
+                }
+            }
+            let current = self.load_current_catalog_manifest().await?;
+            let Some(intent) = self
+                .reconcile_catalog_transaction_intent_for_current_base(identity, stored, &current)
+                .await?
+            else {
+                continue;
+            };
+            self.ensure_catalog_transaction_event(&intent).await?;
+            return Ok(CatalogTransactionEventRecovery::Ready(
+                intent.active_event_id.parse::<EventId>().map_err(|_| {
+                    CatalogError::InvariantViolation {
+                        message: "catalog transaction recovery event ID is invalid".to_string(),
+                    }
+                })?,
+            ));
+        }
+        Err(CatalogError::PreconditionFailed {
+            message: "catalog transaction event intent did not converge".to_string(),
+        })
     }
 
     /// Appends a ledger event for a Tier-1 DDL operation (ADR-018).
@@ -901,13 +2115,22 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+// Advisory lint scope for test code (#331): the allowed pedantic/nursery
+// lints conflict with test ergonomics here; production code keeps them active.
+#[allow(clippy::too_many_lines)]
 #[allow(deprecated)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use crate::tier1_compactor::Tier1Compactor;
+    use crate::write_options::WriteOptions;
+    use crate::writer::{
+        CatalogTransactionRequest, CatalogWriter, RegisterTableInSchemaRequest, TablePatch,
+    };
     use arco_core::Result as CoreResult;
     use arco_core::storage::{MemoryBackend, ObjectMeta};
     use serde::de::DeserializeOwned;
@@ -991,6 +2214,1175 @@ mod tests {
         async fn signed_url(&self, path: &str, expiry: Duration) -> CoreResult<String> {
             self.inner.signed_url(path, expiry).await
         }
+    }
+
+    #[derive(Debug)]
+    struct ObservingBackend {
+        inner: MemoryBackend,
+        unrelated_manifest_gets: AtomicUsize,
+        catalog_snapshot_gets: AtomicUsize,
+        catalog_lock_active: AtomicBool,
+        watched_manifest_suffix: Mutex<Option<String>>,
+        watched_manifest_read_while_locked: AtomicBool,
+    }
+
+    impl ObservingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                unrelated_manifest_gets: AtomicUsize::new(0),
+                catalog_snapshot_gets: AtomicUsize::new(0),
+                catalog_lock_active: AtomicBool::new(false),
+                watched_manifest_suffix: Mutex::new(None),
+                watched_manifest_read_while_locked: AtomicBool::new(false),
+            }
+        }
+
+        fn reset_io_counts(&self) {
+            self.unrelated_manifest_gets.store(0, Ordering::SeqCst);
+            self.catalog_snapshot_gets.store(0, Ordering::SeqCst);
+        }
+
+        fn unrelated_manifest_gets(&self) -> usize {
+            self.unrelated_manifest_gets.load(Ordering::SeqCst)
+        }
+
+        fn catalog_snapshot_gets(&self) -> usize {
+            self.catalog_snapshot_gets.load(Ordering::SeqCst)
+        }
+
+        fn watch_manifest_while_locked(&self, path: String) {
+            *self
+                .watched_manifest_suffix
+                .lock()
+                .expect("watch mutex poisoned") = Some(path);
+            self.watched_manifest_read_while_locked
+                .store(false, Ordering::SeqCst);
+        }
+
+        fn watched_manifest_was_read_while_locked(&self) -> bool {
+            self.watched_manifest_read_while_locked
+                .load(Ordering::SeqCst)
+        }
+
+        fn is_unrelated_manifest_path(path: &str) -> bool {
+            path.contains("/manifests/lineage")
+                || path.contains("/manifests/search")
+                || path.ends_with("/manifests/executions.manifest.json")
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for ObservingBackend {
+        async fn get(&self, path: &str) -> CoreResult<Bytes> {
+            if Self::is_unrelated_manifest_path(path) {
+                self.unrelated_manifest_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            if path.contains("snapshots/catalog/") && path.ends_with(".parquet") {
+                self.catalog_snapshot_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.catalog_lock_active.load(Ordering::SeqCst)
+                && self
+                    .watched_manifest_suffix
+                    .lock()
+                    .expect("watch mutex poisoned")
+                    .as_deref()
+                    .is_some_and(|watched| path.ends_with(watched))
+            {
+                self.watched_manifest_read_while_locked
+                    .store(true, Ordering::SeqCst);
+            }
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> CoreResult<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> CoreResult<WriteResult> {
+            if path.ends_with(&CatalogPaths::domain_lock(CatalogDomain::Catalog))
+                && let Ok(lock) = serde_json::from_slice::<crate::lock::LockInfo>(&data)
+            {
+                self.catalog_lock_active
+                    .store(!lock.is_expired(), Ordering::SeqCst);
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> CoreResult<()> {
+            if path.ends_with(&CatalogPaths::domain_lock(CatalogDomain::Catalog)) {
+                self.catalog_lock_active.store(false, Ordering::SeqCst);
+            }
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> CoreResult<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> CoreResult<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> CoreResult<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    async fn append_catalog_manifest_only_successors(
+        storage: &ScopedStorage,
+        count: usize,
+    ) -> Result<Vec<String>> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_bytes = storage.get_raw(&pointer_path).await?;
+        let pointer: DomainManifestPointer = parse_json(&pointer_bytes)?;
+        let mut previous_path = pointer.manifest_path;
+        let mut previous_bytes = storage.get_raw(&previous_path).await?;
+        let mut previous: CatalogDomainManifest = parse_json(&previous_bytes)?;
+        let mut watermark = previous
+            .watermark_event_id
+            .as_deref()
+            .map(str::parse::<EventId>)
+            .transpose()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "test catalog manifest has an invalid watermark".to_string(),
+            })?;
+        let mut paths = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let manifest_id = next_manifest_id(&previous.manifest_id)
+                .map_err(|message| CatalogError::InvariantViolation { message })?;
+            let event_id = EventId::generate_after(watermark).map_err(CatalogError::from)?;
+            let path = CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &manifest_id);
+            let mut successor = previous.clone();
+            successor.manifest_id = manifest_id;
+            successor.previous_manifest_path = Some(previous_path.clone());
+            successor.parent_hash = Some(compute_manifest_hash(&previous_bytes));
+            successor.watermark_event_id = Some(event_id.to_string());
+            successor.last_commit_id = None;
+            successor.commit_ulid = None;
+            successor.updated_at = Utc::now();
+            let bytes = Bytes::from(serde_json::to_vec(&successor).map_err(|error| {
+                CatalogError::Serialization {
+                    message: format!("encode test catalog manifest: {error}"),
+                }
+            })?);
+            let write = storage
+                .put_raw(&path, bytes.clone(), WritePrecondition::DoesNotExist)
+                .await?;
+            if !matches!(write, WriteResult::Success { .. }) {
+                return Err(CatalogError::InvariantViolation {
+                    message: "test catalog manifest path unexpectedly existed".to_string(),
+                });
+            }
+            paths.push(path.clone());
+            watermark = Some(event_id);
+            previous_path = path;
+            previous_bytes = bytes;
+            previous = successor;
+        }
+
+        let pointer = DomainManifestPointer {
+            manifest_id: previous.manifest_id,
+            manifest_path: previous_path,
+            epoch: previous.epoch,
+            parent_pointer_hash: Some(compute_manifest_hash(&pointer_bytes)),
+            updated_at: Utc::now(),
+        };
+        storage
+            .put_raw(
+                &pointer_path,
+                Bytes::from(serde_json::to_vec(&pointer).map_err(|error| {
+                    CatalogError::Serialization {
+                        message: format!("encode test catalog pointer: {error}"),
+                    }
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+        Ok(paths)
+    }
+
+    async fn rewrite_catalog_commit_for_test(
+        storage: &ScopedStorage,
+        event_id: &str,
+        rewrite: impl FnOnce(&mut crate::parquet_util::CatalogCommitRecord) -> Result<()>,
+    ) -> Result<()> {
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer: DomainManifestPointer = parse_json(&storage.get_raw(&pointer_path).await?)?;
+        let manifest_path = pointer.manifest_path;
+        let mut manifest: CatalogDomainManifest =
+            parse_json(&storage.get_raw(&manifest_path).await?)?;
+        let commit_path =
+            StateKey::snapshot_file_in_dir(&manifest.snapshot_path, "commits.parquet");
+        let mut commits =
+            crate::parquet_util::read_commits(&storage.get_raw(commit_path.as_ref()).await?)?;
+        let commit = commits
+            .iter_mut()
+            .find(|commit| {
+                commit.watermark_event_id.as_deref() == Some(event_id)
+                    || commit
+                        .event_witnesses_json
+                        .as_deref()
+                        .and_then(|encoded| decode_catalog_commit_event_witnesses(encoded).ok())
+                        .is_some_and(|witnesses| {
+                            witnesses.iter().any(|witness| witness.event_id == event_id)
+                        })
+            })
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "test catalog transaction commit is missing".to_string(),
+            })?;
+        rewrite(commit)?;
+        let commit_bytes = crate::parquet_util::write_commits(&commits)?;
+        storage
+            .put_raw(
+                commit_path.as_ref(),
+                commit_bytes.clone(),
+                WritePrecondition::None,
+            )
+            .await?;
+        let snapshot =
+            manifest
+                .snapshot
+                .as_mut()
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "test catalog manifest has no snapshot metadata".to_string(),
+                })?;
+        let commit_file = snapshot
+            .files
+            .iter_mut()
+            .find(|file| file.path == "commits.parquet")
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "test catalog snapshot has no commit file".to_string(),
+            })?;
+        commit_file.checksum_sha256 = hex::encode(Sha256::digest(&commit_bytes));
+        commit_file.byte_size =
+            u64::try_from(commit_bytes.len()).map_err(|_| CatalogError::InvariantViolation {
+                message: "test catalog commit file is too large".to_string(),
+            })?;
+        storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).map_err(|error| {
+                    CatalogError::Serialization {
+                        message: format!("encode test catalog manifest: {error}"),
+                    }
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn strip_catalog_commit_manifest_witness(
+        storage: &ScopedStorage,
+        event_id: &str,
+    ) -> Result<()> {
+        rewrite_catalog_commit_for_test(storage, event_id, |commit| {
+            commit.manifest_id = None;
+            Ok(())
+        })
+        .await
+    }
+
+    fn catalog_transaction_options(identity: &CatalogTransactionIdentity) -> WriteOptions {
+        WriteOptions::default()
+            .with_request_id(identity.request_id.clone())
+            .with_idempotency_key(identity.idempotency_key.clone())
+            .with_transaction_identity(identity.clone())
+    }
+
+    async fn catalog_transaction_intent_fixture(
+        writer: &Tier1Writer,
+    ) -> Result<(CatalogTransactionIdentity, CatalogTransactionEventIntent)> {
+        let reviewed_request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed_operation_a".to_string(),
+            description: Some("reviewed".to_string()),
+        };
+        let identity = catalog_transaction_identity(reviewed_request)?;
+        let event_id = EventId::generate_after(None).expect("event ID");
+        let now = Utc::now().timestamp_millis();
+        let payload =
+            serde_json::to_value(crate::tier1_events::CatalogDdlEventV2::CatalogCreated {
+                catalog: crate::parquet_util::CatalogRecord {
+                    id: uuid::Uuid::now_v7().to_string(),
+                    name: "reviewed_operation_a".to_string(),
+                    description: Some("reviewed".to_string()),
+                    created_at: now,
+                    updated_at: now,
+                    properties_json: None,
+                    storage_root: None,
+                },
+            })
+            .expect("catalog event payload");
+        let idempotency_key =
+            CatalogEvent::<()>::generate_idempotency_key("catalog.ddl", 2, &payload)
+                .expect("idempotency key");
+        let envelope = CatalogEvent {
+            event_type: "catalog.ddl".to_string(),
+            event_version: 2,
+            idempotency_key,
+            occurred_at: Utc::now(),
+            source: "api:test".to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload,
+        };
+        let base = writer.load_current_catalog_manifest().await?;
+        let base_state =
+            tier1_state::load_catalog_state(&writer.storage, &base.value.snapshot_path).await?;
+        let event_semantics = identity.reviewed_request.validate_event_realization(
+            &envelope.event_type,
+            envelope.event_version,
+            &envelope.payload,
+            &base_state,
+            &identity.tenant_id,
+            &identity.workspace_id,
+        )?;
+        let mut intent = CatalogTransactionEventIntent {
+            record_type: CATALOG_TRANSACTION_INTENT_RECORD_TYPE.to_string(),
+            version: CATALOG_TRANSACTION_INTENT_VERSION,
+            tx_id: identity.tx_id.clone(),
+            request_hash: identity.request_hash.clone(),
+            base_manifest_id: base.value.manifest_id.clone(),
+            base_manifest_path: CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &base.value.manifest_id,
+            ),
+            base_manifest_sha256: compute_manifest_hash(&base.bytes),
+            event_binding_sha256: String::new(),
+            source: envelope.source.clone(),
+            revision: 1,
+            event_ids: vec![event_id.to_string()],
+            active_event_id: event_id.to_string(),
+            active_event_path: LedgerKey::event(CatalogDomain::Catalog, &event_id.to_string())
+                .as_ref()
+                .to_string(),
+            event_json: serde_json::to_string_pretty(&envelope).expect("event JSON"),
+        };
+        intent.event_binding_sha256 = Tier1Writer::catalog_transaction_event_binding(
+            &identity,
+            &intent,
+            &envelope,
+            &event_semantics,
+        )?;
+        Ok((identity, intent))
+    }
+
+    fn catalog_transaction_identity(
+        reviewed_request: CatalogTransactionRequest,
+    ) -> Result<CatalogTransactionIdentity> {
+        Ok(CatalogTransactionIdentity {
+            tx_id: Ulid::new().to_string(),
+            request_hash: reviewed_request.request_hash()?,
+            tenant_id: "acme".to_string(),
+            workspace_id: "production".to_string(),
+            request_id: "handle:hdl_00000000000000000000000000:mutation:00000000000000000001"
+                .to_string(),
+            idempotency_key: "handle:hdl_00000000000000000000000000:mutation:00000000000000000001"
+                .to_string(),
+            handle_id: "hdl_00000000000000000000000000".to_string(),
+            ordinal: 1,
+            staged_sha256: format!("sha256:{}", "b".repeat(64)),
+            reviewed_request,
+            mutation_authorized: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_visible_validation_survives_more_than_10000_later_manifests()
+    -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        catalog_writer.initialize().await?;
+        let request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed_operation_a".to_string(),
+            description: Some("reviewed".to_string()),
+        };
+        let identity = catalog_transaction_identity(request)?;
+        let commit = catalog_writer
+            .create_catalog_transaction(
+                "reviewed_operation_a",
+                Some("reviewed"),
+                catalog_transaction_options(&identity),
+            )
+            .await?;
+        let later_manifests = append_catalog_manifest_only_successors(&storage, 10_001).await?;
+        assert_eq!(later_manifests.len(), 10_001);
+
+        Tier1Writer::new(storage)
+            .validate_catalog_transaction_publication(
+                &identity,
+                &CatalogTransactionPublication {
+                    event_id: &commit.event_id,
+                    commit_id: &commit.commit_id,
+                    manifest_id: &commit.manifest_id,
+                    snapshot_version: commit.snapshot_version,
+                    authority_version: &commit.pointer_version,
+                    fencing_token: commit.fencing_token,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_visible_validation_survives_ledger_event_removal() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        catalog_writer.initialize().await?;
+        let request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed_operation_a".to_string(),
+            description: Some("reviewed".to_string()),
+        };
+        let identity = catalog_transaction_identity(request)?;
+        let commit = catalog_writer
+            .create_catalog_transaction(
+                "reviewed_operation_a",
+                Some("reviewed"),
+                catalog_transaction_options(&identity),
+            )
+            .await?;
+        let event_path = LedgerKey::event(CatalogDomain::Catalog, &commit.event_id);
+        storage.delete(event_path.as_ref()).await?;
+
+        Tier1Writer::new(storage)
+            .validate_catalog_transaction_publication(
+                &identity,
+                &CatalogTransactionPublication {
+                    event_id: &commit.event_id,
+                    commit_id: &commit.commit_id,
+                    manifest_id: &commit.manifest_id,
+                    snapshot_version: commit.snapshot_version,
+                    authority_version: &commit.pointer_version,
+                    fencing_token: commit.fencing_token,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_visible_validation_rejects_a_divergent_event_witness() -> Result<()>
+    {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        catalog_writer.initialize().await?;
+        let request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed_operation_a".to_string(),
+            description: Some("reviewed".to_string()),
+        };
+        let identity = catalog_transaction_identity(request)?;
+        let commit = catalog_writer
+            .create_catalog_transaction(
+                "reviewed_operation_a",
+                Some("reviewed"),
+                catalog_transaction_options(&identity),
+            )
+            .await?;
+        rewrite_catalog_commit_for_test(&storage, &commit.event_id, |row| {
+            let mut witnesses = decode_catalog_commit_event_witnesses(
+                row.event_witnesses_json.as_deref().ok_or_else(|| {
+                    CatalogError::InvariantViolation {
+                        message: "test catalog commit has no event witnesses".to_string(),
+                    }
+                })?,
+            )?;
+            let witness = witnesses
+                .iter_mut()
+                .find(|witness| witness.event_id == commit.event_id)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "test catalog commit has no matching event witness".to_string(),
+                })?;
+            witness.event_sha256 = format!("sha256:{}", "c".repeat(64));
+            row.event_witnesses_json = Some(
+                crate::parquet_util::encode_catalog_commit_event_witnesses(witnesses)?,
+            );
+            Ok(())
+        })
+        .await?;
+
+        Tier1Writer::new(storage)
+            .validate_catalog_transaction_publication(
+                &identity,
+                &CatalogTransactionPublication {
+                    event_id: &commit.event_id,
+                    commit_id: &commit.commit_id,
+                    manifest_id: &commit.manifest_id,
+                    snapshot_version: commit.snapshot_version,
+                    authority_version: &commit.pointer_version,
+                    fencing_token: commit.fencing_token,
+                },
+            )
+            .await
+            .expect_err("a divergent event digest must not prove transaction visibility");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_finds_a_nonmax_event_in_a_selected_batch() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let tier1 = Tier1Writer::new(storage.clone());
+        tier1.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&tier1).await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(serde_json::to_vec(&intent).expect("intent JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        tier1.ensure_catalog_transaction_event(&intent).await?;
+
+        let intent_event_id = intent
+            .active_event_id
+            .parse::<EventId>()
+            .expect("intent event ID");
+        let later_event_id =
+            EventId::generate_after(Some(intent_event_id)).expect("later event ID");
+        let now = Utc::now().timestamp_millis();
+        let later_payload = crate::tier1_events::CatalogDdlEventV2::CatalogCreated {
+            catalog: crate::parquet_util::CatalogRecord {
+                id: uuid::Uuid::now_v7().to_string(),
+                name: "background_batch_successor".to_string(),
+                description: Some("later".to_string()),
+                created_at: now,
+                updated_at: now,
+                properties_json: None,
+                storage_root: None,
+            },
+        };
+        let later_event = CatalogEvent {
+            event_type: crate::tier1_events::CatalogDdlEventV2::EVENT_TYPE.to_string(),
+            event_version: crate::tier1_events::CatalogDdlEventV2::EVENT_VERSION,
+            idempotency_key: CatalogEvent::<()>::generate_idempotency_key(
+                crate::tier1_events::CatalogDdlEventV2::EVENT_TYPE,
+                crate::tier1_events::CatalogDdlEventV2::EVENT_VERSION,
+                &later_payload,
+            )
+            .expect("later idempotency key"),
+            occurred_at: Utc::now(),
+            source: "compactor:test".to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload: later_payload,
+        };
+        let later_event_path =
+            LedgerKey::event(CatalogDomain::Catalog, &later_event_id.to_string());
+        storage
+            .put_raw(
+                later_event_path.as_ref(),
+                Bytes::from(serde_json::to_vec_pretty(&later_event).expect("later event JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let guard = tier1.acquire_lock(Duration::from_secs(30), 1).await?;
+        let compacted = Tier1Compactor::new(storage.clone())
+            .sync_compact(
+                CatalogDomain::Catalog.as_str(),
+                vec![
+                    intent.active_event_path.clone(),
+                    later_event_path.as_ref().to_string(),
+                ],
+                guard.fencing_token().sequence(),
+            )
+            .await
+            .expect("background-style multi-event compaction");
+        guard.release().await?;
+
+        let recovered = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage)))
+            .recover_catalog_transaction(&identity, Some(identity.request_id.clone()))
+            .await?
+            .expect("selected batch should recover the frozen transaction");
+
+        assert_eq!(recovered.event_id, intent.active_event_id);
+        assert_eq!(recovered.manifest_id, compacted.manifest_id);
+        assert_eq!(recovered.snapshot_version, compacted.snapshot_version);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_catalog_transaction_publication_walk_has_no_history_ceiling() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        catalog_writer.initialize().await?;
+        let request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed_operation_a".to_string(),
+            description: Some("reviewed".to_string()),
+        };
+        let identity = catalog_transaction_identity(request)?;
+        let commit = catalog_writer
+            .create_catalog_transaction(
+                "reviewed_operation_a",
+                Some("reviewed"),
+                catalog_transaction_options(&identity),
+            )
+            .await?;
+        strip_catalog_commit_manifest_witness(&storage, &commit.event_id).await?;
+        let later_manifests = append_catalog_manifest_only_successors(&storage, 10_001).await?;
+        assert_eq!(later_manifests.len(), 10_001);
+
+        Tier1Writer::new(storage)
+            .validate_catalog_transaction_publication(
+                &identity,
+                &CatalogTransactionPublication {
+                    event_id: &commit.event_id,
+                    commit_id: &commit.commit_id,
+                    manifest_id: &commit.manifest_id,
+                    snapshot_version: commit.snapshot_version,
+                    authority_version: &commit.pointer_version,
+                    fencing_token: commit.fencing_token,
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_never_scans_manifest_history_while_locked() -> Result<()>
+    {
+        let backend = Arc::new(ObservingBackend::new());
+        let storage = ScopedStorage::new(backend.clone(), "acme", "production")?;
+        let tier1 = Tier1Writer::new(storage.clone());
+        tier1.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&tier1).await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(serde_json::to_vec(&intent).expect("intent JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let later_manifests = append_catalog_manifest_only_successors(&storage, 3).await?;
+        backend.watch_manifest_while_locked(later_manifests[0].clone());
+
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage)));
+        let recovered = catalog_writer
+            .recover_catalog_transaction(&identity, Some(identity.request_id.clone()))
+            .await?;
+        assert!(recovered.is_some(), "orphan intent should recover");
+        assert!(
+            !backend.watched_manifest_was_read_while_locked(),
+            "deep manifest history must be inspected before acquiring the catalog lock"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_intent_uses_only_the_stable_catalog_base_watermark() -> Result<()>
+    {
+        let backend = Arc::new(ObservingBackend::new());
+        let storage = ScopedStorage::new(backend.clone(), "acme", "production")?;
+        let tier1 = Tier1Writer::new(storage);
+        tier1.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&tier1).await?;
+        let envelope: CatalogEvent<serde_json::Value> =
+            serde_json::from_str(&intent.event_json).expect("catalog event envelope");
+        let payload: crate::tier1_events::CatalogDdlEventV2 =
+            serde_json::from_value(envelope.payload).expect("catalog event payload");
+        backend.reset_io_counts();
+
+        tier1
+            .build_catalog_transaction_event_intent(&payload, "api:test", &identity)
+            .await?;
+
+        assert_eq!(
+            backend.unrelated_manifest_gets(),
+            0,
+            "a frozen catalog intent must not load unrelated domain manifests"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_collision_loads_each_catalog_state_once() -> Result<()> {
+        let backend = Arc::new(ObservingBackend::new());
+        let storage = ScopedStorage::new(backend.clone(), "acme", "production")?;
+        let catalog_writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        catalog_writer.initialize().await?;
+        catalog_writer
+            .create_catalog_transaction("seed", Some("seed"), WriteOptions::default())
+            .await?;
+        let tier1 = Tier1Writer::new(storage.clone());
+        let (identity, intent) = catalog_transaction_intent_fixture(&tier1).await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(serde_json::to_vec(&intent).expect("intent JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let envelope: CatalogEvent<serde_json::Value> =
+            serde_json::from_str(&intent.event_json).expect("catalog event envelope");
+        let payload: crate::tier1_events::CatalogDdlEventV2 =
+            serde_json::from_value(envelope.payload).expect("catalog event payload");
+        backend.reset_io_counts();
+        let guard = tier1.acquire_lock(Duration::from_secs(30), 1).await?;
+
+        let event_id = tier1
+            .append_ledger_event_for_transaction(
+                &guard,
+                CatalogDomain::Catalog,
+                &payload,
+                "api:test",
+                &identity,
+            )
+            .await?;
+        guard.release().await?;
+
+        assert_eq!(event_id.to_string(), intent.active_event_id);
+        assert_eq!(
+            backend.catalog_snapshot_gets(),
+            10,
+            "candidate and collision winner should each load one five-file catalog state"
+        );
+        Ok(())
+    }
+
+    async fn stale_update_transaction_fixture() -> Result<(
+        ScopedStorage,
+        CatalogWriter,
+        Tier1Writer,
+        CatalogTransactionIdentity,
+        CatalogTransactionEventIntent,
+    )> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = CatalogWriter::new(storage.clone())
+            .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+        writer.initialize().await?;
+        writer
+            .create_schema_transaction("default", "reviewed", None, WriteOptions::default())
+            .await?;
+        writer
+            .register_table_in_schema_transaction(
+                "default",
+                "reviewed",
+                RegisterTableInSchemaRequest {
+                    name: "events".to_string(),
+                    description: Some("before".to_string()),
+                    location: Some("s3://catalog/before".to_string()),
+                    format: Some("parquet".to_string()),
+                    table_type: None,
+                    properties: None,
+                    columns: vec![],
+                },
+                WriteOptions::default(),
+            )
+            .await?;
+
+        let tier1 = Tier1Writer::new(storage.clone());
+        let base = tier1.load_current_catalog_manifest().await?;
+        let state = tier1_state::load_catalog_state(&storage, &base.value.snapshot_path).await?;
+        let mut table = state
+            .tables
+            .iter()
+            .find(|table| table.name == "events")
+            .expect("seeded table")
+            .clone();
+        let reviewed_request = CatalogTransactionRequest::UpdateTable {
+            catalog: "default".to_string(),
+            schema: "reviewed".to_string(),
+            table: "events".to_string(),
+            description: Some(Some("reviewed update".to_string())),
+            location: None,
+            format: None,
+        };
+        let identity = catalog_transaction_identity(reviewed_request)?;
+        table.description = Some("reviewed update".to_string());
+        table.updated_at = table.updated_at.saturating_add(1);
+        let event = crate::tier1_events::CatalogDdlEvent::TableUpdated { table };
+        let intent = tier1
+            .build_catalog_transaction_event_intent(&event, "api:test", &identity)
+            .await?;
+
+        Ok((storage, writer, tier1, identity, intent))
+    }
+
+    fn replace_with_self_bound_operation_b(
+        identity: &CatalogTransactionIdentity,
+        intent: &mut CatalogTransactionEventIntent,
+    ) -> Result<()> {
+        let payload = serde_json::json!({
+            "kind": "namespace_deleted",
+            "namespace_id": "namespace-operation-b",
+            "namespace_name": "operation_b"
+        });
+        let envelope = CatalogEvent {
+            event_type: "catalog.ddl".to_string(),
+            event_version: 1,
+            idempotency_key: CatalogEvent::<()>::generate_idempotency_key(
+                "catalog.ddl",
+                1,
+                &payload,
+            )
+            .expect("operation B idempotency key"),
+            occurred_at: Utc::now(),
+            source: "api:test".to_string(),
+            trace_id: None,
+            sequence_position: None,
+            payload,
+        };
+        intent.event_json =
+            serde_json::to_string_pretty(&envelope).expect("operation B event JSON");
+        intent.event_binding_sha256 = Tier1Writer::catalog_transaction_event_binding(
+            identity,
+            intent,
+            &envelope,
+            &envelope.payload,
+        )?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_intent_rejects_tampered_event_envelope() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage);
+        writer.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&writer).await?;
+        writer
+            .validate_catalog_transaction_intent(&identity, Some("api:test"), &intent)
+            .await
+            .expect("valid event intent");
+
+        let mut tampered = intent.clone();
+        tampered.revision = 2;
+        writer
+            .validate_catalog_transaction_intent(&identity, Some("api:test"), &tampered)
+            .await
+            .expect_err("intent revision must equal its immutable event history length");
+
+        let mut tampered = intent.clone();
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&tampered.event_json).expect("decode event JSON");
+        *envelope
+            .pointer_mut("/payload/catalog/name")
+            .expect("catalog event name") = serde_json::json!("unreviewed");
+        tampered.event_json =
+            serde_json::to_string_pretty(&envelope).expect("encode tampered event JSON");
+        writer
+            .validate_catalog_transaction_intent(&identity, Some("api:test"), &tampered)
+            .await
+            .expect_err("payload changed without its deterministic idempotency key must fail");
+
+        tampered.event_json = serde_json::json!({"source": "api:test"}).to_string();
+        writer
+            .validate_catalog_transaction_intent(&identity, Some("api:test"), &tampered)
+            .await
+            .expect_err("incomplete event envelope must fail");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_rejects_another_operation_with_the_reviewed_hash()
+    -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+        let (identity, mut operation_b_intent) =
+            catalog_transaction_intent_fixture(&writer).await?;
+        replace_with_self_bound_operation_b(&identity, &mut operation_b_intent)?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(
+                    serde_json::to_vec(&operation_b_intent).expect("operation B intent JSON"),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_before = storage.get_raw(&pointer_path).await?;
+
+        writer
+            .recover_catalog_transaction_event(&identity)
+            .await
+            .expect_err("operation B must not recover under operation A's reviewed hash");
+
+        assert!(
+            storage
+                .head_raw(&operation_b_intent.active_event_path)
+                .await?
+                .is_none(),
+            "a divergent event must fail before publication"
+        );
+        assert_eq!(
+            storage.get_raw(&pointer_path).await?,
+            pointer_before,
+            "a divergent event must fail before manifest publication"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_collision_rejects_another_operation_with_the_reviewed_hash()
+    -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+        let (identity, mut operation_b_intent) =
+            catalog_transaction_intent_fixture(&writer).await?;
+        let reviewed_event: CatalogEvent<serde_json::Value> =
+            serde_json::from_str(&operation_b_intent.event_json).expect("reviewed event JSON");
+        let reviewed_payload: crate::tier1_events::CatalogDdlEventV2 =
+            serde_json::from_value(reviewed_event.payload).expect("reviewed event payload");
+        replace_with_self_bound_operation_b(&identity, &mut operation_b_intent)?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(
+                    serde_json::to_vec(&operation_b_intent).expect("operation B intent JSON"),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_before = storage.get_raw(&pointer_path).await?;
+        let guard = writer
+            .acquire_lock(Duration::from_secs(30), 1)
+            .await
+            .expect("catalog lock");
+
+        writer
+            .append_ledger_event_for_transaction(
+                &guard,
+                CatalogDomain::Catalog,
+                &reviewed_payload,
+                "api:test",
+                &identity,
+            )
+            .await
+            .expect_err("operation B must not win operation A's intent collision");
+        guard.release().await?;
+
+        assert!(
+            storage
+                .head_raw(&operation_b_intent.active_event_path)
+                .await?
+                .is_none(),
+            "a divergent collision winner must fail before event publication"
+        );
+        assert_eq!(
+            storage.get_raw(&pointer_path).await?,
+            pointer_before,
+            "a divergent collision winner must fail before manifest publication"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_rejects_stale_inherited_table_state() -> Result<()> {
+        let (storage, writer, tier1, identity, intent) = stale_update_transaction_fixture().await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        let intent_bytes = Bytes::from(serde_json::to_vec(&intent).expect("intent JSON"));
+        storage
+            .put_raw(
+                &intent_path,
+                intent_bytes.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        writer
+            .update_table_in_schema_transaction(
+                "default",
+                "reviewed",
+                "events",
+                TablePatch {
+                    location: Some(Some("s3://catalog/intervening".to_string())),
+                    ..TablePatch::default()
+                },
+                WriteOptions::default(),
+            )
+            .await?;
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_before = storage.get_raw(&pointer_path).await?;
+
+        tier1
+            .recover_catalog_transaction_event(&identity)
+            .await
+            .expect_err("recovery must not reissue stale inherited table state");
+
+        assert_eq!(
+            storage.get_raw(&intent_path).await?,
+            intent_bytes,
+            "stale-base recovery must fail before revising its intent"
+        );
+        assert!(
+            storage.head_raw(&intent.active_event_path).await?.is_none(),
+            "stale-base recovery must fail before event publication"
+        );
+        assert_eq!(
+            storage.get_raw(&pointer_path).await?,
+            pointer_before,
+            "stale-base recovery must fail before manifest publication"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_collision_rejects_stale_inherited_table_state() -> Result<()> {
+        let (storage, writer, tier1, identity, intent) = stale_update_transaction_fixture().await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        let intent_bytes = Bytes::from(serde_json::to_vec(&intent).expect("intent JSON"));
+        storage
+            .put_raw(
+                &intent_path,
+                intent_bytes.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        writer
+            .update_table_in_schema_transaction(
+                "default",
+                "reviewed",
+                "events",
+                TablePatch {
+                    location: Some(Some("s3://catalog/intervening".to_string())),
+                    ..TablePatch::default()
+                },
+                WriteOptions::default(),
+            )
+            .await?;
+
+        let current = tier1.load_current_catalog_manifest().await?;
+        let current_state =
+            tier1_state::load_catalog_state(&storage, &current.value.snapshot_path).await?;
+        let mut current_table = current_state
+            .tables
+            .iter()
+            .find(|table| table.name == "events")
+            .expect("current table")
+            .clone();
+        current_table.description = Some("reviewed update".to_string());
+        current_table.updated_at = current_table.updated_at.saturating_add(1);
+        let current_event = crate::tier1_events::CatalogDdlEvent::TableUpdated {
+            table: current_table,
+        };
+        let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+        let pointer_before = storage.get_raw(&pointer_path).await?;
+        let guard = tier1
+            .acquire_lock(Duration::from_secs(30), 1)
+            .await
+            .expect("catalog lock");
+
+        let result = tier1
+            .append_ledger_event_for_transaction(
+                &guard,
+                CatalogDomain::Catalog,
+                &current_event,
+                "api:test",
+                &identity,
+            )
+            .await;
+        guard.release().await?;
+        result.expect_err("collision must not adopt stale inherited table state");
+
+        assert_eq!(
+            storage.get_raw(&intent_path).await?,
+            intent_bytes,
+            "stale-base collision must not revise its intent"
+        );
+        assert!(
+            storage.head_raw(&intent.active_event_path).await?.is_none(),
+            "stale-base collision must fail before event publication"
+        );
+        assert_eq!(
+            storage.get_raw(&pointer_path).await?,
+            pointer_before,
+            "stale-base collision must fail before manifest publication"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_recreates_the_exact_intended_event() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&writer).await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        let result = storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(serde_json::to_vec(&intent).expect("intent JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        assert!(matches!(result, WriteResult::Success { .. }));
+        assert!(storage.head_raw(&intent.active_event_path).await?.is_none());
+
+        let recovered = writer.recover_catalog_transaction_event(&identity).await?;
+        assert!(matches!(
+            recovered,
+            CatalogTransactionEventRecovery::Ready(event_id)
+                if event_id.to_string() == intent.active_event_id
+        ));
+        assert_eq!(
+            storage.get_raw(&intent.active_event_path).await?.as_ref(),
+            intent.event_json.as_bytes()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_transaction_recovery_rejects_noncanonical_intent_json() -> Result<()> {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production")?;
+        let writer = Tier1Writer::new(storage.clone());
+        writer.initialize().await?;
+        let (identity, intent) = catalog_transaction_intent_fixture(&writer).await?;
+        let intent_path = Tier1Writer::catalog_transaction_intent_path(&identity)?;
+        storage
+            .put_raw(
+                &intent_path,
+                Bytes::from(serde_json::to_vec_pretty(&intent).expect("pretty intent JSON")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+
+        writer
+            .recover_catalog_transaction_event(&identity)
+            .await
+            .expect_err("noncanonical transaction intent JSON must fail closed");
+        assert!(storage.head_raw(&intent.active_event_path).await?.is_none());
+
+        Ok(())
     }
 
     #[tokio::test]

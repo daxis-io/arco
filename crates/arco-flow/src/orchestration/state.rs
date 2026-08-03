@@ -1,6 +1,6 @@
 //! Flow-owned orchestration read models.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
 use arco_core::{ScopedStorage, VisibilityStatus};
@@ -10,19 +10,149 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_client::compact_orchestration_events_fenced;
 use crate::orchestration::compactor::{
-    DepResolution, FoldState, MicroCompactor, OrchestrationManifest, RunRow,
-    RunState as FoldRunState, TaskRow, TaskState as FoldTaskState,
+    DepResolution, FoldState, MicroCompactor, OrchestrationManifest, OrchestrationManifestPointer,
+    RunRow, RunState as FoldRunState, TaskRow, TaskState as FoldTaskState,
 };
 use crate::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, OutputVisibilityState,
 };
 use crate::orchestration::ledger::LedgerWriter;
 use crate::orchestration_compaction_lock_path;
+use crate::paths::{orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path};
+
+pub use crate::orchestration::compactor::OrchestrationPublicationWitness;
 
 const DEFAULT_RUN_LIST_LIMIT: usize = 20;
 const DEFAULT_MAX_RUN_LIST_LIMIT: usize = 100;
 const LABEL_PARENT_RUN_ID: &str = "arco.parent_run_id";
 const LABEL_RERUN_KIND: &str = "arco.rerun.kind";
+
+/// Proves that an exact orchestration manifest and event batch belong to the
+/// currently selected immutable manifest lineage.
+///
+/// The target may be historical. Validation follows only exact predecessor
+/// paths from the current pointer and never lists storage.
+///
+/// # Errors
+///
+/// Returns an error when the pointer or lineage is missing, corrupt, cyclic,
+/// divergent from canonical paths, does not contain the target manifest, or
+/// lacks the exact event-batch witness at or before the target revision.
+#[allow(clippy::too_many_lines)]
+pub async fn validate_selected_orchestration_publication(
+    storage: &ScopedStorage,
+    target_manifest_id: &str,
+    target_revision: &str,
+    target_epoch: u64,
+    target_delta_id: Option<&str>,
+    expected_witness: &OrchestrationPublicationWitness,
+) -> crate::error::Result<DateTime<Utc>> {
+    if expected_witness.events.is_empty() {
+        return Err(crate::error::Error::serialization(
+            "orchestration publication witness is empty",
+        ));
+    }
+
+    let pointer_bytes = storage
+        .get_raw(orchestration_manifest_pointer_path())
+        .await?;
+    let pointer: OrchestrationManifestPointer = serde_json::from_slice(pointer_bytes.as_ref())
+        .map_err(|error| {
+            crate::error::Error::serialization(format!(
+                "failed to decode orchestration manifest pointer: {error}"
+            ))
+        })?;
+    if pointer.manifest_path != orchestration_manifest_snapshot_path(&pointer.manifest_id) {
+        return Err(crate::error::Error::serialization(
+            "orchestration manifest pointer path is non-canonical",
+        ));
+    }
+
+    let target_path = orchestration_manifest_snapshot_path(target_manifest_id);
+    let mut current_path = pointer.manifest_path;
+    let mut selected_child: Option<OrchestrationManifest> = None;
+    let mut visited = HashSet::new();
+    let mut target_published_at = None;
+
+    loop {
+        if !visited.insert(current_path.clone()) {
+            return Err(crate::error::Error::serialization(
+                "orchestration manifest lineage contains a cycle",
+            ));
+        }
+        let manifest_bytes = storage.get_raw(&current_path).await?;
+        let manifest: OrchestrationManifest = serde_json::from_slice(manifest_bytes.as_ref())
+            .map_err(|error| {
+                crate::error::Error::serialization(format!(
+                    "failed to decode selected orchestration manifest '{current_path}': {error}"
+                ))
+            })?;
+        if current_path != orchestration_manifest_snapshot_path(&manifest.manifest_id) {
+            return Err(crate::error::Error::serialization(
+                "orchestration manifest lineage contains a non-canonical path binding",
+            ));
+        }
+        if selected_child.is_none()
+            && (manifest.manifest_id != pointer.manifest_id || manifest.epoch != pointer.epoch)
+        {
+            return Err(crate::error::Error::serialization(
+                "orchestration manifest pointer diverges from its selected manifest",
+            ));
+        }
+        if let Some(child) = selected_child.as_ref() {
+            child
+                .validate_succession(&manifest)
+                .map_err(crate::error::Error::serialization)?;
+            if child.previous_manifest_path.as_deref() != Some(current_path.as_str()) {
+                return Err(crate::error::Error::serialization(
+                    "orchestration manifest lineage predecessor binding diverges",
+                ));
+            }
+        }
+
+        if current_path == target_path {
+            if manifest.manifest_id != target_manifest_id
+                || manifest.revision_ulid != target_revision
+                || manifest.epoch != target_epoch
+                || target_delta_id.is_some_and(|delta_id| {
+                    !manifest
+                        .l0_deltas
+                        .iter()
+                        .any(|delta| delta.delta_id == delta_id)
+                })
+            {
+                return Err(crate::error::Error::serialization(
+                    "selected orchestration target manifest authority diverges",
+                ));
+            }
+            target_published_at = Some(manifest.published_at);
+        }
+        if target_published_at.is_some()
+            && manifest.publication_witness.as_ref() == Some(expected_witness)
+        {
+            return target_published_at.ok_or_else(|| {
+                crate::error::Error::serialization(
+                    "selected orchestration target publication time is missing",
+                )
+            });
+        }
+
+        let Some(previous_path) = manifest.previous_manifest_path.clone() else {
+            break;
+        };
+        selected_child = Some(manifest);
+        current_path = previous_path;
+    }
+
+    if target_published_at.is_none() {
+        return Err(crate::error::Error::serialization(
+            "orchestration target manifest is absent from the selected lineage",
+        ));
+    }
+    Err(crate::error::Error::serialization(
+        "selected orchestration lineage does not prove the exact reviewed event batch",
+    ))
+}
 
 /// Public run state exposed by flow-owned read models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1184,23 +1314,146 @@ mod tests {
     use std::sync::Arc;
 
     use arco_core::lock::{DEFAULT_LOCK_TTL, DistributedLock};
-    use arco_core::{MemoryBackend, ScopedStorage};
+    use arco_core::{MemoryBackend, ScopedStorage, WritePrecondition};
+    use bytes::Bytes;
     use chrono::{TimeZone, Utc};
 
     use super::{
         CancelRunDisposition, CancelRunRequest, OrchestrationStateService, RunDetail, RunListQuery,
         RunStateView, StateServiceError, TaskDetail, TaskRetryAttribution, TaskSkipAttribution,
         TaskStateView, list_runs_from_state, run_detail_from_state, task_detail_from_state,
+        validate_selected_orchestration_publication,
     };
     use crate::orchestration::LedgerWriter;
     use crate::orchestration::compactor::{
-        DepResolution, DepSatisfactionRow, FoldState, MicroCompactor, RunRow,
-        RunState as FoldRunState, TaskRow, TaskState as FoldTaskState,
+        DepResolution, DepSatisfactionRow, FoldState, MicroCompactor,
+        OrchestrationPublicationWitness, RunRow, RunState as FoldRunState, TaskRow,
+        TaskState as FoldTaskState,
     };
     use crate::orchestration::events::{
         OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, TaskDef, TaskOutcome,
         TriggerInfo,
     };
+    use crate::paths::orchestration_manifest_snapshot_path;
+
+    #[tokio::test]
+    async fn selected_orchestration_publication_rejects_orphans_and_wrong_middle_events() {
+        let storage = test_storage();
+        let mut first = run_triggered_event(&storage, "authority-first", 1);
+        let mut reviewed_middle = run_triggered_event(&storage, "authority-reviewed-middle", 2);
+        let mut published_middle = run_triggered_event(&storage, "authority-published-middle", 3);
+        let mut last = run_triggered_event(&storage, "authority-last", 4);
+        first.event_id = "01KXAUTHORITY000000000001".to_string();
+        reviewed_middle.event_id = "01KXAUTHORITY000000000002".to_string();
+        published_middle.event_id = "01KXAUTHORITY000000000003".to_string();
+        last.event_id = "01KXAUTHORITY000000000004".to_string();
+
+        let ledger = LedgerWriter::new(storage.clone());
+        ledger
+            .append_all(vec![
+                first.clone(),
+                reviewed_middle.clone(),
+                published_middle.clone(),
+                last.clone(),
+            ])
+            .await
+            .expect("append authority events");
+        let published_events = vec![first.clone(), published_middle, last.clone()];
+        let published_paths = published_events
+            .iter()
+            .map(LedgerWriter::event_path)
+            .collect::<Vec<_>>();
+        let published = MicroCompactor::new(storage.clone())
+            .compact_events(published_paths)
+            .await
+            .expect("publish selected authority");
+        let reviewed = OrchestrationPublicationWitness::for_events(&[first, reviewed_middle, last])
+            .expect("reviewed witness");
+
+        validate_selected_orchestration_publication(
+            &storage,
+            &published.manifest_id,
+            &published.manifest_revision,
+            0,
+            published.delta_id.as_deref(),
+            &reviewed,
+        )
+        .await
+        .expect_err("same endpoints and count must not prove a different middle event");
+
+        let (mut orphan, _) = MicroCompactor::new(storage.clone())
+            .load_state()
+            .await
+            .expect("load selected manifest");
+        orphan.manifest_id = "00000000000000000099".to_string();
+        orphan.revision_ulid = ulid::Ulid::new().to_string();
+        orphan.publication_witness = Some(reviewed);
+        storage
+            .put_raw(
+                &orchestration_manifest_snapshot_path(&orphan.manifest_id),
+                Bytes::from(serde_json::to_vec(&orphan).expect("encode orphan manifest")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("seed immutable orphan manifest");
+
+        validate_selected_orchestration_publication(
+            &storage,
+            &orphan.manifest_id,
+            &orphan.revision_ulid,
+            orphan.epoch,
+            None,
+            orphan.publication_witness.as_ref().expect("orphan witness"),
+        )
+        .await
+        .expect_err("unselected immutable manifest must not prove visibility");
+    }
+
+    #[tokio::test]
+    async fn selected_orchestration_publication_accepts_historical_lineage_witness() {
+        let storage = test_storage();
+        let historical_events = vec![
+            run_triggered_event(&storage, "authority-history-a", 10),
+            run_triggered_event(&storage, "authority-history-b", 11),
+        ];
+        let historical_witness = OrchestrationPublicationWitness::for_events(&historical_events)
+            .expect("historical witness");
+        let ledger = LedgerWriter::new(storage.clone());
+        ledger
+            .append_all(historical_events.clone())
+            .await
+            .expect("append historical events");
+        let historical = MicroCompactor::new(storage.clone())
+            .compact_events(
+                historical_events
+                    .iter()
+                    .map(LedgerWriter::event_path)
+                    .collect(),
+            )
+            .await
+            .expect("publish historical manifest");
+
+        let successor = run_triggered_event(&storage, "authority-successor", 12);
+        ledger
+            .append(successor.clone())
+            .await
+            .expect("append successor");
+        MicroCompactor::new(storage.clone())
+            .compact_events(vec![LedgerWriter::event_path(&successor)])
+            .await
+            .expect("publish successor manifest");
+
+        validate_selected_orchestration_publication(
+            &storage,
+            &historical.manifest_id,
+            &historical.manifest_revision,
+            0,
+            historical.delta_id.as_deref(),
+            &historical_witness,
+        )
+        .await
+        .expect("selected historical manifest remains valid through exact lineage");
+    }
 
     #[test]
     fn run_detail_from_projection_maps_cancel_requested_to_cancelling() {
@@ -2502,11 +2755,18 @@ mod tests {
         event
     }
 
+    /// Mints a deterministic ULID event id whose embedded timestamp matches
+    /// the event's `ts(10_000 + offset)` producer timestamp. Retention derives
+    /// its reference from event-id ULID timestamps, so fixture ids must agree
+    /// with the times their events intend; the discriminator hash keeps ids
+    /// unique while preserving offset ordering.
     fn test_event_id(timestamp_offset_seconds: i64, discriminator: &str) -> String {
         let suffix = discriminator.bytes().fold(0_u64, |acc, byte| {
             acc.wrapping_mul(131).wrapping_add(u64::from(byte))
-        }) % 1_000_000_000_000;
-        format!("01KSTATE{timestamp_offset_seconds:06}{suffix:012}")
+        });
+        let ms = u64::try_from(ts(10_000 + timestamp_offset_seconds).timestamp_millis())
+            .unwrap_or_default();
+        ulid::Ulid::from_parts(ms, u128::from(suffix)).to_string()
     }
 
     fn task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {

@@ -5,6 +5,10 @@
 //! - fast (unit/integration style)
 //! - hard to “cheat” via doc-only changes
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::unnecessary_wraps)]
+
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
@@ -263,7 +267,7 @@ fn task_finished_event(
 fn default_task_def(key: &str, depends_on: Vec<&str>) -> TaskDef {
     TaskDef {
         key: key.to_string(),
-        depends_on: depends_on.into_iter().map(|dep| dep.to_string()).collect(),
+        depends_on: depends_on.into_iter().map(ToString::to_string).collect(),
         asset_key: None,
         partition_key: None,
         max_attempts: 3,
@@ -277,9 +281,7 @@ async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<(
     use arco_core::WritePrecondition;
     use arco_flow::orchestration::compactor::MicroCompactor;
     use arco_flow::orchestration::compactor::fold::DispatchOutboxRow;
-    fn orchestration_event_path(date: &str, event_id: &str) -> String {
-        format!("ledger/orchestration/{date}/{event_id}.json")
-    }
+    use arco_flow::orchestration::ledger::LedgerWriter;
     use bytes::Bytes;
 
     let backend = Arc::new(MemoryBackend::new());
@@ -300,7 +302,7 @@ async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<(
         },
     );
     enqueued.event_id = "01B".to_string();
-    let path1 = orchestration_event_path("2025-01-15", &enqueued.event_id);
+    let path1 = LedgerWriter::event_path(&enqueued);
     storage
         .put_raw(
             &path1,
@@ -323,7 +325,7 @@ async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<(
         },
     );
     requested.event_id = "01A".to_string();
-    let path2 = orchestration_event_path("2025-01-15", &requested.event_id);
+    let path2 = LedgerWriter::event_path(&requested);
     storage
         .put_raw(
             &path2,
@@ -346,11 +348,8 @@ async fn parity_m1_compactor_persists_out_of_order_dispatch_fields() -> Result<(
 async fn parity_m1_compactor_rejects_stale_task_finished_after_retry_started() -> Result<()> {
     use arco_core::WritePrecondition;
     use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::ledger::LedgerWriter;
     use bytes::Bytes;
-
-    fn orchestration_event_path(date: &str, event_id: &str) -> String {
-        format!("ledger/orchestration/{date}/{event_id}.json")
-    }
 
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant", "workspace")?;
@@ -407,7 +406,7 @@ async fn parity_m1_compactor_rejects_stale_task_finished_after_retry_started() -
     stale_finished.timestamp = base_time + chrono::Duration::seconds(4);
 
     for event in [triggered, planned, started_1, started_2, stale_finished] {
-        let path = orchestration_event_path("2025-01-15", &event.event_id);
+        let path = LedgerWriter::event_path(&event);
         storage
             .put_raw(
                 &path,

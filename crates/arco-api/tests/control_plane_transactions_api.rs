@@ -1,5 +1,13 @@
 //! Integration tests for control-plane transaction commit and lookup APIs.
 
+// Test-target lint scope (#331): tests and their helpers signal failure by
+// panicking. clippy.toml scopes the restriction lints out of #[test] fns;
+// this header extends the same policy to this file's shared helpers.
+#![allow(clippy::expect_used)]
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::too_many_lines)]
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +26,8 @@ use arco_catalog::CatalogReader;
 use arco_core::catalog_event::CatalogEvent;
 use arco_core::catalog_paths::{CatalogDomain, CatalogPaths};
 use arco_core::control_plane_transactions::{
-    ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus, RootTxManifest,
-    RootTxReceipt,
+    CatalogTxRecord, ControlPlaneIdempotencyRecord, ControlPlaneTxPaths, ControlPlaneTxStatus,
+    OrchestrationTxRecord, RootTxManifest, RootTxReceipt,
 };
 use arco_core::orchestration_compaction::OrchestrationCompactRequest;
 use arco_core::storage::{
@@ -413,6 +421,278 @@ struct ReplaceIdempotencyBeforeFinalizeBackend {
     replaced: std::sync::atomic::AtomicBool,
 }
 
+#[derive(Debug)]
+struct VisibleCatalogRecordFaultBackend {
+    inner: MemoryBackend,
+    fault: std::sync::atomic::AtomicU8,
+    triggered: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    pending_record: std::sync::Mutex<Option<(String, Bytes)>>,
+    divergent_marker_key: std::sync::Mutex<Option<String>>,
+}
+
+impl VisibleCatalogRecordFaultBackend {
+    const NONE: u8 = 0;
+    const GATE_STALE_WINNER: u8 = 1;
+    const LOSE_CATALOG_WRITE_RESPONSE: u8 = 2;
+    const LOSE_ORCHESTRATION_WRITE_RESPONSE: u8 = 3;
+    const DIVERGENT_CATALOG_MARKER_AFTER_RECORD: u8 = 4;
+    const WINNER_POINTER_VERSION: &str = "competing-exact-winner";
+
+    fn new() -> Self {
+        Self {
+            inner: MemoryBackend::new(),
+            fault: std::sync::atomic::AtomicU8::new(Self::NONE),
+            triggered: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            pending_record: std::sync::Mutex::new(None),
+            divergent_marker_key: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn arm_stale_winner_gate(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.triggered.store(false, Ordering::SeqCst);
+        self.fault.store(Self::GATE_STALE_WINNER, Ordering::SeqCst);
+    }
+
+    fn arm_lost_write_response(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.triggered.store(false, Ordering::SeqCst);
+        self.fault
+            .store(Self::LOSE_CATALOG_WRITE_RESPONSE, Ordering::SeqCst);
+    }
+
+    fn arm_lost_orchestration_write_response(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.triggered.store(false, Ordering::SeqCst);
+        self.fault
+            .store(Self::LOSE_ORCHESTRATION_WRITE_RESPONSE, Ordering::SeqCst);
+    }
+
+    fn arm_divergent_catalog_marker(&self, idempotency_key: &str) {
+        use std::sync::atomic::Ordering;
+
+        self.triggered.store(false, Ordering::SeqCst);
+        *self
+            .divergent_marker_key
+            .lock()
+            .expect("divergent marker key lock") = Some(idempotency_key.to_string());
+        self.fault.store(
+            Self::DIVERGENT_CATALOG_MARKER_AFTER_RECORD,
+            Ordering::SeqCst,
+        );
+    }
+
+    async fn install_stale_repair_pending_winner(&self) -> Result<()> {
+        self.entered.notified().await;
+        let result = async {
+            let (path, bytes) = self
+                .pending_record
+                .lock()
+                .expect("pending visible record lock")
+                .clone()
+                .context("visible record write was not captured")?;
+            let mut winner: CatalogTxRecord =
+                serde_json::from_slice(bytes.as_ref()).context("decode pending visible record")?;
+            winner.repair_pending = true;
+            winner
+                .result
+                .as_mut()
+                .context("pending visible record result missing")?
+                .pointer_version = Self::WINNER_POINTER_VERSION.to_string();
+            let outcome = self
+                .inner
+                .put(
+                    &path,
+                    Bytes::from(serde_json::to_vec(&winner)?),
+                    WritePrecondition::None,
+                )
+                .await?;
+            assert!(matches!(outcome, WriteResult::Success { .. }));
+            Ok(())
+        }
+        .await;
+        self.release.notify_one();
+        result
+    }
+
+    fn is_visible_catalog_record_write(
+        path: &str,
+        data: &Bytes,
+        precondition: &WritePrecondition,
+    ) -> bool {
+        path.contains("/transactions/catalog/")
+            && matches!(
+                precondition,
+                WritePrecondition::DoesNotExist | WritePrecondition::MatchesVersion(_)
+            )
+            && serde_json::from_slice::<CatalogTxRecord>(data.as_ref())
+                .is_ok_and(|record| record.status == ControlPlaneTxStatus::Visible)
+    }
+
+    fn is_visible_orchestration_record_write(
+        path: &str,
+        data: &Bytes,
+        precondition: &WritePrecondition,
+    ) -> bool {
+        path.contains("/transactions/orchestration/")
+            && matches!(
+                precondition,
+                WritePrecondition::DoesNotExist | WritePrecondition::MatchesVersion(_)
+            )
+            && serde_json::from_slice::<OrchestrationTxRecord>(data.as_ref())
+                .is_ok_and(|record| record.status == ControlPlaneTxStatus::Visible)
+    }
+
+    async fn install_divergent_catalog_marker(
+        &self,
+        record_path: &str,
+        record_bytes: &Bytes,
+    ) -> arco_core::Result<()> {
+        let idempotency_key = self
+            .divergent_marker_key
+            .lock()
+            .expect("divergent marker key lock")
+            .clone()
+            .ok_or_else(|| arco_core::Error::storage("divergent marker key is missing"))?;
+        let scope_prefix = record_path
+            .split_once("/transactions/catalog/")
+            .map(|(prefix, _)| prefix)
+            .ok_or_else(|| arco_core::Error::storage("catalog record path is not scoped"))?;
+        let marker_path = format!(
+            "{scope_prefix}/{}",
+            ControlPlaneTxPaths::idempotency(ControlPlaneTxDomain::Catalog, &idempotency_key)
+        );
+        let mut marker: ControlPlaneIdempotencyRecord =
+            serde_json::from_slice(self.inner.get(&marker_path).await?.as_ref())
+                .map_err(|error| arco_core::Error::storage(format!("decode marker: {error}")))?;
+        let mut divergent: CatalogTxRecord = serde_json::from_slice(record_bytes.as_ref())
+            .map_err(|error| arco_core::Error::storage(format!("decode record: {error}")))?;
+        divergent
+            .result
+            .as_mut()
+            .ok_or_else(|| arco_core::Error::storage("visible catalog result is missing"))?
+            .pointer_version = "divergent-cached-marker".to_string();
+        marker.visible_at = divergent.visible_at;
+        marker.tx_record = Some(
+            serde_json::to_value(&divergent)
+                .map_err(|error| arco_core::Error::storage(format!("encode record: {error}")))?,
+        );
+        let outcome = self
+            .inner
+            .put(
+                &marker_path,
+                Bytes::from(serde_json::to_vec(&marker).map_err(|error| {
+                    arco_core::Error::storage(format!("encode marker: {error}"))
+                })?),
+                WritePrecondition::None,
+            )
+            .await?;
+        if !matches!(outcome, WriteResult::Success { .. }) {
+            return Err(arco_core::Error::storage(
+                "failed to install divergent marker",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StorageBackend for VisibleCatalogRecordFaultBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        use std::sync::atomic::Ordering;
+
+        let fault = self.fault.load(Ordering::SeqCst);
+        let is_target = match fault {
+            Self::GATE_STALE_WINNER
+            | Self::LOSE_CATALOG_WRITE_RESPONSE
+            | Self::DIVERGENT_CATALOG_MARKER_AFTER_RECORD => {
+                Self::is_visible_catalog_record_write(path, &data, &precondition)
+            }
+            Self::LOSE_ORCHESTRATION_WRITE_RESPONSE => {
+                Self::is_visible_orchestration_record_write(path, &data, &precondition)
+            }
+            _ => false,
+        };
+        let should_inject = is_target && !self.triggered.swap(true, Ordering::SeqCst);
+        if should_inject && fault == Self::GATE_STALE_WINNER {
+            *self
+                .pending_record
+                .lock()
+                .expect("pending visible record lock") = Some((path.to_string(), data.clone()));
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.fault.store(Self::NONE, Ordering::SeqCst);
+        }
+
+        let divergent_record_bytes = (should_inject
+            && fault == Self::DIVERGENT_CATALOG_MARKER_AFTER_RECORD)
+            .then(|| data.clone());
+        let outcome = self.inner.put(path, data, precondition).await?;
+        if should_inject
+            && fault == Self::DIVERGENT_CATALOG_MARKER_AFTER_RECORD
+            && matches!(outcome, WriteResult::Success { .. })
+        {
+            self.install_divergent_catalog_marker(
+                path,
+                divergent_record_bytes
+                    .as_ref()
+                    .expect("divergent record bytes captured"),
+            )
+            .await?;
+            self.fault.store(Self::NONE, Ordering::SeqCst);
+        }
+        if should_inject
+            && matches!(
+                fault,
+                Self::LOSE_CATALOG_WRITE_RESPONSE | Self::LOSE_ORCHESTRATION_WRITE_RESPONSE
+            )
+            && matches!(outcome, WriteResult::Success { .. })
+        {
+            self.fault.store(Self::NONE, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(format!(
+                "injected lost response after visible record write: {path}"
+            )));
+        }
+        Ok(outcome)
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
 impl ReplaceIdempotencyBeforeFinalizeBackend {
     const REPLACEMENT_TX_ID: &'static str = "01K0STALECLAIMREPLACED0001";
 
@@ -662,6 +942,192 @@ async fn apply_catalog_ddl_does_not_overwrite_replaced_idempotency_marker_on_fin
         idem.tx_record.is_none(),
         "stale finalize must not cache its visible record under the replacement owner"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_finalize_adopts_stale_exact_winner_before_repairing_marker() -> Result<()> {
+    let backend = Arc::new(VisibleCatalogRecordFaultBackend::new());
+    let erased: Arc<dyn StorageBackend> = backend.clone();
+    let router = test_router_with_backend(erased.clone());
+    let idempotency_key = "idem-cat-record-first-stale-winner-01";
+    let request = catalog_create_default_schema_request(
+        idempotency_key,
+        "req-cat-record-first-stale-winner-01",
+        "record_first_stale_winner",
+    );
+    backend.arm_stale_winner_gate();
+
+    let commit = post_protobuf::<_, ApplyCatalogDdlResponse>(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-record-first-stale-winner-01",
+    );
+    let install_winner = backend.install_stale_repair_pending_winner();
+    let (commit, install_winner) = tokio::join!(commit, install_winner);
+    install_winner?;
+    let (_status, response) = commit?;
+    assert!(
+        response.repair_pending,
+        "the API must report the exact CAS winner's repair state"
+    );
+    let response_receipt = response.receipt.context("catalog receipt missing")?;
+    assert_eq!(
+        response_receipt.pointer_version,
+        VisibleCatalogRecordFaultBackend::WINNER_POINTER_VERSION,
+        "the caller must receive the exact CAS winner rather than its stale proposal"
+    );
+    let tx_id = response_receipt.tx_id.clone();
+
+    let exact = load_catalog_tx_record(erased.clone(), &tx_id).await?;
+    let marker =
+        load_idempotency_record(erased, ControlPlaneTxDomain::Catalog, idempotency_key).await?;
+    let cached: CatalogTxRecord = serde_json::from_value(
+        marker
+            .tx_record
+            .context("visible marker cache must be repaired from exact winner")?,
+    )?;
+    assert!(exact.repair_pending, "the competing exact winner must win");
+    assert_eq!(
+        exact
+            .result
+            .as_ref()
+            .context("exact winner result missing")?
+            .pointer_version,
+        response_receipt.pointer_version
+    );
+    assert_eq!(cached, exact, "marker must cache only the exact CAS winner");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_finalize_rejects_a_result_divergent_visible_marker_cache() -> Result<()> {
+    let backend = Arc::new(VisibleCatalogRecordFaultBackend::new());
+    let erased: Arc<dyn StorageBackend> = backend.clone();
+    let router = test_router_with_backend(erased.clone());
+    let idempotency_key = "idem-cat-record-first-divergent-marker-01";
+    let request = catalog_create_default_schema_request(
+        idempotency_key,
+        "req-cat-record-first-divergent-marker-01",
+        "record_first_divergent_marker",
+    );
+    backend.arm_divergent_catalog_marker(idempotency_key);
+
+    let (status, error) = post_error_json(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-record-first-divergent-marker-01",
+    )
+    .await?;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(error["code"], "INTERNAL");
+
+    let marker = load_idempotency_record(
+        erased.clone(),
+        ControlPlaneTxDomain::Catalog,
+        idempotency_key,
+    )
+    .await?;
+    let cached: CatalogTxRecord = serde_json::from_value(
+        marker
+            .tx_record
+            .context("injected divergent marker cache missing")?,
+    )?;
+    let exact = load_catalog_tx_record(erased, &marker.tx_id).await?;
+    assert_eq!(exact.status, ControlPlaneTxStatus::Visible);
+    assert_eq!(cached.status, ControlPlaneTxStatus::Visible);
+    assert_ne!(cached, exact, "divergent evidence must not be overwritten");
+    assert_eq!(
+        cached
+            .result
+            .as_ref()
+            .context("cached catalog result missing")?
+            .pointer_version,
+        "divergent-cached-marker"
+    );
+    assert_ne!(
+        exact
+            .result
+            .as_ref()
+            .context("exact catalog result missing")?
+            .pointer_version,
+        "divergent-cached-marker"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn visible_reconciliation_recovers_lost_exact_record_write_response() -> Result<()> {
+    let backend = Arc::new(VisibleCatalogRecordFaultBackend::new());
+    let erased: Arc<dyn StorageBackend> = backend.clone();
+    let router = test_router_with_backend(erased.clone());
+    let idempotency_key = "idem-cat-record-first-lost-response-01";
+    let request = catalog_create_default_schema_request(
+        idempotency_key,
+        "req-cat-record-first-lost-response-01",
+        "record_first_lost_response",
+    );
+    let (_status, first): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router.clone(),
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-record-first-lost-response-01",
+    )
+    .await?;
+    let tx_id = first
+        .receipt
+        .context("initial catalog receipt missing")?
+        .tx_id;
+    let mut predecessor = load_catalog_tx_record(erased.clone(), &tx_id).await?;
+    predecessor.status = ControlPlaneTxStatus::Prepared;
+    predecessor.repair_pending = false;
+    predecessor.visible_at = None;
+    predecessor.result = None;
+    let record_path = ControlPlaneTxPaths::record(ControlPlaneTxDomain::Catalog, &tx_id);
+    let rewrite = scoped_storage(erased.clone())
+        .put_raw(
+            &record_path,
+            Bytes::from(serde_json::to_vec(&predecessor)?),
+            WritePrecondition::None,
+        )
+        .await?;
+    assert!(matches!(rewrite, WriteResult::Success { .. }));
+    backend.arm_lost_write_response();
+
+    let (_status, replay): (_, ApplyCatalogDdlResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/applyCatalogDdl",
+        &request,
+        idempotency_key,
+        "req-cat-record-first-lost-response-01",
+    )
+    .await?;
+    assert_eq!(
+        replay
+            .receipt
+            .context("replay catalog receipt missing")?
+            .tx_id,
+        tx_id
+    );
+
+    let exact = load_catalog_tx_record(erased.clone(), &tx_id).await?;
+    let marker =
+        load_idempotency_record(erased, ControlPlaneTxDomain::Catalog, idempotency_key).await?;
+    let cached: CatalogTxRecord = serde_json::from_value(
+        marker
+            .tx_record
+            .context("visible marker cache must converge after lost response")?,
+    )?;
+    assert_eq!(exact.status, ControlPlaneTxStatus::Visible);
+    assert_eq!(cached, exact);
 
     Ok(())
 }
@@ -1025,6 +1491,7 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
     assert!(!receipt.commit_id.is_empty());
     assert!(!receipt.manifest_id.is_empty());
     assert!(!receipt.revision_ulid.is_empty());
+    assert_ne!(receipt.commit_id, receipt.tx_id);
     assert_ne!(receipt.commit_id, receipt.revision_ulid);
     assert!(!receipt.pointer_version.is_empty());
     assert_eq!(receipt.events_processed, 1);
@@ -1075,6 +1542,61 @@ async fn commit_orchestration_batch_returns_visible_receipt_and_persists_lookup_
     assert_eq!(commit_receipt.tx_id, receipt.tx_id);
     assert_eq!(commit_receipt.commit_id, receipt.commit_id);
     assert_eq!(commit_receipt.revision_ulid, receipt.revision_ulid);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn orchestration_finalize_recovers_lost_exact_record_write_response() -> Result<()> {
+    let backend = Arc::new(VisibleCatalogRecordFaultBackend::new());
+    let erased: Arc<dyn StorageBackend> = backend.clone();
+    let router = test_router_with_backend(erased.clone());
+    let idempotency_key = "idem-orch-record-first-lost-response-01";
+    let request = orchestration_request(
+        idempotency_key,
+        "req-orch-record-first-lost-response-01",
+        "run-orch-record-first-lost-response-01",
+    );
+    backend.arm_lost_orchestration_write_response();
+
+    let (_status, response): (_, CommitOrchestrationBatchResponse) = post_protobuf(
+        router,
+        "/api/v1/transactions/commitOrchestrationBatch",
+        &request,
+        idempotency_key,
+        "req-orch-record-first-lost-response-01",
+    )
+    .await?;
+    assert!(!response.repair_pending);
+    let receipt = response
+        .receipt
+        .context("orchestration receipt missing after lost write response")?;
+
+    let exact = load_orchestration_tx_record(erased.clone(), &receipt.tx_id).await?;
+    let marker = load_idempotency_record(
+        erased.clone(),
+        ControlPlaneTxDomain::Orchestration,
+        idempotency_key,
+    )
+    .await?;
+    let cached: OrchestrationTxRecord = serde_json::from_value(
+        marker
+            .tx_record
+            .context("visible orchestration marker cache missing after recovery")?,
+    )?;
+    assert_eq!(exact.status, ControlPlaneTxStatus::Visible);
+    let exact_receipt = exact
+        .result
+        .as_ref()
+        .context("exact orchestration receipt missing after recovery")?;
+    assert_eq!(exact_receipt.tx_id, receipt.tx_id);
+    assert_eq!(exact_receipt.commit_id, receipt.commit_id);
+    assert_eq!(exact_receipt.manifest_id, receipt.manifest_id);
+    assert_eq!(cached, exact);
+    let audit = load_orchestration_commit_receipt(erased, &receipt.commit_id)
+        .await?
+        .context("orchestration audit receipt missing after recovery")?;
+    assert_eq!(&audit, exact_receipt);
 
     Ok(())
 }
@@ -1774,11 +2296,6 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
     .await?;
     assert!(current_catalog_response.receipt.is_some());
 
-    let current_orchestration = orchestration_request(
-        "idem-root-read-orch-current-01",
-        "req-root-read-orch-current-01",
-        "run-current-read-01",
-    );
     let current_orchestration = CommitOrchestrationBatchRequest {
         events: orchestration_request_with_event_id(
             "idem-root-read-orch-current-01",
@@ -1787,7 +2304,6 @@ async fn commit_root_transaction_exposes_pinned_catalog_and_orchestration_reads(
             "01JTXORCH000000000000000002",
         )
         .events,
-        ..current_orchestration
     };
     let (_status, current_orchestration_response): (_, CommitOrchestrationBatchResponse) =
         post_protobuf(
@@ -2265,8 +2781,10 @@ async fn commit_root_transaction_captures_mixed_metastore_hash_before_not_implem
 async fn apply_catalog_ddl_retries_same_key_after_missing_tx_record_is_stale() -> Result<()> {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/transactions/catalog/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
-    let mut config = arco_api::config::Config::default();
-    config.idempotency_stale_timeout_secs = 0;
+    let config = arco_api::config::Config {
+        idempotency_stale_timeout_secs: 0,
+        ..Default::default()
+    };
     let router = test_router_with_config_backend(config, backend.clone());
 
     let first = catalog_create_default_schema_request(
@@ -2316,8 +2834,10 @@ async fn commit_orchestration_batch_marks_failed_attempt_aborted_and_retries_sam
 {
     let fail_prefix = format!("tenant={TENANT}/workspace={WORKSPACE}/ledger/orchestration/");
     let backend: Arc<dyn StorageBackend> = Arc::new(FailPrefixBackend::new(fail_prefix, 1));
-    let mut config = arco_api::config::Config::default();
-    config.idempotency_stale_timeout_secs = 0;
+    let config = arco_api::config::Config {
+        idempotency_stale_timeout_secs: 0,
+        ..Default::default()
+    };
     let router = test_router_with_config_backend(config, backend.clone());
 
     let first = orchestration_request(

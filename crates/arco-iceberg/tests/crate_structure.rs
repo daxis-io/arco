@@ -4,6 +4,10 @@
 //! are accessible and have stable interfaces. It catches breaking changes to the
 //! crate's public API surface at compile time.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(clippy::no_effect_underscore_binding)]
+
 use std::mem::size_of;
 
 #[test]

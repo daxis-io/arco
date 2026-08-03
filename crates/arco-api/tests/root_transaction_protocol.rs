@@ -9,15 +9,15 @@ mod support;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::http::StatusCode;
+use bytes::Bytes;
 
-use arco_core::control_plane_transactions::ControlPlaneTxDomain;
-use arco_core::storage::StorageBackend;
+use arco_core::control_plane_transactions::{ControlPlaneTxDomain, ControlPlaneTxPaths};
+use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_proto::arco::controlplane::v1::CommitRootTransactionResponse;
 use spy_backend::{SpyBackend, SpyOp};
 use support::{
-    FailPrefixOnNoneBackend, TENANT, WORKSPACE, load_idempotency_record, load_root_tx_record,
-    post_error_json, post_protobuf, root_request, test_router_with_backend,
+    TENANT, WORKSPACE, load_idempotency_record, load_root_tx_record, post_protobuf, root_request,
+    test_router_with_backend,
 };
 
 fn scoped_path(path: &str) -> String {
@@ -27,10 +27,7 @@ fn scoped_path(path: &str) -> String {
 #[tokio::test]
 async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_listing()
 -> Result<()> {
-    let inner: Arc<dyn StorageBackend> = Arc::new(FailPrefixOnNoneBackend::new(
-        scoped_path("transactions/root/"),
-        1,
-    ));
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(inner));
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
@@ -41,7 +38,7 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
         "repair-root-tx",
         "run-root-repair-tx-01",
     );
-    let (status, _) = post_error_json(
+    let (_status, response): (_, CommitRootTransactionResponse) = post_protobuf(
         router.clone(),
         "/api/v1/transactions/commitRootTransaction",
         &first,
@@ -49,7 +46,7 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
         "req-root-repair-tx-01",
     )
     .await?;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let first_receipt = response.receipt.context("initial root receipt missing")?;
 
     let cached = load_idempotency_record(
         backend.clone(),
@@ -59,6 +56,13 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
     .await?;
     assert!(cached.visible_at.is_some());
     assert!(cached.tx_record.is_some());
+    assert_eq!(cached.tx_id, first_receipt.tx_id);
+    backend
+        .delete(&scoped_path(&ControlPlaneTxPaths::record(
+            ControlPlaneTxDomain::Root,
+            &cached.tx_id,
+        )))
+        .await?;
 
     let replay = root_request(
         "idem-root-repair-tx-01",
@@ -95,10 +99,7 @@ async fn replay_repairs_missing_root_tx_record_from_visible_idempotency_without_
 #[tokio::test]
 async fn replay_repairs_missing_visible_idempotency_from_root_tx_record_without_listing()
 -> Result<()> {
-    let inner: Arc<dyn StorageBackend> = Arc::new(FailPrefixOnNoneBackend::new(
-        scoped_path("transactions/idempotency/root/"),
-        1,
-    ));
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(inner));
     let backend: Arc<dyn StorageBackend> = spy.clone();
     let router = test_router_with_backend(backend.clone());
@@ -109,7 +110,7 @@ async fn replay_repairs_missing_visible_idempotency_from_root_tx_record_without_
         "repair-root-idem",
         "run-root-repair-idem-01",
     );
-    let (status, _) = post_error_json(
+    let (_status, response): (_, CommitRootTransactionResponse) = post_protobuf(
         router.clone(),
         "/api/v1/transactions/commitRootTransaction",
         &first,
@@ -117,19 +118,32 @@ async fn replay_repairs_missing_visible_idempotency_from_root_tx_record_without_
         "req-root-repair-idem-01",
     )
     .await?;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let first_receipt = response.receipt.context("initial root receipt missing")?;
 
-    let initial_idem = load_idempotency_record(
+    let mut initial_idem = load_idempotency_record(
         backend.clone(),
         ControlPlaneTxDomain::Root,
         "idem-root-repair-idem-01",
     )
     .await?;
-    assert!(initial_idem.visible_at.is_none());
-    assert!(initial_idem.tx_record.is_none());
+    assert!(initial_idem.visible_at.is_some());
+    assert!(initial_idem.tx_record.is_some());
+    assert_eq!(initial_idem.tx_id, first_receipt.tx_id);
     let visible_root = load_root_tx_record(backend.clone(), &initial_idem.tx_id).await?;
     assert_eq!(visible_root.tx_id, initial_idem.tx_id);
     assert!(visible_root.visible_at.is_some());
+    initial_idem.visible_at = None;
+    initial_idem.tx_record = None;
+    backend
+        .put(
+            &scoped_path(&ControlPlaneTxPaths::idempotency(
+                ControlPlaneTxDomain::Root,
+                "idem-root-repair-idem-01",
+            )),
+            Bytes::from(serde_json::to_vec(&initial_idem)?),
+            WritePrecondition::None,
+        )
+        .await?;
 
     let replay = root_request(
         "idem-root-repair-idem-01",

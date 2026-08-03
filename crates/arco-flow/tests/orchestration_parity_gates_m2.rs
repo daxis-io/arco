@@ -3,6 +3,14 @@
 //! Focus: controller emission semantics (atomic batches), bounded catchup, CAS-friendly
 //! poll sensors, and backfill chunk planning invariants.
 
+// Advisory lint scope for test code (#331): the pedantic/nursery lints below
+// conflict with test ergonomics here; production code keeps them active.
+#![allow(
+    clippy::manual_let_else,
+    clippy::too_many_lines,
+    clippy::unreadable_literal
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -103,18 +111,12 @@ fn parity_m2_schedule_reconcile_emits_tick_and_run_requested_in_same_batch() {
 
     let tick = events
         .iter()
-        .find_map(|e| match &e.data {
-            OrchestrationEventData::ScheduleTicked { .. } => Some(e),
-            _ => None,
-        })
+        .find(|e| matches!(&e.data, OrchestrationEventData::ScheduleTicked { .. }))
         .expect("expected ScheduleTicked");
 
     let run_req = events
         .iter()
-        .find_map(|e| match &e.data {
-            OrchestrationEventData::RunRequested { .. } => Some(e),
-            _ => None,
-        })
+        .find(|e| matches!(&e.data, OrchestrationEventData::RunRequested { .. }))
         .expect("expected RunRequested");
 
     // Atomic batch: both events returned together.
@@ -491,11 +493,8 @@ async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload(
 -> arco_flow::error::Result<()> {
     use arco_core::{MemoryBackend, ScopedStorage, WritePrecondition};
     use arco_flow::orchestration::compactor::MicroCompactor;
+    use arco_flow::orchestration::ledger::LedgerWriter;
     use bytes::Bytes;
-
-    fn orchestration_event_path(date: &str, event_id: &str) -> String {
-        format!("ledger/orchestration/{date}/{event_id}.json")
-    }
 
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant-abc", "workspace-prod")?;
@@ -529,7 +528,7 @@ async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload(
     );
     event1.event_id = "evt_01_sensor_eval".to_string();
 
-    let path1 = orchestration_event_path("2025-01-01", &event1.event_id);
+    let path1 = LedgerWriter::event_path(&event1);
     storage
         .put_raw(
             &path1,
@@ -573,7 +572,7 @@ async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload(
     );
     event2.event_id = "evt_02_sensor_eval".to_string();
 
-    let path2 = orchestration_event_path("2025-01-01", &event2.event_id);
+    let path2 = LedgerWriter::event_path(&event2);
     storage
         .put_raw(
             &path2,
@@ -615,7 +614,7 @@ async fn parity_m2_poll_sensor_cursor_and_min_interval_survive_compactor_reload(
     );
     event3.event_id = "evt_03_sensor_eval".to_string();
 
-    let path3 = orchestration_event_path("2025-01-01", &event3.event_id);
+    let path3 = LedgerWriter::event_path(&event3);
     storage
         .put_raw(
             &path3,

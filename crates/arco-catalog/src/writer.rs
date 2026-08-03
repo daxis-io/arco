@@ -28,13 +28,22 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use chrono::Utc;
+use sha2::{Digest as _, Sha256};
+use ulid::Ulid;
 use uuid::Uuid;
 
+use arco_core::control_plane_transactions::{
+    ControlPlaneHandleMutationRef, ControlPlaneHandleRecord, ControlPlaneHandleScope,
+    ControlPlaneHandleStatus,
+};
 use arco_core::storage::StorageBackend;
 use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
-    CatalogDomain, CatalogPaths, ControlPlaneScope, DeltaPaths, ScopedStorage, TableFormat,
+    CatalogDomain, CatalogEventPayload, CatalogPaths, ControlPlaneIdempotencyRecord,
+    ControlPlaneScope, ControlPlaneTxDomain, ControlPlaneTxKind, ControlPlaneTxPaths,
+    ControlPlaneTxRecord, ControlPlaneTxStatus, DeltaPaths, EventId, ScopedStorage, TableFormat,
 };
 
 use crate::error::{CatalogError, Result};
@@ -49,13 +58,17 @@ use crate::manifest::SnapshotInfo;
 use crate::parquet_util::{
     CatalogRecord, ColumnRecord, LineageEdgeRecord, NamespaceRecord, TableRecord,
 };
+use crate::state::CatalogState;
 use crate::sync_compactor::SyncCompactor;
 use crate::tier1_events::{
     CatalogDdlEvent, CatalogDdlEventV2, CatalogDdlEventV3, CatalogDdlEventV4, LineageDdlEvent,
 };
 use crate::tier1_state;
-use crate::tier1_writer::Tier1Writer;
-use crate::write_options::{IdempotencyKey, WriteOptions};
+use crate::tier1_writer::{
+    CatalogTransactionEventInspection, CatalogTransactionEventRecovery,
+    CatalogTransactionPublication, PublishedCatalogTransactionEvent, Tier1Writer,
+};
+use crate::write_options::{CatalogTransactionIdentity, IdempotencyKey, WriteOptions};
 
 /// Native metastore event accepted by future catalog product writer paths.
 pub type MetastoreWriteEvent = crate::metastore::events::MetastoreEvent;
@@ -349,7 +362,9 @@ impl From<&Column> for ColumnRecord {
 /// A lineage edge representing data flow between entities.
 #[derive(Debug, Clone)]
 pub struct LineageEdge {
-    /// Unique edge ID (ULID).
+    /// Unique edge ID. Mixed identity: content-derived SHA-256 hex for edges
+    /// minted by the L0 route, ULID for rows written before it. Opaque to
+    /// readers.
     pub id: String,
     /// Source entity ID.
     pub source_id: String,
@@ -430,7 +445,7 @@ pub struct RegisterTableInSchemaRequest {
 }
 
 /// Column definition for table registration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDefinition {
     /// Column name.
     pub name: String,
@@ -453,6 +468,905 @@ pub struct TablePatch {
     pub location: Option<Option<String>>,
     /// New format (None = no change).
     pub format: Option<Option<String>>,
+}
+
+/// Canonical internal request shape for a durable catalog transaction.
+///
+/// This is an implementation contract shared by the control-plane transaction
+/// service and the catalog writer. It does not expose a mutation entry point.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogTransactionRequest {
+    /// Creates one named catalog.
+    CreateCatalog {
+        /// Catalog name.
+        catalog: String,
+        /// Optional description.
+        description: Option<String>,
+    },
+    /// Creates one schema in a catalog.
+    CreateSchema {
+        /// Catalog name.
+        catalog: String,
+        /// Schema name.
+        schema: String,
+        /// Optional description.
+        description: Option<String>,
+    },
+    /// Registers one table.
+    RegisterTable {
+        /// Catalog name.
+        catalog: String,
+        /// Schema name.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Optional description.
+        description: Option<String>,
+        /// Optional table location.
+        location: Option<String>,
+        /// Optional table format.
+        format: Option<String>,
+        /// Ordered column definitions.
+        columns: Vec<ColumnDefinition>,
+    },
+    /// Updates one table.
+    UpdateTable {
+        /// Catalog name.
+        catalog: String,
+        /// Schema name.
+        schema: String,
+        /// Table name.
+        table: String,
+        /// Optional description patch.
+        description: Option<Option<String>>,
+        /// Optional location patch.
+        location: Option<Option<String>>,
+        /// Optional format patch.
+        format: Option<Option<String>>,
+    },
+    /// Drops one table.
+    DropTable {
+        /// Catalog name.
+        catalog: String,
+        /// Schema name.
+        schema: String,
+        /// Table name.
+        table: String,
+    },
+    /// Renames one table.
+    RenameTable {
+        /// Catalog name.
+        catalog: String,
+        /// Schema name.
+        schema: String,
+        /// Current table name.
+        table: String,
+        /// New table name.
+        new_table: String,
+    },
+}
+
+impl CatalogTransactionRequest {
+    /// Returns the canonical JSON value hashed for frozen transaction identity.
+    #[must_use]
+    pub fn request_value(&self) -> serde_json::Value {
+        match self {
+            Self::CreateCatalog {
+                catalog,
+                description,
+            } => serde_json::json!({
+                "type": "create_catalog",
+                "catalog": catalog,
+                "description": description,
+            }),
+            Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => serde_json::json!({
+                "type": "create_schema",
+                "catalog": catalog,
+                "schema": schema,
+                "description": description,
+            }),
+            Self::RegisterTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+                columns,
+            } => serde_json::json!({
+                "type": "register_table",
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+                "description": description,
+                "location": location,
+                "format": format,
+                "columns": columns.iter().map(|column| serde_json::json!({
+                    "name": column.name,
+                    "data_type": column.data_type,
+                    "is_nullable": column.is_nullable,
+                    "ordinal": column.ordinal,
+                    "description": column.description,
+                })).collect::<Vec<_>>(),
+            }),
+            Self::UpdateTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+            } => Self::update_request_value(
+                catalog,
+                schema,
+                table,
+                description.as_ref(),
+                location.as_ref(),
+                format.as_ref(),
+            ),
+            Self::DropTable {
+                catalog,
+                schema,
+                table,
+            } => serde_json::json!({
+                "type": "drop_table",
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+            }),
+            Self::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            } => serde_json::json!({
+                "type": "rename_table",
+                "catalog": catalog,
+                "schema": schema,
+                "table": table,
+                "new_table": new_table,
+            }),
+        }
+    }
+
+    /// Returns the prefixed canonical request digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonical request hashing fails.
+    pub fn request_hash(&self) -> Result<String> {
+        canonical_request_hash(&self.request_value())
+            .map(|hash| format!("sha256:{hash}"))
+            .map_err(|error| CatalogError::InvariantViolation {
+                message: format!("failed to hash catalog transaction request: {error}"),
+            })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn validate_event_realization(
+        &self,
+        event_type: &str,
+        event_version: u32,
+        payload: &serde_json::Value,
+        base: &CatalogState,
+        tenant: &str,
+        workspace: &str,
+    ) -> Result<serde_json::Value> {
+        match self {
+            Self::CreateCatalog {
+                catalog,
+                description,
+            } => validate_create_catalog_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                catalog,
+                description.as_deref(),
+            ),
+            Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => validate_create_schema_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                catalog,
+                schema,
+                description.as_deref(),
+            ),
+            Self::RegisterTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+                columns,
+            } => validate_register_table_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                CatalogTableTarget {
+                    catalog,
+                    schema,
+                    table,
+                },
+                NewTableFields {
+                    description,
+                    location,
+                    format,
+                    columns,
+                },
+                tenant,
+                workspace,
+            ),
+            Self::UpdateTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+            } => validate_update_table_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                CatalogTableTarget {
+                    catalog,
+                    schema,
+                    table,
+                },
+                TablePatchFields {
+                    description,
+                    location,
+                    format,
+                },
+                tenant,
+                workspace,
+            ),
+            Self::DropTable {
+                catalog,
+                schema,
+                table,
+            } => validate_drop_table_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                CatalogTableTarget {
+                    catalog,
+                    schema,
+                    table,
+                },
+            ),
+            Self::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            } => validate_rename_table_realization(
+                event_type,
+                event_version,
+                payload,
+                base,
+                CatalogTableTarget {
+                    catalog,
+                    schema,
+                    table,
+                },
+                new_table,
+            ),
+        }
+    }
+
+    #[allow(clippy::option_option)]
+    fn update_request_value(
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        description: Option<&Option<String>>,
+        location: Option<&Option<String>>,
+        format: Option<&Option<String>>,
+    ) -> serde_json::Value {
+        let mut value = serde_json::Map::from_iter([
+            (
+                "type".to_string(),
+                serde_json::Value::String("update_table".to_string()),
+            ),
+            (
+                "catalog".to_string(),
+                serde_json::Value::String(catalog.to_string()),
+            ),
+            (
+                "schema".to_string(),
+                serde_json::Value::String(schema.to_string()),
+            ),
+            (
+                "table".to_string(),
+                serde_json::Value::String(table.to_string()),
+            ),
+        ]);
+        for (field, patch) in [
+            ("description", description),
+            ("location", location),
+            ("format", format),
+        ] {
+            if let Some(patch) = patch {
+                value.insert(
+                    field.to_string(),
+                    patch
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
+                );
+            }
+        }
+        serde_json::Value::Object(value)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CatalogTableTarget<'a> {
+    catalog: &'a str,
+    schema: &'a str,
+    table: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct NewTableFields<'a> {
+    description: &'a Option<String>,
+    location: &'a Option<String>,
+    format: &'a Option<String>,
+    columns: &'a [ColumnDefinition],
+}
+
+#[derive(Clone, Copy)]
+#[allow(clippy::option_option)]
+struct TablePatchFields<'a> {
+    description: &'a Option<Option<String>>,
+    location: &'a Option<Option<String>>,
+    format: &'a Option<Option<String>>,
+}
+
+fn catalog_event_realization_error() -> CatalogError {
+    CatalogError::InvariantViolation {
+        message: "catalog transaction event does not realize its reviewed staged operation"
+            .to_string(),
+    }
+}
+
+fn decode_exact_catalog_event<T>(payload: &serde_json::Value) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let decoded = serde_json::from_value::<T>(payload.clone())
+        .map_err(|_| catalog_event_realization_error())?;
+    if serde_json::to_value(&decoded).map_err(|_| catalog_event_realization_error())? != *payload {
+        return Err(catalog_event_realization_error());
+    }
+    Ok(decoded)
+}
+
+fn validate_catalog_event_version(
+    event_type: &str,
+    event_version: u32,
+    expected_version: u32,
+) -> Result<()> {
+    if event_type != "catalog.ddl" || event_version != expected_version {
+        return Err(catalog_event_realization_error());
+    }
+    Ok(())
+}
+
+fn runtime_uuid_v7_is_valid(value: &str) -> bool {
+    Uuid::parse_str(value)
+        .is_ok_and(|uuid| uuid.get_version_num() == 7 && uuid.to_string() == value)
+}
+
+fn runtime_timestamp_is_valid(value: i64) -> bool {
+    value > 0
+}
+
+fn replace_semantic_field(
+    semantics: &mut serde_json::Value,
+    pointer: &str,
+    replacement: &str,
+) -> Result<()> {
+    let field = semantics
+        .pointer_mut(pointer)
+        .ok_or_else(catalog_event_realization_error)?;
+    *field = serde_json::Value::String(replacement.to_string());
+    Ok(())
+}
+
+fn catalog_record_for_name<'a>(
+    state: &'a CatalogState,
+    catalog: &str,
+) -> Result<&'a CatalogRecord> {
+    state
+        .catalogs
+        .iter()
+        .find(|candidate| candidate.name == catalog)
+        .ok_or_else(catalog_event_realization_error)
+}
+
+fn namespace_record_for_target<'a>(
+    state: &'a CatalogState,
+    catalog: &str,
+    schema: &str,
+) -> Result<&'a NamespaceRecord> {
+    let catalog_record = catalog_record_for_name(state, catalog)?;
+    let default_catalog_id = state
+        .catalogs
+        .iter()
+        .find(|candidate| candidate.name == "default")
+        .map(|candidate| candidate.id.as_str());
+    state
+        .namespaces
+        .iter()
+        .find(|candidate| {
+            candidate.name == schema
+                && candidate.catalog_id.as_deref().or(default_catalog_id)
+                    == Some(catalog_record.id.as_str())
+        })
+        .ok_or_else(catalog_event_realization_error)
+}
+
+fn table_record_for_target<'a>(
+    state: &'a CatalogState,
+    target: CatalogTableTarget<'_>,
+) -> Result<&'a TableRecord> {
+    let namespace = namespace_record_for_target(state, target.catalog, target.schema)?;
+    state
+        .tables
+        .iter()
+        .find(|candidate| candidate.namespace_id == namespace.id && candidate.name == target.table)
+        .ok_or_else(catalog_event_realization_error)
+}
+
+fn validate_create_catalog_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    name: &str,
+    description: Option<&str>,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 2)?;
+    let CatalogDdlEventV2::CatalogCreated { catalog } =
+        decode_exact_catalog_event::<CatalogDdlEventV2>(payload)?;
+    if base.catalogs.iter().any(|candidate| candidate.name == name)
+        || catalog.name != name
+        || catalog.description.as_deref() != description
+        || catalog.properties_json.is_some()
+        || catalog.storage_root.is_some()
+        || catalog.created_at != catalog.updated_at
+        || !runtime_timestamp_is_valid(catalog.created_at)
+        || !runtime_uuid_v7_is_valid(&catalog.id)
+    {
+        return Err(catalog_event_realization_error());
+    }
+    let mut semantics = payload.clone();
+    replace_semantic_field(&mut semantics, "/catalog/id", "runtime_uuid_v7")?;
+    replace_semantic_field(
+        &mut semantics,
+        "/catalog/created_at",
+        "runtime_timestamp_ms",
+    )?;
+    replace_semantic_field(
+        &mut semantics,
+        "/catalog/updated_at",
+        "runtime_timestamp_ms",
+    )?;
+    Ok(semantics)
+}
+
+fn validate_create_schema_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    catalog_name: &str,
+    schema: &str,
+    description: Option<&str>,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 1)?;
+    let CatalogDdlEvent::NamespaceCreated { namespace } =
+        decode_exact_catalog_event::<CatalogDdlEvent>(payload)?
+    else {
+        return Err(catalog_event_realization_error());
+    };
+    let catalog = catalog_record_for_name(base, catalog_name)?;
+    let default_catalog_id = base
+        .catalogs
+        .iter()
+        .find(|candidate| candidate.name == "default")
+        .map(|candidate| candidate.id.as_str());
+    if base.namespaces.iter().any(|candidate| {
+        candidate.name == schema
+            && candidate.catalog_id.as_deref().or(default_catalog_id) == Some(catalog.id.as_str())
+    }) || namespace.catalog_id.as_deref() != Some(catalog.id.as_str())
+        || namespace.name != schema
+        || namespace.description.as_deref() != description
+        || namespace.properties_json.is_some()
+        || namespace.storage_root.is_some()
+        || namespace.created_at != namespace.updated_at
+        || !runtime_timestamp_is_valid(namespace.created_at)
+        || !runtime_uuid_v7_is_valid(&namespace.id)
+    {
+        return Err(catalog_event_realization_error());
+    }
+    let mut semantics = payload.clone();
+    replace_semantic_field(&mut semantics, "/namespace/id", "runtime_uuid_v7")?;
+    replace_semantic_field(
+        &mut semantics,
+        "/namespace/created_at",
+        "runtime_timestamp_ms",
+    )?;
+    replace_semantic_field(
+        &mut semantics,
+        "/namespace/updated_at",
+        "runtime_timestamp_ms",
+    )?;
+    Ok(semantics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_register_table_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    target: CatalogTableTarget<'_>,
+    fields: NewTableFields<'_>,
+    tenant: &str,
+    workspace: &str,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 1)?;
+    let CatalogDdlEvent::TableRegistered { table, columns } =
+        decode_exact_catalog_event::<CatalogDdlEvent>(payload)?
+    else {
+        return Err(catalog_event_realization_error());
+    };
+    let namespace = namespace_record_for_target(base, target.catalog, target.schema)?;
+    let expected_format = normalize_new_table_format(fields.format.as_deref())?;
+    let format = TableFormat::parse(&expected_format).map_err(CatalogError::from)?;
+    let expected_location =
+        normalize_table_location_for_write(format, fields.location.clone(), tenant, workspace)?;
+    let table_matches_reviewed_fields = table.namespace_id == namespace.id
+        && table.name == target.table
+        && table.description == *fields.description
+        && table.location == expected_location
+        && table.format.as_deref() == Some(expected_format.as_str())
+        && table.table_type.is_none()
+        && table.properties_json.is_none()
+        && table.created_at == table.updated_at
+        && runtime_timestamp_is_valid(table.created_at)
+        && runtime_uuid_v7_is_valid(&table.id);
+    if base
+        .tables
+        .iter()
+        .any(|candidate| candidate.namespace_id == namespace.id && candidate.name == target.table)
+        || !table_matches_reviewed_fields
+        || columns.len() != fields.columns.len()
+    {
+        return Err(catalog_event_realization_error());
+    }
+    let mut column_ids = std::collections::HashSet::new();
+    for (actual, expected) in columns.iter().zip(fields.columns) {
+        let belongs_to_registered_table = actual.table_id == table.id;
+        let column_matches_reviewed_fields = actual.name == expected.name
+            && actual.data_type == expected.data_type
+            && actual.is_nullable == expected.is_nullable
+            && actual.ordinal == expected.ordinal
+            && actual.description == expected.description
+            && runtime_uuid_v7_is_valid(&actual.id);
+        if !belongs_to_registered_table
+            || !column_matches_reviewed_fields
+            || !column_ids.insert(actual.id.as_str())
+        {
+            return Err(catalog_event_realization_error());
+        }
+    }
+    let mut semantics = payload.clone();
+    replace_semantic_field(&mut semantics, "/table/id", "runtime_uuid_v7")?;
+    replace_semantic_field(&mut semantics, "/table/created_at", "runtime_timestamp_ms")?;
+    replace_semantic_field(&mut semantics, "/table/updated_at", "runtime_timestamp_ms")?;
+    for index in 0..columns.len() {
+        replace_semantic_field(
+            &mut semantics,
+            &format!("/columns/{index}/id"),
+            "runtime_uuid_v7",
+        )?;
+        replace_semantic_field(
+            &mut semantics,
+            &format!("/columns/{index}/table_id"),
+            "runtime_table_uuid_v7",
+        )?;
+    }
+    Ok(semantics)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_update_table_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    target: CatalogTableTarget<'_>,
+    patch: TablePatchFields<'_>,
+    tenant: &str,
+    workspace: &str,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 1)?;
+    let CatalogDdlEvent::TableUpdated { table } =
+        decode_exact_catalog_event::<CatalogDdlEvent>(payload)?
+    else {
+        return Err(catalog_event_realization_error());
+    };
+    let current = table_record_for_target(base, target)?;
+    let mut expected = current.clone();
+    if let Some(description) = patch.description {
+        expected.description.clone_from(description);
+    }
+    if let Some(location) = patch.location {
+        expected.location.clone_from(location);
+    }
+    if let Some(format) = patch.format {
+        expected.format = normalize_table_format_patch(format.clone())?;
+    }
+    let effective_format = expected
+        .format
+        .as_deref()
+        .map(TableFormat::parse)
+        .transpose()
+        .map_err(CatalogError::from)?;
+    if effective_format == Some(TableFormat::Delta) {
+        expected.location = normalize_table_location_for_write(
+            TableFormat::Delta,
+            expected.location,
+            tenant,
+            workspace,
+        )?;
+    }
+    if !runtime_timestamp_is_valid(table.updated_at)
+        || table.updated_at < current.updated_at
+        || table.updated_at < current.created_at
+    {
+        return Err(catalog_event_realization_error());
+    }
+    expected.updated_at = table.updated_at;
+    if table != expected {
+        return Err(catalog_event_realization_error());
+    }
+    let mut semantics = payload.clone();
+    replace_semantic_field(&mut semantics, "/table/updated_at", "runtime_timestamp_ms")?;
+    Ok(semantics)
+}
+
+fn validate_drop_table_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    target: CatalogTableTarget<'_>,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 1)?;
+    let CatalogDdlEvent::TableDropped {
+        table_id,
+        namespace_id,
+        table_name,
+    } = decode_exact_catalog_event::<CatalogDdlEvent>(payload)?
+    else {
+        return Err(catalog_event_realization_error());
+    };
+    let table = table_record_for_target(base, target)?;
+    if table_id != table.id || namespace_id != table.namespace_id || table_name != target.table {
+        return Err(catalog_event_realization_error());
+    }
+    Ok(payload.clone())
+}
+
+fn validate_rename_table_realization(
+    event_type: &str,
+    event_version: u32,
+    payload: &serde_json::Value,
+    base: &CatalogState,
+    target: CatalogTableTarget<'_>,
+    new_table: &str,
+) -> Result<serde_json::Value> {
+    validate_catalog_event_version(event_type, event_version, 1)?;
+    let CatalogDdlEvent::TableRenamed {
+        table_id,
+        namespace_id,
+        old_name,
+        new_name,
+        updated_at,
+    } = decode_exact_catalog_event::<CatalogDdlEvent>(payload)?
+    else {
+        return Err(catalog_event_realization_error());
+    };
+    let table = table_record_for_target(base, target)?;
+    if table_id != table.id
+        || namespace_id != table.namespace_id
+        || old_name != target.table
+        || new_name != new_table
+        || !runtime_timestamp_is_valid(updated_at)
+        || updated_at < table.updated_at
+        || base.tables.iter().any(|candidate| {
+            target.table != new_table
+                && candidate.namespace_id == table.namespace_id
+                && candidate.name == new_table
+        })
+    {
+        return Err(catalog_event_realization_error());
+    }
+    let mut semantics = payload.clone();
+    replace_semantic_field(&mut semantics, "/updated_at", "runtime_timestamp_ms")?;
+    Ok(semantics)
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum StagedCatalogRequestAuthority {
+    CreateCatalog {
+        catalog: String,
+        description: Option<String>,
+    },
+    CreateSchema {
+        catalog: String,
+        schema: String,
+        description: Option<String>,
+    },
+    RegisterTable {
+        catalog: String,
+        schema: String,
+        table: String,
+        description: Option<String>,
+        location: Option<String>,
+        format: Option<String>,
+        columns: Vec<StagedCatalogColumnAuthority>,
+    },
+    UpdateTable {
+        catalog: String,
+        schema: String,
+        table: String,
+        description: StagedCatalogTextPatchAuthority,
+        location: StagedCatalogTextPatchAuthority,
+        format: StagedCatalogTextPatchAuthority,
+    },
+    DropTable {
+        catalog: String,
+        schema: String,
+        table: String,
+    },
+    RenameTable {
+        catalog: String,
+        schema: String,
+        table: String,
+        new_table: String,
+    },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StagedCatalogColumnAuthority {
+    name: String,
+    data_type: String,
+    is_nullable: bool,
+    ordinal: i32,
+    description: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+enum StagedCatalogTextPatchAuthority {
+    Unchanged,
+    Clear,
+    Set(String),
+}
+
+impl StagedCatalogTextPatchAuthority {
+    #[allow(clippy::option_option)]
+    fn into_nested(self) -> Option<Option<String>> {
+        match self {
+            Self::Unchanged => None,
+            Self::Clear => Some(None),
+            Self::Set(value) => Some(Some(value)),
+        }
+    }
+}
+
+impl From<StagedCatalogRequestAuthority> for CatalogTransactionRequest {
+    fn from(authority: StagedCatalogRequestAuthority) -> Self {
+        match authority {
+            StagedCatalogRequestAuthority::CreateCatalog {
+                catalog,
+                description,
+            } => Self::CreateCatalog {
+                catalog,
+                description,
+            },
+            StagedCatalogRequestAuthority::CreateSchema {
+                catalog,
+                schema,
+                description,
+            } => Self::CreateSchema {
+                catalog,
+                schema,
+                description,
+            },
+            StagedCatalogRequestAuthority::RegisterTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+                columns,
+            } => Self::RegisterTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+                columns: columns
+                    .into_iter()
+                    .map(|column| ColumnDefinition {
+                        name: column.name,
+                        data_type: column.data_type,
+                        is_nullable: column.is_nullable,
+                        ordinal: column.ordinal,
+                        description: column.description,
+                    })
+                    .collect(),
+            },
+            StagedCatalogRequestAuthority::UpdateTable {
+                catalog,
+                schema,
+                table,
+                description,
+                location,
+                format,
+            } => Self::UpdateTable {
+                catalog,
+                schema,
+                table,
+                description: description.into_nested(),
+                location: location.into_nested(),
+                format: format.into_nested(),
+            },
+            StagedCatalogRequestAuthority::DropTable {
+                catalog,
+                schema,
+                table,
+            } => Self::DropTable {
+                catalog,
+                schema,
+                table,
+            },
+            StagedCatalogRequestAuthority::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            } => Self::RenameTable {
+                catalog,
+                schema,
+                table,
+                new_table,
+            },
+        }
+    }
 }
 
 /// Patch for updating catalog UC-facing metadata.
@@ -526,6 +1440,44 @@ pub struct DroppedTableIdentity {
 struct DefaultCatalogOutcome {
     catalog: CatalogRecord,
     repair_pending: bool,
+}
+
+#[derive(Debug)]
+struct FrozenCatalogHandleBinding {
+    handle_id: String,
+    ordinal: u64,
+    direct_identity: String,
+    root_child: bool,
+}
+
+#[derive(Debug)]
+struct FrozenCatalogHandleAuthority {
+    handle: ControlPlaneHandleRecord,
+    reference: ControlPlaneHandleMutationRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct FrozenCatalogClaimIdentity {
+    domain: ControlPlaneTxDomain,
+    kind: ControlPlaneTxKind,
+    idempotency_key: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FrozenCatalogHandleIntent {
+    mutation_ref: ControlPlaneHandleMutationRef,
+    claim_identities: Vec<FrozenCatalogClaimIdentity>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FrozenCatalogIdentityAuthority {
+    record_type: String,
+    version: u16,
+    handle_id: String,
+    scope: ControlPlaneHandleScope,
+    ordinal: u64,
+    legacy_reservations: Vec<FrozenCatalogClaimIdentity>,
+    handle_intent: Option<FrozenCatalogHandleIntent>,
 }
 
 impl EventSource {
@@ -1058,7 +2010,1144 @@ impl CatalogWriter {
         outcome
     }
 
-    fn default_catalog_id(state: &crate::state::CatalogState) -> Option<&str> {
+    fn parse_frozen_catalog_handle_binding(
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<FrozenCatalogHandleBinding> {
+        fn parse_direct(value: &str) -> Result<(String, u64)> {
+            let value =
+                value
+                    .strip_prefix("handle:")
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: "frozen catalog identity is not owned by a durable handle"
+                            .to_string(),
+                    })?;
+            let (handle_id, encoded_ordinal) =
+                value
+                    .split_once(":mutation:")
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: "frozen catalog handle identity is non-canonical".to_string(),
+                    })?;
+            if handle_id.contains(':') {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog handle identity is non-canonical".to_string(),
+                });
+            }
+            ControlPlaneTxPaths::handle_record(handle_id).map_err(|_| {
+                CatalogError::InvariantViolation {
+                    message: "frozen catalog handle identity is non-canonical".to_string(),
+                }
+            })?;
+            let ordinal =
+                encoded_ordinal
+                    .parse::<u64>()
+                    .map_err(|_| CatalogError::InvariantViolation {
+                        message: "frozen catalog handle ordinal is non-canonical".to_string(),
+                    })?;
+            if ordinal == 0 || format!("{ordinal:020}") != encoded_ordinal {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog handle ordinal is non-canonical".to_string(),
+                });
+            }
+            Ok((handle_id.to_string(), ordinal))
+        }
+
+        let (direct_identity, root_child) =
+            if let Some(value) = idempotency_key.strip_prefix("root:") {
+                let direct = value.strip_suffix(":catalog").ok_or_else(|| {
+                    CatalogError::InvariantViolation {
+                        message: "frozen catalog root-child identity is non-canonical".to_string(),
+                    }
+                })?;
+                if request_id != direct {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "frozen catalog root-child request identity diverges".to_string(),
+                    });
+                }
+                (direct, true)
+            } else {
+                if request_id != idempotency_key {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "frozen catalog request and idempotency identities diverge"
+                            .to_string(),
+                    });
+                }
+                (idempotency_key, false)
+            };
+        let (handle_id, ordinal) = parse_direct(direct_identity)?;
+        Ok(FrozenCatalogHandleBinding {
+            handle_id,
+            ordinal,
+            direct_identity: direct_identity.to_string(),
+            root_child,
+        })
+    }
+
+    async fn load_stable_exact_bytes(&self, path: &str, label: &str) -> Result<Bytes> {
+        let before =
+            self.storage
+                .head_raw(path)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: format!("{label} is missing"),
+                })?;
+        let bytes = self.storage.get_raw(path).await?;
+        let after =
+            self.storage
+                .head_raw(path)
+                .await?
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: format!("{label} disappeared during exact read"),
+                })?;
+        if before.version != after.version {
+            return Err(CatalogError::PreconditionFailed {
+                message: format!("{label} changed during exact read"),
+            });
+        }
+        Ok(bytes)
+    }
+
+    fn parse_canonical_authority(bytes: &[u8], label: &str) -> Result<serde_json::Value> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|_| CatalogError::InvariantViolation {
+                message: format!("{label} is corrupt"),
+            })?;
+        let canonical = arco_core::canonical_json::to_canonical_bytes(&value).map_err(|_| {
+            CatalogError::InvariantViolation {
+                message: format!("{label} cannot be canonicalized"),
+            }
+        })?;
+        if canonical.as_slice() != bytes {
+            return Err(CatalogError::InvariantViolation {
+                message: format!("{label} is not canonical JSON"),
+            });
+        }
+        Ok(value)
+    }
+
+    fn staged_catalog_transaction_request(
+        staged: &serde_json::Value,
+        root_child: bool,
+    ) -> Result<CatalogTransactionRequest> {
+        let mutation = staged
+            .get("mutation")
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "frozen staged mutation body is missing".to_string(),
+            })?;
+        let operation = if root_child {
+            if mutation
+                .get("mutation_type")
+                .and_then(serde_json::Value::as_str)
+                != Some("root")
+            {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog child is not owned by a staged root mutation"
+                        .to_string(),
+                });
+            }
+            let children = mutation
+                .get("mutations")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen root mutation child set is corrupt".to_string(),
+                })?;
+            let mut catalog_children = children.iter().filter(|child| {
+                child.get("domain").and_then(serde_json::Value::as_str) == Some("catalog")
+            });
+            let child =
+                catalog_children
+                    .next()
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: "frozen root mutation has no catalog child".to_string(),
+                    })?;
+            if catalog_children.next().is_some() {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen root mutation has duplicate catalog children".to_string(),
+                });
+            }
+            child
+                .get("operation")
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen root catalog child is missing its operation".to_string(),
+                })?
+        } else {
+            if mutation
+                .get("mutation_type")
+                .and_then(serde_json::Value::as_str)
+                != Some("catalog")
+            {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog identity names a non-catalog staged mutation"
+                        .to_string(),
+                });
+            }
+            mutation
+                .get("operation")
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen catalog mutation is missing its operation".to_string(),
+                })?
+        };
+        serde_json::from_value::<StagedCatalogRequestAuthority>(operation.clone())
+            .map(CatalogTransactionRequest::from)
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen staged catalog operation is corrupt".to_string(),
+            })
+    }
+
+    const fn frozen_catalog_claim_kind(domain: ControlPlaneTxDomain) -> ControlPlaneTxKind {
+        match domain {
+            ControlPlaneTxDomain::Catalog => ControlPlaneTxKind::CatalogDdl,
+            ControlPlaneTxDomain::Orchestration => ControlPlaneTxKind::OrchestrationBatch,
+            ControlPlaneTxDomain::Root => ControlPlaneTxKind::RootCommit,
+        }
+    }
+
+    const fn frozen_catalog_claim_kind_rank(kind: ControlPlaneTxKind) -> u8 {
+        match kind {
+            ControlPlaneTxKind::CatalogDdl => 0,
+            ControlPlaneTxKind::OrchestrationBatch => 1,
+            ControlPlaneTxKind::RootCommit => 2,
+        }
+    }
+
+    fn sort_frozen_catalog_claims(claims: &mut [FrozenCatalogClaimIdentity]) {
+        claims.sort_by(|left, right| {
+            left.domain
+                .cmp(&right.domain)
+                .then_with(|| {
+                    Self::frozen_catalog_claim_kind_rank(left.kind)
+                        .cmp(&Self::frozen_catalog_claim_kind_rank(right.kind))
+                })
+                .then_with(|| left.idempotency_key.cmp(&right.idempotency_key))
+        });
+    }
+
+    fn validate_frozen_catalog_claims(
+        claims: &[FrozenCatalogClaimIdentity],
+        binding: &FrozenCatalogHandleBinding,
+        label: &str,
+    ) -> Result<()> {
+        let mut canonical = claims.to_vec();
+        Self::sort_frozen_catalog_claims(&mut canonical);
+        let duplicate = canonical.windows(2).any(|pair| pair[0] == pair[1]);
+        if canonical != claims || duplicate {
+            return Err(CatalogError::InvariantViolation {
+                message: format!("frozen {label} must be sorted and unique"),
+            });
+        }
+        let child_prefix = format!("root:{}:", binding.direct_identity);
+        for claim in claims {
+            let canonical_identity = claim.idempotency_key == binding.direct_identity
+                || claim
+                    .idempotency_key
+                    .strip_prefix(&child_prefix)
+                    .is_some_and(|domain| domain == claim.domain.as_str());
+            if claim.kind != Self::frozen_catalog_claim_kind(claim.domain) || !canonical_identity {
+                return Err(CatalogError::InvariantViolation {
+                    message: format!(
+                        "frozen {label} contains a noncanonical domain claim identity"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn expected_frozen_catalog_claims(
+        staged: &serde_json::Value,
+        binding: &FrozenCatalogHandleBinding,
+    ) -> Result<Vec<FrozenCatalogClaimIdentity>> {
+        let mutation = staged
+            .get("mutation")
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "frozen staged mutation body is missing".to_string(),
+            })?;
+        let mutation_type = mutation
+            .get("mutation_type")
+            .and_then(serde_json::Value::as_str);
+        let mut claims = if binding.root_child {
+            if mutation_type != Some("root") {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog child is not owned by a staged root mutation"
+                        .to_string(),
+                });
+            }
+            let children = mutation
+                .get("mutations")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen root mutation child set is corrupt".to_string(),
+                })?;
+            let mut claims = vec![FrozenCatalogClaimIdentity {
+                domain: ControlPlaneTxDomain::Root,
+                kind: ControlPlaneTxKind::RootCommit,
+                idempotency_key: binding.direct_identity.clone(),
+            }];
+            for child in children {
+                let domain = match child.get("domain").and_then(serde_json::Value::as_str) {
+                    Some("catalog") => ControlPlaneTxDomain::Catalog,
+                    Some("orchestration") => ControlPlaneTxDomain::Orchestration,
+                    _ => {
+                        return Err(CatalogError::InvariantViolation {
+                            message: "frozen root mutation contains an unsupported child domain"
+                                .to_string(),
+                        });
+                    }
+                };
+                claims.push(FrozenCatalogClaimIdentity {
+                    domain,
+                    kind: Self::frozen_catalog_claim_kind(domain),
+                    idempotency_key: format!(
+                        "root:{}:{}",
+                        binding.direct_identity,
+                        domain.as_str()
+                    ),
+                });
+            }
+            claims
+        } else {
+            if mutation_type != Some("catalog") {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog identity names a non-catalog staged mutation"
+                        .to_string(),
+                });
+            }
+            vec![FrozenCatalogClaimIdentity {
+                domain: ControlPlaneTxDomain::Catalog,
+                kind: ControlPlaneTxKind::CatalogDdl,
+                idempotency_key: binding.direct_identity.clone(),
+            }]
+        };
+        Self::sort_frozen_catalog_claims(&mut claims);
+        if claims.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen staged mutation contains duplicate claim identities".to_string(),
+            });
+        }
+        Ok(claims)
+    }
+
+    fn validate_identity_authority(
+        authority: serde_json::Value,
+        handle: &ControlPlaneHandleRecord,
+        handle_reference: &ControlPlaneHandleMutationRef,
+        binding: &FrozenCatalogHandleBinding,
+        expected_claims: &[FrozenCatalogClaimIdentity],
+        idempotency_key: &str,
+    ) -> Result<()> {
+        let authority: FrozenCatalogIdentityAuthority =
+            serde_json::from_value(authority).map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen handle identity authority is corrupt".to_string(),
+            })?;
+        if authority.record_type != "control_plane_transaction_handle_identity_authority"
+            || authority.version != 1
+            || authority.handle_id != binding.handle_id
+            || authority.ordinal != binding.ordinal
+            || authority.scope != handle.scope
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen handle identity authority diverges from its exact path"
+                    .to_string(),
+            });
+        }
+        Self::validate_frozen_catalog_claims(
+            &authority.legacy_reservations,
+            binding,
+            "legacy identity reservations",
+        )?;
+        let intent = authority
+            .handle_intent
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "frozen handle identity authority has no handle intent".to_string(),
+            })?;
+        Self::validate_frozen_catalog_claims(
+            &intent.claim_identities,
+            binding,
+            "handle intent claim identities",
+        )?;
+        if intent.mutation_ref != *handle_reference
+            || intent.claim_identities != expected_claims
+            || !expected_claims.iter().any(|claim| {
+                claim.domain == ControlPlaneTxDomain::Catalog
+                    && claim.kind == ControlPlaneTxKind::CatalogDdl
+                    && claim.idempotency_key == idempotency_key
+            })
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen handle intent diverges from its exact staged authority"
+                    .to_string(),
+            });
+        }
+        if authority
+            .legacy_reservations
+            .iter()
+            .any(|reservation| intent.claim_identities.contains(reservation))
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog claims overlap legacy identity authority".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn load_frozen_catalog_handle_authority(
+        &self,
+        binding: &FrozenCatalogHandleBinding,
+        tx_id: &str,
+        request_hash: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<FrozenCatalogHandleAuthority> {
+        let handle_path =
+            ControlPlaneTxPaths::handle_record(&binding.handle_id).map_err(CatalogError::from)?;
+        let handle_bytes = self
+            .load_stable_exact_bytes(&handle_path, "frozen transaction handle")
+            .await?;
+        let handle =
+            ControlPlaneHandleRecord::from_json_slice(handle_bytes.as_ref()).map_err(|_| {
+                CatalogError::InvariantViolation {
+                    message: "frozen transaction handle is corrupt".to_string(),
+                }
+            })?;
+        if handle.handle_id != binding.handle_id
+            || handle.scope.tenant_id != self.storage.tenant_id()
+            || handle.scope.workspace_id != self.storage.workspace_id()
+            || !matches!(
+                handle.status,
+                ControlPlaneHandleStatus::Committing
+                    | ControlPlaneHandleStatus::RepairRequired
+                    | ControlPlaneHandleStatus::Visible
+            )
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction is not authorized by an executable frozen handle"
+                    .to_string(),
+            });
+        }
+        let index =
+            usize::try_from(binding.ordinal - 1).map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen handle ordinal exceeds addressable memory".to_string(),
+            })?;
+        let reference =
+            handle
+                .mutation_refs
+                .get(index)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen handle is missing its catalog mutation reference".to_string(),
+                })?;
+        let participant =
+            handle
+                .participants
+                .get(index)
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "frozen handle is missing its catalog participant".to_string(),
+                })?;
+        let participant_matches = if binding.root_child {
+            participant.kind == ControlPlaneTxKind::RootCommit
+                && participant.domain == ControlPlaneTxDomain::Root
+                && participant.request_id == binding.direct_identity
+                && participant.idempotency_key == binding.direct_identity
+        } else {
+            participant.kind == ControlPlaneTxKind::CatalogDdl
+                && participant.domain == ControlPlaneTxDomain::Catalog
+                && participant.request_id == request_id
+                && participant.idempotency_key == idempotency_key
+                && participant.request_hash == request_hash
+                && participant
+                    .tx_id
+                    .as_ref()
+                    .is_none_or(|participant_tx_id| participant_tx_id == tx_id)
+        };
+        if reference.ordinal != binding.ordinal
+            || reference.kind != participant.kind
+            || participant.ordinal != binding.ordinal
+            || !participant_matches
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog transaction diverges from its frozen handle participant"
+                    .to_string(),
+            });
+        }
+        let reference = reference.clone();
+        Ok(FrozenCatalogHandleAuthority { handle, reference })
+    }
+
+    async fn validate_frozen_catalog_staged_authority(
+        &self,
+        binding: &FrozenCatalogHandleBinding,
+        handle_authority: &FrozenCatalogHandleAuthority,
+        request_hash: &str,
+        idempotency_key: &str,
+    ) -> Result<(String, CatalogTransactionRequest)> {
+        let authority_path =
+            ControlPlaneTxPaths::handle_identity_authority(&binding.handle_id, binding.ordinal)
+                .map_err(CatalogError::from)?;
+        let authority_bytes = self
+            .load_stable_exact_bytes(
+                &authority_path,
+                "frozen transaction handle identity authority",
+            )
+            .await?;
+        let identity_authority = Self::parse_canonical_authority(
+            authority_bytes.as_ref(),
+            "frozen transaction handle identity authority",
+        )?;
+
+        let staged_bytes = self
+            .load_stable_exact_bytes(
+                &handle_authority.reference.path,
+                "frozen staged catalog mutation",
+            )
+            .await?;
+        let staged_sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&staged_bytes)));
+        if staged_sha256 != handle_authority.reference.sha256 {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen staged catalog mutation digest diverges".to_string(),
+            });
+        }
+        let staged = Self::parse_canonical_authority(
+            staged_bytes.as_ref(),
+            "frozen staged catalog mutation",
+        )?;
+        let staged_scope: ControlPlaneHandleScope =
+            serde_json::from_value(staged.get("scope").cloned().ok_or_else(|| {
+                CatalogError::InvariantViolation {
+                    message: "frozen staged catalog mutation is missing its scope".to_string(),
+                }
+            })?)
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen staged catalog mutation has corrupt scope".to_string(),
+            })?;
+        let expected_kind = if binding.root_child {
+            ControlPlaneTxKind::RootCommit
+        } else {
+            ControlPlaneTxKind::CatalogDdl
+        };
+        let staged_kind: ControlPlaneTxKind =
+            serde_json::from_value(staged.get("kind").cloned().ok_or_else(|| {
+                CatalogError::InvariantViolation {
+                    message: "frozen staged catalog mutation is missing its kind".to_string(),
+                }
+            })?)
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen staged catalog mutation has corrupt kind".to_string(),
+            })?;
+        if staged
+            .get("record_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("control_plane_transaction_handle_mutation")
+            || staged.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || staged.get("handle_id").and_then(serde_json::Value::as_str)
+                != Some(binding.handle_id.as_str())
+            || staged.get("ordinal").and_then(serde_json::Value::as_u64) != Some(binding.ordinal)
+            || staged_scope != handle_authority.handle.scope
+            || staged_kind != expected_kind
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen staged catalog mutation diverges from its exact authority"
+                    .to_string(),
+            });
+        }
+        let expected_claims = Self::expected_frozen_catalog_claims(&staged, binding)?;
+        Self::validate_identity_authority(
+            identity_authority,
+            &handle_authority.handle,
+            &handle_authority.reference,
+            binding,
+            &expected_claims,
+            idempotency_key,
+        )?;
+        let staged_request = Self::staged_catalog_transaction_request(&staged, binding.root_child)?;
+        if staged_request.request_hash()? != request_hash {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog request hash diverges from its staged operation"
+                    .to_string(),
+            });
+        }
+        Ok((staged_sha256, staged_request))
+    }
+
+    fn frozen_catalog_record_matches_claim(
+        record: &ControlPlaneTxRecord<serde_json::Value>,
+        tx_id: &str,
+        request_hash: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> bool {
+        record.tx_id == tx_id
+            && record.kind == ControlPlaneTxKind::CatalogDdl
+            && record.request_id == request_id
+            && record.idempotency_key == idempotency_key
+            && record.request_hash == request_hash
+    }
+
+    fn validate_clean_frozen_catalog_prepared(
+        record: &ControlPlaneTxRecord<serde_json::Value>,
+    ) -> Result<()> {
+        if record.status != ControlPlaneTxStatus::Prepared
+            || record.repair_pending
+            || record.visible_at.is_some()
+            || record.result.is_some()
+            || record.durable_append.is_some()
+            || record.lock_path != CatalogPaths::domain_lock(CatalogDomain::Catalog)
+            || record.fencing_token != 0
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog transaction is not an exact clean prepared predecessor"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_frozen_catalog_visible(
+        record: &ControlPlaneTxRecord<serde_json::Value>,
+    ) -> Result<()> {
+        if record.status != ControlPlaneTxStatus::Visible
+            || record.visible_at.is_none()
+            || record
+                .visible_at
+                .is_some_and(|visible_at| visible_at < record.prepared_at)
+            || record.result.is_none()
+            || record.durable_append.is_some()
+            || record.lock_path != CatalogPaths::domain_lock(CatalogDomain::Catalog)
+            || record.fencing_token == 0
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog visible transaction authority is malformed".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_frozen_catalog_cached_shadow(
+        record: &ControlPlaneTxRecord<serde_json::Value>,
+        cached: &ControlPlaneTxRecord<serde_json::Value>,
+    ) -> Result<()> {
+        if !matches!(
+            record.status,
+            ControlPlaneTxStatus::Prepared | ControlPlaneTxStatus::Aborted
+        ) || record.repair_pending
+            || record.visible_at.is_some()
+            || record.result.is_some()
+            || record.durable_append.is_some()
+            || record.lock_path != CatalogPaths::domain_lock(CatalogDomain::Catalog)
+            || record.fencing_token != 0
+            || record.prepared_at != cached.prepared_at
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog exact record conflicts with cached visible authority"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn frozen_catalog_visible_records_match(
+        left: &ControlPlaneTxRecord<serde_json::Value>,
+        right: &ControlPlaneTxRecord<serde_json::Value>,
+    ) -> bool {
+        let mut left = left.clone();
+        let mut right = right.clone();
+        left.repair_pending = false;
+        right.repair_pending = false;
+        left == right
+    }
+
+    fn validate_frozen_catalog_marker(
+        marker: ControlPlaneIdempotencyRecord,
+        tx_id: &str,
+        request_hash: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<ControlPlaneTxRecord<serde_json::Value>>> {
+        if marker.tx_id != tx_id
+            || marker.kind != ControlPlaneTxKind::CatalogDdl
+            || marker.request_id != request_id
+            || marker.idempotency_key != idempotency_key
+            || marker.request_hash != request_hash
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog idempotency claim diverges from its handle".to_string(),
+            });
+        }
+        let marker_visible_at = marker.visible_at;
+        let cached: Option<ControlPlaneTxRecord<serde_json::Value>> = marker
+            .tx_record
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "cached frozen catalog transaction record is corrupt".to_string(),
+            })?;
+        match (&cached, marker_visible_at) {
+            (Some(cached), Some(marker_visible_at)) => {
+                if !Self::frozen_catalog_record_matches_claim(
+                    cached,
+                    tx_id,
+                    request_hash,
+                    request_id,
+                    idempotency_key,
+                ) || cached.visible_at != Some(marker_visible_at)
+                {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "cached frozen catalog transaction diverges from its exact claim"
+                            .to_string(),
+                    });
+                }
+                Self::validate_frozen_catalog_visible(cached)?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog idempotency marker has incomplete visible authority"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(cached)
+    }
+
+    async fn validate_frozen_catalog_low_level_claim(
+        &self,
+        tx_id: &str,
+        request_hash: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        let marker_path =
+            ControlPlaneTxPaths::idempotency(ControlPlaneTxDomain::Catalog, idempotency_key);
+        let marker_bytes = self
+            .load_stable_exact_bytes(&marker_path, "frozen catalog idempotency claim")
+            .await?;
+        let marker: ControlPlaneIdempotencyRecord = serde_json::from_slice(marker_bytes.as_ref())
+            .map_err(|_| {
+            CatalogError::InvariantViolation {
+                message: "frozen catalog idempotency claim is corrupt".to_string(),
+            }
+        })?;
+        let cached = Self::validate_frozen_catalog_marker(
+            marker,
+            tx_id,
+            request_hash,
+            request_id,
+            idempotency_key,
+        )?;
+
+        let record_path = ControlPlaneTxPaths::record(ControlPlaneTxDomain::Catalog, tx_id);
+        let exact = if self.storage.head_raw(&record_path).await?.is_some() {
+            let record_bytes = self
+                .load_stable_exact_bytes(&record_path, "frozen catalog transaction record")
+                .await?;
+            let record: ControlPlaneTxRecord<serde_json::Value> =
+                serde_json::from_slice(record_bytes.as_ref()).map_err(|_| {
+                    CatalogError::InvariantViolation {
+                        message: "frozen catalog transaction record is corrupt".to_string(),
+                    }
+                })?;
+            if !Self::frozen_catalog_record_matches_claim(
+                &record,
+                tx_id,
+                request_hash,
+                request_id,
+                idempotency_key,
+            ) {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog claim diverges from its exact low-level transaction"
+                        .to_string(),
+                });
+            }
+            Some(record)
+        } else {
+            None
+        };
+        let mutation_authorized = match (exact.as_ref(), cached.as_ref()) {
+            (Some(exact), None) if exact.status == ControlPlaneTxStatus::Prepared => {
+                Self::validate_clean_frozen_catalog_prepared(exact)?;
+                true
+            }
+            (Some(exact), None) if exact.status == ControlPlaneTxStatus::Visible => {
+                Self::validate_frozen_catalog_visible(exact)?;
+                false
+            }
+            (Some(exact), Some(cached)) if exact.status == ControlPlaneTxStatus::Visible => {
+                Self::validate_frozen_catalog_visible(exact)?;
+                if !Self::frozen_catalog_visible_records_match(exact, cached) {
+                    return Err(CatalogError::InvariantViolation {
+                        message: "exact and cached frozen catalog visible authority diverge"
+                            .to_string(),
+                    });
+                }
+                false
+            }
+            (Some(exact), Some(cached)) => {
+                Self::validate_frozen_catalog_cached_shadow(exact, cached)?;
+                false
+            }
+            (None, Some(_)) => false,
+            (None, None) => {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog transaction has no exact or cached record".to_string(),
+                });
+            }
+            (Some(_), None) => {
+                return Err(CatalogError::InvariantViolation {
+                    message:
+                        "frozen catalog exact transaction is neither clean prepared nor visible"
+                            .to_string(),
+                });
+            }
+        };
+        Ok(mutation_authorized)
+    }
+
+    /// Exact-reads frozen handle authority and returns an opaque catalog capability.
+    ///
+    /// This read-only seam is internal to durable handle execution. Handle-shaped
+    /// caller syntax, without matching handle, staged, identity, idempotency, and
+    /// low-level transaction records, cannot produce a capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any durable authority is missing, changing,
+    /// noncanonical, out of scope, or divergent from the exact catalog request.
+    #[doc(hidden)]
+    pub async fn authorize_frozen_catalog_transaction(
+        &self,
+        tx_id: &str,
+        request_hash: &str,
+        request_id: &str,
+        idempotency_key: &str,
+    ) -> Result<CatalogTransactionIdentity> {
+        let parsed_tx_id =
+            Ulid::from_string(tx_id).map_err(|_| CatalogError::InvariantViolation {
+                message: "frozen catalog transaction ID is non-canonical".to_string(),
+            })?;
+        if parsed_tx_id.to_string() != tx_id {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog transaction ID is non-canonical".to_string(),
+            });
+        }
+        let binding = Self::parse_frozen_catalog_handle_binding(request_id, idempotency_key)?;
+        let authority = self
+            .load_frozen_catalog_handle_authority(
+                &binding,
+                tx_id,
+                request_hash,
+                request_id,
+                idempotency_key,
+            )
+            .await?;
+        let (staged_sha256, reviewed_request) = self
+            .validate_frozen_catalog_staged_authority(
+                &binding,
+                &authority,
+                request_hash,
+                idempotency_key,
+            )
+            .await?;
+        let mutation_authorized = self
+            .validate_frozen_catalog_low_level_claim(
+                tx_id,
+                request_hash,
+                request_id,
+                idempotency_key,
+            )
+            .await?;
+
+        Ok(CatalogTransactionIdentity {
+            tx_id: tx_id.to_string(),
+            request_hash: request_hash.to_string(),
+            tenant_id: authority.handle.scope.tenant_id,
+            workspace_id: authority.handle.scope.workspace_id,
+            request_id: request_id.to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            handle_id: binding.handle_id,
+            ordinal: binding.ordinal,
+            staged_sha256,
+            reviewed_request,
+            mutation_authorized,
+        })
+    }
+
+    fn validate_catalog_transaction_capability(
+        &self,
+        identity: &CatalogTransactionIdentity,
+    ) -> Result<()> {
+        let binding = Self::parse_frozen_catalog_handle_binding(
+            &identity.request_id,
+            &identity.idempotency_key,
+        )?;
+        let digest_is_canonical = identity.staged_sha256.starts_with("sha256:")
+            && identity.staged_sha256.len() == "sha256:".len() + 64
+            && identity.staged_sha256["sha256:".len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        let reviewed_request_matches = identity
+            .reviewed_request
+            .request_hash()
+            .is_ok_and(|request_hash| request_hash == identity.request_hash);
+        if identity.tenant_id != self.storage.tenant_id()
+            || identity.workspace_id != self.storage.workspace_id()
+            || identity.handle_id != binding.handle_id
+            || identity.ordinal != binding.ordinal
+            || !digest_is_canonical
+            || !reviewed_request_matches
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog capability is corrupt or out of writer scope".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn bind_catalog_transaction_request(
+        &self,
+        mut opts: WriteOptions,
+        request: &CatalogTransactionRequest,
+    ) -> Result<WriteOptions> {
+        if let Some(identity) = &opts.transaction_identity {
+            self.validate_catalog_transaction_capability(identity)?;
+            if !identity.mutation_authorized
+                || opts.request_id.as_deref() != Some(identity.request_id.as_str())
+                || opts.idempotency_key.as_ref().map(IdempotencyKey::as_str)
+                    != Some(identity.idempotency_key.as_str())
+            {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog capability is out of writer scope".to_string(),
+                });
+            }
+            let actual_request_hash = request.request_hash()?;
+            if actual_request_hash != identity.request_hash {
+                return Err(CatalogError::InvariantViolation {
+                    message:
+                        "catalog transaction payload diverges from its frozen staged operation"
+                            .to_string(),
+                });
+            }
+            opts.validated_transaction_request_hash = Some(actual_request_hash);
+        }
+        Ok(opts)
+    }
+
+    async fn append_catalog_transaction_event<T: CatalogEventPayload + serde::Serialize + Sync>(
+        &self,
+        guard: &crate::lock::LockGuard<dyn StorageBackend>,
+        payload: &T,
+        opts: &WriteOptions,
+    ) -> Result<EventId> {
+        let source = opts.actor.as_deref().unwrap_or("api");
+        if let Some(identity) = &opts.transaction_identity {
+            if opts.validated_transaction_request_hash.as_deref()
+                != Some(identity.request_hash.as_str())
+            {
+                return Err(CatalogError::InvariantViolation {
+                    message: "frozen catalog event publication lacks exact request validation"
+                        .to_string(),
+                });
+            }
+            self.tier1
+                .append_ledger_event_for_transaction(
+                    guard,
+                    CatalogDomain::Catalog,
+                    payload,
+                    source,
+                    identity,
+                )
+                .await
+        } else {
+            self.tier1
+                .append_ledger_event(guard, CatalogDomain::Catalog, payload, source)
+                .await
+        }
+    }
+
+    /// Validates a frozen catalog commit against its event intent and immutable
+    /// manifest chain without mutating catalog state.
+    ///
+    /// Returns the immutable manifest publication timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the intent, receipt, or immutable manifest
+    /// authority is missing, corrupt, or divergent.
+    pub async fn validate_catalog_transaction_commit(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        commit: &CatalogTransactionCommit,
+    ) -> Result<chrono::DateTime<Utc>> {
+        self.validate_catalog_transaction_capability(identity)?;
+        self.tier1
+            .validate_catalog_transaction_publication(
+                identity,
+                &CatalogTransactionPublication {
+                    event_id: &commit.event_id,
+                    commit_id: &commit.commit_id,
+                    manifest_id: &commit.manifest_id,
+                    snapshot_version: commit.snapshot_version,
+                    authority_version: &commit.pointer_version,
+                    fencing_token: commit.fencing_token,
+                },
+            )
+            .await
+    }
+
+    fn recovered_catalog_transaction_commit(
+        published: PublishedCatalogTransactionEvent,
+    ) -> Result<CatalogTransactionCommit> {
+        let fencing_token = published
+            .manifest
+            .fencing_token
+            .unwrap_or(published.manifest.epoch);
+        let commit_id = published
+            .manifest
+            .last_commit_id
+            .clone()
+            .or_else(|| published.manifest.commit_ulid.clone())
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "recovered catalog manifest is missing its commit ID".to_string(),
+            })?;
+        if fencing_token == 0 {
+            return Err(CatalogError::InvariantViolation {
+                message: "recovered catalog manifest has no fencing authority".to_string(),
+            });
+        }
+        Ok(CatalogTransactionCommit {
+            event_id: published.event_id,
+            commit_id,
+            manifest_id: published.manifest.manifest_id,
+            snapshot_version: published.manifest.snapshot_version,
+            pointer_version: published.authority_version,
+            lock_path: CatalogPaths::domain_lock(CatalogDomain::Catalog),
+            fencing_token,
+            repair_pending: false,
+            dropped_table: None,
+        })
+    }
+
+    fn validate_catalog_transaction_recovery_request(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        request_id: Option<&str>,
+    ) -> Result<()> {
+        self.validate_catalog_transaction_capability(identity)?;
+        if !identity.mutation_authorized || request_id != Some(identity.request_id.as_str()) {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog recovery request identity diverges from its frozen capability"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn finish_recovered_catalog_transaction(
+        identity: &CatalogTransactionIdentity,
+        guard: crate::lock::LockGuard<dyn StorageBackend>,
+        published: PublishedCatalogTransactionEvent,
+    ) -> Result<CatalogTransactionCommit> {
+        let outcome = Self::recovered_catalog_transaction_commit(published);
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (outcome, release) {
+            (Ok(commit), Ok(())) => Ok(commit),
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(release_error)) => {
+                tracing::warn!(
+                    error = ?release_error,
+                    tx_id = identity.tx_id,
+                    "catalog transaction recovery validation failed and lock release also failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Recovers an interrupted exact-addressed catalog transaction event.
+    ///
+    /// Returns `None` when the writer never published an event intent, which
+    /// proves it is safe for the caller to begin the reviewed mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when recovery cannot acquire or release the catalog
+    /// lock, or when the frozen intent and immutable publication diverge.
+    pub async fn recover_catalog_transaction(
+        &self,
+        identity: &CatalogTransactionIdentity,
+        request_id: Option<String>,
+    ) -> Result<Option<CatalogTransactionCommit>> {
+        self.validate_catalog_transaction_recovery_request(identity, request_id.as_deref())?;
+        if !self.tier1.has_catalog_transaction_intent(identity).await? {
+            return Ok(None);
+        }
+        let compactor = self.sync_compactor()?;
+        for _ in 0..8 {
+            let inspection = match self
+                .tier1
+                .inspect_catalog_transaction_event(identity)
+                .await?
+            {
+                CatalogTransactionEventInspection::Published(published) => {
+                    return Ok(Some(Self::recovered_catalog_transaction_commit(
+                        *published,
+                    )?));
+                }
+                CatalogTransactionEventInspection::Unpublished(inspection) => inspection,
+            };
+            let guard = self
+                .tier1
+                .acquire_lock(self.lock_ttl, self.lock_max_retries)
+                .await?;
+            let recovery = match self
+                .tier1
+                .recover_catalog_transaction_event_after_inspection(identity, &inspection)
+                .await
+            {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    if let Err(release_error) = guard.release().await {
+                        tracing::warn!(
+                            error = ?release_error,
+                            tx_id = identity.tx_id,
+                            "catalog transaction recovery failed and lock release also failed"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            match recovery {
+                CatalogTransactionEventRecovery::Published(published) => {
+                    return Ok(Some(
+                        Self::finish_recovered_catalog_transaction(identity, guard, *published)
+                            .await?,
+                    ));
+                }
+                CatalogTransactionEventRecovery::Ready(event_id) => {
+                    let request = self.single_event_sync_compact_request(
+                        CatalogDomain::Catalog,
+                        &event_id,
+                        guard.fencing_token().sequence(),
+                        request_id.clone(),
+                    );
+                    let event_id_string = event_id.to_string();
+                    return Ok(Some(
+                        self.finish_catalog_transaction(
+                            guard,
+                            event_id_string,
+                            compactor.sync_compact(request).await,
+                        )
+                        .await?,
+                    ));
+                }
+                CatalogTransactionEventRecovery::RetryUnlocked => {
+                    guard.release().await.map_err(CatalogError::from)?;
+                }
+            }
+        }
+        Err(CatalogError::PreconditionFailed {
+            message: "catalog transaction recovery inspection did not converge".to_string(),
+        })
+    }
+
+    fn default_catalog_id(state: &CatalogState) -> Option<&str> {
         state
             .catalogs
             .iter()
@@ -1067,7 +3156,7 @@ impl CatalogWriter {
     }
 
     fn find_default_namespace<'a>(
-        state: &'a crate::state::CatalogState,
+        state: &'a CatalogState,
         schema: &str,
     ) -> Option<&'a NamespaceRecord> {
         let default_catalog_id = Self::default_catalog_id(state);
@@ -1083,7 +3172,7 @@ impl CatalogWriter {
     async fn ensure_default_catalog_locked(
         &self,
         guard: &crate::lock::LockGuard<dyn StorageBackend>,
-        state: &crate::state::CatalogState,
+        state: &CatalogState,
         compactor: &Arc<dyn SyncCompactor>,
         opts: &WriteOptions,
     ) -> Result<CatalogRecord> {
@@ -1096,7 +3185,7 @@ impl CatalogWriter {
     async fn ensure_default_catalog_locked_with_result(
         &self,
         guard: &crate::lock::LockGuard<dyn StorageBackend>,
-        state: &crate::state::CatalogState,
+        state: &CatalogState,
         compactor: &Arc<dyn SyncCompactor>,
         opts: &WriteOptions,
     ) -> Result<DefaultCatalogOutcome> {
@@ -1379,6 +3468,13 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::CreateCatalog {
+                catalog: name.to_string(),
+                description: description.map(str::to_string),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -1437,13 +3533,7 @@ impl CatalogWriter {
             catalog: CatalogRecord::try_from(&catalog)?,
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -2021,6 +4111,7 @@ impl CatalogWriter {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::create_schema`].
+    #[allow(clippy::too_many_lines)]
     pub async fn create_schema_transaction(
         &self,
         catalog: &str,
@@ -2028,6 +4119,14 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::CreateSchema {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                description: description.map(str::to_string),
+            },
+        )?;
         if catalog == "default" {
             return self
                 .create_namespace_transaction(schema, description, opts)
@@ -2110,13 +4209,7 @@ impl CatalogWriter {
             namespace: NamespaceRecord::try_from(&namespace)?,
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -2228,13 +4321,7 @@ impl CatalogWriter {
         };
 
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
 
         let request = self.single_event_sync_compact_request(
@@ -2260,6 +4347,14 @@ impl CatalogWriter {
         description: Option<&str>,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::CreateSchema {
+                catalog: "default".to_string(),
+                schema: name.to_string(),
+                description: description.map(str::to_string),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -2333,13 +4428,7 @@ impl CatalogWriter {
         };
 
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -2817,13 +4906,7 @@ impl CatalogWriter {
         };
 
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
 
         let request = self.single_event_sync_compact_request(
@@ -2931,13 +5014,7 @@ impl CatalogWriter {
         };
 
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
 
         let request = self.single_event_sync_compact_request(
@@ -3090,13 +5167,7 @@ impl CatalogWriter {
         };
 
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
 
         let request = self.single_event_sync_compact_request(
@@ -3126,6 +5197,18 @@ impl CatalogWriter {
         req: RegisterTableRequest,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::RegisterTable {
+                catalog: "default".to_string(),
+                schema: req.namespace.clone(),
+                table: req.name.clone(),
+                description: req.description.clone(),
+                location: req.location.clone(),
+                format: req.format.clone(),
+                columns: req.columns.clone(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -3241,13 +5324,7 @@ impl CatalogWriter {
             columns,
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -3549,6 +5626,25 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        if opts.transaction_identity.is_some()
+            && (req.table_type.is_some() || req.properties.is_some())
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "frozen catalog registration contains unreviewed metadata".to_string(),
+            });
+        }
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::RegisterTable {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: req.name.clone(),
+                description: req.description.clone(),
+                location: req.location.clone(),
+                format: req.format.clone(),
+                columns: req.columns.clone(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -3703,13 +5799,7 @@ impl CatalogWriter {
             columns,
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -3912,6 +6002,17 @@ impl CatalogWriter {
         patch: TablePatch,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::UpdateTable {
+                catalog: "default".to_string(),
+                schema: namespace.to_string(),
+                table: name.to_string(),
+                description: patch.description.clone(),
+                location: patch.location.clone(),
+                format: patch.format.clone(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -4031,13 +6132,7 @@ impl CatalogWriter {
             table: table_rec.clone(),
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -4079,6 +6174,17 @@ impl CatalogWriter {
         patch: TablePatch,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::UpdateTable {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: name.to_string(),
+                description: patch.description.clone(),
+                location: patch.location.clone(),
+                format: patch.format.clone(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -4237,13 +6343,7 @@ impl CatalogWriter {
             table: table_rec.clone(),
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -4393,6 +6493,14 @@ impl CatalogWriter {
         name: &str,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::DropTable {
+                catalog: "default".to_string(),
+                schema: namespace.to_string(),
+                table: name.to_string(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -4474,13 +6582,7 @@ impl CatalogWriter {
             table_name: name.to_string(),
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -4521,6 +6623,14 @@ impl CatalogWriter {
         name: &str,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::DropTable {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: name.to_string(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -4653,13 +6763,7 @@ impl CatalogWriter {
             table_name: name.to_string(),
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -4943,6 +7047,15 @@ impl CatalogWriter {
         new_name: &str,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        let opts = self.bind_catalog_transaction_request(
+            opts,
+            &CatalogTransactionRequest::RenameTable {
+                catalog: catalog.to_string(),
+                schema: schema.to_string(),
+                table: old_name.to_string(),
+                new_table: new_name.to_string(),
+            },
+        )?;
         if let Some(expected) = &opts.if_match {
             let manifest = self.tier1.read_manifest().await?;
             if manifest.catalog.snapshot_version != expected.as_u64() {
@@ -5061,13 +7174,7 @@ impl CatalogWriter {
             updated_at: now,
         };
         let event_id = self
-            .tier1
-            .append_ledger_event(
-                &guard,
-                CatalogDomain::Catalog,
-                &event,
-                opts.actor.as_deref().unwrap_or("api"),
-            )
+            .append_catalog_transaction_event(&guard, &event, &opts)
             .await?;
         let event_id_string = event_id.to_string();
         let request = self.single_event_sync_compact_request(
@@ -5253,6 +7360,515 @@ mod tests {
         let storage = ScopedStorage::new(backend, "acme", "production").expect("valid storage");
         let compactor = Arc::new(Tier1Compactor::new(storage.clone()));
         CatalogWriter::new(storage).with_sync_compactor(compactor)
+    }
+
+    fn test_catalog_identity(
+        tx_id: String,
+        request: &CatalogTransactionRequest,
+    ) -> CatalogTransactionIdentity {
+        let handle_id = "hdl_00000000000000000000000000";
+        let identity = format!("handle:{handle_id}:mutation:{:020}", 1);
+        CatalogTransactionIdentity {
+            tx_id,
+            request_hash: request.request_hash().expect("test request hash"),
+            tenant_id: "acme".to_string(),
+            workspace_id: "production".to_string(),
+            request_id: identity.clone(),
+            idempotency_key: identity,
+            handle_id: handle_id.to_string(),
+            ordinal: 1,
+            staged_sha256: format!("sha256:{}", "d".repeat(64)),
+            reviewed_request: request.clone(),
+            mutation_authorized: true,
+        }
+    }
+
+    fn test_catalog_options(identity: &CatalogTransactionIdentity) -> WriteOptions {
+        WriteOptions::default()
+            .with_request_id(&identity.request_id)
+            .with_idempotency_key(&identity.idempotency_key)
+            .with_transaction_identity(identity.clone())
+    }
+
+    #[test]
+    fn frozen_catalog_capability_is_bound_to_one_exact_request() {
+        let writer = setup();
+        let reviewed = CatalogTransactionRequest::CreateCatalog {
+            catalog: "reviewed".to_string(),
+            description: Some("exact request".to_string()),
+        };
+        let identity = test_catalog_identity(Ulid::new().to_string(), &reviewed);
+        let bound = writer
+            .bind_catalog_transaction_request(test_catalog_options(&identity), &reviewed)
+            .expect("bind exact reviewed request");
+        assert_eq!(
+            bound.validated_transaction_request_hash.as_deref(),
+            Some(identity.request_hash.as_str())
+        );
+
+        let wrong_requests = [
+            CatalogTransactionRequest::CreateCatalog {
+                catalog: "different".to_string(),
+                description: Some("exact request".to_string()),
+            },
+            CatalogTransactionRequest::CreateSchema {
+                catalog: "default".to_string(),
+                schema: "reviewed".to_string(),
+                description: None,
+            },
+            CatalogTransactionRequest::RegisterTable {
+                catalog: "default".to_string(),
+                schema: "default".to_string(),
+                table: "reviewed".to_string(),
+                description: None,
+                location: None,
+                format: Some("delta".to_string()),
+                columns: vec![ColumnDefinition {
+                    name: "id".to_string(),
+                    data_type: "INT64".to_string(),
+                    is_nullable: false,
+                    ordinal: 0,
+                    description: None,
+                }],
+            },
+            CatalogTransactionRequest::UpdateTable {
+                catalog: "default".to_string(),
+                schema: "default".to_string(),
+                table: "reviewed".to_string(),
+                description: Some(None),
+                location: None,
+                format: None,
+            },
+            CatalogTransactionRequest::DropTable {
+                catalog: "default".to_string(),
+                schema: "default".to_string(),
+                table: "reviewed".to_string(),
+            },
+            CatalogTransactionRequest::RenameTable {
+                catalog: "default".to_string(),
+                schema: "default".to_string(),
+                table: "reviewed".to_string(),
+                new_table: "different".to_string(),
+            },
+        ];
+        for wrong in wrong_requests {
+            writer
+                .bind_catalog_transaction_request(test_catalog_options(&identity), &wrong)
+                .expect_err("a capability must reject every different operation payload");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reviewed_catalog_request_validates_all_six_event_realizations() {
+        let mut base = CatalogState::empty();
+        base.catalogs.push(CatalogRecord {
+            id: "catalog-existing".to_string(),
+            name: "existing".to_string(),
+            description: None,
+            created_at: 1_000,
+            updated_at: 1_000,
+            properties_json: None,
+            storage_root: None,
+        });
+        base.namespaces.push(NamespaceRecord {
+            id: "namespace-existing".to_string(),
+            catalog_id: Some("catalog-existing".to_string()),
+            name: "schema".to_string(),
+            description: None,
+            created_at: 1_000,
+            updated_at: 1_000,
+            properties_json: None,
+            storage_root: None,
+        });
+        let existing_table = TableRecord {
+            id: "table-existing".to_string(),
+            namespace_id: "namespace-existing".to_string(),
+            name: "table".to_string(),
+            description: Some("before".to_string()),
+            location: None,
+            format: Some("parquet".to_string()),
+            created_at: 1_000,
+            updated_at: 1_000,
+            table_type: None,
+            properties_json: None,
+        };
+        base.tables.push(existing_table.clone());
+
+        let create_catalog = CatalogTransactionRequest::CreateCatalog {
+            catalog: "created".to_string(),
+            description: Some("catalog".to_string()),
+        };
+        let create_catalog_event = serde_json::to_value(CatalogDdlEventV2::CatalogCreated {
+            catalog: CatalogRecord {
+                id: Uuid::now_v7().to_string(),
+                name: "created".to_string(),
+                description: Some("catalog".to_string()),
+                created_at: 2_000,
+                updated_at: 2_000,
+                properties_json: None,
+                storage_root: None,
+            },
+        })
+        .expect("create catalog event");
+        create_catalog
+            .validate_event_realization(
+                "catalog.ddl",
+                2,
+                &create_catalog_event,
+                &base,
+                "acme",
+                "production",
+            )
+            .expect("reviewed catalog create realization");
+        let mut advanced_base = base.clone();
+        advanced_base.catalogs.push(CatalogRecord {
+            id: "catalog-created-by-another-writer".to_string(),
+            name: "created".to_string(),
+            description: Some("catalog".to_string()),
+            created_at: 1_500,
+            updated_at: 1_500,
+            properties_json: None,
+            storage_root: None,
+        });
+        create_catalog
+            .validate_event_realization(
+                "catalog.ddl",
+                2,
+                &create_catalog_event,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("catalog creation cannot execute against a stale current base");
+
+        let create_schema = CatalogTransactionRequest::CreateSchema {
+            catalog: "existing".to_string(),
+            schema: "created_schema".to_string(),
+            description: Some("schema".to_string()),
+        };
+        let create_schema_event = serde_json::to_value(CatalogDdlEvent::NamespaceCreated {
+            namespace: NamespaceRecord {
+                id: Uuid::now_v7().to_string(),
+                catalog_id: Some("catalog-existing".to_string()),
+                name: "created_schema".to_string(),
+                description: Some("schema".to_string()),
+                created_at: 2_000,
+                updated_at: 2_000,
+                properties_json: None,
+                storage_root: None,
+            },
+        })
+        .expect("create schema event");
+        create_schema
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &create_schema_event,
+                &base,
+                "acme",
+                "production",
+            )
+            .expect("reviewed schema create realization");
+        let mut advanced_base = base.clone();
+        advanced_base.catalogs[0].id = "catalog-replaced".to_string();
+        create_schema
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &create_schema_event,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("schema creation cannot retain a stale resolved catalog ID");
+
+        let register = CatalogTransactionRequest::RegisterTable {
+            catalog: "existing".to_string(),
+            schema: "schema".to_string(),
+            table: "registered".to_string(),
+            description: Some("table".to_string()),
+            location: None,
+            format: Some("parquet".to_string()),
+            columns: vec![ColumnDefinition {
+                name: "id".to_string(),
+                data_type: "INT64".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        };
+        let registered_table_id = Uuid::now_v7().to_string();
+        let register_event = serde_json::to_value(CatalogDdlEvent::TableRegistered {
+            table: TableRecord {
+                id: registered_table_id.clone(),
+                namespace_id: "namespace-existing".to_string(),
+                name: "registered".to_string(),
+                description: Some("table".to_string()),
+                location: None,
+                format: Some("parquet".to_string()),
+                created_at: 2_000,
+                updated_at: 2_000,
+                table_type: None,
+                properties_json: None,
+            },
+            columns: vec![ColumnRecord {
+                id: Uuid::now_v7().to_string(),
+                table_id: registered_table_id,
+                name: "id".to_string(),
+                data_type: "INT64".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        })
+        .expect("register table event");
+        register
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &register_event,
+                &base,
+                "acme",
+                "production",
+            )
+            .expect("reviewed table registration realization");
+        let mut advanced_base = base.clone();
+        advanced_base.namespaces[0].id = "namespace-replaced".to_string();
+        register
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &register_event,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("table registration cannot retain a stale resolved schema ID");
+
+        let update = CatalogTransactionRequest::UpdateTable {
+            catalog: "existing".to_string(),
+            schema: "schema".to_string(),
+            table: "table".to_string(),
+            description: Some(Some("after".to_string())),
+            location: None,
+            format: None,
+        };
+        let mut updated_table = existing_table;
+        updated_table.description = Some("after".to_string());
+        updated_table.updated_at = 2_000;
+        let update_event = CatalogDdlEvent::TableUpdated {
+            table: updated_table.clone(),
+        };
+        let update_event_value = serde_json::to_value(&update_event).expect("update table event");
+        update
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &update_event_value,
+                &base,
+                "acme",
+                "production",
+            )
+            .expect("reviewed table update realization");
+        let mut advanced_base = base.clone();
+        advanced_base.tables[0].location = Some("s3://catalog/intervening".to_string());
+        advanced_base.tables[0].updated_at = 1_500;
+        update
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &update_event_value,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("table update cannot overwrite stale inherited state");
+        updated_table.location = Some("unreviewed://location".to_string());
+        update
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &serde_json::to_value(CatalogDdlEvent::TableUpdated {
+                    table: updated_table,
+                })
+                .expect("divergent update event"),
+                &base,
+                "acme",
+                "production",
+            )
+            .expect_err("an inherited field cannot diverge from the bound base");
+
+        let drop_request = CatalogTransactionRequest::DropTable {
+            catalog: "existing".to_string(),
+            schema: "schema".to_string(),
+            table: "table".to_string(),
+        };
+        let drop_event = serde_json::to_value(CatalogDdlEvent::TableDropped {
+            table_id: "table-existing".to_string(),
+            namespace_id: "namespace-existing".to_string(),
+            table_name: "table".to_string(),
+        })
+        .expect("drop table event");
+        drop_request
+            .validate_event_realization("catalog.ddl", 1, &drop_event, &base, "acme", "production")
+            .expect("reviewed table drop realization");
+        let mut advanced_base = base.clone();
+        advanced_base.tables[0].id = "table-replaced".to_string();
+        drop_request
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &drop_event,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("table drop cannot retain a stale resolved table ID");
+
+        let rename = CatalogTransactionRequest::RenameTable {
+            catalog: "existing".to_string(),
+            schema: "schema".to_string(),
+            table: "table".to_string(),
+            new_table: "renamed".to_string(),
+        };
+        let rename_event = serde_json::to_value(CatalogDdlEvent::TableRenamed {
+            table_id: "table-existing".to_string(),
+            namespace_id: "namespace-existing".to_string(),
+            old_name: "table".to_string(),
+            new_name: "renamed".to_string(),
+            updated_at: 2_000,
+        })
+        .expect("rename table event");
+        rename
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &rename_event,
+                &base,
+                "acme",
+                "production",
+            )
+            .expect("reviewed table rename realization");
+        let mut advanced_base = base;
+        advanced_base.tables[0].id = "table-replaced".to_string();
+        rename
+            .validate_event_realization(
+                "catalog.ddl",
+                1,
+                &rename_event,
+                &advanced_base,
+                "acme",
+                "production",
+            )
+            .expect_err("table rename cannot retain a stale resolved table ID");
+    }
+
+    #[tokio::test]
+    async fn frozen_catalog_transaction_intent_is_opt_in_for_legacy_writes() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+
+        writer
+            .create_catalog_transaction(
+                "legacy",
+                Some("legacy transaction path"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("legacy catalog transaction");
+        assert!(
+            writer
+                .storage
+                .list("transactions/catalog/")
+                .await
+                .expect("list test-only transaction artifacts")
+                .is_empty(),
+            "legacy writers must not publish durable-handle event intents"
+        );
+
+        let tx_id = Ulid::new().to_string();
+        let handle_id = "hdl_00000000000000000000000000";
+        let handle_identity = format!("handle:{handle_id}:mutation:{:020}", 1);
+        writer
+            .authorize_frozen_catalog_transaction(
+                &tx_id,
+                &format!("sha256:{}", "b".repeat(64)),
+                &handle_identity,
+                &handle_identity,
+            )
+            .await
+            .expect_err("handle-shaped syntax alone must not create a capability");
+        assert!(
+            writer
+                .storage
+                .list("transactions/catalog/")
+                .await
+                .expect("list rejected transaction artifacts")
+                .is_empty(),
+            "rejected syntax must not publish a transaction intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_frozen_catalog_recovery_releases_its_lock() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+        let request = CatalogTransactionRequest::CreateCatalog {
+            catalog: "frozen".to_string(),
+            description: Some("frozen transaction path".to_string()),
+        };
+        let identity = test_catalog_identity(Ulid::new().to_string(), &request);
+        let commit = writer
+            .create_catalog_transaction(
+                "frozen",
+                Some("frozen transaction path"),
+                test_catalog_options(&identity),
+            )
+            .await
+            .expect("frozen catalog transaction");
+
+        let manifest_path =
+            CatalogPaths::domain_manifest_snapshot(CatalogDomain::Catalog, &commit.manifest_id);
+        let mut manifest: crate::manifest::CatalogDomainManifest = serde_json::from_slice(
+            writer
+                .storage
+                .get_raw(&manifest_path)
+                .await
+                .expect("read immutable manifest")
+                .as_ref(),
+        )
+        .expect("decode immutable manifest");
+        manifest.last_commit_id = None;
+        manifest.commit_ulid = None;
+        writer
+            .storage
+            .put_raw(
+                &manifest_path,
+                Bytes::from(serde_json::to_vec(&manifest).expect("manifest JSON")),
+                arco_core::storage::WritePrecondition::None,
+            )
+            .await
+            .expect("corrupt immutable manifest");
+
+        writer
+            .recover_catalog_transaction(&identity, Some(identity.request_id.clone()))
+            .await
+            .expect_err("corrupt immutable authority must fail recovery");
+
+        let lock: crate::lock::LockInfo = serde_json::from_slice(
+            writer
+                .storage
+                .get_raw(&CatalogPaths::domain_lock(CatalogDomain::Catalog))
+                .await
+                .expect("read catalog lock")
+                .as_ref(),
+        )
+        .expect("decode catalog lock");
+        assert!(
+            lock.is_expired(),
+            "a failed recovery must synchronously release its catalog lock"
+        );
     }
 
     #[tokio::test]

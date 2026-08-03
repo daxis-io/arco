@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use arco_worker_contract::callback_task_id;
 
@@ -21,6 +21,53 @@ use crate::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, OutputVisibilityState, OutputVisibilityUpdate,
     TaskOutcome,
 };
+
+/// Largest difference tolerated between a worker-reported timestamp and the
+/// server's receipt time before the report is flagged as clock skew.
+///
+/// Reports outside this band are still accepted — a callback must never fail
+/// because a worker's clock drifted — but they are recorded as skew and never
+/// become the event's time.
+const MAX_WORKER_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Returns the server receipt time for a callback and records observed skew.
+///
+/// Worker-reported timestamps (`startedAt`, `heartbeatAt`, `completedAt`) are
+/// *observations*, not authority. Copying them into `OrchestrationEvent::timestamp`
+/// let a skewed or hostile worker steer server-side scheduling and retention:
+/// a completion stamped years in the future pushed `retry_not_before` past any
+/// horizon so the attempt never retried, and one stamped years in the past made
+/// the just-finished run look older than the retention window so the merged
+/// retention sweep tombstoned fresh terminal evidence. Both are avoided by
+/// timing events from the server's own clock at the moment the callback is
+/// accepted.
+///
+/// The reported value is kept as span metadata so operators can still see and
+/// diagnose worker clock drift.
+fn server_receipt_time(handler: &str, reported: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let server_now = Utc::now();
+    if let Some(reported) = reported {
+        let skew = reported.signed_duration_since(server_now);
+        if skew.abs() > MAX_WORKER_CLOCK_SKEW {
+            tracing::Span::current().record("worker_clock_skew_secs", skew.num_seconds());
+            tracing::warn!(
+                handler,
+                reported = %reported,
+                server_now = %server_now,
+                skew_secs = skew.num_seconds(),
+                "worker-reported timestamp is outside the tolerated skew band; \
+                 using server receipt time for the event"
+            );
+            metrics::counter!(
+                metrics_names::ORCH_CALLBACKS_TOTAL,
+                metrics_labels::HANDLER => handler.to_string(),
+                metrics_labels::STATUS => "worker_clock_skew".to_string(),
+            )
+            .increment(1);
+        }
+    }
+    server_now
+}
 
 /// Context for callback handlers.
 pub struct CallbackContext<W: OrchestrationLedgerWriter, V: TaskTokenValidator> {
@@ -306,6 +353,30 @@ where
         );
     }
 
+    // Durable terminal dedup for the attempt itself (issue #328 / H5).
+    //
+    // A failed attempt with retries left leaves the task in RETRY_WAIT while
+    // `attempt` still names the attempt that just finished, so a redelivered
+    // dispatch for that attempt used to pass every check below and re-execute
+    // the asset. Worker-local memory cannot close this: the process that
+    // reported the completion may have died before recording anything, and the
+    // replacement worker starts with an empty set. Only control-plane state
+    // knows the attempt is finished, so it answers authoritatively here and
+    // the worker suppresses execution on this response.
+    if state.state == "RETRY_WAIT" && attempt == state.attempt {
+        return finish_callback(
+            "task_started",
+            CallbackResult::Conflict(CallbackError::attempt_already_completed(
+                &state.state,
+                attempt,
+            )),
+        );
+    }
+
+    // An attempt older than the current one is already covered by the
+    // `attempt_mismatch` conflict below, which a worker treats as equally
+    // authoritative: the control plane has moved past that attempt.
+
     // Validate attempt number
     if attempt != state.attempt {
         return finish_callback(
@@ -344,7 +415,9 @@ where
             worker_id,
         },
     );
-    event.timestamp = started_at.unwrap_or_else(Utc::now);
+    // The worker's `startedAt` is observation metadata only; the event is timed
+    // from the server's receipt of the callback (see `server_receipt_time`).
+    event.timestamp = server_receipt_time("task_started", started_at);
 
     if let Err(e) = ctx.ledger.write_event(&event).await {
         return finish_callback(
@@ -409,7 +482,12 @@ where
         message,
     } = request;
 
-    let event_timestamp = heartbeat_at.unwrap_or_else(Utc::now);
+    // A heartbeat is proof that the server heard from the worker *now*. Taking
+    // the recorded liveness time from the worker let a skewed clock either push
+    // `last_heartbeat_at` far into the future (making a dead worker's task
+    // permanently un-reapable) or far into the past (making a live worker's
+    // task look stale). Both are avoided by recording server receipt time.
+    let event_timestamp = server_receipt_time("heartbeat", heartbeat_at);
     let heartbeat_at = Some(event_timestamp);
 
     if attempt == 0 {
@@ -697,7 +775,11 @@ where
     // Emit one durable completion fact. Output visibility, when present, is
     // bound to the completion so object-store batch partial writes cannot make
     // a completed task visible without its publication state.
-    let finished_at = completed_at.unwrap_or_else(Utc::now);
+    // `completedAt` is worker-reported observation metadata. Timing the
+    // completion event from it let a skewed worker both defer its own retry
+    // past any horizon and, on the final attempt, make its just-terminal run
+    // look older than the retention window so retention erased it.
+    let finished_at = server_receipt_time("task_completed", completed_at);
     let output_visibility = if outcome == TaskOutcome::Succeeded {
         visibility_update.map(|(visibility_state, published_at, publish_error)| {
             OutputVisibilityUpdate {
@@ -1141,6 +1223,153 @@ mod tests {
                 assert_eq!(err.error, "task_already_terminal");
             }
             other => panic!("Expected Conflict, got {:?}", other),
+        }
+    }
+
+    /// H5: a failed attempt with retries left leaves the task in RETRY_WAIT
+    /// with `attempt` still naming the finished attempt. A redelivered dispatch
+    /// for that attempt must be suppressed by durable control-plane state, not
+    /// by the worker's process-local memory — the worker that reported the
+    /// completion may not exist any more.
+    #[tokio::test]
+    async fn task_started_reports_attempt_already_completed_for_a_redelivered_retry_wait_attempt() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger, validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RETRY_WAIT".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-replacement".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "task-1", "token", request, &lookup).await;
+
+        match result {
+            CallbackResult::Conflict(err) => {
+                assert_eq!(err.error, "attempt_already_completed");
+                assert_eq!(err.state.as_deref(), Some("RETRY_WAIT"));
+                assert_eq!(err.received_attempt, Some(1));
+            }
+            other => panic!("Expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// The suppression must be scoped to the finished attempt: the retry's own
+    /// attempt must still be allowed to start.
+    #[tokio::test]
+    async fn task_started_allows_the_next_attempt_after_a_retry_wait_completion() {
+        let ledger = Arc::new(MockLedger::default());
+        let validator = Arc::new(MockTokenValidator::allow_all());
+        let ctx = CallbackContext::new(ledger, validator, "tenant-1", "workspace-1");
+
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "DISPATCHED".to_string(),
+                attempt: 2,
+                attempt_id: "att-2".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+            },
+        );
+
+        let request = TaskStartedRequest {
+            attempt: 2,
+            attempt_id: "att-2".to_string(),
+            worker_id: "worker-abc".to_string(),
+            traceparent: None,
+            started_at: None,
+        };
+
+        let result = handle_task_started(&ctx, "task-1", "token", request, &lookup).await;
+        assert!(
+            matches!(result, CallbackResult::Ok(_)),
+            "the retry attempt must be allowed to start: {result:?}"
+        );
+    }
+
+    /// H3: a worker-reported timestamp never becomes the event's time.
+    #[tokio::test]
+    async fn callback_events_are_timed_from_server_receipt_not_worker_clocks() {
+        for skew_days in [-3650_i64, 3650_i64] {
+            let ledger = Arc::new(MockLedger::default());
+            let validator = Arc::new(MockTokenValidator::allow_all());
+            let ctx =
+                CallbackContext::new(Arc::clone(&ledger), validator, "tenant-1", "workspace-1");
+
+            let mut lookup = MockTaskLookup::new();
+            lookup.add_task(
+                "task-1",
+                TaskState {
+                    state: "RUNNING".to_string(),
+                    attempt: 1,
+                    attempt_id: "att-1".to_string(),
+                    run_id: "run-1".to_string(),
+                    task_key: "task-1".to_string(),
+                    asset_key: None,
+                    partition_key: None,
+                    code_version: None,
+                    cancel_requested: false,
+                },
+            );
+
+            let skewed = Utc::now() + chrono::Duration::days(skew_days);
+            let before = Utc::now();
+            let result = handle_task_completed(
+                &ctx,
+                "task-1",
+                "token",
+                TaskCompletedRequest {
+                    attempt: 1,
+                    attempt_id: "att-1".to_string(),
+                    worker_id: "worker-abc".to_string(),
+                    traceparent: None,
+                    outcome: WorkerOutcome::Failed,
+                    completed_at: Some(skewed),
+                    output: None,
+                    error: None,
+                    metrics: None,
+                    cancelled_during_phase: None,
+                    partial_progress: None,
+                },
+                &lookup,
+            )
+            .await;
+            assert!(matches!(result, CallbackResult::Ok(_)), "{result:?}");
+
+            let events = ledger.events.lock().expect("ledger events");
+            let event = events.first().expect("a completion event was written");
+            let after = Utc::now();
+            assert!(
+                event.timestamp >= before && event.timestamp <= after,
+                "event time must be the server's receipt time, not the worker's \
+                 {skew_days}-day skewed clock: {}",
+                event.timestamp
+            );
         }
     }
 

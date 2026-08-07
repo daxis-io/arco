@@ -44,7 +44,7 @@ impl std::fmt::Debug for BarrierBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BarrierBackend")
             .field("matcher", &self.matcher)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

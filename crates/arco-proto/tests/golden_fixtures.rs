@@ -1,6 +1,6 @@
 //! Golden fixture tests for the authoritative shared protobuf surface.
 
-#![allow(clippy::expect_used, clippy::indexing_slicing)]
+#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::collections::BTreeMap;
 

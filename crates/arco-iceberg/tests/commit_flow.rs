@@ -260,6 +260,54 @@ async fn test_commit_table_success_persists_state() {
 }
 
 #[tokio::test]
+async fn test_commit_table_rejects_set_snapshot_ref_to_unknown_snapshot() {
+    let fixture = Fixture::new().await;
+    let service = CommitService::new(
+        Arc::clone(&fixture.storage),
+        TableLocationGovernance::new((*fixture.storage).clone(), &fixture.workspace),
+    );
+
+    // base_metadata has snapshots: vec![], so snapshot_id 999 can never be valid
+    let request = CommitTableRequest::builder()
+        .add_update(TableUpdate::SetSnapshotRef {
+            ref_name: "main".to_string(),
+            ref_type: SnapshotRefType::Branch,
+            snapshot_id: 999,
+            max_ref_age_ms: None,
+            max_snapshot_age_ms: None,
+            min_snapshots_to_keep: None,
+        })
+        .build();
+    let request_value = serde_json::to_value(&request).expect("serialize request");
+    let request_hash = canonical_request_hash(&request_value).expect("request hash");
+    let idempotency_key = Uuid::now_v7().to_string();
+
+    let response = service
+        .commit_table(
+            fixture.table_uuid,
+            "sales",
+            &fixture.table,
+            request,
+            request_hash,
+            idempotency_key,
+            UpdateSource::IcebergRest {
+                client_info: Some("test-suite".to_string()),
+                principal: None,
+            },
+            &fixture.tenant,
+            &fixture.workspace,
+        )
+        .await;
+
+    assert!(matches!(
+        response,
+        Err(CommitError::Iceberg(
+            arco_iceberg::error::IcebergError::BadRequest { .. }
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn test_commit_table_idempotent_replay_returns_cached_response() {
     let fixture = Fixture::new().await;
     let service = CommitService::new(

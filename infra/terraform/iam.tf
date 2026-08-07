@@ -56,6 +56,22 @@ resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
   member    = "serviceAccount:${google_service_account.compactor.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "api_task_token_secret" {
+  count     = length(google_secret_manager_secret.task_token_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.task_token_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "flow_controller_task_token_secret" {
+  count     = length(google_secret_manager_secret.task_token_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.task_token_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "flow_controller_worker_dispatch_secret" {
   count     = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? 1 : 0
   project   = var.project_id

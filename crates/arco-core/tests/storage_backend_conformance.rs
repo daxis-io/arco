@@ -574,3 +574,27 @@ async fn s3_backend_satisfies_storage_conformance() {
     assert_storage_conformance("s3", backend.clone()).await;
     assert_bounded_list_conformance("s3", &backend).await;
 }
+
+#[tokio::test]
+#[ignore = "requires ARCO_TEST_AZURE_CONTAINER and cloud credentials"]
+async fn azure_backend_satisfies_storage_conformance() {
+    let container = std::env::var("ARCO_TEST_AZURE_CONTAINER")
+        .expect("ARCO_TEST_AZURE_CONTAINER must be set for the Azure conformance test");
+    let backend: Arc<dyn StorageBackend> =
+        Arc::new(ObjectStoreBackend::azure(&container).expect("azure backend"));
+    assert_storage_conformance("azure", backend.clone()).await;
+
+    // Azure intentionally does not enable the bounded ordered pager: flat Blob
+    // (lexicographic) and ADLS Gen2 HNS (depth-first) orderings are
+    // indistinguishable at construction, and depth-first breaks the
+    // lexicographic exclusive-cursor contract. list_page must fail closed
+    // rather than silently skip objects.
+    let bounded = backend
+        .list_page("conformance/azure", None, 10)
+        .await
+        .expect_err("Azure bounded ordered listing must be unsupported");
+    assert!(
+        bounded.to_string().contains("unsupported"),
+        "Azure list_page must fail closed, got {bounded:?}"
+    );
+}

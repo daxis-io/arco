@@ -1,0 +1,102 @@
+name: Azure Storage Conformance
+
+# Evidence-integrity companion to adr-034-gcs-conformance.yml and
+# s3-conformance.yml.
+#
+# ObjectStoreBackend::azure exists in crates/arco-core/src/storage.rs, but the
+# only test that exercises the CAS/precondition contract against real Azure
+# (azure_backend_satisfies_storage_conformance) is #[ignore]d and, before this
+# workflow, had no runner anywhere. Until this workflow passes against a real
+# container, the Azure provider is NOT certified for production use.
+#
+# TRIGGER POLICY: dispatch-only, deliberately. A missing configuration here is
+# a loud failure and never a green skip — but no Azure container or credentials
+# are provisioned yet, so a nightly cron would fail every night by design, for
+# a reason nobody can act on tonight. That is exactly the alert fatigue this
+# branch exists to remove. Run it on demand to prove the gate, and add a
+# `schedule:` block here in the same change that provisions the configuration
+# below.
+#
+# HOW TO CONFIGURE (also required to flip this workflow to a schedule):
+#   vars.ARCO_TEST_AZURE_CONTAINER  — a dedicated, disposable container. It
+#                                     must already EXIST: arco does not
+#                                     auto-create containers.
+#   vars.AZURE_STORAGE_ACCOUNT_NAME — the storage account hosting it.
+#   secrets.AZURE_STORAGE_ACCESS_KEY — the access key.
+#
+# AUTH NOTE: access keys have full-access, so scope blast radius by using a
+# dedicated storage account for the conformance container. Prefer replacing
+# the static keys with Azure OIDC workload-identity federation when that
+# infrastructure exists.
+#
+# The suite authenticates via MicrosoftAzureBuilder::from_env(), so no third-
+# party credentials action is required. Secrets and vars are passed through
+# env: rather than interpolated into the script text, so their values never
+# appear in the generated shell command.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  azure-conformance:
+    name: Azure Storage Conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: "false"
+
+      - name: Check Azure conformance prerequisites
+        id: prereq
+        env:
+          CONTAINER: ${{ vars.ARCO_TEST_AZURE_CONTAINER }}
+          ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
+          ACCESS_KEY: ${{ secrets.AZURE_STORAGE_ACCESS_KEY }}
+        run: |
+          if [ -n "$CONTAINER" ] && [ -n "$ACCOUNT" ] && [ -n "$ACCESS_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Azure storage conformance suite
+        if: steps.prereq.outputs.configured == 'true'
+        env:
+          ARCO_TEST_AZURE_CONTAINER: ${{ vars.ARCO_TEST_AZURE_CONTAINER }}
+          AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
+          AZURE_STORAGE_ACCESS_KEY: ${{ secrets.AZURE_STORAGE_ACCESS_KEY }}
+        run: |
+          cargo test --locked -p arco-core --test storage_backend_conformance \
+            azure_backend_satisfies_storage_conformance -- --ignored --nocapture
+
+      - name: Fail on missing Azure conformance configuration
+        if: steps.prereq.outputs.configured != 'true'
+        run: |
+          {
+            echo "## Azure conformance: FAILED (unconfigured)"
+            echo ""
+            echo "Azure conformance cannot run: Azure credentials/container unconfigured — the provider CAS gate is UNVERIFIED."
+            echo "**Azure is NOT certified**: no CAS conformance evidence exists for this provider."
+            echo ""
+            echo "Configure \`vars.ARCO_TEST_AZURE_CONTAINER\`,"
+            echo "\`vars.AZURE_STORAGE_ACCOUNT_NAME\`, and"
+            echo "\`secrets.AZURE_STORAGE_ACCESS_KEY\`."
+            echo ""
+            echo "This workflow is \`workflow_dispatch\`-only until that configuration exists;"
+            echo "add a \`schedule:\` trigger in the same change that provisions it, so the"
+            echo "nightly signal starts out actionable instead of red by design."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Azure conformance cannot run: Azure credentials/container unconfigured — the provider CAS gate is UNVERIFIED and Azure is NOT certified"
+          exit 1

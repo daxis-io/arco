@@ -22,6 +22,7 @@ use futures::{StreamExt, TryStreamExt};
 use http::Method;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::path::Path as ObjectStorePath;
 use object_store::signer::Signer as ObjectStoreSigner;
 use object_store::{DynObjectStore, PutMode, PutOptions, UpdateVersion};
@@ -40,6 +41,7 @@ use crate::error::{Error, Result};
 /// The version token is opaque - backends interpret it according to their semantics:
 /// - GCS: Numeric generation as string
 /// - S3: `ETag` or version ID
+/// - Azure: `ETag`
 #[derive(Debug, Clone)]
 pub enum WritePrecondition {
     /// Write only if object does not exist.
@@ -79,6 +81,7 @@ pub struct ObjectMeta {
     /// This is an opaque string that backends interpret:
     /// - GCS: Numeric generation as string
     /// - S3: `ETag` or version ID
+    /// - Azure: `ETag`
     pub version: String,
     /// Last modification timestamp.
     pub last_modified: Option<DateTime<Utc>>,
@@ -303,6 +306,78 @@ impl ObjectStoreBackend {
         Ok(backend)
     }
 
+    /// Creates a Microsoft Azure Blob Storage backend for the given container.
+    ///
+    /// Supports both flat-namespace Blob accounts and ADLS Gen2 (hierarchical
+    /// namespace) accounts.
+    ///
+    /// `container` may be provided as a bare container name (`landing`) or with an
+    /// `az://` prefix (`az://container`). Note Azure's naming difference: blob
+    /// storage uses **containers**, not buckets.
+    ///
+    /// Credentials are read from the standard Azure environment variables.
+    ///
+    /// # Bounded listing is disabled
+    ///
+    /// [`StorageBackend::list_page`] is intentionally **not** enabled for Azure.
+    /// Flat-namespace Blob accounts list blobs in lexicographic order, while ADLS
+    /// Gen2 (hierarchical namespace) accounts list them in depth-first order (see
+    /// [the Azure upgrade guide](https://learn.microsoft.com/azure/storage/blobs/upgrade-to-data-lake-storage-gen2#list-operations)),
+    /// and the account type is indistinguishable at construction. The `list_page`
+    /// contract requires strictly lexicographic order with an exclusive path
+    /// cursor; depth-first ordering violates that assumption and can silently skip
+    /// objects. The backend therefore fails closed. Features that page (orchestration
+    /// run-log listing, anti-entropy scan, retention/GC reconciler) are unavailable
+    /// on Azure until a client-sorted pager is implemented.
+    ///
+    /// # Signed URLs
+    ///
+    /// Signed URLs are SAS tokens and require access-key or OAuth (user-delegation
+    /// key) credentials. They cannot be minted when the backend itself is
+    /// authenticated via a SAS token.
+    ///
+    /// # Certification status
+    ///
+    /// **NOT certified for production use.** This provider has no CAS conformance
+    /// evidence yet: `azure_backend_satisfies_storage_conformance` in
+    /// `tests/storage_backend_conformance.rs` is `#[ignore]`d and, until
+    /// `.github/workflows/azure-conformance.yml` passes against a real container,
+    /// the fenced CAS semantics the publish protocol depends on are UNVERIFIED on
+    /// Azure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Azure client cannot be configured.
+    pub fn azure(container: &str) -> Result<Self> {
+        let container = normalize_bucket("az://", container);
+        if container.is_empty() {
+            return Err(Error::InvalidInput(
+                "ARCO_STORAGE_BUCKET cannot be empty".to_string(),
+            ));
+        }
+
+        let azure = MicrosoftAzureBuilder::from_env()
+            .with_container_name(&container)
+            .build()
+            .map_err(|e| {
+                Error::storage_with_source(
+                    format!("failed to configure Azure container '{container}'"),
+                    e,
+                )
+            })?;
+
+        let azure = Arc::new(azure);
+        let store: Arc<DynObjectStore> = azure.clone();
+        let signer: Arc<dyn ObjectStoreSigner> = azure;
+
+        // TODO: bounded ordered listing (`StorageBackend::list_page`) requires
+        // lexicographic ordering, which Azure cannot guarantee across flat Blob and
+        // ADLS Gen2 accounts. Add a client-sorted pager mode in
+        // `ObjectStoreBackend::list_page` so Azure and other non-lexicographic
+        // providers can enable it.
+        Ok(Self::new(store, Some(signer)))
+    }
+
     /// Creates a storage backend from a bucket string, inferring the provider.
     ///
     /// Defaults to GCS when no scheme prefix is provided.
@@ -314,6 +389,9 @@ impl ObjectStoreBackend {
         let trimmed = bucket.trim();
         if trimmed.starts_with("s3://") || trimmed.starts_with("s3a://") {
             return Self::s3(trimmed);
+        }
+        if trimmed.starts_with("az://") || trimmed.starts_with("azure://") {
+            return Self::azure(trimmed);
         }
         if trimmed.starts_with("gs://") || trimmed.starts_with("gcs://") {
             return Self::gcs(trimmed);
@@ -330,6 +408,7 @@ fn normalize_bucket(prefix: &str, raw: &str) -> String {
         .or_else(|| match prefix {
             "gs://" => trimmed.strip_prefix("gcs://"),
             "s3://" => trimmed.strip_prefix("s3a://"),
+            "az://" => trimmed.strip_prefix("azure://"),
             _ => None,
         })
         .unwrap_or(trimmed);
@@ -1343,5 +1422,16 @@ mod tests {
         run_precondition_conformance(&backend, "s3")
             .await
             .expect("s3 backend must satisfy precondition conformance");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ARCO_TEST_AZURE_CONTAINER and cloud credentials"]
+    async fn test_azure_backend_precondition_conformance_harness() {
+        let container = std::env::var("ARCO_TEST_AZURE_CONTAINER")
+            .expect("ARCO_TEST_AZURE_CONTAINER must be set for this test");
+        let backend = ObjectStoreBackend::azure(&container).expect("azure backend");
+        run_precondition_conformance(&backend, "azure")
+            .await
+            .expect("azure backend must satisfy precondition conformance");
     }
 }

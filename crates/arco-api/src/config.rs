@@ -514,7 +514,8 @@ impl Default for UnityCatalogApiConfig {
 /// Storage configuration for the API server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Object storage bucket name (e.g., `my-bucket`, `gs://my-bucket`, `s3://my-bucket`).
+    /// Object storage bucket or Azure container name (e.g., `my-bucket`,
+    /// `gs://my-bucket`, `s3://my-bucket`, `az://my-container`).
     ///
     /// In GCS deployments this is injected via Terraform as `ARCO_STORAGE_BUCKET`.
     #[serde(default)]

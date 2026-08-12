@@ -49,7 +49,8 @@ jobs:
             -var="compactor_workspace_id=test-workspace" \
             -var="flow_tenant_id=flow-tenant" \
             -var="flow_workspace_id=flow-workspace" \
-            -var="jwt_secret_name="
+            -var="jwt_secret_name=ci-jwt-secret" \
+            -var="task_token_secret_name=ci-task-token-secret"
 
       - name: Verify Base Plan Keeps Flow Control Plane Disabled
         run: |
@@ -90,7 +91,8 @@ jobs:
             -var="flow_automation_reconciler_image=example.com/arco-flow-automation-reconciler:test" \
             -var="compactor_tenant_id=compactor-tenant" \
             -var="compactor_workspace_id=compactor-workspace" \
-            -var="jwt_secret_name=" \
+            -var="jwt_secret_name=ci-jwt-secret" \
+            -var="task_token_secret_name=ci-task-token-secret" \
             -var="flow_dispatcher_image=example.com/arco-flow-dispatcher:test" \
             -var="flow_sweeper_image=example.com/arco-flow-sweeper:test" \
             -var="flow_timer_ingest_image=example.com/arco-flow-timer-ingest:test" \

@@ -38,14 +38,19 @@ api_memory     = "512Mi"
 compactor_cpu  = "1"
 compactor_memory = "512Mi"
 
-# Security (dev: relaxed). api_public=true disables debug guardrails.
+# Security. Deployed debug is explicit and remains off by default.
 api_public           = false
+api_debug            = false
 allowed_cors_origins = "*"
 
-# JWT (dev: simple HS256 secret, or leave empty for header-based auth)
-jwt_secret_name = ""
-jwt_issuer      = ""
-jwt_audience    = ""
+# JWT and task-callback keys are Secret Manager references. Add secret versions
+# out of band before deploying an Arco image.
+jwt_secret_name         = "arco-jwt-secret"
+jwt_issuer              = "https://issuer.example.com/dev"
+jwt_audience            = "arco-dev"
+task_token_secret_name  = "arco-task-token-secret"
+task_token_issuer       = "https://issuer.example.com/dev/task-token"
+task_token_audience     = "arco-worker-callback"
 
 # Networking (dev: no VPC connector)
 vpc_connector_name = ""

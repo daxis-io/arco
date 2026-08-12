@@ -1402,7 +1402,8 @@ mod tests {
         builder.config.storage.bucket = Some("test-bucket".to_string());
         builder.config.compactor_url = Some("http://compactor:8081".to_string());
         builder.config.jwt.hs256_secret = Some("test-secret".to_string());
-        builder.config.task_token.hs256_secret = "task-secret".to_string();
+        builder.config.task_token.hs256_secret =
+            "test-task-token-secret-at-least-32-bytes".to_string();
         builder.config.task_token.issuer = Some("task-issuer".to_string());
         builder.config.task_token.audience = Some("task-audience".to_string());
     }

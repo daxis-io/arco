@@ -21,7 +21,7 @@ use barrier_backend::{BarrierBackend, BarrierMatch};
 use bytes::Bytes;
 use scripted_backend::{PreconditionMatcher, ScriptedBackend, ScriptedEffect, ScriptedRule};
 
-async fn scoped_storage(backend: Arc<dyn StorageBackend>) -> ScopedStorage {
+fn scoped_storage(backend: Arc<dyn StorageBackend>) -> ScopedStorage {
     ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage")
 }
 
@@ -34,7 +34,7 @@ async fn visible_publish_race_keeps_pointer_at_old_or_winner_only() {
             CatalogDomain::Catalog,
         )),
     ));
-    let storage = scoped_storage(backend.clone()).await;
+    let storage = scoped_storage(backend.clone());
     let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
 
     let seed = storage
@@ -48,9 +48,10 @@ async fn visible_publish_race_keeps_pointer_at_old_or_winner_only() {
         .await
         .expect("seed pointer");
     let seed_version = match seed {
-        WriteResult::Success { version } => version,
-        WriteResult::PreconditionFailed { .. } => panic!("seed pointer must succeed"),
-    };
+        WriteResult::Success { version } => Some(version),
+        WriteResult::PreconditionFailed { .. } => None,
+    }
+    .expect("seed pointer must succeed");
 
     let left = {
         let storage = storage.clone();
@@ -121,7 +122,7 @@ async fn visible_publish_race_keeps_pointer_at_old_or_winner_only() {
 #[tokio::test]
 async fn persisted_publish_conflict_returns_persisted_not_visible_without_advancing_pointer() {
     let backend: Arc<dyn StorageBackend> = Arc::new(arco_core::MemoryBackend::new());
-    let storage = scoped_storage(backend).await;
+    let storage = scoped_storage(backend);
     let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
     storage
         .put_raw(
@@ -170,7 +171,7 @@ async fn persisted_publish_conflict_returns_persisted_not_visible_without_advanc
 #[tokio::test]
 async fn immutable_snapshot_write_rejects_overwrite_attempts() {
     let backend = Arc::new(ScriptedBackend::new());
-    let storage = scoped_storage(backend.clone()).await;
+    let storage = scoped_storage(backend.clone());
     let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
     storage
         .put_raw(

@@ -1,18 +1,17 @@
 //! Object-store-backed control-state MVP.
 //!
-//! # Replay model (format version 2)
+//! # Replay model (format version 3)
 //!
-//! Every manifest anchors its replay on an optional immutable state-snapshot
-//! object (`states/{state_id}.json`) and carries only the transaction suffix
+//! Every manifest anchors its replay on an optional immutable indexed Arrow
+//! IPC state segment (`segments/l1/{state_id}.arrow`) and carries only the transaction suffix
 //! committed since that anchor. Loading current state therefore costs one
-//! snapshot read plus at most `checkpoint_interval` transaction reads,
+//! segment read plus at most `checkpoint_interval` transaction/L0 reads,
 //! independent of total history length. Commits that fill the interval write a
-//! snapshot of their resulting state and record it as `anchor_state` so
+//! L1 segment of their resulting state and record it as `anchor_state` so
 //! successors start a fresh suffix; explicit checkpoints materialize (or
-//! reuse) the same snapshot objects so `read_checkpoint` never replays
-//! history. Snapshot objects are envelope-checksummed and additionally bound
-//! by raw-byte checksums in every reference to them; corrupt or substituted
-//! snapshots fail closed.
+//! reuse) the same segment objects so `read_checkpoint` never replays
+//! history. Segments and their indexes are bound by raw-byte checksums in every
+//! reference; corrupt or substituted data fails closed.
 //!
 //! # Writer fencing
 //!
@@ -57,23 +56,35 @@
 //!
 //! # Format versioning
 //!
-//! Format version 2 is the only supported on-disk format. There is
-//! deliberately no migration path from format version 1: no production
-//! deployment ever wrote v1 artifacts, so v1 (or any other) `format_version`
-//! values fail closed at artifact validation instead of being migrated.
+//! Format version 3 is the only supported on-disk format and is rooted beneath
+//! the fresh `control/v1/` prefix. There is deliberately no migration path from
+//! the JSON-anchor format version 2 (or version 1): unknown and old
+//! `format_version` values fail closed instead of being migrated.
 //!
 //! Restore *plans* are versioned separately from on-disk state artifacts,
 //! because an in-flight restore attempt written by an older revision must
 //! still be readable by the recovery path that has to supersede it. Plan
-//! version 1 (which predates `observed_writer_epoch`) is therefore decoded by
-//! an explicit migration into a legacy-marked plan that can be inspected and
-//! superseded but can never be applied. See [`ControlMvpRestorePlan`].
+//! version 1 (which predates `observed_writer_epoch`) and version 2 (which
+//! names the retired object layout) are therefore decoded as legacy plans
+//! that can be inspected and superseded but can never be applied. See
+//! [`ControlMvpRestorePlan`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::io::Cursor;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use arco_core::ScopedStorage;
 use arco_core::storage::{WritePrecondition, WriteResult};
+use arrow::array::{
+    Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, UInt8Array, UInt8Builder,
+    UInt64Array, UInt64Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::FileReader;
+use arrow::ipc::writer::FileWriter;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -83,21 +94,26 @@ use ulid::Ulid;
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, KeyRange, KvPair, PersistedAuthorityAdapter, PersistedAuthorityKind,
-    PersistedAuthorityReference, PersistedRestoreParticipantPlan, PredicateInputSet,
-    RestoreAttemptIdentity, RestoreParticipantInspection, RestoredAuthorityEvidence,
-    StateRestoreParticipant, StateScope, StateStoreBindingIdentity, StateStoreCapabilities,
-    StateToken, TxnOptions, VersionedValue,
+    CheckpointToken, CommitOutcome, KeyRange, KvPair, PersistedAuthorityAdapter,
+    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
+    PredicateInputSet, ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
+    RestoredAuthorityEvidence, StateRestoreParticipant, StateScope, StateStoreBindingIdentity,
+    StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
 };
 use crate::error::{CatalogError, Result};
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 2;
-/// Plan version written before `observed_writer_epoch` existed. Decoded by an
-/// explicit migration (see [`ControlMvpRestorePlan`]) and never applied.
-const RESTORE_PLAN_VERSION_LEGACY: u32 = 1;
-const CONTROL_MVP_FORMAT_VERSION: u32 = 2;
+const RESTORE_PLAN_VERSION: u32 = 3;
+/// Restore-plan versions that predate the `control/v1/` authority layout.
+/// They remain decodable only so recovery can safely supersede them without
+/// dereferencing paths from the retired layout.
+const RESTORE_PLAN_VERSION_V1: u32 = 1;
+const RESTORE_PLAN_VERSION_V2: u32 = 2;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 3;
+const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEGMENT_INDEX_BYTES: usize = 512 * 1024;
+const MAX_SEGMENT_ROWS: usize = 1_000_000;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
@@ -301,6 +317,7 @@ impl ControlMvpStateStore {
             writes: BTreeMap::new(),
             outbox: Vec::new(),
             outbox_trim: Vec::new(),
+            projection_intents: Vec::new(),
         })
     }
 
@@ -442,17 +459,23 @@ impl ControlMvpStateStore {
     }
 
     async fn load_state_snapshot(&self, reference: &ControlMvpStateRef) -> Result<ReplayState> {
+        let segment_reference = ControlMvpSegmentRef {
+            segment_id: reference.state_id.clone(),
+            level: ControlMvpSegmentLevel::L1,
+            logical_sequence: reference.logical_sequence,
+            checksum_sha256: reference.checksum_sha256.clone(),
+            index_checksum_sha256: reference.index_checksum_sha256.clone(),
+        };
         let bytes = self
             .storage
             .get_raw(&self.paths.state_object(&reference.state_id))
             .await?;
-        validate_raw_checksum(
-            &bytes,
-            Some(&reference.checksum_sha256),
-            "control MVP state snapshot reference checksum",
-        )?;
-        let snapshot: ControlMvpStateObject =
-            decode_envelope(&bytes, "control-mvp-state", "control MVP state snapshot")?;
+        let index_bytes = self
+            .storage
+            .get_raw(&self.paths.segment_index(&reference.state_id))
+            .await?;
+        let rows = decode_segment_rows(&bytes, &index_bytes, &segment_reference, &self.scope)?;
+        let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
         snapshot.validate(&self.scope, reference)?;
         Ok(snapshot.into_replay_state())
     }
@@ -461,30 +484,80 @@ impl ControlMvpStateStore {
         &self,
         snapshot: &ControlMvpStateObject,
     ) -> Result<ControlMvpStateRef> {
-        let bytes = encode_envelope("control-mvp-state", snapshot)?;
+        let (bytes, index_bytes, reference) = self.render_state_snapshot(snapshot)?;
+        put_immutable_matching(
+            &self.storage,
+            &self.paths.state_object(&snapshot.state_id),
+            bytes,
+            "control MVP L1 segment already exists with different bytes",
+        )
+        .await?;
+        put_immutable_matching(
+            &self.storage,
+            &self.paths.segment_index(&snapshot.state_id),
+            index_bytes,
+            "control MVP L1 segment index already exists with different bytes",
+        )
+        .await?;
+        Ok(reference)
+    }
+
+    fn render_state_snapshot(
+        &self,
+        snapshot: &ControlMvpStateObject,
+    ) -> Result<(Bytes, Bytes, ControlMvpStateRef)> {
+        let rows = segment_rows_for_state(snapshot);
+        let (bytes, index_bytes, segment_reference) = encode_segment(
+            &snapshot.state_id,
+            ControlMvpSegmentLevel::L1,
+            snapshot.logical_sequence,
+            &self.scope,
+            &rows,
+        )?;
         let reference = ControlMvpStateRef {
             state_id: snapshot.state_id.clone(),
             logical_sequence: snapshot.logical_sequence,
-            checksum_sha256: sha256_hex(&bytes),
+            checksum_sha256: segment_reference.checksum_sha256,
+            index_checksum_sha256: segment_reference.index_checksum_sha256,
         };
-        let path = self.paths.state_object(&snapshot.state_id);
-        match self
+        Ok((bytes, index_bytes, reference))
+    }
+
+    async fn write_l0_segment(
+        &self,
+        reference: &ControlMvpSegmentRef,
+        bytes: Bytes,
+        index_bytes: Bytes,
+    ) -> Result<()> {
+        put_immutable_matching(
+            &self.storage,
+            &self.paths.l0_segment_object(&reference.segment_id),
+            bytes,
+            "control MVP L0 segment already exists with different bytes",
+        )
+        .await?;
+        put_immutable_matching(
+            &self.storage,
+            &self.paths.segment_index(&reference.segment_id),
+            index_bytes,
+            "control MVP L0 segment index already exists with different bytes",
+        )
+        .await
+    }
+
+    async fn load_l0_segment_rows(
+        &self,
+        reference: &ControlMvpSegmentRef,
+    ) -> Result<Vec<ControlMvpSegmentRow>> {
+        let bytes = self
             .storage
-            .put_raw(&path, bytes.clone(), WritePrecondition::DoesNotExist)
-            .await?
-        {
-            WriteResult::Success { .. } => Ok(reference),
-            WriteResult::PreconditionFailed { .. } => {
-                let existing = self.storage.get_raw(&path).await?;
-                if existing == bytes {
-                    Ok(reference)
-                } else {
-                    Err(precondition_failed(
-                        "control MVP state snapshot already exists with different bytes",
-                    ))
-                }
-            }
-        }
+            .get_raw(&self.paths.l0_segment_object(&reference.segment_id))
+            .await?;
+        let index_bytes = self
+            .storage
+            .get_raw(&self.paths.segment_index(&reference.segment_id))
+            .await?;
+        decode_segment_rows(&bytes, &index_bytes, reference, &self.scope)
     }
 
     async fn load_tx(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
@@ -497,9 +570,11 @@ impl ControlMvpStateStore {
             Some(&tx_ref.checksum_sha256),
             "control MVP transaction reference checksum",
         )?;
-        let tx: ControlMvpTxObject =
+        let mut tx: ControlMvpTxObject =
             decode_envelope(&bytes, "control-mvp-tx", "control MVP transaction")?;
         tx.validate(&self.scope, tx_ref)?;
+        let rows = self.load_l0_segment_rows(&tx.l0_segment).await?;
+        tx.hydrate_from_segment_rows(rows)?;
         Ok(tx)
     }
 
@@ -812,7 +887,7 @@ impl ControlMvpStateStore {
             source_logical_sequence: source.logical_sequence(),
             result_logical_sequence: result_sequence,
         };
-        let tx = ControlMvpTxObject {
+        let mut tx = ControlMvpTxObject {
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
             tx_id: transaction_id.clone(),
@@ -825,6 +900,7 @@ impl ControlMvpStateStore {
                 identity.attempt(),
                 identity.domain()
             )),
+            l0_segment: unwritten_l0_segment_ref(&transaction_id, result_sequence),
             writes: writes
                 .into_iter()
                 .map(|(key, write)| ControlMvpWriteEntry::from_staged(key, result_sequence, write))
@@ -835,6 +911,15 @@ impl ControlMvpStateStore {
             }],
             outbox_trim: Vec::new(),
         };
+        let l0_rows = segment_rows_for_tx(&tx);
+        let (l0_segment_bytes, l0_index_bytes, l0_reference) = encode_segment(
+            &transaction_id,
+            ControlMvpSegmentLevel::L0,
+            result_sequence,
+            &self.scope,
+            &l0_rows,
+        )?;
+        tx.l0_segment = l0_reference;
         let transaction_bytes = encode_envelope("control-mvp-tx", &tx)?;
         let transaction_checksum = sha256_hex(&transaction_bytes);
         let mut candidate_state = stable.candidate_parent.state.clone();
@@ -845,6 +930,22 @@ impl ControlMvpStateStore {
             sequence: result_sequence,
             checksum_sha256: transaction_checksum,
         });
+        let rendered_l1 =
+            if u64::try_from(tx_refs.len()).unwrap_or(u64::MAX) >= self.checkpoint_interval {
+                let snapshot = ControlMvpStateObject::from_replay(
+                    &candidate_state,
+                    state_id_for_manifest(&candidate_manifest_id),
+                    &self.scope,
+                );
+                let (bytes, index_bytes, reference) = self.render_state_snapshot(&snapshot)?;
+                Some(RenderedControlMvpStateSegment {
+                    reference,
+                    bytes,
+                    index_bytes,
+                })
+            } else {
+                None
+            };
         let manifest = ControlMvpManifest {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -854,7 +955,9 @@ impl ControlMvpStateStore {
             base_manifest_id: Some(base_manifest_id.to_string()),
             writer_epoch: stable.writer_epoch,
             base_state: stable.candidate_parent.base_state.clone(),
-            anchor_state: None,
+            anchor_state: rendered_l1
+                .as_ref()
+                .map(|segment| segment.reference.clone()),
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
         };
@@ -874,6 +977,9 @@ impl ControlMvpStateStore {
         Ok(RenderedControlMvpRestore {
             transaction_id,
             transaction_bytes,
+            l0_segment_bytes,
+            l0_index_bytes,
+            l1_segment: rendered_l1,
             candidate_manifest_id,
             manifest_bytes,
             pointer_bytes,
@@ -941,16 +1047,16 @@ impl ControlMvpPaths {
         }
     }
 
-    /// Returns the base prefix for all MVP control-state artifacts.
+    /// Returns the version-one base prefix for all control-state artifacts.
     #[must_use]
     pub fn base_prefix(&self) -> String {
-        format!("state-store/control-mvp/{}", self.domain)
+        format!("control/v1/domains/{}", self.domain)
     }
 
     /// Returns the immutable transaction object path.
     #[must_use]
     pub fn tx_object(&self, tx_id: &str) -> String {
-        format!("{}/txlog/{tx_id}.json", self.base_prefix())
+        format!("{}/transactions/{tx_id}.json", self.base_prefix())
     }
 
     /// Returns the immutable manifest object path.
@@ -962,7 +1068,7 @@ impl ControlMvpPaths {
     /// Returns the current pointer path.
     #[must_use]
     pub fn current_pointer(&self) -> String {
-        format!("{}/current.pointer.json", self.base_prefix())
+        format!("{}/head/current.json", self.base_prefix())
     }
 
     /// Returns the immutable checkpoint object path.
@@ -971,10 +1077,22 @@ impl ControlMvpPaths {
         format!("{}/checkpoints/{checkpoint_id}.json", self.base_prefix())
     }
 
-    /// Returns the immutable state-snapshot object path.
+    /// Returns the immutable consolidated L1 state-segment object path.
     #[must_use]
     pub fn state_object(&self, state_id: &str) -> String {
-        format!("{}/states/{state_id}.json", self.base_prefix())
+        format!("{}/segments/l1/{state_id}.arrow", self.base_prefix())
+    }
+
+    /// Returns the immutable level-zero transaction-segment object path.
+    #[must_use]
+    pub fn l0_segment_object(&self, segment_id: &str) -> String {
+        format!("{}/segments/l0/{segment_id}.arrow", self.base_prefix())
+    }
+
+    /// Returns the immutable index sidecar path for any segment level.
+    #[must_use]
+    pub fn segment_index(&self, segment_id: &str) -> String {
+        format!("{}/indexes/{segment_id}.idx", self.base_prefix())
     }
 }
 
@@ -1163,19 +1281,16 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 2 is the version this revision plans in. Version 1 predates
-/// `observed_writer_epoch` and is still **decodable**, by explicit migration
-/// rather than by Serde defaults: an in-flight attempt written by an older
-/// revision has to be readable by the recovery path whose job is to supersede
-/// it, and a plan that cannot be deserialized cannot be inspected, superseded,
-/// or safely replanned — recovery would degrade into a serialization failure.
+/// Version 3 is the version this revision plans in. Versions 1 and 2 carry
+/// paths from the retired authority layout and are still **decodable** so an
+/// in-flight attempt can be inspected, superseded, and safely replanned.
 ///
 /// The migration is fail-closed. A decoded v1 plan records
-/// `observed_writer_epoch = 0` as "not observed", is marked legacy by keeping
-/// `version == 1`, and reaches exactly one terminal outcome at inspection:
-/// [`RestoreParticipantInspection::Superseded`]. It is never Ready and is
-/// never applied, so the missing epoch observation can never be mistaken for
-/// an observation of epoch 0. The driver replans it as a version 2 plan.
+/// `observed_writer_epoch = 0` as "not observed". Both old versions reach
+/// exactly one terminal outcome at inspection:
+/// [`RestoreParticipantInspection::Superseded`]. They are never Ready and
+/// their object paths are never read or written. The driver replans them as a
+/// version 3 plan under the current layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     record_type: String,
@@ -1238,7 +1353,7 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
         D: serde::Deserializer<'de>,
     {
         let wire = ControlMvpRestorePlanWire::deserialize(deserializer)?;
-        let observed_writer_epoch = if wire.version == RESTORE_PLAN_VERSION_LEGACY {
+        let observed_writer_epoch = if wire.version == RESTORE_PLAN_VERSION_V1 {
             // Version 1 never carried the field. Present means the record is
             // malformed for its declared version, absent means "not observed",
             // which apply-time handling treats as fail-closed (never Ready).
@@ -1290,11 +1405,14 @@ impl ControlMvpRestorePlan {
         self.version
     }
 
-    /// Returns whether this plan was migrated from the pre-`observed_writer_epoch`
-    /// version and therefore may only be superseded, never applied.
+    /// Returns whether this plan names the retired authority layout and
+    /// therefore may only be superseded, never applied.
     #[must_use]
     pub const fn is_legacy_version(&self) -> bool {
-        self.version == RESTORE_PLAN_VERSION_LEGACY
+        matches!(
+            self.version,
+            RESTORE_PLAN_VERSION_V1 | RESTORE_PLAN_VERSION_V2
+        )
     }
 
     /// Returns the exact source authority reference.
@@ -1391,18 +1509,8 @@ impl ControlMvpRestorePlan {
                 .as_ref()
                 .is_some_and(|version| !version.is_empty()),
         };
-        // Legacy plans are structurally validated exactly like current ones —
-        // the deterministic identity derivation never included the writer
-        // epoch, so every identity check below still binds. What a legacy plan
-        // may not do is become authority; `inspect_restore` refuses to report
-        // it Ready.
-        let version_supported =
-            self.version == RESTORE_PLAN_VERSION || self.version == RESTORE_PLAN_VERSION_LEGACY;
-        let legacy_epoch_valid =
-            self.version != RESTORE_PLAN_VERSION_LEGACY || self.observed_writer_epoch == 0;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
-            || !version_supported
-            || !legacy_epoch_valid
+            || self.version != RESTORE_PLAN_VERSION
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -1463,6 +1571,99 @@ impl ControlMvpRestorePlan {
         }
         Ok(())
     }
+
+    /// Validates only the inert evidence needed to classify a retired plan.
+    ///
+    /// Old transaction, manifest, and checkpoint paths intentionally are not
+    /// compared with the current layout and must never be dereferenced. The
+    /// remaining checks prevent a malformed or cross-scope record from being
+    /// silently accepted as a legitimate recovery artifact.
+    fn validate_legacy_for_supersession(&self, store: &ControlMvpStateStore) -> Result<()> {
+        self.scope.validate()?;
+        self.source.validate()?;
+        let validated_identity = RestoreAttemptIdentity::new(
+            self.identity.restore_id(),
+            self.identity.attempt(),
+            self.identity.domain(),
+        )?;
+        let current_base_valid = match self.current_base_kind {
+            ControlMvpRestoreCurrentBaseKind::Empty => {
+                self.base_pointer_version.is_none()
+                    && self.observed_base_pointer_sha256
+                        == prefixed_sha256(EMPTY_CURRENT_BASE_MARKER)
+                    && self.observed_writer_epoch == 0
+                    && self.base_manifest_id == self.source.manifest_id()
+                    && self.base_logical_sequence == self.source.logical_sequence()
+            }
+            ControlMvpRestoreCurrentBaseKind::Pointer => self
+                .base_pointer_version
+                .as_ref()
+                .is_some_and(|version| !version.is_empty()),
+        };
+        if self.record_type != RESTORE_PLAN_RECORD_TYPE
+            || !self.is_legacy_version()
+            || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
+            || self.implementation != IMPLEMENTATION
+            || self.scope != store.scope
+            || self.identity != validated_identity
+            || self.identity.domain() != store.scope.domain()
+            || self.source.implementation() != IMPLEMENTATION
+            || self.source.scope() != &store.scope
+            || self.source.reference_kind() != PersistedAuthorityKind::Checkpoint
+            || self.source.checkpoint_path().is_none()
+            || self.source.checkpoint_sha256().is_none()
+            || !current_base_valid
+            || self.base_manifest_id.is_empty()
+            || self.base_logical_sequence == 0
+            || self.result_logical_sequence
+                != self.base_logical_sequence.checked_add(1).unwrap_or(0)
+            || self.result_logical_sequence <= self.source.logical_sequence()
+        {
+            return Err(validation_failed("invalid legacy Control MVP restore plan"));
+        }
+        let suffix = restore_identity_suffix(
+            &self.scope,
+            &self.identity,
+            &self.source,
+            self.current_base_kind,
+            &self.base_manifest_id,
+            self.base_pointer_version.as_deref(),
+            &self.observed_base_pointer_sha256,
+            self.result_logical_sequence,
+        );
+        let expected_transaction_id =
+            format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
+        let expected_manifest_id = format!(
+            "manifest-{:020}-restore-{suffix}",
+            self.result_logical_sequence
+        );
+        let expected_outbox_id = format!(
+            "restore:{}:{}:{}",
+            self.identity.restore_id(),
+            self.identity.attempt(),
+            self.identity.domain()
+        );
+        if self.transaction_id != expected_transaction_id
+            || self.candidate_manifest_id != expected_manifest_id
+            || self.restore_outbox_record_id != expected_outbox_id
+        {
+            return Err(validation_failed(
+                "legacy Control MVP restore plan deterministic identity mismatch",
+            ));
+        }
+        for path in [&self.transaction_path, &self.candidate_manifest_path] {
+            ScopedStorage::validate_path(path)?;
+        }
+        for digest in [
+            &self.observed_base_pointer_sha256,
+            &self.transaction_sha256,
+            &self.candidate_manifest_sha256,
+            &self.candidate_pointer_sha256,
+        ] {
+            validate_prefixed_digest(digest, "legacy Control MVP restore digest")?;
+        }
+        Ok(())
+    }
 }
 
 /// Explicit deterministic roll-forward adapter for [`ControlMvpStateStore`].
@@ -1478,29 +1679,69 @@ impl ControlMvpRestoreParticipant {
         Self { store }
     }
 
+    async fn write_restore_immutable_artifacts(
+        &self,
+        plan: &ControlMvpRestorePlan,
+        rendered: &RenderedControlMvpRestore,
+    ) -> Result<()> {
+        put_restore_immutable(
+            &self.store.storage,
+            &plan.transaction_path,
+            rendered.transaction_bytes.clone(),
+        )
+        .await?;
+        put_restore_immutable(
+            &self.store.storage,
+            &self.store.paths.l0_segment_object(&rendered.transaction_id),
+            rendered.l0_segment_bytes.clone(),
+        )
+        .await?;
+        put_restore_immutable(
+            &self.store.storage,
+            &self.store.paths.segment_index(&rendered.transaction_id),
+            rendered.l0_index_bytes.clone(),
+        )
+        .await?;
+        if let Some(l1_segment) = &rendered.l1_segment {
+            put_restore_immutable(
+                &self.store.storage,
+                &self
+                    .store
+                    .paths
+                    .state_object(&l1_segment.reference.state_id),
+                l1_segment.bytes.clone(),
+            )
+            .await?;
+            put_restore_immutable(
+                &self.store.storage,
+                &self
+                    .store
+                    .paths
+                    .segment_index(&l1_segment.reference.state_id),
+                l1_segment.index_bytes.clone(),
+            )
+            .await?;
+        }
+        put_restore_immutable(
+            &self.store.storage,
+            &plan.candidate_manifest_path,
+            rendered.manifest_bytes.clone(),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn inspect_visible_restore(
         &self,
         plan: &ControlMvpRestorePlan,
         planned_checksum: &str,
     ) -> Result<RestoreParticipantInspection> {
-        let tx_bytes = self.store.storage.get_raw(&plan.transaction_path).await?;
-        if prefixed_sha256(&tx_bytes) != plan.transaction_sha256 {
-            return Err(invariant_violation(
-                "visible restore transaction checksum mismatch",
-            ));
-        }
         let planned_tx_ref = ControlMvpTxRef {
             tx_id: plan.transaction_id.clone(),
             sequence: plan.result_logical_sequence,
             checksum_sha256: planned_checksum.to_string(),
         };
-        let tx: ControlMvpTxObject = decode_envelope(
-            &tx_bytes,
-            "control-mvp-tx",
-            "Control MVP visible restore transaction",
-        )?;
-        tx.validate(&self.store.scope, &planned_tx_ref)?;
+        let tx = self.store.load_tx(&planned_tx_ref).await?;
         let expected_request_id = format!(
             "restore:{}:{}:{}",
             plan.identity.restore_id(),
@@ -1552,10 +1793,12 @@ impl ControlMvpRestoreParticipant {
         manifest.validate(&self.store.scope, &plan.candidate_manifest_id)?;
         let base_manifest = self.store.load_manifest(&plan.base_manifest_id).await?;
         let (expected_base_state, expected_prefix) = base_manifest.successor_anchor();
+        let should_anchor = u64::try_from(expected_prefix.len() + 1).unwrap_or(u64::MAX)
+            >= self.store.checkpoint_interval;
         if manifest.logical_sequence != plan.result_logical_sequence
             || manifest.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
             || manifest.base_state != expected_base_state
-            || manifest.anchor_state.is_some()
+            || manifest.anchor_state.is_some() != should_anchor
             || manifest.tx_refs.len() != expected_prefix.len() + 1
             || manifest.tx_refs.get(..expected_prefix.len()) != Some(expected_prefix.as_slice())
             || manifest.tx_refs.last() != Some(&planned_tx_ref)
@@ -1564,7 +1807,15 @@ impl ControlMvpRestoreParticipant {
                 "visible restore candidate manifest does not extend the planned base",
             ));
         }
-        self.store.replay_manifest(&manifest).await?;
+        let replayed = self.store.replay_manifest(&manifest).await?;
+        if let Some(anchor) = &manifest.anchor_state {
+            let anchored = self.store.load_state_snapshot(anchor).await?;
+            if anchored.checksum()? != replayed.checksum()? {
+                return Err(invariant_violation(
+                    "visible restore L1 anchor does not match replayed state",
+                ));
+            }
+        }
         let candidate_pointer = ControlMvpPointer {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -1681,6 +1932,13 @@ pub struct ControlMvpTxn {
     writes: BTreeMap<Vec<u8>, StagedWrite>,
     outbox: Vec<ControlMvpProjectionOutboxRecord>,
     outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
+    projection_intents: Vec<StagedProjectionIntent>,
+}
+
+struct StagedProjectionIntent {
+    intent_id: String,
+    projection_kind: String,
+    payload: Bytes,
 }
 
 impl ControlMvpTxn {
@@ -1733,6 +1991,61 @@ impl ControlMvpTxn {
             });
         }
         self.outbox.push(record);
+        Ok(())
+    }
+
+    /// Stages a version-one projection intent in the authority transaction.
+    ///
+    /// The committed envelope is bound to the successful transaction's
+    /// [`StateToken`], persisted in the source outbox, and returned in the
+    /// [`CommitOutcome`]. Queue delivery happens only after this method's
+    /// transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an invalid version-one envelope or an
+    /// already-retained/staged intent identifier.
+    pub fn stage_projection_intent(
+        &mut self,
+        intent_id: impl Into<String>,
+        projection_kind: impl Into<String>,
+        payload: Bytes,
+    ) -> Result<()> {
+        let staged = StagedProjectionIntent {
+            intent_id: intent_id.into(),
+            projection_kind: projection_kind.into(),
+            payload,
+        };
+        let predicted_token = self.store.token(
+            self.manifest_id.clone(),
+            self.base.state.logical_sequence + 1,
+        );
+        ProjectionIntentV1::new(
+            staged.intent_id.clone(),
+            staged.projection_kind.clone(),
+            &predicted_token,
+            staged.payload.clone(),
+        )?;
+        let duplicate = self
+            .base
+            .state
+            .outbox
+            .iter()
+            .map(|record| record.record_id.as_str())
+            .chain(self.outbox.iter().map(|record| record.record_id.as_str()))
+            .chain(
+                self.projection_intents
+                    .iter()
+                    .map(|intent| intent.intent_id.as_str()),
+            )
+            .any(|existing| existing == staged.intent_id);
+        if duplicate {
+            return Err(CatalogError::AlreadyExists {
+                entity: "projection intent".to_string(),
+                name: staged.intent_id,
+            });
+        }
+        self.projection_intents.push(staged);
         Ok(())
     }
 
@@ -1809,7 +2122,7 @@ impl ControlMvpTxn {
     ///
     /// Returns an error when artifact writes fail, preconditions are not met, or
     /// pointer CAS publication loses to another writer.
-    pub async fn commit(self) -> Result<StateToken> {
+    pub async fn commit(self) -> Result<CommitOutcome> {
         self.commit_inner().await
     }
 
@@ -1904,14 +2217,34 @@ impl ControlMvpTxn {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn commit_inner(self) -> Result<StateToken> {
+    async fn commit_inner(self) -> Result<CommitOutcome> {
         for precondition in &self.preconditions {
             self.base.state.validate_precondition(precondition)?;
         }
         validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
 
         let next_sequence = self.base.state.logical_sequence + 1;
-        let tx = ControlMvpTxObject {
+        let committed_token = self.store.token(self.manifest_id.clone(), next_sequence);
+        let projection_intents = self
+            .projection_intents
+            .iter()
+            .map(|intent| {
+                ProjectionIntentV1::new(
+                    intent.intent_id.clone(),
+                    intent.projection_kind.clone(),
+                    &committed_token,
+                    intent.payload.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut committed_outbox = self.outbox;
+        for intent in &projection_intents {
+            committed_outbox.push(ControlMvpProjectionOutboxRecord::new(
+                intent.intent_id(),
+                encode_json(intent, "projection intent")?,
+            ));
+        }
+        let mut tx = ControlMvpTxObject {
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             tx_id: self.tx_id.clone(),
@@ -1919,18 +2252,27 @@ impl ControlMvpTxn {
             sequence: next_sequence,
             writer_epoch: self.store.writer_epoch,
             request_id: self.request_id.clone(),
+            l0_segment: unwritten_l0_segment_ref(&self.tx_id, next_sequence),
             writes: self
                 .writes
                 .into_iter()
                 .map(|(key, write)| ControlMvpWriteEntry::from_staged(key, next_sequence, write))
                 .collect(),
-            outbox: self
-                .outbox
+            outbox: committed_outbox
                 .iter()
                 .map(ControlMvpOutboxEntry::from_record)
                 .collect(),
             outbox_trim: self.outbox_trim,
         };
+        let l0_rows = segment_rows_for_tx(&tx);
+        let (l0_bytes, l0_index_bytes, l0_reference) = encode_segment(
+            &self.tx_id,
+            ControlMvpSegmentLevel::L0,
+            next_sequence,
+            &self.store.scope,
+            &l0_rows,
+        )?;
+        tx.l0_segment = l0_reference.clone();
         let tx_bytes = encode_envelope("control-mvp-tx", &tx)?;
         let tx_checksum = sha256_hex(&tx_bytes);
         put_immutable(
@@ -1940,6 +2282,9 @@ impl ControlMvpTxn {
             "control MVP transaction object already exists",
         )
         .await?;
+        self.store
+            .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
+            .await?;
 
         let mut candidate_state = self.base.state.clone();
         candidate_state.apply_tx(&tx)?;
@@ -2001,18 +2346,37 @@ impl ControlMvpTxn {
             WritePrecondition::DoesNotExist,
             WritePrecondition::MatchesVersion,
         );
-        match self
+        let pointer_write = self
             .store
             .storage
             .put_raw(
                 &self.store.paths.current_pointer(),
-                pointer_bytes,
+                pointer_bytes.clone(),
                 precondition,
             )
-            .await?
-        {
-            WriteResult::Success { .. } => Ok(self.store.token(self.manifest_id, next_sequence)),
-            WriteResult::PreconditionFailed { .. } => {
+            .await;
+        match pointer_write {
+            Err(error) => {
+                // S3 may accept a conditional PUT and lose the response. The
+                // exact canonical pointer bytes are deterministic, so a
+                // read-after-error can distinguish our successful CAS from an
+                // uncommitted or foreign result without guessing.
+                if self
+                    .store
+                    .storage
+                    .get_raw(&self.store.paths.current_pointer())
+                    .await
+                    .is_ok_and(|current| current == pointer_bytes)
+                {
+                    Ok(CommitOutcome::new(committed_token, projection_intents))
+                } else {
+                    Err(error.into())
+                }
+            }
+            Ok(WriteResult::Success { .. }) => {
+                Ok(CommitOutcome::new(committed_token, projection_intents))
+            }
+            Ok(WriteResult::PreconditionFailed { .. }) => {
                 // Distinguish an epoch supersession from an ordinary CAS race
                 // so fenced-out writers get the typed fail-closed error.
                 if let Ok(current) = self.store.load_pointer().await
@@ -2379,16 +2743,11 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         plan: &PersistedRestoreParticipantPlan,
     ) -> Result<RestoreParticipantInspection> {
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
-        plan.validate(&self.store)?;
         if plan.is_legacy_version() {
-            // Defined terminal outcome for a migrated pre-`observed_writer_epoch`
-            // plan: it never observed the epoch it would have to publish under,
-            // so it can never be reproduced as deterministic candidate bytes
-            // and must not be applied. Reporting Superseded drives the restore
-            // driver to replan the domain at the current version instead of
-            // failing recovery outright.
+            plan.validate_legacy_for_supersession(&self.store)?;
             return Ok(RestoreParticipantInspection::Superseded);
         }
+        plan.validate(&self.store)?;
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         let planned_checksum = plan
             .transaction_sha256
@@ -2450,6 +2809,10 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         now: DateTime<Utc>,
     ) -> Result<RestoreParticipantInspection> {
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = persisted;
+        if plan.is_legacy_version() {
+            plan.validate_legacy_for_supersession(&self.store)?;
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
         plan.validate(&self.store)?;
         match self.inspect_restore(persisted).await? {
             RestoreParticipantInspection::Ready => {}
@@ -2482,18 +2845,8 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             ));
         }
 
-        put_restore_immutable(
-            &self.store.storage,
-            &plan.transaction_path,
-            rendered.transaction_bytes,
-        )
-        .await?;
-        put_restore_immutable(
-            &self.store.storage,
-            &plan.candidate_manifest_path,
-            rendered.manifest_bytes,
-        )
-        .await?;
+        self.write_restore_immutable_artifacts(plan, &rendered)
+            .await?;
         let pointer_precondition = match plan.current_base_kind {
             ControlMvpRestoreCurrentBaseKind::Empty => WritePrecondition::DoesNotExist,
             ControlMvpRestoreCurrentBaseKind::Pointer => WritePrecondition::MatchesVersion(
@@ -2630,7 +2983,7 @@ impl ArcoStateTxn for ControlMvpTxn {
         Ok(())
     }
 
-    async fn commit(self: Box<Self>) -> Result<StateToken> {
+    async fn commit(self: Box<Self>) -> Result<CommitOutcome> {
         (*self).commit_inner().await
     }
 
@@ -2660,11 +3013,20 @@ struct StableRestoreBase {
 struct RenderedControlMvpRestore {
     transaction_id: String,
     transaction_bytes: Bytes,
+    l0_segment_bytes: Bytes,
+    l0_index_bytes: Bytes,
+    l1_segment: Option<RenderedControlMvpStateSegment>,
     candidate_manifest_id: String,
     manifest_bytes: Bytes,
     pointer_bytes: Bytes,
     outbox_record_id: String,
     result_sequence: u64,
+}
+
+struct RenderedControlMvpStateSegment {
+    reference: ControlMvpStateRef,
+    bytes: Bytes,
+    index_bytes: Bytes,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2960,7 +3322,7 @@ struct ChecksumEnvelope<T> {
     payload: T,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlMvpScopeDoc {
     tenant_id: String,
     workspace_id: String,
@@ -3024,10 +3386,58 @@ struct ControlMvpStateRef {
     state_id: String,
     logical_sequence: u64,
     checksum_sha256: String,
+    index_checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ControlMvpSegmentLevel {
+    L0,
+    L1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlMvpSegmentRef {
+    segment_id: String,
+    level: ControlMvpSegmentLevel,
+    logical_sequence: u64,
+    checksum_sha256: String,
+    index_checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlMvpSegmentIndex {
+    format_version: u32,
+    implementation: String,
+    scope: ControlMvpScopeDoc,
+    segment_id: String,
+    level: ControlMvpSegmentLevel,
+    logical_sequence: u64,
+    row_count: u64,
+    min_key_hex: Option<String>,
+    max_key_hex: Option<String>,
+    min_key_utf8: Option<String>,
+    max_key_utf8: Option<String>,
+    record_batch_offsets: Vec<u64>,
+    bloom_bits_hex: String,
+    segment_checksum_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlMvpSegmentRow {
+    record_kind: u8,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
+    generation: u64,
+    tombstone: bool,
+    logical_sequence: u64,
+    logical_ordinal: u64,
+    origin_sequence: Option<u64>,
 }
 
 /// Immutable materialized replay state anchored to one manifest.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 struct ControlMvpStateObject {
     format_version: u32,
     implementation: String,
@@ -3212,13 +3622,18 @@ struct ControlMvpTxObject {
     sequence: u64,
     writer_epoch: u64,
     request_id: Option<String>,
+    l0_segment: ControlMvpSegmentRef,
+    /// Hydrated only from the checksummed Arrow L0 segment. Transaction JSON
+    /// contains metadata and immutable segment references, never state data.
+    #[serde(skip)]
     writes: Vec<ControlMvpWriteEntry>,
+    #[serde(skip)]
     outbox: Vec<ControlMvpOutboxEntry>,
     /// Outbox events removed from replayed state by this transaction.
     /// Consumers trim only events they have durably acknowledged; the store
     /// enforces that every trimmed event incarnation exists at apply time and
     /// fails closed otherwise.
-    #[serde(default)]
+    #[serde(skip)]
     outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
@@ -3271,7 +3686,162 @@ impl ControlMvpTxObject {
                 "control MVP transaction ref does not match transaction payload",
             ));
         }
+        if self.l0_segment.segment_id != self.tx_id
+            || self.l0_segment.level != ControlMvpSegmentLevel::L0
+            || self.l0_segment.logical_sequence != self.sequence
+            || self.l0_segment.checksum_sha256.len() != 64
+            || self.l0_segment.index_checksum_sha256.len() != 64
+        {
+            return Err(invariant_violation(
+                "control MVP transaction L0 segment reference is invalid",
+            ));
+        }
         Ok(())
+    }
+
+    fn hydrate_from_segment_rows(&mut self, rows: Vec<ControlMvpSegmentRow>) -> Result<()> {
+        let mut writes = Vec::new();
+        let mut outbox = Vec::new();
+        let mut outbox_trim = Vec::new();
+        for row in rows {
+            if row.logical_sequence != self.sequence {
+                return Err(invariant_violation(
+                    "control MVP L0 row sequence does not match transaction sequence",
+                ));
+            }
+            match row.record_kind {
+                SEGMENT_RECORD_KV => {
+                    if row.origin_sequence.is_some() || row.generation != self.sequence {
+                        return Err(invariant_violation(
+                            "control MVP L0 key/value row metadata is invalid",
+                        ));
+                    }
+                    writes.push((
+                        row.logical_ordinal,
+                        ControlMvpWriteEntry {
+                            key: row.key,
+                            generation: row.generation,
+                            value: row.value,
+                        },
+                    ));
+                }
+                SEGMENT_RECORD_OUTBOX => {
+                    if row.tombstone
+                        || row.generation != 0
+                        || row.origin_sequence != Some(self.sequence)
+                    {
+                        return Err(invariant_violation(
+                            "control MVP L0 outbox row metadata is invalid",
+                        ));
+                    }
+                    let record_id = String::from_utf8(row.key).map_err(|error| {
+                        segment_serialization_error("decode L0 outbox record id", error)
+                    })?;
+                    let payload = row.value.ok_or_else(|| {
+                        invariant_violation("control MVP L0 outbox row has no payload")
+                    })?;
+                    outbox.push((
+                        row.logical_ordinal,
+                        ControlMvpOutboxEntry { record_id, payload },
+                    ));
+                }
+                SEGMENT_RECORD_OUTBOX_TRIM => {
+                    if !row.tombstone || row.generation != 0 || row.value.is_some() {
+                        return Err(invariant_violation(
+                            "control MVP L0 outbox-trim row metadata is invalid",
+                        ));
+                    }
+                    let record_id = String::from_utf8(row.key).map_err(|error| {
+                        segment_serialization_error("decode L0 outbox trim record id", error)
+                    })?;
+                    let entry = match row.origin_sequence {
+                        Some(origin_sequence) => ControlMvpOutboxTrimEntry::Identified {
+                            record_id,
+                            origin_sequence,
+                        },
+                        None => ControlMvpOutboxTrimEntry::Legacy(record_id),
+                    };
+                    outbox_trim.push((row.logical_ordinal, entry));
+                }
+                _ => {
+                    return Err(invariant_violation(
+                        "control MVP L0 segment contains an unknown row kind",
+                    ));
+                }
+            }
+        }
+        sort_and_validate_segment_ordinals(&mut writes, "key/value")?;
+        sort_and_validate_segment_ordinals(&mut outbox, "outbox")?;
+        sort_and_validate_segment_ordinals(&mut outbox_trim, "outbox trim")?;
+
+        validate_unique_hydrated_rows(&writes, &outbox, &outbox_trim)?;
+
+        self.writes = writes.into_iter().map(|(_, entry)| entry).collect();
+        self.outbox = outbox.into_iter().map(|(_, entry)| entry).collect();
+        self.outbox_trim = outbox_trim.into_iter().map(|(_, entry)| entry).collect();
+        Ok(())
+    }
+}
+
+fn validate_unique_hydrated_rows(
+    writes: &[(u64, ControlMvpWriteEntry)],
+    outbox: &[(u64, ControlMvpOutboxEntry)],
+    outbox_trim: &[(u64, ControlMvpOutboxTrimEntry)],
+) -> Result<()> {
+    let write_keys = writes
+        .iter()
+        .map(|(_, entry)| entry.key.as_slice())
+        .collect::<BTreeSet<_>>();
+    if write_keys.len() != writes.len() {
+        return Err(invariant_violation(
+            "control MVP L0 segment contains duplicate key/value rows",
+        ));
+    }
+    let outbox_ids = outbox
+        .iter()
+        .map(|(_, entry)| entry.record_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if outbox_ids.len() != outbox.len() {
+        return Err(invariant_violation(
+            "control MVP L0 segment contains duplicate outbox rows",
+        ));
+    }
+    let trim_ids = outbox_trim
+        .iter()
+        .map(|(_, entry)| entry.record_id())
+        .collect::<BTreeSet<_>>();
+    if trim_ids.len() != outbox_trim.len() {
+        return Err(invariant_violation(
+            "control MVP L0 segment contains duplicate outbox-trim rows",
+        ));
+    }
+    Ok(())
+}
+
+fn sort_and_validate_segment_ordinals<T>(
+    entries: &mut [(u64, T)],
+    record_kind: &str,
+) -> Result<()> {
+    entries.sort_by_key(|(ordinal, _)| *ordinal);
+    for (expected, (actual, _)) in entries.iter().enumerate() {
+        let expected = u64::try_from(expected)
+            .map_err(|error| segment_serialization_error("convert L0 logical ordinal", error))?;
+        if *actual != expected {
+            return Err(invariant_violation(format!(
+                "control MVP L0 {record_kind} logical ordinals are not contiguous"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn unwritten_l0_segment_ref(segment_id: &str, logical_sequence: u64) -> ControlMvpSegmentRef {
+    ControlMvpSegmentRef {
+        segment_id: segment_id.to_string(),
+        level: ControlMvpSegmentLevel::L0,
+        logical_sequence,
+        checksum_sha256: String::new(),
+        index_checksum_sha256: String::new(),
     }
 }
 
@@ -3347,6 +3917,536 @@ impl ControlMvpOutboxStateEntry {
             payload: Bytes::from(self.payload.clone()),
             origin_sequence: self.origin_sequence,
         }
+    }
+}
+
+const SEGMENT_RECORD_KV: u8 = 0;
+const SEGMENT_RECORD_OUTBOX: u8 = 1;
+const SEGMENT_RECORD_OUTBOX_TRIM: u8 = 2;
+const SEGMENT_BLOOM_BYTES: usize = 32;
+
+fn segment_rows_for_state(state: &ControlMvpStateObject) -> Vec<ControlMvpSegmentRow> {
+    let mut rows = state
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, entry)| ControlMvpSegmentRow {
+            record_kind: SEGMENT_RECORD_KV,
+            key: entry.key.clone(),
+            value: entry.value.clone(),
+            generation: entry.generation,
+            tombstone: entry.value.is_none(),
+            logical_sequence: state.logical_sequence,
+            logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+            origin_sequence: None,
+        })
+        .chain(
+            state
+                .outbox
+                .iter()
+                .enumerate()
+                .map(|(ordinal, entry)| ControlMvpSegmentRow {
+                    record_kind: SEGMENT_RECORD_OUTBOX,
+                    key: entry.record_id.as_bytes().to_vec(),
+                    value: Some(entry.payload.clone()),
+                    generation: 0,
+                    tombstone: false,
+                    logical_sequence: state.logical_sequence,
+                    logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+                    origin_sequence: entry.origin_sequence,
+                }),
+        )
+        .collect::<Vec<_>>();
+    sort_segment_rows(&mut rows);
+    rows
+}
+
+fn state_object_from_segment_rows(
+    reference: &ControlMvpStateRef,
+    rows: Vec<ControlMvpSegmentRow>,
+    scope: &StateScope,
+) -> Result<ControlMvpStateObject> {
+    let mut entries = Vec::new();
+    let mut outbox = Vec::new();
+    for row in rows {
+        if row.logical_sequence != reference.logical_sequence {
+            return Err(invariant_violation(
+                "control MVP L1 segment row sequence does not match its reference",
+            ));
+        }
+        match row.record_kind {
+            SEGMENT_RECORD_KV => {
+                if row.generation == 0 || row.generation > reference.logical_sequence {
+                    return Err(invariant_violation(
+                        "control MVP L1 segment contains an invalid key generation",
+                    ));
+                }
+                entries.push(ReplayStateDigestEntry {
+                    key: row.key,
+                    generation: row.generation,
+                    value: row.value,
+                });
+            }
+            SEGMENT_RECORD_OUTBOX => {
+                let record_id = String::from_utf8(row.key).map_err(|error| {
+                    segment_serialization_error("decode L1 outbox record id", error)
+                })?;
+                let payload = row.value.ok_or_else(|| {
+                    invariant_violation("control MVP L1 outbox row has no payload")
+                })?;
+                outbox.push((
+                    row.logical_ordinal,
+                    ControlMvpOutboxStateEntry {
+                        record_id,
+                        payload,
+                        origin_sequence: row.origin_sequence,
+                    },
+                ));
+            }
+            SEGMENT_RECORD_OUTBOX_TRIM => {
+                return Err(invariant_violation(
+                    "control MVP consolidated L1 state contains an outbox trim row",
+                ));
+            }
+            _ => {
+                return Err(invariant_violation(
+                    "control MVP consolidated L1 state contains an unknown row kind",
+                ));
+            }
+        }
+    }
+    outbox.sort_by_key(|(ordinal, _)| *ordinal);
+    for (expected, (actual, _)) in outbox.iter().enumerate() {
+        let expected = u64::try_from(expected)
+            .map_err(|error| segment_serialization_error("convert L1 outbox ordinal", error))?;
+        if *actual != expected {
+            return Err(invariant_violation(
+                "control MVP L1 outbox logical ordinals are not contiguous",
+            ));
+        }
+    }
+    Ok(ControlMvpStateObject {
+        format_version: CONTROL_MVP_FORMAT_VERSION,
+        implementation: IMPLEMENTATION.to_string(),
+        scope: ControlMvpScopeDoc::from(scope),
+        state_id: reference.state_id.clone(),
+        logical_sequence: reference.logical_sequence,
+        entries,
+        outbox: outbox.into_iter().map(|(_, entry)| entry).collect(),
+    })
+}
+
+fn segment_rows_for_tx(tx: &ControlMvpTxObject) -> Vec<ControlMvpSegmentRow> {
+    let mut rows = tx
+        .writes
+        .iter()
+        .enumerate()
+        .map(|(ordinal, write)| ControlMvpSegmentRow {
+            record_kind: SEGMENT_RECORD_KV,
+            key: write.key.clone(),
+            value: write.value.clone(),
+            generation: write.generation,
+            tombstone: write.value.is_none(),
+            logical_sequence: tx.sequence,
+            logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+            origin_sequence: None,
+        })
+        .chain(
+            tx.outbox
+                .iter()
+                .enumerate()
+                .map(|(ordinal, entry)| ControlMvpSegmentRow {
+                    record_kind: SEGMENT_RECORD_OUTBOX,
+                    key: entry.record_id.as_bytes().to_vec(),
+                    value: Some(entry.payload.clone()),
+                    generation: 0,
+                    tombstone: false,
+                    logical_sequence: tx.sequence,
+                    logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+                    origin_sequence: Some(tx.sequence),
+                }),
+        )
+        .chain(
+            tx.outbox_trim
+                .iter()
+                .enumerate()
+                .map(|(ordinal, entry)| ControlMvpSegmentRow {
+                    record_kind: SEGMENT_RECORD_OUTBOX_TRIM,
+                    key: entry.record_id().as_bytes().to_vec(),
+                    value: None,
+                    generation: 0,
+                    tombstone: true,
+                    logical_sequence: tx.sequence,
+                    logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
+                    origin_sequence: entry.origin_sequence(),
+                }),
+        )
+        .collect::<Vec<_>>();
+    sort_segment_rows(&mut rows);
+    rows
+}
+
+fn sort_segment_rows(rows: &mut [ControlMvpSegmentRow]) {
+    rows.sort_by(|left, right| {
+        (left.record_kind, left.key.as_slice()).cmp(&(right.record_kind, right.key.as_slice()))
+    });
+}
+
+fn encode_segment(
+    segment_id: &str,
+    level: ControlMvpSegmentLevel,
+    logical_sequence: u64,
+    scope: &StateScope,
+    rows: &[ControlMvpSegmentRow],
+) -> Result<(Bytes, Bytes, ControlMvpSegmentRef)> {
+    if rows.len() > MAX_SEGMENT_ROWS {
+        return Err(validation_failed(
+            "control MVP segment exceeds the supported row limit",
+        ));
+    }
+    // Keep the IPC schema metadata-free. Arrow stores schema metadata in a
+    // hash map, whose iteration order is not a stable serialization contract.
+    // Authority identity is checksum-bound in the deterministic JSON index.
+    let schema = Arc::new(control_mvp_segment_schema());
+
+    let mut record_kinds = UInt8Builder::new();
+    let mut keys = BinaryBuilder::new();
+    let mut values = BinaryBuilder::new();
+    let mut generations = UInt64Builder::new();
+    let mut tombstones = BooleanBuilder::new();
+    let mut logical_sequences = UInt64Builder::new();
+    let mut logical_ordinals = UInt64Builder::new();
+    let mut origin_sequences = UInt64Builder::new();
+    for row in rows {
+        record_kinds.append_value(row.record_kind);
+        keys.append_value(&row.key);
+        if let Some(value) = &row.value {
+            values.append_value(value);
+        } else {
+            values.append_null();
+        }
+        generations.append_value(row.generation);
+        tombstones.append_value(row.tombstone);
+        logical_sequences.append_value(row.logical_sequence);
+        logical_ordinals.append_value(row.logical_ordinal);
+        if let Some(origin_sequence) = row.origin_sequence {
+            origin_sequences.append_value(origin_sequence);
+        } else {
+            origin_sequences.append_null();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(record_kinds.finish()),
+            Arc::new(keys.finish()),
+            Arc::new(values.finish()),
+            Arc::new(generations.finish()),
+            Arc::new(tombstones.finish()),
+            Arc::new(logical_sequences.finish()),
+            Arc::new(logical_ordinals.finish()),
+            Arc::new(origin_sequences.finish()),
+        ],
+    )
+    .map_err(|error| segment_serialization_error("build Arrow record batch", error))?;
+    let mut output = Vec::new();
+    {
+        let mut writer = FileWriter::try_new(&mut output, schema.as_ref())
+            .map_err(|error| segment_serialization_error("create Arrow IPC writer", error))?;
+        writer
+            .write(&batch)
+            .map_err(|error| segment_serialization_error("write Arrow IPC batch", error))?;
+        writer
+            .finish()
+            .map_err(|error| segment_serialization_error("finish Arrow IPC segment", error))?;
+    }
+    if output.len() > MAX_SEGMENT_BYTES {
+        return Err(validation_failed(
+            "control MVP segment exceeds the supported byte limit",
+        ));
+    }
+    let segment_bytes = Bytes::from(output);
+    let segment_checksum_sha256 = sha256_hex(&segment_bytes);
+    let index = build_segment_index(
+        segment_id,
+        level,
+        logical_sequence,
+        scope,
+        rows,
+        &segment_bytes,
+        segment_checksum_sha256.clone(),
+    )?;
+    let index_bytes = encode_json(&index, "control MVP segment index")?;
+    if index_bytes.len() > MAX_SEGMENT_INDEX_BYTES {
+        return Err(validation_failed(
+            "control MVP segment index exceeds the supported byte limit",
+        ));
+    }
+    let reference = ControlMvpSegmentRef {
+        segment_id: segment_id.to_string(),
+        level,
+        logical_sequence,
+        checksum_sha256: segment_checksum_sha256,
+        index_checksum_sha256: sha256_hex(&index_bytes),
+    };
+    Ok((segment_bytes, index_bytes, reference))
+}
+
+fn control_mvp_segment_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("record_kind", DataType::UInt8, false),
+        Field::new("key", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
+        Field::new("generation", DataType::UInt64, false),
+        Field::new("tombstone", DataType::Boolean, false),
+        Field::new("logical_sequence", DataType::UInt64, false),
+        Field::new("logical_ordinal", DataType::UInt64, false),
+        Field::new("origin_sequence", DataType::UInt64, true),
+    ])
+}
+
+fn build_segment_index(
+    segment_id: &str,
+    level: ControlMvpSegmentLevel,
+    logical_sequence: u64,
+    scope: &StateScope,
+    rows: &[ControlMvpSegmentRow],
+    segment_bytes: &[u8],
+    segment_checksum_sha256: String,
+) -> Result<ControlMvpSegmentIndex> {
+    let keys = rows
+        .iter()
+        .filter(|row| row.record_kind == SEGMENT_RECORD_KV)
+        .map(|row| row.key.as_slice())
+        .collect::<Vec<_>>();
+    let min_key = keys.first().copied();
+    let max_key = keys.last().copied();
+    Ok(ControlMvpSegmentIndex {
+        format_version: CONTROL_MVP_FORMAT_VERSION,
+        implementation: IMPLEMENTATION.to_string(),
+        scope: scope.into(),
+        segment_id: segment_id.to_string(),
+        level,
+        logical_sequence,
+        row_count: u64::try_from(rows.len())
+            .map_err(|error| segment_serialization_error("convert segment row count", error))?,
+        min_key_hex: min_key.map(hex::encode),
+        max_key_hex: max_key.map(hex::encode),
+        min_key_utf8: min_key.and_then(|key| std::str::from_utf8(key).ok().map(str::to_string)),
+        max_key_utf8: max_key.and_then(|key| std::str::from_utf8(key).ok().map(str::to_string)),
+        record_batch_offsets: arrow_record_batch_offsets(segment_bytes)?,
+        bloom_bits_hex: bloom_bits_hex(&keys),
+        segment_checksum_sha256,
+    })
+}
+
+fn arrow_record_batch_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
+    let trailer_start = bytes
+        .len()
+        .checked_sub(10)
+        .ok_or_else(|| invariant_violation("control MVP Arrow segment trailer is missing"))?;
+    let trailer_bytes = bytes
+        .get(trailer_start..)
+        .ok_or_else(|| invariant_violation("control MVP Arrow segment trailer is missing"))?;
+    let trailer: [u8; 10] = trailer_bytes
+        .try_into()
+        .map_err(|error| segment_serialization_error("read Arrow IPC trailer", error))?;
+    let footer_len = arrow::ipc::reader::read_footer_length(trailer)
+        .map_err(|error| segment_serialization_error("read Arrow IPC footer length", error))?;
+    let footer_start = trailer_start
+        .checked_sub(footer_len)
+        .ok_or_else(|| invariant_violation("control MVP Arrow segment footer is out of bounds"))?;
+    let footer_bytes = bytes
+        .get(footer_start..trailer_start)
+        .ok_or_else(|| invariant_violation("control MVP Arrow segment footer is out of bounds"))?;
+    let footer = arrow::ipc::root_as_footer(footer_bytes)
+        .map_err(|error| segment_serialization_error("decode Arrow IPC footer", error))?;
+    let batches = footer.recordBatches().ok_or_else(|| {
+        invariant_violation("control MVP Arrow segment footer has no record batches")
+    })?;
+    let mut offsets = Vec::with_capacity(batches.len());
+    for block in batches {
+        let offset = u64::try_from(block.offset())
+            .map_err(|error| segment_serialization_error("convert Arrow batch offset", error))?;
+        if offset == 0
+            || offset
+                >= u64::try_from(footer_start).map_err(|error| {
+                    segment_serialization_error("convert Arrow footer offset", error)
+                })?
+        {
+            return Err(invariant_violation(
+                "control MVP Arrow record-batch offset is out of bounds",
+            ));
+        }
+        offsets.push(offset);
+    }
+    if offsets.is_empty() {
+        return Err(invariant_violation(
+            "control MVP Arrow segment footer has no record-batch offsets",
+        ));
+    }
+    Ok(offsets)
+}
+
+fn bloom_bits_hex(keys: &[&[u8]]) -> String {
+    let mut bits = [0_u8; SEGMENT_BLOOM_BYTES];
+    for key in keys {
+        let digest = Sha256::digest(key);
+        for byte in digest.iter().take(3) {
+            let bit = usize::from(*byte) % (SEGMENT_BLOOM_BYTES * 8);
+            if let Some(slot) = bits.get_mut(bit / 8) {
+                *slot |= 1 << (bit % 8);
+            }
+        }
+    }
+    hex::encode(bits)
+}
+
+fn decode_segment_rows(
+    bytes: &[u8],
+    index_bytes: &[u8],
+    reference: &ControlMvpSegmentRef,
+    scope: &StateScope,
+) -> Result<Vec<ControlMvpSegmentRow>> {
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(invariant_violation(
+            "control MVP Arrow segment exceeds the supported byte limit",
+        ));
+    }
+    if index_bytes.len() > MAX_SEGMENT_INDEX_BYTES {
+        return Err(invariant_violation(
+            "control MVP segment index exceeds the supported byte limit",
+        ));
+    }
+    validate_raw_checksum(
+        bytes,
+        Some(&reference.checksum_sha256),
+        "control MVP segment reference checksum",
+    )?;
+    validate_raw_checksum(
+        index_bytes,
+        Some(&reference.index_checksum_sha256),
+        "control MVP segment index reference checksum",
+    )?;
+    let index: ControlMvpSegmentIndex = decode_json(index_bytes, "control MVP segment index")?;
+    let mut reader = FileReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| segment_serialization_error("open Arrow IPC segment", error))?;
+    let mut batches = Vec::new();
+    for batch in &mut reader {
+        batches.push(
+            batch.map_err(|error| segment_serialization_error("read Arrow IPC segment", error))?,
+        );
+    }
+    let [batch] = batches.as_slice() else {
+        return Err(invariant_violation(
+            "control MVP segment must contain exactly one record batch",
+        ));
+    };
+    if batch.num_rows() > MAX_SEGMENT_ROWS {
+        return Err(invariant_violation(
+            "control MVP Arrow segment exceeds the supported row limit",
+        ));
+    }
+    let rows = decode_segment_batch(batch)?;
+    let expected_index = build_segment_index(
+        &reference.segment_id,
+        reference.level,
+        reference.logical_sequence,
+        scope,
+        &rows,
+        bytes,
+        sha256_hex(bytes),
+    )?;
+    if index != expected_index {
+        return Err(invariant_violation(
+            "control MVP segment index does not match indexed Arrow contents",
+        ));
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>> {
+    if batch.schema().as_ref() != &control_mvp_segment_schema() {
+        return Err(invariant_violation(
+            "control MVP Arrow segment schema does not match the supported schema",
+        ));
+    }
+    let record_kinds = segment_column::<UInt8Array>(batch, 0, "record_kind")?;
+    let keys = segment_column::<BinaryArray>(batch, 1, "key")?;
+    let values = segment_column::<BinaryArray>(batch, 2, "value")?;
+    let generations = segment_column::<UInt64Array>(batch, 3, "generation")?;
+    let tombstones = segment_column::<BooleanArray>(batch, 4, "tombstone")?;
+    let logical_sequences = segment_column::<UInt64Array>(batch, 5, "logical_sequence")?;
+    let logical_ordinals = segment_column::<UInt64Array>(batch, 6, "logical_ordinal")?;
+    let origin_sequences = segment_column::<UInt64Array>(batch, 7, "origin_sequence")?;
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for row_index in 0..batch.num_rows() {
+        let record_kind = record_kinds.value(row_index);
+        if !matches!(
+            record_kind,
+            SEGMENT_RECORD_KV | SEGMENT_RECORD_OUTBOX | SEGMENT_RECORD_OUTBOX_TRIM
+        ) {
+            return Err(invariant_violation(
+                "control MVP Arrow segment has an unknown record kind",
+            ));
+        }
+        let tombstone = tombstones.value(row_index);
+        let value = (!values.is_null(row_index)).then(|| values.value(row_index).to_vec());
+        if tombstone == value.is_some() {
+            return Err(invariant_violation(
+                "control MVP Arrow segment tombstone/value polarity is invalid",
+            ));
+        }
+        rows.push(ControlMvpSegmentRow {
+            record_kind,
+            key: keys.value(row_index).to_vec(),
+            value,
+            generation: generations.value(row_index),
+            tombstone,
+            logical_sequence: logical_sequences.value(row_index),
+            logical_ordinal: logical_ordinals.value(row_index),
+            origin_sequence: (!origin_sequences.is_null(row_index))
+                .then(|| origin_sequences.value(row_index)),
+        });
+    }
+    if rows.windows(2).any(|pair| match pair {
+        [left, right] => {
+            (left.record_kind, left.key.as_slice()) > (right.record_kind, right.key.as_slice())
+        }
+        _ => false,
+    }) {
+        return Err(invariant_violation(
+            "control MVP Arrow segment rows are not sorted",
+        ));
+    }
+    Ok(rows)
+}
+
+fn segment_column<'a, T>(batch: &'a RecordBatch, index: usize, name: &str) -> Result<&'a T>
+where
+    T: Array + 'static,
+{
+    batch
+        .columns()
+        .get(index)
+        .ok_or_else(|| {
+            invariant_violation(format!(
+                "control MVP Arrow segment is missing column {name}"
+            ))
+        })?
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| {
+            invariant_violation(format!(
+                "control MVP Arrow segment column {name} has the wrong type"
+            ))
+        })
+}
+
+fn segment_serialization_error(context: &str, error: impl fmt::Display) -> CatalogError {
+    CatalogError::Serialization {
+        message: format!("failed to {context}: {error}"),
     }
 }
 
@@ -3446,6 +4546,28 @@ async fn put_immutable(
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { .. } => Err(precondition_failed(precondition_message)),
+    }
+}
+
+async fn put_immutable_matching(
+    storage: &ScopedStorage,
+    path: &str,
+    bytes: Bytes,
+    mismatch_message: &str,
+) -> Result<()> {
+    match storage
+        .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+        .await?
+    {
+        WriteResult::Success { .. } => Ok(()),
+        WriteResult::PreconditionFailed { .. } => {
+            let existing = storage.get_raw(path).await?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(precondition_failed(mismatch_message))
+            }
+        }
     }
 }
 
@@ -3633,5 +4755,25 @@ fn validation_failed(message: &str) -> CatalogError {
 fn invariant_violation(message: impl Into<String>) -> CatalogError {
     CatalogError::InvariantViolation {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+
+    #[test]
+    fn malformed_arrow_schema_fails_closed_without_panicking() {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+
+        let decoded = catch_unwind(AssertUnwindSafe(|| decode_segment_batch(&batch)));
+
+        assert!(
+            decoded.is_ok(),
+            "malformed schemas must not reach column panics"
+        );
+        assert!(decoded.is_ok_and(|result| result.is_err()));
     }
 }

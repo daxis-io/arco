@@ -901,19 +901,27 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
         .filter(|path| path.contains("/checkpoints/"))
         .collect::<Vec<_>>();
     assert_eq!(checkpoint_paths.len(), 2);
-    assert!(checkpoint_paths[0].contains("/control-mvp/catalog/"));
-    assert!(checkpoint_paths[1].contains("/control-mvp/search/"));
+    assert!(checkpoint_paths[0].contains("/control/v1/domains/catalog/"));
+    assert!(checkpoint_paths[1].contains("/control/v1/domains/search/"));
 
     // Checkpoint materialization writes exactly one immutable state-snapshot
     // object per domain (the bounded-replay anchor), and nothing else.
     let state_paths = put_paths
         .iter()
         .copied()
-        .filter(|path| path.contains("/states/"))
+        .filter(|path| path.contains("/segments/l1/"))
         .collect::<Vec<_>>();
     assert_eq!(state_paths.len(), 2);
-    assert!(state_paths[0].contains("/control-mvp/catalog/"));
-    assert!(state_paths[1].contains("/control-mvp/search/"));
+    assert!(state_paths[0].contains("/control/v1/domains/catalog/"));
+    assert!(state_paths[1].contains("/control/v1/domains/search/"));
+    assert_eq!(
+        put_paths
+            .iter()
+            .copied()
+            .filter(|path| path.contains("/indexes/"))
+            .count(),
+        2
+    );
 
     assert_eq!(
         put_paths
@@ -933,7 +941,8 @@ async fn create_snapshot_checkpoints_canonically_and_publishes_only_retention_ro
     );
     assert!(put_paths.iter().all(|path| {
         path.contains("/checkpoints/")
-            || path.contains("/states/")
+            || path.contains("/segments/l1/")
+            || path.contains("/indexes/")
             || path.contains("/retention/")
             || path.ends_with("/locks/workspace-retention-gc.lock.json")
     }));

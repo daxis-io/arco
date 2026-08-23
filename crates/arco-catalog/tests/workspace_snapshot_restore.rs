@@ -626,7 +626,7 @@ async fn journal_revision_overflow_is_detected_before_participant_apply() {
     assert!(
         audit.operations().iter().all(|operation| {
             !matches!(operation, AuditOperation::Put { path, .. }
-                if path.contains("/state-store/control-mvp/catalog/"))
+                if path.contains("/control/v1/domains/catalog/"))
         }),
         "revision exhaustion must not write participant authority artifacts"
     );
@@ -970,8 +970,8 @@ impl StorageBackend for RestoreAuditBackend {
             .lock()
             .expect("observed journal")
             .clone();
-        if path.contains("/state-store/control-mvp/")
-            && path.contains("/txlog/tx-restore-")
+        if path.contains("/control/v1/domains/")
+            && path.contains("/transactions/tx-restore-")
             && self
                 .journal_at_first_restore_txlog
                 .lock()
@@ -980,7 +980,7 @@ impl StorageBackend for RestoreAuditBackend {
             && let Some(relative) = observed
         {
             let prefix = path
-                .split("/state-store/control-mvp/")
+                .split("/control/v1/domains/")
                 .next()
                 .expect("workspace prefix");
             let full_path = format!("{prefix}/{relative}");
@@ -1547,10 +1547,7 @@ impl StorageBackend for VisibleReceiptRaceBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         self.record_write(path);
-        let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let pointer_suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if self.armed.load(Ordering::SeqCst) && path.ends_with(&pointer_suffix) {
             let result = self.inner.put(path, data, precondition).await?;
             self.pointer_writes.fetch_add(1, Ordering::SeqCst);
@@ -1688,7 +1685,7 @@ impl StorageBackend for CrashAfterReplacementPlanBackend {
         data: Bytes,
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
-        if path.ends_with("/state-store/control-mvp/catalog/current.pointer.json")
+        if path.ends_with("/control/v1/domains/catalog/head/current.json")
             && self.fail_pointer.swap(false, Ordering::SeqCst)
         {
             let prior = self.inner.get(path).await?;
@@ -1879,13 +1876,13 @@ impl StorageBackend for CorruptFirstParticipantBeforeSecondVisibleBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         let result = self.inner.put(path, data, precondition).await?;
-        if path.contains("/state-store/control-mvp/a/txlog/tx-restore-") {
+        if path.contains("/control/v1/domains/a/transactions/tx-restore-") {
             *self
                 .first_restore_transaction
                 .lock()
                 .expect("transaction path") = Some(path.to_string());
         }
-        if path.ends_with("/state-store/control-mvp/b/current.pointer.json") {
+        if path.ends_with("/control/v1/domains/b/head/current.json") {
             let first = self
                 .first_restore_transaction
                 .lock()
@@ -1957,10 +1954,7 @@ impl StorageBackend for DropFirstReceiptCasBackend {
             ));
         }
         let result = self.inner.put(path, data, precondition).await?;
-        let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let pointer_suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&pointer_suffix) && self.armed.swap(false, Ordering::SeqCst) {
             self.drop_next_journal_cas.store(true, Ordering::SeqCst);
         }
@@ -2223,7 +2217,7 @@ impl StorageBackend for JournalReceiptWriteThenErrorBackend {
             && matches!(precondition, WritePrecondition::MatchesVersion(_));
         let result = self.inner.put(path, data, precondition).await?;
         let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
+            "/control/v1/domains/{}/head/current.json",
             self.arm_after_domain
         );
         if path.ends_with(&pointer_suffix) {
@@ -2317,10 +2311,7 @@ impl StorageBackend for SupersedeNextDomainPointerBackend {
                 .expect("statuses")
                 .push(status.to_string());
         }
-        let suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&suffix) && self.armed.swap(false, Ordering::SeqCst) {
             let prior = self.inner.get(path).await?;
             let _ = self.inner.put(path, prior, WritePrecondition::None).await?;
@@ -2370,10 +2361,7 @@ impl StorageBackend for FailNextDomainPointerBackend {
                 .expect("statuses")
                 .push(status.to_string());
         }
-        let suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&suffix) && self.armed.swap(false, Ordering::SeqCst) {
             return Err(arco_core::Error::storage(
                 "injected failure before participant pointer write",
@@ -3041,7 +3029,7 @@ async fn journal_precedes_domain_commit_journal_cas_and_final_read_manifest_retr
         .expect("applying journal");
     let first_restore_txlog = operations
         .iter()
-        .position(|operation| matches!(operation, AuditOperation::Put { path, .. } if path.contains("/txlog/tx-restore-")))
+        .position(|operation| matches!(operation, AuditOperation::Put { path, .. } if path.contains("/transactions/tx-restore-")))
         .expect("restore txlog put");
     assert!(request_put < attempt_put);
     assert!(attempt_put < prepared_put);
@@ -3355,7 +3343,7 @@ async fn restore_authority_boundaries_export_is_no_list_redacted_and_read_only()
         assert!(!path.contains("/commits/root/"));
         assert!(!path.contains("snapshots.parquet"));
         assert!(!path.contains("transactions.parquet"));
-        assert!(!path.ends_with("/state-store/control-mvp/other/current.pointer.json"));
+        assert!(!path.ends_with("/control/v1/domains/other/head/current.json"));
     }
     for (path, before) in source_before {
         assert_eq!(
@@ -3849,7 +3837,7 @@ async fn journal_cas_rejects_corrupt_recorded_receipt_without_revision() {
         .expect("transaction id");
     storage
         .put_raw(
-            &format!("state-store/control-mvp/{domain}/txlog/{transaction_id}.json"),
+            &format!("control/v1/domains/{domain}/transactions/{transaction_id}.json"),
             Bytes::from_static(b"{}"),
             WritePrecondition::None,
         )
@@ -5167,7 +5155,7 @@ async fn workspace_restore_recovery_adopts_multi_domain_orphan_before_any_partic
         .get_raw(&attempt_path)
         .await
         .expect("orphan attempt");
-    let a_pointer_path = "state-store/control-mvp/a/current.pointer.json";
+    let a_pointer_path = "control/v1/domains/a/head/current.json";
     let a_pointer_before = storage
         .get_raw(a_pointer_path)
         .await
@@ -5215,7 +5203,7 @@ async fn workspace_restore_recovery_adopts_multi_domain_orphan_before_any_partic
     );
     assert!(backend.operations().iter().all(|operation| {
         !matches!(operation, AuditOperation::Put { path, .. }
-            if path.contains("/txlog/tx-restore-") || path.ends_with("/current.pointer.json"))
+            if path.contains("/transactions/tx-restore-") || path.ends_with("/head/current.json"))
     }));
 }
 
@@ -7338,7 +7326,7 @@ async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_i
         .find(|participant| participant["domain"] == "c")
         .expect("domain c is replanned rather than carried");
     assert_eq!(
-        serde_json::Value::from(2_u64),
+        serde_json::Value::from(3_u64),
         replanned["plan"]["version"],
         "a superseded v1 plan must be replaced by a current-version plan"
     );

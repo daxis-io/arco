@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, KeyRange, KvPair, PredicateInputSet, StateScope, StateStoreCapabilities,
-    StateToken, TxnOptions, VersionedValue,
+    CheckpointToken, CommitOutcome, KeyRange, KvPair, PredicateInputSet, StateScope,
+    StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
 };
 use crate::error::{CatalogError, Result};
 
@@ -697,7 +697,7 @@ impl ArcoStateTxn for ModelTxn {
         Ok(())
     }
 
-    async fn commit(self: Box<Self>) -> Result<StateToken> {
+    async fn commit(self: Box<Self>) -> Result<CommitOutcome> {
         let store = self.store.clone();
         let next_sequence = {
             let mut inner = lock_model_state(&store.inner);
@@ -753,7 +753,7 @@ impl ArcoStateTxn for ModelTxn {
             next_sequence
         };
 
-        Ok(store.token(next_sequence))
+        Ok(CommitOutcome::new(store.token(next_sequence), Vec::new()))
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {

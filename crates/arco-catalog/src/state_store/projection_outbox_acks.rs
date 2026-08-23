@@ -194,7 +194,10 @@ impl ProjectionOutboxAckWriter {
         txn.assert_absent(&key).await?;
         txn.put(&key, encode_ack_record(&record)?).await?;
         match txn.commit().await {
-            Ok(token) => Ok(ProjectionOutboxAckReceipt { token, record }),
+            Ok(outcome) => Ok(ProjectionOutboxAckReceipt {
+                token: outcome.into_state_token(),
+                record,
+            }),
             Err(CatalogError::CasFailed { .. }) => {
                 self.existing_receipt_for(&key, &record).await?.map_or_else(
                     || {
@@ -369,7 +372,9 @@ impl ProjectionOutboxAckWriter {
             })?,
         )
         .await?;
-        txn.commit().await.map(Some)
+        txn.commit()
+            .await
+            .map(|outcome| Some(outcome.into_state_token()))
     }
 
     /// Returns the event ids this consumer has acknowledged **within one
@@ -1050,7 +1055,7 @@ impl ProjectionOutboxWorker {
             encode_binding(&self.consumer_id, incarnation)?,
         )
         .await?;
-        let token = txn.commit().await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(ProjectionOutboxRebindReport {
             previous_consumer: previous
                 .as_ref()
@@ -1270,7 +1275,7 @@ impl ProjectionOutboxWorker {
             }
         }
         txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))?;
-        let token = txn.commit().await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(ProjectionOutboxTrimReport {
             trimmed_record_ids,
             trimmed_event_ids,
@@ -1457,7 +1462,7 @@ mod tests {
     };
 
     const SOURCE_DOMAIN: &str = "phase5-source";
-    const SOURCE_POINTER: &str = "/control-mvp/phase5-source/current.pointer.json";
+    const SOURCE_POINTER: &str = "/control/v1/domains/phase5-source/head/current.json";
 
     fn ack_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PROJECTION_OUTBOX_ACK_DOMAIN)
@@ -1540,7 +1545,10 @@ mod tests {
             Bytes::from_static(payload),
         ))
         .expect("stage outbox record");
-        txn.commit().await.expect("commit source record")
+        txn.commit()
+            .await
+            .expect("commit source record")
+            .into_state_token()
     }
 
     async fn current_outbox(storage: &ScopedStorage) -> Vec<ControlMvpProjectionOutboxRecord> {

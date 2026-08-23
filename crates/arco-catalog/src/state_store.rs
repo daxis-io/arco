@@ -157,6 +157,366 @@ impl StateToken {
     }
 }
 
+/// Result of one logically committed authority transaction.
+///
+/// The state token and projection intents cross the commit boundary together.
+/// Delivery remains a post-commit side effect: failure to enqueue an intent
+/// cannot revoke or change the token returned here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    state_token: StateToken,
+    projection_intents: Vec<ProjectionIntentV1>,
+}
+
+impl CommitOutcome {
+    pub(crate) fn new(
+        state_token: StateToken,
+        projection_intents: Vec<ProjectionIntentV1>,
+    ) -> Self {
+        Self {
+            state_token,
+            projection_intents,
+        }
+    }
+
+    /// Returns the opaque token naming the committed logical authority state.
+    #[must_use]
+    pub const fn state_token(&self) -> &StateToken {
+        &self.state_token
+    }
+
+    /// Returns the projection intents committed by the transaction.
+    #[must_use]
+    pub fn projection_intents(&self) -> &[ProjectionIntentV1] {
+        &self.projection_intents
+    }
+
+    /// Consumes the outcome and returns its opaque authority token.
+    #[must_use]
+    pub fn into_state_token(self) -> StateToken {
+        self.state_token
+    }
+
+    /// Consumes the outcome and returns the token and committed intents.
+    #[must_use]
+    pub fn into_parts(self) -> (StateToken, Vec<ProjectionIntentV1>) {
+        (self.state_token, self.projection_intents)
+    }
+}
+
+impl std::ops::Deref for CommitOutcome {
+    type Target = StateToken;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state_token
+    }
+}
+
+impl PartialEq<StateToken> for CommitOutcome {
+    fn eq(&self, other: &StateToken) -> bool {
+        self.state_token == *other
+    }
+}
+
+impl PartialEq<CommitOutcome> for StateToken {
+    fn eq(&self, other: &CommitOutcome) -> bool {
+        *self == other.state_token
+    }
+}
+
+/// Version-one committed projection-intent envelope.
+///
+/// The source authority is serialized as its constituent fields so the
+/// otherwise opaque [`StateToken`] does not become a generally serializable
+/// public capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionIntentV1 {
+    contract_version: u32,
+    intent_id: String,
+    projection_kind: String,
+    source_scope: StateScope,
+    source_logical_sequence: u64,
+    source_authority_manifest_id: String,
+    payload: Vec<u8>,
+}
+
+impl ProjectionIntentV1 {
+    /// Wire-contract version written by this implementation.
+    pub const CONTRACT_VERSION: u32 = 1;
+
+    /// Creates and validates a committed projection intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed identifiers, an empty payload,
+    /// or a token that does not name committed authority.
+    pub fn new(
+        intent_id: impl Into<String>,
+        projection_kind: impl Into<String>,
+        source: &StateToken,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<Self> {
+        let intent = Self {
+            contract_version: Self::CONTRACT_VERSION,
+            intent_id: intent_id.into(),
+            projection_kind: projection_kind.into(),
+            source_scope: source.scope.clone(),
+            source_logical_sequence: source.logical_sequence,
+            source_authority_manifest_id: source.authority_manifest_id.clone(),
+            payload: payload.as_ref().to_vec(),
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.contract_version != Self::CONTRACT_VERSION {
+            return Err(CatalogError::Validation {
+                message: "projection intent contract version is unsupported".to_string(),
+            });
+        }
+        validate_scope_component(&self.intent_id, "projection intent_id")?;
+        validate_scope_component(&self.projection_kind, "projection kind")?;
+        self.source_scope.validate()?;
+        if self.source_logical_sequence == 0 || self.source_authority_manifest_id.trim().is_empty()
+        {
+            return Err(CatalogError::Validation {
+                message: "projection intent source token must name committed authority".to_string(),
+            });
+        }
+        if self.payload.is_empty() {
+            return Err(CatalogError::Validation {
+                message: "projection intent payload must not be empty".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the contract version.
+    #[must_use]
+    pub const fn contract_version(&self) -> u32 {
+        self.contract_version
+    }
+
+    /// Returns the immutable intent identifier.
+    #[must_use]
+    pub fn intent_id(&self) -> &str {
+        &self.intent_id
+    }
+
+    /// Returns the projection family this intent targets.
+    #[must_use]
+    pub fn projection_kind(&self) -> &str {
+        &self.projection_kind
+    }
+
+    /// Returns the authority scope that produced this intent.
+    #[must_use]
+    pub const fn source_scope(&self) -> &StateScope {
+        &self.source_scope
+    }
+
+    /// Returns the committed logical sequence that produced this intent.
+    #[must_use]
+    pub const fn source_logical_sequence(&self) -> u64 {
+        self.source_logical_sequence
+    }
+
+    /// Returns the committed authority-manifest identifier as provenance.
+    #[must_use]
+    pub fn source_authority_manifest_id(&self) -> &str {
+        &self.source_authority_manifest_id
+    }
+
+    /// Returns the versioned projection payload bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl<'de> Deserialize<'de> for ProjectionIntentV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            contract_version: u32,
+            intent_id: String,
+            projection_kind: String,
+            source_scope: StateScope,
+            source_logical_sequence: u64,
+            source_authority_manifest_id: String,
+            payload: Vec<u8>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let intent = Self {
+            contract_version: wire.contract_version,
+            intent_id: wire.intent_id,
+            projection_kind: wire.projection_kind,
+            source_scope: wire.source_scope,
+            source_logical_sequence: wire.source_logical_sequence,
+            source_authority_manifest_id: wire.source_authority_manifest_id,
+            payload: wire.payload,
+        };
+        intent.validate().map_err(serde::de::Error::custom)?;
+        Ok(intent)
+    }
+}
+
+/// Threshold that requested asynchronous segment-layout maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutMaintenanceReason {
+    /// More than the supported number of level-zero segments are reachable.
+    L0SegmentCount,
+    /// Reachable level-zero segment bytes exceed the configured threshold.
+    L0Bytes,
+    /// The selected authority manifest exceeds the configured byte threshold.
+    ManifestBytes,
+}
+
+/// Version-one asynchronous physical-layout maintenance envelope.
+///
+/// Its observed logical sequence is a precondition, not a new logical commit.
+/// Applying maintenance may advance layout generation only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayoutMaintenanceIntentV1 {
+    contract_version: u32,
+    intent_id: String,
+    source_scope: StateScope,
+    source_logical_sequence: u64,
+    source_authority_manifest_id: String,
+    layout_generation: u64,
+    reason: LayoutMaintenanceReason,
+}
+
+impl LayoutMaintenanceIntentV1 {
+    /// Wire-contract version written by this implementation.
+    pub const CONTRACT_VERSION: u32 = 1;
+
+    /// Creates a validated layout-maintenance intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for malformed identity, zero generation, or
+    /// a token that does not name committed authority.
+    pub fn new(
+        intent_id: impl Into<String>,
+        source: &StateToken,
+        layout_generation: u64,
+        reason: LayoutMaintenanceReason,
+    ) -> Result<Self> {
+        let intent = Self {
+            contract_version: Self::CONTRACT_VERSION,
+            intent_id: intent_id.into(),
+            source_scope: source.scope.clone(),
+            source_logical_sequence: source.logical_sequence,
+            source_authority_manifest_id: source.authority_manifest_id.clone(),
+            layout_generation,
+            reason,
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.contract_version != Self::CONTRACT_VERSION {
+            return Err(CatalogError::Validation {
+                message: "layout-maintenance intent contract version is unsupported".to_string(),
+            });
+        }
+        validate_scope_component(&self.intent_id, "layout-maintenance intent_id")?;
+        self.source_scope.validate()?;
+        if self.source_logical_sequence == 0 || self.source_authority_manifest_id.trim().is_empty()
+        {
+            return Err(CatalogError::Validation {
+                message: "layout-maintenance source token must name committed authority"
+                    .to_string(),
+            });
+        }
+        if self.layout_generation == 0 {
+            return Err(CatalogError::Validation {
+                message: "layout-maintenance generation must be positive".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns the logical sequence the maintenance operation observed.
+    #[must_use]
+    pub const fn observed_logical_sequence(&self) -> u64 {
+        self.source_logical_sequence
+    }
+
+    /// Returns the candidate physical layout generation.
+    #[must_use]
+    pub const fn layout_generation(&self) -> u64 {
+        self.layout_generation
+    }
+
+    /// Returns the threshold that requested maintenance.
+    #[must_use]
+    pub const fn reason(&self) -> LayoutMaintenanceReason {
+        self.reason
+    }
+
+    /// Returns the authority scope observed by the maintenance worker.
+    #[must_use]
+    pub const fn source_scope(&self) -> &StateScope {
+        &self.source_scope
+    }
+
+    /// Returns the committed logical sequence observed by the worker.
+    #[must_use]
+    pub const fn source_logical_sequence(&self) -> u64 {
+        self.source_logical_sequence
+    }
+
+    /// Returns the observed authority-manifest identifier as provenance.
+    #[must_use]
+    pub fn source_authority_manifest_id(&self) -> &str {
+        &self.source_authority_manifest_id
+    }
+}
+
+impl<'de> Deserialize<'de> for LayoutMaintenanceIntentV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire {
+            contract_version: u32,
+            intent_id: String,
+            source_scope: StateScope,
+            source_logical_sequence: u64,
+            source_authority_manifest_id: String,
+            layout_generation: u64,
+            reason: LayoutMaintenanceReason,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let intent = Self {
+            contract_version: wire.contract_version,
+            intent_id: wire.intent_id,
+            source_scope: wire.source_scope,
+            source_logical_sequence: wire.source_logical_sequence,
+            source_authority_manifest_id: wire.source_authority_manifest_id,
+            layout_generation: wire.layout_generation,
+            reason: wire.reason,
+        };
+        intent.validate().map_err(serde::de::Error::custom)?;
+        Ok(intent)
+    }
+}
+
 mod metadata_readiness {
     use bytes::Bytes;
 
@@ -1532,12 +1892,12 @@ pub trait ArcoStateTxn: Send + Sync {
     /// Returns an error when predicate preconditions are unsupported or invalid.
     async fn assert_inputs_unchanged(&mut self, inputs: PredicateInputSet) -> Result<()>;
 
-    /// Commits the transaction and returns the resulting state token.
+    /// Commits the transaction and returns its authority token and projection intents.
     ///
     /// # Errors
     ///
     /// Returns an error when commit fails or transactions are unsupported.
-    async fn commit(self: Box<Self>) -> Result<StateToken>;
+    async fn commit(self: Box<Self>) -> Result<CommitOutcome>;
 
     /// Rolls back the transaction.
     ///

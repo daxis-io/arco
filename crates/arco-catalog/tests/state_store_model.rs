@@ -57,7 +57,7 @@ async fn accepted_commits_advance_logical_sequence_once() {
 
     assert_eq!(2, second_token.logical_sequence());
     let first_reader = store
-        .read_at(first_token)
+        .read_at(first_token.into_state_token())
         .await
         .expect("open retained first-sequence reader");
     assert_eq!(

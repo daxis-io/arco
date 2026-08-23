@@ -143,11 +143,12 @@ pub use retention_coordination::{
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
-    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
-    CurrentStateStore, KeyRange, KvPair, ModelCommitRecord, ModelStateStore, ModelWrite,
-    PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
-    PersistedRestoreParticipantPlan, PredicateInputSet, RestoreAttemptIdentity,
+    CheckpointToken, CommitOutcome, ControlMvpOutboxTrimTarget, ControlMvpPaths,
+    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
+    ControlMvpStateStore, ControlMvpTxn, CurrentStateStore, KeyRange, KvPair,
+    LayoutMaintenanceIntentV1, LayoutMaintenanceReason, ModelCommitRecord, ModelStateStore,
+    ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
+    PersistedRestoreParticipantPlan, PredicateInputSet, ProjectionIntentV1, RestoreAttemptIdentity,
     RestoreParticipantInspection, RestoredAuthorityEvidence, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
     control_mvp_outbox_event_id,

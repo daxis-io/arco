@@ -114,7 +114,10 @@ impl PathGovernancePendingDeclaration {
     pub(crate) async fn commit(self) -> Result<PathGovernanceMetadataReceipt> {
         let declaration = self.declaration;
         match self.txn.commit().await {
-            Ok(token) => Ok(PathGovernanceMetadataReceipt { token, declaration }),
+            Ok(outcome) => Ok(PathGovernanceMetadataReceipt {
+                token: outcome.into_state_token(),
+                declaration,
+            }),
             Err(CatalogError::CasFailed { .. }) => {
                 if self.writer.has_path_conflict(&declaration).await? {
                     Err(precondition_failed(

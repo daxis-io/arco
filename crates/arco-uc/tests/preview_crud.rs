@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use arco_catalog::CatalogReader;
+use arco_catalog::Tier1CompactorFactory;
 use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
 use arco_catalog::authz::privileges::Privilege;
 use arco_core::storage::{MemoryBackend, WritePrecondition, WriteResult};
@@ -22,15 +23,17 @@ use uuid::Uuid;
 
 fn test_router() -> Router {
     let backend = Arc::new(MemoryBackend::new());
-    let state =
-        UnityCatalogState::new(backend).with_compiled_permissions(create_table_permissions());
+    let state = UnityCatalogState::new(backend)
+        .with_compiled_permissions(create_table_permissions())
+        .with_compactor_factory(Arc::new(Tier1CompactorFactory));
     unity_catalog_router(state)
 }
 
 fn test_harness() -> (Router, Arc<MemoryBackend>) {
     let backend = Arc::new(MemoryBackend::new());
     let state = UnityCatalogState::new(backend.clone())
-        .with_compiled_permissions(create_table_permissions());
+        .with_compiled_permissions(create_table_permissions())
+        .with_compactor_factory(Arc::new(Tier1CompactorFactory));
     (unity_catalog_router(state), backend)
 }
 

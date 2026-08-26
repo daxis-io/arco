@@ -6,7 +6,7 @@ use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogError, CatalogReader, CatalogWriter, Tier1Compactor};
+use arco_catalog::{CatalogError, CatalogReader, CatalogWriter};
 use arco_core::{CatalogPaths, ControlPlaneScope, ScopedStorage};
 use serde::{Deserialize, Deserializer};
 
@@ -302,8 +302,8 @@ pub(crate) async fn initialized_catalog_writer(
     ctx: &UnityCatalogRequestContext,
 ) -> Result<CatalogWriter, UnityCatalogError> {
     let storage = scoped_storage(state, ctx)?;
-    let writer = CatalogWriter::new(storage.clone())
-        .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
+    let compactor = state.create_compactor(&storage)?;
+    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
     writer.initialize().await.map_err(map_catalog_error)?;
     Ok(writer)
 }

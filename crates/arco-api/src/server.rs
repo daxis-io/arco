@@ -23,10 +23,7 @@ use arco_flow::orchestration::controllers::{NoopSensorEvaluator, SensorEvaluator
 #[cfg(feature = "gcp")]
 use arco_iceberg::GcsCredentialProvider;
 use arco_iceberg::context::IcebergRequestContext;
-use arco_iceberg::{
-    CredentialProvider, IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory,
-    iceberg_router,
-};
+use arco_iceberg::{CredentialProvider, IcebergError, IcebergState, iceberg_router};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
 use arco_uc::{MetastorePermissionSource, UnityCatalogState, unity_catalog_router};
@@ -37,7 +34,7 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::grpc_transactions;
 use crate::rate_limit::{RateLimitResult, RateLimitState};
-use arco_catalog::SyncCompactor;
+use arco_catalog::{SharedCompactorFactory, SyncCompactor, Tier1CompactorFactory};
 use arco_core::Result;
 use arco_core::audit::AuditEmitter;
 
@@ -869,10 +866,20 @@ impl Server {
             // the storage-governance recovery routes are unreachable in a
             // deployed server. Wire the per-scope metastore-backed source; it
             // stays fail-closed when a scope's ledger cannot be read.
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+            let mut uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
                 .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
                     &state.storage,
                 ))));
+            if let Some(compactor) = state.sync_compactor() {
+                uc_state = uc_state
+                    .with_compactor_factory(Arc::new(SharedCompactorFactory::new(compactor)));
+                tracing::info!("Unity Catalog CRUD with remote sync compaction");
+            } else if state.config.debug {
+                uc_state = uc_state.with_compactor_factory(Arc::new(Tier1CompactorFactory));
+                tracing::warn!("Unity Catalog CRUD with local Tier1 compaction (debug mode only)");
+            } else {
+                tracing::error!("Unity Catalog CRUD without compaction; CRUD endpoints will fail");
+            }
 
             let uc_service = ServiceBuilder::new()
                 .layer(middleware::from_fn_with_state(

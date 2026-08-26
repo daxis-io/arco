@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogWriter, Tier1Compactor};
+use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1CompactorFactory};
 use arco_core::ScopedStorage;
 use arco_core::storage::{StorageBackend, WritePrecondition};
 use arco_iceberg::commit::{CommitError, CommitService};
@@ -22,7 +22,7 @@ use arco_iceberg::idempotency::{
     canonical_request_hash,
 };
 use arco_iceberg::pointer::{IcebergTablePointer, PointerStore, PointerStoreImpl, UpdateSource};
-use arco_iceberg::state::{IcebergConfig, IcebergState, Tier1CompactorFactory};
+use arco_iceberg::state::{IcebergConfig, IcebergState};
 use arco_iceberg::types::commit::{
     CommitTableRequest, SnapshotRefType, TableUpdate, UpdateRequirement,
 };

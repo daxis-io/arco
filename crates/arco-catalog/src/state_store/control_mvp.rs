@@ -73,6 +73,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Cursor;
 use std::num::NonZeroU64;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use arco_core::ScopedStorage;
@@ -82,12 +83,14 @@ use arrow::array::{
     UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::FileReader;
+use arrow::ipc::MetadataVersion;
+use arrow::ipc::reader::FileReaderBuilder;
 use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use flatbuffers::VerifierOptions;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
@@ -114,6 +117,9 @@ const CONTROL_MVP_FORMAT_VERSION: u32 = 3;
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SEGMENT_INDEX_BYTES: usize = 512 * 1024;
 const MAX_SEGMENT_ROWS: usize = 1_000_000;
+const MAX_SEGMENT_FOOTER_TABLES: usize = 64;
+const MAX_SEGMENT_FOOTER_DEPTH: usize = 16;
+const MAX_SEGMENT_FOOTER_APPARENT_BYTES: usize = 1024 * 1024;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
@@ -2107,11 +2113,10 @@ impl ControlMvpTxn {
                     target.record_id
                 )));
             }
-            self.outbox_trim
-                .push(ControlMvpOutboxTrimEntry::Identified {
-                    record_id: target.record_id,
-                    origin_sequence: target.origin_sequence,
-                });
+            self.outbox_trim.push(ControlMvpOutboxTrimEntry {
+                record_id: target.record_id,
+                origin_sequence: target.origin_sequence,
+            });
         }
         Ok(())
     }
@@ -3086,9 +3091,8 @@ impl ReplayState {
             // Identified trims are conditional on the exact event
             // incarnation, so a forged or stale trim cannot delete a record id
             // that was re-staged after the observation it was built from.
-            if let Some(expected) = trimmed.origin_sequence()
-                && retained_sequence != Some(expected)
-            {
+            let expected = trimmed.origin_sequence();
+            if retained_sequence != Some(expected) {
                 return Err(invariant_violation(format!(
                     "control MVP outbox trim names event {} but record {record_id} is retained as \
                      event {}",
@@ -3637,37 +3641,20 @@ struct ControlMvpTxObject {
     outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
-/// Trim entry as persisted in a transaction object.
-///
-/// New transactions always write the identified form, which pins the exact
-/// event incarnation removed. The bare-string form is only ever *read*: it is
-/// how transactions committed before delivery identity existed encoded a
-/// trim, and replaying them by record id reproduces exactly the state those
-/// commits produced, so retained histories stay deterministic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum ControlMvpOutboxTrimEntry {
-    Identified {
-        record_id: String,
-        origin_sequence: u64,
-    },
-    Legacy(String),
+/// Exact event incarnation removed by a v3 L0 transaction row.
+#[derive(Debug, Clone)]
+struct ControlMvpOutboxTrimEntry {
+    record_id: String,
+    origin_sequence: u64,
 }
 
 impl ControlMvpOutboxTrimEntry {
     fn record_id(&self) -> &str {
-        match self {
-            Self::Identified { record_id, .. } | Self::Legacy(record_id) => record_id,
-        }
+        &self.record_id
     }
 
-    const fn origin_sequence(&self) -> Option<u64> {
-        match self {
-            Self::Identified {
-                origin_sequence, ..
-            } => Some(*origin_sequence),
-            Self::Legacy(_) => None,
-        }
+    const fn origin_sequence(&self) -> u64 {
+        self.origin_sequence
     }
 }
 
@@ -3746,7 +3733,11 @@ impl ControlMvpTxObject {
                     ));
                 }
                 SEGMENT_RECORD_OUTBOX_TRIM => {
-                    if !row.tombstone || row.generation != 0 || row.value.is_some() {
+                    if !row.tombstone
+                        || row.generation != 0
+                        || row.value.is_some()
+                        || row.origin_sequence.is_none()
+                    {
                         return Err(invariant_violation(
                             "control MVP L0 outbox-trim row metadata is invalid",
                         ));
@@ -3754,12 +3745,13 @@ impl ControlMvpTxObject {
                     let record_id = String::from_utf8(row.key).map_err(|error| {
                         segment_serialization_error("decode L0 outbox trim record id", error)
                     })?;
-                    let entry = match row.origin_sequence {
-                        Some(origin_sequence) => ControlMvpOutboxTrimEntry::Identified {
-                            record_id,
-                            origin_sequence,
-                        },
-                        None => ControlMvpOutboxTrimEntry::Legacy(record_id),
+                    let entry = ControlMvpOutboxTrimEntry {
+                        record_id,
+                        origin_sequence: row.origin_sequence.ok_or_else(|| {
+                            invariant_violation(
+                                "control MVP L0 outbox-trim row is missing origin sequence",
+                            )
+                        })?,
                     };
                     outbox_trim.push((row.logical_ordinal, entry));
                 }
@@ -4078,7 +4070,7 @@ fn segment_rows_for_tx(tx: &ControlMvpTxObject) -> Vec<ControlMvpSegmentRow> {
                     tombstone: true,
                     logical_sequence: tx.sequence,
                     logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
-                    origin_sequence: entry.origin_sequence(),
+                    origin_sequence: Some(entry.origin_sequence()),
                 }),
         )
         .collect::<Vec<_>>();
@@ -4241,6 +4233,21 @@ fn build_segment_index(
 }
 
 fn arrow_record_batch_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
+    Ok(preflight_arrow_segment(bytes)?.record_batch_offsets)
+}
+
+#[derive(Debug)]
+struct ArrowSegmentPreflight {
+    record_batch_offsets: Vec<u64>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
+    if bytes.len() > MAX_SEGMENT_BYTES {
+        return Err(invariant_violation(
+            "control MVP Arrow segment exceeds the supported byte limit",
+        ));
+    }
     let trailer_start = bytes
         .len()
         .checked_sub(10)
@@ -4259,23 +4266,78 @@ fn arrow_record_batch_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
     let footer_bytes = bytes
         .get(footer_start..trailer_start)
         .ok_or_else(|| invariant_violation("control MVP Arrow segment footer is out of bounds"))?;
-    let footer = arrow::ipc::root_as_footer(footer_bytes)
-        .map_err(|error| segment_serialization_error("decode Arrow IPC footer", error))?;
+    let verifier_options = segment_verifier_options();
+    let footer =
+        arrow::ipc::root_as_footer_with_opts(&verifier_options, footer_bytes).map_err(|error| {
+            invariant_violation(format!("control MVP Arrow footer is invalid: {error}"))
+        })?;
+    if footer.version() != MetadataVersion::V5 {
+        return Err(invariant_violation(
+            "control MVP Arrow segment metadata version is unsupported",
+        ));
+    }
+    if footer
+        .dictionaries()
+        .is_some_and(|dictionaries| !dictionaries.is_empty())
+    {
+        return Err(invariant_violation(
+            "control MVP Arrow segment dictionaries are unsupported",
+        ));
+    }
+    if footer
+        .custom_metadata()
+        .is_some_and(|metadata| !metadata.is_empty())
+    {
+        return Err(invariant_violation(
+            "control MVP Arrow footer metadata is unsupported",
+        ));
+    }
+    let ipc_schema = footer
+        .schema()
+        .ok_or_else(|| invariant_violation("control MVP Arrow segment footer has no schema"))?;
+    if ipc_schema
+        .features()
+        .is_some_and(|features| !features.is_empty())
+    {
+        return Err(invariant_violation(
+            "control MVP Arrow schema features are unsupported",
+        ));
+    }
+    let decoded_schema = catch_unwind(AssertUnwindSafe(|| {
+        arrow::ipc::convert::fb_to_schema(ipc_schema)
+    }))
+    .map_err(|_| invariant_violation("control MVP Arrow schema conversion panicked"))?;
+    if decoded_schema != control_mvp_segment_schema() {
+        return Err(invariant_violation(
+            "control MVP Arrow segment schema does not match the supported schema",
+        ));
+    }
     let batches = footer.recordBatches().ok_or_else(|| {
         invariant_violation("control MVP Arrow segment footer has no record batches")
     })?;
-    let mut offsets = Vec::with_capacity(batches.len());
+    if batches.len() != 1 {
+        return Err(invariant_violation(
+            "control MVP segment must contain exactly one record batch",
+        ));
+    }
+    let mut offsets = Vec::with_capacity(1);
+    let footer_start = u64::try_from(footer_start)
+        .map_err(|error| segment_serialization_error("convert Arrow footer offset", error))?;
     for block in batches {
         let offset = u64::try_from(block.offset())
-            .map_err(|error| segment_serialization_error("convert Arrow batch offset", error))?;
-        if offset == 0
-            || offset
-                >= u64::try_from(footer_start).map_err(|error| {
-                    segment_serialization_error("convert Arrow footer offset", error)
-                })?
-        {
+            .map_err(|_| invariant_violation("control MVP Arrow batch offset is negative"))?;
+        let metadata_length = u64::try_from(block.metaDataLength()).map_err(|_| {
+            invariant_violation("control MVP Arrow batch metadata length is negative")
+        })?;
+        let body_length = u64::try_from(block.bodyLength())
+            .map_err(|_| invariant_violation("control MVP Arrow batch body length is negative"))?;
+        let block_end = offset
+            .checked_add(metadata_length)
+            .and_then(|end| end.checked_add(body_length))
+            .ok_or_else(|| invariant_violation("control MVP Arrow record-batch bounds overflow"))?;
+        if offset == 0 || metadata_length == 0 || block_end > footer_start {
             return Err(invariant_violation(
-                "control MVP Arrow record-batch offset is out of bounds",
+                "control MVP Arrow record-batch block is out of bounds",
             ));
         }
         offsets.push(offset);
@@ -4285,7 +4347,18 @@ fn arrow_record_batch_offsets(bytes: &[u8]) -> Result<Vec<u64>> {
             "control MVP Arrow segment footer has no record-batch offsets",
         ));
     }
-    Ok(offsets)
+    Ok(ArrowSegmentPreflight {
+        record_batch_offsets: offsets,
+    })
+}
+
+fn segment_verifier_options() -> VerifierOptions {
+    VerifierOptions {
+        max_depth: MAX_SEGMENT_FOOTER_DEPTH,
+        max_tables: MAX_SEGMENT_FOOTER_TABLES,
+        max_apparent_size: MAX_SEGMENT_FOOTER_APPARENT_BYTES,
+        ignore_missing_null_terminator: false,
+    }
 }
 
 fn bloom_bits_hex(keys: &[&[u8]]) -> String {
@@ -4329,14 +4402,29 @@ fn decode_segment_rows(
         "control MVP segment index reference checksum",
     )?;
     let index: ControlMvpSegmentIndex = decode_json(index_bytes, "control MVP segment index")?;
-    let mut reader = FileReader::try_new(Cursor::new(bytes), None)
-        .map_err(|error| segment_serialization_error("open Arrow IPC segment", error))?;
-    let mut batches = Vec::new();
-    for batch in &mut reader {
-        batches.push(
-            batch.map_err(|error| segment_serialization_error("read Arrow IPC segment", error))?,
-        );
+    validate_segment_index_identity(&index, reference, scope)?;
+    let preflight = preflight_arrow_segment(bytes)?;
+    if index.record_batch_offsets != preflight.record_batch_offsets {
+        return Err(invariant_violation(
+            "control MVP segment index record-batch offsets do not match the Arrow footer",
+        ));
     }
+    let batches =
+        catch_unwind(AssertUnwindSafe(|| -> Result<Vec<RecordBatch>> {
+            let mut reader = FileReaderBuilder::new()
+                .with_max_footer_fb_tables(MAX_SEGMENT_FOOTER_TABLES)
+                .with_max_footer_fb_depth(MAX_SEGMENT_FOOTER_DEPTH)
+                .build(Cursor::new(bytes))
+                .map_err(|error| segment_serialization_error("open Arrow IPC segment", error))?;
+            let mut batches = Vec::new();
+            for batch in &mut reader {
+                batches.push(batch.map_err(|error| {
+                    segment_serialization_error("read Arrow IPC segment", error)
+                })?);
+            }
+            Ok(batches)
+        }))
+        .map_err(|_| invariant_violation("control MVP Arrow reader panicked after preflight"))??;
     let [batch] = batches.as_slice() else {
         return Err(invariant_violation(
             "control MVP segment must contain exactly one record batch",
@@ -4363,6 +4451,51 @@ fn decode_segment_rows(
         ));
     }
     Ok(rows)
+}
+
+#[allow(clippy::suspicious_operation_groupings)]
+fn validate_segment_index_identity(
+    index: &ControlMvpSegmentIndex,
+    reference: &ControlMvpSegmentRef,
+    scope: &StateScope,
+) -> Result<()> {
+    let identity_matches = index.format_version == CONTROL_MVP_FORMAT_VERSION
+        && index.implementation == IMPLEMENTATION
+        && index.scope.matches_scope(scope)
+        && index.segment_id == reference.segment_id
+        && index.level == reference.level
+        && index.logical_sequence == reference.logical_sequence
+        && index.segment_checksum_sha256 == reference.checksum_sha256;
+    if !identity_matches {
+        return Err(invariant_violation(
+            "control MVP segment index identity does not match its reference",
+        ));
+    }
+    if index.row_count
+        > u64::try_from(MAX_SEGMENT_ROWS).map_err(|error| {
+            segment_serialization_error("convert supported segment row limit", error)
+        })?
+    {
+        return Err(invariant_violation(
+            "control MVP segment index exceeds the supported row limit",
+        ));
+    }
+    if index.record_batch_offsets.len() != 1 {
+        return Err(invariant_violation(
+            "control MVP segment index must identify exactly one record batch",
+        ));
+    }
+    if index.bloom_bits_hex.len() != SEGMENT_BLOOM_BYTES * 2
+        || !index
+            .bloom_bits_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(invariant_violation(
+            "control MVP segment index Bloom filter is malformed",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4412,7 +4545,7 @@ fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>
     }
     if rows.windows(2).any(|pair| match pair {
         [left, right] => {
-            (left.record_kind, left.key.as_slice()) > (right.record_kind, right.key.as_slice())
+            (left.record_kind, left.key.as_slice()) >= (right.record_kind, right.key.as_slice())
         }
         _ => false,
     }) {
@@ -4762,7 +4895,125 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use arrow::ipc::{Block, Footer, FooterArgs};
+    use flatbuffers::FlatBufferBuilder;
+
     use super::*;
+
+    fn one_kv_row() -> ControlMvpSegmentRow {
+        ControlMvpSegmentRow {
+            record_kind: SEGMENT_RECORD_KV,
+            key: b"key".to_vec(),
+            value: Some(b"value".to_vec()),
+            generation: 1,
+            tombstone: false,
+            logical_sequence: 1,
+            logical_ordinal: 0,
+            origin_sequence: None,
+        }
+    }
+
+    fn encoded_test_segment() -> (Bytes, Bytes, ControlMvpSegmentRef, StateScope) {
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let (bytes, index_bytes, reference) = encode_segment(
+            "test-segment",
+            ControlMvpSegmentLevel::L1,
+            1,
+            &scope,
+            &[one_kv_row()],
+        )
+        .expect("encode test segment");
+        (bytes, index_bytes, reference, scope)
+    }
+
+    fn rebind_segment(
+        bytes: Vec<u8>,
+        index_bytes: &[u8],
+        mut reference: ControlMvpSegmentRef,
+    ) -> (Bytes, Bytes, ControlMvpSegmentRef) {
+        let mut index: ControlMvpSegmentIndex =
+            decode_json(index_bytes, "test segment index").expect("decode index");
+        let checksum = sha256_hex(&bytes);
+        index.segment_checksum_sha256.clone_from(&checksum);
+        let index_bytes = encode_json(&index, "test segment index").expect("encode index");
+        reference.checksum_sha256 = checksum;
+        reference.index_checksum_sha256 = sha256_hex(&index_bytes);
+        (Bytes::from(bytes), index_bytes, reference)
+    }
+
+    fn footer_bounds(bytes: &[u8]) -> (usize, usize) {
+        let trailer_start = bytes.len() - 10;
+        let trailer: [u8; 10] = bytes[trailer_start..].try_into().expect("trailer");
+        let footer_len = arrow::ipc::reader::read_footer_length(trailer).expect("footer length");
+        (trailer_start - footer_len, trailer_start)
+    }
+
+    fn footer_without_schema(bytes: &[u8]) -> Vec<u8> {
+        let (footer_start, trailer_start) = footer_bounds(bytes);
+        let footer = arrow::ipc::root_as_footer(&bytes[footer_start..trailer_start])
+            .expect("decode original footer");
+        let block = *footer.recordBatches().expect("record batches").get(0);
+        let mut builder = FlatBufferBuilder::new();
+        let batches = builder.create_vector(&[block]);
+        let footer = Footer::create(
+            &mut builder,
+            &FooterArgs {
+                version: footer.version(),
+                schema: None,
+                dictionaries: None,
+                recordBatches: Some(batches),
+                custom_metadata: None,
+            },
+        );
+        builder.finish(footer, None);
+        let new_footer = builder.finished_data();
+        let mut malformed = bytes[..footer_start].to_vec();
+        malformed.extend_from_slice(new_footer);
+        malformed.extend_from_slice(
+            &u32::try_from(new_footer.len())
+                .expect("footer length")
+                .to_le_bytes(),
+        );
+        malformed.extend_from_slice(b"ARROW1");
+        malformed
+    }
+
+    fn footer_with_body_length(bytes: &[u8], body_length: i64) -> Vec<u8> {
+        let (footer_start, trailer_start) = footer_bounds(bytes);
+        let footer = arrow::ipc::root_as_footer(&bytes[footer_start..trailer_start])
+            .expect("decode original footer");
+        let original = footer.recordBatches().expect("record batches").get(0);
+        let replacement = Block::new(original.offset(), original.metaDataLength(), body_length);
+        let needle = original.0;
+        let offset = bytes[footer_start..trailer_start]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("footer block bytes");
+        let mut malformed = bytes.to_vec();
+        malformed[footer_start + offset..footer_start + offset + replacement.0.len()]
+            .copy_from_slice(&replacement.0);
+        malformed
+    }
+
+    fn two_duplicate_kv_rows() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(control_mvp_segment_schema()),
+            vec![
+                Arc::new(UInt8Array::from(vec![SEGMENT_RECORD_KV; 2])),
+                Arc::new(BinaryArray::from(vec![b"duplicate".as_slice(); 2])),
+                Arc::new(BinaryArray::from(vec![
+                    Some(b"first".as_slice()),
+                    Some(b"second".as_slice()),
+                ])),
+                Arc::new(UInt64Array::from(vec![1, 1])),
+                Arc::new(BooleanArray::from(vec![false, false])),
+                Arc::new(UInt64Array::from(vec![1, 1])),
+                Arc::new(UInt64Array::from(vec![0, 1])),
+                Arc::new(UInt64Array::from(vec![None, None])),
+            ],
+        )
+        .expect("duplicate-key batch")
+    }
 
     #[test]
     fn malformed_arrow_schema_fails_closed_without_panicking() {
@@ -4775,5 +5026,97 @@ mod tests {
             "malformed schemas must not reach column panics"
         );
         assert!(decoded.is_ok_and(|result| result.is_err()));
+    }
+
+    #[test]
+    fn duplicate_physical_segment_keys_fail_closed() {
+        let error = decode_segment_batch(&two_duplicate_kv_rows())
+            .expect_err("duplicate (record_kind, key) rows must be rejected");
+
+        assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+    }
+
+    #[test]
+    fn v3_l0_trim_rows_require_origin_sequence() {
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let mut tx = ControlMvpTxObject {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&scope),
+            tx_id: "tx-1".to_string(),
+            base_manifest_id: None,
+            sequence: 1,
+            writer_epoch: 0,
+            request_id: None,
+            l0_segment: unwritten_l0_segment_ref("tx-1", 1),
+            writes: Vec::new(),
+            outbox: Vec::new(),
+            outbox_trim: Vec::new(),
+        };
+
+        let error = tx
+            .hydrate_from_segment_rows(vec![ControlMvpSegmentRow {
+                record_kind: SEGMENT_RECORD_OUTBOX_TRIM,
+                key: b"outbox-id".to_vec(),
+                value: None,
+                generation: 0,
+                tombstone: true,
+                logical_sequence: 1,
+                logical_ordinal: 0,
+                origin_sequence: None,
+            }])
+            .expect_err("v3 trim rows must identify the removed event incarnation");
+
+        assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+    }
+
+    #[test]
+    fn checksum_coherent_missing_schema_is_typed_not_a_panic() {
+        let (bytes, index_bytes, reference, scope) = encoded_test_segment();
+        let malformed = footer_without_schema(&bytes);
+        let (bytes, index_bytes, reference) = rebind_segment(malformed, &index_bytes, reference);
+
+        let decoded = catch_unwind(AssertUnwindSafe(|| {
+            decode_segment_rows(&bytes, &index_bytes, &reference, &scope)
+        }));
+
+        assert!(decoded.is_ok(), "missing schema must not panic");
+        assert!(matches!(
+            decoded.expect("unwind boundary"),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn checksum_coherent_negative_body_length_is_typed_not_a_panic() {
+        let (bytes, index_bytes, reference, scope) = encoded_test_segment();
+        let malformed = footer_with_body_length(&bytes, -1);
+        let (bytes, index_bytes, reference) = rebind_segment(malformed, &index_bytes, reference);
+
+        let decoded = catch_unwind(AssertUnwindSafe(|| {
+            decode_segment_rows(&bytes, &index_bytes, &reference, &scope)
+        }));
+
+        assert!(decoded.is_ok(), "negative body length must not panic");
+        assert!(matches!(
+            decoded.expect("unwind boundary"),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn checksum_coherent_huge_body_length_is_typed_without_allocation() {
+        let (bytes, index_bytes, reference, scope) = encoded_test_segment();
+        let malformed = footer_with_body_length(&bytes, 1_i64 << 40);
+        let (bytes, index_bytes, reference) = rebind_segment(malformed, &index_bytes, reference);
+
+        let decoded = catch_unwind(AssertUnwindSafe(|| {
+            decode_segment_rows(&bytes, &index_bytes, &reference, &scope)
+        }));
+
+        assert!(decoded.is_ok(), "huge body length must not panic");
+        assert!(matches!(
+            decoded.expect("unwind boundary"),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
     }
 }

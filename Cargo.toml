@@ -115,6 +115,7 @@ petgraph = "0.7"
 # Data formats
 parquet = { version = "54", features = ["async"] }
 arrow = { version = "54", features = ["chrono-tz"] }
+flatbuffers = "=24.12.23"
 arrow-json = { version = "54" }
 bytes = "1"
 iceberg = "0.6"

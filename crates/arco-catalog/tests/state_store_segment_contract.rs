@@ -1,21 +1,262 @@
 //! Indexed Arrow IPC segment and `control/v1` layout contract tests.
 
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::indexing_slicing)]
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use arco_catalog::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
-    ControlMvpStateStore, StateScope, TxnOptions,
+    ArcoStateReader, ArcoStateTxn, CatalogError, ControlMvpOutboxTrimTarget, ControlMvpPaths,
+    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, TxnOptions,
 };
 use arco_core::storage::{WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
+use arrow::array::{BinaryArray, BooleanArray, UInt8Array, UInt64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::FileWriter;
+use arrow::ipc::{Block, Footer, FooterArgs};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use flatbuffers::FlatBufferBuilder;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn storage() -> ScopedStorage {
     ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
         .expect("scoped storage")
+}
+
+fn segment_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("record_kind", DataType::UInt8, false),
+        Field::new("key", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
+        Field::new("generation", DataType::UInt64, false),
+        Field::new("tombstone", DataType::Boolean, false),
+        Field::new("logical_sequence", DataType::UInt64, false),
+        Field::new("logical_ordinal", DataType::UInt64, false),
+        Field::new("origin_sequence", DataType::UInt64, true),
+    ]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn segment_batch(
+    record_kinds: Vec<u8>,
+    keys: Vec<&'static [u8]>,
+    values: Vec<Option<&'static [u8]>>,
+    generations: Vec<u64>,
+    tombstones: Vec<bool>,
+    sequences: Vec<u64>,
+    ordinals: Vec<u64>,
+    origins: Vec<Option<u64>>,
+) -> RecordBatch {
+    RecordBatch::try_new(
+        segment_schema(),
+        vec![
+            Arc::new(UInt8Array::from(record_kinds)),
+            Arc::new(BinaryArray::from(keys)),
+            Arc::new(BinaryArray::from(values)),
+            Arc::new(UInt64Array::from(generations)),
+            Arc::new(BooleanArray::from(tombstones)),
+            Arc::new(UInt64Array::from(sequences)),
+            Arc::new(UInt64Array::from(ordinals)),
+            Arc::new(UInt64Array::from(origins)),
+        ],
+    )
+    .expect("test segment batch")
+}
+
+fn arrow_file(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut writer = FileWriter::try_new(&mut bytes, schema).expect("Arrow writer");
+    for batch in batches {
+        writer.write(batch).expect("write test batch");
+    }
+    writer.finish().expect("finish test segment");
+    bytes
+}
+
+fn footer_bounds(bytes: &[u8]) -> (usize, usize) {
+    let trailer_start = bytes.len() - 10;
+    let trailer: [u8; 10] = bytes[trailer_start..].try_into().expect("Arrow trailer");
+    let footer_len = arrow::ipc::reader::read_footer_length(trailer).expect("footer length");
+    (trailer_start - footer_len, trailer_start)
+}
+
+fn footer_blocks(bytes: &[u8]) -> Vec<(u64, i32, i64)> {
+    let (footer_start, trailer_start) = footer_bounds(bytes);
+    arrow::ipc::root_as_footer(&bytes[footer_start..trailer_start])
+        .expect("Arrow footer")
+        .recordBatches()
+        .expect("record batches")
+        .iter()
+        .map(|block| {
+            (
+                u64::try_from(block.offset()).expect("positive offset"),
+                block.metaDataLength(),
+                block.bodyLength(),
+            )
+        })
+        .collect()
+}
+
+fn footer_without_schema(bytes: &[u8]) -> Vec<u8> {
+    let (footer_start, trailer_start) = footer_bounds(bytes);
+    let footer =
+        arrow::ipc::root_as_footer(&bytes[footer_start..trailer_start]).expect("original footer");
+    let block = *footer.recordBatches().expect("record batches").get(0);
+    let mut builder = FlatBufferBuilder::new();
+    let batches = builder.create_vector(&[block]);
+    let replacement = Footer::create(
+        &mut builder,
+        &FooterArgs {
+            version: footer.version(),
+            schema: None,
+            dictionaries: None,
+            recordBatches: Some(batches),
+            custom_metadata: None,
+        },
+    );
+    builder.finish(replacement, None);
+    let replacement = builder.finished_data();
+    let mut malformed = bytes[..footer_start].to_vec();
+    malformed.extend_from_slice(replacement);
+    malformed.extend_from_slice(
+        &u32::try_from(replacement.len())
+            .expect("footer length")
+            .to_le_bytes(),
+    );
+    malformed.extend_from_slice(b"ARROW1");
+    malformed
+}
+
+fn footer_with_body_length(bytes: &[u8], body_length: i64) -> Vec<u8> {
+    let (footer_start, trailer_start) = footer_bounds(bytes);
+    let footer =
+        arrow::ipc::root_as_footer(&bytes[footer_start..trailer_start]).expect("original footer");
+    let original = footer.recordBatches().expect("record batches").get(0);
+    let replacement = Block::new(original.offset(), original.metaDataLength(), body_length);
+    let block_offset = bytes[footer_start..trailer_start]
+        .windows(original.0.len())
+        .position(|window| window == original.0)
+        .expect("record-batch block bytes");
+    let mut malformed = bytes.to_vec();
+    malformed[footer_start + block_offset..footer_start + block_offset + replacement.0.len()]
+        .copy_from_slice(&replacement.0);
+    malformed
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn reseal_envelope(value: &mut Value) -> Bytes {
+    let payload = serde_json::to_vec(&value["payload"]).expect("payload bytes");
+    value["checksum_sha256"] = Value::String(sha256(&payload));
+    Bytes::from(serde_json::to_vec(value).expect("sealed envelope"))
+}
+
+async fn overwrite(storage: &ScopedStorage, path: &str, bytes: Bytes) {
+    assert!(matches!(
+        storage
+            .put_raw(path, bytes, WritePrecondition::None)
+            .await
+            .expect("overwrite test artifact"),
+        WriteResult::Success { .. }
+    ));
+}
+
+async fn install_malformed_l1(
+    storage: &ScopedStorage,
+    store: &ControlMvpStateStore,
+    state_id: &str,
+    selected_manifest_id: &str,
+    malformed: Vec<u8>,
+    row_count: usize,
+) {
+    let paths = store.paths();
+    let index_path = paths.segment_index(state_id);
+    let mut index: Value =
+        serde_json::from_slice(&storage.get_raw(&index_path).await.expect("state index"))
+            .expect("state index JSON");
+    index["segmentChecksumSha256"] = Value::String(sha256(&malformed));
+    index["rowCount"] = Value::from(row_count);
+    index["recordBatchOffsets"] = Value::Array(
+        footer_blocks(&malformed)
+            .into_iter()
+            .map(|(offset, _, _)| Value::from(offset))
+            .collect(),
+    );
+    let index_bytes = Bytes::from(serde_json::to_vec(&index).expect("state index bytes"));
+
+    let manifest_path = paths.manifest_object(selected_manifest_id);
+    let mut manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&manifest_path)
+            .await
+            .expect("selected manifest"),
+    )
+    .expect("manifest JSON");
+    manifest["payload"]["base_state"]["checksum_sha256"] = Value::String(sha256(&malformed));
+    manifest["payload"]["base_state"]["index_checksum_sha256"] =
+        Value::String(sha256(&index_bytes));
+    let manifest_bytes = reseal_envelope(&mut manifest);
+
+    let pointer_path = paths.current_pointer();
+    let mut pointer: Value =
+        serde_json::from_slice(&storage.get_raw(&pointer_path).await.expect("pointer"))
+            .expect("pointer JSON");
+    pointer["manifest_checksum_sha256"] = Value::String(sha256(&manifest_bytes));
+
+    overwrite(
+        storage,
+        &paths.state_object(state_id),
+        Bytes::from(malformed),
+    )
+    .await;
+    overwrite(storage, &index_path, index_bytes).await;
+    overwrite(storage, &manifest_path, manifest_bytes).await;
+    overwrite(
+        storage,
+        &pointer_path,
+        Bytes::from(serde_json::to_vec(&pointer).expect("pointer bytes")),
+    )
+    .await;
+}
+
+async fn assert_typed_read_error(store: ControlMvpStateStore) {
+    let joined = tokio::spawn(async move { store.get(b"catalogs/seed").await }).await;
+    let result = joined.expect("malformed segment read must not panic");
+    assert!(
+        matches!(result, Err(CatalogError::InvariantViolation { .. })),
+        "malformed checksum-coherent segment returned {result:?}"
+    );
+}
+
+async fn anchored_store() -> (ScopedStorage, ControlMvpStateStore, String, String) {
+    let storage = storage();
+    let store = store(storage.clone());
+    let mut base = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin base transaction");
+    let state_id = base.candidate_manifest_id().replace("manifest-", "state-");
+    base.put(b"catalogs/seed", Bytes::from_static(b"seed"))
+        .await
+        .expect("stage base write");
+    base.commit().await.expect("commit anchored base");
+
+    let mut successor = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin successor");
+    let selected_manifest_id = successor.candidate_manifest_id().to_string();
+    successor
+        .put(b"catalogs/successor", Bytes::from_static(b"successor"))
+        .await
+        .expect("stage successor");
+    successor.commit().await.expect("commit successor");
+    (storage, store, state_id, selected_manifest_id)
 }
 
 #[tokio::test]
@@ -44,8 +285,7 @@ async fn transaction_envelope_is_metadata_only_and_l0_drives_replay() {
         .get_raw(&store.paths().tx_object(&tx_id))
         .await
         .expect("transaction envelope");
-    let transaction: serde_json::Value =
-        serde_json::from_slice(&transaction_bytes).expect("transaction json");
+    let transaction: Value = serde_json::from_slice(&transaction_bytes).expect("transaction json");
     let payload = transaction["payload"]
         .as_object()
         .expect("transaction payload");
@@ -138,14 +378,14 @@ async fn commit_persists_indexed_l0_and_l1_arrow_segments() {
     assert!(l0.starts_with(b"ARROW1"));
     assert!(l1.starts_with(b"ARROW1"));
 
-    let l0_index: serde_json::Value = serde_json::from_slice(
+    let l0_index: Value = serde_json::from_slice(
         &storage
             .get_raw(&paths.segment_index(&tx_id))
             .await
             .expect("read l0 index"),
     )
     .expect("decode l0 index");
-    let l1_index: serde_json::Value = serde_json::from_slice(
+    let l1_index: Value = serde_json::from_slice(
         &storage
             .get_raw(&paths.segment_index(&state_id))
             .await
@@ -156,23 +396,305 @@ async fn commit_persists_indexed_l0_and_l1_arrow_segments() {
     assert_eq!("l1", l1_index["level"]);
     assert_eq!(1, l0_index["rowCount"]);
     assert_eq!(1, l1_index["rowCount"]);
-    for (index, segment_len) in [(&l0_index, l0.len()), (&l1_index, l1.len())] {
+    for (index, segment) in [(&l0_index, &l0), (&l1_index, &l1)] {
         let offsets = index["recordBatchOffsets"]
             .as_array()
             .expect("record batch offsets");
-        assert_eq!(1, offsets.len());
-        let offset = offsets[0].as_u64().expect("record batch offset");
-        assert!(
-            offset > 0,
-            "Arrow record-batch offset is not the file start"
-        );
-        assert!(
-            offset < u64::try_from(segment_len).expect("segment length"),
-            "Arrow record-batch offset must be within the segment"
-        );
+        let blocks = footer_blocks(segment);
+        assert_eq!(blocks.len(), offsets.len());
+        for (stored, (actual, metadata_length, body_length)) in offsets.iter().zip(blocks) {
+            assert_eq!(stored.as_u64().expect("stored batch offset"), actual);
+            assert!(
+                actual > 0,
+                "Arrow record-batch offset is not the file start"
+            );
+            assert!(
+                metadata_length > 0,
+                "Arrow metadata length must be positive"
+            );
+            assert!(body_length >= 0, "Arrow body length must be nonnegative");
+            assert!(
+                actual < u64::try_from(segment.len()).expect("segment length"),
+                "Arrow record-batch offset must be within the segment"
+            );
+        }
     }
     assert_eq!("catalogs/sales", l1_index["minKeyUtf8"]);
     assert_eq!("catalogs/sales", l1_index["maxKeyUtf8"]);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
+    #[derive(Clone, Copy)]
+    enum Case {
+        WrongSchema,
+        UnknownKind,
+        InvalidPolarity,
+        DuplicateKv,
+        DuplicateOutbox,
+        NonContiguousOrdinals,
+        MissingSchema,
+        NegativeBodyLength,
+        HugeBodyLength,
+        MultipleBatches,
+    }
+
+    let valid_batch = || {
+        segment_batch(
+            vec![0],
+            vec![b"catalogs/seed"],
+            vec![Some(b"seed")],
+            vec![1],
+            vec![false],
+            vec![1],
+            vec![0],
+            vec![None],
+        )
+    };
+    let cases = [
+        Case::WrongSchema,
+        Case::UnknownKind,
+        Case::InvalidPolarity,
+        Case::DuplicateKv,
+        Case::DuplicateOutbox,
+        Case::NonContiguousOrdinals,
+        Case::MissingSchema,
+        Case::NegativeBodyLength,
+        Case::HugeBodyLength,
+        Case::MultipleBatches,
+    ];
+
+    for case in cases {
+        let (storage, store, state_id, selected_manifest_id) = anchored_store().await;
+        let (malformed, row_count, label) = match case {
+            Case::WrongSchema => {
+                let schema = Schema::empty();
+                let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+                (arrow_file(&schema, &[batch]), 0, "wrong schema")
+            }
+            Case::UnknownKind => {
+                let batch = segment_batch(
+                    vec![99],
+                    vec![b"catalogs/seed"],
+                    vec![Some(b"seed")],
+                    vec![1],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![None],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "unknown kind",
+                )
+            }
+            Case::InvalidPolarity => {
+                let batch = segment_batch(
+                    vec![0],
+                    vec![b"catalogs/seed"],
+                    vec![None],
+                    vec![1],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![None],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "invalid polarity",
+                )
+            }
+            Case::DuplicateKv => {
+                let batch = segment_batch(
+                    vec![0, 0],
+                    vec![b"catalogs/seed", b"catalogs/seed"],
+                    vec![Some(b"first"), Some(b"second")],
+                    vec![1, 1],
+                    vec![false, false],
+                    vec![1, 1],
+                    vec![0, 1],
+                    vec![None, None],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    2,
+                    "duplicate KV key",
+                )
+            }
+            Case::DuplicateOutbox => {
+                let batch = segment_batch(
+                    vec![1, 1],
+                    vec![b"outbox", b"outbox"],
+                    vec![Some(b"first"), Some(b"second")],
+                    vec![0, 0],
+                    vec![false, false],
+                    vec![1, 1],
+                    vec![0, 1],
+                    vec![Some(1), Some(1)],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    2,
+                    "duplicate outbox id",
+                )
+            }
+            Case::NonContiguousOrdinals => {
+                let batch = segment_batch(
+                    vec![1, 1],
+                    vec![b"outbox-a", b"outbox-b"],
+                    vec![Some(b"first"), Some(b"second")],
+                    vec![0, 0],
+                    vec![false, false],
+                    vec![1, 1],
+                    vec![0, 2],
+                    vec![Some(1), Some(1)],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    2,
+                    "non-contiguous ordinals",
+                )
+            }
+            Case::MissingSchema => {
+                let valid = arrow_file(segment_schema().as_ref(), &[valid_batch()]);
+                (footer_without_schema(&valid), 1, "missing schema")
+            }
+            Case::NegativeBodyLength => {
+                let valid = arrow_file(segment_schema().as_ref(), &[valid_batch()]);
+                (
+                    footer_with_body_length(&valid, -1),
+                    1,
+                    "negative body length",
+                )
+            }
+            Case::HugeBodyLength => {
+                let valid = arrow_file(segment_schema().as_ref(), &[valid_batch()]);
+                (
+                    footer_with_body_length(&valid, 1_i64 << 40),
+                    1,
+                    "huge body length",
+                )
+            }
+            Case::MultipleBatches => {
+                let batch = valid_batch();
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch.clone(), batch]),
+                    2,
+                    "multiple batches",
+                )
+            }
+        };
+        install_malformed_l1(
+            &storage,
+            &store,
+            &state_id,
+            &selected_manifest_id,
+            malformed,
+            row_count,
+        )
+        .await;
+        assert_typed_read_error(store).await;
+        eprintln!("verified malformed Arrow case: {label}");
+    }
+}
+
+#[tokio::test]
+async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
+    let storage = storage();
+    let store = store(storage.clone());
+    let mut seed = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin seed");
+    seed.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+        "record-r",
+        Bytes::from_static(b"payload"),
+    ))
+    .expect("stage retained outbox record");
+    seed.commit().await.expect("commit seed");
+
+    let mut trim = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin trim");
+    let tx_id = trim.tx_id().to_string();
+    let manifest_id = trim.candidate_manifest_id().to_string();
+    trim.trim_projection_outbox([ControlMvpOutboxTrimTarget::new("record-r", 1)])
+        .expect("stage trim");
+    trim.commit().await.expect("commit trim");
+
+    let batch = segment_batch(
+        vec![2],
+        vec![b"record-r"],
+        vec![None],
+        vec![0],
+        vec![true],
+        vec![2],
+        vec![0],
+        vec![None],
+    );
+    let malformed = arrow_file(segment_schema().as_ref(), &[batch]);
+    let paths = store.paths();
+    let index_path = paths.segment_index(&tx_id);
+    let mut index: Value =
+        serde_json::from_slice(&storage.get_raw(&index_path).await.expect("trim index"))
+            .expect("trim index JSON");
+    index["segmentChecksumSha256"] = Value::String(sha256(&malformed));
+    index["recordBatchOffsets"] = Value::Array(
+        footer_blocks(&malformed)
+            .into_iter()
+            .map(|(offset, _, _)| Value::from(offset))
+            .collect(),
+    );
+    let index_bytes = Bytes::from(serde_json::to_vec(&index).expect("index bytes"));
+
+    let tx_path = paths.tx_object(&tx_id);
+    let mut transaction: Value =
+        serde_json::from_slice(&storage.get_raw(&tx_path).await.expect("trim transaction"))
+            .expect("trim transaction JSON");
+    transaction["payload"]["l0_segment"]["checksum_sha256"] = Value::String(sha256(&malformed));
+    transaction["payload"]["l0_segment"]["index_checksum_sha256"] =
+        Value::String(sha256(&index_bytes));
+    let transaction_bytes = reseal_envelope(&mut transaction);
+
+    let manifest_path = paths.manifest_object(&manifest_id);
+    let mut manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&manifest_path)
+            .await
+            .expect("trim manifest"),
+    )
+    .expect("trim manifest JSON");
+    manifest["payload"]["tx_refs"][0]["checksum_sha256"] =
+        Value::String(sha256(&transaction_bytes));
+    let manifest_bytes = reseal_envelope(&mut manifest);
+
+    let pointer_path = paths.current_pointer();
+    let mut pointer: Value =
+        serde_json::from_slice(&storage.get_raw(&pointer_path).await.expect("pointer"))
+            .expect("pointer JSON");
+    pointer["manifest_checksum_sha256"] = Value::String(sha256(&manifest_bytes));
+
+    overwrite(
+        &storage,
+        &paths.l0_segment_object(&tx_id),
+        Bytes::from(malformed),
+    )
+    .await;
+    overwrite(&storage, &index_path, index_bytes).await;
+    overwrite(&storage, &tx_path, transaction_bytes).await;
+    overwrite(&storage, &manifest_path, manifest_bytes).await;
+    overwrite(
+        &storage,
+        &pointer_path,
+        Bytes::from(serde_json::to_vec(&pointer).expect("pointer bytes")),
+    )
+    .await;
+
+    assert_typed_read_error(store).await;
 }
 
 #[tokio::test]

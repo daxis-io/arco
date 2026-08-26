@@ -247,6 +247,7 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "flatbuffers 24.12.23",
  "futures",
  "hex",
  "metrics",

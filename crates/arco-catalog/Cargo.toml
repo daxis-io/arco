@@ -48,6 +48,7 @@ metrics = { workspace = true }
 # Data formats
 parquet = { workspace = true }
 arrow = { workspace = true }
+flatbuffers = { workspace = true }
 bytes = { workspace = true }
 
 # Storage

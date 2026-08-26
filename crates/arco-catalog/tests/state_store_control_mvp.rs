@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, CatalogError, CheckpointOptions,
@@ -1082,7 +1083,6 @@ async fn request_time_correctness_paths_do_not_call_object_store_listing() {
             .expect("apply restore without listing"),
         RestoreParticipantInspection::Visible { .. }
     ));
-
     assert_eq!(0, backend.list_calls());
 }
 
@@ -1635,6 +1635,7 @@ async fn restore_recovery_reconciles_pointer_write_then_transport_error() {
             .expect("reconciled apply"),
         RestoreParticipantInspection::Visible { .. }
     ));
+    assert!(backend.fault_fired(), "the restore pointer fault must fire");
 }
 
 #[tokio::test]
@@ -1656,12 +1657,153 @@ async fn commit_reconciles_pointer_write_then_transport_error() {
         .commit()
         .await
         .expect("exact pointer bytes reconcile the ambiguous response");
+    assert!(
+        backend.fault_fired(),
+        "the pointer fault must actually fire"
+    );
 
     assert_eq!(1, outcome.state_token().logical_sequence());
     assert_eq!(
         Some(Bytes::from_static(b"committed")),
         store.get(b"catalog/default").await.expect("visible value")
     );
+}
+
+#[tokio::test]
+async fn landed_commit_followed_by_successor_recovers_from_visible_lineage() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(GatedPointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    let mut candidate = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin candidate");
+    candidate
+        .put(b"catalog/default", Bytes::from_static(b"candidate"))
+        .await
+        .expect("stage candidate");
+    backend.arm();
+    let candidate_commit = tokio::spawn(async move { candidate.commit().await });
+    backend.wait_until_landed().await;
+
+    let mut successor = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin successor from landed candidate");
+    successor
+        .put(b"catalog/default", Bytes::from_static(b"successor"))
+        .await
+        .expect("stage successor");
+    successor.commit().await.expect("commit successor");
+    backend.release_response();
+
+    let outcome = candidate_commit
+        .await
+        .expect("candidate task")
+        .expect("candidate transaction remains proven in visible lineage");
+    assert_eq!(1, outcome.logical_sequence());
+    assert!(backend.fault_fired(), "the gated pointer fault must fire");
+    assert_eq!(
+        Some(Bytes::from_static(b"successor")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("visible successor")
+    );
+}
+
+#[tokio::test]
+async fn landed_commit_with_unrelated_visible_head_is_typed_ambiguous() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(GatedPointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage.clone());
+    let mut candidate = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin candidate");
+    candidate
+        .put(b"catalog/default", Bytes::from_static(b"candidate"))
+        .await
+        .expect("stage candidate");
+    let mut foreign = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin foreign fork");
+    foreign
+        .put(b"catalog/default", Bytes::from_static(b"foreign"))
+        .await
+        .expect("stage foreign fork");
+    let foreign_manifest_id = foreign.candidate_manifest_id().to_string();
+
+    backend.arm();
+    let candidate_commit = tokio::spawn(async move { candidate.commit().await });
+    backend.wait_until_landed().await;
+    assert!(matches!(
+        foreign.commit().await,
+        Err(CatalogError::CasFailed { .. })
+    ));
+
+    let paths = store.paths();
+    let foreign_manifest = storage
+        .get_raw(&paths.manifest_object(&foreign_manifest_id))
+        .await
+        .expect("foreign immutable manifest");
+    let pointer_path = paths.current_pointer();
+    let mut foreign_pointer: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&pointer_path)
+            .await
+            .expect("landed candidate pointer"),
+    )
+    .expect("pointer JSON");
+    foreign_pointer["manifest_id"] = Value::String(foreign_manifest_id);
+    foreign_pointer["manifest_checksum_sha256"] =
+        Value::String(hex::encode(sha2::Sha256::digest(&foreign_manifest)));
+    storage
+        .put_raw(
+            &pointer_path,
+            Bytes::from(serde_json::to_vec(&foreign_pointer).expect("foreign pointer bytes")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("install unrelated visible head");
+    backend.release_response();
+
+    let error = candidate_commit
+        .await
+        .expect("candidate task")
+        .expect_err("unrelated visible lineage cannot prove the landed candidate");
+    assert!(
+        format!("{error:?}").starts_with("AmbiguousAuthorityOutcome"),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("injected transport error after gated pointer write"),
+        "ambiguous outcome must preserve the original storage failure"
+    );
+    assert!(backend.fault_fired(), "the gated pointer fault must fire");
+}
+
+#[tokio::test]
+async fn landed_writer_claim_with_lost_response_adopts_exact_claimed_epoch() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(PointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    commit_value(&store, b"catalog/default", "v1").await;
+    backend.arm();
+
+    let claimed = store
+        .claim_writer_authority()
+        .await
+        .expect("exact claimed pointer bytes prove the epoch claim landed");
+
+    assert_eq!(1, claimed.writer_epoch());
+    assert!(backend.fault_fired(), "the claim pointer fault must fire");
 }
 
 #[tokio::test]
@@ -1826,6 +1968,7 @@ impl StorageBackend for ScriptedFailBackend {
 #[tokio::test]
 async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
     let backend = Arc::new(ScriptedFailBackend::new(
         inner,
         &[
@@ -1835,7 +1978,7 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
             "/segments/l1/state-",
             "/indexes/state-",
             "/manifests/",
-            "/head/current.json",
+            &current_pointer,
         ],
     ));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
@@ -2028,7 +2171,8 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
 
 #[tokio::test]
 async fn restore_apply_resumes_transaction_and_manifest_crash_points() {
-    for needle in ["/manifests/", "/head/current.json"] {
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
+    for needle in ["/manifests/", current_pointer.as_str()] {
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let backend = Arc::new(FailOncePathBackend::new(inner, needle));
         let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
@@ -2050,6 +2194,7 @@ async fn restore_apply_resumes_transaction_and_manifest_crash_points() {
             adapter.apply_restore(&plan, Utc::now()).await.is_err(),
             "injected crash at {needle} must interrupt the first apply"
         );
+        assert!(backend.fault_fired(), "the armed restore fault must fire");
         assert_eq!(
             2,
             store
@@ -2475,12 +2620,24 @@ async fn restore_immutable_object_conflicts_never_publish_pointer() {
 struct PointerWriteThenErrorBackend {
     inner: Arc<dyn StorageBackend>,
     armed: AtomicBool,
+    fired: AtomicBool,
+    current_pointer: String,
+}
+
+struct GatedPointerWriteThenErrorBackend {
+    inner: Arc<dyn StorageBackend>,
+    armed: AtomicBool,
+    fired: AtomicBool,
+    current_pointer: String,
+    landed: Notify,
+    release: Notify,
 }
 
 struct FailOncePathBackend {
     inner: Arc<dyn StorageBackend>,
     needle: String,
     armed: AtomicBool,
+    fired: AtomicBool,
 }
 
 impl FailOncePathBackend {
@@ -2489,11 +2646,17 @@ impl FailOncePathBackend {
             inner,
             needle: needle.to_string(),
             armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
         }
     }
 
     fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
     }
 }
 
@@ -2514,6 +2677,7 @@ impl StorageBackend for FailOncePathBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         if path.contains(&self.needle) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
             return Err(arco_core::Error::storage("injected restore crash point"));
         }
         self.inner.put(path, data, precondition).await
@@ -2539,6 +2703,7 @@ impl StorageBackend for FailOncePathBackend {
 struct UnstablePointerHeadBackend {
     inner: Arc<dyn StorageBackend>,
     counter: AtomicUsize,
+    current_pointer: String,
 }
 
 impl UnstablePointerHeadBackend {
@@ -2546,6 +2711,7 @@ impl UnstablePointerHeadBackend {
         Self {
             inner,
             counter: AtomicUsize::new(0),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
         }
     }
 }
@@ -2579,7 +2745,7 @@ impl StorageBackend for UnstablePointerHeadBackend {
 
     async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
         let mut meta = self.inner.head(path).await?;
-        if path.ends_with("/head/current.json")
+        if path.ends_with(&self.current_pointer)
             && let Some(meta) = &mut meta
         {
             meta.version = format!("unstable-{}", self.counter.fetch_add(1, Ordering::SeqCst));
@@ -2597,11 +2763,50 @@ impl PointerWriteThenErrorBackend {
         Self {
             inner,
             armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
         }
     }
 
     fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+impl GatedPointerWriteThenErrorBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
+            landed: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_landed(&self) {
+        while !self.fired.load(Ordering::SeqCst) {
+            self.landed.notified().await;
+        }
+    }
+
+    fn release_response(&self) {
+        self.release.notify_one();
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
     }
 }
 
@@ -2622,9 +2827,55 @@ impl StorageBackend for PointerWriteThenErrorBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         let result = self.inner.put(path, data, precondition).await?;
-        if path.ends_with("/head/current.json") && self.armed.swap(false, Ordering::SeqCst) {
+        if path.ends_with(&self.current_pointer) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
             return Err(arco_core::Error::storage(
                 "injected transport error after pointer write",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GatedPointerWriteThenErrorBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        let result = self.inner.put(path, data, precondition).await?;
+        if path.ends_with(&self.current_pointer) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
+            self.landed.notify_waiters();
+            self.release.notified().await;
+            return Err(arco_core::Error::storage(
+                "injected transport error after gated pointer write",
             ));
         }
         Ok(result)
@@ -2937,6 +3188,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
         txn.commit().await.is_err(),
         "injected snapshot crash must interrupt the boundary commit"
     );
+    assert!(backend.fault_fired(), "the armed snapshot fault must fire");
 
     assert_eq!(
         Some(Bytes::from_static(b"v1")),
@@ -3009,6 +3261,10 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
             .await
             .is_err(),
         "injected snapshot crash must interrupt the explicit checkpoint"
+    );
+    assert!(
+        backend.fault_fired(),
+        "the armed checkpoint snapshot fault must fire"
     );
     assert_eq!(
         pointer_before,
@@ -3869,7 +4125,8 @@ async fn genuinely_superseded_restore_stays_superseded_across_anchor_boundaries(
 #[tokio::test]
 async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recoverable() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(FailOncePathBackend::new(inner, "/head/current.json"));
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
+    let backend = Arc::new(FailOncePathBackend::new(inner, &current_pointer));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
     let store = ControlMvpStateStore::new(storage.clone(), scope())
         .expect("control MVP store")
@@ -3893,6 +4150,7 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
         txn.commit().await.is_err(),
         "injected pointer crash must interrupt the boundary commit"
     );
+    assert!(backend.fault_fired(), "the armed pointer fault must fire");
 
     let torn_state_id = torn_manifest_id.replace("manifest-", "state-");
     storage

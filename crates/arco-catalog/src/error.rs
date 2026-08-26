@@ -78,6 +78,14 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// A conditional authority write may have landed, but visible durable
+    /// state cannot prove either commitment or non-commitment.
+    #[error("ambiguous authority outcome: {message}")]
+    AmbiguousAuthorityOutcome {
+        /// Reconciliation context including the original storage failure.
+        message: String,
+    },
+
     /// Replayed terminal request failure with a preserved HTTP status code.
     #[error("{message}")]
     RequestFailed {
@@ -126,7 +134,8 @@ impl CatalogError {
             Self::Storage { .. }
             | Self::Serialization { .. }
             | Self::Parquet { .. }
-            | Self::InvariantViolation { .. } => None,
+            | Self::InvariantViolation { .. }
+            | Self::AmbiguousAuthorityOutcome { .. } => None,
         }
     }
 }

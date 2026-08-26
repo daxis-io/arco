@@ -262,22 +262,37 @@ impl ControlMvpStateStore {
             ..pointer
         };
         let claimed_bytes = encode_json(&claimed, "control MVP epoch-claim pointer")?;
-        match self
+        let pointer_write = self
             .storage
             .put_raw(
                 &self.paths.current_pointer(),
-                claimed_bytes,
+                claimed_bytes.clone(),
                 WritePrecondition::MatchesVersion(pointer_meta.version),
             )
-            .await?
-        {
-            WriteResult::Success { .. } => {
+            .await;
+        match pointer_write {
+            Ok(WriteResult::Success { .. }) => {
                 self.writer_epoch = claimed_epoch;
                 Ok(self)
             }
-            WriteResult::PreconditionFailed { .. } => Err(CatalogError::CasFailed {
+            Ok(WriteResult::PreconditionFailed { .. }) => Err(CatalogError::CasFailed {
                 message: "control MVP writer epoch claim lost a pointer race".to_string(),
             }),
+            Err(error) => {
+                if self
+                    .storage
+                    .get_raw(&self.paths.current_pointer())
+                    .await
+                    .is_ok_and(|current| current == claimed_bytes)
+                {
+                    self.writer_epoch = claimed_epoch;
+                    Ok(self)
+                } else {
+                    Err(ambiguous_authority_outcome(format!(
+                        "control MVP writer epoch claim could not be reconciled after storage failure: {error}"
+                    )))
+                }
+            }
         }
     }
 
@@ -628,9 +643,9 @@ impl ControlMvpStateStore {
         }
     }
 
-    /// Determines whether a planned restore transaction is part of the
+    /// Determines whether an exact transaction reference is part of the
     /// visible lineage, independent of how many replay anchors have been
-    /// committed since the restore.
+    /// committed since it published.
     ///
     /// The bounded transaction suffix resets at every anchor, so a suffix-only
     /// scan would misreport an applied restore as absent (and therefore
@@ -639,11 +654,11 @@ impl ControlMvpStateStore {
     /// anchor's `base_state` names the snapshot written by exactly one
     /// producing manifest, whose own `anchor_state` must byte-match the
     /// followed reference (binding the snapshot's raw checksum) — until the
-    /// planned sequence is covered or genesis is reached. Every hop loads an
+    /// referenced sequence is covered or genesis is reached. Every hop loads an
     /// envelope-checksummed manifest and the anchor sequence strictly
     /// decreases, so the walk is deterministic, fail-closed, and bounded by
     /// the number of anchors, not by history length.
-    async fn restore_tx_in_lineage(
+    async fn tx_in_lineage(
         &self,
         parent: &ControlMvpBase,
         planned: &ControlMvpTxRef,
@@ -661,7 +676,7 @@ impl ControlMvpStateStore {
                 return Ok(found == planned);
             }
             let Some(anchor) = base_state else {
-                // Genesis reached without covering the planned sequence.
+                // Genesis reached without covering the transaction sequence.
                 return Ok(false);
             };
             if planned.sequence > anchor.logical_sequence {
@@ -2280,6 +2295,11 @@ impl ControlMvpTxn {
         tx.l0_segment = l0_reference.clone();
         let tx_bytes = encode_envelope("control-mvp-tx", &tx)?;
         let tx_checksum = sha256_hex(&tx_bytes);
+        let candidate_tx_ref = ControlMvpTxRef {
+            tx_id: self.tx_id.clone(),
+            sequence: next_sequence,
+            checksum_sha256: tx_checksum.clone(),
+        };
         put_immutable(
             &self.store.storage,
             &self.store.paths.tx_object(&self.tx_id),
@@ -2295,11 +2315,7 @@ impl ControlMvpTxn {
         candidate_state.apply_tx(&tx)?;
 
         let mut tx_refs = self.base.tx_refs.clone();
-        tx_refs.push(ControlMvpTxRef {
-            tx_id: self.tx_id.clone(),
-            sequence: next_sequence,
-            checksum_sha256: tx_checksum,
-        });
+        tx_refs.push(candidate_tx_ref.clone());
 
         // Anchor the resulting state as an immutable snapshot when this commit
         // fills the checkpoint interval, so successors replay a bounded suffix.
@@ -2363,19 +2379,36 @@ impl ControlMvpTxn {
         match pointer_write {
             Err(error) => {
                 // S3 may accept a conditional PUT and lose the response. The
-                // exact canonical pointer bytes are deterministic, so a
-                // read-after-error can distinguish our successful CAS from an
-                // uncommitted or foreign result without guessing.
-                if self
+                // exact canonical pointer bytes prove direct publication. A
+                // successor may advance the head before readback, so the same
+                // exact transaction reference in visible lineage also proves
+                // commitment. Anything else remains genuinely ambiguous.
+                let exact_pointer_match = self
                     .store
                     .storage
                     .get_raw(&self.store.paths.current_pointer())
                     .await
-                    .is_ok_and(|current| current == pointer_bytes)
-                {
+                    .is_ok_and(|current| current == pointer_bytes);
+                if exact_pointer_match {
                     Ok(CommitOutcome::new(committed_token, projection_intents))
                 } else {
-                    Err(error.into())
+                    let visible_lineage_contains_candidate =
+                        match self.store.load_current_base_state().await {
+                            Ok(visible) => self
+                                .store
+                                .tx_in_lineage(&visible, &candidate_tx_ref)
+                                .await
+                                .unwrap_or(false),
+                            Err(_) => false,
+                        };
+                    if visible_lineage_contains_candidate {
+                        Ok(CommitOutcome::new(committed_token, projection_intents))
+                    } else {
+                        Err(ambiguous_authority_outcome(format!(
+                            "control MVP commit {} could not be reconciled after storage failure: {error}",
+                            candidate_tx_ref.tx_id
+                        )))
+                    }
                 }
             }
             Ok(WriteResult::Success { .. }) => {
@@ -2765,7 +2798,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         };
         let in_lineage = self
             .store
-            .restore_tx_in_lineage(&stable.candidate_parent, &planned_tx_ref)
+            .tx_in_lineage(&stable.candidate_parent, &planned_tx_ref)
             .await?;
         if in_lineage {
             return self.inspect_visible_restore(plan, planned_checksum).await;
@@ -4887,6 +4920,12 @@ fn validation_failed(message: &str) -> CatalogError {
 
 fn invariant_violation(message: impl Into<String>) -> CatalogError {
     CatalogError::InvariantViolation {
+        message: message.into(),
+    }
+}
+
+fn ambiguous_authority_outcome(message: impl Into<String>) -> CatalogError {
+    CatalogError::AmbiguousAuthorityOutcome {
         message: message.into(),
     }
 }

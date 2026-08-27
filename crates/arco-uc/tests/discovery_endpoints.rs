@@ -11,9 +11,12 @@
 use std::sync::Arc;
 
 use arco_catalog::{
-    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
-    authz::compiler::{CompiledPermissionRow, CompiledPermissionSet},
-    authz::privileges::Privilege,
+    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor,
+    Tier1CompactorFactory, WriteOptions,
+    authz::{
+        compiler::{CompiledPermissionRow, CompiledPermissionSet},
+        privileges::Privilege,
+    },
     metastore::{
         ledger::MetastoreLedger,
         projections::{ProjectionRegistry, ProjectionSet, build_projection_set},
@@ -100,8 +103,8 @@ async fn seeded_router() -> SeededRouter {
         .expect("register table");
     let catalog_snapshot_version = publish_empty_storage_governance_projection(&scoped).await;
 
-    let state =
-        UnityCatalogState::new(backend).with_compiled_permissions(CompiledPermissionSet::new(
+    let state = UnityCatalogState::new(backend)
+        .with_compiled_permissions(CompiledPermissionSet::new(
             catalog_snapshot_version,
             "groups-rev-discovery",
             true,
@@ -109,7 +112,8 @@ async fn seeded_router() -> SeededRouter {
                 permission_row(&table.id, "TABLE", Privilege::Manage),
                 permission_row(&table.id, "TABLE", Privilege::Select),
             ],
-        ));
+        ))
+        .with_compactor_factory(Arc::new(Tier1CompactorFactory));
     SeededRouter {
         app: unity_catalog_router(state),
         table_id: table.id,

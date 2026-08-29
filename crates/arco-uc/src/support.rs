@@ -473,7 +473,7 @@ const REGISTRY: &[UcOperationSupport] = &[
         "/delta/v1/config",
         "DeltaConfiguration",
         "authoritative catalog ledger plus static protocol negotiation and endpoint advertisement",
-        "input protocol-versions is ignored and the negotiated version is hardcoded to 1.0, as it is the only supported protocol version.",
+        "",
         true,
     ),
     planned(

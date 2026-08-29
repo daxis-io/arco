@@ -1,5 +1,8 @@
 //! Behavior tests for the Delta catalog protocol configuration route
 //! (`GET /delta/v1/config`).
+//!
+//! NOTE: Protocol version negotiation is intentionally not tested here;
+//! it is covered by separate tests.
 
 // Test-target lint scope (#331): tests and their helpers signal failure by
 // panicking. clippy.toml scopes the restriction lints out of #[test] fns;
@@ -11,15 +14,22 @@ use std::sync::Arc;
 use arco_catalog::{CatalogWriter, Tier1Compactor, WriteOptions};
 use arco_core::ScopedStorage;
 use arco_core::storage::MemoryBackend;
-use arco_uc::{UnityCatalogState, unity_catalog_router};
+use arco_uc::{SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS, UnityCatalogState, unity_catalog_router};
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+const TENANT: &str = "tenant1";
+const WORKSPACE: &str = "workspace1";
+const CATALOG: &str = "analytics";
+
+fn supported_protocol_version() -> Option<String> {
+    Some(SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS.get(0)?.to_string())
+}
+
 async fn seeded_app() -> axum::Router {
     let backend = Arc::new(MemoryBackend::new());
-    let scoped =
-        ScopedStorage::new(backend.clone(), "tenant1", "workspace1").expect("scoped storage");
+    let scoped = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");
 
     let writer = CatalogWriter::new(scoped.clone())
         .with_sync_compactor(Arc::new(Tier1Compactor::new(scoped.clone())))
@@ -28,11 +38,7 @@ async fn seeded_app() -> axum::Router {
         .with_lock_policy(std::time::Duration::from_secs(5), 3);
     writer.initialize().await.expect("initialize");
     writer
-        .create_catalog(
-            "analytics",
-            Some("Analytics catalog"),
-            WriteOptions::default(),
-        )
+        .create_catalog(CATALOG, Some("Analytics catalog"), WriteOptions::default())
         .await
         .expect("create catalog");
 
@@ -45,8 +51,8 @@ async fn get_config(app: axum::Router, query: &str) -> (StatusCode, serde_json::
             Request::builder()
                 .method("GET")
                 .uri(format!("/delta/v1/config{query}"))
-                .header("X-Tenant-Id", "tenant1")
-                .header("X-Workspace-Id", "workspace1")
+                .header("X-Tenant-Id", TENANT)
+                .header("X-Workspace-Id", WORKSPACE)
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -62,10 +68,15 @@ async fn get_config(app: axum::Router, query: &str) -> (StatusCode, serde_json::
 #[tokio::test]
 async fn config_returns_negotiated_protocol_and_endpoints() {
     let app = seeded_app().await;
-    let (status, payload) = get_config(app, "?catalog=analytics&protocol-versions=1.0").await;
+    let supported_version = supported_protocol_version().expect("supported version");
+    let (status, payload) = get_config(
+        app,
+        &format!("?catalog={CATALOG}&protocol-versions={supported_version}"),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["protocol-version"], "1.0");
+    assert_eq!(payload["protocol-version"], supported_version);
     let endpoints = payload["endpoints"].as_array().expect("endpoints array");
 
     for endpoint in endpoints {
@@ -96,7 +107,9 @@ async fn config_returns_negotiated_protocol_and_endpoints() {
 #[tokio::test]
 async fn config_requires_catalog_query_parameter() {
     let app = seeded_app().await;
-    let (status, payload) = get_config(app, "?protocol-versions=1.0").await;
+    let supported_version = supported_protocol_version().expect("supported version");
+    let (status, payload) =
+        get_config(app, &format!("?protocol-versions={supported_version}")).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let message = payload["error"]["message"].as_str().expect("error message");
@@ -104,9 +117,38 @@ async fn config_requires_catalog_query_parameter() {
 }
 
 #[tokio::test]
+async fn config_requires_protocol_versions_query_parameter() {
+    let app = seeded_app().await;
+    let (status, payload) = get_config(app, &format!("?catalog={CATALOG}")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = payload["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("protocol-versions"));
+}
+
+#[tokio::test]
+async fn config_returns_bad_request_for_unsupported_version() {
+    let app = seeded_app().await;
+    let (status, payload) = get_config(
+        app,
+        &format!("?catalog={CATALOG}&protocol-versions=100.100"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = payload["error"]["message"].as_str().expect("error message");
+    assert!(message.contains("no mutually supported protocol version"));
+}
+
+#[tokio::test]
 async fn config_returns_not_found_for_unknown_catalog() {
     let app = seeded_app().await;
-    let (status, payload) = get_config(app, "?catalog=missing&protocol-versions=1.0").await;
+    let supported_version = supported_protocol_version().expect("supported version");
+    let (status, payload) = get_config(
+        app,
+        &format!("?catalog=missing&protocol-versions={supported_version}"),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     let message = payload["error"]["message"].as_str().expect("error message");
@@ -114,25 +156,16 @@ async fn config_returns_not_found_for_unknown_catalog() {
 }
 
 #[tokio::test]
-async fn config_does_not_require_protocol_versions_query_parameter() {
-    // Deliberate deviation from the pinned delta spec: `protocol-versions` is
-    // required there (missing -> 400), but the current handler ignores it and
-    // always negotiates 1.0.
+async fn config_rejects_malformed_protocol_versions() {
     let app = seeded_app().await;
-    let (status, payload) = get_config(app, "?catalog=analytics").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["protocol-version"], "1.0");
-}
-
-#[tokio::test]
-async fn config_ignores_declared_protocol_versions_for_now() {
-    // Deliberate deviation: the client declared 2.0-2.1 and 3.0-3.2, which do
-    // not cover the server's 1.0; the pinned spec would require a 400 naming
-    // the supported version. The handler hardcodes 1.0, for now.
-    let app = seeded_app().await;
-    let (status, payload) = get_config(app, "?catalog=analytics&protocol-versions=2.1,3.2").await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["protocol-version"], "1.0");
+    for versions in ["ab.c", "1", "1.", "1.0.1", "1.0,,2.0", "1.0,"] {
+        let (status, payload) = get_config(
+            app.clone(),
+            &format!("?catalog={CATALOG}&protocol-versions={versions}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let message = payload["error"]["message"].as_str().expect("error message");
+        assert!(message.contains("invalid protocol-versions"),);
+    }
 }

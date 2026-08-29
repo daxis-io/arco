@@ -123,6 +123,19 @@ const MAX_SEGMENT_FOOTER_APPARENT_BYTES: usize = 1024 * 1024;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
+#[derive(Debug, Clone, Copy)]
+struct SegmentLimits {
+    bytes: usize,
+    index_bytes: usize,
+    rows: usize,
+}
+
+const PRODUCTION_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
+    bytes: MAX_SEGMENT_BYTES,
+    index_bytes: MAX_SEGMENT_INDEX_BYTES,
+    rows: MAX_SEGMENT_ROWS,
+};
+
 /// Object-store-backed state-store MVP for validating control-manifest authority.
 #[derive(Clone)]
 pub struct ControlMvpStateStore {
@@ -131,6 +144,7 @@ pub struct ControlMvpStateStore {
     paths: ControlMvpPaths,
     checkpoint_interval: u64,
     writer_epoch: u64,
+    segment_limits: SegmentLimits,
 }
 
 impl ControlMvpStateStore {
@@ -165,6 +179,7 @@ impl ControlMvpStateStore {
             paths,
             checkpoint_interval: Self::DEFAULT_CHECKPOINT_INTERVAL,
             writer_epoch: 0,
+            segment_limits: PRODUCTION_SEGMENT_LIMITS,
         })
     }
 
@@ -172,6 +187,12 @@ impl ControlMvpStateStore {
     #[must_use]
     pub const fn with_checkpoint_interval(mut self, interval: NonZeroU64) -> Self {
         self.checkpoint_interval = interval.get();
+        self
+    }
+
+    #[cfg(test)]
+    const fn with_segment_limits(mut self, limits: SegmentLimits) -> Self {
+        self.segment_limits = limits;
         self
     }
 
@@ -309,6 +330,7 @@ impl ControlMvpStateStore {
     /// Returns an error when the requested transaction scope does not match or
     /// the current pointer-selected manifest cannot be loaded.
     pub async fn begin_control_txn(&self, opts: TxnOptions) -> Result<ControlMvpTxn> {
+        opts.validate()?;
         if let Some(scope) = opts.scope()
             && scope != &self.scope
         {
@@ -534,6 +556,7 @@ impl ControlMvpStateStore {
             snapshot.logical_sequence,
             &self.scope,
             &rows,
+            self.segment_limits,
         )?;
         let reference = ControlMvpStateRef {
             state_id: snapshot.state_id.clone(),
@@ -945,6 +968,7 @@ impl ControlMvpStateStore {
             result_sequence,
             &self.scope,
             &l0_rows,
+            self.segment_limits,
         )?;
         tx.l0_segment = l0_reference;
         let transaction_bytes = encode_envelope("control-mvp-tx", &tx)?;
@@ -2066,6 +2090,11 @@ impl ControlMvpTxn {
             .iter()
             .map(|existing| existing.record_id.as_str())
             .chain(self.outbox.iter().map(|staged| staged.record_id.as_str()))
+            .chain(
+                self.projection_intents
+                    .iter()
+                    .map(|intent| intent.intent_id.as_str()),
+            )
             .any(|existing| existing == record.record_id);
         if duplicate {
             return Err(CatalogError::AlreadyExists {
@@ -2353,6 +2382,7 @@ impl ControlMvpTxn {
             next_sequence,
             &self.store.scope,
             &l0_rows,
+            self.store.segment_limits,
         )?;
         tx.l0_segment = l0_reference.clone();
         let tx_bytes = encode_envelope("control-mvp-tx", &tx)?;
@@ -2362,17 +2392,6 @@ impl ControlMvpTxn {
             sequence: next_sequence,
             checksum_sha256: tx_checksum.clone(),
         };
-        put_immutable(
-            &self.store.storage,
-            &self.store.paths.tx_object(&self.tx_id),
-            tx_bytes,
-            "control MVP transaction object already exists",
-        )
-        .await?;
-        self.store
-            .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
-            .await?;
-
         let mut candidate_state = self.base.state.clone();
         candidate_state.apply_tx(&tx)?;
 
@@ -2381,16 +2400,24 @@ impl ControlMvpTxn {
 
         // Anchor the resulting state as an immutable snapshot when this commit
         // fills the checkpoint interval, so successors replay a bounded suffix.
-        let anchor_state = if tx_refs.len() as u64 >= self.store.checkpoint_interval {
+        let rendered_anchor = if tx_refs.len() as u64 >= self.store.checkpoint_interval {
             let snapshot = ControlMvpStateObject::from_replay(
                 &candidate_state,
                 state_id_for_manifest(&self.manifest_id),
                 &self.store.scope,
             );
-            Some(self.store.write_state_snapshot(&snapshot).await?)
+            let (bytes, index_bytes, reference) = self.store.render_state_snapshot(&snapshot)?;
+            Some(RenderedControlMvpStateSegment {
+                reference,
+                bytes,
+                index_bytes,
+            })
         } else {
             None
         };
+        let anchor_state = rendered_anchor
+            .as_ref()
+            .map(|rendered| rendered.reference.clone());
 
         let manifest = ControlMvpManifest {
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -2407,14 +2434,6 @@ impl ControlMvpTxn {
         };
         let manifest_bytes = encode_envelope("control-mvp-manifest", &manifest)?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
-        put_immutable(
-            &self.store.storage,
-            &self.store.paths.manifest_object(&self.manifest_id),
-            manifest_bytes,
-            "control MVP manifest object already exists",
-        )
-        .await?;
-
         let pointer = ControlMvpPointer {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -2429,6 +2448,43 @@ impl ControlMvpTxn {
             WritePrecondition::DoesNotExist,
             WritePrecondition::MatchesVersion,
         );
+
+        // Candidate replay, required-anchor rendering, manifest encoding, and
+        // head encoding all complete before the first immutable artifact is
+        // published. A capacity failure therefore leaves no orphan candidate.
+        put_immutable(
+            &self.store.storage,
+            &self.store.paths.tx_object(&self.tx_id),
+            tx_bytes,
+            "control MVP transaction object already exists",
+        )
+        .await?;
+        self.store
+            .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
+            .await?;
+        if let Some(rendered) = rendered_anchor {
+            put_immutable_matching(
+                &self.store.storage,
+                &self.store.paths.state_object(&rendered.reference.state_id),
+                rendered.bytes,
+                "control MVP L1 segment already exists with different bytes",
+            )
+            .await?;
+            put_immutable_matching(
+                &self.store.storage,
+                &self.store.paths.segment_index(&rendered.reference.state_id),
+                rendered.index_bytes,
+                "control MVP L1 segment index already exists with different bytes",
+            )
+            .await?;
+        }
+        put_immutable(
+            &self.store.storage,
+            &self.store.paths.manifest_object(&self.manifest_id),
+            manifest_bytes,
+            "control MVP manifest object already exists",
+        )
+        .await?;
         let pointer_write = self
             .store
             .storage
@@ -4191,9 +4247,11 @@ fn encode_segment(
     logical_sequence: u64,
     scope: &StateScope,
     rows: &[ControlMvpSegmentRow],
+    limits: SegmentLimits,
 ) -> Result<(Bytes, Bytes, ControlMvpSegmentRef)> {
-    if rows.len() > MAX_SEGMENT_ROWS {
-        return Err(validation_failed(
+    if rows.len() > limits.rows {
+        return Err(segment_capacity_error(
+            level,
             "control MVP segment exceeds the supported row limit",
         ));
     }
@@ -4253,8 +4311,9 @@ fn encode_segment(
             .finish()
             .map_err(|error| segment_serialization_error("finish Arrow IPC segment", error))?;
     }
-    if output.len() > MAX_SEGMENT_BYTES {
-        return Err(validation_failed(
+    if output.len() > limits.bytes {
+        return Err(segment_capacity_error(
+            level,
             "control MVP segment exceeds the supported byte limit",
         ));
     }
@@ -4270,8 +4329,9 @@ fn encode_segment(
         segment_checksum_sha256.clone(),
     )?;
     let index_bytes = encode_json(&index, "control MVP segment index")?;
-    if index_bytes.len() > MAX_SEGMENT_INDEX_BYTES {
-        return Err(validation_failed(
+    if index_bytes.len() > limits.index_bytes {
+        return Err(segment_capacity_error(
+            level,
             "control MVP segment index exceeds the supported byte limit",
         ));
     }
@@ -5002,10 +5062,21 @@ fn ambiguous_authority_outcome(message: impl Into<String>) -> CatalogError {
     }
 }
 
+fn segment_capacity_error(level: ControlMvpSegmentLevel, message: &str) -> CatalogError {
+    match level {
+        ControlMvpSegmentLevel::L0 => validation_failed(message),
+        ControlMvpSegmentLevel::L1 => CatalogError::MaintenanceBackpressure {
+            message: message.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use arco_core::MemoryBackend;
+    use arco_core::storage::StorageBackend as _;
     use arrow::ipc::{Block, Footer, FooterArgs};
     use flatbuffers::FlatBufferBuilder;
 
@@ -5032,9 +5103,138 @@ mod tests {
             1,
             &scope,
             &[one_kv_row()],
+            PRODUCTION_SEGMENT_LIMITS,
         )
         .expect("encode test segment");
         (bytes, index_bytes, reference, scope)
+    }
+
+    #[test]
+    fn l1_row_byte_and_index_capacity_failures_are_typed_backpressure() {
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        for limits in [
+            SegmentLimits {
+                rows: 0,
+                ..PRODUCTION_SEGMENT_LIMITS
+            },
+            SegmentLimits {
+                bytes: 0,
+                ..PRODUCTION_SEGMENT_LIMITS
+            },
+            SegmentLimits {
+                index_bytes: 0,
+                ..PRODUCTION_SEGMENT_LIMITS
+            },
+        ] {
+            let error = encode_segment(
+                "capacity",
+                ControlMvpSegmentLevel::L1,
+                1,
+                &scope,
+                &[one_kv_row()],
+                limits,
+            )
+            .expect_err("required L1 capacity must fail closed");
+            assert!(matches!(
+                error,
+                CatalogError::MaintenanceBackpressure { .. }
+            ));
+        }
+
+        let l0_error = encode_segment(
+            "oversized-input",
+            ControlMvpSegmentLevel::L0,
+            1,
+            &scope,
+            &[one_kv_row()],
+            SegmentLimits {
+                rows: 0,
+                ..PRODUCTION_SEGMENT_LIMITS
+            },
+        )
+        .expect_err("an individually oversized L0 mutation is invalid input");
+        assert!(matches!(l0_error, CatalogError::Validation { .. }));
+    }
+
+    #[tokio::test]
+    async fn required_l1_backpressure_precedes_every_candidate_artifact_write() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .expect("store")
+                .with_checkpoint_interval(NonZeroU64::new(2).expect("nonzero interval"))
+                .with_segment_limits(SegmentLimits {
+                    rows: 2,
+                    ..PRODUCTION_SEGMENT_LIMITS
+                });
+
+        let mut seed = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin seed");
+        seed.put(b"catalog/a", Bytes::from_static(b"a"))
+            .await
+            .expect("put a");
+        seed.put(b"catalog/b", Bytes::from_static(b"b"))
+            .await
+            .expect("put b");
+        seed.commit().await.expect("seed commit below L1 boundary");
+        let head_before = store.current_state_token().await.expect("head before");
+        let artifacts_before = backend
+            .list("")
+            .await
+            .expect("inventory before")
+            .into_iter()
+            .map(|object| object.path)
+            .collect::<BTreeSet<_>>();
+
+        for _attempt in 0..2 {
+            let mut candidate = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("begin candidate");
+            candidate
+                .delete(b"catalog/a")
+                .await
+                .expect("retain tombstone");
+            candidate
+                .put(b"catalog/c", Bytes::from_static(b"c"))
+                .await
+                .expect("put c");
+            let error = candidate
+                .commit()
+                .await
+                .expect_err("three retained L1 rows exceed the reduced two-row cap");
+            assert!(matches!(
+                error,
+                CatalogError::MaintenanceBackpressure { .. }
+            ));
+            assert_eq!(
+                head_before,
+                store
+                    .current_state_token()
+                    .await
+                    .expect("head after failure")
+            );
+            assert_eq!(
+                Some(Bytes::from_static(b"a")),
+                store.get(b"catalog/a").await.expect("retained a")
+            );
+            assert_eq!(None, store.get(b"catalog/c").await.expect("absent c"));
+            assert_eq!(
+                artifacts_before,
+                backend
+                    .list("")
+                    .await
+                    .expect("inventory after")
+                    .into_iter()
+                    .map(|object| object.path)
+                    .collect::<BTreeSet<_>>(),
+                "capacity failure must precede transaction, L0, L1, manifest, and head writes"
+            );
+        }
     }
 
     fn rebind_segment(

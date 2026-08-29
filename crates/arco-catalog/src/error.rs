@@ -86,6 +86,14 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// A mandatory bounded-replay anchor cannot fit the supported immutable
+    /// segment format, so publication must stop before writing candidates.
+    #[error("maintenance backpressure: {message}")]
+    MaintenanceBackpressure {
+        /// Capacity limit that requires offline consolidation or retention work.
+        message: String,
+    },
+
     /// Restore recovery encountered authority from a retired/noncanonical
     /// durable layout that this kernel deliberately does not migrate.
     #[error("unsupported authority format: {message}")]
@@ -144,6 +152,7 @@ impl CatalogError {
             | Self::Parquet { .. }
             | Self::InvariantViolation { .. }
             | Self::AmbiguousAuthorityOutcome { .. }
+            | Self::MaintenanceBackpressure { .. }
             | Self::UnsupportedAuthorityFormat { .. } => None,
         }
     }

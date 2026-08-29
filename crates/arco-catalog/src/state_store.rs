@@ -878,6 +878,21 @@ impl TxnOptions {
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
     }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(scope) = &self.scope {
+            scope.validate()?;
+        }
+        if let Some(request_id) = &self.request_id {
+            if request_id.len() > 256 {
+                return Err(CatalogError::Validation {
+                    message: "transaction request_id must not exceed 256 UTF-8 bytes".to_string(),
+                });
+            }
+            validate_scope_component(request_id, "transaction request_id")?;
+        }
+        Ok(())
+    }
 }
 
 /// Options for creating a future retained authority checkpoint.

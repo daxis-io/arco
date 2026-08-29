@@ -8,6 +8,7 @@ use arco_catalog::{
 };
 use arco_core::{MemoryBackend, ScopedStorage};
 use bytes::Bytes;
+use serde_json::Value;
 
 fn model_store() -> ModelStateStore {
     ModelStateStore::new(StateScope::new("tenant", "workspace", "metastore"))
@@ -140,4 +141,82 @@ async fn control_commit_returns_and_durably_records_projection_intent() {
     let durable: ProjectionIntentV1 =
         serde_json::from_slice(outbox[0].payload()).expect("decode durable intent");
     assert_eq!(committed, &durable);
+}
+
+#[tokio::test]
+async fn projection_intent_wire_rejects_every_invalid_contract_boundary() {
+    let store = model_store();
+    let token = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction")
+        .commit()
+        .await
+        .expect("commit")
+        .into_state_token();
+    let valid = serde_json::to_value(
+        ProjectionIntentV1::new(
+            "project-0001",
+            "system_catalog_tables",
+            &token,
+            Bytes::from_static(b"payload"),
+        )
+        .expect("valid intent"),
+    )
+    .expect("intent JSON");
+
+    for (field, replacement) in [
+        ("contractVersion", Value::from(2_u64)),
+        ("intentId", Value::String("bad/id".to_string())),
+        ("projectionKind", Value::String(" ".to_string())),
+        ("sourceLogicalSequence", Value::from(0_u64)),
+        ("sourceAuthorityManifestId", Value::String(" ".to_string())),
+        ("payload", Value::Array(Vec::new())),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = replacement;
+        assert!(
+            serde_json::from_value::<ProjectionIntentV1>(invalid).is_err(),
+            "invalid projection intent field {field} was accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn layout_maintenance_wire_rejects_every_invalid_contract_boundary() {
+    let store = model_store();
+    let token = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction")
+        .commit()
+        .await
+        .expect("commit")
+        .into_state_token();
+    let valid = serde_json::to_value(
+        LayoutMaintenanceIntentV1::new(
+            "maintain-0001",
+            &token,
+            7,
+            LayoutMaintenanceReason::L0SegmentCount,
+        )
+        .expect("valid maintenance intent"),
+    )
+    .expect("maintenance JSON");
+
+    for (field, replacement) in [
+        ("contractVersion", Value::from(2_u64)),
+        ("intentId", Value::String("bad\\id".to_string())),
+        ("sourceLogicalSequence", Value::from(0_u64)),
+        ("sourceAuthorityManifestId", Value::String(String::new())),
+        ("layoutGeneration", Value::from(0_u64)),
+        ("reason", Value::String("future_reason".to_string())),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[field] = replacement;
+        assert!(
+            serde_json::from_value::<LayoutMaintenanceIntentV1>(invalid).is_err(),
+            "invalid maintenance intent field {field} was accepted"
+        );
+    }
 }

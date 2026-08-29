@@ -517,6 +517,7 @@ impl ArcoStateAdmin for ModelStateStore {
 #[async_trait]
 impl ArcoStateStore for ModelStateStore {
     async fn begin_txn(&self, opts: TxnOptions) -> Result<Box<dyn ArcoStateTxn>> {
+        opts.validate()?;
         if let Some(scope) = opts.scope()
             && scope != &self.scope
         {

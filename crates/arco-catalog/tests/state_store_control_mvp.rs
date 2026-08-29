@@ -4121,6 +4121,117 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
 }
 
 #[tokio::test]
+async fn transaction_request_ids_are_validated_before_control_transaction_begin() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let oversized = "é".repeat(129);
+    for invalid in [
+        String::new(),
+        "   ".to_string(),
+        ".".to_string(),
+        "..".to_string(),
+        "request/child".to_string(),
+        "request\\child".to_string(),
+        "request\u{0000}child".to_string(),
+        oversized,
+    ] {
+        let result = store
+            .begin_control_txn(TxnOptions::default().with_request_id(invalid.clone()))
+            .await;
+        assert!(
+            matches!(result, Err(CatalogError::Validation { .. })),
+            "invalid request id {invalid:?} was accepted"
+        );
+    }
+
+    for valid in [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "01JDPG7Y3ZQ7N8M9K2T4V6W8XA",
+    ] {
+        assert!(
+            store
+                .begin_control_txn(TxnOptions::default().with_request_id(valid))
+                .await
+                .is_ok(),
+            "representative request id {valid:?} must be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+
+    let mut intent_first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin intent-first transaction");
+    intent_first
+        .stage_projection_intent("shared-a", "catalog", Bytes::from_static(b"payload"))
+        .expect("stage first intent");
+    assert!(matches!(
+        intent_first.stage_projection_intent(
+            "shared-a",
+            "catalog",
+            Bytes::from_static(b"duplicate")
+        ),
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        intent_first.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "shared-a",
+            Bytes::from_static(b"record")
+        )),
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+
+    let mut record_first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin record-first transaction");
+    record_first
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "shared-b",
+            Bytes::from_static(b"record"),
+        ))
+        .expect("stage record");
+    assert!(matches!(
+        record_first.stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload")),
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+    record_first.commit().await.expect("commit retained record");
+
+    let mut retained_collision = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin retained collision transaction");
+    assert!(matches!(
+        retained_collision.stage_projection_intent(
+            "shared-b",
+            "catalog",
+            Bytes::from_static(b"payload")
+        ),
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+
+    for (intent_id, projection_kind, payload) in [
+        ("bad/id", "catalog", Bytes::from_static(b"payload")),
+        ("valid-id", " ", Bytes::from_static(b"payload")),
+        ("valid-id", "catalog", Bytes::new()),
+    ] {
+        let mut invalid = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin invalid-intent transaction");
+        assert!(matches!(
+            invalid.stage_projection_intent(intent_id, projection_kind, payload),
+            Err(CatalogError::Validation { .. })
+        ));
+    }
+}
+
+#[tokio::test]
 async fn restore_inspection_stays_visible_across_anchor_boundaries() {
     let (_backend, storage) = storage();
     let store = ControlMvpStateStore::new(storage, scope())

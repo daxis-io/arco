@@ -1245,6 +1245,7 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         "planning writes the current plan version"
     );
     assert!(!plan.is_legacy_version());
+    assert_eq!(Some(32_u64), downgraded_checkpoint_interval(&serialized));
 
     // R6: a round trip of the version this revision writes proves only that
     // the writer and reader agree with themselves. Recovery has to read plans
@@ -1256,6 +1257,11 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("plan object")
         .remove("observed_writer_epoch");
     assert_eq!(Some(Value::from(0_u64)), removed);
+    let removed_interval = downgraded
+        .as_object_mut()
+        .expect("plan object")
+        .remove("checkpoint_interval");
+    assert_eq!(Some(Value::from(32_u64)), removed_interval);
     downgraded["version"] = Value::from(1_u64);
     let migrated: PersistedRestoreParticipantPlan =
         serde_json::from_value(downgraded.clone()).expect("v1 plans must remain decodable");
@@ -1287,6 +1293,87 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         backend.list("").await.expect("inventory after").len(),
         "read-only planning must not write"
     );
+}
+
+fn downgraded_checkpoint_interval(serialized: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(serialized)
+        .expect("restore plan JSON")
+        .get("checkpoint_interval")
+        .and_then(Value::as_u64)
+}
+
+#[tokio::test]
+async fn restore_plan_replay_anchor_interval_survives_store_reconstruction() {
+    let (_backend, storage) = storage();
+    let planning_store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("planning store")
+        .with_checkpoint_interval(interval(1));
+    let source = retained_v1_and_current_v2(&planning_store).await;
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000042", 1, "catalog")
+        .expect("identity");
+    let plan = ControlMvpRestoreParticipant::new(planning_store)
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan with interval one");
+    assert_eq!(
+        Some(1_u64),
+        downgraded_checkpoint_interval(
+            &serde_json::to_string(&plan).expect("serialized restore plan")
+        )
+    );
+
+    let reconstructed = ControlMvpStateStore::new(storage, scope())
+        .expect("reconstructed store")
+        .with_checkpoint_interval(interval(32));
+    let adapter = ControlMvpRestoreParticipant::new(reconstructed);
+    assert!(matches!(
+        adapter.inspect_restore(&plan).await.expect("inspect plan"),
+        RestoreParticipantInspection::Ready
+    ));
+    assert!(matches!(
+        adapter
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("apply plan"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    assert!(matches!(
+        adapter
+            .inspect_restore(&plan)
+            .await
+            .expect("idempotent reinspection"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+}
+
+#[tokio::test]
+async fn noncanonical_restore_authority_is_a_typed_hard_cut_error() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    let mut retired: Value = serde_json::to_value(&source).expect("source JSON");
+    retired["manifest_path"] = Value::String(format!(
+        "state-store/catalog/manifests/{}.json",
+        source.manifest_id()
+    ));
+    let retired = serde_json::from_value(retired).expect("retired reference shape");
+    let error = ControlMvpRestoreParticipant::new(store)
+        .plan_restore(
+            &retired,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000043", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect_err("retired authority layout must not be migrated implicitly");
+    assert!(
+        format!("{error:?}").starts_with("UnsupportedAuthorityFormat"),
+        "unexpected error: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("control/v1 hard cut"));
+    assert!(message.contains("old layouts are not migrated"));
+    assert!(message.contains("retained control/v1 authority source"));
 }
 
 /// R6: literal, hand-maintained versioned plan fixtures.
@@ -1447,6 +1534,7 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     let mut wire = serde_json::to_value(&plan).expect("plan json");
     let object = wire.as_object_mut().expect("plan object");
     object.remove("observed_writer_epoch");
+    object.remove("checkpoint_interval");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
@@ -1872,6 +1960,10 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
         .as_object_mut()
         .expect("plan object")
         .remove("observed_writer_epoch");
+    value
+        .as_object_mut()
+        .expect("plan object")
+        .remove("checkpoint_interval");
     let legacy: PersistedRestoreParticipantPlan =
         serde_json::from_value(value).expect("legacy plan remains decodable");
     assert_eq!(

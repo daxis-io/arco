@@ -86,6 +86,14 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// Restore recovery encountered authority from a retired/noncanonical
+    /// durable layout that this kernel deliberately does not migrate.
+    #[error("unsupported authority format: {message}")]
+    UnsupportedAuthorityFormat {
+        /// Hard-cut diagnosis and operator recovery direction.
+        message: String,
+    },
+
     /// Replayed terminal request failure with a preserved HTTP status code.
     #[error("{message}")]
     RequestFailed {
@@ -135,7 +143,8 @@ impl CatalogError {
             | Self::Serialization { .. }
             | Self::Parquet { .. }
             | Self::InvariantViolation { .. }
-            | Self::AmbiguousAuthorityOutcome { .. } => None,
+            | Self::AmbiguousAuthorityOutcome { .. }
+            | Self::UnsupportedAuthorityFormat { .. } => None,
         }
     }
 }

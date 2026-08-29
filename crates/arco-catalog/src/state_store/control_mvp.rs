@@ -705,11 +705,7 @@ impl ControlMvpStateStore {
         &self,
         source: &PersistedAuthorityReference,
     ) -> Result<ControlMvpBase> {
-        if source.manifest_path() != self.paths.manifest_object(source.manifest_id()) {
-            return Err(validation_failed(
-                "Control MVP restore source manifest path mismatch",
-            ));
-        }
+        self.validate_restore_authority_format(source)?;
         let manifest_bytes = self.storage.get_raw(source.manifest_path()).await?;
         if prefixed_sha256(&manifest_bytes) != source.manifest_sha256() {
             return Err(invariant_violation(
@@ -814,6 +810,7 @@ impl ControlMvpStateStore {
         source: &PersistedAuthorityReference,
         now: DateTime<Utc>,
     ) -> Result<BTreeMap<Vec<u8>, Bytes>> {
+        self.validate_restore_authority_format(source)?;
         if source.reference_kind() != PersistedAuthorityKind::Checkpoint
             || source.checkpoint_path().is_none()
             || source.checkpoint_sha256().is_none()
@@ -829,6 +826,13 @@ impl ControlMvpStateStore {
             .into_iter()
             .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
             .collect())
+    }
+
+    fn validate_restore_authority_format(
+        &self,
+        source: &PersistedAuthorityReference,
+    ) -> Result<()> {
+        validate_control_mvp_authority_format(&self.paths, source)
     }
 
     fn restore_writes(
@@ -862,6 +866,7 @@ impl ControlMvpStateStore {
         source_values: &BTreeMap<Vec<u8>, Bytes>,
         identity: &RestoreAttemptIdentity,
         stable: &StableRestoreBase,
+        checkpoint_interval: u64,
     ) -> Result<RenderedControlMvpRestore> {
         let base_manifest_id = stable
             .candidate_parent
@@ -889,6 +894,7 @@ impl ControlMvpStateStore {
             stable.current.pointer_version.as_deref(),
             &prefixed_sha256(&stable.pointer_bytes),
             result_sequence,
+            Some(checkpoint_interval),
         );
         let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
         let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
@@ -951,22 +957,22 @@ impl ControlMvpStateStore {
             sequence: result_sequence,
             checksum_sha256: transaction_checksum,
         });
-        let rendered_l1 =
-            if u64::try_from(tx_refs.len()).unwrap_or(u64::MAX) >= self.checkpoint_interval {
-                let snapshot = ControlMvpStateObject::from_replay(
-                    &candidate_state,
-                    state_id_for_manifest(&candidate_manifest_id),
-                    &self.scope,
-                );
-                let (bytes, index_bytes, reference) = self.render_state_snapshot(&snapshot)?;
-                Some(RenderedControlMvpStateSegment {
-                    reference,
-                    bytes,
-                    index_bytes,
-                })
-            } else {
-                None
-            };
+        let rendered_l1 = if u64::try_from(tx_refs.len()).unwrap_or(u64::MAX) >= checkpoint_interval
+        {
+            let snapshot = ControlMvpStateObject::from_replay(
+                &candidate_state,
+                state_id_for_manifest(&candidate_manifest_id),
+                &self.scope,
+            );
+            let (bytes, index_bytes, reference) = self.render_state_snapshot(&snapshot)?;
+            Some(RenderedControlMvpStateSegment {
+                reference,
+                bytes,
+                index_bytes,
+            })
+        } else {
+            None
+        };
         let manifest = ControlMvpManifest {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -1020,7 +1026,13 @@ impl ControlMvpStateStore {
         }
         let source_values = self.restore_source_values(source, now).await?;
         let stable = self.load_stable_restore_base(source).await?;
-        let rendered = self.render_restore_candidate(source, &source_values, identity, &stable)?;
+        let rendered = self.render_restore_candidate(
+            source,
+            &source_values,
+            identity,
+            &stable,
+            self.checkpoint_interval,
+        )?;
         let plan = ControlMvpRestorePlan {
             record_type: RESTORE_PLAN_RECORD_TYPE.to_string(),
             version: RESTORE_PLAN_VERSION,
@@ -1032,6 +1044,7 @@ impl ControlMvpStateStore {
             base_pointer_version: stable.current.pointer_version.clone(),
             observed_base_pointer_sha256: prefixed_sha256(&stable.pointer_bytes),
             observed_writer_epoch: stable.writer_epoch,
+            checkpoint_interval: Some(self.checkpoint_interval),
             base_manifest_id: stable
                 .candidate_parent
                 .manifest_id
@@ -1115,6 +1128,26 @@ impl ControlMvpPaths {
     pub fn segment_index(&self, segment_id: &str) -> String {
         format!("{}/indexes/{segment_id}.idx", self.base_prefix())
     }
+}
+
+fn validate_control_mvp_authority_format(
+    paths: &ControlMvpPaths,
+    source: &PersistedAuthorityReference,
+) -> Result<()> {
+    let canonical_manifest = paths.manifest_object(source.manifest_id());
+    let checkpoint_prefix = format!("{}/checkpoints/", paths.base_prefix());
+    let canonical_checkpoint = source
+        .checkpoint_path()
+        .is_none_or(|path| path.starts_with(&checkpoint_prefix));
+    if source.manifest_path() == canonical_manifest && canonical_checkpoint {
+        return Ok(());
+    }
+    Err(CatalogError::UnsupportedAuthorityFormat {
+        message: format!(
+            "the control/v1 hard cut rejects authority reference {}; old layouts are not migrated; recover from a retained control/v1 authority source",
+            source.manifest_path()
+        ),
+    })
 }
 
 /// Returns the deterministic state-snapshot id anchored to a manifest.
@@ -1324,6 +1357,8 @@ pub struct ControlMvpRestorePlan {
     base_pointer_version: Option<String>,
     observed_base_pointer_sha256: String,
     observed_writer_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_interval: Option<u64>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -1355,6 +1390,8 @@ struct ControlMvpRestorePlanWire {
     observed_base_pointer_sha256: String,
     #[serde(default)]
     observed_writer_epoch: Option<u64>,
+    #[serde(default)]
+    checkpoint_interval: Option<u64>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -1393,6 +1430,30 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
                 )
             })?
         };
+        let checkpoint_interval = match wire.version {
+            RESTORE_PLAN_VERSION_V1 | RESTORE_PLAN_VERSION_V2 => {
+                if wire.checkpoint_interval.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "legacy Control MVP restore plans must not carry checkpoint_interval",
+                    ));
+                }
+                None
+            }
+            RESTORE_PLAN_VERSION => match wire.checkpoint_interval {
+                Some(interval) if interval > 0 => Some(interval),
+                Some(_) => {
+                    return Err(serde::de::Error::custom(
+                        "Control MVP restore plan checkpoint_interval must be positive",
+                    ));
+                }
+                None => {
+                    return Err(serde::de::Error::custom(
+                        "Control MVP restore plan is missing checkpoint_interval",
+                    ));
+                }
+            },
+            _ => wire.checkpoint_interval,
+        };
         Ok(Self {
             record_type: wire.record_type,
             version: wire.version,
@@ -1404,6 +1465,7 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             base_pointer_version: wire.base_pointer_version,
             observed_base_pointer_sha256: wire.observed_base_pointer_sha256,
             observed_writer_epoch,
+            checkpoint_interval,
             base_manifest_id: wire.base_manifest_id,
             base_logical_sequence: wire.base_logical_sequence,
             transaction_id: wire.transaction_id,
@@ -1440,6 +1502,13 @@ impl ControlMvpRestorePlan {
     #[must_use]
     pub const fn source(&self) -> &PersistedAuthorityReference {
         &self.source
+    }
+
+    pub(crate) fn validate_source_authority_format(&self) -> Result<()> {
+        validate_control_mvp_authority_format(
+            &ControlMvpPaths::new(self.scope.domain()),
+            &self.source,
+        )
     }
 
     /// Returns the originating participant attempt identity.
@@ -1508,6 +1577,14 @@ impl ControlMvpRestorePlan {
         self.result_logical_sequence
     }
 
+    fn required_checkpoint_interval(&self) -> Result<u64> {
+        self.checkpoint_interval
+            .filter(|interval| *interval > 0)
+            .ok_or_else(|| {
+                validation_failed("Control MVP restore plan checkpoint_interval is missing or zero")
+            })
+    }
+
     fn validate(&self, store: &ControlMvpStateStore) -> Result<()> {
         self.scope.validate()?;
         self.source.validate()?;
@@ -1530,6 +1607,7 @@ impl ControlMvpRestorePlan {
                 .as_ref()
                 .is_some_and(|version| !version.is_empty()),
         };
+        let checkpoint_interval = self.required_checkpoint_interval()?;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || self.version != RESTORE_PLAN_VERSION
             || self.implementation != IMPLEMENTATION
@@ -1559,6 +1637,7 @@ impl ControlMvpRestorePlan {
             self.base_pointer_version.as_deref(),
             &self.observed_base_pointer_sha256,
             self.result_logical_sequence,
+            Some(checkpoint_interval),
         );
         let expected_transaction_id =
             format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
@@ -1624,6 +1703,7 @@ impl ControlMvpRestorePlan {
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || !self.is_legacy_version()
             || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
+            || self.checkpoint_interval.is_some()
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -1642,32 +1722,13 @@ impl ControlMvpRestorePlan {
         {
             return Err(validation_failed("invalid legacy Control MVP restore plan"));
         }
-        let suffix = restore_identity_suffix(
-            &self.scope,
-            &self.identity,
-            &self.source,
-            self.current_base_kind,
-            &self.base_manifest_id,
-            self.base_pointer_version.as_deref(),
-            &self.observed_base_pointer_sha256,
-            self.result_logical_sequence,
-        );
-        let expected_transaction_id =
-            format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
-        let expected_manifest_id = format!(
-            "manifest-{:020}-restore-{suffix}",
-            self.result_logical_sequence
-        );
         let expected_outbox_id = format!(
             "restore:{}:{}:{}",
             self.identity.restore_id(),
             self.identity.attempt(),
             self.identity.domain()
         );
-        if self.transaction_id != expected_transaction_id
-            || self.candidate_manifest_id != expected_manifest_id
-            || self.restore_outbox_record_id != expected_outbox_id
-        {
+        if self.restore_outbox_record_id != expected_outbox_id {
             return Err(validation_failed(
                 "legacy Control MVP restore plan deterministic identity mismatch",
             ));
@@ -1814,8 +1875,9 @@ impl ControlMvpRestoreParticipant {
         manifest.validate(&self.store.scope, &plan.candidate_manifest_id)?;
         let base_manifest = self.store.load_manifest(&plan.base_manifest_id).await?;
         let (expected_base_state, expected_prefix) = base_manifest.successor_anchor();
-        let should_anchor = u64::try_from(expected_prefix.len() + 1).unwrap_or(u64::MAX)
-            >= self.store.checkpoint_interval;
+        let checkpoint_interval = plan.required_checkpoint_interval()?;
+        let should_anchor =
+            u64::try_from(expected_prefix.len() + 1).unwrap_or(u64::MAX) >= checkpoint_interval;
         if manifest.logical_sequence != plan.result_logical_sequence
             || manifest.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
             || manifest.base_state != expected_base_state
@@ -2785,6 +2847,8 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             plan.validate_legacy_for_supersession(&self.store)?;
             return Ok(RestoreParticipantInspection::Superseded);
         }
+        self.store
+            .validate_restore_authority_format(plan.source())?;
         plan.validate(&self.store)?;
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         let planned_checksum = plan
@@ -2821,6 +2885,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
                 &source_values,
                 &plan.identity,
                 &stable,
+                plan.required_checkpoint_interval()?,
             )?;
             if plan.base_logical_sequence != stable.candidate_parent.state.logical_sequence
                 || rendered.transaction_id != plan.transaction_id
@@ -2851,6 +2916,8 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             plan.validate_legacy_for_supersession(&self.store)?;
             return Ok(RestoreParticipantInspection::Superseded);
         }
+        self.store
+            .validate_restore_authority_format(plan.source())?;
         plan.validate(&self.store)?;
         match self.inspect_restore(persisted).await? {
             RestoreParticipantInspection::Ready => {}
@@ -2870,6 +2937,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             &source_values,
             &plan.identity,
             &stable,
+            plan.required_checkpoint_interval()?,
         )?;
         if rendered.transaction_id != plan.transaction_id
             || prefixed_sha256(&rendered.transaction_bytes) != plan.transaction_sha256
@@ -4851,6 +4919,7 @@ fn restore_identity_suffix(
     base_pointer_version: Option<&str>,
     observed_base_pointer_sha256: &str,
     result_sequence: u64,
+    checkpoint_interval: Option<u64>,
 ) -> String {
     let mut hasher = Sha256::new();
     for value in [
@@ -4875,6 +4944,9 @@ fn restore_identity_suffix(
     hash_u64(&mut hasher, identity.attempt());
     hash_u64(&mut hasher, source.logical_sequence());
     hash_u64(&mut hasher, result_sequence);
+    if let Some(checkpoint_interval) = checkpoint_interval {
+        hash_u64(&mut hasher, checkpoint_interval);
+    }
     hex::encode(hasher.finalize())[..32].to_string()
 }
 

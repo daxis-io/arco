@@ -24,7 +24,7 @@ const WORKSPACE: &str = "workspace1";
 const CATALOG: &str = "analytics";
 
 fn supported_protocol_version() -> Option<String> {
-    Some(SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS.get(0)?.to_string())
+    Some(SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS.first()?.to_string())
 }
 
 async fn seeded_app() -> axum::Router {

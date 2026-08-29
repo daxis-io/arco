@@ -2321,7 +2321,8 @@ mod tests {
             .await
             .expect_err("injected crash after ack retirement must interrupt the trim");
         assert!(
-            matches!(error, CatalogError::Storage { .. }),
+            matches!(&error, CatalogError::AmbiguousAuthorityOutcome { message }
+                if message.contains("injected trim crash point")),
             "unexpected error: {error:?}"
         );
 

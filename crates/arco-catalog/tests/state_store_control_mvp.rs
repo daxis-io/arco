@@ -1351,29 +1351,50 @@ async fn noncanonical_restore_authority_is_a_typed_hard_cut_error() {
     let (_backend, storage) = storage();
     let store = store(storage);
     let source = retained_v1_and_current_v2(&store).await;
-    let mut retired: Value = serde_json::to_value(&source).expect("source JSON");
-    retired["manifest_path"] = Value::String(format!(
-        "state-store/catalog/manifests/{}.json",
-        source.manifest_id()
-    ));
-    let retired = serde_json::from_value(retired).expect("retired reference shape");
-    let error = ControlMvpRestoreParticipant::new(store)
-        .plan_restore(
-            &retired,
-            &RestoreAttemptIdentity::new("rst_00000000000000000000000043", 1, "catalog")
-                .expect("identity"),
-            Utc::now(),
-        )
-        .await
-        .expect_err("retired authority layout must not be migrated implicitly");
-    assert!(
-        format!("{error:?}").starts_with("UnsupportedAuthorityFormat"),
-        "unexpected error: {error:?}"
-    );
-    let message = error.to_string();
-    assert!(message.contains("control/v1 hard cut"));
-    assert!(message.contains("old layouts are not migrated"));
-    assert!(message.contains("retained control/v1 authority source"));
+    for (label, retired) in [
+        ("retired manifest path", {
+            let mut retired = serde_json::to_value(&source).expect("source JSON");
+            retired["manifest_path"] = Value::String(format!(
+                "state-store/catalog/manifests/{}.json",
+                source.manifest_id()
+            ));
+            retired
+        }),
+        ("nested checkpoint path", {
+            let mut retired = serde_json::to_value(&source).expect("source JSON");
+            let checkpoint_name = source
+                .checkpoint_path()
+                .expect("checkpoint source")
+                .rsplit('/')
+                .next()
+                .expect("checkpoint file");
+            retired["checkpoint_path"] = Value::String(format!(
+                "control/v1/domains/catalog/checkpoints/nested/{checkpoint_name}"
+            ));
+            retired
+        }),
+    ] {
+        let retired = serde_json::from_value(retired).expect("retired reference shape");
+        let result = ControlMvpRestoreParticipant::new(store.clone())
+            .plan_restore(
+                &retired,
+                &RestoreAttemptIdentity::new("rst_00000000000000000000000043", 1, "catalog")
+                    .expect("identity"),
+                Utc::now(),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("{label} must not be migrated implicitly");
+        };
+        assert!(
+            format!("{error:?}").starts_with("UnsupportedAuthorityFormat"),
+            "unexpected {label} error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("control/v1 hard cut"));
+        assert!(message.contains("old layouts are not migrated"));
+        assert!(message.contains("retained control/v1 authority source"));
+    }
 }
 
 /// R6: literal, hand-maintained versioned plan fixtures.
@@ -1724,6 +1745,45 @@ async fn restore_recovery_reconciles_pointer_write_then_transport_error() {
         RestoreParticipantInspection::Visible { .. }
     ));
     assert!(backend.fault_fired(), "the restore pointer fault must fire");
+}
+
+#[tokio::test]
+async fn restore_write_and_readback_failures_are_typed_ambiguous() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(PointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store);
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000044", 1, "catalog")
+        .expect("identity");
+    let plan = adapter
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan");
+    backend.arm_with_failed_readback();
+
+    let error = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect_err("failed reconciliation cannot prove the landed restore outcome");
+    let CatalogError::AmbiguousAuthorityOutcome { message } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(message.contains("injected transport error after pointer write"));
+    assert!(message.contains("injected reconciliation pointer read error"));
+    assert!(backend.fault_fired(), "the restore pointer fault must fire");
+    assert!(
+        backend.read_fault_fired(),
+        "the reconciliation read fault must fire"
+    );
+    assert!(matches!(
+        adapter
+            .inspect_restore(&plan)
+            .await
+            .expect("later inspection"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
 }
 
 #[tokio::test]
@@ -2713,6 +2773,8 @@ struct PointerWriteThenErrorBackend {
     inner: Arc<dyn StorageBackend>,
     armed: AtomicBool,
     fired: AtomicBool,
+    fail_next_pointer_read: AtomicBool,
+    read_fault_fired: AtomicBool,
     current_pointer: String,
 }
 
@@ -2856,17 +2918,30 @@ impl PointerWriteThenErrorBackend {
             inner,
             armed: AtomicBool::new(false),
             fired: AtomicBool::new(false),
+            fail_next_pointer_read: AtomicBool::new(false),
+            read_fault_fired: AtomicBool::new(false),
             current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
         }
     }
 
     fn arm(&self) {
         self.fired.store(false, Ordering::SeqCst);
+        self.fail_next_pointer_read.store(false, Ordering::SeqCst);
+        self.read_fault_fired.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn arm_with_failed_readback(&self) {
+        self.arm();
+        self.fail_next_pointer_read.store(true, Ordering::SeqCst);
     }
 
     fn fault_fired(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
+    }
+
+    fn read_fault_fired(&self) -> bool {
+        self.read_fault_fired.load(Ordering::SeqCst)
     }
 }
 
@@ -2905,6 +2980,15 @@ impl GatedPointerWriteThenErrorBackend {
 #[async_trait]
 impl StorageBackend for PointerWriteThenErrorBackend {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        if path.ends_with(&self.current_pointer)
+            && self.fired.load(Ordering::SeqCst)
+            && self.fail_next_pointer_read.swap(false, Ordering::SeqCst)
+        {
+            self.read_fault_fired.store(true, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(
+                "injected reconciliation pointer read error",
+            ));
+        }
         self.inner.get(path).await
     }
 

@@ -18,6 +18,7 @@ use arrow::ipc::{Block, Footer, FooterArgs};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -150,8 +151,92 @@ fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn bloom_bits_hex(keys: &[&[u8]]) -> String {
+    let mut bits = [0_u8; 32];
+    for key in keys {
+        let digest = Sha256::digest(key);
+        for byte in digest.iter().take(3) {
+            let bit = usize::from(*byte) % (bits.len() * 8);
+            bits[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    hex::encode(bits)
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorScope {
+    tenant_id: String,
+    workspace_id: String,
+    domain: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorStateRef {
+    state_id: String,
+    logical_sequence: u64,
+    checksum_sha256: String,
+    index_checksum_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorTxRef {
+    tx_id: String,
+    sequence: u64,
+    checksum_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorSegmentRef {
+    segment_id: String,
+    level: String,
+    logical_sequence: u64,
+    checksum_sha256: String,
+    index_checksum_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorManifest {
+    format_version: u32,
+    implementation: String,
+    scope: MirrorScope,
+    manifest_id: String,
+    logical_sequence: u64,
+    base_manifest_id: Option<String>,
+    writer_epoch: u64,
+    base_state: Option<MirrorStateRef>,
+    anchor_state: Option<MirrorStateRef>,
+    tx_refs: Vec<MirrorTxRef>,
+    state_checksum_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorTransaction {
+    implementation: String,
+    scope: MirrorScope,
+    tx_id: String,
+    base_manifest_id: Option<String>,
+    sequence: u64,
+    writer_epoch: u64,
+    request_id: Option<String>,
+    l0_segment: MirrorSegmentRef,
+}
+
 fn reseal_envelope(value: &mut Value) -> Bytes {
-    let payload = serde_json::to_vec(&value["payload"]).expect("payload bytes");
+    let artifact_type = value["artifact_type"].as_str().expect("artifact type");
+    let payload = if artifact_type == "control-mvp-manifest" {
+        serde_json::to_vec(
+            &serde_json::from_value::<MirrorManifest>(value["payload"].clone())
+                .expect("manifest payload"),
+        )
+        .expect("manifest payload bytes")
+    } else {
+        assert_eq!(artifact_type, "control-mvp-tx", "test envelope type");
+        serde_json::to_vec(
+            &serde_json::from_value::<MirrorTransaction>(value["payload"].clone())
+                .expect("transaction payload"),
+        )
+        .expect("transaction payload bytes")
+    };
     value["checksum_sha256"] = Value::String(sha256(&payload));
     Bytes::from(serde_json::to_vec(value).expect("sealed envelope"))
 }
@@ -166,6 +251,7 @@ async fn overwrite(storage: &ScopedStorage, path: &str, bytes: Bytes) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn install_malformed_l1(
     storage: &ScopedStorage,
     store: &ControlMvpStateStore,
@@ -173,6 +259,8 @@ async fn install_malformed_l1(
     selected_manifest_id: &str,
     malformed: Vec<u8>,
     row_count: usize,
+    index_keys: &[&[u8]],
+    state_checksum_sha256: Option<&str>,
 ) {
     let paths = store.paths();
     let index_path = paths.segment_index(state_id);
@@ -181,6 +269,17 @@ async fn install_malformed_l1(
             .expect("state index JSON");
     index["segmentChecksumSha256"] = Value::String(sha256(&malformed));
     index["rowCount"] = Value::from(row_count);
+    let min_key = index_keys.iter().copied().min();
+    let max_key = index_keys.iter().copied().max();
+    index["minKeyHex"] = min_key.map_or(Value::Null, |key| Value::String(hex::encode(key)));
+    index["maxKeyHex"] = max_key.map_or(Value::Null, |key| Value::String(hex::encode(key)));
+    index["minKeyUtf8"] = min_key
+        .and_then(|key| std::str::from_utf8(key).ok())
+        .map_or(Value::Null, |key| Value::String(key.to_string()));
+    index["maxKeyUtf8"] = max_key
+        .and_then(|key| std::str::from_utf8(key).ok())
+        .map_or(Value::Null, |key| Value::String(key.to_string()));
+    index["bloomBitsHex"] = Value::String(bloom_bits_hex(index_keys));
     index["recordBatchOffsets"] = Value::Array(
         footer_blocks(&malformed)
             .into_iter()
@@ -200,6 +299,12 @@ async fn install_malformed_l1(
     manifest["payload"]["base_state"]["checksum_sha256"] = Value::String(sha256(&malformed));
     manifest["payload"]["base_state"]["index_checksum_sha256"] =
         Value::String(sha256(&index_bytes));
+    if let Some(state_checksum_sha256) = state_checksum_sha256 {
+        *manifest["payload"]
+            .get_mut("state_checksum_sha256")
+            .expect("manifest state checksum field") =
+            Value::String(state_checksum_sha256.to_string());
+    }
     let manifest_bytes = reseal_envelope(&mut manifest);
 
     let pointer_path = paths.current_pointer();
@@ -224,13 +329,14 @@ async fn install_malformed_l1(
     .await;
 }
 
-async fn assert_typed_read_error(store: ControlMvpStateStore) {
+async fn assert_typed_read_error(store: ControlMvpStateStore) -> CatalogError {
     let joined = tokio::spawn(async move { store.get(b"catalogs/seed").await }).await;
     let result = joined.expect("malformed segment read must not panic");
     assert!(
         matches!(result, Err(CatalogError::InvariantViolation { .. })),
         "malformed checksum-coherent segment returned {result:?}"
     );
+    result.expect_err("malformed segment must fail")
 }
 
 async fn anchored_store() -> (ScopedStorage, ControlMvpStateStore, String, String) {
@@ -434,6 +540,10 @@ async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
         DuplicateKv,
         DuplicateOutbox,
         NonContiguousOrdinals,
+        NullOutboxOrigin,
+        ZeroOutboxOrigin,
+        FutureOutboxOrigin,
+        InvalidOutboxGeneration,
         MissingSchema,
         NegativeBodyLength,
         HugeBodyLength,
@@ -459,6 +569,10 @@ async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
         Case::DuplicateKv,
         Case::DuplicateOutbox,
         Case::NonContiguousOrdinals,
+        Case::NullOutboxOrigin,
+        Case::ZeroOutboxOrigin,
+        Case::FutureOutboxOrigin,
+        Case::InvalidOutboxGeneration,
         Case::MissingSchema,
         Case::NegativeBodyLength,
         Case::HugeBodyLength,
@@ -558,6 +672,74 @@ async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
                     "non-contiguous ordinals",
                 )
             }
+            Case::NullOutboxOrigin => {
+                let batch = segment_batch(
+                    vec![1],
+                    vec![b"outbox"],
+                    vec![Some(b"payload")],
+                    vec![0],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![None],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "null L1 outbox origin",
+                )
+            }
+            Case::ZeroOutboxOrigin => {
+                let batch = segment_batch(
+                    vec![1],
+                    vec![b"outbox"],
+                    vec![Some(b"payload")],
+                    vec![0],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![Some(0)],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "zero L1 outbox origin",
+                )
+            }
+            Case::FutureOutboxOrigin => {
+                let batch = segment_batch(
+                    vec![1],
+                    vec![b"outbox"],
+                    vec![Some(b"payload")],
+                    vec![0],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![Some(2)],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "future L1 outbox origin",
+                )
+            }
+            Case::InvalidOutboxGeneration => {
+                let batch = segment_batch(
+                    vec![1],
+                    vec![b"outbox"],
+                    vec![Some(b"payload")],
+                    vec![1],
+                    vec![false],
+                    vec![1],
+                    vec![0],
+                    vec![Some(1)],
+                );
+                (
+                    arrow_file(segment_schema().as_ref(), &[batch]),
+                    1,
+                    "nonzero L1 outbox generation",
+                )
+            }
             Case::MissingSchema => {
                 let valid = arrow_file(segment_schema().as_ref(), &[valid_batch()]);
                 (footer_without_schema(&valid), 1, "missing schema")
@@ -587,6 +769,59 @@ async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
                 )
             }
         };
+        let outbox_origin = match case {
+            Case::NullOutboxOrigin => Some(None),
+            Case::ZeroOutboxOrigin => Some(Some(0)),
+            Case::FutureOutboxOrigin => Some(Some(2)),
+            Case::InvalidOutboxGeneration => Some(Some(1)),
+            _ => None,
+        };
+        let state_checksum_sha256 = outbox_origin.map(|origin_sequence| {
+            #[derive(Serialize)]
+            struct DigestEntry {
+                key: Vec<u8>,
+                generation: u64,
+                value: Option<Vec<u8>>,
+            }
+            #[derive(Serialize)]
+            struct DigestOutbox {
+                record_id: String,
+                payload: Vec<u8>,
+                origin_sequence: Option<u64>,
+            }
+            #[derive(Serialize)]
+            struct ReplayDigest {
+                logical_sequence: u64,
+                entries: Vec<DigestEntry>,
+                outbox: Vec<DigestOutbox>,
+            }
+            let digest = ReplayDigest {
+                logical_sequence: 2,
+                entries: vec![DigestEntry {
+                    key: b"catalogs/successor".to_vec(),
+                    generation: 2,
+                    value: Some(b"successor".to_vec()),
+                }],
+                outbox: vec![DigestOutbox {
+                    record_id: "outbox".to_string(),
+                    payload: b"payload".to_vec(),
+                    origin_sequence,
+                }],
+            };
+            sha256(&serde_json::to_vec(&digest).expect("logical state digest"))
+        });
+        let index_keys: Vec<&[u8]> = match case {
+            Case::WrongSchema
+            | Case::UnknownKind
+            | Case::DuplicateOutbox
+            | Case::NonContiguousOrdinals
+            | Case::NullOutboxOrigin
+            | Case::ZeroOutboxOrigin
+            | Case::FutureOutboxOrigin
+            | Case::InvalidOutboxGeneration => Vec::new(),
+            Case::DuplicateKv => vec![b"catalogs/seed", b"catalogs/seed"],
+            _ => vec![b"catalogs/seed"],
+        };
         install_malformed_l1(
             &storage,
             &store,
@@ -594,9 +829,17 @@ async fn checksum_coherent_malformed_arrow_cases_fail_closed_without_panics() {
             &selected_manifest_id,
             malformed,
             row_count,
+            &index_keys,
+            state_checksum_sha256.as_deref(),
         )
         .await;
-        assert_typed_read_error(store).await;
+        let error = assert_typed_read_error(store).await;
+        if outbox_origin.is_some() {
+            assert!(
+                error.to_string().contains("origin"),
+                "null L1 origin failed for the wrong reason: {error:?}"
+            );
+        }
         eprintln!("verified malformed Arrow case: {label}");
     }
 }
@@ -694,7 +937,7 @@ async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
     )
     .await;
 
-    assert_typed_read_error(store).await;
+    let _ = assert_typed_read_error(store).await;
 }
 
 #[tokio::test]

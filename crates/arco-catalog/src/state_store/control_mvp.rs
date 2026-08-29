@@ -1160,16 +1160,22 @@ fn validate_control_mvp_authority_format(
 ) -> Result<()> {
     let canonical_manifest = paths.manifest_object(source.manifest_id());
     let checkpoint_prefix = format!("{}/checkpoints/", paths.base_prefix());
-    let canonical_checkpoint = source
-        .checkpoint_path()
-        .is_none_or(|path| path.starts_with(&checkpoint_prefix));
+    let canonical_checkpoint = source.checkpoint_path().is_none_or(|path| {
+        path.strip_prefix(&checkpoint_prefix)
+            .and_then(|suffix| suffix.strip_suffix(".json"))
+            .is_some_and(|checkpoint_id| {
+                super::validate_scope_component(checkpoint_id, "checkpoint_id").is_ok()
+                    && paths.checkpoint_object(checkpoint_id) == path
+            })
+    });
     if source.manifest_path() == canonical_manifest && canonical_checkpoint {
         return Ok(());
     }
     Err(CatalogError::UnsupportedAuthorityFormat {
         message: format!(
-            "the control/v1 hard cut rejects authority reference {}; old layouts are not migrated; recover from a retained control/v1 authority source",
-            source.manifest_path()
+            "the control/v1 hard cut rejects authority reference manifest {} checkpoint {:?}; old layouts are not migrated; recover from a retained control/v1 authority source",
+            source.manifest_path(),
+            source.checkpoint_path(),
         ),
     })
 }
@@ -3038,6 +3044,9 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
                 "Control MVP pointer CAS reported success but restore is not visible",
             )),
             (Err(error), Ok(RestoreParticipantInspection::Ready)) => Err(error.into()),
+            (Err(write_error), Err(inspection_error)) => Err(ambiguous_authority_outcome(format!(
+                "control MVP restore pointer write could not be reconciled after storage failure: {write_error}; reconciliation inspection failed: {inspection_error}"
+            ))),
             (_, Err(error)) => Err(error),
         }
     }
@@ -4137,6 +4146,17 @@ fn state_object_from_segment_rows(
                 });
             }
             SEGMENT_RECORD_OUTBOX => {
+                let origin_sequence = row.origin_sequence.ok_or_else(|| {
+                    invariant_violation("control MVP L1 outbox row is missing origin sequence")
+                })?;
+                if row.generation != 0
+                    || origin_sequence == 0
+                    || origin_sequence > reference.logical_sequence
+                {
+                    return Err(invariant_violation(
+                        "control MVP L1 outbox row origin metadata is invalid",
+                    ));
+                }
                 let record_id = String::from_utf8(row.key).map_err(|error| {
                     segment_serialization_error("decode L1 outbox record id", error)
                 })?;
@@ -4148,7 +4168,7 @@ fn state_object_from_segment_rows(
                     ControlMvpOutboxStateEntry {
                         record_id,
                         payload,
-                        origin_sequence: row.origin_sequence,
+                        origin_sequence: Some(origin_sequence),
                     },
                 ));
             }

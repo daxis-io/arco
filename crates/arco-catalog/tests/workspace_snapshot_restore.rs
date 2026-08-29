@@ -7274,8 +7274,9 @@ async fn workspace_restore_recovery_uses_the_planned_checkpoint_interval() {
     );
 }
 
-#[tokio::test]
-async fn workspace_recovery_rejects_a_seeded_old_layout_authority_without_writes() {
+async fn assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(
+    checkpoint_path_only: bool,
+) {
     let memory = Arc::new(MemoryBackend::new());
     let inner: Arc<dyn StorageBackend> = memory.clone();
     let backend = Arc::new(FailNextDomainPointerBackend::new(inner, "catalog"));
@@ -7341,12 +7342,18 @@ async fn workspace_recovery_rejects_a_seeded_old_layout_authority_without_writes
         .next()
         .expect("checkpoint file")
         .to_string();
-    plan["source"]["manifest_path"] = serde_json::Value::String(format!(
-        "state-store/control-mvp/catalog/manifests/{manifest_id}.json"
-    ));
-    plan["source"]["checkpoint_path"] = serde_json::Value::String(format!(
-        "state-store/control-mvp/catalog/checkpoints/{checkpoint_name}"
-    ));
+    if checkpoint_path_only {
+        plan["source"]["checkpoint_path"] = serde_json::Value::String(format!(
+            "control/v1/domains/catalog/checkpoints/nested/{checkpoint_name}"
+        ));
+    } else {
+        plan["source"]["manifest_path"] = serde_json::Value::String(format!(
+            "state-store/control-mvp/catalog/manifests/{manifest_id}.json"
+        ));
+        plan["source"]["checkpoint_path"] = serde_json::Value::String(format!(
+            "state-store/control-mvp/catalog/checkpoints/{checkpoint_name}"
+        ));
+    }
     let plan_sha = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(
@@ -7391,6 +7398,13 @@ async fn workspace_recovery_rejects_a_seeded_old_layout_authority_without_writes
     assert!(message.contains("old layouts are not migrated"));
     assert!(message.contains("retained control/v1 authority source"));
     assert_eq!(before, restore_and_state_bytes(memory.as_ref()).await);
+}
+
+#[tokio::test]
+async fn workspace_recovery_rejects_seeded_noncanonical_authority_paths_without_writes() {
+    assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(false)
+        .await;
+    assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(true).await;
 }
 
 /// R6: in-flight restore attempts written by older revisions embed version 1

@@ -34,16 +34,21 @@ This ADR fixes the following invariants.
    layouts are neither read nor migrated by this release.
 3. Transaction envelopes, manifests, checkpoints, and the mutable head are
    small JSON documents. Sorted key/value changes and consolidated state are
-   Arrow IPC segments with checksummed JSON indexes. Parquet is projection
-   only.
+   Arrow IPC segments with checksummed JSON indexes. Before Arrow decoding,
+   the kernel validates the checksum-bound footer, exact schema, supported
+   metadata version and feature set, record-batch count, block arithmetic,
+   stored offsets, and index bounds. Parquet is projection only.
 4. A commit writes immutable transaction and segment artifacts, writes an
    immutable candidate manifest, and conditionally replaces the head. The
    state-store kernel performs one CAS and returns a typed conflict to a loser;
    the production API retry layer must re-read authority, re-evaluate every
    precondition, and retry with jitter within the 1.5-second budget. Exhaustion
-   is a retryable authority conflict, never a partial success. A transport
-   error after the head write is reconciled by comparing the exact canonical
-   pointer bytes before the caller is told the outcome is unknown.
+   is a retryable authority conflict, never a partial success. Every head
+   writer reconciles transport ambiguity: normal commits accept exact pointer
+   bytes or an exact transaction reference in newer visible lineage, restore
+   publication re-inspects the deterministic candidate, and writer-authority
+   claims adopt only exact claimed bytes. An outcome that still cannot be
+   proven committed or uncommitted returns `AmbiguousAuthorityOutcome`.
 5. A committed mutation returns `CommitOutcome { state_token,
    projection_intents }`. Post-commit delivery is best effort and cannot roll
    back or change the successful authority result.
@@ -57,6 +62,16 @@ This ADR fixes the following invariants.
    public gRPC listener are removed at the catalog cutover. Flow may retain
    deterministic folding, but that operation is a projection and is not named
    or treated as logical catalog compaction.
+9. A required L1 replay anchor is rendered before any candidate transaction,
+   segment, manifest, or head object is published. Row, byte, or index overflow
+   returns `MaintenanceBackpressure`; the kernel does not skip the anchor or
+   permit an unbounded replay suffix.
+10. Current restore plans persist the positive checkpoint interval used to
+    decide and render their replay anchor. Inspection and application use that
+    durable value, not the receiving process's current configuration. Retired
+    v1/v2 plans remain supersession-only, and a non-`control/v1` authority
+    reference returns `UnsupportedAuthorityFormat` with hard-cut recovery
+    direction.
 
 ### Layout
 
@@ -86,6 +101,9 @@ Arrow segments. It does not yet use index ranges and Bloom data to avoid full
 segment reads for point and prefix lookups. Index-pruned reads, paginated scans,
 the API-level 1.5-second CAS retry loop, retention/GC, and real-S3 performance
 qualification are cutover requirements rather than claims of this revision.
+JSON artifact byte caps, consolidation, and retention/GC also remain cutover
+work; typed L1 backpressure is the bounded fail-closed behavior at the current
+capacity ceiling.
 
 ### Cutover and qualification
 
@@ -94,6 +112,9 @@ compactor remain the current catalog runtime until native catalog routes are
 explicitly switched to the new root. Cutover is forbidden until real-S3
 qualification demonstrates conditional-put semantics and the stated latency,
 throughput, corruption, recovery, retention, and maintenance gates.
+Provider-internal conditional retries and production HTTP error-envelope
+mapping for the new kernel errors must be qualified during route cutover; they
+are not established by this repository-only remediation.
 
 If a single metastore root cannot sustain 25 qualified mutations per second,
 or maintenance cannot remain ahead of writes, implementation stops for a new

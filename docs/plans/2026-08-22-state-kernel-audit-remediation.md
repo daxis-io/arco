@@ -30,7 +30,7 @@
 - Modify: `crates/arco-catalog/tests/workspace_snapshot_restore.rs`
 - Modify: `crates/arco-catalog/src/state_store/control_mvp.rs`
 
-1. Add runtime tests that pass the literal checked-in old-layout v1 and v2 plans through `inspect_restore` and workspace recovery and assert a no-write terminal result.
+1. Add `literal_old_layout_restore_plans_are_superseded_without_writes` for direct participant inspection/application and `workspace_restore_recovery_migrates_v1_and_v2_participant_plans_and_replans_them` for the actual v1/v2 workspace recovery path; require supersession followed by a current-version replan.
 2. Run them and confirm current-path validation rejects the old fixtures.
 3. Advance the current restore-plan version. Validate legacy plans using only their safe scope/identity/source invariants before returning `Superseded`; never apply or migrate them.
 4. Re-run focused restore and workspace recovery suites.
@@ -75,9 +75,9 @@
 - Modify: `crates/arco-catalog/src/state_store/control_mvp.rs`
 
 1. Add a normal-commit fault test where the head write succeeds and the transport returns an error; require readback reconciliation to return the committed outcome.
-2. Add coherently checksum-bound malformed Arrow/schema tests and failure injection at transaction, L0, L0 index, L1, L1 index, manifest, and head writes.
+2. Add the checksum-coherent malformed-segment suite in `state_store_segment_contract.rs` (`checksum_coherent_malformed_arrow_cases_fail_closed_without_panics` and `checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic`) plus failure injection at transaction, L0, L0 index, L1, L1 index, manifest, and head writes.
 3. Confirm each regression fails for the intended reason.
-4. Add exact schema/column/nullability validation, bounded row-count checks, and normal-head readback reconciliation.
+4. Add checksum-bound footer/schema/feature/block preflight before Arrow decoding, bounded row-count checks, and normal-head exact-byte plus visible-lineage reconciliation.
 5. Re-run every focused control/restore suite.
 
 ### Task 7: Align ADR claims and verify the complete remediation

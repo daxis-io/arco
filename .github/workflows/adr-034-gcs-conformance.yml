@@ -54,6 +54,14 @@ jobs:
         with:
           cache-targets: "false"
 
+      - name: Verify GCS conformance test discovery
+        run: |
+          discovered_tests="$(
+            cargo test --locked -p arco-storage-gcs --test live_conformance -- --ignored --list |
+              grep -Fxc 'gcs_backend_satisfies_storage_conformance: test'
+          )"
+          test "$discovered_tests" -eq 1
+
       # Secrets and vars are passed through env: rather than interpolated into
       # the script text, so their values never appear in the generated shell
       # command.
@@ -91,8 +99,8 @@ jobs:
         env:
           ARCO_TEST_GCS_BUCKET: ${{ vars.ARCO_TEST_GCS_BUCKET }}
         run: |
-          cargo test --locked -p arco-core --test storage_backend_conformance \
-            gcs_backend_satisfies_storage_conformance -- --ignored --nocapture
+          cargo test --locked -p arco-storage-gcs --test live_conformance \
+            gcs_backend_satisfies_storage_conformance -- --ignored --exact --nocapture
 
       # This workflow only runs on schedule and workflow_dispatch; on both
       # triggers a missing configuration is an evidence-integrity failure, not

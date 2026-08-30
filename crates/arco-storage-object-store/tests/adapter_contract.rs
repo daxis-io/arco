@@ -12,7 +12,7 @@ use std::io;
 use std::sync::Arc;
 
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
-use arco_storage_object_store::ObjectStoreBackend;
+use arco_storage_object_store::{ObjectStoreBackend, no_automatic_request_retries};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -100,6 +100,11 @@ fn ordered_memory_adapter() -> ObjectStoreBackend {
     ObjectStoreBackend::new_with_ordered_listing(store, None)
 }
 
+#[test]
+fn provider_request_policy_does_not_retry_ambiguous_writes() {
+    assert_eq!(no_automatic_request_retries().max_retries, 0);
+}
+
 #[tokio::test]
 async fn translates_create_compare_and_swap_range_and_delete() {
     let backend = ordered_memory_adapter();
@@ -164,6 +169,32 @@ async fn translates_create_compare_and_swap_range_and_delete() {
     backend.delete("authority/head.json").await.unwrap();
     backend.delete("authority/head.json").await.unwrap();
     assert!(backend.head("authority/head.json").await.unwrap().is_none());
+
+    let recreated = backend
+        .put(
+            "authority/head.json",
+            Bytes::from_static(b"version-three"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("recreate");
+    let WriteResult::Success { version: recreated } = recreated else {
+        panic!("recreate must succeed");
+    };
+    assert_ne!(second, recreated);
+
+    let pre_delete_token = backend
+        .put(
+            "authority/head.json",
+            Bytes::from_static(b"stale-after-recreate"),
+            WritePrecondition::MatchesVersion(second),
+        )
+        .await
+        .expect("stale post-recreate update is a typed result");
+    assert!(matches!(
+        pre_delete_token,
+        WriteResult::PreconditionFailed { current_version } if current_version == recreated
+    ));
 }
 
 #[tokio::test]

@@ -11,6 +11,27 @@ const STORAGE_CRATES: [&str; 5] = [
     "crates/arco-storage",
 ];
 
+const LIVE_PROVIDER_WORKFLOWS: [(&str, &str, &str, &str); 3] = [
+    (
+        ".github/workflows/s3-conformance.yml",
+        "arco-storage-s3",
+        "crates/arco-storage-s3/tests/live_conformance.rs",
+        "s3_backend_satisfies_storage_conformance",
+    ),
+    (
+        ".github/workflows/adr-034-gcs-conformance.yml",
+        "arco-storage-gcs",
+        "crates/arco-storage-gcs/tests/live_conformance.rs",
+        "gcs_backend_satisfies_storage_conformance",
+    ),
+    (
+        ".github/workflows/azure-conformance.yml",
+        "arco-storage-azure",
+        "crates/arco-storage-azure/tests/live_conformance.rs",
+        "azure_backend_satisfies_storage_conformance",
+    ),
+];
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -32,6 +53,14 @@ fn dependency_names(manifest: &Value) -> Vec<&str> {
         .into_iter()
         .flat_map(|dependencies| dependencies.keys().map(String::as_str))
         .collect()
+}
+
+fn normalized_whitespace(contents: &str) -> String {
+    contents
+        .split_whitespace()
+        .filter(|token| *token != "\\")
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
@@ -136,4 +165,74 @@ fn control_state_kernel_uses_the_narrow_authority_capability() {
             "{source} bypasses the narrow authority capability with `{forbidden}`"
         );
     }
+}
+
+#[test]
+fn live_provider_workflows_fail_closed_on_zero_test_discovery() {
+    let root = workspace_root();
+
+    for (workflow, package, test_source, test_name) in LIVE_PROVIDER_WORKFLOWS {
+        let workflow_contents =
+            fs::read_to_string(root.join(workflow)).expect("read live provider workflow");
+        let normalized = normalized_whitespace(&workflow_contents);
+        let list_command =
+            format!("cargo test --locked -p {package} --test live_conformance -- --ignored --list");
+        let run_command = format!(
+            "cargo test --locked -p {package} --test live_conformance {test_name} -- --ignored --exact --nocapture"
+        );
+        assert!(
+            normalized.contains(&list_command),
+            "{workflow} must enumerate the owning provider test target"
+        );
+        assert!(
+            normalized.contains(&format!("grep -Fxc '{test_name}: test'")),
+            "{workflow} must count the exact discovered test"
+        );
+        assert!(
+            normalized.contains("test \"$discovered_tests\" -eq 1"),
+            "{workflow} must fail unless exactly one ignored test is discovered"
+        );
+        assert!(
+            normalized.contains(&run_command),
+            "{workflow} must execute the exact owning provider test"
+        );
+
+        let test_contents =
+            fs::read_to_string(root.join(test_source)).expect("read live provider test source");
+        assert_eq!(
+            test_contents
+                .matches(&format!("async fn {test_name}()"))
+                .count(),
+            1,
+            "{test_source} must define exactly one {test_name}"
+        );
+        assert!(
+            test_contents.contains("#[ignore ="),
+            "{test_source} must keep live cloud access opt-in"
+        );
+    }
+}
+
+#[test]
+fn provider_builders_preserve_conditional_write_ambiguity() {
+    let root = workspace_root();
+
+    for source in [
+        "crates/arco-storage-s3/src/lib.rs",
+        "crates/arco-storage-gcs/src/lib.rs",
+        "crates/arco-storage-azure/src/lib.rs",
+    ] {
+        let contents = fs::read_to_string(root.join(source)).expect("read provider adapter");
+        assert!(
+            contents.contains(".with_retry(no_automatic_request_retries())"),
+            "{source} must not hide conditional-write transport ambiguity behind SDK retries"
+        );
+    }
+
+    let s3 = fs::read_to_string(root.join("crates/arco-storage-s3/src/lib.rs"))
+        .expect("read S3 provider adapter");
+    assert!(
+        s3.contains(".with_conditional_put(S3ConditionalPut::ETagMatch)"),
+        "S3 must explicitly enable native ETag conditional writes"
+    );
 }

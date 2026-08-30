@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{Error, Result};
-use arco_storage_object_store::ObjectStoreBackend;
+use arco_storage_object_store::{ObjectStoreBackend, no_automatic_request_retries};
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::DynObjectStore;
@@ -37,6 +37,7 @@ impl AzureStorageBackend {
         let azure = Arc::new(
             MicrosoftAzureBuilder::from_env()
                 .with_container_name(&container)
+                .with_retry(no_automatic_request_retries())
                 .build()
                 .map_err(|error| {
                     Error::storage_with_source(

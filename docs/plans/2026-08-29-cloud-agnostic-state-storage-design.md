@@ -88,6 +88,13 @@ local substitutes. S3, GCS, and Azure remain separately qualified by ignored,
 credentialed live tests and provider evidence. S3 remains the first GA target;
 the artifact format and state algorithm are not S3-specific.
 
+The provider builders disable upstream automatic request retries. This is
+intentionally broader than conditional writes because the upstream clients do
+not expose a separate retry policy for the authority write path. Callers own
+bounded retry, and head writers reconcile a surfaced transport error before
+claiming a conditional outcome. A future provider-internal retry mode requires
+separate ambiguity and recovery qualification before it can be enabled.
+
 ## Alternatives considered
 
 ### Extract the entire catalog state kernel immediately

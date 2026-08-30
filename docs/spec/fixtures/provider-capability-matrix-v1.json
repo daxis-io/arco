@@ -41,10 +41,10 @@
         "cas_semantics": "proven-safe"
       },
       "evidence": {
-        "conditional_create": ["crates/arco-core/tests/storage_backend_conformance.rs"],
-        "pointer_cas": ["crates/arco-core/tests/storage_backend_conformance.rs"],
-        "stable_version_token": ["crates/arco-core/tests/storage_backend_conformance.rs"],
-        "addressed_read_after_write": ["crates/arco-core/tests/storage_backend_conformance.rs"],
+        "conditional_create": ["crates/arco-storage-object-store/tests/adapter_contract.rs"],
+        "pointer_cas": ["crates/arco-storage-object-store/tests/adapter_contract.rs"],
+        "stable_version_token": ["crates/arco-storage-object-store/tests/adapter_contract.rs"],
+        "addressed_read_after_write": ["crates/arco-storage-object-store/tests/adapter_contract.rs"],
         "checksum_or_corruption_detection": ["object_store memory fixture has exact addressed reads"],
         "retry_timeout_policy": ["test-only backend does not perform network retries"]
       }

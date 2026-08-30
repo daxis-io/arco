@@ -116,9 +116,11 @@ compactor remain the current catalog runtime until native catalog routes are
 explicitly switched to the new root. Cutover is forbidden until real-S3
 qualification demonstrates conditional-put semantics and the stated latency,
 throughput, corruption, recovery, retention, and maintenance gates.
-Provider-internal conditional retries and production HTTP error-envelope
-mapping for the new kernel errors must be qualified during route cutover; they
-are not established by this repository-only remediation.
+The provider adapters disable upstream automatic request retries so ambiguous
+conditional-write transport failures reach the kernel's reconciliation path.
+Any future provider-internal conditional retry mode, plus production HTTP
+error-envelope mapping for the new kernel errors, must be qualified during
+route cutover; they are not established by this repository-only remediation.
 
 ### Storage ownership
 

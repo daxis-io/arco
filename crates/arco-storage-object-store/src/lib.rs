@@ -15,7 +15,21 @@ use futures::{StreamExt, TryStreamExt};
 use http::Method;
 use object_store::path::Path as ObjectStorePath;
 use object_store::signer::Signer as ObjectStoreSigner;
-use object_store::{DynObjectStore, PutMode, PutOptions, UpdateVersion};
+use object_store::{DynObjectStore, PutMode, PutOptions, RetryConfig, UpdateVersion};
+
+/// Returns an upstream request policy with automatic retries disabled.
+///
+/// Provider adapters use this policy so a response loss after a conditional
+/// write is surfaced to Arco as a transport error. The state kernel can then
+/// reconcile the authority object instead of receiving a retry-derived
+/// precondition result that hides whether the original write landed.
+#[must_use]
+pub fn no_automatic_request_retries() -> RetryConfig {
+    RetryConfig {
+        max_retries: 0,
+        ..RetryConfig::default()
+    }
+}
 
 /// Provider-neutral adapter from an [`object_store::ObjectStore`] to Arco's
 /// storage interface.

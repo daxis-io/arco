@@ -14,16 +14,20 @@ gRPC surface for typed calls into the service.
 
 The `ArcoStateStore` work proved a smaller authority boundary: immutable
 objects plus a conditional object-store head update can publish logical state
-without making a projection part of the transaction. Arco's GA target is AWS,
-S3, API Gateway, and Lambda, where a resident writer or synchronous compactor
-would defeat scale-to-zero operation.
+without making a projection part of the transaction. Arco's first GA target is
+AWS, S3, API Gateway, and Lambda, where a resident writer or synchronous
+compactor would defeat scale-to-zero operation. The authority format and state
+transition algorithm require conditional object writes and opaque version
+tokens; they do not require an S3-specific artifact or transition.
 
 ## Decision
 
-Arco adopts an Arco-owned S3 compare-and-swap state store as the GA logical
-authority. A successful conditional replacement of an authority root's
-`head/current.json` is the commit point. The resulting opaque `StateToken`
-identifies the committed logical sequence and immutable authority manifest.
+Arco adopts an Arco-owned compare-and-swap state store as the logical authority,
+with S3 as the first GA-qualified adapter. A successful conditional replacement
+of an authority root's `head/current.json` is the commit point. The resulting
+opaque `StateToken` identifies the committed logical sequence and immutable
+authority manifest. Provider selection is deployment composition and is not
+part of `StateToken`, `control/v1`, or transaction identity.
 
 This ADR fixes the following invariants.
 
@@ -88,8 +92,8 @@ control/v1/domains/{domain}/
   checkpoints/{id}.json
 ```
 
-The head is the only mutable object and may only be written with an S3
-conditional precondition. Segment rows carry sorted binary key/value data,
+The head is the only mutable object and may only be written with the selected
+provider's exact-version conditional precondition. Segment rows carry sorted binary key/value data,
 generation, tombstone, logical sequence, and the logical ordinal needed for
 ordered records. Transaction JSON contains metadata and the immutable L0
 reference; mutation and outbox payloads live only in the Arrow segment.
@@ -116,6 +120,23 @@ Provider-internal conditional retries and production HTTP error-envelope
 mapping for the new kernel errors must be qualified during route cutover; they
 are not established by this repository-only remediation.
 
+### Storage ownership
+
+The `control/v1` kernel depends on a narrow `ScopedAuthorityStore` capability:
+scope-relative reads, metadata reads, create-if-absent writes, and exact-version
+replacement. It cannot list, delete, sign, or write unconditionally through
+that capability. `arco-core` owns the provider-neutral `StorageBackend`
+contract and deterministic `MemoryBackend`; it does not construct cloud
+clients or select a provider.
+
+`arco-storage-object-store` owns common protocol translation. Provider-specific
+builders, credential discovery, capability decisions, and credentialed live
+conformance entry points are owned independently by `arco-storage-s3`,
+`arco-storage-gcs`, and `arco-storage-azure`. The `arco-storage` composition
+crate alone maps deployment bucket references to those adapters. Passing local
+or repository conformance does not promote any provider: S3, GCS, and Azure
+each require independent live evidence, and S3 remains the first GA target.
+
 If a single metastore root cannot sustain 25 qualified mutations per second,
 or maintenance cannot remain ahead of writes, implementation stops for a new
 ADR. It must not silently add DynamoDB, a resident writer, implicit sharding,
@@ -136,6 +157,7 @@ or another state-store dependency.
 - ADR-018 describes the pre-cutover synchronous catalog path. ADR-032's
   immutable-manifest/CAS primitive remains valid, while this ADR moves the GA
   catalog authority from Parquet snapshots to `ArcoStateStore` state.
-- Repository tests and emulators prove only local behavior. AWS promotion also
-  requires live S3, KMS, SQS, IAM, Access Grants, STS, and regional-recovery
-  evidence.
+- Repository tests and emulators prove only local behavior. Every provider
+  promotion requires its own live conditional-write and recovery evidence.
+  AWS promotion additionally requires live S3, KMS, SQS, IAM, Access Grants,
+  STS, and regional-recovery evidence.

@@ -58,7 +58,7 @@ provider-specific capability decisions, and live qualification test. The
 configuration and returns `Arc<dyn StorageBackend>`; runtime crates depend on
 that composition layer rather than teaching `arco-core` about provider schemes.
 
-The control-state kernel receives a private `ScopedAuthorityStore` view with
+The control-state kernel receives a narrow `ScopedAuthorityStore` view with
 only read, metadata, create-if-absent, and compare-and-swap operations. Listing,
 deletion, signed URLs, and unconditional overwrite are not exposed through that
 interface. Existing callers continue to construct it from `ScopedStorage`, so
@@ -117,7 +117,7 @@ them would multiply correctness and audit surfaces.
   `ScopedStorage` retain their existing public contracts.
 - Runtime construction changes from `ObjectStoreBackend::from_bucket` to the
   `arco-storage` composition interface.
-- Tests that need a generic in-memory or local `object_store` adapter import it
+- Tests that need a generic in-memory `object_store` adapter import it
   from `arco-storage-object-store`.
 - The catalog removes its unused direct `object_store` dependency.
 - ADR-043 is clarified to distinguish a provider-neutral `control/v1` format
@@ -135,4 +135,3 @@ them would multiply correctness and audit surfaces.
 - The control-state implementation uses only its scoped authority-storage
   interface.
 - Existing catalog state-store contracts and the workspace test gate pass.
-

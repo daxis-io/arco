@@ -78,6 +78,7 @@ no remaining P0, P1, or P2 findings in those ranges.
 The following remain explicitly outside this remediation:
 
 - live S3 conditional-write and ambiguous-response qualification;
+- independent live GCS and Azure conditional-write and recovery qualification;
 - provider-internal conditional retry behavior;
 - JSON artifact byte caps;
 - segment consolidation and retention/garbage collection;

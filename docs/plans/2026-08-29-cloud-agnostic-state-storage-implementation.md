@@ -37,7 +37,7 @@
 
 **Files:**
 - Create: `crates/arco-storage-object-store/src/lib.rs`
-- Create: `crates/arco-storage-object-store/tests/conformance.rs`
+- Create: `crates/arco-storage-object-store/tests/adapter_contract.rs`
 - Modify: `crates/arco-core/src/storage.rs`
 - Modify: `crates/arco-core/Cargo.toml`
 - Modify: `crates/arco-core/tests/storage_backend_conformance.rs`
@@ -50,8 +50,8 @@
 2. Run the new test and verify it fails because the adapter does not exist.
 3. Move the generic adapter and version-token/error translation into
    `arco-storage-object-store`; keep provider builders out of it.
-4. Remove the generic adapter and production `object_store`/`http` dependencies
-   from `arco-core`; retain memory conformance there.
+4. Remove the generic adapter and production `object_store` dependency from
+   `arco-core`; retain its independently used HTTP types and memory conformance.
 5. Run both core memory conformance and shared-adapter conformance tests.
 
 ### Task 3: Add independently owned provider adapters
@@ -144,4 +144,3 @@
 5. Address every P0/P1/P2 finding and repeat affected gates.
 6. Commit the implementation as small local commits. Do not push, open a pull
    request, deploy, access cloud credentials, or claim provider qualification.
-

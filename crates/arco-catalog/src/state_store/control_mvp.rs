@@ -76,8 +76,8 @@ use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use arco_core::ScopedStorage;
-use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::storage::WriteResult;
+use arco_core::{AuthorityWritePrecondition, ScopedAuthorityStore, ScopedStorage};
 use arrow::array::{
     Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, UInt8Array, UInt8Builder,
     UInt64Array, UInt64Builder,
@@ -139,7 +139,8 @@ const PRODUCTION_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
 /// Object-store-backed state-store MVP for validating control-manifest authority.
 #[derive(Clone)]
 pub struct ControlMvpStateStore {
-    storage: ScopedStorage,
+    storage: ScopedAuthorityStore,
+    binding_identity: StateStoreBindingIdentity,
     scope: StateScope,
     paths: ControlMvpPaths,
     checkpoint_interval: u64,
@@ -172,9 +173,11 @@ impl ControlMvpStateStore {
 
         let paths = ControlMvpPaths::new(scope.domain());
         ScopedStorage::validate_path(&paths.current_pointer())?;
+        let binding_identity = StateStoreBindingIdentity::from_scoped_storage(&storage);
 
         Ok(Self {
-            storage,
+            storage: ScopedAuthorityStore::new(storage),
+            binding_identity,
             scope,
             paths,
             checkpoint_interval: Self::DEFAULT_CHECKPOINT_INTERVAL,
@@ -264,7 +267,7 @@ impl ControlMvpStateStore {
     /// publish [`u64::MAX`] (which no later claim could supersede), and a CAS
     /// error when another writer moved the pointer concurrently.
     pub async fn claim_writer_authority(mut self) -> Result<Self> {
-        let pointer_meta = self.storage.head_raw(&self.paths.current_pointer()).await?;
+        let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
         let Some(pointer_meta) = pointer_meta else {
             return Err(validation_failed(
                 "cannot claim a control MVP writer epoch before the first commit",
@@ -285,10 +288,10 @@ impl ControlMvpStateStore {
         let claimed_bytes = encode_json(&claimed, "control MVP epoch-claim pointer")?;
         let pointer_write = self
             .storage
-            .put_raw(
+            .put(
                 &self.paths.current_pointer(),
                 claimed_bytes.clone(),
-                WritePrecondition::MatchesVersion(pointer_meta.version),
+                AuthorityWritePrecondition::MatchesVersion(pointer_meta.version),
             )
             .await;
         match pointer_write {
@@ -302,7 +305,7 @@ impl ControlMvpStateStore {
             Err(error) => {
                 if self
                     .storage
-                    .get_raw(&self.paths.current_pointer())
+                    .get(&self.paths.current_pointer())
                     .await
                     .is_ok_and(|current| current == claimed_bytes)
                 {
@@ -387,7 +390,7 @@ impl ControlMvpStateStore {
     }
 
     async fn load_current_base_state(&self) -> Result<ControlMvpBase> {
-        let pointer_meta = self.storage.head_raw(&self.paths.current_pointer()).await?;
+        let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
         let Some(pointer_meta) = pointer_meta else {
             return Ok(ControlMvpBase {
                 pointer_version: None,
@@ -415,8 +418,7 @@ impl ControlMvpStateStore {
     }
 
     async fn load_current_state(&self) -> Result<ReplayState> {
-        let Some(_pointer_meta) = self.storage.head_raw(&self.paths.current_pointer()).await?
-        else {
+        let Some(_pointer_meta) = self.storage.head(&self.paths.current_pointer()).await? else {
             return Ok(ReplayState::default());
         };
         let pointer = self.load_pointer().await?;
@@ -440,7 +442,7 @@ impl ControlMvpStateStore {
     }
 
     async fn load_pointer(&self) -> Result<ControlMvpPointer> {
-        let bytes = self.storage.get_raw(&self.paths.current_pointer()).await?;
+        let bytes = self.storage.get(&self.paths.current_pointer()).await?;
         let pointer: ControlMvpPointer = decode_json(&bytes, "control MVP pointer")?;
         pointer.validate(&self.scope)?;
         Ok(pointer)
@@ -469,7 +471,7 @@ impl ControlMvpStateStore {
     ) -> Result<ControlMvpManifest> {
         let bytes = self
             .storage
-            .get_raw(&self.paths.manifest_object(manifest_id))
+            .get(&self.paths.manifest_object(manifest_id))
             .await?;
         validate_raw_checksum(
             &bytes,
@@ -511,11 +513,11 @@ impl ControlMvpStateStore {
         };
         let bytes = self
             .storage
-            .get_raw(&self.paths.state_object(&reference.state_id))
+            .get(&self.paths.state_object(&reference.state_id))
             .await?;
         let index_bytes = self
             .storage
-            .get_raw(&self.paths.segment_index(&reference.state_id))
+            .get(&self.paths.segment_index(&reference.state_id))
             .await?;
         let rows = decode_segment_rows(&bytes, &index_bytes, &segment_reference, &self.scope)?;
         let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
@@ -595,11 +597,11 @@ impl ControlMvpStateStore {
     ) -> Result<Vec<ControlMvpSegmentRow>> {
         let bytes = self
             .storage
-            .get_raw(&self.paths.l0_segment_object(&reference.segment_id))
+            .get(&self.paths.l0_segment_object(&reference.segment_id))
             .await?;
         let index_bytes = self
             .storage
-            .get_raw(&self.paths.segment_index(&reference.segment_id))
+            .get(&self.paths.segment_index(&reference.segment_id))
             .await?;
         decode_segment_rows(&bytes, &index_bytes, reference, &self.scope)
     }
@@ -607,7 +609,7 @@ impl ControlMvpStateStore {
     async fn load_tx(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
         let bytes = self
             .storage
-            .get_raw(&self.paths.tx_object(&tx_ref.tx_id))
+            .get(&self.paths.tx_object(&tx_ref.tx_id))
             .await?;
         validate_raw_checksum(
             &bytes,
@@ -626,10 +628,10 @@ impl ControlMvpStateStore {
         let bytes = encode_envelope("control-mvp-checkpoint", checkpoint)?;
         match self
             .storage
-            .put_raw(
+            .put(
                 &self.paths.checkpoint_object(&checkpoint.checkpoint_id),
                 bytes,
-                WritePrecondition::DoesNotExist,
+                AuthorityWritePrecondition::DoesNotExist,
             )
             .await?
         {
@@ -643,7 +645,7 @@ impl ControlMvpStateStore {
     async fn load_checkpoint(&self, checkpoint_id: &str) -> Result<ControlMvpCheckpoint> {
         let bytes = self
             .storage
-            .get_raw(&self.paths.checkpoint_object(checkpoint_id))
+            .get(&self.paths.checkpoint_object(checkpoint_id))
             .await?;
         let checkpoint: ControlMvpCheckpoint =
             decode_envelope(&bytes, "control-mvp-checkpoint", "control MVP checkpoint")?;
@@ -729,7 +731,7 @@ impl ControlMvpStateStore {
         source: &PersistedAuthorityReference,
     ) -> Result<ControlMvpBase> {
         self.validate_restore_authority_format(source)?;
-        let manifest_bytes = self.storage.get_raw(source.manifest_path()).await?;
+        let manifest_bytes = self.storage.get(source.manifest_path()).await?;
         if prefixed_sha256(&manifest_bytes) != source.manifest_sha256() {
             return Err(invariant_violation(
                 "Control MVP restore source manifest checksum mismatch",
@@ -763,11 +765,11 @@ impl ControlMvpStateStore {
         source: &PersistedAuthorityReference,
     ) -> Result<StableRestoreBase> {
         for _ in 0..4 {
-            let before = self.storage.head_raw(&self.paths.current_pointer()).await?;
+            let before = self.storage.head(&self.paths.current_pointer()).await?;
             let Some(before) = before else {
                 if self
                     .storage
-                    .head_raw(&self.paths.current_pointer())
+                    .head(&self.paths.current_pointer())
                     .await?
                     .is_some()
                 {
@@ -789,8 +791,8 @@ impl ControlMvpStateStore {
                     pointer_bytes: Bytes::from_static(EMPTY_CURRENT_BASE_MARKER),
                 });
             };
-            let pointer_bytes = self.storage.get_raw(&self.paths.current_pointer()).await?;
-            let Some(after) = self.storage.head_raw(&self.paths.current_pointer()).await? else {
+            let pointer_bytes = self.storage.get(&self.paths.current_pointer()).await?;
+            let Some(after) = self.storage.head(&self.paths.current_pointer()).await? else {
                 continue;
             };
             if before.version != after.version {
@@ -1890,7 +1892,7 @@ impl ControlMvpRestoreParticipant {
         let manifest_bytes = self
             .store
             .storage
-            .get_raw(&plan.candidate_manifest_path)
+            .get(&plan.candidate_manifest_path)
             .await?;
         if prefixed_sha256(&manifest_bytes) != plan.candidate_manifest_sha256 {
             return Err(invariant_violation(
@@ -2451,8 +2453,8 @@ impl ControlMvpTxn {
         };
         let pointer_bytes = encode_json(&pointer, "control MVP pointer")?;
         let precondition = self.base.pointer_version.map_or(
-            WritePrecondition::DoesNotExist,
-            WritePrecondition::MatchesVersion,
+            AuthorityWritePrecondition::DoesNotExist,
+            AuthorityWritePrecondition::MatchesVersion,
         );
 
         // Candidate replay, required-anchor rendering, manifest encoding, and
@@ -2494,7 +2496,7 @@ impl ControlMvpTxn {
         let pointer_write = self
             .store
             .storage
-            .put_raw(
+            .put(
                 &self.store.paths.current_pointer(),
                 pointer_bytes.clone(),
                 precondition,
@@ -2510,7 +2512,7 @@ impl ControlMvpTxn {
                 let exact_pointer_match = self
                     .store
                     .storage
-                    .get_raw(&self.store.paths.current_pointer())
+                    .get(&self.store.paths.current_pointer())
                     .await
                     .is_ok_and(|current| current == pointer_bytes);
                 if exact_pointer_match {
@@ -2694,7 +2696,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             ));
         }
         let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
-        let bytes = self.storage.get_raw(&manifest_path).await?;
+        let bytes = self.storage.get(&manifest_path).await?;
         let manifest: ControlMvpManifest =
             decode_envelope(&bytes, "control-mvp-manifest", "control MVP manifest")?;
         manifest.validate(&self.scope, token.authority_manifest_id())?;
@@ -2733,7 +2735,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             ));
         }
         let checkpoint_path = self.paths.checkpoint_object(token.checkpoint_id());
-        let checkpoint_bytes = self.storage.get_raw(&checkpoint_path).await?;
+        let checkpoint_bytes = self.storage.get(&checkpoint_path).await?;
         let checkpoint: ControlMvpCheckpoint = decode_envelope(
             &checkpoint_bytes,
             "control-mvp-checkpoint",
@@ -2742,7 +2744,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         checkpoint.validate(&self.scope, token.checkpoint_id())?;
 
         let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
-        let manifest_bytes = self.storage.get_raw(&manifest_path).await?;
+        let manifest_bytes = self.storage.get(&manifest_path).await?;
         validate_raw_checksum(
             &manifest_bytes,
             Some(&checkpoint.manifest_checksum_sha256),
@@ -2802,7 +2804,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "persisted authority manifest path is not canonical for this store",
             ));
         }
-        let manifest_bytes = self.storage.get_raw(&manifest_path).await?;
+        let manifest_bytes = self.storage.get(&manifest_path).await?;
         if prefixed_sha256(&manifest_bytes) != reference.manifest_sha256() {
             return Err(invariant_violation(
                 "persisted authority manifest checksum mismatch",
@@ -2847,7 +2849,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                         "persisted checkpoint path is not canonical for this store",
                     ));
                 }
-                let checkpoint_bytes = self.storage.get_raw(checkpoint_path).await?;
+                let checkpoint_bytes = self.storage.get(checkpoint_path).await?;
                 if prefixed_sha256(&checkpoint_bytes) != reference.checkpoint_sha256().unwrap_or("")
                 {
                     return Err(invariant_violation(
@@ -2886,7 +2888,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
     }
 
     fn restore_binding_identity(&self) -> StateStoreBindingIdentity {
-        StateStoreBindingIdentity::from_scoped_storage(&self.store.storage)
+        self.store.binding_identity.clone()
     }
 
     async fn plan_restore(
@@ -3016,17 +3018,19 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         self.write_restore_immutable_artifacts(plan, &rendered)
             .await?;
         let pointer_precondition = match plan.current_base_kind {
-            ControlMvpRestoreCurrentBaseKind::Empty => WritePrecondition::DoesNotExist,
-            ControlMvpRestoreCurrentBaseKind::Pointer => WritePrecondition::MatchesVersion(
-                plan.base_pointer_version
-                    .clone()
-                    .ok_or_else(|| validation_failed("restore base pointer version missing"))?,
-            ),
+            ControlMvpRestoreCurrentBaseKind::Empty => AuthorityWritePrecondition::DoesNotExist,
+            ControlMvpRestoreCurrentBaseKind::Pointer => {
+                AuthorityWritePrecondition::MatchesVersion(
+                    plan.base_pointer_version
+                        .clone()
+                        .ok_or_else(|| validation_failed("restore base pointer version missing"))?,
+                )
+            }
         };
         let pointer_write = self
             .store
             .storage
-            .put_raw(
+            .put(
                 &self.store.paths.current_pointer(),
                 rendered.pointer_bytes,
                 pointer_precondition,
@@ -3055,9 +3059,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
 #[async_trait]
 impl ArcoStateStore for ControlMvpStateStore {
     fn restore_binding_identity(&self) -> Option<StateStoreBindingIdentity> {
-        Some(StateStoreBindingIdentity::from_scoped_storage(
-            &self.storage,
-        ))
+        Some(self.binding_identity.clone())
     }
 
     async fn begin_txn(&self, opts: TxnOptions) -> Result<Box<dyn ArcoStateTxn>> {
@@ -4849,13 +4851,13 @@ impl ArcoStateReader for ControlMvpRetainedReader {
 }
 
 async fn put_immutable(
-    storage: &ScopedStorage,
+    storage: &ScopedAuthorityStore,
     path: &str,
     bytes: Bytes,
     precondition_message: &str,
 ) -> Result<()> {
     match storage
-        .put_raw(path, bytes, WritePrecondition::DoesNotExist)
+        .put(path, bytes, AuthorityWritePrecondition::DoesNotExist)
         .await?
     {
         WriteResult::Success { .. } => Ok(()),
@@ -4864,18 +4866,22 @@ async fn put_immutable(
 }
 
 async fn put_immutable_matching(
-    storage: &ScopedStorage,
+    storage: &ScopedAuthorityStore,
     path: &str,
     bytes: Bytes,
     mismatch_message: &str,
 ) -> Result<()> {
     match storage
-        .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+        .put(
+            path,
+            bytes.clone(),
+            AuthorityWritePrecondition::DoesNotExist,
+        )
         .await?
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { .. } => {
-            let existing = storage.get_raw(path).await?;
+            let existing = storage.get(path).await?;
             if existing == bytes {
                 Ok(())
             } else {
@@ -4885,14 +4891,22 @@ async fn put_immutable_matching(
     }
 }
 
-async fn put_restore_immutable(storage: &ScopedStorage, path: &str, bytes: Bytes) -> Result<()> {
+async fn put_restore_immutable(
+    storage: &ScopedAuthorityStore,
+    path: &str,
+    bytes: Bytes,
+) -> Result<()> {
     match storage
-        .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+        .put(
+            path,
+            bytes.clone(),
+            AuthorityWritePrecondition::DoesNotExist,
+        )
         .await?
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { .. } => {
-            let existing = storage.get_raw(path).await?;
+            let existing = storage.get(path).await?;
             if existing == bytes {
                 Ok(())
             } else {

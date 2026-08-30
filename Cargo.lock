@@ -193,6 +193,7 @@ dependencies = [
  "arco-flow",
  "arco-iceberg",
  "arco-proto",
+ "arco-storage",
  "arco-test-utils",
  "arco-uc",
  "arco-worker-contract",
@@ -252,7 +253,6 @@ dependencies = [
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
- "object_store",
  "parquet 54.3.1",
  "proptest",
  "serde",
@@ -295,6 +295,7 @@ dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "arco-storage",
  "async-trait",
  "axum 0.7.9",
  "bytes",
@@ -325,7 +326,6 @@ dependencies = [
  "hex",
  "http",
  "jsonwebtoken",
- "object_store",
  "proptest",
  "reqwest",
  "serde",
@@ -367,6 +367,7 @@ version = "0.2.1"
 dependencies = [
  "arco-core",
  "arco-proto",
+ "arco-storage",
  "arco-worker-contract",
  "arrow 54.3.1",
  "async-trait",
@@ -450,6 +451,7 @@ dependencies = [
  "arco-delta",
  "arco-flow",
  "arco-iceberg",
+ "arco-storage",
  "arrow 54.3.1",
  "axum 0.7.9",
  "bytes",
@@ -481,6 +483,72 @@ dependencies = [
  "serde_json",
  "tonic",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "arco-storage"
+version = "0.2.1"
+dependencies = [
+ "arco-core",
+ "arco-storage-azure",
+ "arco-storage-gcs",
+ "arco-storage-s3",
+]
+
+[[package]]
+name = "arco-storage-azure"
+version = "0.2.1"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "arco-storage-gcs"
+version = "0.2.1"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "arco-storage-object-store"
+version = "0.2.1"
+dependencies = [
+ "arco-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "object_store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arco-storage-s3"
+version = "0.2.1"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -7203,6 +7271,7 @@ dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "arco-storage",
  "chrono",
  "clap",
  "hex",

@@ -23,8 +23,9 @@ use uuid::Uuid;
 
 use arco_core::ScopedStorage;
 use arco_core::observability::{LogFormat, init_logging};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend, WritePrecondition};
+use arco_core::storage::WritePrecondition;
 use arco_flow::orchestration::worker_contract::WorkerDispatchEnvelope;
+use arco_storage::from_bucket;
 
 const DEFAULT_ASSET_NAMESPACE: &str = "pipeline";
 const DEFAULT_ASSET_NAME: &str = "orders_smoke";
@@ -981,8 +982,7 @@ fn config_from_env() -> Result<WorkerConfig> {
 }
 
 fn storage_from_config(config: &WorkerConfig) -> Result<ScopedStorage> {
-    let backend = ObjectStoreBackend::from_bucket(&config.storage_bucket)?;
-    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+    let backend = from_bucket(&config.storage_bucket)?;
     ScopedStorage::new(
         backend,
         config.tenant_id.as_str(),

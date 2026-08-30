@@ -25,9 +25,8 @@
 #![cfg(feature = "iam-smoke")]
 
 use arco_core::storage_keys::{LedgerKey, StateKey};
-use arco_core::{
-    CatalogDomain, ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult,
-};
+use arco_core::{CatalogDomain, StorageBackend, WritePrecondition, WriteResult};
+use arco_storage::from_bucket;
 use bytes::Bytes;
 use std::env;
 use std::sync::Arc;
@@ -61,7 +60,7 @@ async fn test_api_cannot_write_state() {
     let (bucket, tenant, workspace) = test_config();
 
     // Create GCS backend (uses default credentials - should be API SA)
-    let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
+    let backend = from_bucket(&bucket).expect("Failed to create GCS backend");
 
     // Attempt to write to state/ prefix - this SHOULD FAIL
     let state_key = StateKey::state_snapshot(
@@ -110,7 +109,7 @@ async fn test_api_cannot_write_state() {
 async fn test_api_cannot_write_state_even_if_path_contains_ledger_segment() {
     let (bucket, tenant, workspace) = test_config();
 
-    let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
+    let backend = from_bucket(&bucket).expect("Failed to create GCS backend");
 
     // This is NOT under `ledger/` at the correct path boundary.
     // A `contains("/ledger/")` condition would incorrectly allow it.
@@ -147,7 +146,7 @@ async fn test_api_can_write_ledger() {
     let (bucket, tenant, workspace) = test_config();
 
     // Create GCS backend (uses default credentials - should be API SA)
-    let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
+    let backend = from_bucket(&bucket).expect("Failed to create GCS backend");
 
     // Write to ledger/ prefix - this SHOULD SUCCEED
     let event_id = format!("iam-smoke-{}", Ulid::new());
@@ -193,7 +192,7 @@ async fn test_api_can_write_ledger() {
 async fn test_api_can_write_locks() {
     let (bucket, tenant, workspace) = test_config();
 
-    let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
+    let backend = from_bucket(&bucket).expect("Failed to create GCS backend");
 
     // Write to locks/ prefix
     let lock_id = format!("iam-smoke-{}", Ulid::new());
@@ -231,7 +230,7 @@ async fn test_api_can_write_locks() {
 async fn test_api_can_write_commits() {
     let (bucket, tenant, workspace) = test_config();
 
-    let backend = Arc::new(ObjectStoreBackend::gcs(&bucket).expect("Failed to create GCS backend"));
+    let backend = from_bucket(&bucket).expect("Failed to create GCS backend");
 
     // Write to the still-active root receipt prefix.
     let commit_id = format!("iam-smoke-{}", Ulid::new());

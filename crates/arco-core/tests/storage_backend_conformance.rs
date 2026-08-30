@@ -12,98 +12,14 @@ mod barrier_backend;
 #[path = "support/spy_backend.rs"]
 mod spy_backend;
 
-use std::fmt;
-use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use arco_core::storage::{ObjectStoreBackend, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ObjectMeta};
-use async_trait::async_trait;
 use barrier_backend::{BarrierBackend, BarrierMatch};
 use bytes::Bytes;
-use futures::stream::BoxStream;
-use object_store::local::LocalFileSystem;
-use object_store::memory::InMemory;
-use object_store::path::Path as ObjectStorePath;
-use object_store::{
-    DynObjectStore, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult,
-};
 use spy_backend::{SpyBackend, SpyOp};
 use ulid::Ulid;
-
-#[derive(Debug, Default)]
-struct NotFoundOnWriteStore {
-    inner: InMemory,
-}
-
-impl fmt::Display for NotFoundOnWriteStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("not-found-on-write")
-    }
-}
-
-#[async_trait]
-impl ObjectStore for NotFoundOnWriteStore {
-    async fn put_opts(
-        &self,
-        location: &ObjectStorePath,
-        _payload: PutPayload,
-        _opts: PutOptions,
-    ) -> object_store::Result<PutResult> {
-        Err(object_store::Error::NotFound {
-            path: location.to_string(),
-            source: Box::new(io::Error::new(io::ErrorKind::NotFound, "missing root")),
-        })
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &ObjectStorePath,
-        opts: PutMultipartOpts,
-    ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &ObjectStorePath,
-        options: GetOptions,
-    ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    async fn delete(&self, location: &ObjectStorePath) -> object_store::Result<()> {
-        self.inner.delete(location).await
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&ObjectStorePath>,
-    ) -> BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&ObjectStorePath>,
-    ) -> object_store::Result<ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy(&self, from: &ObjectStorePath, to: &ObjectStorePath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
-        &self,
-        from: &ObjectStorePath,
-        to: &ObjectStorePath,
-    ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
-    }
-}
 
 async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>) {
     let path = format!("conformance/{name}/{}/head.json", Ulid::new());
@@ -277,51 +193,6 @@ async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>
     assert_exact_one_cas_winner(name, backend, &path, &recreated_version).await;
 }
 
-async fn assert_bounded_list_conformance(name: &str, backend: &Arc<dyn StorageBackend>) {
-    const LIMIT: usize = 3;
-    let prefix = format!("conformance/{name}/{}/paged/", Ulid::new());
-    let expected: Vec<String> = (0..6)
-        .map(|index| format!("{prefix}object-{index:02}.json"))
-        .collect();
-    for path in &expected {
-        let result = backend
-            .put(
-                path,
-                Bytes::from_static(b"page"),
-                WritePrecondition::DoesNotExist,
-            )
-            .await
-            .expect("seed bounded-list conformance object");
-        assert!(matches!(result, WriteResult::Success { .. }));
-    }
-
-    let mut cursor: Option<String> = None;
-    let mut seen = Vec::new();
-    loop {
-        let page = backend
-            .list_page(&prefix, cursor.as_deref(), LIMIT)
-            .await
-            .expect("bounded list page");
-        assert!(page.objects.len() <= LIMIT);
-        if let Some(cursor) = cursor.as_deref() {
-            assert!(page.objects.iter().all(|meta| meta.path.as_str() > cursor));
-        }
-        seen.extend(page.objects.into_iter().map(|meta| meta.path));
-        let Some(next) = page.next_start_after else {
-            break;
-        };
-        cursor = Some(next);
-    }
-
-    assert_eq!(seen, expected);
-    for path in &expected {
-        backend
-            .delete(path)
-            .await
-            .expect("delete bounded-list conformance object");
-    }
-}
-
 fn assert_head_version(head: &ObjectMeta, expected_version: &str) {
     assert_eq!(head.version, expected_version);
     assert!(!head.version.is_empty(), "head version must be non-empty");
@@ -430,57 +301,9 @@ async fn assert_exact_one_cas_winner(
     );
 }
 
-fn object_store_memory_backend() -> Arc<dyn StorageBackend> {
-    let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-    Arc::new(ObjectStoreBackend::new(store, None))
-}
-
-fn object_store_local_backend() -> (Arc<dyn StorageBackend>, PathBuf) {
-    let root = std::env::temp_dir().join(format!("arco-storage-conformance-{}", Ulid::new()));
-    std::fs::create_dir_all(&root).expect("create local object store root");
-    let store: Arc<DynObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(&root).expect("local filesystem store"));
-    (Arc::new(ObjectStoreBackend::new(store, None)), root)
-}
-
 #[tokio::test]
 async fn memory_backend_satisfies_storage_conformance() {
     assert_storage_conformance("memory", Arc::new(MemoryBackend::new())).await;
-}
-
-#[tokio::test]
-async fn object_store_memory_backend_satisfies_storage_conformance() {
-    assert_storage_conformance("object-store-memory", object_store_memory_backend()).await;
-}
-
-#[tokio::test]
-async fn object_store_backend_preserves_non_cas_not_found_write_errors() {
-    let store: Arc<DynObjectStore> = Arc::new(NotFoundOnWriteStore::default());
-    let backend = ObjectStoreBackend::new(store, None);
-
-    let create = backend
-        .put(
-            "missing-root/create.json",
-            Bytes::from_static(b"v1"),
-            WritePrecondition::DoesNotExist,
-        )
-        .await;
-    assert!(
-        create.is_err(),
-        "create write NotFound must remain an operational error, got {create:?}"
-    );
-
-    let unconditional = backend
-        .put(
-            "missing-root/unconditional.json",
-            Bytes::from_static(b"v1"),
-            WritePrecondition::None,
-        )
-        .await;
-    assert!(
-        unconditional.is_err(),
-        "unconditional write NotFound must remain an operational error, got {unconditional:?}"
-    );
 }
 
 #[tokio::test]
@@ -520,81 +343,5 @@ async fn spy_backend_records_failed_get_range_attempts() {
             }] if path == "missing/object.json" && *byte_len == 0
         ),
         "spy should record failed get_range attempts with zero bytes: {ops:?}"
-    );
-}
-
-#[tokio::test]
-async fn object_store_local_backend_is_not_a_cas_conformance_substitute() {
-    let (backend, root) = object_store_local_backend();
-    let path = format!("local-cas-negative/{}/head.json", Ulid::new());
-    let seed = backend
-        .put(
-            &path,
-            Bytes::from_static(b"v1"),
-            WritePrecondition::DoesNotExist,
-        )
-        .await
-        .expect("seed local object");
-    let WriteResult::Success { version } = seed else {
-        panic!("seed local object must succeed");
-    };
-
-    let update = backend
-        .put(
-            &path,
-            Bytes::from_static(b"v2"),
-            WritePrecondition::MatchesVersion(version),
-        )
-        .await;
-    assert!(
-        format!("{update:?}").contains("NotImplemented"),
-        "object_store::local must not be treated as production CAS conformance"
-    );
-    std::fs::remove_dir_all(root).expect("remove local object store root");
-}
-
-#[tokio::test]
-#[ignore = "requires ARCO_TEST_GCS_BUCKET and cloud credentials"]
-async fn gcs_backend_satisfies_storage_conformance() {
-    let bucket = std::env::var("ARCO_TEST_GCS_BUCKET")
-        .expect("ARCO_TEST_GCS_BUCKET must be set for the GCS conformance test");
-    let backend: Arc<dyn StorageBackend> =
-        Arc::new(ObjectStoreBackend::gcs(&bucket).expect("gcs backend"));
-    assert_storage_conformance("gcs", backend.clone()).await;
-    assert_bounded_list_conformance("gcs", &backend).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ARCO_TEST_S3_BUCKET and cloud credentials"]
-async fn s3_backend_satisfies_storage_conformance() {
-    let bucket = std::env::var("ARCO_TEST_S3_BUCKET")
-        .expect("ARCO_TEST_S3_BUCKET must be set for the S3 conformance test");
-    let backend: Arc<dyn StorageBackend> =
-        Arc::new(ObjectStoreBackend::s3(&bucket).expect("s3 backend"));
-    assert_storage_conformance("s3", backend.clone()).await;
-    assert_bounded_list_conformance("s3", &backend).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ARCO_TEST_AZURE_CONTAINER and cloud credentials"]
-async fn azure_backend_satisfies_storage_conformance() {
-    let container = std::env::var("ARCO_TEST_AZURE_CONTAINER")
-        .expect("ARCO_TEST_AZURE_CONTAINER must be set for the Azure conformance test");
-    let backend: Arc<dyn StorageBackend> =
-        Arc::new(ObjectStoreBackend::azure(&container).expect("azure backend"));
-    assert_storage_conformance("azure", backend.clone()).await;
-
-    // Azure intentionally does not enable the bounded ordered pager: flat Blob
-    // (lexicographic) and ADLS Gen2 HNS (depth-first) orderings are
-    // indistinguishable at construction, and depth-first breaks the
-    // lexicographic exclusive-cursor contract. list_page must fail closed
-    // rather than silently skip objects.
-    let bounded = backend
-        .list_page("conformance/azure", None, 10)
-        .await
-        .expect_err("Azure bounded ordered listing must be unsupported");
-    assert!(
-        bounded.to_string().contains("unsupported"),
-        "Azure list_page must fail closed, got {bounded:?}"
     );
 }

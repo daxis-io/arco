@@ -1,0 +1,29 @@
+[package]
+name = "arco-storage"
+description = "Runtime composition for Arco cloud storage adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["full"]
+full = ["aws", "gcp", "azure"]
+aws = ["dep:arco-storage-s3"]
+gcp = ["dep:arco-storage-gcs"]
+azure = ["dep:arco-storage-azure"]
+
+[dependencies]
+arco-core = { path = "../arco-core", default-features = false }
+arco-storage-s3 = { path = "../arco-storage-s3", optional = true }
+arco-storage-gcs = { path = "../arco-storage-gcs", optional = true }
+arco-storage-azure = { path = "../arco-storage-azure", optional = true }

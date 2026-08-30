@@ -31,24 +31,35 @@ impl GcsStorageBackend {
     /// Returns an error for an empty bucket or invalid GCS configuration.
     pub fn new(bucket: &str) -> Result<Self> {
         let bucket = normalize_bucket(bucket)?;
-        let gcs = Arc::new(
-            GoogleCloudStorageBuilder::new()
-                .with_bucket_name(&bucket)
+        let gcs = Arc::new(configured_gcs_builder(&bucket).build().map_err(|error| {
+            Error::storage_with_source(format!("failed to configure GCS bucket '{bucket}'"), error)
+        })?);
+        let conditional_gcs = Arc::new(
+            configured_gcs_builder(&bucket)
                 .with_retry(no_automatic_request_retries())
                 .build()
                 .map_err(|error| {
                     Error::storage_with_source(
-                        format!("failed to configure GCS bucket '{bucket}'"),
+                        format!("failed to configure conditional GCS bucket '{bucket}'"),
                         error,
                     )
                 })?,
         );
         let store: Arc<DynObjectStore> = gcs.clone();
+        let conditional_write_store: Arc<DynObjectStore> = conditional_gcs;
         let signer: Arc<dyn ObjectStoreSigner> = gcs;
         Ok(Self {
-            inner: ObjectStoreBackend::new_with_ordered_listing(store, Some(signer)),
+            inner: ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
+                store,
+                conditional_write_store,
+                Some(signer),
+            ),
         })
     }
+}
+
+fn configured_gcs_builder(bucket: &str) -> GoogleCloudStorageBuilder {
+    GoogleCloudStorageBuilder::new().with_bucket_name(bucket)
 }
 
 fn normalize_bucket(raw: &str) -> Result<String> {

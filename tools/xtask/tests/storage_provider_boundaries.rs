@@ -227,6 +227,17 @@ fn provider_builders_preserve_conditional_write_ambiguity() {
             contents.contains(".with_retry(no_automatic_request_retries())"),
             "{source} must not hide conditional-write transport ambiguity behind SDK retries"
         );
+        assert_eq!(
+            contents
+                .matches(".with_retry(no_automatic_request_retries())")
+                .count(),
+            1,
+            "{source} must disable retries only on its conditional-write client"
+        );
+        assert!(
+            contents.contains("conditional_write_store"),
+            "{source} must keep ordinary operations on a separate retrying client"
+        );
     }
 
     let s3 = fs::read_to_string(root.join("crates/arco-storage-s3/src/lib.rs"))

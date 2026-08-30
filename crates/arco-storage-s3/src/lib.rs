@@ -34,25 +34,35 @@ impl S3StorageBackend {
     /// Returns an error for an empty bucket or invalid S3 configuration.
     pub fn new(bucket: &str) -> Result<Self> {
         let bucket = normalize_bucket(bucket)?;
-        let s3 = Arc::new(
-            AmazonS3Builder::from_env()
-                .with_bucket_name(&bucket)
-                .with_conditional_put(S3ConditionalPut::ETagMatch)
+        let s3 = Arc::new(configured_s3_builder(&bucket).build().map_err(|error| {
+            Error::storage_with_source(format!("failed to configure S3 bucket '{bucket}'"), error)
+        })?);
+        let conditional_s3 = Arc::new(
+            configured_s3_builder(&bucket)
                 .with_retry(no_automatic_request_retries())
                 .build()
                 .map_err(|error| {
                     Error::storage_with_source(
-                        format!("failed to configure S3 bucket '{bucket}'"),
+                        format!("failed to configure conditional S3 bucket '{bucket}'"),
                         error,
                     )
                 })?,
         );
         let store: Arc<DynObjectStore> = s3.clone();
+        let conditional_write_store: Arc<DynObjectStore> = conditional_s3;
         let signer: Arc<dyn ObjectStoreSigner> = s3;
         let inner = if supports_ordered_listing(&bucket) {
-            ObjectStoreBackend::new_with_ordered_listing(store, Some(signer))
+            ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
+                store,
+                conditional_write_store,
+                Some(signer),
+            )
         } else {
-            ObjectStoreBackend::new(store, Some(signer))
+            ObjectStoreBackend::new_with_conditional_write_store(
+                store,
+                conditional_write_store,
+                Some(signer),
+            )
         };
         Ok(Self { inner })
     }
@@ -62,6 +72,12 @@ impl S3StorageBackend {
     pub const fn ordered_listing_enabled(&self) -> bool {
         self.inner.ordered_listing_enabled()
     }
+}
+
+fn configured_s3_builder(bucket: &str) -> AmazonS3Builder {
+    AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
 }
 
 fn normalize_bucket(raw: &str) -> Result<String> {

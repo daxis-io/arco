@@ -35,9 +35,7 @@ impl AzureStorageBackend {
     pub fn new(container: &str) -> Result<Self> {
         let container = normalize_container(container)?;
         let azure = Arc::new(
-            MicrosoftAzureBuilder::from_env()
-                .with_container_name(&container)
-                .with_retry(no_automatic_request_retries())
+            configured_azure_builder(&container)
                 .build()
                 .map_err(|error| {
                     Error::storage_with_source(
@@ -46,12 +44,32 @@ impl AzureStorageBackend {
                     )
                 })?,
         );
+        let conditional_azure = Arc::new(
+            configured_azure_builder(&container)
+                .with_retry(no_automatic_request_retries())
+                .build()
+                .map_err(|error| {
+                    Error::storage_with_source(
+                        format!("failed to configure conditional Azure container '{container}'"),
+                        error,
+                    )
+                })?,
+        );
         let store: Arc<DynObjectStore> = azure.clone();
+        let conditional_write_store: Arc<DynObjectStore> = conditional_azure;
         let signer: Arc<dyn ObjectStoreSigner> = azure;
         Ok(Self {
-            inner: ObjectStoreBackend::new(store, Some(signer)),
+            inner: ObjectStoreBackend::new_with_conditional_write_store(
+                store,
+                conditional_write_store,
+                Some(signer),
+            ),
         })
     }
+}
+
+fn configured_azure_builder(container: &str) -> MicrosoftAzureBuilder {
+    MicrosoftAzureBuilder::from_env().with_container_name(container)
 }
 
 fn normalize_container(raw: &str) -> Result<String> {

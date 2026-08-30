@@ -40,6 +40,7 @@ pub fn no_automatic_request_retries() -> RetryConfig {
 #[derive(Debug, Clone)]
 pub struct ObjectStoreBackend {
     store: Arc<DynObjectStore>,
+    conditional_write_store: Arc<DynObjectStore>,
     signer: Option<Arc<dyn ObjectStoreSigner>>,
     ordered_listing: bool,
 }
@@ -49,7 +50,27 @@ impl ObjectStoreBackend {
     #[must_use]
     pub fn new(store: Arc<DynObjectStore>, signer: Option<Arc<dyn ObjectStoreSigner>>) -> Self {
         Self {
+            conditional_write_store: store.clone(),
             store,
+            signer,
+            ordered_listing: false,
+        }
+    }
+
+    /// Creates an adapter with a distinct client for conditional writes.
+    ///
+    /// Provider crates use a normally retrying `store` for reads and legacy
+    /// operations, and a single-attempt `conditional_write_store` for
+    /// create-if-absent and exact-version replacement.
+    #[must_use]
+    pub fn new_with_conditional_write_store(
+        store: Arc<DynObjectStore>,
+        conditional_write_store: Arc<DynObjectStore>,
+        signer: Option<Arc<dyn ObjectStoreSigner>>,
+    ) -> Self {
+        Self {
+            store,
+            conditional_write_store,
             signer,
             ordered_listing: false,
         }
@@ -63,7 +84,24 @@ impl ObjectStoreBackend {
         signer: Option<Arc<dyn ObjectStoreSigner>>,
     ) -> Self {
         Self {
+            conditional_write_store: store.clone(),
             store,
+            signer,
+            ordered_listing: true,
+        }
+    }
+
+    /// Creates an ordered-listing adapter with a distinct client for
+    /// conditional writes.
+    #[must_use]
+    pub fn new_with_ordered_listing_and_conditional_write_store(
+        store: Arc<DynObjectStore>,
+        conditional_write_store: Arc<DynObjectStore>,
+        signer: Option<Arc<dyn ObjectStoreSigner>>,
+    ) -> Self {
+        Self {
+            store,
+            conditional_write_store,
             signer,
             ordered_listing: true,
         }
@@ -279,7 +317,13 @@ impl StorageBackend for ObjectStoreBackend {
             )),
             WritePrecondition::None => PutOptions::default(),
         };
-        match self.store.put_opts(&location, data.into(), options).await {
+        let write_store = match &precondition {
+            WritePrecondition::None => &self.store,
+            WritePrecondition::DoesNotExist | WritePrecondition::MatchesVersion(_) => {
+                &self.conditional_write_store
+            }
+        };
+        match write_store.put_opts(&location, data.into(), options).await {
             Ok(result) => Ok(WriteResult::Success {
                 version: VersionToken::from_parts(result.e_tag, result.version).encode(),
             }),

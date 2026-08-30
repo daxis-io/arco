@@ -643,7 +643,7 @@ mod tests {
     use super::*;
     use arco_flow::orchestration::controllers::LedgerFreshness;
 
-    use arco_core::{FlowPaths, MemoryBackend};
+    use arco_core::{FlowPaths, MemoryBackend, StorageBackend};
     use arco_flow::orchestration::callbacks::{
         CallbackContext, CallbackResult, TaskCompletedRequest, TaskState as CallbackTaskState,
         TaskStateLookup, TaskTokenValidator, WorkerOutcome, handle_task_completed,

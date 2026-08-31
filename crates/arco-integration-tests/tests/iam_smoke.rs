@@ -25,11 +25,10 @@
 #![cfg(feature = "iam-smoke")]
 
 use arco_core::storage_keys::{LedgerKey, StateKey};
-use arco_core::{CatalogDomain, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::{CatalogDomain, WritePrecondition, WriteResult};
 use arco_storage::from_bucket;
 use bytes::Bytes;
 use std::env;
-use std::sync::Arc;
 use ulid::Ulid;
 
 /// Helper to get test configuration from environment.

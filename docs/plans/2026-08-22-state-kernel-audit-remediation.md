@@ -1,7 +1,5 @@
 # State Kernel Audit Remediation Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Close every material finding from the fresh Phase 1 state-kernel audit without expanding into the deferred AWS, route-cutover, or Phase 2-6 program.
 
 **Architecture:** Arrow segments remain physically sorted and checksum-bound, but logical outbox order is encoded explicitly. L0 Arrow becomes the sole mutation payload while JSON transactions retain metadata and the L0 reference. The hard-cut restore contract advances to a new current version and recognizes older plans only well enough to terminate them without writes. Serialized intent evidence remains public, but only the state store may mint `StateToken` values.

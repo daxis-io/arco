@@ -2,8 +2,7 @@
 
 ## Status
 
-Accepted for implementation on `codex/s3-lambda-state-kernel-v1` after the
-Phase 1 second-audit remediation.
+Accepted for implementation after the Phase 1 second-audit remediation.
 
 ## Problem
 

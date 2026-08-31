@@ -2,8 +2,8 @@
 
 ## Status and scope
 
-This record maps the 16 second-audit findings to the local remediation on
-`codex/s3-lambda-state-kernel-v1`. The preserved audited commit is
+This record maps the 16 second-audit findings to the local remediation branch.
+The preserved audited commit is
 `0c5c155d17f0d50562209e55fd37d27c66e2d3a9`; remediation is additive.
 
 The evidence below qualifies the repository kernel against deterministic and

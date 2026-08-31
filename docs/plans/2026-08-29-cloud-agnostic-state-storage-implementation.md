@@ -1,7 +1,5 @@
 # Cloud-Agnostic State Storage Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make the `control/v1` state kernel cloud-neutral at the crate and interface seams while isolating S3, GCS, and Azure construction and qualification in provider crates.
 
 **Architecture:** `arco-core` retains provider-neutral storage contracts and deterministic memory storage. A shared `arco-storage-object-store` adapter translates the upstream object-store interface, three provider crates own provider construction, and `arco-storage` owns runtime selection. The catalog state kernel uses a scoped authority-only view and contains no provider dependency or selection logic.

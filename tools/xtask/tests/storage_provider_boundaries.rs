@@ -247,3 +247,57 @@ fn provider_builders_preserve_conditional_write_ambiguity() {
         "S3 must explicitly enable native ETag conditional writes"
     );
 }
+
+#[test]
+fn shared_adapter_requires_an_explicit_conditional_write_client() {
+    let root = workspace_root();
+    let source = "crates/arco-storage-object-store/src/lib.rs";
+    let contents = fs::read_to_string(root.join(source)).expect("read shared storage adapter");
+
+    for forbidden in ["pub fn new(store:", "pub fn new_with_ordered_listing(\n"] {
+        assert!(
+            !contents.contains(forbidden),
+            "{source} exposes a same-client constructor `{forbidden}` that can hide conditional-write retries"
+        );
+    }
+    assert!(
+        contents.contains("pub fn new_with_conditional_write_store("),
+        "{source} must require callers to identify a conditional-write client"
+    );
+    assert!(
+        contents.contains("pub fn new_with_ordered_listing_and_conditional_write_store("),
+        "{source} must require ordered providers to identify a conditional-write client"
+    );
+}
+
+#[test]
+fn published_adapter_relocation_is_a_versioned_breaking_change() {
+    let root = workspace_root();
+    let workspace_manifest = manifest(&root.join("Cargo.toml"));
+    let version = workspace_manifest["workspace"]["package"]["version"]
+        .as_str()
+        .expect("workspace package version");
+    let mut components = version
+        .split('.')
+        .map(|component| component.parse::<u64>().expect("numeric semver component"));
+    let major = components.next().expect("semver major");
+    let minor = components.next().expect("semver minor");
+
+    assert!(
+        major > 0 || minor >= 3,
+        "moving the published arco_core::ObjectStoreBackend API requires Rust workspace version 0.3.0 or later, got {version}"
+    );
+
+    let changelog =
+        fs::read_to_string(root.join("CHANGELOG.md")).expect("read workspace changelog");
+    for required in [
+        "arco_core::ObjectStoreBackend",
+        "arco_storage_object_store::ObjectStoreBackend",
+        "arco_storage::from_bucket",
+    ] {
+        assert!(
+            changelog.contains(required),
+            "CHANGELOG.md must document the breaking storage migration using `{required}`"
+        );
+    }
+}

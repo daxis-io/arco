@@ -48,6 +48,19 @@ mirror structs in production field order. It also rebuilds the index identity
 and logical-state checksum for malformed fixtures. The malformed Arrow tests
 therefore reach the intended footer, row, and provenance checks.
 
+## Fresh final-audit follow-up
+
+The fresh read-only audit of `9f3d0ad8..87e219ae`,
+`0c5c155d..87e219ae`, and `54fb6483..87e219ae` found one additional P2
+fail-closed defect plus two storage-boundary risks. The follow-up closes all
+three locally:
+
+| Review item | Follow-up | Evidence |
+|---|---|---|
+| A checksum-coherent manifest or L1 anchor at `logical_sequence = u64::MAX` could panic in checked builds or wrap to zero in release builds. | Every transaction begin, projected-token prediction, commit, replay, and manifest-suffix advancement uses one checked logical-sequence successor that returns `InvariantViolation` on overflow. | `checksum_coherent_terminal_logical_sequence_is_typed_not_a_panic`; `replay_rejects_sequence_zero_after_terminal_logical_sequence_without_panicking`, including the focused release-profile run. |
+| Shared adapter convenience constructors could reuse an automatically retrying client for conditional authority writes. | Same-client constructors were removed. Every adapter construction must explicitly identify the conditional-write client, and provider crates continue to configure that client with zero automatic request retries. | `shared_adapter_requires_an_explicit_conditional_write_client`; `provider_builders_preserve_conditional_write_ambiguity`; shared adapter contract tests. |
+| Moving the published `arco_core::ObjectStoreBackend` export was an undocumented Rust source break at workspace version 0.2.1. | The Rust workspace advances to 0.3.0 and the changelog gives the exact adapter and runtime-factory migration. Reintroducing the old export would recreate the forbidden core-to-provider dependency cycle. | `published_adapter_relocation_is_a_versioned_breaking_change`; `storage_provider_crates_own_cloud_dependencies`. |
+
 ## Exact local acceptance gate
 
 The completed branch must pass:

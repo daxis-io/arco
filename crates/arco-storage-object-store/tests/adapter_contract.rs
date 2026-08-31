@@ -97,7 +97,11 @@ impl ObjectStore for NotFoundOnWriteStore {
 
 fn ordered_memory_adapter() -> ObjectStoreBackend {
     let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-    ObjectStoreBackend::new_with_ordered_listing(store, None)
+    ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
+        store.clone(),
+        store,
+        None,
+    )
 }
 
 #[test]
@@ -233,7 +237,7 @@ async fn ordered_paging_is_exclusive_and_defers_insertions_before_the_cursor() {
 #[tokio::test]
 async fn generic_adapter_fails_closed_for_bounded_listing() {
     let store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-    let backend = ObjectStoreBackend::new(store, None);
+    let backend = ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store, None);
     let empty = backend.list_page("ledger/", None, 0).await.unwrap();
     assert!(empty.objects.is_empty());
     assert!(empty.next_start_after.is_none());
@@ -244,7 +248,7 @@ async fn generic_adapter_fails_closed_for_bounded_listing() {
 #[tokio::test]
 async fn non_cas_not_found_writes_remain_operational_errors() {
     let store: Arc<DynObjectStore> = Arc::new(NotFoundOnWriteStore::default());
-    let backend = ObjectStoreBackend::new(store, None);
+    let backend = ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store, None);
     for precondition in [WritePrecondition::DoesNotExist, WritePrecondition::None] {
         let write = backend
             .put(

@@ -46,22 +46,13 @@ pub struct ObjectStoreBackend {
 }
 
 impl ObjectStoreBackend {
-    /// Creates an adapter that fails closed for bounded ordered listing.
-    #[must_use]
-    pub fn new(store: Arc<DynObjectStore>, signer: Option<Arc<dyn ObjectStoreSigner>>) -> Self {
-        Self {
-            conditional_write_store: store.clone(),
-            store,
-            signer,
-            ordered_listing: false,
-        }
-    }
-
     /// Creates an adapter with a distinct client for conditional writes.
     ///
     /// Provider crates use a normally retrying `store` for reads and legacy
     /// operations, and a single-attempt `conditional_write_store` for
-    /// create-if-absent and exact-version replacement.
+    /// create-if-absent and exact-version replacement. The caller must disable
+    /// automatic request retries on `conditional_write_store`; this adapter
+    /// deliberately cannot infer the upstream client's retry policy.
     #[must_use]
     pub fn new_with_conditional_write_store(
         store: Arc<DynObjectStore>,
@@ -76,23 +67,12 @@ impl ObjectStoreBackend {
         }
     }
 
-    /// Creates an adapter for a provider that guarantees lexicographically
-    /// ordered listing with an exclusive offset.
-    #[must_use]
-    pub fn new_with_ordered_listing(
-        store: Arc<DynObjectStore>,
-        signer: Option<Arc<dyn ObjectStoreSigner>>,
-    ) -> Self {
-        Self {
-            conditional_write_store: store.clone(),
-            store,
-            signer,
-            ordered_listing: true,
-        }
-    }
-
     /// Creates an ordered-listing adapter with a distinct client for
     /// conditional writes.
+    ///
+    /// The caller must disable automatic request retries on
+    /// `conditional_write_store`; this adapter deliberately cannot infer the
+    /// upstream client's retry policy.
     #[must_use]
     pub fn new_with_ordered_listing_and_conditional_write_store(
         store: Arc<DynObjectStore>,

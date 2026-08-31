@@ -139,6 +139,11 @@ conformance entry points are owned independently by `arco-storage-s3`,
 crate alone maps deployment bucket references to those adapters. Passing local
 or repository conformance does not promote any provider: S3, GCS, and Azure
 each require independent live evidence, and S3 remains the first GA target.
+Shared adapter construction always requires an explicit conditional-write
+client; custom providers must configure that client for a single request so a
+lost response reaches authority reconciliation. Moving the previously
+published adapter out of `arco-core` is therefore a documented Rust 0.3.0
+source boundary rather than an implicit 0.2.x compatibility claim.
 
 If a single metastore root cannot sustain 25 qualified mutations per second,
 or maintenance cannot remain ahead of writes, implementation stops for a new

@@ -344,7 +344,10 @@ impl ControlMvpStateStore {
 
         let base = self.load_current_base_state().await?;
         validate_publication_epoch(self.writer_epoch, base.writer_epoch)?;
-        let next_sequence = base.state.logical_sequence + 1;
+        let next_sequence = next_logical_sequence(
+            base.state.logical_sequence,
+            "beginning a control MVP transaction",
+        )?;
         let request_id = opts.request_id().map(ToOwned::to_owned);
         let suffix = Ulid::new().to_string().to_ascii_lowercase();
         let tx_id = request_id.clone().map_or_else(
@@ -2136,10 +2139,13 @@ impl ControlMvpTxn {
             projection_kind: projection_kind.into(),
             payload,
         };
-        let predicted_token = self.store.token(
-            self.manifest_id.clone(),
-            self.base.state.logical_sequence + 1,
-        );
+        let predicted_sequence = next_logical_sequence(
+            self.base.state.logical_sequence,
+            "predicting a control MVP projection token",
+        )?;
+        let predicted_token = self
+            .store
+            .token(self.manifest_id.clone(), predicted_sequence);
         ProjectionIntentV1::new(
             staged.intent_id.clone(),
             staged.projection_kind.clone(),
@@ -2342,7 +2348,10 @@ impl ControlMvpTxn {
         }
         validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
 
-        let next_sequence = self.base.state.logical_sequence + 1;
+        let next_sequence = next_logical_sequence(
+            self.base.state.logical_sequence,
+            "committing a control MVP transaction",
+        )?;
         let committed_token = self.store.token(self.manifest_id.clone(), next_sequence);
         let projection_intents = self
             .projection_intents
@@ -3220,7 +3229,8 @@ struct ReplayState {
 
 impl ReplayState {
     fn apply_tx(&mut self, tx: &ControlMvpTxObject) -> Result<()> {
-        let expected = self.logical_sequence + 1;
+        let expected =
+            next_logical_sequence(self.logical_sequence, "replaying a control MVP transaction")?;
         if tx.sequence != expected {
             return Err(invariant_violation(format!(
                 "control MVP replay expected sequence {expected}, got {}",
@@ -3741,10 +3751,13 @@ impl ControlMvpManifest {
                 "control MVP manifest carries no transaction suffix",
             ));
         }
-        let expected_first = self
-            .base_state
-            .as_ref()
-            .map_or(1, |anchor| anchor.logical_sequence + 1);
+        let expected_first = match self.base_state.as_ref() {
+            Some(anchor) => next_logical_sequence(
+                anchor.logical_sequence,
+                "validating a control MVP manifest suffix",
+            )?,
+            None => 1,
+        };
         if self.tx_refs.first().map_or(0, |tx_ref| tx_ref.sequence) != expected_first {
             return Err(invariant_violation(
                 "control MVP manifest suffix does not start at its replay anchor",
@@ -5090,6 +5103,14 @@ fn invariant_violation(message: impl Into<String>) -> CatalogError {
     }
 }
 
+fn next_logical_sequence(current: u64, context: &str) -> Result<u64> {
+    current.checked_add(1).ok_or_else(|| {
+        invariant_violation(format!(
+            "control MVP logical sequence overflow while {context}"
+        ))
+    })
+}
+
 fn ambiguous_authority_outcome(message: impl Into<String>) -> CatalogError {
     CatalogError::AmbiguousAuthorityOutcome {
         message: message.into(),
@@ -5412,6 +5433,37 @@ mod tests {
             .expect_err("v3 trim rows must identify the removed event incarnation");
 
         assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+    }
+
+    #[test]
+    fn replay_rejects_sequence_zero_after_terminal_logical_sequence_without_panicking() {
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let tx = ControlMvpTxObject {
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&scope),
+            tx_id: "tx-zero".to_string(),
+            base_manifest_id: Some("manifest-terminal".to_string()),
+            sequence: 0,
+            writer_epoch: 0,
+            request_id: None,
+            l0_segment: unwritten_l0_segment_ref("tx-zero", 0),
+            writes: Vec::new(),
+            outbox: Vec::new(),
+            outbox_trim: Vec::new(),
+        };
+        let mut state = ReplayState {
+            logical_sequence: u64::MAX,
+            ..ReplayState::default()
+        };
+
+        let applied = catch_unwind(AssertUnwindSafe(|| state.apply_tx(&tx)));
+
+        assert!(applied.is_ok(), "terminal replay must not panic");
+        assert!(matches!(
+            applied.expect("unwind boundary"),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+        assert_eq!(u64::MAX, state.logical_sequence);
     }
 
     #[test]

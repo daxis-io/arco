@@ -877,6 +877,71 @@ async fn manifest_transaction_checksum_mismatch_fails_closed() {
 }
 
 #[tokio::test]
+async fn checksum_coherent_terminal_logical_sequence_is_typed_not_a_panic() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(1));
+    let paths = ControlMvpPaths::new("catalog");
+
+    commit_value(&store, b"catalog/default", "v1").await;
+    commit_value(&store, b"catalog/default", "v2").await;
+    let token = store
+        .current_state_token()
+        .await
+        .expect("current state token");
+    let manifest_path = paths.manifest_object(token.authority_manifest_id());
+    let manifest = storage
+        .get_raw(&manifest_path)
+        .await
+        .expect("current manifest");
+    let terminal_manifest = reseal_envelope(&manifest, |payload| {
+        let terminal = payload.replacen(
+            "\"logical_sequence\":1",
+            &format!("\"logical_sequence\":{}", u64::MAX),
+            1,
+        );
+        assert_ne!(
+            payload, terminal,
+            "manifest must carry the sequence-one base"
+        );
+        terminal
+    });
+    let manifest_checksum = hex::encode(sha2::Sha256::digest(&terminal_manifest));
+    storage
+        .put_raw(&manifest_path, terminal_manifest, WritePrecondition::None)
+        .await
+        .expect("write checksum-coherent terminal manifest");
+
+    let pointer_path = paths.current_pointer();
+    let pointer = storage
+        .get_raw(&pointer_path)
+        .await
+        .expect("current pointer");
+    let mut pointer: Value = serde_json::from_slice(&pointer).expect("pointer json");
+    pointer["manifest_checksum_sha256"] = Value::String(manifest_checksum);
+    storage
+        .put_raw(
+            &pointer_path,
+            Bytes::from(serde_json::to_vec(&pointer).expect("pointer bytes")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("bind pointer to terminal manifest");
+
+    let task = tokio::spawn(async move { store.get(b"catalog/default").await });
+    let result = task
+        .await
+        .expect("terminal sequence must return a typed error, not panic");
+    let error = result.expect_err("terminal sequence must fail closed");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+    assert!(
+        error.to_string().contains("logical sequence overflow"),
+        "unexpected terminal-sequence error: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn tombstoned_keys_keep_range_empty_preconditions_from_succeeding() {
     let (_backend, storage) = storage();
     let store = store(storage);

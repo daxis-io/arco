@@ -9,6 +9,7 @@
 #![allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -626,7 +627,7 @@ async fn journal_revision_overflow_is_detected_before_participant_apply() {
     assert!(
         audit.operations().iter().all(|operation| {
             !matches!(operation, AuditOperation::Put { path, .. }
-                if path.contains("/state-store/control-mvp/catalog/"))
+                if path.contains("/control/v1/domains/catalog/"))
         }),
         "revision exhaustion must not write participant authority artifacts"
     );
@@ -828,15 +829,24 @@ async fn retention_epoch(storage: &ScopedStorage) -> serde_json::Value {
 
 async fn restore_and_state_bytes(backend: &MemoryBackend) -> BTreeMap<String, Bytes> {
     let mut selected = BTreeMap::new();
+    let mut authority_objects = 0_usize;
     for object in backend.list("").await.expect("test inventory") {
-        if object.path.contains("/transactions/restores/") || object.path.contains("/state-store/")
+        let is_authority = object.path.contains("/control/v1/domains/");
+        if object.path.contains("/transactions/restores/")
+            || object.path.contains("/state-store/")
+            || is_authority
         {
+            authority_objects += usize::from(is_authority);
             selected.insert(
                 object.path.clone(),
                 backend.get(&object.path).await.expect("test object bytes"),
             );
         }
     }
+    assert!(
+        authority_objects > 0,
+        "restore no-write comparisons must include state authority objects"
+    );
     selected
 }
 
@@ -970,8 +980,8 @@ impl StorageBackend for RestoreAuditBackend {
             .lock()
             .expect("observed journal")
             .clone();
-        if path.contains("/state-store/control-mvp/")
-            && path.contains("/txlog/tx-restore-")
+        if path.contains("/control/v1/domains/")
+            && path.contains("/transactions/tx-restore-")
             && self
                 .journal_at_first_restore_txlog
                 .lock()
@@ -980,7 +990,7 @@ impl StorageBackend for RestoreAuditBackend {
             && let Some(relative) = observed
         {
             let prefix = path
-                .split("/state-store/control-mvp/")
+                .split("/control/v1/domains/")
                 .next()
                 .expect("workspace prefix");
             let full_path = format!("{prefix}/{relative}");
@@ -1547,10 +1557,7 @@ impl StorageBackend for VisibleReceiptRaceBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         self.record_write(path);
-        let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let pointer_suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if self.armed.load(Ordering::SeqCst) && path.ends_with(&pointer_suffix) {
             let result = self.inner.put(path, data, precondition).await?;
             self.pointer_writes.fetch_add(1, Ordering::SeqCst);
@@ -1688,7 +1695,7 @@ impl StorageBackend for CrashAfterReplacementPlanBackend {
         data: Bytes,
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
-        if path.ends_with("/state-store/control-mvp/catalog/current.pointer.json")
+        if path.ends_with("/control/v1/domains/catalog/head/current.json")
             && self.fail_pointer.swap(false, Ordering::SeqCst)
         {
             let prior = self.inner.get(path).await?;
@@ -1879,13 +1886,13 @@ impl StorageBackend for CorruptFirstParticipantBeforeSecondVisibleBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         let result = self.inner.put(path, data, precondition).await?;
-        if path.contains("/state-store/control-mvp/a/txlog/tx-restore-") {
+        if path.contains("/control/v1/domains/a/transactions/tx-restore-") {
             *self
                 .first_restore_transaction
                 .lock()
                 .expect("transaction path") = Some(path.to_string());
         }
-        if path.ends_with("/state-store/control-mvp/b/current.pointer.json") {
+        if path.ends_with("/control/v1/domains/b/head/current.json") {
             let first = self
                 .first_restore_transaction
                 .lock()
@@ -1957,10 +1964,7 @@ impl StorageBackend for DropFirstReceiptCasBackend {
             ));
         }
         let result = self.inner.put(path, data, precondition).await?;
-        let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let pointer_suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&pointer_suffix) && self.armed.swap(false, Ordering::SeqCst) {
             self.drop_next_journal_cas.store(true, Ordering::SeqCst);
         }
@@ -2223,7 +2227,7 @@ impl StorageBackend for JournalReceiptWriteThenErrorBackend {
             && matches!(precondition, WritePrecondition::MatchesVersion(_));
         let result = self.inner.put(path, data, precondition).await?;
         let pointer_suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
+            "/control/v1/domains/{}/head/current.json",
             self.arm_after_domain
         );
         if path.ends_with(&pointer_suffix) {
@@ -2317,10 +2321,7 @@ impl StorageBackend for SupersedeNextDomainPointerBackend {
                 .expect("statuses")
                 .push(status.to_string());
         }
-        let suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&suffix) && self.armed.swap(false, Ordering::SeqCst) {
             let prior = self.inner.get(path).await?;
             let _ = self.inner.put(path, prior, WritePrecondition::None).await?;
@@ -2370,10 +2371,7 @@ impl StorageBackend for FailNextDomainPointerBackend {
                 .expect("statuses")
                 .push(status.to_string());
         }
-        let suffix = format!(
-            "/state-store/control-mvp/{}/current.pointer.json",
-            self.domain
-        );
+        let suffix = format!("/control/v1/domains/{}/head/current.json", self.domain);
         if path.ends_with(&suffix) && self.armed.swap(false, Ordering::SeqCst) {
             return Err(arco_core::Error::storage(
                 "injected failure before participant pointer write",
@@ -3041,7 +3039,7 @@ async fn journal_precedes_domain_commit_journal_cas_and_final_read_manifest_retr
         .expect("applying journal");
     let first_restore_txlog = operations
         .iter()
-        .position(|operation| matches!(operation, AuditOperation::Put { path, .. } if path.contains("/txlog/tx-restore-")))
+        .position(|operation| matches!(operation, AuditOperation::Put { path, .. } if path.contains("/transactions/tx-restore-")))
         .expect("restore txlog put");
     assert!(request_put < attempt_put);
     assert!(attempt_put < prepared_put);
@@ -3355,7 +3353,7 @@ async fn restore_authority_boundaries_export_is_no_list_redacted_and_read_only()
         assert!(!path.contains("/commits/root/"));
         assert!(!path.contains("snapshots.parquet"));
         assert!(!path.contains("transactions.parquet"));
-        assert!(!path.ends_with("/state-store/control-mvp/other/current.pointer.json"));
+        assert!(!path.ends_with("/control/v1/domains/other/head/current.json"));
     }
     for (path, before) in source_before {
         assert_eq!(
@@ -3849,7 +3847,7 @@ async fn journal_cas_rejects_corrupt_recorded_receipt_without_revision() {
         .expect("transaction id");
     storage
         .put_raw(
-            &format!("state-store/control-mvp/{domain}/txlog/{transaction_id}.json"),
+            &format!("control/v1/domains/{domain}/transactions/{transaction_id}.json"),
             Bytes::from_static(b"{}"),
             WritePrecondition::None,
         )
@@ -5167,7 +5165,7 @@ async fn workspace_restore_recovery_adopts_multi_domain_orphan_before_any_partic
         .get_raw(&attempt_path)
         .await
         .expect("orphan attempt");
-    let a_pointer_path = "state-store/control-mvp/a/current.pointer.json";
+    let a_pointer_path = "control/v1/domains/a/head/current.json";
     let a_pointer_before = storage
         .get_raw(a_pointer_path)
         .await
@@ -5215,7 +5213,7 @@ async fn workspace_restore_recovery_adopts_multi_domain_orphan_before_any_partic
     );
     assert!(backend.operations().iter().all(|operation| {
         !matches!(operation, AuditOperation::Put { path, .. }
-            if path.contains("/txlog/tx-restore-") || path.ends_with("/current.pointer.json"))
+            if path.contains("/transactions/tx-restore-") || path.ends_with("/head/current.json"))
     }));
 }
 
@@ -7162,38 +7160,27 @@ async fn final_read_manifest_conflicting_immutable_bytes_fail_closed() {
     );
 }
 
-/// R6: an in-flight restore attempt written by an older revision embeds a
-/// version 1 participant plan (no `observed_writer_epoch`). Recovery has to be
-/// able to read it in order to supersede it; a decoder that rejects it turns
-/// recovery into a serialization failure with no way forward. The plan must
-/// therefore migrate, reach the defined terminal outcome of Superseded, and be
-/// replanned at the current version — never applied.
 #[tokio::test]
-async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_it() {
-    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(SupersedeNextDomainPointerBackend::new(inner, "b"));
+async fn workspace_restore_recovery_uses_the_planned_checkpoint_interval() {
+    let memory = Arc::new(MemoryBackend::new());
+    let inner: Arc<dyn StorageBackend> = memory.clone();
+    let backend = Arc::new(FailJournalCreateOnceBackend::new(inner));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
-    let stores = ["a", "b", "c"]
-        .into_iter()
-        .map(|domain| {
-            Arc::new(
-                ControlMvpStateStore::new(
-                    storage.clone(),
-                    StateScope::new("tenant", "workspace", domain),
-                )
-                .expect("store"),
-            )
-        })
-        .collect::<Vec<_>>();
-    for store in &stores {
-        committed_value(store, b"v1").await;
-    }
+    let planning_store = Arc::new(
+        ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("planning store")
+        .with_checkpoint_interval(NonZeroU64::new(1).expect("nonzero interval")),
+    );
+    committed_value(&planning_store, b"v1").await;
     let now = Utc::now();
-    let snapshot_id = snapshot_id();
-    let pin_id = pin_id();
+    let snapshot_id = format!("snap_{}", Ulid::from(266_u128));
+    let pin_id = format!("pin_{}", Ulid::from(267_u128));
     WorkspaceSnapshotService::new(
         storage.clone(),
-        multi_domain_registry(&stores, &["a", "b", "c"], false),
+        domain_registry(planning_store.clone(), false),
     )
     .expect("snapshot service")
     .create_snapshot(
@@ -7208,16 +7195,12 @@ async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_i
     )
     .await
     .expect("snapshot");
-    for store in &stores {
-        committed_value(store, b"v2").await;
-    }
+    committed_value(&planning_store, b"v2").await;
 
-    let restore_id = restore_id();
-    let service = WorkspaceRestoreService::new(
-        storage.clone(),
-        multi_domain_registry(&stores, &["a", "b", "c"], true),
-    )
-    .expect("restore service");
+    let restore_id = format!("rst_{}", Ulid::from(268_u128));
+    let planning_service =
+        WorkspaceRestoreService::new(storage.clone(), domain_registry(planning_store, true))
+            .expect("planning restore service");
     let request = RestoreWorkspaceToSnapshot::new(
         &restore_id,
         RestoreSource::snapshot(snapshot_id, pin_id).expect("source"),
@@ -7227,69 +7210,165 @@ async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_i
     )
     .expect("restore request");
     backend.arm();
-    let partial = service
-        .restore_workspace_to_snapshot(&request)
-        .await
-        .expect("partial restore is durably repairable");
-    assert_eq!(WorkspaceRestoreStatus::RepairRequired, partial.status());
+    assert!(matches!(
+        planning_service
+            .restore_workspace_to_snapshot(&request)
+            .await,
+        Err(CatalogError::Storage { .. })
+    ));
 
-    // Rewrite the untouched participant's durable plan into the exact shape an
-    // older revision wrote: version 1, with no `observed_writer_epoch`.
+    let attempt: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get_raw(&restore_attempt_plan_path(&restore_id, 1).expect("attempt path"))
+            .await
+            .expect("durable attempt"),
+    )
+    .expect("attempt JSON");
+    let plan = &attempt["participants"][0]["plan"];
+    assert_eq!(serde_json::Value::from(1_u64), plan["checkpoint_interval"]);
+    let candidate_manifest_path = plan["candidate_manifest_path"]
+        .as_str()
+        .expect("candidate manifest path");
+    assert!(
+        !candidate_manifest_path.is_empty(),
+        "the durable orphan attempt must expose the exact deterministic candidate identity"
+    );
+
+    let reconstructed = Arc::new(
+        ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("reconstructed store")
+        .with_checkpoint_interval(NonZeroU64::new(32).expect("nonzero interval")),
+    );
+    let recovery =
+        WorkspaceRestoreService::new(storage, domain_registry(reconstructed.clone(), true))
+            .expect("recovery service");
+    assert_eq!(
+        WorkspaceRestoreStatus::Visible,
+        recovery
+            .recover_restore(&restore_id)
+            .await
+            .expect("persisted interval makes recovery configuration independent")
+            .status()
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        arco_catalog::ArcoStateReader::get(reconstructed.as_ref(), b"catalog/default")
+            .await
+            .expect("restored state")
+    );
+    let visible_bytes = restore_and_state_bytes(memory.as_ref()).await;
+    assert_eq!(
+        WorkspaceRestoreStatus::Visible,
+        recovery
+            .recover_restore(&restore_id)
+            .await
+            .expect("idempotent recovery")
+            .status()
+    );
+    assert_eq!(
+        visible_bytes,
+        restore_and_state_bytes(memory.as_ref()).await
+    );
+}
+
+async fn assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(
+    checkpoint_path_only: bool,
+) {
+    let memory = Arc::new(MemoryBackend::new());
+    let inner: Arc<dyn StorageBackend> = memory.clone();
+    let backend = Arc::new(FailNextDomainPointerBackend::new(inner, "catalog"));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = Arc::new(
+        ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store"),
+    );
+    committed_value(&store, b"v1").await;
+    let now = Utc::now();
+    let snapshot_id = format!("snap_{}", Ulid::from(269_u128));
+    let pin_id = format!("pin_{}", Ulid::from(270_u128));
+    WorkspaceSnapshotService::new(storage.clone(), domain_registry(store.clone(), false))
+        .expect("snapshot service")
+        .create_snapshot(
+            &CreateWorkspaceSnapshotRequest::new(
+                &snapshot_id,
+                &pin_id,
+                now,
+                now + ChronoDuration::hours(1),
+                None,
+            )
+            .expect("snapshot request"),
+        )
+        .await
+        .expect("snapshot");
+    committed_value(&store, b"v2").await;
+
+    let restore_id = format!("rst_{}", Ulid::from(271_u128));
+    let service = WorkspaceRestoreService::new(storage.clone(), domain_registry(store, true))
+        .expect("restore service");
+    let request = RestoreWorkspaceToSnapshot::new(
+        &restore_id,
+        RestoreSource::snapshot(snapshot_id, pin_id).expect("source"),
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        now,
+        OmittedDomainPolicy::Reject,
+    )
+    .expect("restore request");
+    backend.arm();
+    assert!(matches!(
+        service.restore_workspace_to_snapshot(&request).await,
+        Err(CatalogError::Storage { .. })
+    ));
+
     let attempt_path = restore_attempt_plan_path(&restore_id, 1).expect("attempt path");
     let mut attempt: serde_json::Value =
-        serde_json::from_slice(&storage.get_raw(&attempt_path).await.expect("attempt one"))
-            .expect("attempt json");
-    let plan = attempt["participants"][2]["plan"]
-        .as_object_mut()
-        .expect("participant plan object");
-    assert_eq!(
-        Some(serde_json::Value::from(0_u64)),
-        plan.remove("observed_writer_epoch"),
-        "the current plan version carries the field version 1 lacked"
-    );
-    plan.insert("version".to_string(), serde_json::Value::from(1_u64));
-
-    // The downgraded plan must match the checked-in canonical v1 field set, so
-    // this test cannot drift away from the fixture the decoder is pinned to.
-    let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
-    ))
-    .expect("v1 fixture json");
-    let mut fixture_fields = fixture
-        .as_object()
-        .expect("fixture object")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    fixture_fields.sort();
-    let mut downgraded_fields = attempt["participants"][2]["plan"]
-        .as_object()
-        .expect("downgraded plan object")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    downgraded_fields.sort();
-    assert_eq!(fixture_fields, downgraded_fields);
-
-    let downgraded_plan = attempt["participants"][2]["plan"].clone();
-    let downgraded_sha = format!(
+        serde_json::from_slice(&storage.get_raw(&attempt_path).await.expect("attempt bytes"))
+            .expect("attempt JSON");
+    let plan = &mut attempt["participants"][0]["plan"];
+    let manifest_id = plan["source"]["manifest_id"]
+        .as_str()
+        .expect("manifest id")
+        .to_string();
+    let checkpoint_path = plan["source"]["checkpoint_path"]
+        .as_str()
+        .expect("checkpoint path");
+    let checkpoint_name = checkpoint_path
+        .rsplit('/')
+        .next()
+        .expect("checkpoint file")
+        .to_string();
+    if checkpoint_path_only {
+        plan["source"]["checkpoint_path"] = serde_json::Value::String(format!(
+            "control/v1/domains/catalog/checkpoints/nested/{checkpoint_name}"
+        ));
+    } else {
+        plan["source"]["manifest_path"] = serde_json::Value::String(format!(
+            "state-store/control-mvp/catalog/manifests/{manifest_id}.json"
+        ));
+        plan["source"]["checkpoint_path"] = serde_json::Value::String(format!(
+            "state-store/control-mvp/catalog/checkpoints/{checkpoint_name}"
+        ));
+    }
+    let plan_sha = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(
-            serde_jcs::to_vec(&downgraded_plan).expect("downgraded plan bytes")
+            serde_jcs::to_vec(plan).expect("old-layout plan bytes")
         ))
     );
-    attempt["participants"][2]["plan_sha256"] = serde_json::Value::String(downgraded_sha.clone());
-    let attempt_bytes = serde_jcs::to_vec(&attempt).expect("downgraded attempt bytes");
+    attempt["participants"][0]["plan_sha256"] = serde_json::Value::String(plan_sha.clone());
+    let attempt_bytes = serde_jcs::to_vec(&attempt).expect("seeded attempt bytes");
     let attempt_sha = format!("sha256:{}", hex::encode(Sha256::digest(&attempt_bytes)));
-    let mut journal: serde_json::Value = serde_json::from_slice(
-        &storage
-            .get_raw(&restore_journal_path(&restore_id).expect("journal path"))
-            .await
-            .expect("journal"),
-    )
-    .expect("journal json");
+    let journal_path = restore_journal_path(&restore_id).expect("journal path");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&storage.get_raw(&journal_path).await.expect("journal bytes"))
+            .expect("journal JSON");
     journal["attempt_sha256"] = serde_json::Value::String(attempt_sha);
-    journal["participants"][2]["plan_sha256"] = serde_json::Value::String(downgraded_sha);
+    journal["participants"][0]["plan_sha256"] = serde_json::Value::String(plan_sha);
     storage
         .put_raw(
             &attempt_path,
@@ -7297,58 +7376,252 @@ async fn workspace_restore_recovery_migrates_a_v1_participant_plan_and_replans_i
             WritePrecondition::None,
         )
         .await
-        .expect("install the v1 participant plan");
+        .expect("seed literal old-layout attempt");
     storage
         .put_raw(
-            &restore_journal_path(&restore_id).expect("journal path"),
-            Bytes::from(serde_jcs::to_vec(&journal).expect("updated journal bytes")),
+            &journal_path,
+            Bytes::from(serde_jcs::to_vec(&journal).expect("seeded journal bytes")),
             WritePrecondition::None,
         )
         .await
-        .expect("bind journal to the v1 participant plan");
+        .expect("bind journal to old-layout attempt");
 
-    // Recovery reads the v1 plan (rather than failing to deserialize it),
-    // supersedes it, and replans the domain at the current version.
-    let recovered = service
+    let before = restore_and_state_bytes(memory.as_ref()).await;
+    let error = service
         .recover_restore(&restore_id)
         .await
-        .expect("a v1 in-flight plan must not turn recovery into a serialization failure");
-    assert_eq!(WorkspaceRestoreStatus::Visible, recovered.status());
-    for store in &stores {
+        .expect_err("retired authority layout must fail closed");
+    let CatalogError::UnsupportedAuthorityFormat { message } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(message.contains("control/v1 hard cut"));
+    assert!(message.contains("old layouts are not migrated"));
+    assert!(message.contains("retained control/v1 authority source"));
+    assert_eq!(before, restore_and_state_bytes(memory.as_ref()).await);
+}
+
+#[tokio::test]
+async fn workspace_recovery_rejects_seeded_noncanonical_authority_paths_without_writes() {
+    assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(false)
+        .await;
+    assert_workspace_recovery_rejects_seeded_noncanonical_authority_path_without_writes(true).await;
+}
+
+/// R6: in-flight restore attempts written by older revisions embed version 1
+/// or version 2 participant plans. Recovery has to read both exact wire shapes
+/// in order to supersede them; a decoder that rejects either one turns recovery
+/// into a serialization failure with no way forward. Each plan must therefore
+/// reach Superseded and be replanned at the current version — never applied.
+#[tokio::test]
+async fn workspace_restore_recovery_migrates_v1_and_v2_participant_plans_and_replans_them() {
+    for (legacy_version, fixture_json) in [
+        (
+            1_u64,
+            include_str!("fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"),
+        ),
+        (
+            2_u64,
+            include_str!("fixtures/control_mvp_restore_plans/v2_current.json"),
+        ),
+    ] {
+        let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(SupersedeNextDomainPointerBackend::new(inner, "b"));
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+        let stores = ["a", "b", "c"]
+            .into_iter()
+            .map(|domain| {
+                Arc::new(
+                    ControlMvpStateStore::new(
+                        storage.clone(),
+                        StateScope::new("tenant", "workspace", domain),
+                    )
+                    .expect("store"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for store in &stores {
+            committed_value(store, b"v1").await;
+        }
+        let now = Utc::now();
+        let snapshot_id = snapshot_id();
+        let pin_id = pin_id();
+        WorkspaceSnapshotService::new(
+            storage.clone(),
+            multi_domain_registry(&stores, &["a", "b", "c"], false),
+        )
+        .expect("snapshot service")
+        .create_snapshot(
+            &CreateWorkspaceSnapshotRequest::new(
+                &snapshot_id,
+                &pin_id,
+                now,
+                now + ChronoDuration::hours(1),
+                None,
+            )
+            .expect("snapshot request"),
+        )
+        .await
+        .expect("snapshot");
+        for store in &stores {
+            committed_value(store, b"v2").await;
+        }
+
+        let restore_id = restore_id();
+        let service = WorkspaceRestoreService::new(
+            storage.clone(),
+            multi_domain_registry(&stores, &["a", "b", "c"], true),
+        )
+        .expect("restore service");
+        let request = RestoreWorkspaceToSnapshot::new(
+            &restore_id,
+            RestoreSource::snapshot(snapshot_id, pin_id).expect("source"),
+            WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            now,
+            OmittedDomainPolicy::Reject,
+        )
+        .expect("restore request");
+        backend.arm();
+        let partial = service
+            .restore_workspace_to_snapshot(&request)
+            .await
+            .expect("partial restore is durably repairable");
+        assert_eq!(WorkspaceRestoreStatus::RepairRequired, partial.status());
+
+        // Rewrite the untouched participant's durable plan into the exact field
+        // set written by the selected older revision.
+        let attempt_path = restore_attempt_plan_path(&restore_id, 1).expect("attempt path");
+        let mut attempt: serde_json::Value =
+            serde_json::from_slice(&storage.get_raw(&attempt_path).await.expect("attempt one"))
+                .expect("attempt json");
+        let plan = attempt["participants"][2]["plan"]
+            .as_object_mut()
+            .expect("participant plan object");
         assert_eq!(
-            Some(Bytes::from_static(b"v1")),
-            arco_catalog::ArcoStateReader::get(store.as_ref(), b"catalog/default")
+            Some(serde_json::Value::from(32_u64)),
+            plan.remove("checkpoint_interval"),
+            "legacy plans predate the persisted replay-anchor interval"
+        );
+        if legacy_version == 1 {
+            assert_eq!(
+                Some(serde_json::Value::from(0_u64)),
+                plan.remove("observed_writer_epoch"),
+                "version 1 predates the writer-epoch observation"
+            );
+        } else {
+            assert!(plan["observed_writer_epoch"].is_u64());
+        }
+        plan.insert(
+            "version".to_string(),
+            serde_json::Value::from(legacy_version),
+        );
+
+        // The downgraded plan must match the corresponding checked-in field set,
+        // so this test cannot drift away from the literal compatibility fixtures.
+        let fixture: serde_json::Value = serde_json::from_str(fixture_json).expect("fixture json");
+        let mut fixture_fields = fixture
+            .as_object()
+            .expect("fixture object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        fixture_fields.sort();
+        let mut downgraded_fields = attempt["participants"][2]["plan"]
+            .as_object()
+            .expect("downgraded plan object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        downgraded_fields.sort();
+        assert_eq!(fixture_fields, downgraded_fields);
+
+        let downgraded_plan = attempt["participants"][2]["plan"].clone();
+        let downgraded_sha = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                serde_jcs::to_vec(&downgraded_plan).expect("downgraded plan bytes")
+            ))
+        );
+        attempt["participants"][2]["plan_sha256"] =
+            serde_json::Value::String(downgraded_sha.clone());
+        let attempt_bytes = serde_jcs::to_vec(&attempt).expect("downgraded attempt bytes");
+        let attempt_sha = format!("sha256:{}", hex::encode(Sha256::digest(&attempt_bytes)));
+        let mut journal: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(&restore_journal_path(&restore_id).expect("journal path"))
                 .await
-                .expect("restored value")
+                .expect("journal"),
+        )
+        .expect("journal json");
+        journal["attempt_sha256"] = serde_json::Value::String(attempt_sha);
+        journal["participants"][2]["plan_sha256"] = serde_json::Value::String(downgraded_sha);
+        storage
+            .put_raw(
+                &attempt_path,
+                Bytes::from(attempt_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("install the v{legacy_version} participant plan: {error}")
+            });
+        storage
+            .put_raw(
+                &restore_journal_path(&restore_id).expect("journal path"),
+                Bytes::from(serde_jcs::to_vec(&journal).expect("updated journal bytes")),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("bind journal to the v{legacy_version} plan: {error}"));
+
+        // Recovery reads the legacy plan, supersedes it, and replans the domain at
+        // the current version.
+        let recovered = service
+            .recover_restore(&restore_id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a v{legacy_version} in-flight plan must remain recoverable: {error}")
+            });
+        assert_eq!(WorkspaceRestoreStatus::Visible, recovered.status());
+        for store in &stores {
+            assert_eq!(
+                Some(Bytes::from_static(b"v1")),
+                arco_catalog::ArcoStateReader::get(store.as_ref(), b"catalog/default")
+                    .await
+                    .expect("restored value")
+            );
+        }
+
+        let attempt_two: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(&restore_attempt_plan_path(&restore_id, 2).expect("attempt path"))
+                .await
+                .expect("attempt two"),
+        )
+        .expect("attempt json");
+        let participants = attempt_two["participants"]
+            .as_array()
+            .expect("participants");
+        let replanned = participants
+            .iter()
+            .find(|participant| participant["domain"] == "c")
+            .expect("domain c is replanned rather than carried");
+        assert_eq!(
+            serde_json::Value::from(3_u64),
+            replanned["plan"]["version"],
+            "a superseded v{legacy_version} plan must be replaced by a current-version plan"
+        );
+        assert!(
+            replanned["plan"]["observed_writer_epoch"].is_u64(),
+            "the replacement plan must carry an actual epoch observation"
+        );
+        assert!(
+            replanned["plan"]["checkpoint_interval"].is_u64(),
+            "the replacement plan must carry the current replay-anchor interval"
+        );
+        assert_eq!(
+            serde_json::Value::from(2_u64),
+            replanned["participant_attempt"],
+            "the superseded participant must advance its attempt"
         );
     }
-
-    let attempt_two: serde_json::Value = serde_json::from_slice(
-        &storage
-            .get_raw(&restore_attempt_plan_path(&restore_id, 2).expect("attempt path"))
-            .await
-            .expect("attempt two"),
-    )
-    .expect("attempt json");
-    let participants = attempt_two["participants"]
-        .as_array()
-        .expect("participants");
-    let replanned = participants
-        .iter()
-        .find(|participant| participant["domain"] == "c")
-        .expect("domain c is replanned rather than carried");
-    assert_eq!(
-        serde_json::Value::from(2_u64),
-        replanned["plan"]["version"],
-        "a superseded v1 plan must be replaced by a current-version plan"
-    );
-    assert!(
-        replanned["plan"]["observed_writer_epoch"].is_u64(),
-        "the replacement plan must carry an actual epoch observation"
-    );
-    assert_eq!(
-        serde_json::Value::from(2_u64),
-        replanned["participant_attempt"],
-        "the superseded participant must advance its attempt"
-    );
 }

@@ -53,7 +53,7 @@ impl ExternalLocationMetadataWriter {
         }
         txn.assert_absent(&key).await?;
         txn.put(&key, encode_credential_reference(&record)?).await?;
-        let token = txn.commit().await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(CredentialReferenceMetadataReceipt { token, record })
     }
 
@@ -104,8 +104,8 @@ impl ExternalLocationMetadataWriter {
             .await?;
 
         match txn.commit().await {
-            Ok(token) => Ok(ExternalLocationMetadataReceipt {
-                token,
+            Ok(outcome) => Ok(ExternalLocationMetadataReceipt {
+                token: outcome.into_state_token(),
                 record,
                 path_declaration,
             }),

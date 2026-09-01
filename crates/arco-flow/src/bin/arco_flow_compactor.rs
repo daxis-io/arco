@@ -25,7 +25,6 @@ use arco_core::orchestration_compaction::{
     OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
 };
 use arco_core::repair_backlog::RepairBacklogEntry;
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{InternalOidcConfig, InternalOidcError, InternalOidcVerifier, ScopedStorage};
 use arco_flow::error::{Error, Result};
 use arco_flow::metrics::{
@@ -37,6 +36,7 @@ use arco_flow::orchestration::compactor::{
     CompactionResult, MicroCompactor, OrchestrationReconciler, OrchestrationReconciliationReport,
     OrchestrationRepairResult, OrchestrationRepairScope,
 };
+use arco_storage::from_bucket;
 
 const REBUILD_MANIFEST_PREFIX: &str = "state/orchestration/rebuilds/";
 const ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_MODE_ENV: &str =
@@ -813,8 +813,7 @@ async fn main() -> Result<()> {
     init_metrics();
     arco_flow::metrics::register_metrics();
 
-    let backend = ObjectStoreBackend::from_bucket(&bucket)?;
-    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+    let backend = from_bucket(&bucket)?;
     let storage = ScopedStorage::new(backend, tenant_id, workspace_id)?;
 
     tracing::info!(

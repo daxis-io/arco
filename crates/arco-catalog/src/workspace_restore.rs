@@ -1898,6 +1898,9 @@ impl WorkspaceRestoreService {
                     validation("orphan replacement participant is absent from source")
                 })?;
             let PersistedRestoreParticipantPlan::ControlMvp(plan) = &participant.plan;
+            if !plan.is_legacy_version() {
+                plan.validate_source_authority_format()?;
+            }
             if plan.source() != authority.authority() {
                 return Err(validation(
                     "orphan replacement participant source does not match source cut",
@@ -2107,6 +2110,9 @@ impl WorkspaceRestoreService {
                     .iter()
                     .find(|authority| authority.domain() == participant.domain);
                 let PersistedRestoreParticipantPlan::ControlMvp(plan) = &participant.plan;
+                if !plan.is_legacy_version() {
+                    plan.validate_source_authority_format()?;
+                }
                 let source_matches = cut.source_record_sha256 == attempt.source_record_sha256;
                 let retention_covers_attempt =
                     cut.usable_retention_deadline >= attempt.active_retention_deadline;
@@ -2623,6 +2629,9 @@ impl WorkspaceRestoreService {
                 ));
             }
             let PersistedRestoreParticipantPlan::ControlMvp(control_plan) = &participant.plan;
+            if !control_plan.is_legacy_version() {
+                control_plan.validate_source_authority_format()?;
+            }
             if control_plan.source() != authority.authority() {
                 return Err(validation(
                     "persisted restore participant source does not match validated source cut",
@@ -2820,6 +2829,9 @@ impl WorkspaceRestoreService {
                 .get(recorded.domain.as_str())
                 .ok_or_else(|| validation("active restore participant is absent from source"))?;
             let PersistedRestoreParticipantPlan::ControlMvp(control_plan) = &participant.plan;
+            if !control_plan.is_legacy_version() {
+                control_plan.validate_source_authority_format()?;
+            }
             if control_plan.source() != authority.authority() {
                 return Err(validation(
                     "active restore participant source does not match immutable source record",

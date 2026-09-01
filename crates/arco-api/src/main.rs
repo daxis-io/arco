@@ -12,7 +12,8 @@ use anyhow::Result;
 use arco_api::config::Config;
 use arco_api::server::Server;
 use arco_core::observability::{LogFormat, init_logging};
-use arco_core::storage::{MemoryBackend, ObjectStoreBackend, StorageBackend};
+use arco_core::storage::{MemoryBackend, StorageBackend};
+use arco_storage::from_bucket;
 
 fn choose_log_format(config: &Config) -> LogFormat {
     if config.debug {
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
             "GCS"
         };
         tracing::info!(bucket = %bucket, backend = backend, "Using object storage backend");
-        Arc::new(ObjectStoreBackend::from_bucket(bucket)?)
+        from_bucket(bucket)?
     } else {
         if !config.debug {
             anyhow::bail!("ARCO_STORAGE_BUCKET is required when ARCO_DEBUG=false");

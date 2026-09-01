@@ -7,7 +7,6 @@ use std::env;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -21,8 +20,8 @@ use arco_catalog::manifest::{
     CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
     RootManifest, SearchManifest, SnapshotInfo,
 };
-use arco_core::storage::ObjectStoreBackend;
 use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
+use arco_storage::from_bucket;
 
 /// Expected tool versions (should match CI)
 mod versions {
@@ -2040,9 +2039,9 @@ fn run_workspace_integrity(
     println!("  Scope: tenant={tenant}, workspace={workspace}");
     println!("  Bucket: {bucket}");
 
-    let backend = ObjectStoreBackend::from_bucket(&bucket)
+    let backend = from_bucket(&bucket)
         .with_context(|| format!("Failed to configure storage backend for '{bucket}'"))?;
-    let storage = ScopedStorage::new(Arc::new(backend), tenant, workspace)
+    let storage = ScopedStorage::new(backend, tenant, workspace)
         .context("Failed to create scoped storage")?;
 
     let runtime = Runtime::new().context("Failed to create tokio runtime")?;

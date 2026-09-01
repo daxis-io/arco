@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "arco-api"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arco-catalog",
@@ -193,6 +193,7 @@ dependencies = [
  "arco-flow",
  "arco-iceberg",
  "arco-proto",
+ "arco-storage",
  "arco-test-utils",
  "arco-uc",
  "arco-worker-contract",
@@ -238,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "arco-catalog"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-core",
  "arco-proto",
@@ -247,11 +248,11 @@ dependencies = [
  "bytes",
  "chrono",
  "criterion",
+ "flatbuffers 24.12.23",
  "futures",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
- "object_store",
  "parquet 54.3.1",
  "proptest",
  "serde",
@@ -270,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "arco-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -289,11 +290,12 @@ dependencies = [
 
 [[package]]
 name = "arco-compactor"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "arco-storage",
  "async-trait",
  "axum 0.7.9",
  "bytes",
@@ -314,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "arco-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -324,7 +326,6 @@ dependencies = [
  "hex",
  "http",
  "jsonwebtoken",
- "object_store",
  "proptest",
  "reqwest",
  "serde",
@@ -343,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "arco-delta"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-core",
  "async-trait",
@@ -362,10 +363,11 @@ dependencies = [
 
 [[package]]
 name = "arco-flow"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-core",
  "arco-proto",
+ "arco-storage",
  "arco-worker-contract",
  "arrow 54.3.1",
  "async-trait",
@@ -406,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "arco-iceberg"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -441,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "arco-integration-tests"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-api",
  "arco-catalog",
@@ -449,6 +451,7 @@ dependencies = [
  "arco-delta",
  "arco-flow",
  "arco-iceberg",
+ "arco-storage",
  "arrow 54.3.1",
  "axum 0.7.9",
  "bytes",
@@ -469,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "arco-proto"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-worker-contract",
  "chrono",
@@ -483,8 +486,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "arco-storage"
+version = "0.3.0"
+dependencies = [
+ "arco-core",
+ "arco-storage-azure",
+ "arco-storage-gcs",
+ "arco-storage-s3",
+]
+
+[[package]]
+name = "arco-storage-azure"
+version = "0.3.0"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "arco-storage-gcs"
+version = "0.3.0"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
+name = "arco-storage-object-store"
+version = "0.3.0"
+dependencies = [
+ "arco-core",
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "object_store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "arco-storage-s3"
+version = "0.3.0"
+dependencies = [
+ "arco-core",
+ "arco-storage-object-store",
+ "async-trait",
+ "bytes",
+ "object_store",
+ "tokio",
+ "ulid",
+]
+
+[[package]]
 name = "arco-test-utils"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -512,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "arco-uc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arco-catalog",
  "arco-core",
@@ -539,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "arco-worker-contract"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chrono",
@@ -2978,9 +3047,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.12"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c0b69cfcb4e1b9f1bf2f53f95f766e4661169728ec61cd3fe5a0166f2d1386"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -7197,11 +7266,12 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arco-catalog",
  "arco-core",
+ "arco-storage",
  "chrono",
  "clap",
  "hex",

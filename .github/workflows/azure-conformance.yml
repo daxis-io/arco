@@ -3,11 +3,9 @@ name: Azure Storage Conformance
 # Evidence-integrity companion to adr-034-gcs-conformance.yml and
 # s3-conformance.yml.
 #
-# ObjectStoreBackend::azure exists in crates/arco-core/src/storage.rs, but the
-# only test that exercises the CAS/precondition contract against real Azure
-# (azure_backend_satisfies_storage_conformance) is #[ignore]d and, before this
-# workflow, had no runner anywhere. Until this workflow passes against a real
-# container, the Azure provider is NOT certified for production use.
+# The Azure adapter and its ignored live CAS test are owned by
+# arco-storage-azure. Until this workflow passes against a real container, the
+# Azure provider is NOT certified for production use.
 #
 # TRIGGER POLICY: dispatch-only, deliberately. A missing configuration here is
 # a loud failure and never a green skip — but no Azure container or credentials
@@ -58,6 +56,14 @@ jobs:
         with:
           cache-targets: "false"
 
+      - name: Verify Azure conformance test discovery
+        run: |
+          discovered_tests="$(
+            cargo test --locked -p arco-storage-azure --test live_conformance -- --ignored --list |
+              grep -Fxc 'azure_backend_satisfies_storage_conformance: test'
+          )"
+          test "$discovered_tests" -eq 1
+
       - name: Check Azure conformance prerequisites
         id: prereq
         env:
@@ -78,8 +84,8 @@ jobs:
           AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
           AZURE_STORAGE_ACCESS_KEY: ${{ secrets.AZURE_STORAGE_ACCESS_KEY }}
         run: |
-          cargo test --locked -p arco-core --test storage_backend_conformance \
-            azure_backend_satisfies_storage_conformance -- --ignored --nocapture
+          cargo test --locked -p arco-storage-azure --test live_conformance \
+            azure_backend_satisfies_storage_conformance -- --ignored --exact --nocapture
 
       - name: Fail on missing Azure conformance configuration
         if: steps.prereq.outputs.configured != 'true'

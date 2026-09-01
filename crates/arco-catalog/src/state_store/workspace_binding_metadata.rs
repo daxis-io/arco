@@ -66,7 +66,7 @@ impl WorkspaceMetastoreBindingMetadataWriter {
         txn.put(&pair_key, Bytes::from(record.binding_id().to_string()))
             .await?;
 
-        let token = txn.commit().await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(WorkspaceMetastoreBindingMetadataReceipt { token, record })
     }
 

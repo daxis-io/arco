@@ -68,8 +68,6 @@ jsonwebtoken = { version = "10", default-features = false }
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
-# Cloud object storage integration (GCS/S3/Azure) via `object_store`.
-object_store = { workspace = true }
 http = { workspace = true }
 
 [dev-dependencies]

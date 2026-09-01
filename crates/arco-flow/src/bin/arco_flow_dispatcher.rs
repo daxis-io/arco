@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use arco_core::observability::{LogFormat, init_logging};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_core::{
     DEFAULT_DISPATCH_TASK_TIMEOUT_SECONDS, DEFAULT_TASK_TOKEN_TTL_SECONDS, ScopedStorage,
     TaskTokenConfig, mint_task_token_for_attempt,
@@ -33,6 +32,7 @@ use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_flow::orchestration::worker_contract::{
     DispatchEnvelopeSpec, dispatch_envelope_for_attempt,
 };
+use arco_storage::from_bucket;
 
 #[derive(Clone)]
 struct AppState {
@@ -623,8 +623,7 @@ async fn main() -> Result<()> {
 
     let cloud_tasks = build_cloud_tasks(cloud_config).await?;
 
-    let backend = ObjectStoreBackend::from_bucket(&bucket)?;
-    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+    let backend = from_bucket(&bucket)?;
     let storage = ScopedStorage::new(backend, tenant_id.clone(), workspace_id.clone())?;
 
     let state = AppState {

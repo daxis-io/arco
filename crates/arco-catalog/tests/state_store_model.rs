@@ -57,7 +57,7 @@ async fn accepted_commits_advance_logical_sequence_once() {
 
     assert_eq!(2, second_token.logical_sequence());
     let first_reader = store
-        .read_at(first_token)
+        .read_at(first_token.into_state_token())
         .await
         .expect("open retained first-sequence reader");
     assert_eq!(
@@ -103,6 +103,43 @@ async fn transaction_scope_mismatch_fails_closed() {
             .logical_sequence()
     );
     assert!(store.committed_records().is_empty());
+}
+
+#[tokio::test]
+async fn transaction_request_ids_are_validated_before_model_transaction_begin() {
+    let store = ModelStateStore::new(scope());
+    let oversized = "é".repeat(129);
+    for invalid in [
+        String::new(),
+        "   ".to_string(),
+        ".".to_string(),
+        "..".to_string(),
+        "request/child".to_string(),
+        "request\\child".to_string(),
+        "request\nchild".to_string(),
+        oversized,
+    ] {
+        let result = store
+            .begin_txn(TxnOptions::default().with_request_id(invalid.clone()))
+            .await;
+        assert!(
+            matches!(result, Err(CatalogError::Validation { .. })),
+            "invalid request id {invalid:?} was accepted"
+        );
+    }
+
+    for valid in [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "01JDPG7Y3ZQ7N8M9K2T4V6W8XA",
+    ] {
+        assert!(
+            store
+                .begin_txn(TxnOptions::default().with_request_id(valid))
+                .await
+                .is_ok(),
+            "representative request id {valid:?} must be accepted"
+        );
+    }
 }
 
 #[tokio::test]

@@ -176,6 +176,8 @@ struct MirrorStateRef {
     logical_sequence: u64,
     checksum_sha256: String,
     index_checksum_sha256: String,
+    min_key_hex: Option<String>,
+    max_key_hex: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -203,10 +205,12 @@ struct MirrorManifest {
     logical_sequence: u64,
     base_manifest_id: Option<String>,
     writer_epoch: u64,
-    base_state: Option<MirrorStateRef>,
-    anchor_state: Option<MirrorStateRef>,
+    layout_generation: u64,
+    base_states: Vec<MirrorStateRef>,
+    anchor_states: Vec<MirrorStateRef>,
     tx_refs: Vec<MirrorTxRef>,
     state_checksum_sha256: String,
+    maintenance_intent: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -269,6 +273,8 @@ async fn install_malformed_l1(
             .expect("state index JSON");
     index["segmentChecksumSha256"] = Value::String(sha256(&malformed));
     index["rowCount"] = Value::from(row_count);
+    index["segmentSizeBytes"] =
+        Value::from(u64::try_from(malformed.len()).expect("malformed segment length fits in u64"));
     let min_key = index_keys.iter().copied().min();
     let max_key = index_keys.iter().copied().max();
     index["minKeyHex"] = min_key.map_or(Value::Null, |key| Value::String(hex::encode(key)));
@@ -296,9 +302,13 @@ async fn install_malformed_l1(
             .expect("selected manifest"),
     )
     .expect("manifest JSON");
-    manifest["payload"]["base_state"]["checksum_sha256"] = Value::String(sha256(&malformed));
-    manifest["payload"]["base_state"]["index_checksum_sha256"] =
+    manifest["payload"]["base_states"][0]["checksum_sha256"] = Value::String(sha256(&malformed));
+    manifest["payload"]["base_states"][0]["index_checksum_sha256"] =
         Value::String(sha256(&index_bytes));
+    manifest["payload"]["base_states"][0]["min_key_hex"] =
+        min_key.map_or(Value::Null, |key| Value::String(hex::encode(key)));
+    manifest["payload"]["base_states"][0]["max_key_hex"] =
+        max_key.map_or(Value::Null, |key| Value::String(hex::encode(key)));
     if let Some(state_checksum_sha256) = state_checksum_sha256 {
         *manifest["payload"]
             .get_mut("state_checksum_sha256")
@@ -330,7 +340,7 @@ async fn install_malformed_l1(
 }
 
 async fn assert_typed_read_error(store: ControlMvpStateStore) -> CatalogError {
-    let joined = tokio::spawn(async move { store.get(b"catalogs/seed").await }).await;
+    let joined = tokio::spawn(async move { store.current_projection_outbox().await }).await;
     let result = joined.expect("malformed segment read must not panic");
     assert!(
         matches!(result, Err(CatalogError::InvariantViolation { .. })),
@@ -508,6 +518,10 @@ async fn commit_persists_indexed_l0_and_l1_arrow_segments() {
             .expect("record batch offsets");
         let blocks = footer_blocks(segment);
         assert_eq!(blocks.len(), offsets.len());
+        assert_eq!(
+            index["segmentSizeBytes"].as_u64(),
+            Some(u64::try_from(segment.len()).expect("segment length"))
+        );
         for (stored, (actual, metadata_length, body_length)) in offsets.iter().zip(blocks) {
             assert_eq!(stored.as_u64().expect("stored batch offset"), actual);
             assert!(
@@ -977,7 +991,7 @@ async fn corrupted_segment_index_fails_closed_before_state_is_returned() {
     let result = storage
         .put_raw(
             &index_path,
-            Bytes::from_static(br#"{"formatVersion":3}"#),
+            Bytes::from_static(br#"{"formatVersion":4}"#),
             WritePrecondition::MatchesVersion(meta.version),
         )
         .await

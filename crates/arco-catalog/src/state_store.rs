@@ -10,8 +10,11 @@ use std::sync::Arc;
 use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
@@ -35,9 +38,10 @@ pub mod shadow_replay;
 pub(crate) mod workspace_binding_metadata;
 
 pub use control_mvp::{
-    ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
-    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
-    control_mvp_outbox_event_id,
+    ControlMvpGcCandidate, ControlMvpGcOutcome, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
+    ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
+    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
+    ControlMvpStateStore, ControlMvpTxn, control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 
@@ -333,6 +337,14 @@ impl ProjectionIntentV1 {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    pub(crate) fn source_token(&self) -> StateToken {
+        StateToken {
+            scope: self.source_scope.clone(),
+            logical_sequence: self.source_logical_sequence,
+            authority_manifest_id: self.source_authority_manifest_id.clone(),
+        }
     }
 }
 
@@ -848,6 +860,7 @@ impl CheckpointToken {
 pub struct TxnOptions {
     scope: Option<StateScope>,
     request_id: Option<String>,
+    operation_id: Option<String>,
 }
 
 impl TxnOptions {
@@ -857,6 +870,7 @@ impl TxnOptions {
         Self {
             scope,
             request_id: None,
+            operation_id: None,
         }
     }
 
@@ -864,6 +878,11 @@ impl TxnOptions {
     #[must_use]
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub(crate) fn with_operation_id(mut self, operation_id: impl Into<String>) -> Self {
+        self.operation_id = Some(operation_id.into());
         self
     }
 
@@ -879,6 +898,10 @@ impl TxnOptions {
         self.request_id.as_deref()
     }
 
+    pub(crate) fn operation_id(&self) -> Option<&str> {
+        self.operation_id.as_deref()
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if let Some(scope) = &self.scope {
             scope.validate()?;
@@ -891,6 +914,14 @@ impl TxnOptions {
             }
             validate_scope_component(request_id, "transaction request_id")?;
         }
+        if let Some(operation_id) = &self.operation_id {
+            if operation_id.len() > 128 {
+                return Err(CatalogError::Validation {
+                    message: "transaction operation_id must not exceed 128 UTF-8 bytes".to_string(),
+                });
+            }
+            validate_scope_component(operation_id, "transaction operation_id")?;
+        }
         Ok(())
     }
 }
@@ -900,6 +931,7 @@ impl TxnOptions {
 pub struct CheckpointOptions {
     scope: Option<StateScope>,
     min_retention_seconds: Option<u64>,
+    externally_retention_coordinated: bool,
 }
 
 impl CheckpointOptions {
@@ -909,6 +941,7 @@ impl CheckpointOptions {
         Self {
             scope,
             min_retention_seconds: None,
+            externally_retention_coordinated: false,
         }
     }
 
@@ -929,6 +962,19 @@ impl CheckpointOptions {
     #[must_use]
     pub const fn min_retention_seconds(&self) -> Option<u64> {
         self.min_retention_seconds
+    }
+
+    /// Marks a checkpoint publication as covered by the caller's already
+    /// claimed retention epoch. Only workspace retained-root publication may
+    /// construct this mode; public checkpoint callers cannot bypass the
+    /// store's own GC exclusion.
+    pub(crate) const fn with_external_retention_coordination(mut self) -> Self {
+        self.externally_retention_coordinated = true;
+        self
+    }
+
+    pub(crate) const fn is_externally_retention_coordinated(&self) -> bool {
+        self.externally_retention_coordinated
     }
 }
 
@@ -1054,6 +1100,535 @@ impl Eq for PredicateInputSet {}
 pub struct KvPair {
     key: Vec<u8>,
     value: VersionedValue,
+}
+
+/// Maximum decoded bytes returned by one state-store scan page.
+pub const MAX_SCAN_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum immutable segments a backend may fetch for one scan page.
+pub const MAX_SCAN_PAGE_SEGMENTS: usize = 64;
+
+/// Maximum rows accepted in one generic state-store scan request.
+pub const MAX_SCAN_PAGE_ROWS: usize = 1_000_000;
+
+/// Opaque cursor for the next page of one authority-pinned prefix scan.
+///
+/// The cursor binds the authority scope, prefix, manifest, logical sequence,
+/// and exclusive last key. Callers can clone and return it but cannot alter
+/// those fields independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanContinuation {
+    scope: StateScope,
+    prefix: Vec<u8>,
+    observed_token: StateToken,
+    exclusive_last_key: Vec<u8>,
+    query_binding: Option<Vec<u8>>,
+}
+
+const SCAN_CONTINUATION_VERSION: u32 = 2;
+const SCAN_CONTINUATION_PREFIX: &str = "v2.";
+const SCAN_CONTINUATION_AAD: &[u8] = b"arco/control-v1/scan-continuation/v2";
+const SCAN_CONTINUATION_NONCE_BYTES: usize = 12;
+const MAX_SCAN_CONTINUATION_ENCODED_BYTES: usize = 16 * 1024;
+
+/// Authenticated-encryption key for protocol continuations.
+///
+/// The key is shared by every protocol facade through the exact-root binding
+/// registry. Deployed servers construct it from one private replica-stable
+/// secret. It is deliberately non-serializable and redacted from debug output;
+/// explicit key rotation invalidates old cursors rather than exposing the
+/// authority token they retain.
+#[derive(Clone)]
+pub(crate) struct ScanContinuationKey(Arc<[u8; 32]>);
+
+impl fmt::Debug for ScanContinuationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ScanContinuationKey(<redacted>)")
+    }
+}
+
+impl ScanContinuationKey {
+    pub(crate) fn generate() -> Result<Self> {
+        let mut key = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut key)
+            .map_err(|_| CatalogError::Storage {
+                message: "secure scan-continuation key generation failed".to_string(),
+            })?;
+        Ok(Self(Arc::new(key)))
+    }
+
+    pub(crate) fn from_bytes(key: &[u8]) -> Result<Self> {
+        let key: [u8; 32] = key.try_into().map_err(|_| CatalogError::Validation {
+            message: "scan-continuation key must contain exactly 32 bytes".to_string(),
+        })?;
+        Ok(Self(Arc::new(key)))
+    }
+
+    fn less_safe_key(&self) -> Result<LessSafeKey> {
+        UnboundKey::new(&aead::AES_256_GCM, self.0.as_ref())
+            .map(LessSafeKey::new)
+            .map_err(|_| CatalogError::InvariantViolation {
+                message: "scan-continuation key has an invalid length".to_string(),
+            })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanContinuationEnvelope {
+    version: u32,
+    tenant_id: String,
+    workspace_id: String,
+    domain: String,
+    prefix_hex: String,
+    manifest_id: String,
+    logical_sequence: u64,
+    exclusive_last_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    query_binding_hex: Option<String>,
+}
+
+impl ScanContinuation {
+    pub(crate) fn encode_opaque(&self, key: &ScanContinuationKey) -> Result<String> {
+        let envelope = ScanContinuationEnvelope {
+            version: SCAN_CONTINUATION_VERSION,
+            tenant_id: self.scope.tenant_id().to_string(),
+            workspace_id: self.scope.workspace_id().to_string(),
+            domain: self.scope.domain().to_string(),
+            prefix_hex: hex::encode(&self.prefix),
+            manifest_id: self.observed_token.authority_manifest_id().to_string(),
+            logical_sequence: self.observed_token.logical_sequence(),
+            exclusive_last_key_hex: hex::encode(&self.exclusive_last_key),
+            query_binding_hex: self.query_binding.as_ref().map(hex::encode),
+        };
+        let mut plaintext =
+            serde_json::to_vec(&envelope).map_err(|error| CatalogError::Serialization {
+                message: format!("failed to encode scan continuation: {error}"),
+            })?;
+        let mut nonce_bytes = [0_u8; SCAN_CONTINUATION_NONCE_BYTES];
+        SystemRandom::new()
+            .fill(&mut nonce_bytes)
+            .map_err(|_| CatalogError::Storage {
+                message: "secure scan-continuation nonce generation failed".to_string(),
+            })?;
+        key.less_safe_key()?
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(SCAN_CONTINUATION_AAD),
+                &mut plaintext,
+            )
+            .map_err(|_| CatalogError::Serialization {
+                message: "failed to seal scan continuation".to_string(),
+            })?;
+        let mut sealed = Vec::with_capacity(SCAN_CONTINUATION_NONCE_BYTES + plaintext.len());
+        sealed.extend_from_slice(&nonce_bytes);
+        sealed.extend_from_slice(&plaintext);
+        Ok(format!(
+            "{SCAN_CONTINUATION_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(sealed)
+        ))
+    }
+
+    pub(crate) fn decode_opaque(value: &str, key: &ScanContinuationKey) -> Result<Self> {
+        let encoded = value
+            .strip_prefix(SCAN_CONTINUATION_PREFIX)
+            .ok_or_else(|| CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            })?;
+        if encoded.len() > MAX_SCAN_CONTINUATION_ENCODED_BYTES {
+            return Err(CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            });
+        }
+        let mut sealed = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            })?;
+        if sealed.len() <= SCAN_CONTINUATION_NONCE_BYTES + aead::AES_256_GCM.tag_len() {
+            return Err(CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            });
+        }
+        let nonce_bytes: [u8; SCAN_CONTINUATION_NONCE_BYTES] = sealed
+            .get(..SCAN_CONTINUATION_NONCE_BYTES)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            })?;
+        let plaintext = key
+            .less_safe_key()?
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(SCAN_CONTINUATION_AAD),
+                sealed
+                    .get_mut(SCAN_CONTINUATION_NONCE_BYTES..)
+                    .ok_or_else(|| CatalogError::Validation {
+                        message: "invalid opaque scan continuation".to_string(),
+                    })?,
+            )
+            .map_err(|_| CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            })?;
+        let envelope: ScanContinuationEnvelope =
+            serde_json::from_slice(plaintext).map_err(|_| CatalogError::Validation {
+                message: "invalid opaque scan continuation".to_string(),
+            })?;
+        if envelope.version != SCAN_CONTINUATION_VERSION {
+            return Err(CatalogError::Validation {
+                message: "unsupported opaque scan continuation version".to_string(),
+            });
+        }
+        let prefix = hex::decode(envelope.prefix_hex).map_err(|_| CatalogError::Validation {
+            message: "invalid opaque scan continuation prefix".to_string(),
+        })?;
+        let exclusive_last_key =
+            hex::decode(envelope.exclusive_last_key_hex).map_err(|_| CatalogError::Validation {
+                message: "invalid opaque scan continuation boundary".to_string(),
+            })?;
+        let query_binding = envelope
+            .query_binding_hex
+            .map(|binding| {
+                hex::decode(binding).map_err(|_| CatalogError::Validation {
+                    message: "invalid opaque scan continuation".to_string(),
+                })
+            })
+            .transpose()?;
+        let scope = StateScope::new(envelope.tenant_id, envelope.workspace_id, envelope.domain);
+        scope.validate()?;
+        Ok(Self {
+            observed_token: StateToken {
+                scope: scope.clone(),
+                logical_sequence: envelope.logical_sequence,
+                authority_manifest_id: envelope.manifest_id,
+            },
+            scope,
+            prefix,
+            exclusive_last_key,
+            query_binding,
+        })
+    }
+
+    pub(crate) const fn observed_token(&self) -> &StateToken {
+        &self.observed_token
+    }
+
+    pub(crate) fn bind_query(mut self, query_binding: Option<&[u8]>) -> Self {
+        self.query_binding = query_binding.map(<[u8]>::to_vec);
+        self
+    }
+
+    pub(crate) fn validate_query_binding(&self, expected: Option<&[u8]>) -> Result<()> {
+        if self.query_binding.as_deref() == expected {
+            Ok(())
+        } else {
+            Err(CatalogError::Validation {
+                message: "scan continuation query mismatch".to_string(),
+            })
+        }
+    }
+}
+
+/// Bounded request for a prefix scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRequest {
+    prefix: Vec<u8>,
+    start_after: Option<Vec<u8>>,
+    max_rows: usize,
+    max_bytes: usize,
+    max_segments: usize,
+    token: Option<ScanContinuation>,
+}
+
+impl ScanRequest {
+    /// Creates a request with the production hard budgets.
+    #[must_use]
+    pub fn new(prefix: impl AsRef<[u8]>) -> Self {
+        Self {
+            prefix: prefix.as_ref().to_vec(),
+            start_after: None,
+            max_rows: MAX_SCAN_PAGE_ROWS,
+            max_bytes: MAX_SCAN_PAGE_BYTES,
+            max_segments: MAX_SCAN_PAGE_SEGMENTS,
+            token: None,
+        }
+    }
+
+    /// Sets the exclusive initial key for the first page.
+    #[must_use]
+    pub fn with_start_after(mut self, start_after: impl AsRef<[u8]>) -> Self {
+        self.start_after = Some(start_after.as_ref().to_vec());
+        self
+    }
+
+    /// Sets requested row, decoded-byte, and segment budgets.
+    ///
+    /// The request is validated by the backend so construction stays
+    /// allocation-only and convenient for protocol adapters.
+    #[must_use]
+    pub const fn with_limits(
+        mut self,
+        max_rows: usize,
+        max_bytes: usize,
+        max_segments: usize,
+    ) -> Self {
+        self.max_rows = max_rows;
+        self.max_bytes = max_bytes;
+        self.max_segments = max_segments;
+        self
+    }
+
+    /// Continues a prior authority-pinned page.
+    #[must_use]
+    pub fn with_token(mut self, token: ScanContinuation) -> Self {
+        self.token = Some(token);
+        self
+    }
+
+    /// Returns the requested prefix.
+    #[must_use]
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
+    }
+
+    /// Returns the exclusive initial key, if supplied.
+    #[must_use]
+    pub fn start_after(&self) -> Option<&[u8]> {
+        self.start_after.as_deref()
+    }
+
+    /// Returns the maximum rows requested for the page.
+    #[must_use]
+    pub const fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+
+    /// Returns the maximum decoded bytes requested for the page.
+    #[must_use]
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Returns the maximum segments requested for the page.
+    #[must_use]
+    pub const fn max_segments(&self) -> usize {
+        self.max_segments
+    }
+
+    fn validate_for_scope(&self, scope: &StateScope) -> Result<()> {
+        if self.max_rows == 0 || self.max_rows > MAX_SCAN_PAGE_ROWS {
+            return Err(CatalogError::Validation {
+                message: format!("scan max_rows must be between 1 and {MAX_SCAN_PAGE_ROWS}"),
+            });
+        }
+        if self.max_bytes == 0 || self.max_bytes > MAX_SCAN_PAGE_BYTES {
+            return Err(CatalogError::Validation {
+                message: format!("scan max_bytes must be between 1 and {MAX_SCAN_PAGE_BYTES}"),
+            });
+        }
+        if self.max_segments == 0 || self.max_segments > MAX_SCAN_PAGE_SEGMENTS {
+            return Err(CatalogError::Validation {
+                message: format!(
+                    "scan max_segments must be between 1 and {MAX_SCAN_PAGE_SEGMENTS}"
+                ),
+            });
+        }
+        if self
+            .start_after
+            .as_ref()
+            .is_some_and(|key| !key.starts_with(&self.prefix))
+        {
+            return Err(CatalogError::Validation {
+                message: "scan start_after must be inside the requested prefix".to_string(),
+            });
+        }
+        if let Some(token) = &self.token {
+            if self.start_after.is_some() {
+                return Err(CatalogError::Validation {
+                    message: "scan continuation cannot be combined with start_after".to_string(),
+                });
+            }
+            if &token.scope != scope {
+                return Err(CatalogError::Validation {
+                    message: "scan continuation scope mismatch".to_string(),
+                });
+            }
+            if token.prefix != self.prefix {
+                return Err(CatalogError::Validation {
+                    message: "scan continuation prefix mismatch".to_string(),
+                });
+            }
+            if !token.exclusive_last_key.starts_with(&self.prefix) {
+                return Err(CatalogError::Validation {
+                    message: "scan continuation last key is outside its prefix".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn continuation_token(&self) -> Option<&StateToken> {
+        self.token.as_ref().map(|token| &token.observed_token)
+    }
+
+    fn effective_start_after(&self) -> Option<&[u8]> {
+        self.token
+            .as_ref()
+            .map_or(self.start_after.as_deref(), |token| {
+                Some(token.exclusive_last_key.as_slice())
+            })
+    }
+}
+
+/// One bounded page from an authority-pinned prefix scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPage {
+    entries: Vec<KvPair>,
+    continuation: Option<ScanContinuation>,
+    observed_token: Option<StateToken>,
+}
+
+impl ScanPage {
+    /// Returns entries in ascending binary-key order.
+    #[must_use]
+    pub fn entries(&self) -> &[KvPair] {
+        &self.entries
+    }
+
+    /// Returns the opaque cursor for a subsequent page, if more entries exist.
+    #[must_use]
+    pub const fn continuation(&self) -> Option<&ScanContinuation> {
+        self.continuation.as_ref()
+    }
+
+    /// Returns the authority cut observed by this page.
+    ///
+    /// An empty, never-committed backend has no authority token and returns
+    /// `None`; any non-empty page is always bound to a token.
+    #[must_use]
+    pub const fn observed_token(&self) -> Option<&StateToken> {
+        self.observed_token.as_ref()
+    }
+}
+
+pub(crate) fn build_scan_page(
+    scope: &StateScope,
+    request: ScanRequest,
+    observed_token: Option<StateToken>,
+    entries: impl IntoIterator<Item = KvPair>,
+) -> Result<ScanPage> {
+    request.validate_for_scope(scope)?;
+    if let Some(continued) = request.continuation_token()
+        && observed_token.as_ref() != Some(continued)
+    {
+        return Err(CatalogError::Validation {
+            message: "scan continuation authority mismatch".to_string(),
+        });
+    }
+
+    let start_after = request.effective_start_after();
+    let mut page_entries = Vec::new();
+    let mut decoded_bytes = 0_usize;
+    let mut has_more = false;
+    for entry in entries.into_iter().filter(|entry| {
+        entry.key().starts_with(request.prefix())
+            && start_after.is_none_or(|start| entry.key() > start)
+    }) {
+        let entry_bytes = entry
+            .key()
+            .len()
+            .checked_add(entry.value().bytes().len())
+            .ok_or_else(|| CatalogError::Validation {
+                message: "scan entry decoded byte size overflow".to_string(),
+            })?;
+        let would_exceed_rows = page_entries.len() == request.max_rows();
+        let would_exceed_bytes = decoded_bytes
+            .checked_add(entry_bytes)
+            .is_none_or(|total| total > request.max_bytes());
+        if would_exceed_rows || would_exceed_bytes {
+            if page_entries.is_empty() {
+                return Err(CatalogError::Validation {
+                    message: format!(
+                        "scan entry requires {entry_bytes} decoded bytes, above the requested page budget {}",
+                        request.max_bytes()
+                    ),
+                });
+            }
+            has_more = true;
+            break;
+        }
+        decoded_bytes += entry_bytes;
+        page_entries.push(entry);
+    }
+
+    let continuation = if has_more {
+        let observed_token =
+            observed_token
+                .as_ref()
+                .ok_or_else(|| CatalogError::InvariantViolation {
+                    message: "non-empty continued scan has no observed authority token".to_string(),
+                })?;
+        let exclusive_last_key = page_entries
+            .last()
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "continued scan page is unexpectedly empty".to_string(),
+            })?
+            .key()
+            .to_vec();
+        Some(ScanContinuation {
+            scope: scope.clone(),
+            prefix: request.prefix,
+            observed_token: observed_token.clone(),
+            exclusive_last_key,
+            query_binding: None,
+        })
+    } else {
+        None
+    };
+
+    Ok(ScanPage {
+        entries: page_entries,
+        continuation,
+        observed_token,
+    })
+}
+
+pub(crate) fn build_scan_page_with_backend_boundary(
+    scope: &StateScope,
+    request: ScanRequest,
+    observed_token: Option<StateToken>,
+    entries: impl IntoIterator<Item = KvPair>,
+    backend_resume_after: Option<Vec<u8>>,
+) -> Result<ScanPage> {
+    let prefix = request.prefix.clone();
+    let prior_boundary = request.effective_start_after().map(<[u8]>::to_vec);
+    let mut page = build_scan_page(scope, request, observed_token.clone(), entries)?;
+    if page.continuation.is_none()
+        && let Some(exclusive_last_key) = backend_resume_after
+    {
+        if !exclusive_last_key.starts_with(&prefix)
+            || prior_boundary
+                .as_deref()
+                .is_some_and(|prior| exclusive_last_key.as_slice() <= prior)
+        {
+            return Err(CatalogError::InvariantViolation {
+                message: "scan backend continuation boundary is not monotonic inside its prefix"
+                    .to_string(),
+            });
+        }
+        let observed_token = observed_token.ok_or_else(|| CatalogError::InvariantViolation {
+            message: "continued backend scan has no observed authority token".to_string(),
+        })?;
+        page.continuation = Some(ScanContinuation {
+            scope: scope.clone(),
+            prefix,
+            observed_token,
+            exclusive_last_key,
+            query_binding: None,
+        });
+    }
+    Ok(page)
 }
 
 impl KvPair {
@@ -1660,12 +2235,12 @@ pub trait ArcoStateReader: Send + Sync {
     /// Returns an error when the backend cannot perform the read.
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
-    /// Scans current key/value pairs by prefix.
+    /// Scans current key/value pairs under explicit row, byte, and segment budgets.
     ///
     /// # Errors
     ///
     /// Returns an error when the backend cannot perform the scan.
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvPair>>;
+    async fn scan(&self, request: ScanRequest) -> Result<ScanPage>;
 
     /// Opens a retained reader at a specific state token.
     ///
@@ -1680,6 +2255,59 @@ pub trait ArcoStateReader: Send + Sync {
     ///
     /// Returns an error when checkpoint reads are unsupported or invalid.
     async fn read_checkpoint(&self, token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>>;
+}
+
+pub(crate) async fn scan_all_entries_bounded(
+    reader: &dyn ArcoStateReader,
+    prefix: &[u8],
+    max_total_rows: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<KvPair>> {
+    if max_total_rows == 0 || max_total_bytes == 0 {
+        return Err(CatalogError::Validation {
+            message: "bounded scan aggregate limits must be positive".to_string(),
+        });
+    }
+    let mut entries = Vec::new();
+    let mut decoded_bytes = 0_usize;
+    let mut continuation = None;
+    loop {
+        let mut request = ScanRequest::new(prefix).with_limits(
+            MAX_SCAN_PAGE_ROWS,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        );
+        if let Some(token) = continuation.take() {
+            request = request.with_token(token);
+        }
+        let page = reader.scan(request).await?;
+        for entry in page.entries {
+            let entry_bytes = entry
+                .key()
+                .len()
+                .checked_add(entry.value().bytes().len())
+                .ok_or_else(|| CatalogError::MaintenanceBackpressure {
+                    message: "bounded scan aggregate byte count overflow".to_string(),
+                })?;
+            decoded_bytes = decoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+                CatalogError::MaintenanceBackpressure {
+                    message: "bounded scan aggregate byte count overflow".to_string(),
+                }
+            })?;
+            if entries.len() == max_total_rows || decoded_bytes > max_total_bytes {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: format!(
+                        "bounded scan exceeds aggregate limit of {max_total_rows} rows or {max_total_bytes} decoded bytes"
+                    ),
+                });
+            }
+            entries.push(entry);
+        }
+        continuation = page.continuation;
+        if continuation.is_none() {
+            return Ok(entries);
+        }
+    }
 }
 
 /// Administrative state-store operations.
@@ -1836,12 +2464,12 @@ pub trait ArcoStateTxn: Send + Sync {
     /// Returns an error when the backend cannot perform the read.
     async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>>;
 
-    /// Scans key/value pairs by prefix inside the transaction.
+    /// Scans key/value pairs under explicit budgets inside the transaction.
     ///
     /// # Errors
     ///
     /// Returns an error when the backend cannot perform the scan.
-    async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>>;
+    async fn scan(&mut self, request: ScanRequest) -> Result<ScanPage>;
 
     /// Stages a value write.
     ///
@@ -1922,6 +2550,59 @@ pub trait ArcoStateTxn: Send + Sync {
     async fn rollback(self: Box<Self>) -> Result<()>;
 }
 
+pub(crate) async fn scan_txn_all_entries_bounded(
+    txn: &mut dyn ArcoStateTxn,
+    prefix: &[u8],
+    max_total_rows: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<KvPair>> {
+    if max_total_rows == 0 || max_total_bytes == 0 {
+        return Err(CatalogError::Validation {
+            message: "bounded transaction scan aggregate limits must be positive".to_string(),
+        });
+    }
+    let mut entries = Vec::new();
+    let mut decoded_bytes = 0_usize;
+    let mut continuation = None;
+    loop {
+        let mut request = ScanRequest::new(prefix).with_limits(
+            MAX_SCAN_PAGE_ROWS,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        );
+        if let Some(token) = continuation.take() {
+            request = request.with_token(token);
+        }
+        let page = txn.scan(request).await?;
+        for entry in page.entries {
+            let entry_bytes = entry
+                .key()
+                .len()
+                .checked_add(entry.value().bytes().len())
+                .ok_or_else(|| CatalogError::MaintenanceBackpressure {
+                    message: "bounded transaction scan aggregate byte count overflow".to_string(),
+                })?;
+            decoded_bytes = decoded_bytes.checked_add(entry_bytes).ok_or_else(|| {
+                CatalogError::MaintenanceBackpressure {
+                    message: "bounded transaction scan aggregate byte count overflow".to_string(),
+                }
+            })?;
+            if entries.len() == max_total_rows || decoded_bytes > max_total_bytes {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: format!(
+                        "bounded transaction scan exceeds aggregate limit of {max_total_rows} rows or {max_total_bytes} decoded bytes"
+                    ),
+                });
+            }
+            entries.push(entry);
+        }
+        continuation = page.continuation;
+        if continuation.is_none() {
+            return Ok(entries);
+        }
+    }
+}
+
 /// Capability-only adapter for today's ledger plus synchronous compactor path.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CurrentStateStore;
@@ -1943,7 +2624,7 @@ impl ArcoStateReader for CurrentStateStore {
         Err(unsupported("point reads through arco-state-current"))
     }
 
-    async fn scan_prefix(&self, _prefix: &[u8]) -> Result<Vec<KvPair>> {
+    async fn scan(&self, _request: ScanRequest) -> Result<ScanPage> {
         Err(unsupported("range reads through arco-state-current"))
     }
 

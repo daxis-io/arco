@@ -2,12 +2,128 @@
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, CatalogError, KeyRange, ModelStateStore,
-    PredicateInputSet, StateScope, TxnOptions,
+    PredicateInputSet, ScanRequest, StateScope, TxnOptions,
 };
 use bytes::Bytes;
 
 fn scope() -> StateScope {
     StateScope::new("tenant", "workspace", "catalog")
+}
+
+#[tokio::test]
+async fn scan_pages_are_bounded_and_keep_the_observed_authority_cut() {
+    let store = ModelStateStore::new(scope());
+    let mut seed = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin seed transaction");
+    for (key, value) in [
+        (&b"catalog/a"[..], &b"one"[..]),
+        (&b"catalog/b"[..], &b"two"[..]),
+        (&b"catalog/c"[..], &b"three"[..]),
+    ] {
+        seed.put(key, Bytes::copy_from_slice(value))
+            .await
+            .expect("stage seed value");
+    }
+    let seeded = seed.commit().await.expect("commit seed transaction");
+
+    let first = store
+        .scan(ScanRequest::new(b"catalog/").with_limits(2, 1024, 64))
+        .await
+        .expect("first page");
+    assert_eq!(
+        vec![b"catalog/a".to_vec(), b"catalog/b".to_vec()],
+        first
+            .entries()
+            .iter()
+            .map(|entry| entry.key().to_vec())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        seeded.authority_manifest_id(),
+        first
+            .observed_token()
+            .expect("first page authority token")
+            .authority_manifest_id()
+    );
+    let continuation = first
+        .continuation()
+        .expect("first page continuation")
+        .clone();
+
+    let mut advance = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin advancing transaction");
+    advance
+        .put(b"catalog/d", Bytes::from_static(b"new-head-only"))
+        .await
+        .expect("stage head-only value");
+    advance.commit().await.expect("advance current head");
+
+    let second = store
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(2, 1024, 64)
+                .with_token(continuation.clone()),
+        )
+        .await
+        .expect("second page at retained authority");
+    assert_eq!(
+        vec![b"catalog/c".to_vec()],
+        second
+            .entries()
+            .iter()
+            .map(|entry| entry.key().to_vec())
+            .collect::<Vec<_>>()
+    );
+    assert!(second.continuation().is_none());
+    assert_eq!(
+        seeded.authority_manifest_id(),
+        second
+            .observed_token()
+            .expect("second page authority token")
+            .authority_manifest_id()
+    );
+
+    let wrong_prefix = store
+        .scan(
+            ScanRequest::new(b"schema/")
+                .with_limits(2, 1024, 64)
+                .with_token(continuation.clone()),
+        )
+        .await
+        .expect_err("continuation must be prefix-bound");
+    assert!(matches!(wrong_prefix, CatalogError::Validation { .. }));
+
+    let other_scope = ModelStateStore::new(StateScope::new("tenant", "other", "catalog"));
+    let wrong_scope = other_scope
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(2, 1024, 64)
+                .with_token(continuation),
+        )
+        .await
+        .expect_err("continuation must be scope-bound");
+    assert!(matches!(wrong_scope, CatalogError::Validation { .. }));
+}
+
+#[tokio::test]
+async fn scan_request_rejects_zero_and_over_hard_budget_limits() {
+    let store = ModelStateStore::new(scope());
+    for request in [
+        ScanRequest::new(b"catalog/").with_limits(0, 1024, 1),
+        ScanRequest::new(b"catalog/").with_limits(1, 0, 1),
+        ScanRequest::new(b"catalog/").with_limits(1, 1024, 0),
+        ScanRequest::new(b"catalog/").with_limits(1, 4 * 1024 * 1024 + 1, 1),
+        ScanRequest::new(b"catalog/").with_limits(1, 1024, 65),
+    ] {
+        assert!(matches!(
+            store.scan(request).await,
+            Err(CatalogError::Validation { .. })
+        ));
+    }
 }
 
 #[tokio::test]
@@ -23,13 +139,16 @@ async fn accepted_commits_advance_logical_sequence_once() {
         .await
         .expect("stage first write");
     let staged_pairs = first_txn
-        .scan_prefix(b"catalog/")
+        .scan(ScanRequest::new(b"catalog/").with_limits(1, 1024, 64))
         .await
         .expect("scan staged writes");
-    assert_eq!(1, staged_pairs.len());
-    assert_eq!(b"catalog/default", staged_pairs[0].key());
-    assert_eq!(Bytes::from_static(b"v1"), *staged_pairs[0].value().bytes());
-    assert_eq!(None, staged_pairs[0].value().generation());
+    assert_eq!(1, staged_pairs.entries().len());
+    assert_eq!(b"catalog/default", staged_pairs.entries()[0].key());
+    assert_eq!(
+        Bytes::from_static(b"v1"),
+        *staged_pairs.entries()[0].value().bytes()
+    );
+    assert_eq!(None, staged_pairs.entries()[0].value().generation());
     let first_token = first_txn.commit().await.expect("commit first transaction");
 
     assert_eq!(1, first_token.logical_sequence());

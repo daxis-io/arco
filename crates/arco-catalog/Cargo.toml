@@ -57,6 +57,8 @@ chrono = { workspace = true }
 # Hashing
 sha2 = { workspace = true }
 hex = { workspace = true }
+base64 = { workspace = true }
+ring = { workspace = true }
 
 # Identifiers
 ulid = { workspace = true }

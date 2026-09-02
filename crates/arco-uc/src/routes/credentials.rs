@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use arco_catalog::CatalogReader;
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::credential_vending::{
@@ -168,7 +167,8 @@ pub(crate) async fn post_temporary_table_credentials(
         return credential_denied(&reason_code, None);
     }
 
-    let table = CatalogReader::new(storage)
+    let table = crate::routes::common::catalog_authority(&state, &ctx)
+        .await?
         .get_table_by_id(&table_id)
         .await
         .map_err(map_catalog_error)?

@@ -4,7 +4,7 @@
 //! catalog ledger and manifest-published snapshot path.
 
 use arco_catalog::authz::privileges::Privilege;
-use arco_catalog::{CatalogError, CatalogReader};
+use arco_catalog::{CatalogAuthority, CatalogError};
 use arco_catalog::{ColumnDefinition, RegisterTableInSchemaRequest};
 use arco_core::IcebergPaths;
 use axum::Json;
@@ -160,7 +160,7 @@ fn column_value(column: arco_catalog::writer::Column) -> Value {
 }
 
 async fn table_info_with_columns(
-    reader: &CatalogReader,
+    reader: &CatalogAuthority,
     catalog_name: &str,
     schema_name: &str,
     table: arco_catalog::writer::Table,
@@ -174,25 +174,6 @@ async fn table_info_with_columns(
     let mut info = table_info_base(catalog_name, schema_name, table);
     info.columns = Some(columns);
     Ok(info)
-}
-
-fn paginate_tables(
-    tables: &[TableInfo],
-    pagination: &preview::Pagination,
-) -> (Vec<TableInfo>, Option<String>) {
-    let start = pagination.start();
-    if start >= tables.len() {
-        return (Vec::new(), None);
-    }
-
-    let end = start.saturating_add(pagination.limit()).min(tables.len());
-    let next_page_token = (end < tables.len()).then(|| end.to_string());
-    (
-        tables
-            .get(start..end)
-            .map_or_else(Vec::new, ToOwned::to_owned),
-        next_page_token,
-    )
 }
 
 fn column_definitions(columns: &[Value]) -> UnityCatalogResult<Vec<ColumnDefinition>> {
@@ -277,12 +258,15 @@ pub(crate) async fn get_tables(
         request_id = %ctx.request_id,
         catalog_name = %catalog_name,
         schema_name = %schema_name,
-        page_token = ?query.page_token,
+        page_token_present = query.page_token.is_some(),
         max_results = ?query.max_results,
         "unity catalog list tables from authoritative catalog state"
     );
-    let pagination = preview::parse_pagination(
-        query.page_token.as_deref(),
+    if !common::uses_control_v1_catalog_authority(&state, &ctx) {
+        preview::validate_legacy_page_token(query.page_token.as_deref())?;
+    }
+    let pagination = preview::catalog_list_request(
+        query.page_token,
         query.max_results,
         preview::DEFAULT_PAGE_SIZE,
         50,
@@ -293,15 +277,16 @@ pub(crate) async fn get_tables(
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("catalog not found: {catalog_name}"),
         })?;
-    let mut tables = reader
-        .list_tables_in_schema(&catalog_name, &schema_name)
+    let page = reader
+        .list_tables_page(&catalog_name, &schema_name, pagination)
         .await
-        .map_err(common::map_catalog_error)?
+        .map_err(common::map_catalog_error)?;
+    let next_page_token = page.next_page_token().map(str::to_string);
+    let tables = page
+        .into_items()
         .into_iter()
         .map(|table| table_info_base(&catalog_name, &schema_name, table))
         .collect::<Vec<_>>();
-    tables.sort_by(|left, right| left.name.cmp(&right.name));
-    let (tables, next_page_token) = paginate_tables(&tables, &pagination);
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
@@ -309,7 +294,7 @@ pub(crate) async fn get_tables(
         catalog_name = %catalog_name,
         schema_name = %schema_name,
         tables = tables.len(),
-        next_page_token = ?next_page_token,
+        next_page_token_present = next_page_token.is_some(),
         "unity catalog listed tables from authoritative catalog state"
     );
 
@@ -427,9 +412,9 @@ pub(crate) async fn post_tables(
     .map_err(common::map_catalog_error)?;
 
     let authoritative_columns = column_definitions(&columns)?;
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let table = writer
-        .register_table_in_schema(
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let table = authority
+        .register_table(
             &catalog_name,
             &schema_name,
             RegisterTableInSchemaRequest {
@@ -505,7 +490,7 @@ pub(crate) async fn get_table(
             message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
         })?;
     let table = reader
-        .get_table_in_schema(&catalog_name, &schema_name, &table_name)
+        .get_table(&catalog_name, &schema_name, &table_name)
         .await
         .map_err(common::map_catalog_error)?
         .ok_or_else(|| UnityCatalogError::NotFound {
@@ -551,9 +536,16 @@ pub(crate) async fn delete_table(
         "unity catalog delete table from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let commit = writer
-        .drop_table_in_schema_transaction(
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let table = authority
+        .get_table(&catalog_name, &schema_name, &table_name)
+        .await
+        .map_err(common::map_catalog_error)?
+        .ok_or_else(|| UnityCatalogError::NotFound {
+            message: format!("table not found: {catalog_name}.{schema_name}.{table_name}"),
+        })?;
+    authority
+        .drop_table(
             &catalog_name,
             &schema_name,
             &table_name,
@@ -562,11 +554,8 @@ pub(crate) async fn delete_table(
         .await
         .map_err(common::map_catalog_error)?;
 
-    if let Some(dropped_table) = commit
-        .dropped_table
-        .filter(|table| is_iceberg_table(table.format.as_deref()))
-    {
-        if let Ok(uuid) = Uuid::parse_str(&dropped_table.table_id) {
+    if is_iceberg_table(table.format.as_deref()) {
+        if let Ok(uuid) = Uuid::parse_str(&table.id) {
             let pointer_path = IcebergPaths::pointer_path(&uuid);
             let storage = common::scoped_storage(&state, &ctx)?;
             if let Err(err) = storage.delete(&pointer_path).await {

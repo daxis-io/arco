@@ -25,7 +25,8 @@ use arco_catalog::manifest::CommitRecord;
 use arco_catalog::write_options::{CatalogTransactionIdentity, WriteOptions};
 use arco_catalog::writer::{CatalogTransactionCommit, CatalogTransactionRequest};
 use arco_catalog::{
-    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, TablePatch, Tier1Compactor,
+    CatalogAuthorityKind, CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest,
+    TablePatch, Tier1Compactor,
 };
 use arco_core::ScopedStorage;
 use arco_core::canonical_json::to_canonical_bytes;
@@ -921,6 +922,20 @@ impl<'a> ControlPlaneTransactionService<'a> {
         command: CatalogMutation,
         claim_policy: IdempotencyClaimPolicy<'_>,
     ) -> Result<TxExecutionOutcome<CatalogTxReceipt>, ApiError> {
+        // This transaction stack is part of the legacy synchronous-compactor
+        // authority. A control/v1 root must never reach it, including through
+        // root transactions or durable handles. The catalog-facing HTTP, UC,
+        // and Iceberg routes use CatalogAuthority directly; until this legacy
+        // receipt protocol is redesigned around StateToken it fails closed.
+        if self
+            .state
+            .catalog_authority_bindings()
+            .resolve(&self.ctx.tenant, &self.ctx.workspace)
+            == CatalogAuthorityKind::ControlV1
+        {
+            return Err(ApiError::legacy_catalog_transaction_disabled()
+                .with_request_id(meta.request_id.clone()));
+        }
         let request_hash = command.request_hash()?;
         let idempotency_path = ControlPlaneTxPaths::idempotency(
             ControlPlaneTxDomain::Catalog,

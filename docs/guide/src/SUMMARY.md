@@ -18,6 +18,7 @@
 
 - [Documentation Map](./reference/documentation-map.md)
 - [Control-Plane Scope](./reference/control-plane-scope.md)
+- [Catalog Authority Hard Cut](./reference/catalog-authority-hard-cut.md)
 - [System Catalog](./reference/system-catalog.md)
 - [Orchestration Product Contract](./reference/orchestration-product-contract.md)
 - [Orchestration Embedding](./reference/orchestration-embedding.md)

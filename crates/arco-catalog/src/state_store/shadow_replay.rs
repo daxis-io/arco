@@ -34,7 +34,10 @@ use bytes::Bytes;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{ArcoStateReader, ArcoStateStore, ControlMvpStateStore, StateScope, TxnOptions};
+use super::{
+    ArcoStateStore, ControlMvpStateStore, MAX_SCAN_PAGE_ROWS, StateScope, TxnOptions,
+    scan_all_entries_bounded, scan_txn_all_entries_bounded,
+};
 use crate::error::{CatalogError, Result};
 use crate::idempotency::CATALOG_IDEMPOTENCY_PREFIX;
 use crate::manifest::{CatalogDomainManifest, DomainManifestPointer, compute_manifest_hash};
@@ -502,7 +505,14 @@ async fn import_rows_into_shadow(
         )
         .await?;
 
-    for existing in txn.scan_prefix(KEY_PREFIX.as_bytes()).await? {
+    for existing in scan_txn_all_entries_bounded(
+        txn.as_mut(),
+        KEY_PREFIX.as_bytes(),
+        MAX_SCAN_PAGE_ROWS,
+        64 * 1024 * 1024,
+    )
+    .await?
+    {
         if !rows.contains_key(existing.key()) {
             txn.delete(existing.key()).await?;
         }
@@ -613,12 +623,16 @@ pub async fn compare_extended_catalog_shadow(
 }
 
 async fn scan_shadow_rows(store: &ControlMvpStateStore) -> Result<BTreeMap<Vec<u8>, Bytes>> {
-    Ok(store
-        .scan_prefix(KEY_PREFIX.as_bytes())
-        .await?
-        .into_iter()
-        .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
-        .collect())
+    Ok(scan_all_entries_bounded(
+        store,
+        KEY_PREFIX.as_bytes(),
+        MAX_SCAN_PAGE_ROWS,
+        64 * 1024 * 1024,
+    )
+    .await?
+    .into_iter()
+    .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
+    .collect())
 }
 
 fn base_comparisons(

@@ -4,6 +4,11 @@
 
 Accepted
 
+This ADR is the canonical authority decision for `control/v1`. ADR-018 remains
+the active legacy catalog path until an exact root completes the hard-cut
+procedure below. Planner/runtime migration and the proposed ADR-042 lineage
+model are outside the first metastore milestone.
+
 ## Context
 
 Arco's current catalog write path makes synchronous Parquet publication the
@@ -66,16 +71,27 @@ This ADR fixes the following invariants.
    public gRPC listener are removed at the catalog cutover. Flow may retain
    deterministic folding, but that operation is a projection and is not named
    or treated as logical catalog compaction.
-9. A required L1 replay anchor is rendered before any candidate transaction,
-   segment, manifest, or head object is published. Row, byte, or index overflow
-   returns `MaintenanceBackpressure`; the kernel does not skip the anchor or
-   permit an unbounded replay suffix.
+9. Production logical mutations publish only bounded L0/manifest artifacts.
+   They durably request layout maintenance at 16 reachable L0 segments and
+   return `MaintenanceBackpressure` at 32 if consolidation has not completed.
+   A separate worker publishes equivalent L1 state through exact CAS without
+   incrementing logical sequence. Row, byte, index, or envelope overflow fails
+   before the oversized candidate is published.
 10. Current restore plans persist the positive checkpoint interval used to
     decide and render their replay anchor. Inspection and application use that
     durable value, not the receiving process's current configuration. Retired
     v1/v2 plans remain supersession-only, and a non-`control/v1` authority
     reference returns `UnsupportedAuthorityFormat` with hard-cut recovery
     direction.
+11. The first metastore cut is a seeded synthetic `(tenant_id, workspace_id)`
+    root. Native, UC, and Iceberg catalog operations switch together. The
+    winning `StateToken` is bound internally and is not exposed in those
+    protocols during the pilot.
+12. The pilot uses conservative active collection: unreachable candidates are
+    eligible only after seven days, token and checkpoint pins are retained for
+    30 days, and pre-cutover exports plus legacy authority artifacts are kept
+    indefinitely. Projection p99 lag must be at most 10 seconds, with no normal
+    interval above 60 seconds, throughout a seven-consecutive-day soak.
 
 ### Layout
 
@@ -100,14 +116,22 @@ reference; mutation and outbox payloads live only in the Arrow segment.
 Indexes bind the segment checksum and record key bounds, actual Arrow
 record-batch offsets, Bloom data, and row counts.
 
-The current kernel validates and replays a bounded manifest suffix from its
-Arrow segments. It does not yet use index ranges and Bloom data to avoid full
-segment reads for point and prefix lookups. Index-pruned reads, paginated scans,
-the API-level 1.5-second CAS retry loop, retention/GC, and real-S3 performance
-qualification are cutover requirements rather than claims of this revision.
-JSON artifact byte caps, consolidation, and retention/GC also remain cutover
-work; typed L1 backpressure is the bounded fail-closed behavior at the current
-capacity ceiling.
+The current v4 kernel validates ordered L1 shard bounds, consults checksummed
+index ranges and Bloom data before Arrow fetches, and pins scan continuations
+to an exact authority manifest. JSON artifacts and decoded pages are bounded.
+Logical commits durably request layout maintenance at 16 reachable L0 segments
+and fail closed at 32; a separately constructed worker publishes equivalent
+L1 state through exact head CAS without incrementing logical sequence. Active
+retention/GC is resumable across bounded inventory pages, coordinates with
+checkpoint publication, and revalidates the head and retention epoch before
+deletion. Very wide prefix scans continue across bounded segment and raw-read
+budgets while retaining the original authority cut. The API-level 1.5-second
+catalog conflict loop and stable protocol mappings are locally implemented.
+The public implementation attempts a fail-open process-local projection wake
+after each committed intent, while durable anti-entropy remains authoritative.
+Real-S3 correctness/performance evidence, provider queue delivery, and
+always-on deployed worker scheduling remain cutover requirements rather than
+claims of this revision.
 
 ### Cutover and qualification
 
@@ -119,9 +143,10 @@ throughput, corruption, recovery, retention, and maintenance gates.
 The provider adapters use a distinct single-attempt client for conditional
 writes so ambiguous transport failures reach the kernel's reconciliation path,
 while safe reads and legacy operations retain the upstream bounded retry policy.
-Any future provider-internal conditional retry mode, plus production HTTP
-error-envelope mapping for the new kernel errors, must be qualified during
-route cutover; they are not established by this repository-only remediation.
+Any future provider-internal conditional retry mode, plus the deployed HTTP
+error-envelope behavior for the new kernel errors, must be qualified during
+route cutover; repository-only mappings and tests do not establish live
+behavior.
 
 ### Storage ownership
 
@@ -154,10 +179,9 @@ or another state-store dependency.
 
 - Logical mutation success no longer depends on projection publication or a
   synchronous compactor service.
-- Ordinary point reads and bounded scans will use index-pruned control
-  segments before cutover; this revision supplies and validates the index but
-  still replays each selected segment. Parquet stays useful for system-table
-  and discovery projections.
+- Ordinary point, prefix, retained-token, and bounded paginated reads use
+  checksummed index bounds and Bloom metadata before fetching selected Arrow
+  segments. Parquet stays useful for system-table and discovery projections.
 - Immutable losing-CAS artifacts and failed post-commit deliveries require
   recovery, anti-entropy, and garbage-collection workers.
 - Cross-root workflows are explicit sagas with fences and receipts rather than

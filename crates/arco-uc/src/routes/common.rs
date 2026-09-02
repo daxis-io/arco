@@ -6,7 +6,9 @@ use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogError, CatalogReader, CatalogWriter, Tier1Compactor};
+use arco_catalog::{
+    CatalogAuthority, CatalogAuthorityKind, CatalogError, StateScope, Tier1Compactor,
+};
 use arco_core::{CatalogPaths, ControlPlaneScope, ScopedStorage};
 use serde::{Deserialize, Deserializer};
 
@@ -51,6 +53,7 @@ fn unity_catalog_error_for_status(http_status: u16, message: String) -> UnityCat
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
     match err {
         CatalogError::Validation { message } => UnityCatalogError::BadRequest { message },
@@ -63,6 +66,38 @@ pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
         CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
             UnityCatalogError::Conflict { message }
         }
+        CatalogError::StaleWriterEpoch { message } => {
+            tracing::warn!(internal_error = %message, "UC catalog authority fencing failure");
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_FENCED",
+                message: "Catalog authority fencing check failed".to_string(),
+                retry_after_seconds: 1,
+            }
+        }
+        CatalogError::AmbiguousAuthorityOutcome { message } => {
+            tracing::warn!(internal_error = %message, "ambiguous UC catalog authority outcome");
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_UNKNOWN_OUTCOME",
+                message: "Catalog mutation outcome is not yet known".to_string(),
+                retry_after_seconds: 1,
+            }
+        }
+        CatalogError::MaintenanceBackpressure { message } => {
+            tracing::warn!(internal_error = %message, "UC catalog authority maintenance backpressure");
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_MAINTENANCE_BACKPRESSURE",
+                message: "Catalog authority maintenance is catching up".to_string(),
+                retry_after_seconds: 5,
+            }
+        }
+        CatalogError::UnsupportedAuthorityFormat { message } => {
+            tracing::warn!(internal_error = %message, "unsupported UC catalog authority format");
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_UNSUPPORTED_FORMAT",
+                message: "Catalog authority format is not supported by this server".to_string(),
+                retry_after_seconds: 5,
+            }
+        }
         CatalogError::RequestFailed {
             http_status,
             message,
@@ -72,22 +107,28 @@ pub(crate) fn map_catalog_error(err: CatalogError) -> UnityCatalogError {
         },
         CatalogError::Storage { message } => {
             tracing::warn!(internal_error = %message, "redacted UC storage error");
-            UnityCatalogError::ServiceUnavailable {
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_UNAVAILABLE",
                 message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
+                retry_after_seconds: 1,
             }
         }
         CatalogError::Serialization { message }
         | CatalogError::Parquet { message }
         | CatalogError::InvariantViolation { message } => {
             tracing::warn!(internal_error = %message, "redacted UC internal error");
-            UnityCatalogError::Internal {
-                message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_CORRUPT",
+                message: "Catalog authority state failed integrity validation".to_string(),
+                retry_after_seconds: 5,
             }
         }
         error => {
-            tracing::warn!(internal_error = %error, "redacted unknown UC catalog error");
-            UnityCatalogError::Internal {
+            tracing::warn!(internal_error = %error, "redacted unknown UC catalog authority error");
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code: "CATALOG_AUTHORITY_UNAVAILABLE",
                 message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
+                retry_after_seconds: 1,
             }
         }
     }
@@ -103,6 +144,35 @@ pub(crate) fn writer_options(ctx: &UnityCatalogRequestContext) -> WriteOptions {
     } else {
         options
     }
+}
+
+pub(crate) fn reject_table_commit_for_control_v1(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+) -> Result<(), UnityCatalogError> {
+    if state
+        .catalog_authority_bindings
+        .resolve(&ctx.tenant, &ctx.workspace)
+        == CatalogAuthorityKind::ControlV1
+    {
+        return Err(UnityCatalogError::CatalogAuthorityUnavailable {
+            error_code: "CATALOG_AUTHORITY_TABLE_COMMIT_DISABLED",
+            message: "Table-format commits are not enabled for the control/v1 catalog-DDL pilot"
+                .to_string(),
+            retry_after_seconds: 5,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn uses_control_v1_catalog_authority(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+) -> bool {
+    state
+        .catalog_authority_bindings
+        .resolve(&ctx.tenant, &ctx.workspace)
+        == CatalogAuthorityKind::ControlV1
 }
 
 #[allow(clippy::option_option)]
@@ -286,26 +356,57 @@ pub(crate) async fn require_authz(
 pub(crate) async fn authoritative_catalog_reader(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
-) -> Result<Option<CatalogReader>, UnityCatalogError> {
+) -> Result<Option<CatalogAuthority>, UnityCatalogError> {
     let storage = scoped_storage(state, ctx)?;
+    if state
+        .catalog_authority_bindings
+        .resolve(&ctx.tenant, &ctx.workspace)
+        == CatalogAuthorityKind::ControlV1
+    {
+        return CatalogAuthority::control_v1_bound(
+            storage,
+            StateScope::new(&ctx.tenant, &ctx.workspace, "catalog"),
+            state.catalog_authority_bindings.as_ref(),
+        )
+        .map(Some)
+        .map_err(map_catalog_error);
+    }
     let initialized = storage
         .head_raw(CatalogPaths::ROOT_MANIFEST)
         .await
         .map_err(|err| map_catalog_error(CatalogError::from(err)))?
         .is_some();
 
-    Ok(initialized.then(|| CatalogReader::new(storage)))
+    if !initialized {
+        return Ok(None);
+    }
+    Ok(Some(CatalogAuthority::legacy_existing(
+        storage.clone(),
+        Arc::new(Tier1Compactor::new(storage)),
+    )))
 }
 
-pub(crate) async fn initialized_catalog_writer(
+pub(crate) async fn catalog_authority(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
-) -> Result<CatalogWriter, UnityCatalogError> {
+) -> Result<CatalogAuthority, UnityCatalogError> {
     let storage = scoped_storage(state, ctx)?;
-    let writer = CatalogWriter::new(storage.clone())
-        .with_sync_compactor(Arc::new(Tier1Compactor::new(storage.clone())));
-    writer.initialize().await.map_err(map_catalog_error)?;
-    Ok(writer)
+    match state
+        .catalog_authority_bindings
+        .resolve(&ctx.tenant, &ctx.workspace)
+    {
+        CatalogAuthorityKind::Legacy => {
+            CatalogAuthority::legacy(storage.clone(), Arc::new(Tier1Compactor::new(storage)))
+                .await
+                .map_err(map_catalog_error)
+        }
+        CatalogAuthorityKind::ControlV1 => CatalogAuthority::control_v1_bound(
+            storage,
+            StateScope::new(&ctx.tenant, &ctx.workspace, "catalog"),
+            state.catalog_authority_bindings.as_ref(),
+        )
+        .map_err(map_catalog_error),
+    }
 }
 
 #[cfg(test)]
@@ -320,9 +421,14 @@ mod tests {
         });
 
         match err {
-            UnityCatalogError::ServiceUnavailable { message }
-            | UnityCatalogError::Internal { message } => {
+            UnityCatalogError::CatalogAuthorityUnavailable {
+                error_code,
+                message,
+                retry_after_seconds,
+            } => {
+                assert_eq!(error_code, "CATALOG_AUTHORITY_UNAVAILABLE");
                 assert_eq!(message, "Service temporarily unavailable");
+                assert_eq!(retry_after_seconds, 1);
                 assert!(!message.contains("prod-secret"));
                 assert!(!message.contains("tenant=acme"));
             }

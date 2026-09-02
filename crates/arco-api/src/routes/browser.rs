@@ -45,6 +45,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use arco_catalog::CatalogAuthorityKind;
 use arco_core::CatalogDomain;
 
 use crate::context::RequestContext;
@@ -137,6 +138,15 @@ pub(crate) async fn mint_urls(
             return Err(e);
         }
     };
+
+    if domain == CatalogDomain::Catalog
+        && state
+            .catalog_authority_bindings()
+            .resolve(&ctx.tenant, &ctx.workspace)
+            == CatalogAuthorityKind::ControlV1
+    {
+        return Err(ApiError::catalog_projection_unavailable());
+    }
 
     // Bound TTL
     let ttl_seconds = req

@@ -1403,7 +1403,8 @@ impl WorkspaceSnapshotService {
                 .run_external_mutation(
                     binding.state_store.checkpoint(
                         CheckpointOptions::new(Some(binding.state_scope.clone()))
-                            .with_min_retention_seconds(retention_seconds),
+                            .with_min_retention_seconds(retention_seconds)
+                            .with_external_retention_coordination(),
                     ),
                 )
                 .await?;

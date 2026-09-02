@@ -132,7 +132,7 @@ async fn resolve_permission_object_id(
             };
             map_optional_object(
                 reader
-                    .get_table_in_schema(catalog_name, schema_name, table_name)
+                    .get_table(catalog_name, schema_name, table_name)
                     .await,
             )?
             .map(|table| table.id)

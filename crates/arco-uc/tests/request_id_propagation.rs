@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use arco_catalog::Tier1CompactorFactory;
 use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
 use arco_catalog::authz::privileges::Privilege;
 use arco_core::storage::MemoryBackend;
@@ -16,8 +17,9 @@ use tower::ServiceExt;
 
 fn test_router() -> axum::Router {
     let backend = Arc::new(MemoryBackend::new());
-    let state =
-        UnityCatalogState::new(backend).with_compiled_permissions(create_table_permissions());
+    let state = UnityCatalogState::new(backend)
+        .with_compiled_permissions(create_table_permissions())
+        .with_compactor_factory(Arc::new(Tier1CompactorFactory));
     unity_catalog_router(state)
 }
 

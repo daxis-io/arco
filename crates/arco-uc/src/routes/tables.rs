@@ -643,7 +643,7 @@ mod tests {
     use std::sync::Arc;
 
     use arco_catalog::write_options::WriteOptions;
-    use arco_catalog::{CatalogWriter, Tier1Compactor};
+    use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1CompactorFactory};
     use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
     use arco_core::{IcebergPaths, ScopedStorage};
     use axum::body::Body;
@@ -708,7 +708,10 @@ mod tests {
                 .is_some()
         );
 
-        let app = unity_catalog_router(UnityCatalogState::new(storage_backend));
+        let app = unity_catalog_router(
+            UnityCatalogState::new(storage_backend)
+                .with_compactor_factory(Arc::new(Tier1CompactorFactory)),
+        );
         let response = app
             .oneshot(
                 Request::builder()

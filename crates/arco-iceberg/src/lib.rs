@@ -118,10 +118,7 @@ pub use pointer::{
 };
 pub use pointer_store::IcebergPointerStore;
 pub use router::iceberg_router;
-pub use state::{
-    CredentialProvider, IcebergConfig, IcebergState, SharedCompactorFactory, SyncCompactorFactory,
-    Tier1CompactorFactory,
-};
+pub use state::{CredentialProvider, IcebergConfig, IcebergState};
 
 // Re-export reconciler types
 pub use reconciler::{IcebergReconciler, Reconciler, ReconciliationReport};

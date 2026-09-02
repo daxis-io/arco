@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arco_catalog::Tier1CompactorFactory;
 use arco_catalog::authz::compiler::{CompiledPermissionRow, CompiledPermissionSet};
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::metastore::events::{
@@ -125,7 +126,9 @@ async fn governed_scope_stale_projection_denies_closed() {
 
 fn router(backend: Arc<dyn StorageBackend>) -> Router {
     unity_catalog_router(
-        UnityCatalogState::new(backend).with_compiled_permissions(create_table_permissions()),
+        UnityCatalogState::new(backend)
+            .with_compiled_permissions(create_table_permissions())
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory)),
     )
 }
 

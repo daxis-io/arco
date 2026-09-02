@@ -486,8 +486,8 @@ async fn handle_multi_table_commit(
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;
-    use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{Tier1Compactor, Tier1CompactorFactory};
     use arco_core::ScopedStorage;
     use arco_core::storage::MemoryBackend;
     use axum::body::Body;
@@ -501,7 +501,7 @@ mod tests {
             ..Default::default()
         };
         IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory))
     }
 
     async fn seed_table(state: &IcebergState, namespace: &str, table: &str) {
@@ -654,7 +654,7 @@ mod tests {
             ..Default::default()
         };
         IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory))
     }
 
     #[tokio::test]

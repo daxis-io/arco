@@ -1380,9 +1380,8 @@ async fn maybe_vended_credentials(
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;
-    use arco_catalog::CatalogWriter;
-    use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1CompactorFactory};
     use arco_core::ScopedStorage;
     use arco_core::storage::{
         MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -1482,7 +1481,7 @@ mod tests {
             ..Default::default()
         };
         IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory))
     }
 
     fn build_state_with_table_crud_and_write_enabled() -> IcebergState {
@@ -1493,7 +1492,7 @@ mod tests {
             ..Default::default()
         };
         IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory))
     }
 
     async fn seed_table(state: &IcebergState, namespace: &str, table: &str) -> String {
@@ -2746,7 +2745,7 @@ mod tests {
             ..Default::default()
         };
         let state = IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory));
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory));
 
         seed_namespace_only(&state, "conflict_ns").await;
 
@@ -2802,7 +2801,7 @@ mod tests {
             ..Default::default()
         };
         let state = IcebergState::with_config(storage, config)
-            .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory));
+            .with_compactor_factory(Arc::new(Tier1CompactorFactory));
 
         let scoped = ScopedStorage::new(Arc::clone(&state.storage), "acme", "analytics")
             .expect("scoped storage");

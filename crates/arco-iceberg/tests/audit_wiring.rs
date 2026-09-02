@@ -14,13 +14,13 @@
 use std::sync::Arc;
 
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogWriter, RegisterTableRequest, Tier1Compactor};
+use arco_catalog::{CatalogWriter, RegisterTableRequest, Tier1Compactor, Tier1CompactorFactory};
 use arco_core::ScopedStorage;
 use arco_core::audit::{AuditAction, AuditEmitter, TestAuditSink};
 use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_iceberg::pointer::IcebergTablePointer;
 use arco_iceberg::router::iceberg_router;
-use arco_iceberg::state::{IcebergConfig, IcebergState, Tier1CompactorFactory};
+use arco_iceberg::state::{IcebergConfig, IcebergState};
 use arco_iceberg::types::{
     CommitTableRequest, PartitionSpec, Schema, SchemaField, SortOrder, TableMetadata, TableUuid,
     UpdateRequirement,

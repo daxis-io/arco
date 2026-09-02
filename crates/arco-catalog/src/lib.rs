@@ -102,6 +102,7 @@ mod state;
 pub mod state_store;
 pub mod storage_governance;
 pub mod sync_compactor;
+pub mod sync_compactor_factory;
 pub mod tier1_compactor;
 pub mod tier1_events;
 pub mod tier1_snapshot;
@@ -154,6 +155,9 @@ pub use state_store::{
     control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
+pub use sync_compactor_factory::{
+    SharedCompactorFactory, SyncCompactorFactory, Tier1CompactorFactory,
+};
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};
 pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 pub use tier1_writer::Tier1Writer;

@@ -517,9 +517,8 @@ pub(crate) async fn update_namespace_properties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arco_catalog::CatalogWriter;
-    use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{CatalogWriter, Tier1Compactor, Tier1CompactorFactory};
     use arco_core::ScopedStorage;
     use arco_core::storage::MemoryBackend;
     use axum::body::Body;
@@ -527,7 +526,7 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    use crate::state::{IcebergConfig, Tier1CompactorFactory};
+    use crate::state::IcebergConfig;
 
     fn build_state() -> IcebergState {
         let storage = Arc::new(MemoryBackend::new());

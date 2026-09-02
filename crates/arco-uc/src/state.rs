@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
+use arco_catalog::{SyncCompactor, SyncCompactorFactory};
+use arco_core::ScopedStorage;
 
+use crate::error::{UnityCatalogError, UnityCatalogResult};
 use crate::permissions::CompiledPermissionSource;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
@@ -41,6 +44,8 @@ pub struct UnityCatalogState {
     pub permission_source: Option<Arc<dyn CompiledPermissionSource>>,
     /// Published storage-governance projection cache for credential decisions.
     pub storage_governance_cache: Arc<PublishedStorageGovernanceCache>,
+    /// Optional factory for creating per-tenant compactors.
+    pub compactor_factory: Option<Arc<dyn SyncCompactorFactory>>,
     /// Optional security audit event emitter.
     pub audit_emitter: Option<AuditEmitter>,
 }
@@ -55,6 +60,7 @@ impl UnityCatalogState {
             compiled_permissions: None,
             permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
+            compactor_factory: None,
             audit_emitter: None,
         }
     }
@@ -68,6 +74,7 @@ impl UnityCatalogState {
             compiled_permissions: None,
             permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
+            compactor_factory: None,
             audit_emitter: None,
         }
     }
@@ -88,6 +95,30 @@ impl UnityCatalogState {
     pub fn with_permission_source(mut self, source: Arc<dyn CompiledPermissionSource>) -> Self {
         self.permission_source = Some(source);
         self
+    }
+
+    /// Adds a compactor factory for UC CRUD operations.
+    #[must_use]
+    pub fn with_compactor_factory(mut self, factory: Arc<dyn SyncCompactorFactory>) -> Self {
+        self.compactor_factory = Some(factory);
+        self
+    }
+
+    /// Creates a compactor for the given scoped storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnityCatalogError::Internal` if no compactor factory is configured.
+    pub fn create_compactor(
+        &self,
+        storage: &ScopedStorage,
+    ) -> UnityCatalogResult<Arc<dyn SyncCompactor>> {
+        self.compactor_factory
+            .as_ref()
+            .map(|f| f.create_compactor(storage.clone()))
+            .ok_or_else(|| UnityCatalogError::Internal {
+                message: "Catalog CRUD operations require a compactor factory".to_string(),
+            })
     }
 
     /// Adds an audit emitter for UC security decisions.

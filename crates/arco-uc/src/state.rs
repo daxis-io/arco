@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
+use arco_catalog::CatalogAuthorityBindings;
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
 
@@ -43,6 +44,8 @@ pub struct UnityCatalogState {
     pub storage_governance_cache: Arc<PublishedStorageGovernanceCache>,
     /// Optional security audit event emitter.
     pub audit_emitter: Option<AuditEmitter>,
+    /// Exact-root catalog authority bindings; unlisted roots remain legacy.
+    pub catalog_authority_bindings: Arc<CatalogAuthorityBindings>,
 }
 
 impl UnityCatalogState {
@@ -56,6 +59,7 @@ impl UnityCatalogState {
             permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -69,6 +73,7 @@ impl UnityCatalogState {
             permission_source: None,
             storage_governance_cache: Arc::new(PublishedStorageGovernanceCache::default()),
             audit_emitter: None,
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -94,6 +99,16 @@ impl UnityCatalogState {
     #[must_use]
     pub fn with_audit_emitter(mut self, audit_emitter: AuditEmitter) -> Self {
         self.audit_emitter = Some(audit_emitter);
+        self
+    }
+
+    /// Installs validated exact-root catalog authority bindings.
+    #[must_use]
+    pub fn with_catalog_authority_bindings(
+        mut self,
+        bindings: Arc<CatalogAuthorityBindings>,
+    ) -> Self {
+        self.catalog_authority_bindings = bindings;
         self
     }
 }

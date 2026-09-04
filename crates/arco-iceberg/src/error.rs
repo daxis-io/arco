@@ -227,7 +227,6 @@ impl IcebergError {
 }
 
 const PUBLIC_STORAGE_UNAVAILABLE_MESSAGE: &str = "Service temporarily unavailable";
-const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
 
 /// Iceberg REST Catalog error response format.
 ///
@@ -274,6 +273,18 @@ impl From<CatalogError> for IcebergError {
             CatalogError::PreconditionFailed { message } | CatalogError::CasFailed { message } => {
                 map_catalog_commit_conflict(message)
             }
+            CatalogError::StaleWriterEpoch { message } => {
+                map_authority_unavailable("catalog_authority_fenced", &message, 1)
+            }
+            CatalogError::AmbiguousAuthorityOutcome { message } => {
+                map_authority_unavailable("catalog_authority_unknown_outcome", &message, 1)
+            }
+            CatalogError::MaintenanceBackpressure { message } => {
+                map_authority_unavailable("catalog_authority_maintenance_backpressure", &message, 5)
+            }
+            CatalogError::UnsupportedAuthorityFormat { message } => {
+                map_authority_unavailable("catalog_authority_unsupported_format", &message, 5)
+            }
             CatalogError::RequestFailed {
                 http_status,
                 message,
@@ -281,12 +292,24 @@ impl From<CatalogError> for IcebergError {
             CatalogError::Storage { message } => map_catalog_storage(&message),
             CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
-            | CatalogError::InvariantViolation { message } => map_catalog_internal(&message),
+            | CatalogError::InvariantViolation { message } => {
+                map_authority_unavailable("catalog_authority_corrupt", &message, 5)
+            }
             CatalogError::UnsupportedOperation { message } => {
                 Self::UnsupportedOperation { message }
             }
-            error => map_unknown_catalog_error(&error),
+            error => {
+                map_authority_unavailable("catalog_authority_unavailable", &error.to_string(), 1)
+            }
         }
+    }
+}
+
+fn map_authority_unavailable(code: &str, internal_message: &str, retry_after: u32) -> IcebergError {
+    tracing::warn!(internal_error = %internal_message, authority_code = %code, "redacted Iceberg catalog authority error");
+    IcebergError::ServiceUnavailable {
+        message: format!("{code}: catalog authority is temporarily unavailable"),
+        retry_after_seconds: Some(retry_after),
     }
 }
 
@@ -359,20 +382,6 @@ fn map_catalog_storage(message: &str) -> IcebergError {
     IcebergError::ServiceUnavailable {
         message: PUBLIC_STORAGE_UNAVAILABLE_MESSAGE.to_string(),
         retry_after_seconds: None,
-    }
-}
-
-fn map_catalog_internal(message: &str) -> IcebergError {
-    tracing::warn!(internal_error = %message, "redacted Iceberg internal error");
-    IcebergError::Internal {
-        message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
-    }
-}
-
-fn map_unknown_catalog_error(error: &CatalogError) -> IcebergError {
-    tracing::warn!(internal_error = %error, "redacted unknown Iceberg catalog error");
-    IcebergError::Internal {
-        message: PUBLIC_INTERNAL_ERROR_MESSAGE.to_string(),
     }
 }
 

@@ -5,8 +5,8 @@
 
 #![allow(clippy::option_option)]
 
+use arco_catalog::CatalogError;
 use arco_catalog::writer::SchemaPatch;
-use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Extension, Path, Query, State};
@@ -124,25 +124,6 @@ fn schema_info(catalog_name: &str, schema: arco_catalog::writer::Schema) -> Sche
     }
 }
 
-fn paginate_schemas(
-    schemas: &[SchemaInfo],
-    pagination: &preview::Pagination,
-) -> (Vec<SchemaInfo>, Option<String>) {
-    let start = pagination.start();
-    if start >= schemas.len() {
-        return (Vec::new(), None);
-    }
-
-    let end = start.saturating_add(pagination.limit()).min(schemas.len());
-    let next_page_token = (end < schemas.len()).then(|| end.to_string());
-    (
-        schemas
-            .get(start..end)
-            .map_or_else(Vec::new, ToOwned::to_owned),
-        next_page_token,
-    )
-}
-
 fn validate_storage_root(value: Option<String>) -> UnityCatalogResult<Option<String>> {
     value
         .map(|storage_root| preview::require_non_empty_string(Some(storage_root), "storage_root"))
@@ -221,12 +202,15 @@ pub(crate) async fn get_schemas(
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalog_name = %catalog_name,
-        page_token = ?query.page_token,
+        page_token_present = query.page_token.is_some(),
         max_results = ?query.max_results,
         "unity catalog list schemas from authoritative catalog state"
     );
-    let pagination = preview::parse_pagination(
-        query.page_token.as_deref(),
+    if !common::uses_control_v1_catalog_authority(&state, &ctx) {
+        preview::validate_legacy_page_token(query.page_token.as_deref())?;
+    }
+    let pagination = preview::catalog_list_request(
+        query.page_token,
         query.max_results,
         preview::DEFAULT_PAGE_SIZE,
         1000,
@@ -237,22 +221,23 @@ pub(crate) async fn get_schemas(
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("catalog not found: {catalog_name}"),
         })?;
-    let mut schemas = reader
-        .list_schemas(&catalog_name)
+    let page = reader
+        .list_schemas_page(&catalog_name, pagination)
         .await
-        .map_err(common::map_catalog_error)?
+        .map_err(common::map_catalog_error)?;
+    let next_page_token = page.next_page_token().map(str::to_string);
+    let schemas = page
+        .into_items()
         .into_iter()
         .map(|schema| schema_info(&catalog_name, schema))
         .collect::<Vec<_>>();
-    schemas.sort_by(|left, right| left.name.cmp(&right.name));
-    let (schemas, next_page_token) = paginate_schemas(&schemas, &pagination);
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalog_name = %catalog_name,
         schemas = schemas.len(),
-        next_page_token = ?next_page_token,
+        next_page_token_present = next_page_token.is_some(),
         "unity catalog listed schemas from authoritative catalog state"
     );
 
@@ -303,8 +288,8 @@ pub(crate) async fn post_schemas(
         "unity catalog create schema on authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let schema = writer
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let schema = authority
         .create_schema_with_metadata(
             &catalog_name,
             &name,
@@ -419,9 +404,9 @@ pub(crate) async fn update_schema(
         "unity catalog update schema on authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let schema = writer
-        .patch_schema_in_catalog(
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let schema = authority
+        .patch_schema(
             &catalog_name,
             &schema_name,
             SchemaPatch {
@@ -476,11 +461,10 @@ pub(crate) async fn delete_schema(
         "unity catalog delete schema from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let authority = common::catalog_authority(&state, &ctx).await?;
     if !force {
-        let reader = CatalogReader::new(writer.storage().clone());
-        let tables = reader
-            .list_tables_in_schema(&catalog_name, &schema_name)
+        let tables = authority
+            .list_tables(&catalog_name, &schema_name)
             .await
             .map_err(common::map_catalog_error)?;
         if !tables.is_empty() {
@@ -490,8 +474,8 @@ pub(crate) async fn delete_schema(
         }
     }
 
-    writer
-        .delete_schema_in_catalog(
+    authority
+        .delete_schema(
             &catalog_name,
             &schema_name,
             force,

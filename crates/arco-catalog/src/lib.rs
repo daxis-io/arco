@@ -79,6 +79,7 @@
 pub mod asset;
 pub mod audit;
 pub mod authz;
+pub mod catalog_authority;
 pub mod compactor;
 pub mod credential_vending;
 pub mod error;
@@ -115,6 +116,11 @@ pub mod writer;
 
 // Re-export main types at crate root
 pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest};
+pub use catalog_authority::{
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority, CatalogAuthorityBinding,
+    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListPage, CatalogListRequest,
+    CatalogProjectionMaterializer, CatalogProjectionNotifier, ControlCatalogAuthority,
+};
 pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};
 pub use event_writer::EventWriter;
@@ -143,15 +149,17 @@ pub use retention_coordination::{
 pub use search_tombstone::{SearchTombstone, TombstoneBatch, TombstoneReason};
 pub use state_store::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, CommitOutcome, ControlMvpOutboxTrimTarget, ControlMvpPaths,
-    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
-    ControlMvpStateStore, ControlMvpTxn, CurrentStateStore, KeyRange, KvPair,
-    LayoutMaintenanceIntentV1, LayoutMaintenanceReason, ModelCommitRecord, ModelStateStore,
-    ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
-    PersistedRestoreParticipantPlan, PredicateInputSet, ProjectionIntentV1, RestoreAttemptIdentity,
-    RestoreParticipantInspection, RestoredAuthorityEvidence, StateRestoreParticipant, StateScope,
-    StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
-    control_mvp_outbox_event_id,
+    CheckpointToken, CommitOutcome, ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker,
+    ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
+    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
+    CurrentStateStore, KeyRange, KvPair, LayoutMaintenanceIntentV1, LayoutMaintenanceReason,
+    MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_ROWS, MAX_SCAN_PAGE_SEGMENTS, ModelCommitRecord,
+    ModelStateStore, ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind,
+    PersistedAuthorityReference, PersistedRestoreParticipantPlan, PredicateInputSet,
+    ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
+    RestoredAuthorityEvidence, ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant,
+    StateScope, StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions,
+    VersionedValue, control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};
@@ -159,8 +167,9 @@ pub use tier1_events::{CatalogDdlEvent, LineageDdlEvent};
 pub use tier1_writer::Tier1Writer;
 pub use write_options::{IdempotencyKey, SnapshotVersion, WriteOptions};
 pub use writer::{
-    Catalog, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge, Namespace,
-    RegisterTableInSchemaRequest, RegisterTableRequest, Schema, Table, TablePatch,
+    Catalog, CatalogPatch, CatalogWriter, Column, ColumnDefinition, EventSource, LineageEdge,
+    Namespace, RegisterTableInSchemaRequest, RegisterTableRequest, Schema, SchemaPatch, Table,
+    TablePatch,
 };
 
 /// Creates a publish permit issuer for sync compaction.

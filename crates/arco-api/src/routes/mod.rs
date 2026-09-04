@@ -1,6 +1,7 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub(crate) mod catalog_authority;
 pub mod catalogs;
 pub mod control_store;
 pub mod delta;

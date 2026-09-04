@@ -63,12 +63,14 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use arco_catalog::CatalogError;
 use arco_catalog::state_store::projection_outbox_acks::{
     AckOnlyProjectionHandler, ProjectionOutboxWorker,
 };
 use arco_catalog::state_store::shadow_replay::{
     ShadowComparisonStatus, ShadowDifferenceClass, import_current_catalog_shadow,
+};
+use arco_catalog::{
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogError, CatalogProjectionMaterializer,
 };
 
 use crate::context::RequestContext;
@@ -94,7 +96,8 @@ pub fn routes() -> Router<Arc<AppState>> {
 pub struct ControlStoreOutboxRequest {
     source_domain: String,
     consumer_id: String,
-    /// Operator drain: acknowledge pending records WITHOUT projecting them.
+    /// Drain pending records. Catalog uses the materializer; other internal
+    /// domains retain the explicitly operator-only acknowledgement handler.
     #[serde(default)]
     drain: bool,
     /// Trim events this consumer already acknowledged from the source outbox.
@@ -116,8 +119,8 @@ pub struct ControlStoreOutboxRequest {
 /// Fails closed in both directions: an authenticated principal without the
 /// group is refused, and so is *every* principal when no group is configured.
 /// The refusal never falls back to "authenticated is good enough", because the
-/// operations behind it (ack-only drain, binding transfer, source trim) can
-/// silently destroy projection data for the legitimate consumer.
+/// operations behind it (materialization/drain, binding transfer, source trim)
+/// can silently destroy projection data for the legitimate consumer.
 fn authorize_operator(
     state: &AppState,
     ctx: &RequestContext,
@@ -178,10 +181,26 @@ async fn projection_outbox_handler(
     let resource = format!("control-store/projection-outbox:{}", request.source_domain);
     authorize_operator(&state, &ctx, &resource)?;
 
+    if request.source_domain == "catalog" {
+        if request.consumer_id != CATALOG_PARQUET_PROJECTION_CONSUMER_ID {
+            return Err(ApiError::bad_request(format!(
+                "the catalog projection outbox is reserved for consumer {CATALOG_PARQUET_PROJECTION_CONSUMER_ID}"
+            )));
+        }
+        if request.force_rebind_consumer || request.trim {
+            return Err(ApiError::bad_request(
+                "catalog projection acknowledgements are isolated from catalog authority; source-domain rebind and trim are unsupported",
+            ));
+        }
+    }
+
     let storage = ctx.scoped_storage(state.storage_backend()?)?;
-    let worker =
-        ProjectionOutboxWorker::new(storage, &request.source_domain, request.consumer_id.clone())
-            .map_err(control_store_error)?;
+    let worker = ProjectionOutboxWorker::new(
+        storage.clone(),
+        &request.source_domain,
+        request.consumer_id.clone(),
+    )
+    .map_err(control_store_error)?;
 
     // An externally supplied epoch is a request to publish *at* that epoch,
     // never a grant of authority over it: the store additionally requires it
@@ -206,10 +225,25 @@ async fn projection_outbox_handler(
         None
     };
     let drain_report = if request.drain {
-        let report = worker
-            .drain(&AckOnlyProjectionHandler)
-            .await
-            .map_err(control_store_error)?;
+        let report = if request.source_domain == "catalog" {
+            let materializer =
+                CatalogProjectionMaterializer::new(storage).map_err(control_store_error)?;
+            let materializer = match request.writer_epoch {
+                Some(epoch) => materializer
+                    .with_writer_epoch(epoch)
+                    .map_err(control_store_error)?,
+                None => materializer,
+            };
+            materializer
+                .drain_once()
+                .await
+                .map_err(control_store_error)?
+        } else {
+            worker
+                .drain(&AckOnlyProjectionHandler)
+                .await
+                .map_err(control_store_error)?
+        };
         crate::audit::emit_control_store_mutation(&state, &ctx, &format!("{resource}:drain"));
         Some(report)
     } else {

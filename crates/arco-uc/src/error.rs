@@ -67,6 +67,16 @@ pub enum UnityCatalogError {
         /// Human readable message.
         message: String,
     },
+    /// Fail-closed catalog authority error with a stable code and retry delay.
+    #[error("{message}")]
+    CatalogAuthorityUnavailable {
+        /// Stable machine-readable catalog authority code.
+        error_code: &'static str,
+        /// Human readable redacted message.
+        message: String,
+        /// Retry delay in seconds.
+        retry_after_seconds: u64,
+    },
     /// Request rate was limited.
     #[error("{message}")]
     TooManyRequests {
@@ -147,6 +157,19 @@ impl UnityCatalogError {
                     },
                 },
             ),
+            Self::CatalogAuthorityUnavailable {
+                error_code,
+                message,
+                ..
+            } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                UnityCatalogErrorResponse {
+                    error: UnityCatalogErrorDetail {
+                        error_code: (*error_code).to_string(),
+                        message: message.clone(),
+                    },
+                },
+            ),
             Self::TooManyRequests { message } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 UnityCatalogErrorResponse {
@@ -172,7 +195,17 @@ impl UnityCatalogError {
 impl IntoResponse for UnityCatalogError {
     fn into_response(self) -> Response {
         let (status, payload) = self.to_status_and_payload();
-        (status, axum::Json(payload)).into_response()
+        let mut response = (status, axum::Json(payload)).into_response();
+        if let Self::CatalogAuthorityUnavailable {
+            retry_after_seconds,
+            ..
+        } = self
+        {
+            if let Ok(value) = retry_after_seconds.to_string().parse() {
+                response.headers_mut().insert("Retry-After", value);
+            }
+        }
+        response
     }
 }
 

@@ -1,16 +1,17 @@
 //! Object-store-backed control-state MVP.
 //!
-//! # Replay model (format version 3)
+//! # Replay model (format version 4)
 //!
-//! Every manifest anchors its replay on an optional immutable indexed Arrow
-//! IPC state segment (`segments/l1/{state_id}.arrow`) and carries only the transaction suffix
-//! committed since that anchor. Loading current state therefore costs one
-//! segment read plus at most `checkpoint_interval` transaction/L0 reads,
-//! independent of total history length. Commits that fill the interval write a
-//! L1 segment of their resulting state and record it as `anchor_state` so
-//! successors start a fresh suffix; explicit checkpoints materialize (or
-//! reuse) the same segment objects so `read_checkpoint` never replays
-//! history. Segments and their indexes are bound by raw-byte checksums in every
+//! Every manifest anchors replay on an ordered set of checksummed, non-overlapping
+//! immutable Arrow IPC L1 segments and carries only the transaction suffix
+//! committed since that anchor. Point and prefix reads consult segment indexes
+//! before fetching Arrow data. Production commits request asynchronous layout
+//! maintenance at 16 reachable L0 segments and fail closed at 32; the worker
+//! renders L1 shards at half the hard segment capacity without advancing the
+//! logical sequence. Explicit non-production checkpoint intervals may render
+//! anchors inline for deterministic restore tests. Checkpoints materialize (or
+//! reuse) the same segment set so `read_checkpoint` never replays history.
+//! Segments and their indexes are bound by raw-byte checksums in every
 //! reference; corrupt or substituted data fails closed.
 //!
 //! # Writer fencing
@@ -56,9 +57,9 @@
 //!
 //! # Format versioning
 //!
-//! Format version 3 is the only supported on-disk format and is rooted beneath
+//! Format version 4 is the only supported on-disk format and is rooted beneath
 //! the fresh `control/v1/` prefix. There is deliberately no migration path from
-//! the JSON-anchor format version 2 (or version 1): unknown and old
+//! the version 3 shadow format or the older JSON-anchor formats: unknown and old
 //! `format_version` values fail closed instead of being migrated.
 //!
 //! Restore *plans* are versioned separately from on-disk state artifacts,
@@ -76,6 +77,7 @@ use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use arco_core::lock::DistributedLock;
 use arco_core::storage::WriteResult;
 use arco_core::{AuthorityWritePrecondition, ScopedAuthorityStore, ScopedStorage};
 use arrow::array::{
@@ -89,7 +91,7 @@ use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flatbuffers::VerifierOptions;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -97,13 +99,19 @@ use ulid::Ulid;
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, CommitOutcome, KeyRange, KvPair, PersistedAuthorityAdapter,
-    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
-    PredicateInputSet, ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
-    RestoredAuthorityEvidence, StateRestoreParticipant, StateScope, StateStoreBindingIdentity,
-    StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
+    CheckpointToken, CommitOutcome, KeyRange, KvPair, LayoutMaintenanceIntentV1,
+    LayoutMaintenanceReason, PersistedAuthorityAdapter, PersistedAuthorityKind,
+    PersistedAuthorityReference, PersistedRestoreParticipantPlan, PredicateInputSet,
+    ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
+    RestoredAuthorityEvidence, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
+    StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
+    build_scan_page, build_scan_page_with_backend_boundary, scan_all_entries_bounded,
 };
 use crate::error::{CatalogError, Result};
+use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
+use crate::workspace_snapshot::{
+    RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
+};
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
@@ -113,13 +121,20 @@ const RESTORE_PLAN_VERSION: u32 = 3;
 /// dereferencing paths from the retired layout.
 const RESTORE_PLAN_VERSION_V1: u32 = 1;
 const RESTORE_PLAN_VERSION_V2: u32 = 2;
-const CONTROL_MVP_FORMAT_VERSION: u32 = 3;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 4;
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SCAN_ARROW_BYTES: usize = MAX_SEGMENT_BYTES;
 const MAX_SEGMENT_INDEX_BYTES: usize = 512 * 1024;
 const MAX_SEGMENT_ROWS: usize = 1_000_000;
 const MAX_SEGMENT_FOOTER_TABLES: usize = 64;
 const MAX_SEGMENT_FOOTER_DEPTH: usize = 16;
 const MAX_SEGMENT_FOOTER_APPARENT_BYTES: usize = 1024 * 1024;
+const MAX_HEAD_JSON_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_JSON_BYTES: usize = 1024 * 1024;
+const MAX_TRANSACTION_JSON_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROJECTION_INTENT_AGGREGATE_BYTES: usize = 4 * 1024 * 1024;
+const L0_MAINTENANCE_INTENT_THRESHOLD: usize = 16;
+const L0_MAINTENANCE_BACKPRESSURE_THRESHOLD: usize = 32;
 const EMPTY_CURRENT_BASE_MARKER: &[u8] =
     br#"{"record_type":"control_mvp_empty_current_base","version":1}"#;
 
@@ -140,6 +155,7 @@ const PRODUCTION_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
 #[derive(Clone)]
 pub struct ControlMvpStateStore {
     storage: ScopedAuthorityStore,
+    retention: ScopedStorage,
     binding_identity: StateStoreBindingIdentity,
     scope: StateScope,
     paths: ControlMvpPaths,
@@ -176,7 +192,8 @@ impl ControlMvpStateStore {
         let binding_identity = StateStoreBindingIdentity::from_scoped_storage(&storage);
 
         Ok(Self {
-            storage: ScopedAuthorityStore::new(storage),
+            storage: ScopedAuthorityStore::new(storage.clone()),
+            retention: storage,
             binding_identity,
             scope,
             paths,
@@ -285,7 +302,11 @@ impl ControlMvpStateStore {
             writer_epoch: claimed_epoch,
             ..pointer
         };
-        let claimed_bytes = encode_json(&claimed, "control MVP epoch-claim pointer")?;
+        let claimed_bytes = encode_json_limited(
+            &claimed,
+            MAX_HEAD_JSON_BYTES,
+            "control MVP epoch-claim head",
+        )?;
         let pointer_write = self
             .storage
             .put(
@@ -349,7 +370,10 @@ impl ControlMvpStateStore {
             "beginning a control MVP transaction",
         )?;
         let request_id = opts.request_id().map(ToOwned::to_owned);
-        let suffix = Ulid::new().to_string().to_ascii_lowercase();
+        let suffix = opts.operation_id().map_or_else(
+            || Ulid::new().to_string().to_ascii_lowercase(),
+            ToOwned::to_owned,
+        );
         let tx_id = request_id.clone().map_or_else(
             || format!("tx-{next_sequence:020}-{suffix}"),
             |request_id| format!("tx-{next_sequence:020}-{request_id}-{suffix}"),
@@ -399,8 +423,9 @@ impl ControlMvpStateStore {
                 pointer_version: None,
                 manifest_id: None,
                 writer_epoch: 0,
+                layout_generation: 0,
                 state: ReplayState::default(),
-                base_state: None,
+                base_states: Vec::new(),
                 tx_refs: Vec::new(),
             });
         };
@@ -408,14 +433,15 @@ impl ControlMvpStateStore {
         let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
         let state = self.replay_manifest(&manifest).await?;
-        let (base_state, tx_refs) = manifest.successor_anchor();
+        let (base_states, tx_refs) = manifest.successor_anchor();
 
         Ok(ControlMvpBase {
             pointer_version: Some(pointer_meta.version),
             manifest_id: Some(pointer.manifest_id),
             writer_epoch: pointer.writer_epoch,
+            layout_generation: manifest.layout_generation,
             state,
-            base_state,
+            base_states,
             tx_refs,
         })
     }
@@ -446,7 +472,8 @@ impl ControlMvpStateStore {
 
     async fn load_pointer(&self) -> Result<ControlMvpPointer> {
         let bytes = self.storage.get(&self.paths.current_pointer()).await?;
-        let pointer: ControlMvpPointer = decode_json(&bytes, "control MVP pointer")?;
+        let pointer: ControlMvpPointer =
+            decode_json_limited(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
         pointer.validate(&self.scope)?;
         Ok(pointer)
     }
@@ -481,17 +508,18 @@ impl ControlMvpStateStore {
             expected_checksum,
             "control MVP manifest reference checksum",
         )?;
-        let manifest: ControlMvpManifest =
-            decode_envelope(&bytes, "control-mvp-manifest", "control MVP manifest")?;
+        let manifest: ControlMvpManifest = decode_envelope_limited(
+            &bytes,
+            "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
         manifest.validate(&self.scope, manifest_id)?;
         Ok(manifest)
     }
 
     async fn replay_manifest(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
-        let mut state = match manifest.base_state.as_ref() {
-            Some(reference) => self.load_state_snapshot(reference).await?,
-            None => ReplayState::default(),
-        };
+        let mut state = self.load_state_snapshots(&manifest.base_states).await?;
         for tx_ref in &manifest.tx_refs {
             let tx = self.load_tx(tx_ref).await?;
             state.apply_tx(&tx)?;
@@ -506,70 +534,236 @@ impl ControlMvpStateStore {
         Ok(state)
     }
 
-    async fn load_state_snapshot(&self, reference: &ControlMvpStateRef) -> Result<ReplayState> {
-        let segment_reference = ControlMvpSegmentRef {
-            segment_id: reference.state_id.clone(),
-            level: ControlMvpSegmentLevel::L1,
-            logical_sequence: reference.logical_sequence,
-            checksum_sha256: reference.checksum_sha256.clone(),
-            index_checksum_sha256: reference.index_checksum_sha256.clone(),
+    async fn load_state_snapshots(&self, references: &[ControlMvpStateRef]) -> Result<ReplayState> {
+        let Some(first) = references.first() else {
+            return Ok(ReplayState::default());
         };
+        let mut combined = ReplayState {
+            logical_sequence: first.logical_sequence,
+            ..ReplayState::default()
+        };
+        let mut expected_outbox_ordinal = 0_u64;
+        let indexes = self.load_l1_indexes(references).await?;
+        for (reference, (index_bytes, _index)) in references.iter().zip(indexes) {
+            if reference.logical_sequence != combined.logical_sequence {
+                return Err(invariant_violation(
+                    "control MVP L1 segment set mixes logical sequences",
+                ));
+            }
+            let shard = self
+                .load_state_snapshot_from_index(reference, &index_bytes)
+                .await?;
+            for entry in shard.entries {
+                let tombstone = entry.value.is_none();
+                let value = StoredValue {
+                    bytes: Bytes::from(entry.value.unwrap_or_default()),
+                    generation: entry.generation,
+                    tombstone,
+                };
+                if combined.kv.insert(entry.key, value).is_some() {
+                    return Err(invariant_violation(
+                        "control MVP L1 segment set contains duplicate keys",
+                    ));
+                }
+            }
+            if let Some(start) = shard.outbox_start_ordinal {
+                if start != expected_outbox_ordinal {
+                    return Err(invariant_violation(
+                        "control MVP L1 segment set has discontinuous outbox ordinals",
+                    ));
+                }
+                expected_outbox_ordinal = expected_outbox_ordinal
+                    .checked_add(u64::try_from(shard.outbox.len()).map_err(|error| {
+                        segment_serialization_error("count L1 outbox rows", error)
+                    })?)
+                    .ok_or_else(|| invariant_violation("control MVP L1 outbox ordinal overflow"))?;
+                combined.outbox.extend(
+                    shard
+                        .outbox
+                        .iter()
+                        .map(ControlMvpOutboxStateEntry::to_record),
+                );
+            }
+        }
+        Ok(combined)
+    }
+
+    async fn load_state_snapshot_from_index(
+        &self,
+        reference: &ControlMvpStateRef,
+        index_bytes: &[u8],
+    ) -> Result<ControlMvpStateObject> {
+        let segment_reference = state_segment_reference(reference);
         let bytes = self
             .storage
             .get(&self.paths.state_object(&reference.state_id))
             .await?;
-        let index_bytes = self
-            .storage
-            .get(&self.paths.segment_index(&reference.state_id))
-            .await?;
-        let rows = decode_segment_rows(&bytes, &index_bytes, &segment_reference, &self.scope)?;
+        let rows = decode_segment_rows(&bytes, index_bytes, &segment_reference, &self.scope)?;
         let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
         snapshot.validate(&self.scope, reference)?;
-        Ok(snapshot.into_replay_state())
+        Ok(snapshot)
     }
 
-    async fn write_state_snapshot(
+    async fn load_segment_index(
         &self,
-        snapshot: &ControlMvpStateObject,
-    ) -> Result<ControlMvpStateRef> {
-        let (bytes, index_bytes, reference) = self.render_state_snapshot(snapshot)?;
-        put_immutable_matching(
-            &self.storage,
-            &self.paths.state_object(&snapshot.state_id),
-            bytes,
-            "control MVP L1 segment already exists with different bytes",
-        )
-        .await?;
-        put_immutable_matching(
-            &self.storage,
-            &self.paths.segment_index(&snapshot.state_id),
-            index_bytes,
-            "control MVP L1 segment index already exists with different bytes",
-        )
-        .await?;
-        Ok(reference)
-    }
-
-    fn render_state_snapshot(
-        &self,
-        snapshot: &ControlMvpStateObject,
-    ) -> Result<(Bytes, Bytes, ControlMvpStateRef)> {
-        let rows = segment_rows_for_state(snapshot);
-        let (bytes, index_bytes, segment_reference) = encode_segment(
-            &snapshot.state_id,
-            ControlMvpSegmentLevel::L1,
-            snapshot.logical_sequence,
-            &self.scope,
-            &rows,
-            self.segment_limits,
+        reference: &ControlMvpSegmentRef,
+    ) -> Result<(Bytes, ControlMvpSegmentIndex)> {
+        let index_bytes = self
+            .storage
+            .get(&self.paths.segment_index(&reference.segment_id))
+            .await?;
+        if index_bytes.len() > MAX_SEGMENT_INDEX_BYTES {
+            return Err(invariant_violation(
+                "control MVP segment index exceeds the supported byte limit",
+            ));
+        }
+        validate_raw_checksum(
+            &index_bytes,
+            Some(&reference.index_checksum_sha256),
+            "control MVP segment index reference checksum",
         )?;
-        let reference = ControlMvpStateRef {
-            state_id: snapshot.state_id.clone(),
-            logical_sequence: snapshot.logical_sequence,
-            checksum_sha256: segment_reference.checksum_sha256,
-            index_checksum_sha256: segment_reference.index_checksum_sha256,
-        };
-        Ok((bytes, index_bytes, reference))
+        let index: ControlMvpSegmentIndex = decode_json(&index_bytes, "control MVP segment index")?;
+        validate_segment_index_identity(&index, reference, &self.scope)?;
+        validate_segment_index_key_metadata(&index)?;
+        Ok((index_bytes, index))
+    }
+
+    async fn load_l1_indexes(
+        &self,
+        references: &[ControlMvpStateRef],
+    ) -> Result<Vec<(Bytes, ControlMvpSegmentIndex)>> {
+        let mut indexes = Vec::with_capacity(references.len());
+        let mut prior_max_key: Option<Vec<u8>> = None;
+        let mut saw_keyless_segment = false;
+        let mut segment_ids = BTreeSet::new();
+        for reference in references {
+            if !segment_ids.insert(reference.state_id.as_str()) {
+                return Err(invariant_violation(
+                    "control MVP L1 segment set repeats a segment id",
+                ));
+            }
+            let loaded = self
+                .load_segment_index(&state_segment_reference(reference))
+                .await?;
+            match index_key_bounds(&loaded.1)? {
+                Some((min_key, max_key)) => {
+                    if saw_keyless_segment
+                        || prior_max_key
+                            .as_ref()
+                            .is_some_and(|prior| prior.as_slice() >= min_key.as_slice())
+                    {
+                        return Err(invariant_violation(
+                            "control MVP L1 segment key bounds overlap or are out of order",
+                        ));
+                    }
+                    prior_max_key = Some(max_key);
+                }
+                None => saw_keyless_segment = true,
+            }
+            indexes.push(loaded);
+        }
+        Ok(indexes)
+    }
+
+    async fn load_state_value_from_index(
+        &self,
+        reference: &ControlMvpStateRef,
+        index_bytes: &[u8],
+        index: &ControlMvpSegmentIndex,
+        key: &[u8],
+    ) -> Result<Option<StoredValue>> {
+        let segment_reference = state_segment_reference(reference);
+        if !segment_index_might_contain_key(index, key)? {
+            return Ok(None);
+        }
+        let bytes = self
+            .storage
+            .get(&self.paths.state_object(&reference.state_id))
+            .await?;
+        let rows = decode_segment_rows(&bytes, index_bytes, &segment_reference, &self.scope)?;
+        let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
+        snapshot.validate(&self.scope, reference)?;
+        Ok(snapshot
+            .entries
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| StoredValue {
+                bytes: Bytes::from(entry.value.clone().unwrap_or_default()),
+                generation: entry.generation,
+                tombstone: entry.value.is_none(),
+            }))
+    }
+
+    async fn write_rendered_state_snapshots(
+        &self,
+        rendered: &[RenderedControlMvpStateSegment],
+    ) -> Result<()> {
+        for segment in rendered {
+            put_immutable_matching(
+                &self.storage,
+                &self.paths.state_object(&segment.reference.state_id),
+                segment.bytes.clone(),
+                "control MVP L1 segment already exists with different bytes",
+            )
+            .await?;
+            put_immutable_matching(
+                &self.storage,
+                &self.paths.segment_index(&segment.reference.state_id),
+                segment.index_bytes.clone(),
+                "control MVP L1 segment index already exists with different bytes",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn render_state_snapshots(
+        &self,
+        state: &ReplayState,
+        manifest_id: &str,
+    ) -> Result<Vec<RenderedControlMvpStateSegment>> {
+        let snapshot = ControlMvpStateObject::from_replay(
+            state,
+            state_segment_id_for_manifest(manifest_id, 0),
+            &self.scope,
+        );
+        let rows = segment_rows_for_state(&snapshot);
+        let target_limits = half_segment_limits(self.segment_limits);
+        let row_shards = partition_state_rows(
+            &rows,
+            state.logical_sequence,
+            manifest_id,
+            &self.scope,
+            target_limits,
+        )?;
+        row_shards
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, rows)| {
+                let state_id = state_segment_id_for_manifest(manifest_id, ordinal);
+                let (bytes, index_bytes, segment_reference) = encode_segment(
+                    &state_id,
+                    ControlMvpSegmentLevel::L1,
+                    state.logical_sequence,
+                    &self.scope,
+                    &rows,
+                    target_limits,
+                )?;
+                let (min_key_hex, max_key_hex) = segment_row_key_bounds_hex(&rows);
+                Ok(RenderedControlMvpStateSegment {
+                    reference: ControlMvpStateRef {
+                        state_id,
+                        logical_sequence: state.logical_sequence,
+                        checksum_sha256: segment_reference.checksum_sha256,
+                        index_checksum_sha256: segment_reference.index_checksum_sha256,
+                        min_key_hex,
+                        max_key_hex,
+                    },
+                    bytes,
+                    index_bytes,
+                })
+            })
+            .collect()
     }
 
     async fn write_l0_segment(
@@ -610,6 +804,13 @@ impl ControlMvpStateStore {
     }
 
     async fn load_tx(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
+        let mut tx = self.load_tx_metadata(tx_ref).await?;
+        let rows = self.load_l0_segment_rows(&tx.l0_segment).await?;
+        tx.hydrate_from_segment_rows(rows)?;
+        Ok(tx)
+    }
+
+    async fn load_tx_metadata(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
         let bytes = self
             .storage
             .get(&self.paths.tx_object(&tx_ref.tx_id))
@@ -619,16 +820,337 @@ impl ControlMvpStateStore {
             Some(&tx_ref.checksum_sha256),
             "control MVP transaction reference checksum",
         )?;
-        let mut tx: ControlMvpTxObject =
-            decode_envelope(&bytes, "control-mvp-tx", "control MVP transaction")?;
+        let tx: ControlMvpTxObject = decode_envelope_limited(
+            &bytes,
+            "control-mvp-tx",
+            MAX_TRANSACTION_JSON_BYTES,
+            "control MVP transaction",
+        )?;
         tx.validate(&self.scope, tx_ref)?;
-        let rows = self.load_l0_segment_rows(&tx.l0_segment).await?;
-        tx.hydrate_from_segment_rows(rows)?;
         Ok(tx)
     }
 
+    async fn load_tx_write_if_indexed(
+        &self,
+        tx_ref: &ControlMvpTxRef,
+        key: &[u8],
+    ) -> Result<Option<ControlMvpWriteEntry>> {
+        let mut tx = self.load_tx_metadata(tx_ref).await?;
+        let (index_bytes, index) = self.load_segment_index(&tx.l0_segment).await?;
+        if !segment_index_might_contain_key(&index, key)? {
+            return Ok(None);
+        }
+        let bytes = self
+            .storage
+            .get(&self.paths.l0_segment_object(&tx.l0_segment.segment_id))
+            .await?;
+        let rows = decode_segment_rows(&bytes, &index_bytes, &tx.l0_segment, &self.scope)?;
+        tx.hydrate_from_segment_rows(rows)?;
+        Ok(tx.writes.into_iter().find(|write| write.key == key))
+    }
+
+    async fn get_from_manifest(
+        &self,
+        manifest: &ControlMvpManifest,
+        key: &[u8],
+    ) -> Result<Option<Bytes>> {
+        let mut selected = None;
+        let indexes = self.load_l1_indexes(&manifest.base_states).await?;
+        for (reference, (index_bytes, index)) in manifest.base_states.iter().zip(indexes) {
+            if let Some(value) = self
+                .load_state_value_from_index(reference, &index_bytes, &index, key)
+                .await?
+            {
+                if selected.replace(value).is_some() {
+                    return Err(invariant_violation(
+                        "control MVP L1 segment set contains overlapping keys",
+                    ));
+                }
+            }
+        }
+        for tx_ref in &manifest.tx_refs {
+            if let Some(write) = self.load_tx_write_if_indexed(tx_ref, key).await? {
+                selected = Some(StoredValue {
+                    bytes: Bytes::from(write.value.clone().unwrap_or_default()),
+                    generation: write.generation,
+                    tombstone: write.value.is_none(),
+                });
+            }
+        }
+        Ok(selected
+            .filter(|value| !value.tombstone)
+            .map(|value| value.bytes))
+    }
+
+    async fn validate_manifest_read_metadata(&self, manifest: &ControlMvpManifest) -> Result<()> {
+        self.load_l1_indexes(&manifest.base_states).await?;
+        for tx_ref in &manifest.tx_refs {
+            let tx = self.load_tx_metadata(tx_ref).await?;
+            self.load_segment_index(&tx.l0_segment).await?;
+        }
+        Ok(())
+    }
+
+    async fn load_state_prefix_from_index(
+        &self,
+        reference: &ControlMvpStateRef,
+        index_bytes: &[u8],
+        index: &ControlMvpSegmentIndex,
+        prefix: &[u8],
+        remaining_segments: &mut usize,
+    ) -> Result<Vec<(Vec<u8>, StoredValue)>> {
+        let segment_reference = state_segment_reference(reference);
+        if !segment_index_overlaps_prefix(index, prefix)? {
+            return Ok(Vec::new());
+        }
+        *remaining_segments = remaining_segments.checked_sub(1).ok_or_else(|| {
+            CatalogError::MaintenanceBackpressure {
+                message: "prefix scan requires more immutable segments than its page budget"
+                    .to_string(),
+            }
+        })?;
+        let bytes = self
+            .storage
+            .get(&self.paths.state_object(&reference.state_id))
+            .await?;
+        let rows = decode_segment_rows(&bytes, index_bytes, &segment_reference, &self.scope)?;
+        let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
+        snapshot.validate(&self.scope, reference)?;
+        Ok(snapshot
+            .entries
+            .into_iter()
+            .filter(|entry| entry.key.starts_with(prefix))
+            .map(|entry| {
+                let tombstone = entry.value.is_none();
+                (
+                    entry.key,
+                    StoredValue {
+                        bytes: Bytes::from(entry.value.unwrap_or_default()),
+                        generation: entry.generation,
+                        tombstone,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn load_tx_prefix_if_indexed(
+        &self,
+        tx_ref: &ControlMvpTxRef,
+        prefix: &[u8],
+        remaining_segments: &mut usize,
+        remaining_arrow_bytes: &mut usize,
+    ) -> Result<Vec<ControlMvpWriteEntry>> {
+        let mut tx = self.load_tx_metadata(tx_ref).await?;
+        let (index_bytes, index) = self.load_segment_index(&tx.l0_segment).await?;
+        if !segment_index_overlaps_prefix(&index, prefix)? {
+            return Ok(Vec::new());
+        }
+        let segment_size = usize::try_from(index.segment_size_bytes).map_err(|error| {
+            segment_serialization_error("convert indexed segment byte size", error)
+        })?;
+        if segment_size > *remaining_arrow_bytes {
+            return Err(CatalogError::MaintenanceBackpressure {
+                message: "prefix scan L0 overlay exceeds its physical Arrow read budget; consolidation is required"
+                    .to_string(),
+            });
+        }
+        *remaining_segments = remaining_segments.checked_sub(1).ok_or_else(|| {
+            CatalogError::MaintenanceBackpressure {
+                message: "prefix scan requires more immutable segments than its page budget"
+                    .to_string(),
+            }
+        })?;
+        *remaining_arrow_bytes -= segment_size;
+        let bytes = self
+            .storage
+            .get(&self.paths.l0_segment_object(&tx.l0_segment.segment_id))
+            .await?;
+        let rows = decode_segment_rows(&bytes, &index_bytes, &tx.l0_segment, &self.scope)?;
+        tx.hydrate_from_segment_rows(rows)?;
+        Ok(tx
+            .writes
+            .into_iter()
+            .filter(|write| write.key.starts_with(prefix))
+            .collect())
+    }
+
+    async fn load_scan_overlay(
+        &self,
+        manifest: &ControlMvpManifest,
+        prefix: &[u8],
+        start_after: Option<&[u8]>,
+        remaining_segments: &mut usize,
+        remaining_arrow_bytes: &mut usize,
+    ) -> Result<BTreeMap<Vec<u8>, StoredValue>> {
+        let mut overlay = BTreeMap::new();
+        for tx_ref in &manifest.tx_refs {
+            for write in self
+                .load_tx_prefix_if_indexed(
+                    tx_ref,
+                    prefix,
+                    remaining_segments,
+                    remaining_arrow_bytes,
+                )
+                .await?
+            {
+                if start_after.is_none_or(|start| write.key.as_slice() > start) {
+                    overlay.insert(
+                        write.key,
+                        StoredValue {
+                            bytes: Bytes::from(write.value.clone().unwrap_or_default()),
+                            generation: write.generation,
+                            tombstone: write.value.is_none(),
+                        },
+                    );
+                }
+            }
+        }
+        Ok(overlay)
+    }
+
+    async fn scan_manifest_page(
+        &self,
+        manifest: &ControlMvpManifest,
+        request: ScanRequest,
+        observed_token: StateToken,
+    ) -> Result<ScanPage> {
+        self.scan_manifest_page_with_arrow_budget(
+            manifest,
+            request,
+            observed_token,
+            MAX_SCAN_ARROW_BYTES,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn scan_manifest_page_with_arrow_budget(
+        &self,
+        manifest: &ControlMvpManifest,
+        request: ScanRequest,
+        observed_token: StateToken,
+        raw_arrow_budget: usize,
+    ) -> Result<ScanPage> {
+        request.validate_for_scope(&self.scope)?;
+        let prefix = request.prefix();
+        let start_after = request.effective_start_after();
+        let mut remaining_segments = request.max_segments();
+        let mut remaining_arrow_bytes = raw_arrow_budget;
+        let overlay = self
+            .load_scan_overlay(
+                manifest,
+                prefix,
+                start_after,
+                &mut remaining_segments,
+                &mut remaining_arrow_bytes,
+            )
+            .await?;
+
+        let mut base = BTreeMap::new();
+        let mut last_loaded_max = None;
+        let mut backend_resume_after = None;
+        for reference in &manifest.base_states {
+            let bounds = state_reference_key_bounds(reference)?;
+            let Some((_min_key, max_key)) = bounds.as_ref() else {
+                continue;
+            };
+            if !key_bounds_overlap_prefix(bounds.as_ref(), prefix) {
+                continue;
+            }
+            if start_after.is_some_and(|start| max_key.as_slice() <= start) {
+                continue;
+            }
+            if remaining_segments == 0 {
+                backend_resume_after = last_loaded_max;
+                if backend_resume_after.is_none() {
+                    return Err(CatalogError::MaintenanceBackpressure {
+                        message: "prefix scan segment budget is consumed by the L0 overlay before any L1 progress"
+                            .to_string(),
+                    });
+                }
+                break;
+            }
+            let (index_bytes, index) = self
+                .load_segment_index(&state_segment_reference(reference))
+                .await?;
+            if index_key_bounds(&index)?.as_ref() != bounds.as_ref() {
+                return Err(invariant_violation(
+                    "control MVP manifest L1 bounds do not match its checksummed segment index",
+                ));
+            }
+            let segment_size = usize::try_from(index.segment_size_bytes).map_err(|error| {
+                segment_serialization_error("convert indexed segment byte size", error)
+            })?;
+            if segment_size > remaining_arrow_bytes {
+                if last_loaded_max.is_none() {
+                    return Err(CatalogError::MaintenanceBackpressure {
+                        message: "prefix scan L0 overlay leaves no physical Arrow read budget for required L1 state; consolidation is required"
+                            .to_string(),
+                    });
+                }
+                backend_resume_after = last_loaded_max;
+                break;
+            }
+            for (key, value) in self
+                .load_state_prefix_from_index(
+                    reference,
+                    &index_bytes,
+                    &index,
+                    prefix,
+                    &mut remaining_segments,
+                )
+                .await?
+            {
+                if start_after.is_none_or(|start| key.as_slice() > start) {
+                    base.insert(key, value);
+                }
+            }
+            remaining_arrow_bytes -= segment_size;
+            last_loaded_max = Some(max_key.clone());
+            if scan_page_budget_exceeded(
+                &base,
+                &overlay,
+                max_key.as_slice(),
+                request.max_rows(),
+                request.max_bytes(),
+            )? {
+                break;
+            }
+        }
+
+        let merge_through = backend_resume_after.as_deref();
+        for (key, value) in overlay {
+            if merge_through.is_none_or(|boundary| key.as_slice() <= boundary) {
+                base.insert(key, value);
+            }
+        }
+        let entries = base
+            .into_iter()
+            .filter(|(_key, value)| !value.tombstone)
+            .map(|(key, value)| {
+                KvPair::new(
+                    key,
+                    VersionedValue::new(value.bytes, Some(value.generation)),
+                )
+            })
+            .collect::<Vec<_>>();
+        build_scan_page_with_backend_boundary(
+            &self.scope,
+            request,
+            Some(observed_token),
+            entries,
+            backend_resume_after,
+        )
+    }
+
     async fn write_checkpoint(&self, checkpoint: &ControlMvpCheckpoint) -> Result<()> {
-        let bytes = encode_envelope("control-mvp-checkpoint", checkpoint)?;
+        let bytes = encode_envelope_limited(
+            "control-mvp-checkpoint",
+            checkpoint,
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
         match self
             .storage
             .put(
@@ -645,13 +1167,69 @@ impl ControlMvpStateStore {
         }
     }
 
+    /// Publishes immutable checkpoint artifacts without acquiring retention
+    /// coordination. The caller must already own a durable retention epoch and
+    /// must treat any returned error as an uncertain external mutation.
+    async fn publish_checkpoint_under_retention(
+        &self,
+        opts: &CheckpointOptions,
+    ) -> Result<CheckpointToken> {
+        let pointer = self.load_pointer().await?;
+        let manifest = self.load_manifest_for_pointer(&pointer).await?;
+        // Reuse the manifest's own anchored snapshot when it has one;
+        // otherwise materialize the replay state as a new immutable snapshot
+        // so checkpoint reads never replay history.
+        let (state_refs, rendered) = if !manifest.anchor_states.is_empty() {
+            (manifest.anchor_states.clone(), Vec::new())
+        } else if manifest.tx_refs.is_empty() && !manifest.base_states.is_empty() {
+            (manifest.base_states.clone(), Vec::new())
+        } else {
+            let state = self.replay_manifest(&manifest).await?;
+            let rendered = self.render_state_snapshots(&state, &manifest.manifest_id)?;
+            let state_refs = rendered
+                .iter()
+                .map(|segment| segment.reference.clone())
+                .collect();
+            (state_refs, rendered)
+        };
+        let checkpoint_id = format!(
+            "checkpoint-{:020}-{}",
+            pointer.logical_sequence,
+            Ulid::new().to_string().to_ascii_lowercase()
+        );
+        let checkpoint = ControlMvpCheckpoint {
+            format_version: CONTROL_MVP_FORMAT_VERSION,
+            implementation: IMPLEMENTATION.to_string(),
+            scope: ControlMvpScopeDoc::from(&self.scope),
+            checkpoint_id: checkpoint_id.clone(),
+            manifest_id: pointer.manifest_id,
+            logical_sequence: pointer.logical_sequence,
+            manifest_checksum_sha256: pointer.manifest_checksum_sha256,
+            states: state_refs,
+            min_retention_seconds: opts.min_retention_seconds(),
+        };
+        encode_envelope_limited(
+            "control-mvp-checkpoint",
+            &checkpoint,
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
+        self.write_rendered_state_snapshots(&rendered).await?;
+        self.write_checkpoint(&checkpoint).await?;
+        Ok(self.checkpoint_token(checkpoint_id))
+    }
+
     async fn load_checkpoint(&self, checkpoint_id: &str) -> Result<ControlMvpCheckpoint> {
         let bytes = self
             .storage
             .get(&self.paths.checkpoint_object(checkpoint_id))
             .await?;
-        let checkpoint: ControlMvpCheckpoint =
-            decode_envelope(&bytes, "control-mvp-checkpoint", "control MVP checkpoint")?;
+        let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+            &bytes,
+            "control-mvp-checkpoint",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
         checkpoint.validate(&self.scope, checkpoint_id)?;
         Ok(checkpoint)
     }
@@ -679,9 +1257,9 @@ impl ControlMvpStateStore {
     /// scan would misreport an applied restore as absent (and therefore
     /// Superseded) once `checkpoint_interval` commits pass. This walk starts
     /// at the current suffix and follows the anchor chain backwards — each
-    /// anchor's `base_state` names the snapshot written by exactly one
-    /// producing manifest, whose own `anchor_state` must byte-match the
-    /// followed reference (binding the snapshot's raw checksum) — until the
+    /// ordered `base_states` set names shards written by exactly one producing
+    /// manifest, whose own `anchor_states` must byte-match the followed set
+    /// (binding every shard's raw checksum) — until the
     /// referenced sequence is covered or genesis is reached. Every hop loads an
     /// envelope-checksummed manifest and the anchor sequence strictly
     /// decreases, so the walk is deterministic, fail-closed, and bounded by
@@ -695,7 +1273,7 @@ impl ControlMvpStateStore {
             return Ok(false);
         }
         let mut tx_refs = parent.tx_refs.clone();
-        let mut base_state = parent.base_state.clone();
+        let mut base_states = parent.base_states.clone();
         loop {
             if let Some(found) = tx_refs
                 .iter()
@@ -703,7 +1281,7 @@ impl ControlMvpStateStore {
             {
                 return Ok(found == planned);
             }
-            let Some(anchor) = base_state else {
+            let Some(anchor) = base_states.first() else {
                 // Genesis reached without covering the transaction sequence.
                 return Ok(false);
             };
@@ -719,13 +1297,33 @@ impl ControlMvpStateStore {
                     )
                 })?;
             let manifest = self.load_manifest(&producing_manifest_id).await?;
-            if manifest.anchor_state.as_ref() != Some(&anchor) {
-                return Err(invariant_violation(
-                    "control MVP anchor chain producing manifest does not carry the referenced anchor snapshot",
-                ));
+            if manifest.anchor_states == base_states {
+                tx_refs = manifest.tx_refs;
+                base_states = manifest.base_states;
+                continue;
             }
-            tx_refs = manifest.tx_refs;
-            base_state = manifest.base_state;
+            if manifest.base_states == base_states && manifest.tx_refs.is_empty() {
+                let source_manifest_id = manifest.base_manifest_id.as_deref().ok_or_else(|| {
+                    invariant_violation(
+                        "control MVP maintenance manifest has no logical source manifest",
+                    )
+                })?;
+                let source = self.load_manifest(source_manifest_id).await?;
+                if source.logical_sequence != manifest.logical_sequence
+                    || source.state_checksum_sha256 != manifest.state_checksum_sha256
+                    || source.layout_generation >= manifest.layout_generation
+                {
+                    return Err(invariant_violation(
+                        "control MVP maintenance lineage does not preserve equivalent logical state",
+                    ));
+                }
+                tx_refs = source.tx_refs;
+                base_states = source.base_states;
+                continue;
+            }
+            return Err(invariant_violation(
+                "control MVP anchor chain producing manifest does not carry the referenced L1 segments",
+            ));
         }
     }
 
@@ -740,9 +1338,10 @@ impl ControlMvpStateStore {
                 "Control MVP restore source manifest checksum mismatch",
             ));
         }
-        let manifest: ControlMvpManifest = decode_envelope(
+        let manifest: ControlMvpManifest = decode_envelope_limited(
             &manifest_bytes,
             "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
             "Control MVP restore source manifest",
         )?;
         manifest.validate(&self.scope, source.manifest_id())?;
@@ -752,13 +1351,14 @@ impl ControlMvpStateStore {
             ));
         }
         let state = self.replay_manifest(&manifest).await?;
-        let (base_state, tx_refs) = manifest.successor_anchor();
+        let (base_states, tx_refs) = manifest.successor_anchor();
         Ok(ControlMvpBase {
             pointer_version: None,
             manifest_id: Some(manifest.manifest_id),
             writer_epoch: 0,
+            layout_generation: manifest.layout_generation,
             state,
-            base_state,
+            base_states,
             tx_refs,
         })
     }
@@ -784,8 +1384,9 @@ impl ControlMvpStateStore {
                         pointer_version: None,
                         manifest_id: None,
                         writer_epoch: 0,
+                        layout_generation: 0,
                         state: ReplayState::default(),
-                        base_state: None,
+                        base_states: Vec::new(),
                         tx_refs: Vec::new(),
                     },
                     candidate_parent,
@@ -811,13 +1412,14 @@ impl ControlMvpStateStore {
                 ));
             }
             let state = self.replay_manifest(&manifest).await?;
-            let (base_state, tx_refs) = manifest.successor_anchor();
+            let (base_states, tx_refs) = manifest.successor_anchor();
             let current = ControlMvpBase {
                 pointer_version: Some(before.version),
                 manifest_id: Some(pointer.manifest_id),
                 writer_epoch: pointer.writer_epoch,
+                layout_generation: manifest.layout_generation,
                 state,
-                base_state,
+                base_states,
                 tx_refs,
             };
             return Ok(StableRestoreBase {
@@ -848,12 +1450,13 @@ impl ControlMvpStateStore {
             ));
         }
         let reader = self.resolve_persisted_reference_at(source, now).await?;
-        Ok(reader
-            .scan_prefix(b"")
-            .await?
-            .into_iter()
-            .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
-            .collect())
+        Ok(
+            scan_all_entries_bounded(reader.as_ref(), b"", MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+                .await?
+                .into_iter()
+                .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
+                .collect(),
+        )
     }
 
     fn validate_restore_authority_format(
@@ -976,7 +1579,12 @@ impl ControlMvpStateStore {
             self.segment_limits,
         )?;
         tx.l0_segment = l0_reference;
-        let transaction_bytes = encode_envelope("control-mvp-tx", &tx)?;
+        let transaction_bytes = encode_envelope_limited(
+            "control-mvp-tx",
+            &tx,
+            MAX_TRANSACTION_JSON_BYTES,
+            "Control MVP restore transaction",
+        )?;
         let transaction_checksum = sha256_hex(&transaction_bytes);
         let mut candidate_state = stable.candidate_parent.state.clone();
         candidate_state.apply_tx(&tx)?;
@@ -986,22 +1594,27 @@ impl ControlMvpStateStore {
             sequence: result_sequence,
             checksum_sha256: transaction_checksum,
         });
-        let rendered_l1 = if u64::try_from(tx_refs.len()).unwrap_or(u64::MAX) >= checkpoint_interval
+        let production_async_layout = checkpoint_interval == Self::DEFAULT_CHECKPOINT_INTERVAL;
+        if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
+            return Err(CatalogError::MaintenanceBackpressure {
+                message: "control MVP reached 32 L0 segments before layout maintenance completed"
+                    .to_string(),
+            });
+        }
+        let rendered_l1 = if !production_async_layout
+            && u64::try_from(tx_refs.len()).unwrap_or(u64::MAX) >= checkpoint_interval
         {
-            let snapshot = ControlMvpStateObject::from_replay(
-                &candidate_state,
-                state_id_for_manifest(&candidate_manifest_id),
-                &self.scope,
-            );
-            let (bytes, index_bytes, reference) = self.render_state_snapshot(&snapshot)?;
-            Some(RenderedControlMvpStateSegment {
-                reference,
-                bytes,
-                index_bytes,
-            })
+            self.render_state_snapshots(&candidate_state, &candidate_manifest_id)?
         } else {
-            None
+            Vec::new()
         };
+        let maintenance_intent = layout_maintenance_intent_for_manifest(
+            &self.scope,
+            &candidate_manifest_id,
+            result_sequence,
+            stable.candidate_parent.layout_generation,
+            tx_refs.len(),
+        )?;
         let manifest = ControlMvpManifest {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -1010,14 +1623,22 @@ impl ControlMvpStateStore {
             logical_sequence: result_sequence,
             base_manifest_id: Some(base_manifest_id.to_string()),
             writer_epoch: stable.writer_epoch,
-            base_state: stable.candidate_parent.base_state.clone(),
-            anchor_state: rendered_l1
-                .as_ref()
-                .map(|segment| segment.reference.clone()),
+            layout_generation: stable.candidate_parent.layout_generation,
+            base_states: stable.candidate_parent.base_states.clone(),
+            anchor_states: rendered_l1
+                .iter()
+                .map(|segment| segment.reference.clone())
+                .collect(),
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
+            maintenance_intent,
         };
-        let manifest_bytes = encode_envelope("control-mvp-manifest", &manifest)?;
+        let manifest_bytes = encode_envelope_limited(
+            "control-mvp-manifest",
+            &manifest,
+            MAX_CONTROL_JSON_BYTES,
+            "Control MVP restore manifest",
+        )?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
         let pointer = ControlMvpPointer {
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -1028,14 +1649,15 @@ impl ControlMvpStateStore {
             manifest_checksum_sha256: manifest_checksum,
             writer_epoch: stable.writer_epoch,
         };
-        let pointer_bytes = encode_json(&pointer, "Control MVP restore pointer")?;
+        let pointer_bytes =
+            encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "Control MVP restore head")?;
 
         Ok(RenderedControlMvpRestore {
             transaction_id,
             transaction_bytes,
             l0_segment_bytes,
             l0_index_bytes,
-            l1_segment: rendered_l1,
+            l1_segments: rendered_l1,
             candidate_manifest_id,
             manifest_bytes,
             pointer_bytes,
@@ -1091,6 +1713,12 @@ impl ControlMvpStateStore {
             restore_outbox_record_id: rendered.outbox_record_id,
         };
         plan.validate(self)?;
+        let plan_bytes = encode_json(&plan, "Control MVP restore plan")?;
+        validate_candidate_json_size(
+            &plan_bytes,
+            MAX_CONTROL_JSON_BYTES,
+            "Control MVP restore plan",
+        )?;
         Ok(plan)
     }
 }
@@ -1193,14 +1821,733 @@ fn state_id_for_manifest(manifest_id: &str) -> String {
     )
 }
 
+fn state_segment_id_for_manifest(manifest_id: &str, ordinal: usize) -> String {
+    let state_id = state_id_for_manifest(manifest_id);
+    if ordinal == 0 {
+        state_id
+    } else {
+        format!("{state_id}-part-{ordinal:06}")
+    }
+}
+
+fn layout_maintenance_intent_for_manifest(
+    scope: &StateScope,
+    manifest_id: &str,
+    logical_sequence: u64,
+    layout_generation: u64,
+    l0_count: usize,
+) -> Result<Option<LayoutMaintenanceIntentV1>> {
+    if l0_count < L0_MAINTENANCE_INTENT_THRESHOLD {
+        return Ok(None);
+    }
+    let next_generation = layout_generation.checked_add(1).ok_or_else(|| {
+        invariant_violation("control MVP layout generation cannot advance beyond u64::MAX")
+    })?;
+    let token = StateToken {
+        scope: scope.clone(),
+        logical_sequence,
+        authority_manifest_id: manifest_id.to_string(),
+    };
+    LayoutMaintenanceIntentV1::new(
+        format!("maintain-{manifest_id}"),
+        &token,
+        next_generation,
+        LayoutMaintenanceReason::L0SegmentCount,
+    )
+    .map(Some)
+}
+
 /// Returns the manifest id that produced a deterministic anchor snapshot.
 ///
 /// Inverse of [`state_id_for_manifest`] for anchor snapshots, which are only
 /// ever written under the producing manifest's identity.
 fn manifest_id_for_anchor_state(state_id: &str) -> Option<String> {
     state_id
+        .split_once("-part-")
+        .map_or(state_id, |(base, _ordinal)| base)
         .strip_prefix("state-")
         .map(|suffix| format!("manifest-{suffix}"))
+}
+
+/// Separately constructed capability for asynchronous physical-layout maintenance.
+///
+/// API request code receives [`ControlMvpStateStore`], not this type. Operators
+/// construct the worker explicitly so consolidation has an independently
+/// auditable identity and never becomes an implicit mutation fallback.
+pub struct ControlMvpMaintenanceWorker {
+    store: ControlMvpStateStore,
+    lifecycle: ScopedStorage,
+}
+
+const CONTROL_MVP_GC_PAGE_SIZE: usize = 256;
+const CONTROL_MVP_ORPHAN_MIN_AGE_DAYS: i64 = 7;
+const CONTROL_MVP_TOKEN_RETENTION_DAYS: i64 = 30;
+
+/// One immutable `control/v1` artifact proven eligible for deletion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpGcCandidate {
+    path: String,
+    version: String,
+    size: u64,
+}
+
+impl ControlMvpGcCandidate {
+    /// Returns the scope-relative object path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Returns the size observed during the coordinated inventory.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// Conservative dry-run plan for one `control/v1` garbage-collection pass.
+#[derive(Debug, Clone)]
+pub struct ControlMvpGcPlan {
+    head_version: String,
+    candidates: Vec<ControlMvpGcCandidate>,
+    continuation: Option<String>,
+}
+
+impl ControlMvpGcPlan {
+    /// Returns candidates in deterministic path order.
+    #[must_use]
+    pub fn candidates(&self) -> &[ControlMvpGcCandidate] {
+        &self.candidates
+    }
+
+    /// Returns the total candidate bytes observed by the plan.
+    #[must_use]
+    pub fn candidate_bytes(&self) -> u64 {
+        self.candidates.iter().fold(0_u64, |total, candidate| {
+            total.saturating_add(candidate.size)
+        })
+    }
+
+    /// Returns the exclusive inventory cursor for the next bounded pass.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+}
+
+/// Result of one coordinated active `control/v1` garbage-collection pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpGcOutcome {
+    objects_deleted: u64,
+    bytes_reclaimed: u64,
+    continuation: Option<String>,
+}
+
+impl ControlMvpGcOutcome {
+    /// Returns the number of immutable objects deleted.
+    #[must_use]
+    pub const fn objects_deleted(&self) -> u64 {
+        self.objects_deleted
+    }
+
+    /// Returns the bytes represented by deleted inventory entries.
+    #[must_use]
+    pub const fn bytes_reclaimed(&self) -> u64 {
+        self.bytes_reclaimed
+    }
+
+    /// Returns the exclusive inventory cursor for the next bounded pass.
+    #[must_use]
+    pub fn continuation(&self) -> Option<&str> {
+        self.continuation.as_deref()
+    }
+}
+
+/// Successful publication of an equivalent-state physical layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpMaintenanceOutcome {
+    source_token: StateToken,
+    selected_token: StateToken,
+    layout_generation: u64,
+}
+
+impl ControlMvpMaintenanceOutcome {
+    /// Returns the exact logical authority cut the worker consolidated.
+    #[must_use]
+    pub const fn source_token(&self) -> &StateToken {
+        &self.source_token
+    }
+
+    /// Returns the equivalent-state manifest selected by exact head CAS.
+    #[must_use]
+    pub const fn selected_token(&self) -> &StateToken {
+        &self.selected_token
+    }
+
+    /// Returns the physical layout generation selected by this publication.
+    #[must_use]
+    pub const fn layout_generation(&self) -> u64 {
+        self.layout_generation
+    }
+}
+
+impl ControlMvpMaintenanceWorker {
+    /// Creates a maintenance capability over the exact scoped authority root.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors when storage and state scope differ.
+    pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+        Ok(Self {
+            store: ControlMvpStateStore::new(storage.clone(), scope)?,
+            lifecycle: storage,
+        })
+    }
+
+    /// Builds a bounded, read-only GC plan at the supplied clock cut.
+    ///
+    /// All manifests and checkpoints younger than 30 days are treated as
+    /// retained token pins. The current head closure is retained regardless
+    /// of age. Only immutable artifacts older than seven days are considered;
+    /// missing object timestamps fail closed by retaining the object.
+    ///
+    /// `additional_protected_paths` carries snapshot/export/restore-journal
+    /// closure discovered by the operator. Every path must be inside this
+    /// exact authority domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, corruption, invalid-protection-path, or bounded-list
+    /// capacity errors.
+    pub async fn plan_gc_at(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+    ) -> Result<ControlMvpGcPlan> {
+        self.plan_gc_page_at(now, additional_protected_paths, None)
+            .await
+    }
+
+    /// Builds one bounded, resumable GC plan page.
+    ///
+    /// `continuation` is the exclusive cursor returned by the preceding page.
+    /// The cursor is validated against this exact authority prefix. Each page
+    /// inventories at most `CONTROL_MVP_GC_PAGE_SIZE` candidate objects while
+    /// streaming all retained roots through a page-sized working set.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage, corruption, or invalid-cursor errors.
+    pub async fn plan_gc_page_at(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+        continuation: Option<&str>,
+    ) -> Result<ControlMvpGcPlan> {
+        self.plan_gc_page_inner(now, additional_protected_paths, continuation)
+            .await
+    }
+
+    /// Executes conservative active GC under the workspace retention lock and
+    /// durable mutation epoch.
+    ///
+    /// The inventory is rebuilt after the epoch is claimed, before any delete.
+    /// The authority head and each candidate version are rechecked during the
+    /// sweep. A concurrent head advance aborts the remaining pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns coordination, storage, corruption, or revalidation errors.
+    pub async fn collect_gc_at(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+    ) -> Result<ControlMvpGcOutcome> {
+        self.collect_gc_page_at(now, additional_protected_paths, None)
+            .await
+    }
+
+    /// Executes one bounded, resumable GC page under retention coordination.
+    ///
+    /// # Errors
+    ///
+    /// Returns coordination, storage, corruption, invalid-cursor, or
+    /// revalidation errors.
+    pub async fn collect_gc_page_at(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+        continuation: Option<&str>,
+    ) -> Result<ControlMvpGcOutcome> {
+        let protected = additional_protected_paths.into_iter().collect::<Vec<_>>();
+        let mut guard =
+            DistributedLock::new(Arc::new(self.lifecycle.clone()), RETENTION_GC_LOCK_PATH)
+                .acquire_with_operation(
+                    RETENTION_GC_LOCK_TTL,
+                    RETENTION_GC_LOCK_MAX_RETRIES,
+                    Some(format!("control-v1-gc:{}", self.store.scope.domain())),
+                )
+                .await
+                .map_err(CatalogError::from)?;
+        let operation_id = guard.holder_id().to_string();
+        let mut epoch = match RetentionMutationEpoch::claim(
+            self.lifecycle.clone(),
+            &mut guard,
+            RetentionMutationKind::CatalogGc,
+            operation_id,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                let _ = guard.release().await;
+                return Err(error);
+            }
+        };
+        let collection = async {
+            let plan = self
+                .plan_gc_page_inner(now, protected, continuation)
+                .await?;
+            let mut outcome = ControlMvpGcOutcome {
+                objects_deleted: 0,
+                bytes_reclaimed: 0,
+                continuation: plan.continuation.clone(),
+            };
+            for candidate in &plan.candidates {
+                let head = self
+                    .lifecycle
+                    .head_raw(&self.store.paths.current_pointer())
+                    .await?
+                    .ok_or_else(|| invariant_violation("control MVP head disappeared during GC"))?;
+                if head.version != plan.head_version {
+                    return Err(CatalogError::CasFailed {
+                        message: "control MVP head advanced during GC revalidation".to_string(),
+                    });
+                }
+                let Some(selected) = self.lifecycle.head_raw(&candidate.path).await? else {
+                    continue;
+                };
+                if selected.version != candidate.version {
+                    return Err(CatalogError::CasFailed {
+                        message: format!(
+                            "control MVP GC candidate changed after inventory: {}",
+                            candidate.path
+                        ),
+                    });
+                }
+                epoch.delete_reclaimable(&candidate.path).await?;
+                outcome.objects_deleted = outcome.objects_deleted.saturating_add(1);
+                outcome.bytes_reclaimed = outcome.bytes_reclaimed.saturating_add(candidate.size);
+            }
+            Ok(outcome)
+        }
+        .await;
+        let settlement = epoch.settle().await;
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (collection, settlement, release) {
+            (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn plan_gc_page_inner(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+        continuation: Option<&str>,
+    ) -> Result<ControlMvpGcPlan> {
+        let base_prefix = format!("{}/", self.store.paths.base_prefix());
+        let mut protected = BTreeSet::new();
+        for path in additional_protected_paths {
+            ScopedStorage::validate_path(&path)?;
+            if !path.starts_with(&base_prefix) {
+                return Err(validation_failed(&format!(
+                    "control MVP GC protected path is outside authority domain: {path}"
+                )));
+            }
+            protected.insert(path);
+        }
+
+        let inventory_page = self
+            .lifecycle
+            .list_page_meta(&base_prefix, continuation, CONTROL_MVP_GC_PAGE_SIZE)
+            .await?;
+        let next_continuation = inventory_page.next_start_after.clone();
+
+        let Some(head) = self
+            .lifecycle
+            .head_raw(&self.store.paths.current_pointer())
+            .await?
+        else {
+            return Ok(ControlMvpGcPlan {
+                head_version: String::new(),
+                candidates: Vec::new(),
+                continuation: next_continuation,
+            });
+        };
+
+        let token_cutoff = now - ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS);
+        let orphan_cutoff = now - ChronoDuration::days(CONTROL_MVP_ORPHAN_MIN_AGE_DAYS);
+        let manifests_prefix = format!("{base_prefix}manifests/");
+        let checkpoints_prefix = format!("{base_prefix}checkpoints/");
+        let mut candidates = inventory_page
+            .objects
+            .into_iter()
+            .filter_map(|object| {
+                let path = object.path.to_string();
+                if protected.contains(&path) || !Self::is_gc_managed_immutable(&base_prefix, &path)
+                {
+                    return None;
+                }
+                let cutoff = if path.starts_with(&manifests_prefix)
+                    || path.starts_with(&checkpoints_prefix)
+                {
+                    token_cutoff
+                } else {
+                    orphan_cutoff
+                };
+                object
+                    .last_modified
+                    .is_some_and(|last_modified| last_modified <= cutoff)
+                    .then_some(ControlMvpGcCandidate {
+                        path,
+                        version: object.version,
+                        size: object.size,
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if candidates.is_empty() {
+            return Ok(ControlMvpGcPlan {
+                head_version: head.version,
+                candidates,
+                continuation: next_continuation,
+            });
+        }
+
+        candidates.retain(|candidate| !protected.contains(&candidate.path));
+        let pointer = self.store.load_pointer().await?;
+        let mut current_closure = BTreeSet::from([self.store.paths.current_pointer()]);
+        self.protect_manifest_closure(&pointer.manifest_id, &mut current_closure)
+            .await?;
+        candidates.retain(|candidate| !current_closure.contains(&candidate.path));
+
+        // Stream every retained root through a page-sized inventory and a
+        // single-root closure. Only the bounded candidate page survives across
+        // iterations, so total authority inventory can grow without increasing
+        // process memory or wedging reclamation.
+        let mut root_cursor = None;
+        while !candidates.is_empty() {
+            let root_page = self
+                .lifecycle
+                .list_page_meta(
+                    &base_prefix,
+                    root_cursor.as_deref(),
+                    CONTROL_MVP_GC_PAGE_SIZE,
+                )
+                .await?;
+            for object in &root_page.objects {
+                let path = object.path.to_string();
+                let retained_by_age = object
+                    .last_modified
+                    .is_none_or(|last_modified| last_modified >= token_cutoff);
+                let mut retained_closure = BTreeSet::new();
+                if retained_by_age && path.starts_with(&manifests_prefix) {
+                    let manifest_id = path
+                        .strip_prefix(&manifests_prefix)
+                        .and_then(|suffix| suffix.strip_suffix(".json"))
+                        .filter(|id| !id.is_empty() && !id.contains('/'))
+                        .ok_or_else(|| {
+                            invariant_violation("noncanonical control MVP manifest path")
+                        })?;
+                    self.protect_manifest_closure(manifest_id, &mut retained_closure)
+                        .await?;
+                } else if path.starts_with(&checkpoints_prefix) {
+                    let checkpoint_id = path
+                        .strip_prefix(&checkpoints_prefix)
+                        .and_then(|suffix| suffix.strip_suffix(".json"))
+                        .filter(|id| !id.is_empty() && !id.contains('/'))
+                        .ok_or_else(|| {
+                            invariant_violation("noncanonical control MVP checkpoint path")
+                        })?;
+                    let bytes = self.lifecycle.get_raw(&path).await?;
+                    let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+                        &bytes,
+                        "control-mvp-checkpoint",
+                        MAX_CONTROL_JSON_BYTES,
+                        "control MVP checkpoint",
+                    )?;
+                    checkpoint.validate(&self.store.scope, checkpoint_id)?;
+                    let minimum_seconds = u64::try_from(
+                        ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS).num_seconds(),
+                    )
+                    .map_err(|error| {
+                        invariant_violation(format!("convert checkpoint retention floor: {error}"))
+                    })?;
+                    let retention_seconds = checkpoint
+                        .min_retention_seconds
+                        .unwrap_or(0)
+                        .max(minimum_seconds);
+                    let retention_seconds = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+                    let retained_checkpoint = object.last_modified.is_none_or(|last_modified| {
+                        last_modified
+                            .checked_add_signed(ChronoDuration::seconds(retention_seconds))
+                            .is_none_or(|deadline| deadline >= now)
+                    });
+                    if retained_checkpoint {
+                        retained_closure.insert(path);
+                        self.protect_manifest_closure(
+                            &checkpoint.manifest_id,
+                            &mut retained_closure,
+                        )
+                        .await?;
+                        for reference in &checkpoint.states {
+                            Self::protect_segment(
+                                &self.store.paths,
+                                reference,
+                                &mut retained_closure,
+                            );
+                        }
+                    }
+                }
+                if !retained_closure.is_empty() {
+                    candidates.retain(|candidate| !retained_closure.contains(&candidate.path));
+                }
+            }
+            match root_page.next_start_after {
+                Some(next) => root_cursor = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(ControlMvpGcPlan {
+            head_version: head.version,
+            candidates,
+            continuation: next_continuation,
+        })
+    }
+
+    async fn protect_manifest_closure(
+        &self,
+        manifest_id: &str,
+        protected: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let manifest_path = self.store.paths.manifest_object(manifest_id);
+        if !protected.insert(manifest_path) {
+            return Ok(());
+        }
+        let manifest = self.store.load_manifest(manifest_id).await?;
+        for reference in manifest
+            .base_states
+            .iter()
+            .chain(manifest.anchor_states.iter())
+        {
+            Self::protect_segment(&self.store.paths, reference, protected);
+        }
+        for tx_ref in &manifest.tx_refs {
+            protected.insert(self.store.paths.tx_object(&tx_ref.tx_id));
+            let tx = self.store.load_tx_metadata(tx_ref).await?;
+            protected.insert(
+                self.store
+                    .paths
+                    .l0_segment_object(&tx.l0_segment.segment_id),
+            );
+            protected.insert(self.store.paths.segment_index(&tx.l0_segment.segment_id));
+        }
+        Ok(())
+    }
+
+    fn protect_segment(
+        paths: &ControlMvpPaths,
+        reference: &ControlMvpStateRef,
+        protected: &mut BTreeSet<String>,
+    ) {
+        protected.insert(paths.state_object(&reference.state_id));
+        protected.insert(paths.segment_index(&reference.state_id));
+    }
+
+    fn is_gc_managed_immutable(base_prefix: &str, path: &str) -> bool {
+        [
+            "manifests/",
+            "transactions/",
+            "segments/l0/",
+            "segments/l1/",
+            "indexes/",
+            "checkpoints/",
+        ]
+        .iter()
+        .any(|suffix| path.starts_with(&format!("{base_prefix}{suffix}")))
+    }
+
+    /// Returns the durable intent selected by the current authority manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current head or manifest is unavailable or corrupt.
+    pub async fn pending_intent(&self) -> Result<Option<LayoutMaintenanceIntentV1>> {
+        let Some(_) = self
+            .store
+            .storage
+            .head(&self.store.paths.current_pointer())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let pointer = self.store.load_pointer().await?;
+        let manifest = self.store.load_manifest_for_pointer(&pointer).await?;
+        Ok(manifest.maintenance_intent)
+    }
+
+    /// Consolidates the currently selected suffix into a checksummed L1 shard set.
+    ///
+    /// Publication uses the exact observed head version. A conflict triggers a
+    /// fresh read and replan; the worker never overwrites a newer logical state.
+    /// The returned token has the same logical sequence as the source token.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed corruption, storage, ambiguity, or repeated-CAS errors.
+    #[allow(clippy::too_many_lines)]
+    pub async fn consolidate_pending(&self) -> Result<Option<ControlMvpMaintenanceOutcome>> {
+        for _attempt in 0..4 {
+            let Some(head) = self
+                .store
+                .storage
+                .head(&self.store.paths.current_pointer())
+                .await?
+            else {
+                return Ok(None);
+            };
+            let pointer = self.store.load_pointer().await?;
+            let source_manifest = self.store.load_manifest_for_pointer(&pointer).await?;
+            let Some(intent) = source_manifest.maintenance_intent.clone() else {
+                return Ok(None);
+            };
+            let source_token = self.store.token(
+                source_manifest.manifest_id.clone(),
+                source_manifest.logical_sequence,
+            );
+            let state = self.store.replay_manifest(&source_manifest).await?;
+            let candidate_manifest_id = format!(
+                "manifest-{:020}-layout-{:020}-{}",
+                source_manifest.logical_sequence,
+                intent.layout_generation(),
+                Ulid::new().to_string().to_ascii_lowercase()
+            );
+            let rendered = self
+                .store
+                .render_state_snapshots(&state, &candidate_manifest_id)?;
+            let base_states = rendered
+                .iter()
+                .map(|segment| segment.reference.clone())
+                .collect::<Vec<_>>();
+            let candidate_manifest = ControlMvpManifest {
+                format_version: CONTROL_MVP_FORMAT_VERSION,
+                implementation: IMPLEMENTATION.to_string(),
+                scope: ControlMvpScopeDoc::from(&self.store.scope),
+                manifest_id: candidate_manifest_id.clone(),
+                logical_sequence: source_manifest.logical_sequence,
+                base_manifest_id: Some(source_manifest.manifest_id.clone()),
+                writer_epoch: pointer.writer_epoch,
+                layout_generation: intent.layout_generation(),
+                base_states,
+                anchor_states: Vec::new(),
+                tx_refs: Vec::new(),
+                state_checksum_sha256: source_manifest.state_checksum_sha256.clone(),
+                maintenance_intent: None,
+            };
+            candidate_manifest.validate(&self.store.scope, &candidate_manifest_id)?;
+            let manifest_bytes = encode_envelope_limited(
+                "control-mvp-manifest",
+                &candidate_manifest,
+                MAX_CONTROL_JSON_BYTES,
+                "control MVP maintenance manifest",
+            )?;
+            let candidate_pointer = ControlMvpPointer {
+                format_version: CONTROL_MVP_FORMAT_VERSION,
+                implementation: IMPLEMENTATION.to_string(),
+                scope: ControlMvpScopeDoc::from(&self.store.scope),
+                manifest_id: candidate_manifest_id.clone(),
+                logical_sequence: source_manifest.logical_sequence,
+                manifest_checksum_sha256: sha256_hex(&manifest_bytes),
+                writer_epoch: pointer.writer_epoch,
+            };
+            let pointer_bytes = encode_json_limited(
+                &candidate_pointer,
+                MAX_HEAD_JSON_BYTES,
+                "control MVP maintenance head",
+            )?;
+
+            for segment in &rendered {
+                put_immutable_matching(
+                    &self.store.storage,
+                    &self.store.paths.state_object(&segment.reference.state_id),
+                    segment.bytes.clone(),
+                    "control MVP maintenance L1 segment already exists with different bytes",
+                )
+                .await?;
+                put_immutable_matching(
+                    &self.store.storage,
+                    &self.store.paths.segment_index(&segment.reference.state_id),
+                    segment.index_bytes.clone(),
+                    "control MVP maintenance L1 index already exists with different bytes",
+                )
+                .await?;
+            }
+            put_immutable_matching(
+                &self.store.storage,
+                &self.store.paths.manifest_object(&candidate_manifest_id),
+                manifest_bytes,
+                "control MVP maintenance manifest already exists with different bytes",
+            )
+            .await?;
+            let publish = self
+                .store
+                .storage
+                .put(
+                    &self.store.paths.current_pointer(),
+                    pointer_bytes.clone(),
+                    AuthorityWritePrecondition::MatchesVersion(head.version),
+                )
+                .await;
+            match publish {
+                Ok(WriteResult::Success { .. }) => {
+                    return Ok(Some(ControlMvpMaintenanceOutcome {
+                        source_token,
+                        selected_token: self
+                            .store
+                            .token(candidate_manifest_id, source_manifest.logical_sequence),
+                        layout_generation: intent.layout_generation(),
+                    }));
+                }
+                Ok(WriteResult::PreconditionFailed { .. }) => {}
+                Err(error) => {
+                    if self
+                        .store
+                        .storage
+                        .get(&self.store.paths.current_pointer())
+                        .await
+                        .is_ok_and(|visible| visible == pointer_bytes)
+                    {
+                        return Ok(Some(ControlMvpMaintenanceOutcome {
+                            source_token,
+                            selected_token: self
+                                .store
+                                .token(candidate_manifest_id, source_manifest.logical_sequence),
+                            layout_generation: intent.layout_generation(),
+                        }));
+                    }
+                    return Err(ambiguous_authority_outcome(format!(
+                        "control MVP maintenance head CAS outcome is unknown: {error}"
+                    )));
+                }
+            }
+        }
+        Err(CatalogError::CasFailed {
+            message: "control MVP maintenance head changed during four replans".to_string(),
+        })
+    }
 }
 
 fn stale_writer_epoch(held: u64, current: u64) -> CatalogError {
@@ -1819,7 +3166,7 @@ impl ControlMvpRestoreParticipant {
             rendered.l0_index_bytes.clone(),
         )
         .await?;
-        if let Some(l1_segment) = &rendered.l1_segment {
+        for l1_segment in &rendered.l1_segments {
             put_restore_immutable(
                 &self.store.storage,
                 &self
@@ -1902,21 +3249,22 @@ impl ControlMvpRestoreParticipant {
                 "visible restore manifest checksum mismatch",
             ));
         }
-        let manifest: ControlMvpManifest = decode_envelope(
+        let manifest: ControlMvpManifest = decode_envelope_limited(
             &manifest_bytes,
             "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
             "Control MVP restore candidate manifest",
         )?;
         manifest.validate(&self.store.scope, &plan.candidate_manifest_id)?;
         let base_manifest = self.store.load_manifest(&plan.base_manifest_id).await?;
-        let (expected_base_state, expected_prefix) = base_manifest.successor_anchor();
+        let (expected_base_states, expected_prefix) = base_manifest.successor_anchor();
         let checkpoint_interval = plan.required_checkpoint_interval()?;
         let should_anchor =
             u64::try_from(expected_prefix.len() + 1).unwrap_or(u64::MAX) >= checkpoint_interval;
         if manifest.logical_sequence != plan.result_logical_sequence
             || manifest.base_manifest_id.as_deref() != Some(plan.base_manifest_id.as_str())
-            || manifest.base_state != expected_base_state
-            || manifest.anchor_state.is_some() != should_anchor
+            || manifest.base_states != expected_base_states
+            || manifest.anchor_states.is_empty() == should_anchor
             || manifest.tx_refs.len() != expected_prefix.len() + 1
             || manifest.tx_refs.get(..expected_prefix.len()) != Some(expected_prefix.as_slice())
             || manifest.tx_refs.last() != Some(&planned_tx_ref)
@@ -1926,8 +3274,11 @@ impl ControlMvpRestoreParticipant {
             ));
         }
         let replayed = self.store.replay_manifest(&manifest).await?;
-        if let Some(anchor) = &manifest.anchor_state {
-            let anchored = self.store.load_state_snapshot(anchor).await?;
+        if !manifest.anchor_states.is_empty() {
+            let anchored = self
+                .store
+                .load_state_snapshots(&manifest.anchor_states)
+                .await?;
             if anchored.checksum()? != replayed.checksum()? {
                 return Err(invariant_violation(
                     "visible restore L1 anchor does not match replayed state",
@@ -2070,6 +3421,16 @@ impl ControlMvpTxn {
     #[must_use]
     pub fn candidate_manifest_id(&self) -> &str {
         &self.manifest_id
+    }
+
+    pub(crate) fn predicted_state_token(&self) -> Result<StateToken> {
+        let predicted_sequence = next_logical_sequence(
+            self.base.state.logical_sequence,
+            "predicting a control MVP transaction token",
+        )?;
+        Ok(self
+            .store
+            .token(self.manifest_id.clone(), predicted_sequence))
     }
 
     /// Stages a projection outbox record in this MVP transaction.
@@ -2365,11 +3726,32 @@ impl ControlMvpTxn {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let encoded_projection_intents = projection_intents
+            .iter()
+            .map(|intent| encode_json(intent, "projection intent"))
+            .collect::<Result<Vec<_>>>()?;
+        let aggregate_intent_bytes =
+            encoded_projection_intents
+                .iter()
+                .try_fold(0_usize, |total, intent| {
+                    total.checked_add(intent.len()).ok_or_else(|| {
+                        CatalogError::MaintenanceBackpressure {
+                            message: "projection intent aggregate byte count overflow".to_string(),
+                        }
+                    })
+                })?;
+        if aggregate_intent_bytes > MAX_PROJECTION_INTENT_AGGREGATE_BYTES {
+            return Err(CatalogError::MaintenanceBackpressure {
+                message: format!(
+                    "projection intents require {aggregate_intent_bytes} JSON bytes, above the {MAX_PROJECTION_INTENT_AGGREGATE_BYTES}-byte transaction budget"
+                ),
+            });
+        }
         let mut committed_outbox = self.outbox;
-        for intent in &projection_intents {
+        for (intent, encoded) in projection_intents.iter().zip(encoded_projection_intents) {
             committed_outbox.push(ControlMvpProjectionOutboxRecord::new(
                 intent.intent_id(),
-                encode_json(intent, "projection intent")?,
+                encoded,
             ));
         }
         let mut tx = ControlMvpTxObject {
@@ -2402,7 +3784,12 @@ impl ControlMvpTxn {
             self.store.segment_limits,
         )?;
         tx.l0_segment = l0_reference.clone();
-        let tx_bytes = encode_envelope("control-mvp-tx", &tx)?;
+        let tx_bytes = encode_envelope_limited(
+            "control-mvp-tx",
+            &tx,
+            MAX_TRANSACTION_JSON_BYTES,
+            "control MVP transaction",
+        )?;
         let tx_checksum = sha256_hex(&tx_bytes);
         let candidate_tx_ref = ControlMvpTxRef {
             tx_id: self.tx_id.clone(),
@@ -2415,26 +3802,35 @@ impl ControlMvpTxn {
         let mut tx_refs = self.base.tx_refs.clone();
         tx_refs.push(candidate_tx_ref.clone());
 
-        // Anchor the resulting state as an immutable snapshot when this commit
-        // fills the checkpoint interval, so successors replay a bounded suffix.
-        let rendered_anchor = if tx_refs.len() as u64 >= self.store.checkpoint_interval {
-            let snapshot = ControlMvpStateObject::from_replay(
-                &candidate_state,
-                state_id_for_manifest(&self.manifest_id),
-                &self.store.scope,
-            );
-            let (bytes, index_bytes, reference) = self.store.render_state_snapshot(&snapshot)?;
-            Some(RenderedControlMvpStateSegment {
-                reference,
-                bytes,
-                index_bytes,
-            })
-        } else {
-            None
-        };
-        let anchor_state = rendered_anchor
-            .as_ref()
-            .map(|rendered| rendered.reference.clone());
+        let production_async_layout =
+            self.store.checkpoint_interval == ControlMvpStateStore::DEFAULT_CHECKPOINT_INTERVAL;
+        if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
+            return Err(CatalogError::MaintenanceBackpressure {
+                message: "control MVP reached 32 L0 segments before layout maintenance completed"
+                    .to_string(),
+            });
+        }
+
+        // Explicit non-production intervals retain the deterministic inline
+        // anchor path used by restore tests. Production uses maintenance intent.
+        let rendered_anchor =
+            if !production_async_layout && tx_refs.len() as u64 >= self.store.checkpoint_interval {
+                self.store
+                    .render_state_snapshots(&candidate_state, &self.manifest_id)?
+            } else {
+                Vec::new()
+            };
+        let anchor_states = rendered_anchor
+            .iter()
+            .map(|rendered| rendered.reference.clone())
+            .collect();
+        let maintenance_intent = layout_maintenance_intent_for_manifest(
+            &self.store.scope,
+            &self.manifest_id,
+            next_sequence,
+            self.base.layout_generation,
+            tx_refs.len(),
+        )?;
 
         let manifest = ControlMvpManifest {
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -2444,12 +3840,19 @@ impl ControlMvpTxn {
             logical_sequence: next_sequence,
             base_manifest_id: self.base.manifest_id,
             writer_epoch: self.store.writer_epoch,
-            base_state: self.base.base_state,
-            anchor_state,
+            layout_generation: self.base.layout_generation,
+            base_states: self.base.base_states,
+            anchor_states,
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
+            maintenance_intent,
         };
-        let manifest_bytes = encode_envelope("control-mvp-manifest", &manifest)?;
+        let manifest_bytes = encode_envelope_limited(
+            "control-mvp-manifest",
+            &manifest,
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
         let pointer = ControlMvpPointer {
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -2460,7 +3863,8 @@ impl ControlMvpTxn {
             manifest_checksum_sha256: manifest_checksum,
             writer_epoch: self.store.writer_epoch,
         };
-        let pointer_bytes = encode_json(&pointer, "control MVP pointer")?;
+        let pointer_bytes =
+            encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
         let precondition = self.base.pointer_version.map_or(
             AuthorityWritePrecondition::DoesNotExist,
             AuthorityWritePrecondition::MatchesVersion,
@@ -2479,7 +3883,7 @@ impl ControlMvpTxn {
         self.store
             .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
             .await?;
-        if let Some(rendered) = rendered_anchor {
+        for rendered in rendered_anchor {
             put_immutable_matching(
                 &self.store.storage,
                 &self.store.paths.state_object(&rendered.reference.state_id),
@@ -2571,22 +3975,63 @@ impl ControlMvpTxn {
 #[async_trait]
 impl ArcoStateReader for ControlMvpStateStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(self
-            .load_current_state()
-            .await?
-            .kv
-            .get(key)
-            .filter(|value| !value.tombstone)
-            .map(|value| value.bytes.clone()))
+        let Some(_pointer_meta) = self.storage.head(&self.paths.current_pointer()).await? else {
+            return Ok(None);
+        };
+        let pointer = self.load_pointer().await?;
+        let manifest = self.load_manifest_for_pointer(&pointer).await?;
+        self.get_from_manifest(&manifest, key).await
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        Ok(self.load_current_state().await?.scan_prefix(prefix))
+    async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        request.validate_for_scope(&self.scope)?;
+        let (manifest, observed_token) = if let Some(token) = request.continuation_token() {
+            let manifest = self.load_manifest(token.authority_manifest_id()).await?;
+            if manifest.logical_sequence != token.logical_sequence() {
+                return Err(invariant_violation(
+                    "scan continuation logical sequence does not match authority manifest",
+                ));
+            }
+            (manifest, Some(token.clone()))
+        } else {
+            let Some(_pointer_meta) = self.storage.head(&self.paths.current_pointer()).await?
+            else {
+                return build_scan_page(&self.scope, request, None, Vec::new());
+            };
+            let pointer = self.load_pointer().await?;
+            let manifest = self.load_manifest_for_pointer(&pointer).await?;
+            (
+                manifest,
+                Some(self.token(pointer.manifest_id, pointer.logical_sequence)),
+            )
+        };
+        let observed_token = observed_token.ok_or_else(|| {
+            invariant_violation("control MVP manifest scan has no observed authority token")
+        })?;
+        self.scan_manifest_page(&manifest, request, observed_token)
+            .await
     }
 
     async fn read_at(&self, token: StateToken) -> Result<Box<dyn ArcoStateReader>> {
+        if token.scope() != &self.scope {
+            return Err(validation_failed(
+                "StateToken scope does not match control MVP store",
+            ));
+        }
+        let manifest = self.load_manifest(token.authority_manifest_id()).await?;
+        if manifest.logical_sequence != token.logical_sequence() {
+            return Err(invariant_violation(
+                "StateToken logical sequence does not match manifest",
+            ));
+        }
+        self.validate_manifest_read_metadata(&manifest).await?;
         Ok(Box::new(ControlMvpRetainedReader {
-            state: self.load_state_at_token(&token).await?,
+            scope: self.scope.clone(),
+            token,
+            source: ControlMvpRetainedSource::Manifest {
+                store: Box::new(self.clone()),
+                manifest: Box::new(manifest),
+            },
         }))
     }
 
@@ -2597,9 +4042,14 @@ impl ArcoStateReader for ControlMvpStateStore {
             ));
         }
         let checkpoint = self.load_checkpoint(token.checkpoint_id()).await?;
-        if checkpoint.state.logical_sequence != checkpoint.logical_sequence {
+        if checkpoint.states.is_empty()
+            || checkpoint
+                .states
+                .iter()
+                .any(|state| state.logical_sequence != checkpoint.logical_sequence)
+        {
             return Err(invariant_violation(
-                "control MVP checkpoint state sequence does not match checkpoint",
+                "control MVP checkpoint state segments do not match checkpoint sequence",
             ));
         }
         // Sequence agreement alone does not prove the snapshot is the state
@@ -2621,13 +4071,17 @@ impl ArcoStateReader for ControlMvpStateStore {
                 "control MVP checkpoint sequence does not match its authority manifest",
             ));
         }
-        let state = self.load_state_snapshot(&checkpoint.state).await?;
+        let state = self.load_state_snapshots(&checkpoint.states).await?;
         if state.checksum()? != manifest.state_checksum_sha256 {
             return Err(invariant_violation(
                 "control MVP checkpoint snapshot is not the state named by its authority manifest",
             ));
         }
-        Ok(Box::new(ControlMvpRetainedReader { state }))
+        Ok(Box::new(ControlMvpRetainedReader {
+            scope: self.scope.clone(),
+            token: self.token(checkpoint.manifest_id, checkpoint.logical_sequence),
+            source: ControlMvpRetainedSource::Materialized(state),
+        }))
     }
 }
 
@@ -2650,40 +4104,74 @@ impl ArcoStateAdmin for ControlMvpStateStore {
                 "checkpoint scope does not match control MVP store",
             ));
         }
-        let pointer = self.load_pointer().await?;
-        let manifest = self.load_manifest_for_pointer(&pointer).await?;
-        // Reuse the manifest's own anchored snapshot when it has one;
-        // otherwise materialize the replay state as a new immutable snapshot
-        // so checkpoint reads never replay history.
-        let state_ref = if let Some(reference) = manifest.anchor_state.clone() {
-            reference
-        } else {
-            let state = self.replay_manifest(&manifest).await?;
-            let snapshot = ControlMvpStateObject::from_replay(
-                &state,
-                state_id_for_manifest(&manifest.manifest_id),
-                &self.scope,
-            );
-            self.write_state_snapshot(&snapshot).await?
-        };
-        let checkpoint_id = format!(
-            "checkpoint-{:020}-{}",
-            pointer.logical_sequence,
+        if opts.is_externally_retention_coordinated() {
+            return self.publish_checkpoint_under_retention(&opts).await;
+        }
+        let mut guard =
+            DistributedLock::new(Arc::new(self.retention.clone()), RETENTION_GC_LOCK_PATH)
+                .acquire_with_operation(
+                    RETENTION_GC_LOCK_TTL,
+                    RETENTION_GC_LOCK_MAX_RETRIES,
+                    Some(format!("control-v1-checkpoint:{}", self.scope.domain())),
+                )
+                .await
+                .map_err(CatalogError::from)?;
+        let operation_id = format!(
+            "control-v1-checkpoint-{}",
             Ulid::new().to_string().to_ascii_lowercase()
         );
-        let checkpoint = ControlMvpCheckpoint {
-            format_version: CONTROL_MVP_FORMAT_VERSION,
-            implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
-            checkpoint_id: checkpoint_id.clone(),
-            manifest_id: pointer.manifest_id,
-            logical_sequence: pointer.logical_sequence,
-            manifest_checksum_sha256: pointer.manifest_checksum_sha256,
-            state: state_ref,
-            min_retention_seconds: opts.min_retention_seconds(),
+        let lifecycle = self.retention.clone();
+        let terminal_operation_id = operation_id.clone();
+        let mut epoch = match RetentionMutationEpoch::claim(
+            lifecycle,
+            &mut guard,
+            RetentionMutationKind::CatalogCheckpointPublish,
+            operation_id,
+        )
+        .await
+        {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                let _ = guard.release().await;
+                return Err(error);
+            }
         };
-        self.write_checkpoint(&checkpoint).await?;
-        Ok(self.checkpoint_token(checkpoint_id))
+        let publication = epoch
+            .run_external_mutation(self.publish_checkpoint_under_retention(&opts))
+            .await;
+        let settlement = if publication.is_ok() {
+            epoch.settle().await
+        } else {
+            // Every checkpoint write above has finished before this branch is
+            // entered. Checkpoint publication is additive: a selected final
+            // checkpoint record is a retained root, while snapshots without
+            // that record are merely unreachable candidates. It is therefore
+            // safe to prove this exact operation terminal after a returned
+            // error. A process crash cannot execute this reconciliation and
+            // deliberately leaves the epoch in flight for operator recovery.
+            drop(epoch);
+            let terminal_operation_ids = BTreeSet::from([terminal_operation_id]);
+            match RetentionMutationEpoch::settle_terminal_matching(
+                self.retention.clone(),
+                &mut guard,
+                RetentionMutationKind::CatalogCheckpointPublish,
+                &terminal_operation_ids,
+            )
+            .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(CatalogError::CasFailed {
+                    message: "checkpoint retention epoch changed before terminal settlement"
+                        .to_string(),
+                }),
+                Err(error) => Err(error),
+            }
+        };
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (publication, settlement, release) {
+            (Ok(token), Ok(()), Ok(())) => Ok(token),
+            (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -2706,8 +4194,12 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         }
         let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
         let bytes = self.storage.get(&manifest_path).await?;
-        let manifest: ControlMvpManifest =
-            decode_envelope(&bytes, "control-mvp-manifest", "control MVP manifest")?;
+        let manifest: ControlMvpManifest = decode_envelope_limited(
+            &bytes,
+            "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
         manifest.validate(&self.scope, token.authority_manifest_id())?;
         if manifest.logical_sequence != token.logical_sequence() {
             return Err(invariant_violation(
@@ -2745,9 +4237,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         }
         let checkpoint_path = self.paths.checkpoint_object(token.checkpoint_id());
         let checkpoint_bytes = self.storage.get(&checkpoint_path).await?;
-        let checkpoint: ControlMvpCheckpoint = decode_envelope(
+        let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
             &checkpoint_bytes,
             "control-mvp-checkpoint",
+            MAX_CONTROL_JSON_BYTES,
             "control MVP checkpoint",
         )?;
         checkpoint.validate(&self.scope, token.checkpoint_id())?;
@@ -2759,9 +4252,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             Some(&checkpoint.manifest_checksum_sha256),
             "control MVP checkpoint manifest checksum",
         )?;
-        let manifest: ControlMvpManifest = decode_envelope(
+        let manifest: ControlMvpManifest = decode_envelope_limited(
             &manifest_bytes,
             "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
             "control MVP manifest",
         )?;
         manifest.validate(&self.scope, &checkpoint.manifest_id)?;
@@ -2819,9 +4313,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "persisted authority manifest checksum mismatch",
             ));
         }
-        let manifest: ControlMvpManifest = decode_envelope(
+        let manifest: ControlMvpManifest = decode_envelope_limited(
             &manifest_bytes,
             "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
             "control MVP manifest",
         )?;
         manifest.validate(&self.scope, reference.manifest_id())?;
@@ -2865,9 +4360,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                         "persisted checkpoint checksum mismatch",
                     ));
                 }
-                let checkpoint: ControlMvpCheckpoint = decode_envelope(
+                let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
                     &checkpoint_bytes,
                     "control-mvp-checkpoint",
+                    MAX_CONTROL_JSON_BYTES,
                     "control MVP checkpoint",
                 )?;
                 checkpoint.validate(&self.scope, checkpoint_id)?;
@@ -3082,8 +4578,13 @@ impl ArcoStateTxn for ControlMvpTxn {
         Ok(self.get_inner(key))
     }
 
-    async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        Ok(self.scan_prefix_inner(prefix))
+    async fn scan(&mut self, request: ScanRequest) -> Result<ScanPage> {
+        let observed_token = self.base.manifest_id.as_ref().map(|manifest_id| {
+            self.store
+                .token(manifest_id.clone(), self.base.state.logical_sequence)
+        });
+        let entries = self.scan_prefix_inner(request.prefix());
+        build_scan_page(&self.store.scope, request, observed_token, entries)
     }
 
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
@@ -3179,8 +4680,9 @@ struct ControlMvpBase {
     pointer_version: Option<String>,
     manifest_id: Option<String>,
     writer_epoch: u64,
+    layout_generation: u64,
     state: ReplayState,
-    base_state: Option<ControlMvpStateRef>,
+    base_states: Vec<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
 }
 
@@ -3197,7 +4699,7 @@ struct RenderedControlMvpRestore {
     transaction_bytes: Bytes,
     l0_segment_bytes: Bytes,
     l0_index_bytes: Bytes,
-    l1_segment: Option<RenderedControlMvpStateSegment>,
+    l1_segments: Vec<RenderedControlMvpStateSegment>,
     candidate_manifest_id: String,
     manifest_bytes: Bytes,
     pointer_bytes: Bytes,
@@ -3460,6 +4962,39 @@ struct StoredValue {
     tombstone: bool,
 }
 
+fn scan_page_budget_exceeded(
+    base: &BTreeMap<Vec<u8>, StoredValue>,
+    overlay: &BTreeMap<Vec<u8>, StoredValue>,
+    through: &[u8],
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<bool> {
+    let keys = base
+        .keys()
+        .chain(overlay.keys())
+        .filter(|key| key.as_slice() <= through)
+        .collect::<BTreeSet<_>>();
+    let mut rows = 0_usize;
+    let mut bytes = 0_usize;
+    for key in keys {
+        let value = overlay.get(key).or_else(|| base.get(key)).ok_or_else(|| {
+            invariant_violation("control MVP scan merge key lost its selected value")
+        })?;
+        if value.tombstone {
+            continue;
+        }
+        rows = rows.saturating_add(1);
+        bytes = bytes
+            .checked_add(key.len())
+            .and_then(|total| total.checked_add(value.bytes.len()))
+            .ok_or_else(|| validation_failed("control MVP scan decoded byte count overflow"))?;
+        if rows > max_rows || bytes > max_bytes {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[derive(Debug)]
 enum StagedWrite {
     Put(Bytes),
@@ -3569,6 +5104,8 @@ struct ControlMvpStateRef {
     logical_sequence: u64,
     checksum_sha256: String,
     index_checksum_sha256: String,
+    min_key_hex: Option<String>,
+    max_key_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3597,6 +5134,7 @@ struct ControlMvpSegmentIndex {
     level: ControlMvpSegmentLevel,
     logical_sequence: u64,
     row_count: u64,
+    segment_size_bytes: u64,
     min_key_hex: Option<String>,
     max_key_hex: Option<String>,
     min_key_utf8: Option<String>,
@@ -3627,6 +5165,7 @@ struct ControlMvpStateObject {
     state_id: String,
     logical_sequence: u64,
     entries: Vec<ReplayStateDigestEntry>,
+    outbox_start_ordinal: Option<u64>,
     outbox: Vec<ControlMvpOutboxStateEntry>,
 }
 
@@ -3647,6 +5186,7 @@ impl ControlMvpStateObject {
                     value: (!value.tombstone).then(|| value.bytes.to_vec()),
                 })
                 .collect(),
+            outbox_start_ordinal: (!state.outbox.is_empty()).then_some(0),
             outbox: state
                 .outbox
                 .iter()
@@ -3683,35 +5223,9 @@ impl ControlMvpStateObject {
         }
         Ok(())
     }
-
-    fn into_replay_state(self) -> ReplayState {
-        ReplayState {
-            logical_sequence: self.logical_sequence,
-            kv: self
-                .entries
-                .into_iter()
-                .map(|entry| {
-                    let tombstone = entry.value.is_none();
-                    (
-                        entry.key,
-                        StoredValue {
-                            bytes: Bytes::from(entry.value.unwrap_or_default()),
-                            generation: entry.generation,
-                            tombstone,
-                        },
-                    )
-                })
-                .collect(),
-            outbox: self
-                .outbox
-                .iter()
-                .map(ControlMvpOutboxStateEntry::to_record)
-                .collect(),
-        }
-    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpManifest {
     format_version: u32,
     implementation: String,
@@ -3720,10 +5234,12 @@ struct ControlMvpManifest {
     logical_sequence: u64,
     base_manifest_id: Option<String>,
     writer_epoch: u64,
-    base_state: Option<ControlMvpStateRef>,
-    anchor_state: Option<ControlMvpStateRef>,
+    layout_generation: u64,
+    base_states: Vec<ControlMvpStateRef>,
+    anchor_states: Vec<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
     state_checksum_sha256: String,
+    maintenance_intent: Option<LayoutMaintenanceIntentV1>,
 }
 
 impl ControlMvpManifest {
@@ -3746,36 +5262,115 @@ impl ControlMvpManifest {
                 "control MVP manifest id does not match requested path",
             ));
         }
+        let base_sequence = self.validate_base_states()?;
+        self.validate_replay_suffix(base_sequence)?;
+        self.validate_anchor_states()?;
+        self.validate_maintenance_intent(scope)?;
+        Ok(())
+    }
+
+    fn validate_base_states(&self) -> Result<Option<u64>> {
+        let base_sequence = self
+            .base_states
+            .first()
+            .map(|reference| reference.logical_sequence);
+        if self
+            .base_states
+            .iter()
+            .any(|reference| Some(reference.logical_sequence) != base_sequence)
+        {
+            return Err(invariant_violation(
+                "control MVP manifest base L1 segments mix logical sequences",
+            ));
+        }
+        let mut prior_max = None;
+        for reference in &self.base_states {
+            match state_reference_key_bounds(reference)? {
+                Some((minimum, maximum)) => {
+                    if prior_max
+                        .as_ref()
+                        .is_some_and(|prior: &Vec<u8>| prior.as_slice() >= minimum.as_slice())
+                    {
+                        return Err(invariant_violation(
+                            "control MVP manifest L1 key bounds overlap or are out of order",
+                        ));
+                    }
+                    prior_max = Some(maximum);
+                }
+                None if self.base_states.len() == 1 => {}
+                None => {
+                    return Err(invariant_violation(
+                        "control MVP manifest has a keyless L1 shard in a multi-shard layout",
+                    ));
+                }
+            }
+        }
+        Ok(base_sequence)
+    }
+
+    fn validate_replay_suffix(&self, base_sequence: Option<u64>) -> Result<()> {
         if self.tx_refs.is_empty() {
-            return Err(invariant_violation(
-                "control MVP manifest carries no transaction suffix",
-            ));
-        }
-        let expected_first = match self.base_state.as_ref() {
-            Some(anchor) => next_logical_sequence(
-                anchor.logical_sequence,
-                "validating a control MVP manifest suffix",
-            )?,
-            None => 1,
-        };
-        if self.tx_refs.first().map_or(0, |tx_ref| tx_ref.sequence) != expected_first {
-            return Err(invariant_violation(
-                "control MVP manifest suffix does not start at its replay anchor",
-            ));
-        }
-        if self.tx_refs.last().map_or(0, |tx_ref| tx_ref.sequence) != self.logical_sequence {
-            return Err(invariant_violation(
-                "control MVP manifest sequence does not match selected tx refs",
-            ));
-        }
-        if let Some(anchor) = &self.anchor_state {
-            if anchor.logical_sequence != self.logical_sequence
-                || anchor.state_id != state_id_for_manifest(&self.manifest_id)
-            {
+            if base_sequence != Some(self.logical_sequence) {
                 return Err(invariant_violation(
-                    "control MVP manifest anchor snapshot does not match manifest identity",
+                    "control MVP suffix-free manifest must select an equivalent L1 state",
                 ));
             }
+        } else {
+            let expected_first = match base_sequence {
+                Some(sequence) => {
+                    next_logical_sequence(sequence, "validating a control MVP manifest suffix")?
+                }
+                None => 1,
+            };
+            if self.tx_refs.first().map_or(0, |tx_ref| tx_ref.sequence) != expected_first {
+                return Err(invariant_violation(
+                    "control MVP manifest suffix does not start at its replay anchor",
+                ));
+            }
+            if self.tx_refs.last().map_or(0, |tx_ref| tx_ref.sequence) != self.logical_sequence {
+                return Err(invariant_violation(
+                    "control MVP manifest sequence does not match selected tx refs",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_anchor_states(&self) -> Result<()> {
+        for (ordinal, anchor) in self.anchor_states.iter().enumerate() {
+            if anchor.logical_sequence != self.logical_sequence
+                || anchor.state_id != state_segment_id_for_manifest(&self.manifest_id, ordinal)
+            {
+                return Err(invariant_violation(
+                    "control MVP manifest anchor segment does not match manifest identity",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_maintenance_intent(&self, scope: &StateScope) -> Result<()> {
+        match &self.maintenance_intent {
+            Some(intent)
+                if self.tx_refs.len() >= L0_MAINTENANCE_INTENT_THRESHOLD
+                    && intent.source_scope() == scope
+                    && intent.source_logical_sequence() == self.logical_sequence
+                    && intent.source_authority_manifest_id() == self.manifest_id
+                    && self
+                        .layout_generation
+                        .checked_add(1)
+                        .is_some_and(|next| next == intent.layout_generation()) => {}
+            Some(_) => {
+                return Err(invariant_violation(
+                    "control MVP layout-maintenance intent does not match its source manifest",
+                ));
+            }
+            None if self.tx_refs.len() >= L0_MAINTENANCE_INTENT_THRESHOLD => {
+                return Err(invariant_violation(
+                    "control MVP manifest above the L0 maintenance threshold has no intent",
+                ));
+            }
+            None => {}
         }
         Ok(())
     }
@@ -3783,11 +5378,12 @@ impl ControlMvpManifest {
     /// Returns the replay anchor and transaction suffix a successor manifest
     /// must extend: a fresh suffix on this manifest's own snapshot when one
     /// was anchored, otherwise this manifest's anchor and suffix.
-    fn successor_anchor(&self) -> (Option<ControlMvpStateRef>, Vec<ControlMvpTxRef>) {
-        self.anchor_state.as_ref().map_or_else(
-            || (self.base_state.clone(), self.tx_refs.clone()),
-            |anchor| (Some(anchor.clone()), Vec::new()),
-        )
+    fn successor_anchor(&self) -> (Vec<ControlMvpStateRef>, Vec<ControlMvpTxRef>) {
+        if self.anchor_states.is_empty() {
+            (self.base_states.clone(), self.tx_refs.clone())
+        } else {
+            (self.anchor_states.clone(), Vec::new())
+        }
     }
 }
 
@@ -3822,7 +5418,7 @@ struct ControlMvpTxObject {
     outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
-/// Exact event incarnation removed by a v3 L0 transaction row.
+/// Exact event incarnation removed by a v4 L0 transaction row.
 #[derive(Debug, Clone)]
 struct ControlMvpOutboxTrimEntry {
     record_id: String,
@@ -4113,22 +5709,22 @@ fn segment_rows_for_state(state: &ControlMvpStateObject) -> Vec<ControlMvpSegmen
             logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
             origin_sequence: None,
         })
-        .chain(
-            state
-                .outbox
-                .iter()
-                .enumerate()
-                .map(|(ordinal, entry)| ControlMvpSegmentRow {
-                    record_kind: SEGMENT_RECORD_OUTBOX,
-                    key: entry.record_id.as_bytes().to_vec(),
-                    value: Some(entry.payload.clone()),
-                    generation: 0,
-                    tombstone: false,
-                    logical_sequence: state.logical_sequence,
-                    logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
-                    origin_sequence: entry.origin_sequence,
-                }),
-        )
+        .chain(state.outbox.iter().enumerate().map(|(ordinal, entry)| {
+            ControlMvpSegmentRow {
+                record_kind: SEGMENT_RECORD_OUTBOX,
+                key: entry.record_id.as_bytes().to_vec(),
+                value: Some(entry.payload.clone()),
+                generation: 0,
+                tombstone: false,
+                logical_sequence: state.logical_sequence,
+                logical_ordinal: state
+                    .outbox_start_ordinal
+                    .unwrap_or(0)
+                    .checked_add(u64::try_from(ordinal).unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX),
+                origin_sequence: entry.origin_sequence,
+            }
+        }))
         .collect::<Vec<_>>();
     sort_segment_rows(&mut rows);
     rows
@@ -4200,9 +5796,15 @@ fn state_object_from_segment_rows(
         }
     }
     outbox.sort_by_key(|(ordinal, _)| *ordinal);
+    let outbox_start_ordinal = outbox.first().map(|(ordinal, _)| *ordinal);
     for (expected, (actual, _)) in outbox.iter().enumerate() {
-        let expected = u64::try_from(expected)
-            .map_err(|error| segment_serialization_error("convert L1 outbox ordinal", error))?;
+        let expected =
+            outbox_start_ordinal
+                .unwrap_or(0)
+                .checked_add(u64::try_from(expected).map_err(|error| {
+                    segment_serialization_error("convert L1 outbox ordinal", error)
+                })?)
+                .ok_or_else(|| invariant_violation("control MVP L1 outbox ordinal overflow"))?;
         if *actual != expected {
             return Err(invariant_violation(
                 "control MVP L1 outbox logical ordinals are not contiguous",
@@ -4216,6 +5818,7 @@ fn state_object_from_segment_rows(
         state_id: reference.state_id.clone(),
         logical_sequence: reference.logical_sequence,
         entries,
+        outbox_start_ordinal,
         outbox: outbox.into_iter().map(|(_, entry)| entry).collect(),
     })
 }
@@ -4274,6 +5877,94 @@ fn sort_segment_rows(rows: &mut [ControlMvpSegmentRow]) {
     rows.sort_by(|left, right| {
         (left.record_kind, left.key.as_slice()).cmp(&(right.record_kind, right.key.as_slice()))
     });
+}
+
+const fn half_segment_limits(limits: SegmentLimits) -> SegmentLimits {
+    SegmentLimits {
+        bytes: if limits.bytes < 2 {
+            1
+        } else {
+            limits.bytes / 2
+        },
+        index_bytes: if limits.index_bytes < 2 {
+            1
+        } else {
+            limits.index_bytes / 2
+        },
+        rows: if limits.rows < 2 { 1 } else { limits.rows / 2 },
+    }
+}
+
+fn partition_state_rows(
+    rows: &[ControlMvpSegmentRow],
+    logical_sequence: u64,
+    manifest_id: &str,
+    scope: &StateScope,
+    target_limits: SegmentLimits,
+) -> Result<Vec<Vec<ControlMvpSegmentRow>>> {
+    let initial = if rows.is_empty() {
+        vec![Vec::new()]
+    } else {
+        rows.chunks(target_limits.rows)
+            .map(<[ControlMvpSegmentRow]>::to_vec)
+            .collect()
+    };
+    let probe_id = state_segment_id_for_manifest(manifest_id, 999_999);
+    let mut shards = Vec::new();
+    for rows in initial {
+        partition_state_row_chunk(
+            rows,
+            logical_sequence,
+            &probe_id,
+            scope,
+            target_limits,
+            &mut shards,
+        )?;
+    }
+    Ok(shards)
+}
+
+fn partition_state_row_chunk(
+    mut rows: Vec<ControlMvpSegmentRow>,
+    logical_sequence: u64,
+    probe_id: &str,
+    scope: &StateScope,
+    target_limits: SegmentLimits,
+    shards: &mut Vec<Vec<ControlMvpSegmentRow>>,
+) -> Result<()> {
+    match encode_segment(
+        probe_id,
+        ControlMvpSegmentLevel::L1,
+        logical_sequence,
+        scope,
+        &rows,
+        target_limits,
+    ) {
+        Ok(_) => {
+            shards.push(rows);
+            Ok(())
+        }
+        Err(CatalogError::MaintenanceBackpressure { .. }) if rows.len() > 1 => {
+            let right = rows.split_off(rows.len() / 2);
+            partition_state_row_chunk(
+                rows,
+                logical_sequence,
+                probe_id,
+                scope,
+                target_limits,
+                shards,
+            )?;
+            partition_state_row_chunk(
+                right,
+                logical_sequence,
+                probe_id,
+                scope,
+                target_limits,
+                shards,
+            )
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn encode_segment(
@@ -4418,6 +6109,8 @@ fn build_segment_index(
         logical_sequence,
         row_count: u64::try_from(rows.len())
             .map_err(|error| segment_serialization_error("convert segment row count", error))?,
+        segment_size_bytes: u64::try_from(segment_bytes.len())
+            .map_err(|error| segment_serialization_error("convert segment byte size", error))?,
         min_key_hex: min_key.map(hex::encode),
         max_key_hex: max_key.map(hex::encode),
         min_key_utf8: min_key.and_then(|key| std::str::from_utf8(key).ok().map(str::to_string)),
@@ -4676,6 +6369,16 @@ fn validate_segment_index_identity(
             "control MVP segment index exceeds the supported row limit",
         ));
     }
+    if index.segment_size_bytes == 0
+        || index.segment_size_bytes
+            > u64::try_from(MAX_SEGMENT_BYTES).map_err(|error| {
+                segment_serialization_error("convert supported segment byte limit", error)
+            })?
+    {
+        return Err(invariant_violation(
+            "control MVP segment index has an invalid segment byte size",
+        ));
+    }
     if index.record_batch_offsets.len() != 1 {
         return Err(invariant_violation(
             "control MVP segment index must identify exactly one record batch",
@@ -4692,6 +6395,190 @@ fn validate_segment_index_identity(
         ));
     }
     Ok(())
+}
+
+fn validate_segment_index_key_metadata(index: &ControlMvpSegmentIndex) -> Result<()> {
+    let bounds = match (&index.min_key_hex, &index.max_key_hex) {
+        (None, None) => None,
+        (Some(minimum), Some(maximum)) => {
+            let minimum = hex::decode(minimum).map_err(|error| {
+                segment_serialization_error("decode segment minimum key", error)
+            })?;
+            let maximum = hex::decode(maximum).map_err(|error| {
+                segment_serialization_error("decode segment maximum key", error)
+            })?;
+            if minimum > maximum {
+                return Err(invariant_violation(
+                    "control MVP segment index minimum key exceeds maximum key",
+                ));
+            }
+            Some((minimum, maximum))
+        }
+        _ => {
+            return Err(invariant_violation(
+                "control MVP segment index key bounds are incomplete",
+            ));
+        }
+    };
+    if let Some((minimum, maximum)) = &bounds {
+        let expected_min_utf8 = std::str::from_utf8(minimum).ok();
+        let expected_max_utf8 = std::str::from_utf8(maximum).ok();
+        if index.min_key_utf8.as_deref() != expected_min_utf8
+            || index.max_key_utf8.as_deref() != expected_max_utf8
+        {
+            return Err(invariant_violation(
+                "control MVP segment index UTF-8 key bounds do not match binary bounds",
+            ));
+        }
+    } else if index.min_key_utf8.is_some() || index.max_key_utf8.is_some() {
+        return Err(invariant_violation(
+            "control MVP segment index has UTF-8 bounds without binary bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn index_key_bounds(index: &ControlMvpSegmentIndex) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    validate_segment_index_key_metadata(index)?;
+    match (&index.min_key_hex, &index.max_key_hex) {
+        (Some(minimum), Some(maximum)) => Ok(Some((
+            hex::decode(minimum).map_err(|error| {
+                segment_serialization_error("decode segment minimum key", error)
+            })?,
+            hex::decode(maximum).map_err(|error| {
+                segment_serialization_error("decode segment maximum key", error)
+            })?,
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(invariant_violation(
+            "control MVP segment index key bounds are incomplete",
+        )),
+    }
+}
+
+fn state_reference_key_bounds(
+    reference: &ControlMvpStateRef,
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    match (&reference.min_key_hex, &reference.max_key_hex) {
+        (Some(minimum), Some(maximum)) => {
+            let minimum = hex::decode(minimum).map_err(|error| {
+                segment_serialization_error("decode manifest L1 minimum key", error)
+            })?;
+            let maximum = hex::decode(maximum).map_err(|error| {
+                segment_serialization_error("decode manifest L1 maximum key", error)
+            })?;
+            if minimum > maximum {
+                return Err(invariant_violation(
+                    "control MVP manifest L1 minimum key exceeds maximum key",
+                ));
+            }
+            Ok(Some((minimum, maximum)))
+        }
+        (None, None) => Ok(None),
+        _ => Err(invariant_violation(
+            "control MVP manifest L1 key bounds are incomplete",
+        )),
+    }
+}
+
+fn key_bounds_overlap_prefix(bounds: Option<&(Vec<u8>, Vec<u8>)>, prefix: &[u8]) -> bool {
+    let Some((minimum, maximum)) = bounds else {
+        return false;
+    };
+    if maximum.as_slice() < prefix {
+        return false;
+    }
+    prefix_exclusive_end(prefix).is_none_or(|exclusive_end| minimum < &exclusive_end)
+}
+
+fn segment_row_key_bounds_hex(rows: &[ControlMvpSegmentRow]) -> (Option<String>, Option<String>) {
+    let mut keys = rows
+        .iter()
+        .filter(|row| row.record_kind == SEGMENT_RECORD_KV)
+        .map(|row| row.key.as_slice());
+    let minimum = keys.next();
+    let maximum = keys.next_back().or(minimum);
+    (minimum.map(hex::encode), maximum.map(hex::encode))
+}
+
+fn state_segment_reference(reference: &ControlMvpStateRef) -> ControlMvpSegmentRef {
+    ControlMvpSegmentRef {
+        segment_id: reference.state_id.clone(),
+        level: ControlMvpSegmentLevel::L1,
+        logical_sequence: reference.logical_sequence,
+        checksum_sha256: reference.checksum_sha256.clone(),
+        index_checksum_sha256: reference.index_checksum_sha256.clone(),
+    }
+}
+
+fn segment_index_might_contain_key(index: &ControlMvpSegmentIndex, key: &[u8]) -> Result<bool> {
+    validate_segment_index_key_metadata(index)?;
+    let (Some(minimum), Some(maximum)) = (&index.min_key_hex, &index.max_key_hex) else {
+        return Ok(false);
+    };
+    let minimum = hex::decode(minimum)
+        .map_err(|error| segment_serialization_error("decode segment minimum key", error))?;
+    let maximum = hex::decode(maximum)
+        .map_err(|error| segment_serialization_error("decode segment maximum key", error))?;
+    if key < minimum.as_slice() || key > maximum.as_slice() {
+        return Ok(false);
+    }
+    let bloom = hex::decode(&index.bloom_bits_hex)
+        .map_err(|error| segment_serialization_error("decode segment Bloom filter", error))?;
+    if bloom.len() != SEGMENT_BLOOM_BYTES {
+        return Err(invariant_violation(
+            "control MVP segment index Bloom filter has the wrong byte length",
+        ));
+    }
+    let digest = Sha256::digest(key);
+    for byte in digest.iter().take(3) {
+        let bit = usize::from(*byte) % (SEGMENT_BLOOM_BYTES * 8);
+        let Some(slot) = bloom.get(bit / 8) else {
+            return Err(invariant_violation(
+                "control MVP segment index Bloom bit is out of bounds",
+            ));
+        };
+        if slot & (1 << (bit % 8)) == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn segment_index_overlaps_prefix(index: &ControlMvpSegmentIndex, prefix: &[u8]) -> Result<bool> {
+    validate_segment_index_key_metadata(index)?;
+    let (Some(minimum), Some(maximum)) = (&index.min_key_hex, &index.max_key_hex) else {
+        return Ok(false);
+    };
+    let minimum = hex::decode(minimum)
+        .map_err(|error| segment_serialization_error("decode segment minimum key", error))?;
+    let maximum = hex::decode(maximum)
+        .map_err(|error| segment_serialization_error("decode segment maximum key", error))?;
+    if maximum.as_slice() < prefix {
+        return Ok(false);
+    }
+    if let Some(exclusive_end) = prefix_exclusive_end(prefix)
+        && minimum >= exclusive_end
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn prefix_exclusive_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    let mut truncate_at = None;
+    for (index, byte) in end.iter_mut().enumerate().rev() {
+        if *byte != u8::MAX {
+            *byte += 1;
+            truncate_at = Some(index + 1);
+            break;
+        }
+    }
+    truncate_at.map(|length| {
+        end.truncate(length);
+        end
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4802,7 +6689,7 @@ struct ControlMvpCheckpoint {
     manifest_id: String,
     logical_sequence: u64,
     manifest_checksum_sha256: String,
-    state: ControlMvpStateRef,
+    states: Vec<ControlMvpStateRef>,
     min_retention_seconds: Option<u64>,
 }
 
@@ -4830,24 +6717,52 @@ impl ControlMvpCheckpoint {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ControlMvpRetainedReader {
-    state: ReplayState,
+    scope: StateScope,
+    token: StateToken,
+    source: ControlMvpRetainedSource,
+}
+
+#[derive(Clone)]
+enum ControlMvpRetainedSource {
+    Manifest {
+        store: Box<ControlMvpStateStore>,
+        manifest: Box<ControlMvpManifest>,
+    },
+    Materialized(ReplayState),
 }
 
 #[async_trait]
 impl ArcoStateReader for ControlMvpRetainedReader {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(self
-            .state
-            .kv
-            .get(key)
-            .filter(|value| !value.tombstone)
-            .map(|value| value.bytes.clone()))
+        match &self.source {
+            ControlMvpRetainedSource::Manifest { store, manifest } => {
+                store.get_from_manifest(manifest, key).await
+            }
+            ControlMvpRetainedSource::Materialized(state) => Ok(state
+                .kv
+                .get(key)
+                .filter(|value| !value.tombstone)
+                .map(|value| value.bytes.clone())),
+        }
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        Ok(self.state.scan_prefix(prefix))
+    async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        request.validate_for_scope(&self.scope)?;
+        match &self.source {
+            ControlMvpRetainedSource::Manifest { store, manifest } => {
+                store
+                    .scan_manifest_page(manifest, request, self.token.clone())
+                    .await
+            }
+            ControlMvpRetainedSource::Materialized(state) => build_scan_page(
+                &self.scope,
+                request.clone(),
+                Some(self.token.clone()),
+                state.scan_prefix(request.prefix()),
+            ),
+        }
     }
 
     async fn read_at(&self, _token: StateToken) -> Result<Box<dyn ArcoStateReader>> {
@@ -4941,6 +6856,17 @@ fn encode_envelope<T: Serialize>(artifact_type: &str, payload: &T) -> Result<Byt
     Ok(Bytes::from(encode_json_vec(&envelope, artifact_type)?))
 }
 
+fn encode_envelope_limited<T: Serialize>(
+    artifact_type: &str,
+    payload: &T,
+    max_bytes: usize,
+    context: &str,
+) -> Result<Bytes> {
+    let bytes = encode_envelope(artifact_type, payload)?;
+    validate_candidate_json_size(&bytes, max_bytes, context)?;
+    Ok(bytes)
+}
+
 fn decode_envelope<T>(bytes: &[u8], artifact_type: &str, context: &str) -> Result<T>
 where
     T: Serialize + for<'de> Deserialize<'de>,
@@ -4959,6 +6885,19 @@ where
     Ok(envelope.payload)
 }
 
+fn decode_envelope_limited<T>(
+    bytes: &[u8],
+    artifact_type: &str,
+    max_bytes: usize,
+    context: &str,
+) -> Result<T>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+{
+    validate_persisted_json_size(bytes, max_bytes, context)?;
+    decode_envelope(bytes, artifact_type, context)
+}
+
 fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) -> Result<()> {
     if let Some(expected) = expected {
         let actual = sha256_hex(bytes);
@@ -4971,6 +6910,12 @@ fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) ->
 
 fn encode_json<T: Serialize>(value: &T, context: &str) -> Result<Bytes> {
     Ok(Bytes::from(encode_json_vec(value, context)?))
+}
+
+fn encode_json_limited<T: Serialize>(value: &T, max_bytes: usize, context: &str) -> Result<Bytes> {
+    let bytes = encode_json(value, context)?;
+    validate_candidate_json_size(&bytes, max_bytes, context)?;
+    Ok(bytes)
 }
 
 fn encode_json_vec<T: Serialize>(value: &T, context: &str) -> Result<Vec<u8>> {
@@ -4986,6 +6931,36 @@ where
     serde_json::from_slice(bytes).map_err(|error| CatalogError::Serialization {
         message: format!("failed to deserialize {context}: {error}"),
     })
+}
+
+fn decode_json_limited<T>(bytes: &[u8], max_bytes: usize, context: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    validate_persisted_json_size(bytes, max_bytes, context)?;
+    decode_json(bytes, context)
+}
+
+fn validate_candidate_json_size(bytes: &[u8], max_bytes: usize, context: &str) -> Result<()> {
+    if bytes.len() > max_bytes {
+        return Err(CatalogError::MaintenanceBackpressure {
+            message: format!(
+                "{context} requires {} JSON bytes, above the {max_bytes}-byte limit",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_persisted_json_size(bytes: &[u8], max_bytes: usize, context: &str) -> Result<()> {
+    if bytes.len() > max_bytes {
+        return Err(invariant_violation(format!(
+            "{context} is {} bytes, above the supported {max_bytes}-byte limit",
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -5128,14 +7103,108 @@ fn segment_capacity_error(level: ControlMvpSegmentLevel, message: &str) -> Catal
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-    use arco_core::MemoryBackend;
-    use arco_core::storage::StorageBackend as _;
+    use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition};
+    use arco_core::{MemoryBackend, WriteResult};
     use arrow::ipc::{Block, Footer, FooterArgs};
     use flatbuffers::FlatBufferBuilder;
+    use tokio::sync::oneshot;
 
     use super::*;
+
+    struct PauseCheckpointPutBackend {
+        inner: MemoryBackend,
+        gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        arrow_gets: AtomicUsize,
+    }
+
+    impl PauseCheckpointPutBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryBackend::new(),
+                gate: Mutex::new(None),
+                arrow_gets: AtomicUsize::new(0),
+            })
+        }
+
+        fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            *self.gate.lock().expect("checkpoint gate") = Some((reached_tx, release_rx));
+            (reached_rx, release_tx)
+        }
+
+        fn reset_arrow_gets(&self) {
+            self.arrow_gets.store(0, Ordering::SeqCst);
+        }
+
+        fn arrow_gets(&self) -> usize {
+            self.arrow_gets.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for PauseCheckpointPutBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            if std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("arrow"))
+            {
+                self.arrow_gets.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path.contains("/checkpoints/") {
+                let gate = self.gate.lock().expect("checkpoint gate").take();
+                if let Some((reached, release)) = gate {
+                    let _ = reached.send(());
+                    let _ = release.await;
+                }
+            }
+            self.inner.put(path, data, precondition).await
+        }
+
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
 
     fn one_kv_row() -> ControlMvpSegmentRow {
         ControlMvpSegmentRow {
@@ -5162,6 +7231,48 @@ mod tests {
         )
         .expect("encode test segment");
         (bytes, index_bytes, reference, scope)
+    }
+
+    #[tokio::test]
+    async fn l0_arrow_is_charged_before_fetching_against_the_shared_scan_budget() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin");
+        txn.put(b"catalog/a", Bytes::from_static(b"value"))
+            .await
+            .expect("put");
+        let token = txn.commit().await.expect("commit").into_state_token();
+        let manifest = store
+            .load_manifest(token.authority_manifest_id())
+            .await
+            .expect("manifest");
+
+        backend.reset_arrow_gets();
+        let error = store
+            .scan_manifest_page_with_arrow_budget(
+                &manifest,
+                ScanRequest::new(b"catalog/"),
+                token,
+                1,
+            )
+            .await
+            .expect_err("the indexed L0 segment cannot fit the physical byte budget");
+        assert!(matches!(
+            error,
+            CatalogError::MaintenanceBackpressure { .. }
+        ));
+        assert_eq!(
+            0,
+            backend.arrow_gets(),
+            "the indexed segment size must be charged before its Arrow object is fetched"
+        );
     }
 
     #[test]
@@ -5212,7 +7323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_l1_backpressure_precedes_every_candidate_artifact_write() {
+    async fn l1_sharding_keeps_each_segment_below_half_capacity() {
         let backend = Arc::new(MemoryBackend::new());
         let storage =
             ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
@@ -5221,7 +7332,7 @@ mod tests {
                 .expect("store")
                 .with_checkpoint_interval(NonZeroU64::new(2).expect("nonzero interval"))
                 .with_segment_limits(SegmentLimits {
-                    rows: 2,
+                    rows: 4,
                     ..PRODUCTION_SEGMENT_LIMITS
                 });
 
@@ -5236,6 +7347,70 @@ mod tests {
             .await
             .expect("put b");
         seed.commit().await.expect("seed commit below L1 boundary");
+        let mut candidate = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin candidate");
+        candidate
+            .delete(b"catalog/a")
+            .await
+            .expect("retain tombstone");
+        candidate
+            .put(b"catalog/c", Bytes::from_static(b"c"))
+            .await
+            .expect("put c");
+        let outcome = candidate.commit().await.expect("publish sharded L1 state");
+        let manifest = store
+            .load_manifest(outcome.state_token().authority_manifest_id())
+            .await
+            .expect("load sharded manifest");
+        assert_eq!(
+            2,
+            manifest.anchor_states.len(),
+            "three retained rows at a two-row target require two ordered shards"
+        );
+        assert_eq!(None, store.get(b"catalog/a").await.expect("deleted a"));
+        assert_eq!(
+            Some(Bytes::from_static(b"b")),
+            store.get(b"catalog/b").await.expect("retained b")
+        );
+        assert_eq!(
+            Some(Bytes::from_static(b"c")),
+            store.get(b"catalog/c").await.expect("inserted c")
+        );
+    }
+
+    #[tokio::test]
+    async fn individually_oversized_l1_row_precedes_every_candidate_artifact_write() {
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let (_bytes, probe_index, _reference) = encode_segment(
+            &"x".repeat(128),
+            ControlMvpSegmentLevel::L0,
+            1,
+            &scope,
+            &[one_kv_row()],
+            PRODUCTION_SEGMENT_LIMITS,
+        )
+        .expect("probe L0 index size");
+        let backend = Arc::new(MemoryBackend::new());
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let store = ControlMvpStateStore::new(storage, scope)
+            .expect("store")
+            .with_checkpoint_interval(NonZeroU64::new(2).expect("nonzero interval"))
+            .with_segment_limits(SegmentLimits {
+                index_bytes: probe_index.len(),
+                ..PRODUCTION_SEGMENT_LIMITS
+            });
+
+        let mut seed = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin seed");
+        seed.put(b"key", Bytes::from_static(b"value"))
+            .await
+            .expect("stage seed");
+        seed.commit().await.expect("seed below L1 boundary");
         let head_before = store.current_state_token().await.expect("head before");
         let artifacts_before = backend
             .list("")
@@ -5245,51 +7420,402 @@ mod tests {
             .map(|object| object.path)
             .collect::<BTreeSet<_>>();
 
-        for _attempt in 0..2 {
-            let mut candidate = store
+        let mut candidate = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin candidate");
+        candidate
+            .put(b"key", Bytes::from_static(b"next"))
+            .await
+            .expect("stage candidate");
+        let error = candidate
+            .commit()
+            .await
+            .expect_err("one row cannot be split below the L1 target index budget");
+        assert!(matches!(
+            error,
+            CatalogError::MaintenanceBackpressure { .. }
+        ));
+        assert_eq!(
+            head_before,
+            store.current_state_token().await.expect("head")
+        );
+        assert_eq!(
+            artifacts_before,
+            backend
+                .list("")
+                .await
+                .expect("inventory after")
+                .into_iter()
+                .map(|object| object.path)
+                .collect::<BTreeSet<_>>(),
+            "known capacity failure must precede transaction, L0, L1, manifest, and head writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_lineage_crosses_equivalent_maintenance_manifests() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        for sequence in 1..=16_u64 {
+            let mut txn = store
                 .begin_control_txn(TxnOptions::default())
                 .await
-                .expect("begin candidate");
-            candidate
-                .delete(b"catalog/a")
+                .expect("begin transaction");
+            txn.put(b"catalog/hot", Bytes::from(sequence.to_be_bytes().to_vec()))
                 .await
-                .expect("retain tombstone");
-            candidate
-                .put(b"catalog/c", Bytes::from_static(b"c"))
-                .await
-                .expect("put c");
-            let error = candidate
-                .commit()
-                .await
-                .expect_err("three retained L1 rows exceed the reduced two-row cap");
-            assert!(matches!(
-                error,
-                CatalogError::MaintenanceBackpressure { .. }
-            ));
-            assert_eq!(
-                head_before,
-                store
-                    .current_state_token()
-                    .await
-                    .expect("head after failure")
-            );
-            assert_eq!(
-                Some(Bytes::from_static(b"a")),
-                store.get(b"catalog/a").await.expect("retained a")
-            );
-            assert_eq!(None, store.get(b"catalog/c").await.expect("absent c"));
-            assert_eq!(
-                artifacts_before,
-                backend
-                    .list("")
-                    .await
-                    .expect("inventory after")
-                    .into_iter()
-                    .map(|object| object.path)
-                    .collect::<BTreeSet<_>>(),
-                "capacity failure must precede transaction, L0, L1, manifest, and head writes"
-            );
+                .expect("stage write");
+            txn.commit().await.expect("commit write");
         }
+        let source_token = store.current_state_token().await.expect("source token");
+        let source_manifest = store
+            .load_manifest(source_token.authority_manifest_id())
+            .await
+            .expect("source manifest");
+        let planned = source_manifest.tx_refs[0].clone();
+        ControlMvpMaintenanceWorker::new(storage, scope)
+            .expect("maintenance worker")
+            .consolidate_pending()
+            .await
+            .expect("maintenance")
+            .expect("selected layout");
+        let current = store.load_current_base_state().await.expect("current base");
+        assert!(
+            store
+                .tx_in_lineage(&current, &planned)
+                .await
+                .expect("lineage lookup"),
+            "physical-only publication must retain logical transaction lineage"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_gc_deletes_only_aged_unreachable_artifacts() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin transaction");
+        txn.put(b"catalog/live", Bytes::from_static(b"value"))
+            .await
+            .expect("stage write");
+        let live = txn.commit().await.expect("commit live state");
+        let paths = store.paths();
+        let orphan_path = paths.tx_object("tx-orphan");
+        storage
+            .put_raw(
+                &orphan_path,
+                Bytes::from_static(b"orphan"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("seed orphan");
+
+        let worker =
+            ControlMvpMaintenanceWorker::new(storage.clone(), scope).expect("maintenance worker");
+        let now = Utc::now() + ChronoDuration::days(8);
+        let plan = worker.plan_gc_at(now, Vec::new()).await.expect("plan GC");
+        assert_eq!(
+            vec![orphan_path.as_str()],
+            plan.candidates()
+                .iter()
+                .map(ControlMvpGcCandidate::path)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !plan.candidates().iter().any(|candidate| candidate.path()
+                == paths.manifest_object(live.state_token().authority_manifest_id())),
+            "current authority closure is retained regardless of age"
+        );
+
+        let outcome = worker
+            .collect_gc_at(now, Vec::new())
+            .await
+            .expect("collect GC");
+        assert_eq!(1, outcome.objects_deleted());
+        assert!(
+            storage
+                .head_raw(&orphan_path)
+                .await
+                .expect("head")
+                .is_none()
+        );
+        assert_eq!(
+            Some(Bytes::from_static(b"value")),
+            store.get(b"catalog/live").await.expect("read live state")
+        );
+    }
+
+    #[tokio::test]
+    async fn control_gc_honors_checkpoint_retention_above_thirty_day_floor() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin transaction");
+        txn.put(b"catalog/live", Bytes::from_static(b"value"))
+            .await
+            .expect("stage write");
+        txn.commit().await.expect("commit live state");
+        let checkpoint = store
+            .checkpoint(
+                CheckpointOptions::new(Some(scope.clone()))
+                    .with_min_retention_seconds(60 * 24 * 60 * 60),
+            )
+            .await
+            .expect("checkpoint");
+        let checkpoint_path = store.paths().checkpoint_object(checkpoint.checkpoint_id());
+
+        let plan = ControlMvpMaintenanceWorker::new(storage, scope)
+            .expect("maintenance worker")
+            .plan_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+            .await
+            .expect("plan GC");
+        assert!(
+            !plan
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.path() == checkpoint_path),
+            "explicit 60-day checkpoint pin must outlive the 30-day floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_gc_pages_and_converges_beyond_ten_thousand_objects() {
+        const ORPHANS: usize = 10_241;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin transaction");
+        txn.put(b"catalog/live", Bytes::from_static(b"value"))
+            .await
+            .expect("stage write");
+        txn.commit().await.expect("commit live state");
+        let checkpoint = store
+            .checkpoint(
+                CheckpointOptions::new(Some(scope.clone()))
+                    .with_min_retention_seconds(60 * 24 * 60 * 60),
+            )
+            .await
+            .expect("checkpoint");
+
+        let paths = store.paths();
+        let explicitly_pinned = paths.tx_object("tx-orphan-00000");
+        for ordinal in 0..ORPHANS {
+            storage
+                .put_raw(
+                    &paths.tx_object(&format!("tx-orphan-{ordinal:05}")),
+                    Bytes::from_static(b"orphan"),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("seed orphan");
+        }
+
+        let worker =
+            ControlMvpMaintenanceWorker::new(storage.clone(), scope).expect("maintenance worker");
+        let now = Utc::now() + ChronoDuration::days(31);
+        let first = worker
+            .plan_gc_page_at(now, vec![explicitly_pinned.clone()], None)
+            .await
+            .expect("first bounded plan");
+        assert!(first.candidates().len() <= CONTROL_MVP_GC_PAGE_SIZE);
+        assert!(
+            first.continuation().is_some(),
+            "large inventory must continue"
+        );
+
+        let mut continuation = None;
+        let mut deleted = 0_u64;
+        loop {
+            let outcome = worker
+                .collect_gc_page_at(
+                    now,
+                    vec![explicitly_pinned.clone()],
+                    continuation.as_deref(),
+                )
+                .await
+                .expect("bounded GC page");
+            deleted = deleted.saturating_add(outcome.objects_deleted());
+            continuation = outcome.continuation().map(ToOwned::to_owned);
+            if continuation.is_none() {
+                break;
+            }
+        }
+        assert_eq!(u64::try_from(ORPHANS - 1).expect("orphan count"), deleted);
+        assert!(
+            storage
+                .head_raw(&explicitly_pinned)
+                .await
+                .expect("head")
+                .is_some()
+        );
+        assert_eq!(
+            Some(Bytes::from_static(b"value")),
+            store
+                .get(b"catalog/live")
+                .await
+                .expect("live authority read")
+        );
+        let retained = store
+            .read_checkpoint(checkpoint)
+            .await
+            .expect("retained checkpoint remains readable");
+        assert_eq!(
+            Some(Bytes::from_static(b"value")),
+            retained
+                .get(b"catalog/live")
+                .await
+                .expect("checkpoint read")
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_excludes_gc_until_the_retained_root_is_visible() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        let mut seed = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin seed");
+        seed.put(b"catalog/live", Bytes::from_static(b"old"))
+            .await
+            .expect("stage seed");
+        seed.commit().await.expect("commit seed");
+
+        let (checkpoint_reached, release_checkpoint) = backend.arm();
+        let checkpoint_store = store.clone();
+        let checkpoint_scope = scope.clone();
+        let checkpoint_task = tokio::spawn(async move {
+            checkpoint_store
+                .checkpoint(
+                    CheckpointOptions::new(Some(checkpoint_scope))
+                        .with_min_retention_seconds(60 * 24 * 60 * 60),
+                )
+                .await
+        });
+        checkpoint_reached
+            .await
+            .expect("checkpoint reached publication");
+
+        let mut advance = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin advance");
+        advance
+            .put(b"catalog/live", Bytes::from_static(b"new"))
+            .await
+            .expect("stage advance");
+        advance.commit().await.expect("advance authority");
+
+        let gc_worker =
+            ControlMvpMaintenanceWorker::new(storage, scope).expect("maintenance worker");
+        let gc_task = tokio::spawn(async move {
+            gc_worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !gc_task.is_finished(),
+            "GC must wait while checkpoint publication owns retention coordination"
+        );
+
+        release_checkpoint.send(()).expect("release checkpoint");
+        let checkpoint = checkpoint_task
+            .await
+            .expect("checkpoint task")
+            .expect("checkpoint publication");
+        gc_task.await.expect("GC task").expect("coordinated GC");
+        let retained = store
+            .read_checkpoint(checkpoint)
+            .await
+            .expect("successful checkpoint must remain readable");
+        assert_eq!(
+            Some(Bytes::from_static(b"old")),
+            retained
+                .get(b"catalog/live")
+                .await
+                .expect("checkpoint read")
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_scan_continues_across_more_overlapping_l1_segments_than_one_page() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage, scope)
+            .expect("store")
+            .with_checkpoint_interval(NonZeroU64::new(1).expect("interval"))
+            .with_segment_limits(SegmentLimits {
+                rows: 1,
+                ..PRODUCTION_SEGMENT_LIMITS
+            });
+        for ordinal in 0..70_u64 {
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("begin seed");
+            txn.put(
+                format!("catalog/{ordinal:03}").as_bytes(),
+                Bytes::from(ordinal.to_be_bytes().to_vec()),
+            )
+            .await
+            .expect("stage seed");
+            txn.commit().await.expect("commit seed");
+        }
+        // The successor reads the preceding 70-shard anchor plus one L0 suffix.
+        let mut tail = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin tail");
+        tail.put(b"catalog/070", Bytes::from_static(b"tail"))
+            .await
+            .expect("stage tail");
+        tail.commit().await.expect("commit tail");
+
+        let mut continuation = None;
+        let mut keys = Vec::new();
+        let mut pages = 0_usize;
+        loop {
+            backend.reset_arrow_gets();
+            let mut request = ScanRequest::new(b"catalog/").with_limits(1_000, 4 * 1024 * 1024, 3);
+            if let Some(token) = continuation.take() {
+                request = request.with_token(token);
+            }
+            let page = store.scan(request).await.expect("bounded scan page");
+            assert!(
+                backend.arrow_gets() <= 3,
+                "one page fetched more Arrow segments than its hard budget"
+            );
+            keys.extend(page.entries().iter().map(|entry| entry.key().to_vec()));
+            pages += 1;
+            continuation = page.continuation().cloned();
+            if continuation.is_none() {
+                break;
+            }
+        }
+        assert!(pages > 1, "segment budget must produce resumable pages");
+        assert_eq!(71, keys.len());
+        assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     fn rebind_segment(
@@ -5403,7 +7929,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_l0_trim_rows_require_origin_sequence() {
+    fn v4_l0_trim_rows_require_origin_sequence() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let mut tx = ControlMvpTxObject {
             implementation: IMPLEMENTATION.to_string(),
@@ -5430,7 +7956,7 @@ mod tests {
                 logical_ordinal: 0,
                 origin_sequence: None,
             }])
-            .expect_err("v3 trim rows must identify the removed event incarnation");
+            .expect_err("v4 trim rows must identify the removed event incarnation");
 
         assert!(matches!(error, CatalogError::InvariantViolation { .. }));
     }

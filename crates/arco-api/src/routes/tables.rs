@@ -22,16 +22,14 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use arco_catalog::CatalogAuthorityKind;
+
 use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
-use crate::routes::pagination::{ListPageQuery, page_by_key};
+use crate::routes::catalog_authority;
+use crate::routes::pagination::{ListPageQuery, catalog_list_request, page_by_key};
 use crate::server::AppState;
-use arco_catalog::Tier1Compactor;
-use arco_catalog::idempotency::{
-    CatalogOperation, IdempotencyCheck, IdempotencyStore, IdempotencyStoreImpl,
-    calculate_retry_after, canonical_request_hash, check_idempotency,
-};
 use arco_core::TableFormat;
 
 /// Request to register a table.
@@ -173,113 +171,7 @@ pub(crate) async fn register_table(
         "Registering table"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
     let requested_format = normalize_requested_format(req.format.as_deref())?;
-
-    let columns_json: Vec<serde_json::Value> = req
-        .columns
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "name": c.name,
-                "data_type": c.data_type,
-                "nullable": c.nullable,
-                "description": c.description
-            })
-        })
-        .collect();
-
-    let request_json = serde_json::json!({
-        "namespace": namespace,
-        "name": req.name,
-        "description": req.description,
-        "format": &requested_format,
-        "columns": columns_json
-    });
-    let request_hash = canonical_request_hash(&request_json)
-        .map_err(|e| ApiError::internal(format!("Failed to compute request hash: {e}")))?;
-
-    let storage_arc = Arc::new(storage.clone());
-    let idempotency_store = IdempotencyStoreImpl::new(storage_arc);
-    let idempotency_check = check_idempotency(
-        &idempotency_store,
-        ctx.idempotency_key.as_deref(),
-        CatalogOperation::RegisterTable,
-        &request_hash,
-        state.config.idempotency_stale_timeout(),
-    )
-    .await
-    .map_err(ApiError::from)?;
-
-    let (marker, marker_version) = match idempotency_check {
-        IdempotencyCheck::NoKey => (None, None),
-        IdempotencyCheck::Proceed { marker, version } => (Some(marker), Some(version)),
-        IdempotencyCheck::StaleReserved { .. } => {
-            return Err(ApiError::conflict(
-                "request with Idempotency-Key is still in progress",
-            ));
-        }
-        IdempotencyCheck::Replay {
-            entity_id,
-            entity_name,
-        } => {
-            let reader = arco_catalog::CatalogReader::new(storage);
-            let table = reader
-                .get_table(&namespace, &entity_name)
-                .await
-                .map_err(ApiError::from)?
-                .ok_or_else(|| ApiError::internal("Cached table not found"))?;
-            let cols = reader
-                .get_columns(&entity_id)
-                .await
-                .map_err(ApiError::from)?;
-            let response = TableResponse {
-                id: entity_id,
-                namespace,
-                name: table.name,
-                description: table.description,
-                format: effective_table_format(table.format.as_deref())?,
-                columns: cols
-                    .into_iter()
-                    .map(|c| ColumnResponse {
-                        id: c.id,
-                        name: c.name,
-                        data_type: c.data_type,
-                        nullable: c.is_nullable,
-                        position: c.ordinal,
-                        description: c.description,
-                    })
-                    .collect(),
-                created_at: format_timestamp(table.created_at),
-                updated_at: format_timestamp(table.updated_at),
-            };
-            return Ok((StatusCode::CREATED, Json(response)));
-        }
-        IdempotencyCheck::Conflict => {
-            return Err(ApiError::conflict(
-                "Idempotency-Key already used with different request body",
-            ));
-        }
-        IdempotencyCheck::PreviousFailed {
-            http_status,
-            message,
-        } => {
-            return Err(ApiError::from_status_and_message(http_status, message));
-        }
-        IdempotencyCheck::InProgress { started_at } => {
-            let retry_after =
-                calculate_retry_after(started_at, state.config.idempotency_stale_timeout());
-            return Err(ApiError::conflict_in_progress(retry_after));
-        }
-    };
-
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(ApiError::from)?;
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
@@ -304,58 +196,25 @@ pub(crate) async fn register_table(
         })
         .collect();
 
-    let register_result = writer
-        .register_table(
-            arco_catalog::RegisterTableRequest {
-                namespace: namespace.clone(),
+    let authority = catalog_authority::resolve(&state, &ctx).await?;
+    let table = authority
+        .register_native_table(
+            &namespace,
+            arco_catalog::RegisterTableInSchemaRequest {
                 name: req.name.clone(),
                 description: req.description.clone(),
                 location: None,
                 format: Some(requested_format.clone()),
+                table_type: None,
+                properties: None,
                 columns,
             },
             options,
         )
-        .await;
+        .await
+        .map_err(ApiError::from)?;
 
-    if let (Some(marker), Some(version)) = (&marker, &marker_version) {
-        match &register_result {
-            Ok(table) => {
-                let finalized = marker
-                    .clone()
-                    .finalize_committed(table.id.clone(), table.name.clone());
-                if let Err(e) = idempotency_store.finalize(&finalized, version).await {
-                    tracing::warn!(
-                        idempotency_key = %marker.idempotency_key,
-                        operation = ?marker.operation,
-                        error = %e,
-                        "Failed to finalize idempotency marker as committed"
-                    );
-                }
-            }
-            Err(e) => {
-                if let Some(status) = e.http_status_code() {
-                    if (400..500).contains(&status) {
-                        let finalized = marker.clone().finalize_failed(status, e.to_string());
-                        if let Err(fin_err) = idempotency_store.finalize(&finalized, version).await
-                        {
-                            tracing::warn!(
-                                idempotency_key = %marker.idempotency_key,
-                                operation = ?marker.operation,
-                                error = %fin_err,
-                                "Failed to finalize idempotency marker as failed"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let table = register_result.map_err(ApiError::from)?;
-
-    let reader = arco_catalog::CatalogReader::new(storage);
-    let cols = reader
+    let cols = authority
         .get_columns(&table.id)
         .await
         .map_err(ApiError::from)?;
@@ -419,15 +278,25 @@ pub(crate) async fn list_tables(
         "Listing tables"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = arco_catalog::CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
-    let tables = reader
-        .list_tables(&namespace)
-        .await
-        .map_err(ApiError::from)?;
-    let (tables, next_cursor) = page_by_key(tables, &query, |table| &table.name)?;
+    let (tables, next_cursor) = if reader.kind() == CatalogAuthorityKind::Legacy {
+        page_by_key(
+            reader
+                .list_native_tables(&namespace)
+                .await
+                .map_err(ApiError::from)?,
+            &query,
+            |table| &table.name,
+        )?
+    } else {
+        let page = reader
+            .list_native_tables_page(&namespace, catalog_list_request(&query)?)
+            .await
+            .map_err(ApiError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        (page.into_items(), next)
+    };
 
     let mut responses = Vec::new();
     for table in tables {
@@ -498,12 +367,10 @@ pub(crate) async fn get_table(
         "Getting table"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = arco_catalog::CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
     let table = reader
-        .get_table(&namespace, &name)
+        .get_native_table(&namespace, &name)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("Table not found: {namespace}.{name}")))?;
@@ -575,13 +442,6 @@ pub(crate) async fn update_table(
         "Updating table"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = arco_catalog::CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
@@ -597,14 +457,13 @@ pub(crate) async fn update_table(
         ..Default::default()
     };
 
-    let table = writer
-        .update_table(&namespace, &name, patch, options)
+    let authority = catalog_authority::resolve(&state, &ctx).await?;
+    let table = authority
+        .update_native_table(&namespace, &name, patch, options)
         .await
         .map_err(ApiError::from)?;
 
-    let reader = arco_catalog::CatalogReader::new(storage);
-
-    let cols = reader
+    let cols = authority
         .get_columns(&table.id)
         .await
         .map_err(ApiError::from)?;
@@ -667,13 +526,6 @@ pub(crate) async fn drop_table(
         "Dropping table"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = arco_catalog::CatalogWriter::new(storage).with_sync_compactor(compactor);
-
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
@@ -684,8 +536,9 @@ pub(crate) async fn drop_table(
         options
     };
 
-    writer
-        .drop_table(&namespace, &name, options)
+    catalog_authority::resolve(&state, &ctx)
+        .await?
+        .drop_native_table(&namespace, &name, options)
         .await
         .map_err(ApiError::from)?;
 

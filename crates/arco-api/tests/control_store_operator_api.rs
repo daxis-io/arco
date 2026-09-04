@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
-use arco_api::config::{Config, Posture};
+use arco_api::config::{Config, ControlV1CatalogRootConfig, ControlV1CursorKeyConfig, Posture};
 use arco_api::server::Server;
-use arco_catalog::ArcoStateTxn;
 use arco_catalog::state_store::{
     ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, TxnOptions,
 };
+use arco_catalog::{ArcoStateTxn, ControlCatalogAuthority, WriteOptions};
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use axum::body::Body;
@@ -35,6 +35,13 @@ fn config(operator_endpoints: bool) -> Config {
     let mut config = Config {
         debug: true,
         posture: Posture::Dev,
+        catalog_control_v1_root: Some(ControlV1CatalogRootConfig {
+            tenant_id: TENANT.to_string(),
+            workspace_id: WORKSPACE.to_string(),
+        }),
+        catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )),
         ..Config::default()
     };
     config.control_store_operator_endpoints = operator_endpoints;
@@ -62,6 +69,17 @@ fn post(body: &'static str) -> Request<Body> {
         .expect("request build failed")
 }
 
+fn query(body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/api/v1/query?format=json")
+        .header("content-type", "application/json")
+        .header("X-Tenant-Id", TENANT)
+        .header("X-Workspace-Id", WORKSPACE)
+        .body(Body::from(body))
+        .expect("request build failed")
+}
+
 async fn json_body(response: axum::response::Response) -> Value {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -72,7 +90,11 @@ async fn json_body(response: axum::response::Response) -> Value {
 /// Seeds one committed source record carrying a staged outbox entry, in the
 /// request scope the operator endpoint will derive from the request context.
 async fn seed_source_record(backend: Arc<dyn StorageBackend>) {
-    let scope = StateScope::new(TENANT, WORKSPACE, SOURCE_DOMAIN);
+    seed_source_record_in_domain(backend, SOURCE_DOMAIN).await;
+}
+
+async fn seed_source_record_in_domain(backend: Arc<dyn StorageBackend>, domain: &str) {
+    let scope = StateScope::new(TENANT, WORKSPACE, domain);
     let store = ControlMvpStateStore::new(scoped(backend), scope.clone()).expect("control store");
     let mut txn = store
         .begin_control_txn(TxnOptions::new(Some(scope)))
@@ -87,6 +109,70 @@ async fn seed_source_record(backend: Arc<dyn StorageBackend>) {
     ))
     .expect("stage outbox record");
     txn.commit().await.expect("commit source record");
+}
+
+#[tokio::test]
+async fn catalog_projection_outbox_materializes_before_operator_drain_acknowledges() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    ControlCatalogAuthority::new(
+        scoped(Arc::clone(&backend)),
+        StateScope::new(TENANT, WORKSPACE, "catalog"),
+    )
+    .expect("catalog authority")
+    .create_catalog("analytics", None, WriteOptions::default())
+    .await
+    .expect("catalog mutation");
+
+    let response = router_with(Arc::clone(&backend), true)
+        .oneshot(post(
+            r#"{"sourceDomain":"catalog","consumerId":"catalog-parquet-v1","drain":true}"#,
+        ))
+        .await
+        .expect("request failed");
+    assert_eq!(StatusCode::OK, response.status());
+    let json = json_body(response).await;
+    assert!(
+        json["drain"]["drainedRecordIds"]
+            .as_array()
+            .is_some_and(|records| records.len() == 1),
+        "unexpected body: {json}"
+    );
+    let artifacts = backend
+        .list("tenant=acme/workspace=analytics/control/v1/projections/catalog-parquet/")
+        .await
+        .expect("projection artifacts");
+    assert!(
+        artifacts
+            .iter()
+            .any(|object| object.path.ends_with("manifest.json")),
+        "acknowledged drain must leave a materialized manifest: {artifacts:?}"
+    );
+
+    let status_response = router_with(Arc::clone(&backend), true)
+        .oneshot(query(
+            r#"{"sql":"SELECT projection_kind, applied_authority_sequence, observed_head_sequence, lag, last_success_at_ms, failure_state FROM system.catalog.projection_status"}"#,
+        ))
+        .await
+        .expect("projection status query");
+    assert_eq!(StatusCode::OK, status_response.status());
+    let status = json_body(status_response).await;
+    assert_eq!("catalog-parquet-v1", status[0]["projection_kind"]);
+    assert_eq!(1, status[0]["applied_authority_sequence"]);
+    assert_eq!(1, status[0]["observed_head_sequence"]);
+    assert_eq!(0, status[0]["lag"]);
+    assert!(status[0]["last_success_at_ms"].as_str().is_some());
+    assert!(status[0]["failure_state"].is_null());
+
+    for body in [
+        r#"{"sourceDomain":"catalog","consumerId":"catalog-parquet-v1","trim":true}"#,
+        r#"{"sourceDomain":"catalog","consumerId":"catalog-parquet-v1","forceRebindConsumer":true}"#,
+    ] {
+        let response = router_with(Arc::clone(&backend), true)
+            .oneshot(post(body))
+            .await
+            .expect("catalog source mutation request");
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
+    }
 }
 
 #[tokio::test]

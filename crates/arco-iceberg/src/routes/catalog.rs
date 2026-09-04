@@ -16,7 +16,6 @@ use serde::Deserialize;
 use tracing::instrument;
 
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogReader, CatalogWriter};
 
 use crate::audit::{
     REASON_COMMIT_CACHED_FAILURE, REASON_COMMIT_CAS_CONFLICT, REASON_COMMIT_IN_PROGRESS,
@@ -32,6 +31,7 @@ use crate::error::{IcebergError, IcebergResult};
 use crate::governance::TableLocationGovernance;
 use crate::idempotency::{IdempotencyMarker, canonical_request_hash};
 use crate::pointer::{PointerStoreImpl, UpdateSource};
+use crate::routes::authority;
 use crate::routes::utils::{
     commit_idempotency_key, ensure_prefix, is_iceberg_table, join_namespace,
 };
@@ -102,11 +102,8 @@ async fn rename_table(
 
     let separator = state.config.namespace_separator_decoded();
     let source_namespace = join_namespace(&req.source.namespace, &separator)?;
-    let dest_namespace = join_namespace(&req.destination.namespace, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -116,11 +113,10 @@ async fn rename_table(
         options = options.with_idempotency_key(key);
     }
 
-    writer
-        .rename_table(
+    catalog
+        .rename_native_table(
             &source_namespace,
             &req.source.name,
-            &dest_namespace,
             &req.destination.name,
             options,
         )
@@ -169,6 +165,7 @@ async fn commit_transaction(
     Json(req): Json<CommitTransactionRequest>,
 ) -> IcebergResult<Response> {
     ensure_prefix(&path.prefix, &state.config)?;
+    authority::reject_table_commit_for_control_v1(&state, &ctx)?;
 
     if !state.config.allow_write {
         return Err(IcebergError::BadRequest {
@@ -245,10 +242,10 @@ async fn commit_transaction(
     let namespace_name = join_namespace(&identifier.namespace, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let table = reader
-        .get_table(&namespace_name, &identifier.name)
+    let table = catalog
+        .get_native_table(&namespace_name, &identifier.name)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
@@ -397,7 +394,7 @@ async fn handle_multi_table_commit(
 
     let separator = state.config.namespace_separator_decoded();
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
     let mut table_inputs = Vec::with_capacity(req.table_changes.len());
     for change in req.table_changes {
@@ -417,8 +414,8 @@ async fn handle_multi_table_commit(
             })?;
 
         let namespace_name = join_namespace(&identifier.namespace, &separator)?;
-        let table = reader
-            .get_table(&namespace_name, &identifier.name)
+        let table = catalog
+            .get_native_table(&namespace_name, &identifier.name)
             .await
             .map_err(IcebergError::from)?
             .filter(|t| is_iceberg_table(t.format.as_deref()))
@@ -486,8 +483,8 @@ async fn handle_multi_table_commit(
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;
-    use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{CatalogWriter, Tier1Compactor};
     use arco_core::ScopedStorage;
     use arco_core::storage::MemoryBackend;
     use axum::body::Body;

@@ -15,18 +15,19 @@
 
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, CatalogError, CheckpointOptions,
-    ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
-    ControlMvpRestoreParticipant, ControlMvpStateStore, KeyRange, PersistedAuthorityAdapter,
-    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
-    RestoreAttemptIdentity, RestoreParticipantInspection, StateRestoreParticipant, StateScope,
-    TxnOptions,
+    ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
+    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpStateStore, KeyRange,
+    PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
+    PersistedRestoreParticipantPlan, RestoreAttemptIdentity, RestoreParticipantInspection,
+    ScanRequest, StateRestoreParticipant, StateScope, TxnOptions,
 };
 use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
@@ -46,6 +47,12 @@ fn storage() -> (Arc<MemoryBackend>, ScopedStorage) {
     let storage =
         ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
     (backend, storage)
+}
+
+fn path_has_extension(path: &str, extension: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
 fn store(storage: ScopedStorage) -> ControlMvpStateStore {
@@ -607,10 +614,11 @@ async fn manifest_reachable_replay_folds_expected_kv_state() {
             Some(1)
         )],
         reader
-            .scan_prefix(b"catalog/")
+            .scan(ScanRequest::new(b"catalog/"))
             .await
             .expect("scan folded state")
-            .into_iter()
+            .entries()
+            .iter()
             .map(|pair| {
                 (
                     pair.key().to_vec(),
@@ -1035,13 +1043,15 @@ async fn checkpoint_reads_open_the_retained_manifest_reader() {
         .expect("token-pinned read of the checkpointed manifest");
     assert_eq!(
         manifest_reader
-            .scan_prefix(b"")
+            .scan(ScanRequest::new(b""))
             .await
-            .expect("manifest state"),
+            .expect("manifest state")
+            .entries(),
         checkpoint_reader
-            .scan_prefix(b"")
+            .scan(ScanRequest::new(b""))
             .await
-            .expect("checkpoint state"),
+            .expect("checkpoint state")
+            .entries(),
         "the checkpoint reader must serve exactly the manifest-named state"
     );
 
@@ -1049,7 +1059,7 @@ async fn checkpoint_reads_open_the_retained_manifest_reader() {
     // substituting its bytes fails closed instead of serving another state.
     let paths = ControlMvpPaths::new("catalog");
     let checkpoint_path = paths.checkpoint_object(checkpoint.checkpoint_id());
-    let state_id = envelope_payload(&storage, &checkpoint_path).await["state"]["state_id"]
+    let state_id = envelope_payload(&storage, &checkpoint_path).await["states"][0]["state_id"]
         .as_str()
         .expect("checkpoint state id")
         .to_string();
@@ -3142,6 +3152,7 @@ impl StorageBackend for GatedPointerWriteThenErrorBackend {
 struct CountingGetBackend {
     inner: Arc<dyn StorageBackend>,
     get_calls: AtomicUsize,
+    get_paths: Mutex<Vec<String>>,
 }
 
 impl CountingGetBackend {
@@ -3149,6 +3160,7 @@ impl CountingGetBackend {
         Self {
             inner,
             get_calls: AtomicUsize::new(0),
+            get_paths: Mutex::new(Vec::new()),
         }
     }
 
@@ -3158,6 +3170,11 @@ impl CountingGetBackend {
 
     fn reset(&self) {
         self.get_calls.store(0, Ordering::SeqCst);
+        self.get_paths.lock().expect("get paths lock").clear();
+    }
+
+    fn get_paths(&self) -> Vec<String> {
+        self.get_paths.lock().expect("get paths lock").clone()
     }
 }
 
@@ -3165,6 +3182,10 @@ impl CountingGetBackend {
 impl StorageBackend for CountingGetBackend {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.get_paths
+            .lock()
+            .expect("get paths lock")
+            .push(path.to_string());
         self.inner.get(path).await
     }
 
@@ -3196,6 +3217,186 @@ impl StorageBackend for CountingGetBackend {
     async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
+}
+
+#[tokio::test]
+async fn unrelated_point_read_uses_indexes_without_fetching_arrow_segments() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+
+    backend.reset();
+    assert_eq!(None, store.get(b"unrelated/key").await.expect("point read"));
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "point read must consult checksummed segment indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated point read fetched Arrow data despite disjoint indexes: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_prefix_scan_uses_indexes_without_fetching_arrow_segments() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+
+    backend.reset();
+    let page = store
+        .scan(ScanRequest::new(b"unrelated/"))
+        .await
+        .expect("prefix scan");
+    assert!(page.entries().is_empty());
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "prefix scan must consult checksummed segment indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated prefix scan fetched Arrow data despite disjoint indexes: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_token_pinned_read_stays_lazy_and_index_pruned() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+    let token = store.current_state_token().await.expect("current token");
+
+    backend.reset();
+    let reader = store.read_at(token).await.expect("open retained reader");
+    assert_eq!(
+        None,
+        reader
+            .get(b"unrelated/key")
+            .await
+            .expect("token-pinned point read")
+    );
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "token-pinned read must consult checksummed indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated token-pinned read eagerly fetched Arrow data: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn control_scan_continuations_pin_authority_and_reject_prefix_or_scope_reuse() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    for key in [b"catalog/a", b"catalog/b", b"catalog/c"] {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin seed transaction");
+        txn.put(key, Bytes::copy_from_slice(key))
+            .await
+            .expect("stage seed key");
+        txn.commit().await.expect("commit seed key");
+    }
+
+    let first = store
+        .scan(ScanRequest::new(b"catalog/").with_limits(1, 1024, 64))
+        .await
+        .expect("first page");
+    assert_eq!(b"catalog/a", first.entries()[0].key());
+    let observed = first.observed_token().expect("observed authority").clone();
+    let continuation = first.continuation().expect("first continuation").clone();
+
+    let mut advance = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin head advance");
+    advance
+        .put(b"catalog/d", Bytes::from_static(b"catalog/d"))
+        .await
+        .expect("stage head advance");
+    advance.commit().await.expect("commit head advance");
+
+    let wrong_prefix = store
+        .scan(ScanRequest::new(b"other/").with_token(continuation.clone()))
+        .await
+        .expect_err("continuation prefix mismatch must fail closed");
+    assert!(matches!(wrong_prefix, CatalogError::Validation { .. }));
+
+    let foreign_storage =
+        ScopedStorage::new(backend, "tenant", "other-workspace").expect("foreign storage");
+    let foreign = ControlMvpStateStore::new(
+        foreign_storage,
+        StateScope::new("tenant", "other-workspace", "catalog"),
+    )
+    .expect("foreign store");
+    let wrong_scope = foreign
+        .scan(ScanRequest::new(b"catalog/").with_token(continuation.clone()))
+        .await
+        .expect_err("continuation scope mismatch must fail closed");
+    assert!(matches!(wrong_scope, CatalogError::Validation { .. }));
+
+    let second = store
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(1, 1024, 64)
+                .with_token(continuation),
+        )
+        .await
+        .expect("second retained page");
+    assert_eq!(Some(&observed), second.observed_token());
+    assert_eq!(b"catalog/b", second.entries()[0].key());
+    let third = store
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(1, 1024, 64)
+                .with_token(second.continuation().expect("second continuation").clone()),
+        )
+        .await
+        .expect("third retained page");
+    assert_eq!(Some(&observed), third.observed_token());
+    assert_eq!(b"catalog/c", third.entries()[0].key());
+    assert!(third.continuation().is_none());
 }
 
 fn interval(value: u64) -> NonZeroU64 {
@@ -3308,12 +3509,15 @@ async fn manifest_suffix_and_size_stay_bounded_by_checkpoint_interval() {
             tx_refs <= 4,
             "manifest suffix {tx_refs} exceeded the checkpoint interval at commit {index}"
         );
-        if manifest_json["payload"]["anchor_state"].is_object() {
+        if manifest_json["payload"]["anchor_states"]
+            .as_array()
+            .is_some_and(|states| !states.is_empty())
+        {
             boundary_manifest_sizes.push(manifest_bytes.len());
         }
     }
 
-    // The genesis boundary carries no base_state reference, so steady-state
+    // The genesis boundary carries no base_states references, so steady-state
     // size comparison starts at the second boundary.
     let steady_state = &boundary_manifest_sizes[1..];
     let first_boundary = steady_state
@@ -3328,6 +3532,174 @@ async fn manifest_suffix_and_size_stay_bounded_by_checkpoint_interval() {
     assert!(
         last_boundary <= first_boundary + 64,
         "boundary manifest size must not grow with history: first {first_boundary}, last {last_boundary}"
+    );
+}
+
+#[tokio::test]
+async fn default_layout_emits_intent_at_sixteen_and_worker_preserves_logical_sequence() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    for sequence in 1..=16_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            format!("catalog/key-{sequence:02}").as_bytes(),
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let source = store.current_state_token().await.expect("source token");
+    assert_eq!(16, source.logical_sequence());
+
+    let worker = ControlMvpMaintenanceWorker::new(storage, scope()).expect("maintenance worker");
+    let pending = worker
+        .pending_intent()
+        .await
+        .expect("pending maintenance intent")
+        .expect("intent at sixteen L0 segments");
+    assert_eq!(source.scope(), pending.source_scope());
+    assert_eq!(source.logical_sequence(), pending.source_logical_sequence());
+    assert_eq!(
+        source.authority_manifest_id(),
+        pending.source_authority_manifest_id()
+    );
+
+    let maintenance = worker
+        .consolidate_pending()
+        .await
+        .expect("consolidate pending suffix")
+        .expect("selected maintenance layout");
+    assert_eq!(&source, maintenance.source_token());
+    assert_eq!(
+        source.logical_sequence(),
+        maintenance.selected_token().logical_sequence()
+    );
+    assert_ne!(
+        source.authority_manifest_id(),
+        maintenance.selected_token().authority_manifest_id()
+    );
+    assert_eq!(1, maintenance.layout_generation());
+    assert_eq!(
+        maintenance.selected_token(),
+        &store.current_state_token().await.expect("selected token")
+    );
+    assert!(
+        worker
+            .pending_intent()
+            .await
+            .expect("post-maintenance intent")
+            .is_none()
+    );
+    for sequence in 1..=16_u64 {
+        assert_eq!(
+            Some(Bytes::from(sequence.to_be_bytes().to_vec())),
+            store
+                .get(format!("catalog/key-{sequence:02}").as_bytes())
+                .await
+                .expect("read consolidated key")
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_layout_fails_closed_before_thirty_second_l0_candidate_publication() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    for sequence in 1..=31_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            b"catalog/hot-key",
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let head_before = store.current_state_token().await.expect("head before");
+    let artifacts_before = backend
+        .list("")
+        .await
+        .expect("artifacts before")
+        .into_iter()
+        .map(|object| object.path)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut blocked = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin blocked transaction");
+    blocked
+        .put(b"catalog/hot-key", Bytes::from_static(b"blocked"))
+        .await
+        .expect("stage blocked write");
+    let error = blocked
+        .commit()
+        .await
+        .expect_err("the thirty-second reachable L0 must apply backpressure");
+    assert!(matches!(
+        error,
+        CatalogError::MaintenanceBackpressure { .. }
+    ));
+    assert_eq!(
+        head_before,
+        store.current_state_token().await.expect("head after")
+    );
+    assert_eq!(
+        artifacts_before,
+        backend
+            .list("")
+            .await
+            .expect("artifacts after")
+            .into_iter()
+            .map(|object| object.path)
+            .collect(),
+        "known maintenance backpressure must precede candidate artifact publication"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_maintenance_workers_select_only_one_equivalent_layout() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    for sequence in 1..=16_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            b"catalog/hot-key",
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let source = store.current_state_token().await.expect("source token");
+    let worker_a = ControlMvpMaintenanceWorker::new(storage.clone(), scope()).expect("worker a");
+    let worker_b = ControlMvpMaintenanceWorker::new(storage, scope()).expect("worker b");
+    let (result_a, result_b) = tokio::join!(
+        worker_a.consolidate_pending(),
+        worker_b.consolidate_pending()
+    );
+    let result_a = result_a.expect("worker a result");
+    let result_b = result_b.expect("worker b result");
+    assert_eq!(
+        1,
+        usize::from(result_a.is_some()) + usize::from(result_b.is_some()),
+        "exact head CAS must select exactly one physical layout"
+    );
+    let current = store.current_state_token().await.expect("current token");
+    assert_eq!(source.logical_sequence(), current.logical_sequence());
+    assert_ne!(
+        source.authority_manifest_id(),
+        current.authority_manifest_id()
     );
 }
 
@@ -3564,7 +3936,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
             .expect("checkpoint manifest checksum"),
         "the checkpoint must be bound to its authority manifest by checksum"
     );
-    let snapshot_id = checkpoint_payload["state"]["state_id"]
+    let snapshot_id = checkpoint_payload["states"][0]["state_id"]
         .as_str()
         .expect("checkpoint state id")
         .to_string();
@@ -3574,7 +3946,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
         .expect("checkpointed snapshot");
     assert_eq!(
         hex::encode(sha2::Sha256::digest(&snapshot_bytes)),
-        checkpoint_payload["state"]["checksum_sha256"]
+        checkpoint_payload["states"][0]["checksum_sha256"]
             .as_str()
             .expect("checkpoint snapshot checksum"),
         "the checkpoint must be bound to its snapshot by checksum"
@@ -3806,7 +4178,7 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
         .await
         .expect("checkpoint object");
     let checkpoint_payload = envelope_payload(&storage, &checkpoint_path).await;
-    let winning_state_id = checkpoint_payload["state"]["state_id"]
+    let winning_state_id = checkpoint_payload["states"][0]["state_id"]
         .as_str()
         .expect("winning state id")
         .to_string();
@@ -3817,11 +4189,11 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
     // bytes it covers.
     let orphan_checksum = hex::encode(sha2::Sha256::digest(&orphan_bytes));
     let orphan_index_checksum = hex::encode(sha2::Sha256::digest(&orphan_index_bytes));
-    let winning_checksum = checkpoint_payload["state"]["checksum_sha256"]
+    let winning_checksum = checkpoint_payload["states"][0]["checksum_sha256"]
         .as_str()
         .expect("winning segment checksum")
         .to_string();
-    let winning_index_checksum = checkpoint_payload["state"]["index_checksum_sha256"]
+    let winning_index_checksum = checkpoint_payload["states"][0]["index_checksum_sha256"]
         .as_str()
         .expect("winning segment index checksum")
         .to_string();
@@ -4381,6 +4753,62 @@ async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
 }
 
 #[tokio::test]
+async fn oversized_projection_intent_aggregate_fails_before_candidate_publication() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin oversized-intent transaction");
+    txn.stage_projection_intent(
+        "oversized-intent",
+        "catalog",
+        Bytes::from(vec![b'x'; 4 * 1024 * 1024]),
+    )
+    .expect("staging validates semantic fields before aggregate encoding");
+
+    assert!(matches!(
+        txn.commit().await,
+        Err(CatalogError::MaintenanceBackpressure { .. })
+    ));
+    let published = backend
+        .list("tenant=tenant/workspace=workspace/control/v1/")
+        .await
+        .expect("list test artifacts");
+    assert!(
+        published.is_empty(),
+        "oversized intent published candidate artifacts: {published:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_mutable_head_fails_closed_before_json_decode() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    commit_value(&store, b"catalog/default", "v1").await;
+    storage
+        .put_raw(
+            &ControlMvpPaths::new("catalog").current_pointer(),
+            Bytes::from(vec![b' '; 64 * 1024 + 1]),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("replace head with oversized bytes");
+
+    let error = store
+        .get(b"catalog/default")
+        .await
+        .expect_err("oversized head must fail closed");
+    match error {
+        CatalogError::InvariantViolation { message } => {
+            assert!(message.contains("head"));
+            assert!(message.contains("65536"));
+        }
+        other => panic!("expected invariant violation, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn restore_inspection_stays_visible_across_anchor_boundaries() {
     let (_backend, storage) = storage();
     let store = ControlMvpStateStore::new(storage, scope())
@@ -4553,7 +4981,7 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
                 .authority_manifest_id()
                 .replace("manifest-", "state-")
         ),
-        manifest_json["payload"]["anchor_state"]["state_id"],
+        manifest_json["payload"]["anchor_states"][0]["state_id"],
         "the recovered boundary must anchor its own snapshot, not the orphan"
     );
     storage

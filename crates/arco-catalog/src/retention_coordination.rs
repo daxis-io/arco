@@ -57,6 +57,8 @@ pub struct RecoveredRetentionEpoch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionMutationKind {
+    /// Publication of a catalog checkpoint retained root.
+    CatalogCheckpointPublish,
     /// First publication of a workspace snapshot's retained root.
     WorkspaceSnapshotFinalize,
     /// Retry of a workspace snapshot publication.
@@ -588,8 +590,9 @@ async fn recover_stale_epoch_while_locked(
 /// objects that already cleared the fail-closed protection set, so a partially
 /// applied pass leaves no half-written product state and a later pass simply
 /// re-derives its candidates. The publication kinds
-/// (`WorkspaceSnapshotFinalize`, `WorkspaceExportFinalize`, their retries, and
-/// `WorkspaceRestoreApply`) can leave partial retained roots and are never
+/// (`CatalogCheckpointPublish`, `WorkspaceSnapshotFinalize`,
+/// `WorkspaceExportFinalize`, their retries, and `WorkspaceRestoreApply`) can
+/// leave partial retained roots and are never
 /// adopted here: they keep failing closed until their own reconciliation
 /// (`settle_terminal_matching`) or an operator override settles them.
 ///

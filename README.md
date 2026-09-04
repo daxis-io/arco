@@ -11,9 +11,13 @@ for open table formats, with Delta Lake as the first-class managed format.
 
 ## What is Arco?
 
-Arco stores catalog and orchestration metadata as **Parquet files on object
-storage** no always on database, no proprietary catalog service. Query your
-metadata with SQL the same way you query your data.
+Arco's accepted architecture stores authoritative transactional control state
+as versioned object-store artifacts selected by exact compare-and-swap heads,
+then publishes open, watermarked Parquet projections for SQL and operational
+reads. Existing roots still use the ADR-018 ledger plus synchronous Parquet
+path; the default-disabled ADR-043 `control/v1` catalog route is a cutover
+candidate, not a deployed authority. There is no mandatory always-on database
+or proprietary catalog service.
 
 At the catalog layer, Arco manages table identity, locations, schemas, lineage,
 and operational metadata for open lakehouse table formats. New Arco table
@@ -22,8 +26,8 @@ catalog surfaces with compatibility and governance support growing over time.
 
 ## Why Arco?
 
-- **No catalog server to operate** - metadata lives in object storage; engines
-  read it directly via signed URLs.
+- **Object-store authority** - correctness-critical state and its open Parquet
+  projections live in object storage without a mandatory catalog database.
 - **Query metadata with SQL** - catalog, lineage, and run history are exposed
   as `system.*` tables.
 - **Real lineage** - captured from actual runs, not guessed from SQL parsing.

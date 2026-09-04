@@ -910,6 +910,7 @@ pub(crate) async fn post_delta_preview_commits(
     Extension(ctx): Extension<UnityCatalogRequestContext>,
     Json(request): Json<DeltaCommitRequestBody>,
 ) -> UnityCatalogResult<(StatusCode, Json<Value>)> {
+    common::reject_table_commit_for_control_v1(&state, &ctx)?;
     let DeltaCommitRequestBody {
         table_id,
         table_uri,

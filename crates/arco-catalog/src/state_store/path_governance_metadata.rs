@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange, StateScope,
-    StateToken, TxnOptions,
+    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange,
+    MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_SEGMENTS, ScanRequest, StateScope, StateToken, TxnOptions,
 };
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
@@ -338,7 +338,16 @@ pub(super) async fn stage_path_governance_declaration(
             ));
         }
     }
-    if !txn.scan_prefix(&keys.descendant_prefix).await?.is_empty() {
+    if !txn
+        .scan(ScanRequest::new(&keys.descendant_prefix).with_limits(
+            1,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        ))
+        .await?
+        .entries()
+        .is_empty()
+    {
         return Err(precondition_failed(
             "descendant path governance metadata conflict",
         ));
@@ -386,7 +395,15 @@ pub(super) async fn path_governance_declaration_conflicts(
             return Ok(true);
         }
     }
-    Ok(!store.scan_prefix(&keys.descendant_prefix).await?.is_empty())
+    Ok(!store
+        .scan(ScanRequest::new(&keys.descendant_prefix).with_limits(
+            1,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        ))
+        .await?
+        .entries()
+        .is_empty())
 }
 
 fn validate_declaration_scope(

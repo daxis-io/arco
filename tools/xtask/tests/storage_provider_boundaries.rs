@@ -154,17 +154,24 @@ fn control_state_kernel_uses_the_narrow_authority_capability() {
     let root = workspace_root();
     let source = "crates/arco-catalog/src/state_store/control_mvp.rs";
     let contents = fs::read_to_string(root.join(source)).expect("read control state kernel");
+    let (request_kernel, maintenance_kernel) = contents
+        .split_once("pub struct ControlMvpMaintenanceWorker")
+        .expect("control state kernel must isolate its maintenance worker");
 
     assert!(
-        contents.contains("storage: ScopedAuthorityStore"),
+        request_kernel.contains("storage: ScopedAuthorityStore"),
         "{source} must depend on ScopedAuthorityStore"
     );
     for forbidden in [".get_raw(", ".put_raw(", ".head_raw("] {
         assert!(
-            !contents.contains(forbidden),
-            "{source} bypasses the narrow authority capability with `{forbidden}`"
+            !request_kernel.contains(forbidden),
+            "{source} request kernel bypasses the narrow authority capability with `{forbidden}`"
         );
     }
+    assert!(
+        maintenance_kernel.contains("lifecycle: ScopedStorage"),
+        "{source} maintenance worker must hold its separate lifecycle capability"
+    );
 }
 
 #[test]

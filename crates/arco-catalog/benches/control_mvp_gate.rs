@@ -33,7 +33,8 @@ use arco_catalog::state_store::promotion_gate::{
     PromotionGateReport, PromotionMeasurement, PromotionMeasurementKind,
 };
 use arco_catalog::{
-    ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, StateScope, TxnOptions,
+    ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ScanRequest, StateScope,
+    TxnOptions,
 };
 use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
@@ -169,9 +170,12 @@ async fn run() -> PromotionGateReport {
     let mut scan_samples = Vec::with_capacity(SAMPLES);
     for _ in 0..SAMPLES {
         let started = Instant::now();
-        let entries = store.scan_prefix(b"catalog/").await.expect("prefix scan");
+        let entries = store
+            .scan(ScanRequest::new(b"catalog/"))
+            .await
+            .expect("prefix scan");
         scan_samples.push(started.elapsed().as_micros());
-        assert!(!entries.is_empty());
+        assert!(!entries.entries().is_empty());
     }
     let scan_p99 = p99_micros(scan_samples);
 

@@ -166,6 +166,7 @@ fn is_write_precondition_failure(
             object_store::Error::Generic { source, .. } => {
                 let message = source.to_string();
                 message.contains("ETag required for conditional update")
+                    || message.contains("ETag required for conditional put")
                     || message.contains("MissingETag")
             }
             _ => false,
@@ -394,5 +395,36 @@ impl StorageBackend for ObjectStoreBackend {
             .await
             .map(|url| url.to_string())
             .map_err(map_object_store_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::is_write_precondition_failure;
+    use arco_core::storage::WritePrecondition;
+
+    fn s3_generic_error(message: &str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: Box::new(io::Error::other(message.to_string())),
+        }
+    }
+
+    #[test]
+    fn classifies_s3_missing_etag_messages_as_precondition_failures() {
+        let precondition = WritePrecondition::MatchesVersion("invalid".to_string());
+
+        for message in [
+            "ETag required for conditional update",
+            "ETag required for conditional put",
+            "MissingETag",
+        ] {
+            assert!(
+                is_write_precondition_failure(&precondition, &s3_generic_error(message)),
+                "expected a precondition failure for: {message}"
+            );
+        }
     }
 }

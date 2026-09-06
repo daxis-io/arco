@@ -56,3 +56,4 @@ Each ADR follows this structure:
 | [041](adr-041-tiered-object-storage-orchestration-event-log.md) | Tiered Object-Storage Orchestration Event Log | Accepted |
 | [042](adr-042-lineage-observation-projection.md) | Lineage Observation And Projection Architecture | Proposed |
 | [043](adr-043-s3-state-token-authority.md) | S3 StateToken Authority | Accepted |
+| [044](adr-044-tenant-level-identity-authority.md) | Tenant Level Identity Authority | Proposed |

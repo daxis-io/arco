@@ -558,19 +558,16 @@ impl MetastoreLedger {
                 ),
             });
         };
-        if scope.tenant_id != self.storage.tenant_id() {
+        if !self.storage.scope().accepts_scope(
+            &scope.tenant_id,
+            &scope.workspace_id,
+            &scope.metastore_id,
+        ) {
             return Err(CatalogError::Validation {
                 message: format!(
-                    "metastore event '{}' tenant scope does not match storage scope",
-                    event.event_id
-                ),
-            });
-        }
-        if scope.workspace_id != self.storage.workspace_id() {
-            return Err(CatalogError::Validation {
-                message: format!(
-                    "metastore event '{}' workspace scope does not match storage scope",
-                    event.event_id
+                    "metastore event '{}' scope does not match storage authority '{}'",
+                    event.event_id,
+                    self.storage.scope().prefix()
                 ),
             });
         }

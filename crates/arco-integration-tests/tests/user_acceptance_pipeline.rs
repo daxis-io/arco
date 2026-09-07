@@ -86,7 +86,7 @@ async fn user_acceptance_schedule_tick_is_queryable_after_manifest_deploy() {
 
 #[tokio::test]
 async fn user_acceptance_backfill_request_is_queryable_after_chunk_planning() {
-    assert_backfill_workflow(AcceptanceHarness::new()).await;
+    Box::pin(assert_backfill_workflow(AcceptanceHarness::new())).await;
 }
 
 #[tokio::test]
@@ -636,10 +636,10 @@ async fn live_user_acceptance_pipeline_runs_against_durable_storage() {
     ))
     .await;
     let backfill_identity = config.identity("backfill");
-    let backfill_proof = assert_backfill_workflow(AcceptanceHarness::with_backend(
+    let backfill_proof = Box::pin(assert_backfill_workflow(AcceptanceHarness::with_backend(
         backend.clone(),
         backfill_identity.clone(),
-    ))
+    )))
     .await;
     let sensor_identity = config.identity("sensor");
     let sensor_proof =

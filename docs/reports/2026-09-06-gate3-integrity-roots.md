@@ -5,7 +5,7 @@ bounds pass. Fresh read-only reviewer `/root/gate3_final_review` (Carver) return
 **APPROVED LOCALLY**, with no unresolved correctness or safety blocker in tested
 source aggregate `798b4953f5049c43829b17db0ef72fb1f0fbf2e216b758c138c68b12b6aeb0ec`.
 
-The candidate is uncommitted on `codex/state-store-vnext`, based on
+The candidate is uncommitted on the state-store vNext work branch, based on
 `0235eb6c1552c5c87fe3a7638e10022889462b35`. Gate 2 completed before these edits;
 its approved source/evidence checkpoint is recorded in
 [Gate 2 closeout](2026-09-06-gate2-closeout.md). The initial dirty baseline and

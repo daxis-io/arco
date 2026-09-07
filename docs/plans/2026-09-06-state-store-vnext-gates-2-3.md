@@ -9,8 +9,8 @@ re-execution, exact HEAD CAS, reclamation generation, separate writer fencing,
 backpressure, retention floors, and uncertain-publication handling. Tier-1 success
 remains fenced control-pointer publication; Parquet projections are asynchronous.
 
-Starting worktree: `/Users/ethanurbanski/arco/.worktrees/state-store-vnext`, branch
-`codex/state-store-vnext`, HEAD `0235eb6c1552c5c87fe3a7638e10022889462b35`.
+Starting worktree: `/Users/ethanurbanski/arco/.worktrees/state-store-vnext`, on the
+state-store vNext work branch at `0235eb6c1552c5c87fe3a7638e10022889462b35`.
 The 24 preexisting changed/untracked files and both baseline cost reports are
 preserved in `/private/tmp/arco-gates-2-3-baseline-wonihzqn`, including a binary
 tracked patch, source/evidence archive, status, per-file hashes, and archive hash.

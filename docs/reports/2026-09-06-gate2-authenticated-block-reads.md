@@ -3,8 +3,8 @@
 Status: implementation and command/cost verification complete; final audit verdict
 and recoverable checkpoint pending. Gate 3 has not started.
 
-Base commit: `0235eb6c1552c5c87fe3a7638e10022889462b35`, branch
-`codex/state-store-vnext`. All changes remain uncommitted. The 24-file starting
+Base commit: `0235eb6c1552c5c87fe3a7638e10022889462b35` on the state-store vNext work
+branch. All changes remain uncommitted. The 24-file starting
 candidate and both original operation-cost reports are preserved in
 `/private/tmp/arco-gates-2-3-baseline-wonihzqn/source-evidence.tar.gz`, together
 with binary tracked patches, status, and file hashes. The starting aggregate

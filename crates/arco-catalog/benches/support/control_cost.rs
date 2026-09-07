@@ -1106,7 +1106,7 @@ pub async fn run_scaling() -> serde_json::Value {
     for suffix in [0, 1, 8, 16, 31] {
         samples.push(scaling_fixture(256, 1, 64 * 1024, suffix).await);
     }
-    let exceptional = exceptional_scaling_costs().await;
+    let exceptional = Box::pin(exceptional_scaling_costs()).await;
     serde_json::json!({"samples": samples, "exceptional_cases": exceptional, "backend": "MemoryBackend API calls, not provider traffic", "authentication": "thread-local SHA-256 helper input bytes/calls; excludes Bloom probe hashing", "allocation_bound": "pinned point cumulative allocations <= 12 * returned metadata and selected data bytes + 128 KiB; eager begin measured separately"})
 }
 

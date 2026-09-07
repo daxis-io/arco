@@ -7,8 +7,8 @@ Gates 5–7 remain outstanding.
 
 The candidate is the uncommitted diff from
 `ca5023caa3ec1eb5b39edeef6291082f544a5153` in
-`/Users/ethanurbanski/arco/.worktrees/state-store-vnext`, on
-`codex/state-store-vnext`. The [approved plan](../plans/2026-09-06-state-store-vnext-gate-4.md)
+`/Users/ethanurbanski/arco/.worktrees/state-store-vnext`, on the state-store
+vNext work branch. The [approved plan](../plans/2026-09-06-state-store-vnext-gate-4.md)
 defines the acceptance contract. No commit, push, merge, deployment, cutover, or
 credentialed provider operation was performed.
 

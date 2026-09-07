@@ -8,8 +8,8 @@ checksum, history, layout, and materialized-rewrite validation guarantee. Gate 4
 improves beginning, inspecting, and abandoning transactions; reduced total
 commit work is not an acceptance claim.
 
-The execution base is `ca5023caa3ec1eb5b39edeef6291082f544a5153` on
-`codex/state-store-vnext` in `/Users/ethanurbanski/arco/.worktrees/state-store-vnext`.
+The execution base is `ca5023caa3ec1eb5b39edeef6291082f544a5153` on the
+state-store vNext work branch in `/Users/ethanurbanski/arco/.worktrees/state-store-vnext`.
 Recheck provenance, status, processes, disk, and Gate 3's 24 tested inputs before
 editing. Use one source-editing owner and sequential Cargo ownership. Preserve
 all worktrees, reports, and checkpoints. Authority 7, restore plan 6,

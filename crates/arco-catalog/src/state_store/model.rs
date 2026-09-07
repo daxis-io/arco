@@ -104,6 +104,7 @@ impl ModelStateStore {
 
     fn token(&self, logical_sequence: u64) -> StateToken {
         StateToken {
+            expected_manifest_sha256: None,
             scope: self.scope.clone(),
             logical_sequence,
             authority_manifest_id: format!("model-state-{logical_sequence:020}"),

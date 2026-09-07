@@ -119,14 +119,35 @@ fn validate_metadata_timestamp(updated_at_ms: i64) -> Result<()> {
 /// fn assert_serializable<T: Serialize>() {}
 /// assert_serializable::<StateToken>();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct StateToken {
+    expected_manifest_sha256: Option<String>,
     scope: StateScope,
     logical_sequence: u64,
     authority_manifest_id: String,
 }
 
+impl PartialEq for StateToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.logical_sequence == other.logical_sequence
+            && self.authority_manifest_id == other.authority_manifest_id
+    }
+}
+
 impl StateToken {
+    fn with_manifest_witness(mut self, digest: String) -> Self {
+        self.expected_manifest_sha256 = Some(digest);
+        self
+    }
+
+    fn manifest_witness(&self) -> Result<&str> {
+        self.expected_manifest_sha256
+            .as_deref()
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "StateToken has no authenticated manifest witness".to_string(),
+            })
+    }
     /// Creates a state token value for crate-local tests.
     #[cfg(test)]
     #[must_use]
@@ -139,6 +160,7 @@ impl StateToken {
             scope,
             logical_sequence,
             authority_manifest_id: authority_manifest_id.into(),
+            expected_manifest_sha256: Some("0".repeat(64)),
         }
     }
 
@@ -337,14 +359,6 @@ impl ProjectionIntentV1 {
     #[must_use]
     pub fn payload(&self) -> &[u8] {
         &self.payload
-    }
-
-    pub(crate) fn source_token(&self) -> StateToken {
-        StateToken {
-            scope: self.source_scope.clone(),
-            logical_sequence: self.source_logical_sequence,
-            authority_manifest_id: self.source_authority_manifest_id.clone(),
-        }
     }
 }
 
@@ -835,13 +849,32 @@ mod test_support {
 /// fn assert_serializable<T: Serialize>() {}
 /// assert_serializable::<CheckpointToken>();
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct CheckpointToken {
+    expected_checkpoint_sha256: Option<String>,
     scope: StateScope,
     checkpoint_id: String,
 }
 
+impl PartialEq for CheckpointToken {
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope && self.checkpoint_id == other.checkpoint_id
+    }
+}
+
 impl CheckpointToken {
+    fn with_checkpoint_witness(mut self, digest: String) -> Self {
+        self.expected_checkpoint_sha256 = Some(digest);
+        self
+    }
+
+    fn checkpoint_witness(&self) -> Result<&str> {
+        self.expected_checkpoint_sha256
+            .as_deref()
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "CheckpointToken has no authenticated checkpoint witness".to_string(),
+            })
+    }
     /// Returns the authority scope retained by this checkpoint.
     #[must_use]
     pub const fn scope(&self) -> &StateScope {
@@ -1125,9 +1158,9 @@ pub struct ScanContinuation {
     query_binding: Option<Vec<u8>>,
 }
 
-const SCAN_CONTINUATION_VERSION: u32 = 2;
-const SCAN_CONTINUATION_PREFIX: &str = "v2.";
-const SCAN_CONTINUATION_AAD: &[u8] = b"arco/control-v1/scan-continuation/v2";
+const SCAN_CONTINUATION_VERSION: u32 = 3;
+const SCAN_CONTINUATION_PREFIX: &str = "v3.";
+const SCAN_CONTINUATION_AAD: &[u8] = b"arco/control-v1/scan-continuation/v3";
 const SCAN_CONTINUATION_NONCE_BYTES: usize = 12;
 const MAX_SCAN_CONTINUATION_ENCODED_BYTES: usize = 16 * 1024;
 
@@ -1177,6 +1210,7 @@ impl ScanContinuationKey {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScanContinuationEnvelope {
+    manifest_sha256: String,
     version: u32,
     tenant_id: String,
     workspace_id: String,
@@ -1192,6 +1226,7 @@ struct ScanContinuationEnvelope {
 impl ScanContinuation {
     pub(crate) fn encode_opaque(&self, key: &ScanContinuationKey) -> Result<String> {
         let envelope = ScanContinuationEnvelope {
+            manifest_sha256: self.observed_token.manifest_witness()?.to_string(),
             version: SCAN_CONTINUATION_VERSION,
             tenant_id: self.scope.tenant_id().to_string(),
             workspace_id: self.scope.workspace_id().to_string(),
@@ -1231,6 +1266,11 @@ impl ScanContinuation {
     }
 
     pub(crate) fn decode_opaque(value: &str, key: &ScanContinuationKey) -> Result<Self> {
+        if value.starts_with("v1.") || value.starts_with("v2.") {
+            return Err(CatalogError::Validation {
+                message: "unsupported opaque scan continuation version".to_string(),
+            });
+        }
         let encoded = value
             .strip_prefix(SCAN_CONTINUATION_PREFIX)
             .ok_or_else(|| CatalogError::Validation {
@@ -1280,6 +1320,16 @@ impl ScanContinuation {
                 message: "unsupported opaque scan continuation version".to_string(),
             });
         }
+        if envelope.manifest_sha256.len() != 64
+            || !envelope
+                .manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CatalogError::Validation {
+                message: "invalid scan continuation manifest witness".to_string(),
+            });
+        }
         let prefix = hex::decode(envelope.prefix_hex).map_err(|_| CatalogError::Validation {
             message: "invalid opaque scan continuation prefix".to_string(),
         })?;
@@ -1302,6 +1352,7 @@ impl ScanContinuation {
                 scope: scope.clone(),
                 logical_sequence: envelope.logical_sequence,
                 authority_manifest_id: envelope.manifest_id,
+                expected_manifest_sha256: Some(envelope.manifest_sha256),
             },
             scope,
             prefix,
@@ -1520,7 +1571,10 @@ pub(crate) fn build_scan_page(
 ) -> Result<ScanPage> {
     request.validate_for_scope(scope)?;
     if let Some(continued) = request.continuation_token()
-        && observed_token.as_ref() != Some(continued)
+        && observed_token.as_ref().is_none_or(|observed| {
+            observed != continued
+                || observed.expected_manifest_sha256 != continued.expected_manifest_sha256
+        })
     {
         return Err(CatalogError::Validation {
             message: "scan continuation authority mismatch".to_string(),
@@ -2739,6 +2793,7 @@ mod tests {
     #[tokio::test]
     async fn current_state_store_rejects_read_checkpoint_with_internal_token() {
         let token = CheckpointToken {
+            expected_checkpoint_sha256: None,
             scope: StateScope::new("tenant", "workspace", "catalog"),
             checkpoint_id: "checkpoint-1".to_string(),
         };

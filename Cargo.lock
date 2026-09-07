@@ -941,6 +941,7 @@ dependencies = [
  "arrow-schema 54.3.1",
  "flatbuffers 24.12.23",
  "lz4_flex",
+ "zstd",
 ]
 
 [[package]]

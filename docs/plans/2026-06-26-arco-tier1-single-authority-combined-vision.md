@@ -118,7 +118,10 @@ the success path does not promise unlimited writes while internal maintenance
 is stalled.
 
 In the [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries),
-Gate 2 introduces block-addressable segments and only adapts existing maintenance
+The [Gate 2 block format contract](state-store-block-format-v1.md) specifies
+authenticated root witnesses, bounded directories, independent IPC blocks and
+selective readers; its [local evidence](../reports/2026-09-06-gate2-authenticated-block-reads.md)
+records qualification separately from implementation. Gate 2 introduces block-addressable segments and only adapts existing maintenance
 read/write paths as needed for the format. Gate 5 makes internal segment
 maintenance incremental, durable, and resumable. It does not reintroduce the
 legacy event-to-Parquet publication dependency. Neither gate itself authorizes

@@ -543,7 +543,11 @@ impl CatalogProjectionMaterializer {
             .await
     }
 
-    async fn materialize(&self, intent: &ProjectionIntentV1) -> Result<String> {
+    async fn materialize(
+        &self,
+        intent: &ProjectionIntentV1,
+        record: &crate::state_store::ControlMvpProjectionOutboxRecord,
+    ) -> Result<String> {
         if intent.projection_kind() != CATALOG_PARQUET_PROJECTION_CONSUMER_ID
             || intent.source_scope().domain() != "catalog"
         {
@@ -552,7 +556,11 @@ impl CatalogProjectionMaterializer {
                     .to_string(),
             });
         }
-        let reader = self.source.read_at(intent.source_token()).await?;
+        let token = self
+            .source
+            .resolve_projection_source(record, intent)
+            .await?;
+        let reader = self.source.read_at(token).await?;
         let state = catalog_state_from_reader(reader.as_ref()).await?;
         let directory = format!(
             "control/v1/projections/catalog-parquet/{:020}-{}/",
@@ -624,7 +632,7 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                     .await?;
                 return Ok(ProjectionOutboxProcessDisposition::Quarantined);
             };
-        match self.materialize(&intent).await {
+        match self.materialize(&intent, record).await {
             Ok(manifest_path) => {
                 self.status
                     .record_projection_success(

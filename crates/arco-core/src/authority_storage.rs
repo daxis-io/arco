@@ -1,10 +1,11 @@
 //! Narrow storage capability for immutable authority objects and fenced heads.
 
 use bytes::Bytes;
+use std::ops::Range;
 
 use crate::Result;
 use crate::scoped_storage::ScopedStorage;
-use crate::storage::{ObjectMeta, WritePrecondition, WriteResult};
+use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 
 /// Preconditions allowed for authority-object publication.
 ///
@@ -73,6 +74,15 @@ impl ScopedAuthorityStore {
     /// Returns path-validation, not-found, or backend errors.
     pub async fn get(&self, path: &str) -> Result<Bytes> {
         self.storage.get_raw(path).await
+    }
+
+    /// Reads a byte range from a scope-relative authority object.
+    ///
+    /// # Errors
+    ///
+    /// Returns path-validation, not-found, invalid-range, or backend errors.
+    pub async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        self.storage.get_range(path, range).await
     }
 
     /// Reads authority-object metadata without fetching its content.
@@ -167,6 +177,12 @@ mod tests {
         assert!(authority.get("../other/head.json").await.is_err());
         assert!(
             authority
+                .get_range("../other/head.json", 0..1)
+                .await
+                .is_err()
+        );
+        assert!(
+            authority
                 .put(
                     "/absolute/head.json",
                     Bytes::new(),
@@ -175,5 +191,32 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn ranges_preserve_scope_and_exact_bytes() {
+        let backend = Arc::new(MemoryBackend::new());
+        let authority = ScopedAuthorityStore::new(
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
+        );
+        let other =
+            ScopedAuthorityStore::new(ScopedStorage::new(backend, "tenant", "other").unwrap());
+        authority
+            .put(
+                "segment",
+                Bytes::from_static(b"abcdef"),
+                AuthorityWritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            authority.get_range("segment", 2..5).await.unwrap(),
+            Bytes::from_static(b"cde")
+        );
+        assert_eq!(
+            authority.get_range("segment", 0..7).await.unwrap(),
+            Bytes::from_static(b"abcdef")
+        );
+        assert!(other.get_range("segment", 0..1).await.is_err());
     }
 }

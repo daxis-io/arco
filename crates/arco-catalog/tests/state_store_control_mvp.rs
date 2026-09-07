@@ -896,10 +896,14 @@ async fn manifest_transaction_checksum_mismatch_fails_closed() {
 
     rewrite_object_pretty(&storage, &paths.tx_object(&tx_id)).await;
 
-    let error = match store.read_at(token.into_state_token()).await {
-        Err(error) => error,
-        Ok(_) => panic!("manifest transaction checksum mismatch must fail closed"),
-    };
+    let reader = store
+        .read_at(token.into_state_token())
+        .await
+        .expect("root metadata opens without reading transaction objects");
+    let error = reader
+        .get(b"catalog/default")
+        .await
+        .expect_err("selected transaction checksum mismatch must fail closed");
     assert!(matches!(error, CatalogError::InvariantViolation { .. }));
 }
 
@@ -1334,7 +1338,7 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        4,
+        5,
         plan.version(),
         "planning writes the current plan version"
     );
@@ -2094,7 +2098,7 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
 
     for (field, replacement) in [
         ("record_type", Value::String("other_plan".to_string())),
-        ("version", Value::from(5_u64)),
+        ("version", Value::from(99_u64)),
     ] {
         let mut value = serde_json::to_value(&plan).expect("plan json");
         value[field] = replacement;
@@ -3210,6 +3214,11 @@ impl StorageBackend for CountingGetBackend {
     }
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.get_paths
+            .lock()
+            .expect("range paths lock")
+            .push(path.to_string());
         self.inner.get_range(path, range).await
     }
 
@@ -4111,7 +4120,8 @@ fn reseal_envelope(bytes: &[u8], mutate: impl FnOnce(&str) -> String) -> Bytes {
     let payload = mutate(&text[start..text.len() - 1]);
     let checksum = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
     Bytes::from(format!(
-        "{{\"artifact_type\":{},\"checksum_sha256\":\"{checksum}\",\"payload\":{payload}}}",
+        "{{\"format_version\":{},\"artifact_type\":{},\"checksum_sha256\":\"{checksum}\",\"payload\":{payload}}}",
+        value["format_version"],
         serde_json::to_string(artifact_type).expect("artifact type json"),
     ))
 }
@@ -4248,26 +4258,15 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
     );
     assert!(
         matches!(&error, CatalogError::InvariantViolation { message }
-            if message.contains("not the state named by its authority manifest")),
+            if message.contains("witness")),
         "unexpected error: {error:?}"
     );
 
-    // Persisted-reference resolution must fail closed on the same ground: the
-    // reference is minted from the substituted bytes, so its own digests match.
-    let reference = store
+    let error = store
         .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
         .await
-        .expect("the substitution is coherent enough to mint a reference");
-    let error = store
-        .resolve_persisted_reference(&reference)
-        .await
-        .err()
-        .expect("resolving a substituted checkpoint reference must fail closed");
-    assert!(
-        matches!(&error, CatalogError::InvariantViolation { message }
-            if message.contains("not the state named by its authority manifest")),
-        "unexpected error: {error:?}"
-    );
+        .expect_err("a historical token cannot mint a reference to coherently substituted bytes");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
 
     // Restoring the original checkpoint bytes serves the winning fork again.
     storage

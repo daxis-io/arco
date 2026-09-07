@@ -46,6 +46,10 @@ impl Profile {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BackendCounts {
+    pub sha256_helper_calls: u64,
+    pub sha256_helper_bytes: u64,
+    pub object_reads: BTreeMap<String, ObjectReadCounts>,
+    pub requested_ranges: BTreeMap<String, u64>,
     pub logical_storage_calls: u64,
     pub get_attempts: u64,
     pub range_get_attempts: u64,
@@ -61,6 +65,30 @@ pub struct BackendCounts {
     pub immutable_write_attempt_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ObjectReadCounts {
+    pub full_reads: u64,
+    pub ranges: u64,
+    pub returned_bytes: u64,
+    pub failures: u64,
+}
+
+// Authority paths have canonical lowercase extensions.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn object_class(path: &str) -> &'static str {
+    if path.contains("/manifests/") {
+        "manifest"
+    } else if path.contains("/indexes/") || path.ends_with(".index.json") {
+        "directory"
+    } else if path.ends_with(".arrow") {
+        "data"
+    } else if path.contains("/transactions/") {
+        "transaction"
+    } else {
+        "other"
+    }
+}
+
 impl BackendCounts {
     pub fn requests(&self) -> u64 {
         self.get_attempts
@@ -73,6 +101,18 @@ impl BackendCounts {
     }
 
     fn add(&mut self, other: &Self) {
+        self.sha256_helper_calls += other.sha256_helper_calls;
+        self.sha256_helper_bytes += other.sha256_helper_bytes;
+        for (class, read) in &other.object_reads {
+            let entry = self.object_reads.entry(class.clone()).or_default();
+            entry.full_reads += read.full_reads;
+            entry.ranges += read.ranges;
+            entry.returned_bytes += read.returned_bytes;
+            entry.failures += read.failures;
+        }
+        for (range, count) in &other.requested_ranges {
+            *self.requested_ranges.entry(range.clone()).or_default() += count;
+        }
         self.logical_storage_calls += other.logical_storage_calls;
         self.get_attempts += other.get_attempts;
         self.range_get_attempts += other.range_get_attempts;
@@ -109,7 +149,16 @@ impl CountingBackend {
         update(&mut self.counts.lock().unwrap());
     }
     fn take(&self) -> BackendCounts {
-        std::mem::take(&mut *self.counts.lock().unwrap())
+        let result = std::mem::take(&mut *self.counts.lock().unwrap());
+        #[cfg(feature = "test-utils")]
+        let result = {
+            let mut result = result;
+            let (calls, bytes) = ControlMvpStateStore::take_test_authentication_work();
+            result.sha256_helper_calls = calls;
+            result.sha256_helper_bytes = bytes;
+            result
+        };
+        result
     }
 }
 
@@ -121,6 +170,17 @@ impl StorageBackend for CountingBackend {
         for _ in 0..self.get_repetitions {
             self.count(|count| count.get_attempts += 1);
             result = self.inner.get(path).await;
+            self.count(|count| {
+                let read = count
+                    .object_reads
+                    .entry(object_class(path).to_string())
+                    .or_default();
+                read.full_reads += 1;
+                match &result {
+                    Ok(bytes) => read.returned_bytes += bytes.len() as u64,
+                    Err(_) => read.failures += 1,
+                }
+            });
             if let Ok(bytes) = &result {
                 self.count(|count| count.read_bytes += u64::try_from(bytes.len()).unwrap());
             }
@@ -132,7 +192,20 @@ impl StorageBackend for CountingBackend {
             count.logical_storage_calls += 1;
             count.range_get_attempts += 1;
         });
+        let range_key = format!("{}:{}:{}", object_class(path), range.start, range.end);
         let result = self.inner.get_range(path, range).await;
+        self.count(|count| {
+            *count.requested_ranges.entry(range_key).or_default() += 1;
+            let read = count
+                .object_reads
+                .entry(object_class(path).to_string())
+                .or_default();
+            read.ranges += 1;
+            match &result {
+                Ok(bytes) => read.returned_bytes += bytes.len() as u64,
+                Err(_) => read.failures += 1,
+            }
+        });
         if let Ok(bytes) = &result {
             self.count(|count| count.read_bytes += u64::try_from(bytes.len()).unwrap());
         }
@@ -780,4 +853,347 @@ async fn verify_retention_and_recovery(
             assert_eq!(read_contents(&reopened).await, *expected);
         })
         .await;
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Serialize)]
+pub struct ScalingSample {
+    pub target_bytes: usize,
+    pub rows: usize,
+    pub l1_segments: usize,
+    pub l0_suffix: usize,
+    pub blocks: usize,
+    pub encoded_data_bytes: usize,
+    pub index_bytes: usize,
+    pub pages: usize,
+    pub operations: BTreeMap<String, BackendCounts>,
+    pub allocations: BTreeMap<String, Allocations>,
+}
+
+#[cfg(feature = "test-utils")]
+fn scaling_key(ordinal: usize) -> Vec<u8> {
+    format!("{:032}", ordinal * 2).into_bytes()
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::indexing_slicing
+)]
+async fn scaling_fixture(
+    rows: usize,
+    segments: usize,
+    target: usize,
+    suffix: usize,
+) -> ScalingSample {
+    let backend = Arc::new(CountingBackend::new(1));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+    for sequence in 0..16 {
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        if sequence == 0 {
+            for ordinal in 0..rows {
+                tx.put(&scaling_key(ordinal), Bytes::from(vec![42; 1024]))
+                    .await
+                    .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+    }
+    let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope)
+        .unwrap()
+        .with_test_segment_sizing(rows.div_ceil(segments), target)
+        .unwrap();
+    worker.consolidate_pending().await.unwrap().unwrap();
+    for _ in 0..suffix {
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(&scaling_key(rows / 2), Bytes::from(vec![43; 1024]))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let token = store.current_state_token().await.unwrap();
+    let paths = arco_catalog::ControlMvpPaths::new("catalog");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get_raw(&paths.manifest_object(token.authority_manifest_id()))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let refs = manifest["payload"]["base_states"].as_array().unwrap();
+    assert_eq!(refs.len(), segments);
+    let mut sample = ScalingSample {
+        target_bytes: target,
+        rows,
+        l1_segments: segments,
+        l0_suffix: suffix,
+        blocks: 0,
+        encoded_data_bytes: 0,
+        index_bytes: 0,
+        pages: 0,
+        operations: BTreeMap::new(),
+        allocations: BTreeMap::new(),
+    };
+    for reference in refs {
+        sample.encoded_data_bytes +=
+            usize::try_from(reference["segment_size_bytes"].as_u64().unwrap()).unwrap();
+        sample.index_bytes +=
+            usize::try_from(reference["index_size_bytes"].as_u64().unwrap()).unwrap();
+        let index: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(&paths.segment_index(reference["state_id"].as_str().unwrap()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        sample.blocks += index["blocks"].as_array().unwrap().len();
+    }
+    backend.take();
+    let (reader, allocations) = measure_allocations(store.read_at(token)).await;
+    let reader = reader.unwrap();
+    sample
+        .operations
+        .insert("reader_open".to_string(), backend.take());
+    sample
+        .allocations
+        .insert("reader_open".to_string(), allocations);
+    let (value, allocations) = measure_allocations(reader.get(&scaling_key(rows / 2))).await;
+    assert_eq!(value.unwrap().unwrap().len(), 1024);
+    let point = backend.take();
+    let data = point.object_reads.get("data").unwrap();
+    assert_eq!(data.full_reads, 0);
+    assert_eq!(data.ranges, (suffix + 1) as u64);
+    let directories = point.object_reads.get("directory").unwrap();
+    assert_eq!(directories.full_reads, 0);
+    assert_eq!(directories.ranges, (suffix + 1) as u64);
+    let transactions = point
+        .object_reads
+        .get("transaction")
+        .map_or(0, |read| read.full_reads + read.ranges);
+    assert!(transactions + directories.ranges <= (2 * suffix + 1) as u64);
+    if suffix == 0 && segments == 1 && sample.blocks >= 16 {
+        assert!(data.returned_bytes * sample.blocks as u64 <= 2 * sample.encoded_data_bytes as u64);
+    }
+    sample.operations.insert("pinned_point".to_string(), point);
+    sample
+        .allocations
+        .insert("pinned_point".to_string(), allocations);
+    if suffix == 0 {
+        assert!(
+            reader
+                .get(b"outside-manifest-bounds")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let outside = backend.take();
+        assert!(
+            !outside.object_reads.contains_key("directory")
+                && !outside.object_reads.contains_key("data")
+        );
+        sample
+            .operations
+            .insert("outside_bounds".to_string(), outside);
+        // Fixed odd key between present even keys. Find the first actual Bloom-negative.
+        for probe in 0..100 {
+            let absent = format!("{:032}", probe * 2 + 1);
+            assert!(reader.get(absent.as_bytes()).await.unwrap().is_none());
+            let miss = backend.take();
+            if !miss.object_reads.contains_key("data") {
+                assert_eq!(miss.object_reads["directory"].ranges, 1);
+                sample.operations.insert("bloom_negative".to_string(), miss);
+                break;
+            }
+        }
+        assert!(sample.operations.contains_key("bloom_negative"));
+    }
+    let mut continuation = None;
+    let mut observed = Vec::new();
+    let mut scan_counts = BackendCounts::default();
+    loop {
+        let mut request = ScanRequest::new(b"").with_limits(113, 256 * 1024, 64);
+        if let Some(cursor) = continuation.take() {
+            request = request.with_token(cursor);
+        }
+        let page = reader.scan(request).await.unwrap();
+        sample.pages += 1;
+        scan_counts.add(&backend.take());
+        observed.extend(page.entries().iter().map(|entry| entry.key().to_vec()));
+        continuation = page.continuation().cloned();
+        if continuation.is_none() {
+            break;
+        }
+        assert!(sample.pages <= rows + 1);
+    }
+    assert_eq!(observed, (0..rows).map(scaling_key).collect::<Vec<_>>());
+    let data = &scan_counts.object_reads["data"];
+    assert_eq!(data.full_reads, 0);
+    if suffix == 0 {
+        assert!(
+            data.ranges <= (sample.blocks + sample.pages - 1) as u64,
+            "scan reads {} blocks for {} blocks / {} pages",
+            data.ranges,
+            sample.blocks,
+            sample.pages
+        );
+    }
+    sample
+        .operations
+        .insert("complete_scan".to_string(), scan_counts);
+    let (_, allocations) = measure_allocations(store.get(&scaling_key(rows / 2))).await;
+    sample
+        .operations
+        .insert("current_point".to_string(), backend.take());
+    sample
+        .allocations
+        .insert("current_point".to_string(), allocations);
+    let (txn, allocations) =
+        measure_allocations(store.begin_control_txn(TxnOptions::default())).await;
+    Box::new(txn.unwrap()).rollback().await.unwrap();
+    sample
+        .operations
+        .insert("eager_begin".to_string(), backend.take());
+    sample
+        .allocations
+        .insert("eager_begin".to_string(), allocations);
+    assert!(
+        sample.allocations["pinned_point"].bytes
+            <= sample.operations["pinned_point"].read_bytes * 12 + 128 * 1024
+    );
+    if rows >= 4096 {
+        assert!(sample.allocations["pinned_point"].bytes < sample.allocations["eager_begin"].bytes);
+    }
+    sample
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(clippy::indexing_slicing)]
+pub async fn run_scaling() -> serde_json::Value {
+    let mut samples = Vec::new();
+    for target in [32, 64, 128, 256] {
+        samples.push(scaling_fixture(4096, 1, target * 1024, 0).await);
+    }
+    let small = &samples[1];
+    let large = &samples[3];
+    assert!(small.encoded_data_bytes * 100 <= large.encoded_data_bytes * 115);
+    let data = |sample: &ScalingSample, name: &str| {
+        sample.operations[name].object_reads["data"].returned_bytes
+    };
+    assert!(data(small, "complete_scan") * 100 <= data(large, "complete_scan") * 115);
+    assert!(data(small, "pinned_point") * 100 <= data(large, "pinned_point") * 40);
+    assert!(
+        small.operations["complete_scan"].object_reads["data"].ranges * 2
+            <= large.operations["complete_scan"].object_reads["data"].ranges * 9 + 2
+    );
+    assert!(small.index_bytes <= large.index_bytes * 3);
+    for blocks in [1, 4, 16, 64] {
+        let sample = scaling_fixture(blocks * 55, 1, 64 * 1024, 0).await;
+        assert_eq!(sample.blocks, blocks);
+        samples.push(sample);
+    }
+    for segments in [1, 4, 16, 64] {
+        samples.push(scaling_fixture(4096, segments, 64 * 1024, 0).await);
+    }
+    for suffix in [0, 1, 8, 16, 31] {
+        samples.push(scaling_fixture(256, 1, 64 * 1024, suffix).await);
+    }
+    let exceptional = Box::pin(exceptional_scaling_costs()).await;
+    serde_json::json!({"samples": samples, "exceptional_cases": exceptional, "backend": "MemoryBackend API calls, not provider traffic", "authentication": "thread-local SHA-256 helper input bytes/calls; excludes Bloom probe hashing", "allocation_bound": "pinned point cumulative allocations <= 12 * returned metadata and selected data bytes + 128 KiB; eager begin measured separately"})
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::indexing_slicing
+)]
+async fn exceptional_scaling_costs() -> serde_json::Value {
+    let mut cases = Vec::new();
+    for oversized in [true, false] {
+        let backend = Arc::new(CountingBackend::new(1));
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        let tx_id = tx.tx_id().to_string();
+        if oversized {
+            tx.put(&scaling_key(0), Bytes::from(vec![42; 300 * 1024]))
+                .await
+                .unwrap();
+            tx.put(&scaling_key(1), Bytes::from(vec![42; 1024]))
+                .await
+                .unwrap();
+        } else {
+            for ordinal in 0..104_859 {
+                tx.delete(&scaling_key(ordinal)).await.unwrap();
+            }
+        }
+        backend.take();
+        let (token, write_allocations) = measure_allocations(tx.commit()).await;
+        let token = token.unwrap();
+        let writes = backend.take();
+        let index_bytes = storage
+            .get_raw(&store.paths().segment_index(&tx_id))
+            .await
+            .unwrap();
+        let index: serde_json::Value = serde_json::from_slice(&index_bytes).unwrap();
+        if oversized {
+            assert_eq!(index["blocks"][0]["rowCount"], 1);
+            assert!(index["blocks"][0]["length"].as_u64().unwrap() > 256 * 1024);
+        } else {
+            assert_eq!(index["bloomMode"], "Disabled");
+            assert_eq!(index["bloomBitsHex"], "");
+        }
+        let reader = store.read_at(token.into_state_token()).await.unwrap();
+        backend.take();
+        let (value, allocations) = measure_allocations(reader.get(&scaling_key(0))).await;
+        assert_eq!(value.unwrap().is_some(), oversized);
+        cases.push(serde_json::json!({"case": if oversized { "oversized_row" } else { "disabled_filter" }, "directory_bytes":index_bytes.len(), "blocks":index["blocks"].as_array().unwrap().len(), "commit":writes, "commit_allocations":write_allocations, "point":backend.take(), "point_allocations":allocations}));
+    }
+    let backend = Arc::new(CountingBackend::new(1));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let store =
+        ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+            .unwrap();
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    first
+        .stage_projection_intent("projection", "test", Bytes::from_static(b"payload"))
+        .unwrap();
+    first.commit().await.unwrap();
+    for _ in 0..2 {
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+    }
+    let records = store.current_projection_outbox().await.unwrap();
+    backend.take();
+    let (resolved, allocations) =
+        measure_allocations(store.resolve_test_projection_source(&records[0])).await;
+    assert_eq!(resolved.unwrap().logical_sequence(), 1);
+    let counts = backend.take();
+    assert_eq!(counts.object_reads["manifest"].ranges, 3);
+    cases.push(serde_json::json!({"case":"projection_source_resolution", "manifests":3, "reads":counts, "allocations":allocations}));
+    serde_json::Value::Array(cases)
 }

@@ -121,3 +121,14 @@ async fn authenticated_block_scaling_acceptance() {
         .expect("write scaling report");
     }
 }
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "explicit Gate 4 lazy transaction scaling lane"]
+async fn lazy_transaction_scaling_acceptance() {
+    let report = Box::pin(control_cost::run_lazy_scaling()).await;
+    if let Ok(path) = std::env::var("ARCO_LAZY_TXN_REPORT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&report).expect("report"))
+            .expect("write report");
+    }
+}

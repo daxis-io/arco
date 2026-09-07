@@ -497,6 +497,7 @@ async fn transaction_envelope_is_metadata_only_and_l0_drives_replay() {
         "large-projection",
         outbox_payload.clone(),
     ))
+    .await
     .expect("stage outbox");
 
     txn.commit().await.expect("commit");
@@ -978,6 +979,7 @@ async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
         "record-r",
         Bytes::from_static(b"payload"),
     ))
+    .await
     .expect("stage retained outbox record");
     seed.commit().await.expect("commit seed");
 
@@ -988,6 +990,7 @@ async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
     let tx_id = trim.tx_id().to_string();
     let manifest_id = trim.candidate_manifest_id().to_string();
     trim.trim_projection_outbox([ControlMvpOutboxTrimTarget::new("record-r", 1)])
+        .await
         .expect("stage trim");
     trim.commit().await.expect("commit trim");
 

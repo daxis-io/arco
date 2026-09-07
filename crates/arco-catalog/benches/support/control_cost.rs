@@ -46,6 +46,14 @@ impl Profile {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BackendCounts {
+    pub phases: BTreeMap<String, BackendCounts>,
+    pub replayed_rows: u64,
+    pub full_checksum_calls: u64,
+    pub full_checksum_bytes: u64,
+    pub digest_validation_hash_calls: u64,
+    pub digest_validation_hash_bytes: u64,
+    pub witness_hash_calls: u64,
+    pub witness_hash_bytes: u64,
     pub sha256_helper_calls: u64,
     pub sha256_helper_bytes: u64,
     pub canonical_root_hash_calls: u64,
@@ -107,6 +115,16 @@ impl BackendCounts {
     }
 
     fn add(&mut self, other: &Self) {
+        self.replayed_rows += other.replayed_rows;
+        self.full_checksum_calls += other.full_checksum_calls;
+        self.full_checksum_bytes += other.full_checksum_bytes;
+        self.digest_validation_hash_calls += other.digest_validation_hash_calls;
+        self.digest_validation_hash_bytes += other.digest_validation_hash_bytes;
+        self.witness_hash_calls += other.witness_hash_calls;
+        self.witness_hash_bytes += other.witness_hash_bytes;
+        for (name, phase) in &other.phases {
+            self.phases.entry(name.clone()).or_default().add(phase);
+        }
         self.canonical_root_hash_calls += other.canonical_root_hash_calls;
         self.canonical_root_hash_bytes += other.canonical_root_hash_bytes;
         self.rendered_state_validation_calls += other.rendered_state_validation_calls;
@@ -157,8 +175,18 @@ impl CountingBackend {
             lose_head_response: AtomicBool::new(false),
         }
     }
-    fn count(&self, update: impl FnOnce(&mut BackendCounts)) {
-        update(&mut self.counts.lock().unwrap());
+    fn count(&self, update: impl Fn(&mut BackendCounts)) {
+        let mut counts = self.counts.lock().unwrap();
+        update(&mut counts);
+        #[cfg(feature = "test-utils")]
+        if ControlMvpStateStore::test_cost_phase() != "request" {
+            update(
+                counts
+                    .phases
+                    .entry(ControlMvpStateStore::test_cost_phase().to_string())
+                    .or_default(),
+            );
+        }
     }
     fn take(&self) -> BackendCounts {
         let result = std::mem::take(&mut *self.counts.lock().unwrap());
@@ -166,6 +194,33 @@ impl CountingBackend {
         let result = {
             let mut result = result;
             let (calls, bytes) = ControlMvpStateStore::take_test_authentication_work();
+            for (name, work) in ControlMvpStateStore::take_test_phase_work() {
+                result.full_checksum_bytes += work[12];
+                result.digest_validation_hash_calls += work[13];
+                result.digest_validation_hash_bytes += work[14];
+                result.replayed_rows += work[8];
+                result.full_checksum_calls += work[9];
+                result.witness_hash_calls += work[10];
+                result.witness_hash_bytes += work[11];
+                if name != "request" {
+                    let phase = result.phases.entry(name.to_string()).or_default();
+                    phase.sha256_helper_calls = work[0];
+                    phase.sha256_helper_bytes = work[1];
+                    phase.canonical_root_hash_calls = work[2];
+                    phase.canonical_root_hash_bytes = work[3];
+                    phase.rendered_state_validation_calls = work[4];
+                    phase.rendered_state_validation_bytes = work[5];
+                    phase.rendered_transaction_validation_calls = work[6];
+                    phase.rendered_transaction_validation_bytes = work[7];
+                    phase.full_checksum_bytes = work[12];
+                    phase.digest_validation_hash_calls = work[13];
+                    phase.digest_validation_hash_bytes = work[14];
+                    phase.replayed_rows = work[8];
+                    phase.full_checksum_calls = work[9];
+                    phase.witness_hash_calls = work[10];
+                    phase.witness_hash_bytes = work[11];
+                }
+            }
             result.sha256_helper_calls = calls;
             result.sha256_helper_bytes = bytes;
             let [
@@ -221,7 +276,7 @@ impl StorageBackend for CountingBackend {
         let range_key = format!("{}:{}:{}", object_class(path), range.start, range.end);
         let result = self.inner.get_range(path, range).await;
         self.count(|count| {
-            *count.requested_ranges.entry(range_key).or_default() += 1;
+            *count.requested_ranges.entry(range_key.clone()).or_default() += 1;
             let read = count
                 .object_reads
                 .entry(object_class(path).to_string())
@@ -672,18 +727,24 @@ pub async fn run(profile: Profile) -> CostReport {
     ));
     // Rerun the entire command, including its read and recomputed response.
     recorder
-        .measure("conflict_retry", &backend, key.len() + 7, false, async {
-            let mut txn = state
-                .begin_control_txn(TxnOptions::default())
-                .await
-                .unwrap();
-            assert_eq!(
-                txn.get(key).await.unwrap().unwrap().bytes(),
-                &Bytes::from_static(b"winner")
-            );
-            txn.put(key, Bytes::from_static(b"retried")).await.unwrap();
-            txn.commit().await.unwrap();
-        })
+        .measure(
+            "full_command_retry",
+            &backend,
+            key.len() + 7,
+            false,
+            async {
+                let mut txn = state
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    txn.get(key).await.unwrap().unwrap().bytes(),
+                    &Bytes::from_static(b"winner")
+                );
+                txn.put(key, Bytes::from_static(b"retried")).await.unwrap();
+                txn.commit().await.unwrap();
+            },
+        )
         .await;
     expected.insert(key.to_vec(), Bytes::from_static(b"retried"));
     pending += 2;
@@ -912,6 +973,7 @@ async fn scaling_fixture(
     segments: usize,
     target: usize,
     suffix: usize,
+    lazy: bool,
 ) -> ScalingSample {
     let backend = Arc::new(CountingBackend::new(1));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
@@ -1093,7 +1155,7 @@ async fn scaling_fixture(
         .allocations
         .insert("current_point".to_string(), allocations);
     let (txn, allocations) =
-        measure_allocations(store.begin_control_txn(TxnOptions::default())).await;
+        measure_allocations(store.begin_eager_reference(TxnOptions::default())).await;
     Box::new(txn.unwrap()).rollback().await.unwrap();
     sample
         .operations
@@ -1108,6 +1170,9 @@ async fn scaling_fixture(
     if rows >= 4096 {
         assert!(sample.allocations["pinned_point"].bytes < sample.allocations["eager_begin"].bytes);
     }
+    if lazy {
+        Box::pin(lazy_transaction_costs(&store, &backend, &mut sample)).await;
+    }
     sample
 }
 
@@ -1116,7 +1181,7 @@ async fn scaling_fixture(
 pub async fn run_scaling() -> serde_json::Value {
     let mut samples = Vec::new();
     for target in [32, 64, 128, 256] {
-        samples.push(scaling_fixture(4096, 1, target * 1024, 0).await);
+        samples.push(Box::pin(scaling_fixture(4096, 1, target * 1024, 0, false)).await);
     }
     let small = &samples[1];
     let large = &samples[3];
@@ -1132,15 +1197,15 @@ pub async fn run_scaling() -> serde_json::Value {
     );
     assert!(small.index_bytes <= large.index_bytes * 3);
     for blocks in [1, 4, 16, 64] {
-        let sample = scaling_fixture(blocks * 55, 1, 64 * 1024, 0).await;
+        let sample = Box::pin(scaling_fixture(blocks * 55, 1, 64 * 1024, 0, false)).await;
         assert_eq!(sample.blocks, blocks);
         samples.push(sample);
     }
     for segments in [1, 4, 16, 64] {
-        samples.push(scaling_fixture(4096, segments, 64 * 1024, 0).await);
+        samples.push(Box::pin(scaling_fixture(4096, segments, 64 * 1024, 0, false)).await);
     }
     for suffix in [0, 1, 8, 16, 31] {
-        samples.push(scaling_fixture(256, 1, 64 * 1024, suffix).await);
+        samples.push(Box::pin(scaling_fixture(256, 1, 64 * 1024, suffix, false)).await);
     }
     let exceptional = Box::pin(exceptional_scaling_costs()).await;
     serde_json::json!({"samples": samples, "exceptional_cases": exceptional, "backend": "MemoryBackend API calls, not provider traffic", "authentication": "thread-local SHA-256 helper input bytes/calls; excludes Bloom probe hashing", "allocation_bound": "pinned point cumulative allocations <= 12 * returned metadata and selected data bytes + 128 KiB; eager begin measured separately"})
@@ -1212,6 +1277,7 @@ async fn exceptional_scaling_costs() -> serde_json::Value {
         .unwrap();
     first
         .stage_projection_intent("projection", "test", Bytes::from_static(b"payload"))
+        .await
         .unwrap();
     first.commit().await.unwrap();
     for _ in 0..2 {
@@ -1232,4 +1298,359 @@ async fn exceptional_scaling_costs() -> serde_json::Value {
     assert_eq!(counts.object_reads["manifest"].ranges, 3);
     cases.push(serde_json::json!({"case":"projection_source_resolution", "manifests":3, "reads":counts, "allocations":allocations}));
     serde_json::Value::Array(cases)
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(
+    clippy::too_many_lines,
+    clippy::indexing_slicing,
+    clippy::cognitive_complexity,
+    reason = "explicit executable acceptance table"
+)]
+async fn lazy_transaction_costs(
+    store: &ControlMvpStateStore,
+    backend: &Arc<CountingBackend>,
+    sample: &mut ScalingSample,
+) {
+    backend.take();
+    let (txn, allocations) =
+        measure_allocations(store.begin_control_txn(TxnOptions::default())).await;
+    let mut txn = txn.unwrap();
+    let begin = backend.take();
+    assert_eq!(begin.head_attempts, 1);
+    assert_eq!(begin.get_attempts + begin.range_get_attempts, 2);
+    for class in ["data", "transaction", "directory"] {
+        assert!(!begin.object_reads.contains_key(class));
+    }
+    assert_eq!(begin.replayed_rows, 0);
+    assert_eq!(begin.full_checksum_calls, 0);
+    assert_eq!(
+        begin.rendered_state_validation_calls + begin.rendered_transaction_validation_calls,
+        0
+    );
+    assert!(allocations.bytes <= begin.read_bytes * 12 + 128 * 1024);
+    sample.operations.insert("lazy_begin".to_string(), begin);
+    sample
+        .allocations
+        .insert("lazy_begin".to_string(), allocations);
+    for (name, key) in [
+        ("first_point", scaling_key(sample.rows / 2)),
+        ("repeated_point", scaling_key(sample.rows / 2)),
+        ("different_point", scaling_key(0)),
+    ] {
+        let (value, allocations) = measure_allocations(txn.get(&key)).await;
+        assert!(value.unwrap().is_some());
+        let counts = backend.take();
+        if name == "repeated_point" {
+            assert_eq!(counts.requests(), 0);
+        } else {
+            assert!(
+                counts.object_reads.get("data").map_or(0, |v| v.ranges)
+                    <= (sample.l0_suffix + 1) as u64
+            );
+            assert_eq!(
+                counts.object_reads.get("data").map_or(0, |v| v.full_reads),
+                0
+            );
+            let metadata = ["directory", "transaction"]
+                .iter()
+                .map(|c| {
+                    counts
+                        .object_reads
+                        .get(*c)
+                        .map_or(0, |v| v.full_reads + v.ranges)
+                })
+                .sum::<u64>();
+            assert!(metadata <= (2 * sample.l0_suffix + 1) as u64);
+            assert!(allocations.bytes <= counts.read_bytes * 12 + 128 * 1024);
+        }
+        sample.operations.insert(name.to_string(), counts);
+        sample.allocations.insert(name.to_string(), allocations);
+    }
+    let lazy_bytes =
+        sample.operations["lazy_begin"].read_bytes + sample.operations["first_point"].read_bytes;
+    let lazy_allocations =
+        sample.allocations["lazy_begin"].bytes + sample.allocations["first_point"].bytes;
+    if sample.rows == 4096 && sample.l0_suffix == 0 {
+        assert!(lazy_bytes * 10 <= sample.operations["eager_begin"].read_bytes);
+        assert!(lazy_allocations * 10 <= sample.allocations["eager_begin"].bytes);
+    }
+    backend.take();
+    let ((), allocations) = measure_allocations(async {
+        let mut abandoned = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        abandoned.get(&scaling_key(sample.rows / 2)).await.unwrap();
+        Box::new(abandoned).rollback().await.unwrap();
+    })
+    .await;
+    let total = backend.take();
+    if sample.rows == 4096 && sample.l0_suffix == 0 {
+        assert!(total.read_bytes * 10 <= sample.operations["eager_begin"].read_bytes);
+        assert!(allocations.bytes * 10 <= sample.allocations["eager_begin"].bytes);
+    }
+    sample
+        .operations
+        .insert("begin_point_rollback_total".to_string(), total);
+    sample
+        .allocations
+        .insert("begin_point_rollback_total".to_string(), allocations);
+    let range = arco_catalog::KeyRange::new(Vec::new(), vec![255]);
+    for name in ["witness_capture", "witness_reuse"] {
+        let (result, allocations) =
+            measure_allocations(txn.read_set(&[], std::slice::from_ref(&range))).await;
+        result.unwrap();
+        let counts = backend.take();
+        if name == "witness_reuse" {
+            assert_eq!(counts.requests(), 0);
+        }
+        sample.operations.insert(name.to_string(), counts);
+        sample.allocations.insert(name.to_string(), allocations);
+    }
+    let ((), allocations) = measure_allocations(async {
+        txn.put(&scaling_key(0), Bytes::new()).await.unwrap();
+        txn.delete(&scaling_key(1)).await.unwrap();
+        txn.put(b"new-overlay-key", Bytes::from_static(b"staged"))
+            .await
+            .unwrap();
+    })
+    .await;
+    sample
+        .operations
+        .insert("staging".to_string(), backend.take());
+    sample
+        .allocations
+        .insert("staging".to_string(), allocations);
+    let mut cursor = None;
+    let mut pages = 0;
+    let mut scan = BackendCounts::default();
+    let mut keys = Vec::new();
+    loop {
+        let mut request = ScanRequest::new(b"").with_limits(113, 256 * 1024, 64);
+        if let Some(c) = cursor.take() {
+            request = request.with_token(c);
+        }
+        let page = txn.scan(request).await.unwrap();
+        pages += 1;
+        scan.add(&backend.take());
+        keys.extend(page.entries().iter().map(|v| v.key().to_vec()));
+        cursor = page.continuation().cloned();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let mut expected = (0..sample.rows)
+        .filter(|n| *n != 1)
+        .map(scaling_key)
+        .collect::<Vec<_>>();
+    expected.push(b"new-overlay-key".to_vec());
+    expected.sort();
+    assert_eq!(keys, expected);
+    let distinct = sample.blocks + sample.l0_suffix;
+    assert_eq!(scan.object_reads["data"].full_reads, 0);
+    assert!(
+        scan.object_reads["data"].ranges
+            <= (distinct + (sample.l0_suffix + 1) * (pages - 1)) as u64
+    );
+    sample.operations.insert("overlay_scan".to_string(), scan);
+    Box::new(txn).rollback().await.unwrap();
+    // Duplicate lookup with an absent ID authenticates outbox blocks only.
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    backend.take();
+    tx.stage_projection_outbox(arco_catalog::ControlMvpProjectionOutboxRecord::new(
+        "missing-outbox-id",
+        Bytes::new(),
+    ))
+    .await
+    .unwrap();
+    let lookup = backend.take();
+    assert_eq!(
+        lookup
+            .object_reads
+            .get("data")
+            .map_or(0, |v| v.full_reads + v.ranges),
+        0,
+        "KV-only fixture must not read KV blocks for outbox lookup"
+    );
+    assert!(
+        lookup
+            .object_reads
+            .values()
+            .map(|v| v.full_reads + v.ranges)
+            .sum::<u64>()
+            <= (sample.l1_segments + 2 * sample.l0_suffix) as u64
+    );
+    sample
+        .operations
+        .insert("outbox_id_lookup".to_string(), lookup);
+    Box::new(tx).rollback().await.unwrap();
+    // Matched immutable fixtures make both lifecycle attempts successful (or
+    // both intentionally hit the retained 32-L0 capacity gate).
+    for eager in [true, false] {
+        let copy = Arc::new(CountingBackend::new(1));
+        for object in backend.inner.list("").await.unwrap() {
+            copy.inner
+                .put(
+                    &object.path,
+                    backend.inner.get(&object.path).await.unwrap(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+        }
+        let copy_store = ControlMvpStateStore::new(
+            ScopedStorage::new(copy.clone(), "tenant", "workspace").unwrap(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        copy.take();
+        let (tx, allocation) = measure_allocations(async {
+            if eager {
+                copy_store
+                    .begin_eager_reference(TxnOptions::default())
+                    .await
+            } else {
+                copy_store.begin_control_txn(TxnOptions::default()).await
+            }
+        })
+        .await;
+        let prefix = if eager {
+            "eager_no_read"
+        } else {
+            "lazy_no_read"
+        };
+        let mut total = copy.take();
+        sample
+            .operations
+            .insert(format!("{prefix}_begin"), total.clone());
+        sample
+            .allocations
+            .insert(format!("{prefix}_begin"), allocation);
+        let (result, allocation) = measure_allocations(tx.unwrap().commit()).await;
+        if sample.l0_suffix == 31 {
+            assert!(matches!(
+                result,
+                Err(CatalogError::MaintenanceBackpressure { .. })
+            ));
+        } else {
+            result.unwrap();
+        }
+        let commit = copy.take();
+        total.add(&commit);
+        sample.operations.insert(format!("{prefix}_commit"), commit);
+        sample.operations.insert(format!("{prefix}_total"), total);
+        sample
+            .allocations
+            .insert(format!("{prefix}_commit"), allocation);
+        sample.allocations.insert(
+            format!("{prefix}_total"),
+            Allocations {
+                count: sample.allocations[&format!("{prefix}_begin")].count
+                    + sample.allocations[&format!("{prefix}_commit")].count,
+                bytes: sample.allocations[&format!("{prefix}_begin")].bytes
+                    + sample.allocations[&format!("{prefix}_commit")].bytes,
+            },
+        );
+    }
+    let data = |name: &str| {
+        sample.operations[name]
+            .object_reads
+            .get("data")
+            .map_or(0, |v| v.returned_bytes)
+    };
+    assert!(data("lazy_no_read_total") <= data("eager_no_read_total"));
+    assert!(sample.operations["lazy_no_read_commit"].full_checksum_calls > 0);
+    assert!(sample.operations["lazy_no_read_commit"].replayed_rows > 0);
+}
+
+#[cfg(feature = "test-utils")]
+pub async fn run_lazy_scaling() -> serde_json::Value {
+    let mut samples = Vec::new();
+    for target in [32, 64, 128, 256] {
+        samples.push(Box::pin(scaling_fixture(4096, 1, target * 1024, 0, true)).await);
+    }
+    for blocks in [1, 4, 16, 64] {
+        samples.push(Box::pin(scaling_fixture(blocks * 55, 1, 64 * 1024, 0, true)).await);
+    }
+    for segments in [1, 4, 16, 64] {
+        samples.push(Box::pin(scaling_fixture(4096, segments, 64 * 1024, 0, true)).await);
+    }
+    for suffix in [0, 1, 8, 16, 31] {
+        samples.push(Box::pin(scaling_fixture(256, 1, 64 * 1024, suffix, true)).await);
+    }
+    let exceptional = Box::pin(lazy_exceptional_costs()).await;
+    serde_json::json!({"exceptional_cases":exceptional,"samples":samples,"acceptance":"all executable assertions passed","counter_nesting":"phases partition totals; canonical hashes are included in SHA helper work; rendered validation includes replay/checksum work; cumulative allocations are allocator requests, not RSS","reference":"real test-only eager snapshot begin and pre-Gate-4 reads/preconditions; matched independent MemoryBackend fixtures for no-read lifecycle","no_read_suffix_31":"both lifecycles fail capacity before first PUT, as required"})
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(clippy::indexing_slicing)]
+async fn lazy_exceptional_costs() -> serde_json::Value {
+    let backend = Arc::new(CountingBackend::new(1));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let store = ControlMvpStateStore::new(
+        storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+    )
+    .unwrap()
+    .with_checkpoint_interval(std::num::NonZeroU64::new(1).unwrap())
+    .with_test_segment_sizing(8, 8192)
+    .unwrap();
+    backend.take();
+    let (tx, allocation) =
+        measure_allocations(store.begin_control_txn(TxnOptions::default())).await;
+    let mut tx = tx.unwrap();
+    let genesis = backend.take();
+    assert_eq!(genesis.head_attempts, 1);
+    assert_eq!(genesis.get_attempts + genesis.range_get_attempts, 0);
+    assert_eq!(
+        genesis.replayed_rows
+            + genesis.full_checksum_calls
+            + genesis.rendered_state_validation_calls
+            + genesis.rendered_transaction_validation_calls,
+        0
+    );
+    let genesis = serde_json::json!({"backend":genesis,"allocations":allocation});
+    tx.put(b"only-kv-key", Bytes::from_static(b"kv"))
+        .await
+        .unwrap();
+    for n in 0..32 {
+        tx.stage_projection_outbox(arco_catalog::ControlMvpProjectionOutboxRecord::new(
+            format!("record-{n:02}"),
+            Bytes::from(vec![42; 1024]),
+        ))
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    backend.take();
+    let (result, allocation) = measure_allocations(tx.stage_projection_outbox(
+        arco_catalog::ControlMvpProjectionOutboxRecord::new("record-16", Bytes::new()),
+    ))
+    .await;
+    assert!(matches!(result, Err(CatalogError::AlreadyExists { .. })));
+    let lookup = backend.take();
+    assert_eq!(lookup.object_reads["data"].ranges, 1);
+    assert_eq!(lookup.object_reads["data"].full_reads, 0);
+    // 32 outbox rows plus one KV row are five owners, four are keyless.
+    assert!(lookup.object_reads["directory"].ranges <= 6);
+    assert!(
+        lookup.object_reads["transaction"].ranges + lookup.object_reads["transaction"].full_reads
+            <= 1
+    );
+    serde_json::json!({"genesis":genesis,"keyless_outbox_id":{"backend":lookup,"allocations":allocation,"expected_selected_outbox_blocks":1,"expected_kv_blocks":0}})
 }

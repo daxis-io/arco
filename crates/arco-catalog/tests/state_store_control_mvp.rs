@@ -418,6 +418,7 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
             "stale-outbox",
             Bytes::from_static(b"stale"),
         ))
+        .await
         .expect("stage outbox record");
     let stale_tx_id = stale_txn.tx_id().to_string();
     let stale_manifest_id = stale_txn.candidate_manifest_id().to_string();
@@ -435,6 +436,7 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
             "winning-outbox",
             Bytes::from_static(b"winner"),
         ))
+        .await
         .expect("stage outbox record");
     let winning_token = winning_txn.commit().await.expect("commit winner");
 
@@ -496,6 +498,7 @@ async fn unreachable_manifest_artifacts_are_invisible_without_pointer_reachabili
             "hidden-outbox",
             Bytes::from_static(b"hidden"),
         ))
+        .await
         .expect("stage outbox record");
 
     let mut winning_txn = store
@@ -663,6 +666,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "first",
             Bytes::from_static(b"payload-1"),
         ))
+        .await
         .expect("stage outbox record");
     let first_token = first_txn.commit().await.expect("commit first");
 
@@ -675,6 +679,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "stale",
             Bytes::from_static(b"payload-stale"),
         ))
+        .await
         .expect("stage outbox record");
 
     let mut winning_txn = store
@@ -686,6 +691,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "second",
             Bytes::from_static(b"payload-2"),
         ))
+        .await
         .expect("stage outbox record");
     let second_token = winning_txn.commit().await.expect("commit second");
     assert!(matches!(
@@ -758,12 +764,14 @@ async fn l1_anchor_preserves_projection_outbox_replay_order() {
             "z-old",
             Bytes::from_static(b"older"),
         ))
+        .await
         .expect("stage older record");
     first
         .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
             "a-new",
             Bytes::from_static(b"newer"),
         ))
+        .await
         .expect("stage newer record");
     let first_token = first.commit().await.expect("commit first transaction");
 
@@ -3186,6 +3194,8 @@ impl StorageBackend for GatedPointerWriteThenErrorBackend {
 struct CountingGetBackend {
     inner: Arc<dyn StorageBackend>,
     get_calls: AtomicUsize,
+    pause_at: AtomicUsize,
+    paused: Notify,
     get_paths: Mutex<Vec<String>>,
 }
 
@@ -3194,7 +3204,18 @@ impl CountingGetBackend {
         Self {
             inner,
             get_calls: AtomicUsize::new(0),
+            pause_at: AtomicUsize::new(0),
+            paused: Notify::new(),
             get_paths: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn pause_if_armed(&self) {
+        if self.pause_at.load(Ordering::SeqCst) != 0
+            && self.get_calls() == self.pause_at.load(Ordering::SeqCst)
+        {
+            self.paused.notify_one();
+            std::future::pending::<()>().await;
         }
     }
 
@@ -3220,6 +3241,7 @@ impl StorageBackend for CountingGetBackend {
             .lock()
             .expect("get paths lock")
             .push(path.to_string());
+        self.pause_if_armed().await;
         self.inner.get(path).await
     }
 
@@ -3229,6 +3251,7 @@ impl StorageBackend for CountingGetBackend {
             .lock()
             .expect("range paths lock")
             .push(path.to_string());
+        self.pause_if_armed().await;
         self.inner.get_range(path, range).await
     }
 
@@ -4563,12 +4586,14 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
         "record-r",
         Bytes::from_static(b"payload-a"),
     ))
+    .await
     .expect("first staging");
     let error = txn
         .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
             "record-r",
             Bytes::from_static(b"payload-dup"),
         ))
+        .await
         .expect_err("duplicate staging within a transaction must fail");
     assert!(
         matches!(error, CatalogError::AlreadyExists { .. }),
@@ -4588,6 +4613,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"loser"),
         ))
+        .await
         .expect("loser stages a fresh id against its base");
     let mut concurrent_winner = store
         .begin_control_txn(TxnOptions::default())
@@ -4598,6 +4624,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"winner"),
         ))
+        .await
         .expect("winner stages the same id concurrently");
     concurrent_winner
         .commit()
@@ -4616,6 +4643,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"retry"),
         ))
+        .await
         .expect_err("retry against the winning state must reject the duplicate id");
     assert!(
         matches!(&error, CatalogError::AlreadyExists { entity, name }
@@ -4646,6 +4674,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             ControlMvpOutboxTrimTarget::new("record-r", 1),
             ControlMvpOutboxTrimTarget::new("record-s", 2),
         ])
+        .await
         .expect("trim stays functional");
     trim_txn.commit().await.expect("commit trim");
     assert!(
@@ -4666,6 +4695,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-r",
             Bytes::from_static(b"payload-b"),
         ))
+        .await
         .expect("trimmed id is stageable again");
     restage.commit().await.expect("commit restage");
 }
@@ -4719,20 +4749,21 @@ async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
         .expect("begin intent-first transaction");
     intent_first
         .stage_projection_intent("shared-a", "catalog", Bytes::from_static(b"payload"))
+        .await
         .expect("stage first intent");
     assert!(matches!(
-        intent_first.stage_projection_intent(
-            "shared-a",
-            "catalog",
-            Bytes::from_static(b"duplicate")
-        ),
+        intent_first
+            .stage_projection_intent("shared-a", "catalog", Bytes::from_static(b"duplicate"))
+            .await,
         Err(CatalogError::AlreadyExists { .. })
     ));
     assert!(matches!(
-        intent_first.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-            "shared-a",
-            Bytes::from_static(b"record")
-        )),
+        intent_first
+            .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+                "shared-a",
+                Bytes::from_static(b"record")
+            ))
+            .await,
         Err(CatalogError::AlreadyExists { .. })
     ));
 
@@ -4745,9 +4776,12 @@ async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
             "shared-b",
             Bytes::from_static(b"record"),
         ))
+        .await
         .expect("stage record");
     assert!(matches!(
-        record_first.stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload")),
+        record_first
+            .stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload"))
+            .await,
         Err(CatalogError::AlreadyExists { .. })
     ));
     record_first.commit().await.expect("commit retained record");
@@ -4757,11 +4791,9 @@ async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
         .await
         .expect("begin retained collision transaction");
     assert!(matches!(
-        retained_collision.stage_projection_intent(
-            "shared-b",
-            "catalog",
-            Bytes::from_static(b"payload")
-        ),
+        retained_collision
+            .stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload"))
+            .await,
         Err(CatalogError::AlreadyExists { .. })
     ));
 
@@ -4775,7 +4807,9 @@ async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
             .await
             .expect("begin invalid-intent transaction");
         assert!(matches!(
-            invalid.stage_projection_intent(intent_id, projection_kind, payload),
+            invalid
+                .stage_projection_intent(intent_id, projection_kind, payload)
+                .await,
             Err(CatalogError::Validation { .. })
         ));
     }
@@ -4794,6 +4828,7 @@ async fn oversized_projection_intent_aggregate_fails_before_candidate_publicatio
         "catalog",
         Bytes::from(vec![b'x'; 4 * 1024 * 1024]),
     )
+    .await
     .expect("staging validates semantic fields before aggregate encoding");
 
     assert!(matches!(
@@ -5040,5 +5075,176 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
             .as_array()
             .is_some_and(|refs| refs.len() <= 2),
         "replay suffix must stay bounded by the checkpoint interval"
+    );
+}
+
+#[tokio::test]
+async fn gate4_begin_is_metadata_only_and_points_are_memoized() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scope");
+    let store = store(storage);
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("genesis");
+    assert_eq!(backend.get_calls(), 0);
+    first
+        .put(b"a", Bytes::from_static(b"value"))
+        .await
+        .expect("put");
+    first.commit().await.expect("commit");
+    backend.reset();
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    assert_eq!(
+        backend.get_calls(),
+        2,
+        "begin reads only pointer and manifest: {:?}",
+        backend.get_paths()
+    );
+    backend.reset();
+    assert_eq!(
+        tx.get(b"a").await.expect("get").expect("present").bytes(),
+        b"value".as_slice()
+    );
+    assert!(
+        backend.get_calls() > 0,
+        "cold point must authenticate selected evidence"
+    );
+    backend.reset();
+    tx.get(b"a").await.expect("memoized get");
+    assert_eq!(backend.get_calls(), 0);
+    Box::new(tx).rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+async fn gate4_genesis_cursors_are_local_and_dynamic() {
+    let (_, storage) = storage();
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    for key in [b"".as_slice(), b"b", b"d"] {
+        tx.put(key, Bytes::new()).await.expect("put");
+    }
+    let first = tx
+        .scan(ScanRequest::new(b"").with_limits(1, 128, 64))
+        .await
+        .expect("genesis scan");
+    assert!(first.observed_token().is_none());
+    assert_eq!(first.entries()[0].key(), b"");
+    let cursor = first.continuation().expect("local cursor").clone();
+    let mut other = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("other");
+    assert!(
+        other
+            .scan(ScanRequest::new(b"").with_token(cursor.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .scan(ScanRequest::new(b"").with_token(cursor.clone()))
+            .await
+            .is_err()
+    );
+    tx.delete(b"b").await.expect("delete");
+    tx.put(b"c", Bytes::from_static(b"new"))
+        .await
+        .expect("insert");
+    let page = tx
+        .scan(ScanRequest::new(b"").with_token(cursor))
+        .await
+        .expect("continue");
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(arco_catalog::KvPair::key)
+            .collect::<Vec<_>>(),
+        vec![b"c".as_slice(), b"d"]
+    );
+}
+
+#[tokio::test]
+async fn gate4_failed_multi_trim_stages_nothing() {
+    let (_, storage) = storage();
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new("a", Bytes::new()))
+        .await
+        .expect("stage");
+    tx.commit().await.expect("commit");
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    assert!(
+        tx.trim_projection_outbox([
+            ControlMvpOutboxTrimTarget::new("a", 1),
+            ControlMvpOutboxTrimTarget::new("missing", 1),
+        ])
+        .await
+        .is_err()
+    );
+    tx.commit().await.expect("commit empty batch");
+    assert_eq!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn gate4_cancelled_multi_trim_stages_nothing() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scope");
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    for id in ["a", "b"] {
+        tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(id, Bytes::new()))
+            .await
+            .expect("stage");
+    }
+    tx.commit().await.expect("commit");
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    backend.reset();
+    backend.pause_at.store(4, Ordering::SeqCst);
+    {
+        let batch = tx.trim_projection_outbox([
+            ControlMvpOutboxTrimTarget::new("a", 1),
+            ControlMvpOutboxTrimTarget::new("b", 1),
+        ]);
+        tokio::pin!(batch);
+        tokio::select! {
+            result = &mut batch => panic!("batch completed before cancellation: {result:?}"),
+            () = backend.paused.notified() => {},
+        }
+    }
+    backend.pause_at.store(0, Ordering::SeqCst);
+    tx.commit().await.expect("commit after cancellation");
+    assert_eq!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox")
+            .len(),
+        2
     );
 }

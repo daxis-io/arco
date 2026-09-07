@@ -16,9 +16,9 @@ use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionOutboxAckWriter, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthorityBinding,
-    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListRequest, CatalogPatch,
-    CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
+    ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListRequest,
+    CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
     ControlCatalogAuthority, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
     ProjectionIntentV1, RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions,
     WriteOptions,
@@ -36,6 +36,10 @@ struct FailProjectionPutBackend {
 struct LoseAcceptedCatalogHeadResponseBackend {
     inner: MemoryBackend,
     lose_next: AtomicBool,
+    gate_next: AtomicBool,
+    paused: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    attempts: std::sync::Mutex<Vec<Bytes>>,
 }
 
 #[derive(Default)]
@@ -62,6 +66,10 @@ impl LoseAcceptedCatalogHeadResponseBackend {
         Arc::new(Self {
             inner: MemoryBackend::new(),
             lose_next: AtomicBool::new(false),
+            gate_next: AtomicBool::new(false),
+            paused: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            attempts: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -86,6 +94,13 @@ impl StorageBackend for LoseAcceptedCatalogHeadResponseBackend {
         data: Bytes,
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
+        if path.ends_with("/control/v1/domains/catalog/head/current.json") {
+            self.attempts.lock().unwrap().push(data.clone());
+            if self.gate_next.swap(false, Ordering::SeqCst) {
+                self.paused.notify_one();
+                self.resume.notified().await;
+            }
+        }
         let result = self.inner.put(path, data, precondition).await?;
         if path.ends_with("/control/v1/domains/catalog/head/current.json")
             && matches!(result, WriteResult::Success { .. })
@@ -712,6 +727,7 @@ async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_lat
         "malformed-catalog-intent",
         Bytes::from_static(b"{}"),
     ))
+    .await
     .expect("stage malformed projection intent");
     let malformed_token = txn
         .commit()
@@ -735,6 +751,7 @@ async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_lat
         "wrong-kind-intent",
         Bytes::from(serde_json::to_vec(&incompatible).expect("encode incompatible intent")),
     ))
+    .await
     .expect("stage incompatible projection intent");
     let incompatible_sequence = txn
         .commit()
@@ -1132,4 +1149,106 @@ async fn renames_keep_stable_parent_ids_and_cascades_remove_every_index_and_colu
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn gate4_cas_loss_reexecutes_decisions_and_regenerates_receipt_response_and_intent() {
+    let backend = LoseAcceptedCatalogHeadResponseBackend::new();
+    let storage =
+        ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace").unwrap();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope()).unwrap();
+    authority
+        .create_catalog(
+            "analytics",
+            Some("before"),
+            WriteOptions::with_idempotency("seed"),
+        )
+        .await
+        .unwrap();
+    backend.gate_next.store(true, Ordering::SeqCst);
+    let properties =
+        std::collections::BTreeMap::from([("pending-property".to_string(), "value".to_string())]);
+    let pending = authority.patch_catalog(
+        "analytics",
+        CatalogPatch {
+            properties: Some(Some(properties)),
+            ..CatalogPatch::default()
+        },
+        WriteOptions::with_idempotency("pending"),
+    );
+    tokio::pin!(pending);
+    tokio::select! {
+        result = &mut pending => panic!("pending command finished before the CAS gate: {result:?}"),
+        () = backend.paused.notified() => {},
+    }
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("concurrent".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("concurrent"),
+        )
+        .await
+        .unwrap();
+    backend.resume.notify_one();
+    let response = pending.await.unwrap();
+    assert_eq!(
+        response.description.as_deref(),
+        Some("concurrent"),
+        "retry must rebuild its response from the winning base"
+    );
+    let repeated = authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                properties: Some(Some(std::collections::BTreeMap::from([(
+                    "pending-property".to_string(),
+                    "value".to_string(),
+                )]))),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("pending"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.description, response.description,
+        "receipt contains the regenerated response"
+    );
+    let store = ControlMvpStateStore::new(storage, scope()).unwrap();
+    let token = store.current_state_token().await.unwrap();
+    assert_eq!(token.logical_sequence(), 3);
+    let records = store.current_projection_outbox().await.unwrap();
+    assert_eq!(records.len(), 3);
+    let latest = records.last().unwrap();
+    assert_eq!(latest.origin_sequence(), Some(3));
+    let intent: ProjectionIntentV1 = serde_json::from_slice(latest.payload()).unwrap();
+    assert_eq!(
+        intent.source_authority_manifest_id(),
+        token.authority_manifest_id()
+    );
+    let attempts = {
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 4);
+        attempts
+            .iter()
+            .map(|b| serde_json::from_slice::<serde_json::Value>(b).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let manifests = attempts
+        .iter()
+        .map(|v| v["manifest_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        manifests.len(),
+        4,
+        "the lost attempt cannot reuse candidate objects"
+    );
+    let receipts = store
+        .scan(arco_catalog::ScanRequest::new(b"\x03"))
+        .await
+        .unwrap();
+    assert_eq!(receipts.entries().len(), 3);
 }

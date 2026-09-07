@@ -335,6 +335,9 @@ async fn corrupt_redundant_anchor_cannot_be_promoted_by_a_successor() {
                 store
                     .begin_control_txn(TxnOptions::default())
                     .await
+                    .unwrap()
+                    .commit()
+                    .await
                     .is_err()
             );
         }

@@ -8,12 +8,18 @@ audit and a recoverable checkpoint; see [Gate 2 closeout](2026-09-06-gate2-close
 **Gate 3 is complete locally**, with a fresh approval and all nine verification
 lanes passing; see [Gate 3 evidence and handoff](2026-09-06-gate3-integrity-roots.md).
 Its [format contract](../plans/state-store-integrity-format-v1.md) defines authority
-7 / restore 6. Gates 4–7 remain outstanding. Provider
+7 / restore 6. **Gate 4 is complete locally**, with all required verification
+lanes passing and a fresh independent approval; see the
+[Gate 4 closeout](2026-09-06-gate4-closeout.md),
+[audit](2026-09-06-gate4-audit.md), and
+[cost comparison](2026-09-06-gate4-cost-comparison.json).
+Transaction begin and selective access are lazy; commit retains full pinned
+reconstruction and Gate 3 validation. Gates 5–7 remain outstanding. Provider
 qualification, deployment, writer revocation, cutover and production readiness
 are unproven.
 
 The sections below retain the Gate 0/1 evidence and historical format transitions.
-Current Gate 2/3 evidence is recorded separately so the original baselines remain
+Current Gate 2/3/4 evidence is recorded separately so the original baselines remain
 reviewable.
 
 ## Implemented behavior

@@ -794,7 +794,7 @@ impl ControlCatalogAuthority {
         let catalog_record = if let Some(continuation) = continuation.as_ref() {
             let reader = self
                 .store
-                .read_at(continuation.observed_token().clone())
+                .read_at(continuation.observed_token()?.clone())
                 .await?;
             let catalog_record = get_catalog_from_reader(reader.as_ref(), catalog).await?;
             if let Some(parent) = required_schema {
@@ -881,7 +881,7 @@ impl ControlCatalogAuthority {
             Some(continuation) => {
                 let reader = self
                     .store
-                    .read_at(continuation.observed_token().clone())
+                    .read_at(continuation.observed_token()?.clone())
                     .await?;
                 get_schema_from_reader(reader.as_ref(), catalog, schema).await?
             }
@@ -2322,7 +2322,8 @@ async fn stage_commit_records(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
         audit_bytes,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 

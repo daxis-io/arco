@@ -162,7 +162,7 @@ impl LogicalOracle {
 }
 
 #[test]
-fn oracle_applies_exact_trims_before_same_id_additions() {
+fn oracle_applies_exact_trims_before_later_same_id_additions() {
     let mut oracle = LogicalOracle::new();
     oracle.commit(
         Vec::new(),
@@ -170,14 +170,103 @@ fn oracle_applies_exact_trims_before_same_id_additions() {
         Vec::new(),
     );
     let prior = oracle.root.clone();
+    oracle.commit(Vec::new(), Vec::new(), vec![("event".to_string(), 1)]);
     oracle.commit(
         Vec::new(),
         vec![("event".to_string(), Bytes::from_static(b"new"))],
-        vec![("event".to_string(), 1)],
+        Vec::new(),
     );
     assert_eq!(
         oracle.outbox,
-        vec![("event".to_string(), Bytes::from_static(b"new"), 2)]
+        vec![("event".to_string(), Bytes::from_static(b"new"), 3)]
     );
     assert_ne!(oracle.root, prior);
+}
+
+type VersionObservation = Option<(u64, Option<Vec<u8>>)>;
+
+/// Independent pinned transaction model; no production readers or witnesses.
+#[allow(dead_code)] // Shared by several independently compiled contract suites.
+#[derive(Clone)]
+pub struct LogicalTransaction {
+    pub pinned: LogicalOracle,
+    pub captured_head: u64,
+    pub writes: BTreeMap<Vec<u8>, Option<Bytes>>,
+    pub observations: BTreeMap<Vec<u8>, VersionObservation>,
+    pub overlay_reads: Vec<Vec<u8>>,
+}
+#[allow(dead_code)]
+impl LogicalTransaction {
+    pub fn pin(state: &LogicalOracle, head: u64) -> Self {
+        Self {
+            pinned: state.clone(),
+            captured_head: head,
+            writes: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            overlay_reads: Vec::new(),
+        }
+    }
+    pub fn get(&mut self, key: &[u8]) -> Option<(Bytes, Option<u64>)> {
+        if let Some(value) = self.writes.get(key) {
+            self.overlay_reads.push(key.to_vec());
+            return value.clone().map(|v| (v, None));
+        }
+        let value = self.pinned.kv.get(key).cloned();
+        self.observations.insert(key.to_vec(), value.clone());
+        value.and_then(|(g, v)| v.map(|v| (Bytes::from(v), Some(g))))
+    }
+    pub fn assert_absent(&self, key: &[u8]) -> bool {
+        self.pinned.kv.get(key).is_none_or(|(_, v)| v.is_none())
+    }
+    pub fn assert_generation(&self, key: &[u8], generation: u64) -> bool {
+        self.pinned
+            .kv
+            .get(key)
+            .is_some_and(|(g, v)| *g == generation && v.is_some())
+    }
+    pub fn range_empty(&self, start: &[u8], end: &[u8]) -> bool {
+        !self
+            .pinned
+            .kv
+            .keys()
+            .any(|k| k.as_slice() >= start && k.as_slice() < end)
+    }
+    pub fn range_witness(&self, start: &[u8], end: &[u8]) -> u64 {
+        let mut encoded = Vec::new();
+        field(&mut encoded, start);
+        field(&mut encoded, end);
+        for (key, (generation, value)) in &self.pinned.kv {
+            if key.as_slice() >= start && key.as_slice() < end {
+                field(&mut encoded, key);
+                encoded.extend_from_slice(&generation.to_be_bytes());
+                encoded.push(u8::from(value.is_none()));
+            }
+        }
+        u64::from_be_bytes(Sha256::digest(encoded)[..8].try_into().unwrap())
+    }
+    pub fn scan(&self, prefix: &[u8], after: Option<&[u8]>) -> Vec<(Vec<u8>, Bytes, Option<u64>)> {
+        let mut values = self
+            .pinned
+            .kv
+            .iter()
+            .map(|(k, (g, v))| (k.clone(), v.clone().map(|v| (Bytes::from(v), Some(*g)))))
+            .collect::<BTreeMap<_, _>>();
+        for (k, v) in &self.writes {
+            values.insert(k.clone(), v.clone().map(|v| (v, None)));
+        }
+        values
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(prefix) && after.is_none_or(|a| k.as_slice() > a))
+            .filter_map(|(k, v)| v.map(|(v, g)| (k, v, g)))
+            .collect()
+    }
+    pub fn commit(self, state: &mut LogicalOracle, head: &mut u64) -> bool {
+        if self.captured_head != *head {
+            return false;
+        }
+        assert_eq!(self.pinned.root, state.root);
+        state.commit(self.writes.into_iter().collect(), Vec::new(), Vec::new());
+        *head += 1;
+        true
+    }
 }

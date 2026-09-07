@@ -1,0 +1,3835 @@
+{
+  "original_workload": [
+    {
+      "phase": "ambiguous_commit_reconciliation",
+      "samples": 1,
+      "gate2_read_bytes": 479,
+      "gate3_read_bytes": 479,
+      "gate2_allocation_bytes": 146938,
+      "gate3_allocation_bytes": 206844
+    },
+    {
+      "phase": "begin",
+      "samples": 456,
+      "gate2_read_bytes": 20909340,
+      "gate3_read_bytes": 22914848,
+      "gate2_allocation_bytes": 116886756,
+      "gate3_allocation_bytes": 143046968
+    },
+    {
+      "phase": "checkpoint",
+      "samples": 1,
+      "gate2_read_bytes": 7324,
+      "gate3_read_bytes": 13278,
+      "gate2_allocation_bytes": 83650,
+      "gate3_allocation_bytes": 138715
+    },
+    {
+      "phase": "commit",
+      "samples": 200,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 61100,
+      "gate2_allocation_bytes": 26950770,
+      "gate3_allocation_bytes": 40534086
+    },
+    {
+      "phase": "conflict_retry",
+      "samples": 1,
+      "gate2_read_bytes": 54384,
+      "gate3_read_bytes": 59608,
+      "gate2_allocation_bytes": 428573,
+      "gate3_allocation_bytes": 560881
+    },
+    {
+      "phase": "contention_loser",
+      "samples": 1,
+      "gate2_read_bytes": 479,
+      "gate3_read_bytes": 479,
+      "gate2_allocation_bytes": 129829,
+      "gate3_allocation_bytes": 193559
+    },
+    {
+      "phase": "contention_winner",
+      "samples": 1,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 0,
+      "gate2_allocation_bytes": 128507,
+      "gate3_allocation_bytes": 191715
+    },
+    {
+      "phase": "expected_backpressure",
+      "samples": 1,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 0,
+      "gate2_allocation_bytes": 86656,
+      "gate3_allocation_bytes": 121286
+    },
+    {
+      "phase": "gc",
+      "samples": 1,
+      "gate2_read_bytes": 40363363,
+      "gate3_read_bytes": 55638498,
+      "gate2_allocation_bytes": 265100309,
+      "gate3_allocation_bytes": 422361546
+    },
+    {
+      "phase": "maintenance",
+      "samples": 29,
+      "gate2_read_bytes": 2658760,
+      "gate3_read_bytes": 2921492,
+      "gate2_allocation_bytes": 19666457,
+      "gate3_allocation_bytes": 24992818
+    },
+    {
+      "phase": "maintenance_fill_commit",
+      "samples": 5,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 0,
+      "gate2_allocation_bytes": 670570,
+      "gate3_allocation_bytes": 1118586
+    },
+    {
+      "phase": "point_read",
+      "samples": 3200,
+      "gate2_read_bytes": 87900800,
+      "gate3_read_bytes": 102864000,
+      "gate2_allocation_bytes": 330068800,
+      "gate3_allocation_bytes": 483608000
+    },
+    {
+      "phase": "recovery",
+      "samples": 1,
+      "gate2_read_bytes": 33419,
+      "gate3_read_bytes": 37764,
+      "gate2_allocation_bytes": 214630,
+      "gate3_allocation_bytes": 248865
+    },
+    {
+      "phase": "retained_validation",
+      "samples": 912,
+      "gate2_read_bytes": 122019244,
+      "gate3_read_bytes": 132509576,
+      "gate2_allocation_bytes": 582811740,
+      "gate3_allocation_bytes": 712630272
+    },
+    {
+      "phase": "scan",
+      "samples": 200,
+      "gate2_read_bytes": 26875400,
+      "gate3_read_bytes": 30616200,
+      "gate2_allocation_bytes": 128610400,
+      "gate3_allocation_bytes": 167074400
+    },
+    {
+      "phase": "setup_commit",
+      "samples": 256,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 70494,
+      "gate2_allocation_bytes": 34324038,
+      "gate3_allocation_bytes": 51758198
+    },
+    {
+      "phase": "stage_write",
+      "samples": 456,
+      "gate2_read_bytes": 0,
+      "gate3_read_bytes": 0,
+      "gate2_allocation_bytes": 296400,
+      "gate3_allocation_bytes": 296400
+    }
+  ],
+  "gate2_source": "2026-09-06-gate2-block-scaling.json",
+  "gate3_source": "2026-09-06-gate3-block-scaling.json",
+  "selected_data_and_ranges_unchanged_for_all_17_standard_samples": true,
+  "exceptional_selected_data_unchanged": true,
+  "samples": [
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 32768,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 97134,
+          "gate3_read_bytes": 97134,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 255767,
+            "count": 2205
+          },
+          "gate3_allocations": {
+            "bytes": 255767,
+            "count": 2205
+          },
+          "gate2_sha256_helper_bytes": 128240,
+          "gate3_sha256_helper_bytes": 128240,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 99029,
+          "gate3_read_bytes": 99896,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 264091,
+            "count": 2279
+          },
+          "gate3_allocations": {
+            "bytes": 270766,
+            "count": 2318
+          },
+          "gate2_sha256_helper_bytes": 131027,
+          "gate3_sha256_helper_bytes": 133202,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 66028,
+          "gate3_read_bytes": 66028,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 66028,
+          "gate3_sha256_helper_bytes": 66028,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 8433182,
+          "gate3_read_bytes": 8433182,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 14423328,
+          "gate3_sha256_helper_bytes": 14423328,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4969359,
+          "gate3_read_bytes": 4970226,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 52402540,
+            "count": 40652
+          },
+          "gate3_allocations": {
+            "bytes": 52409679,
+            "count": 40711
+          },
+          "gate2_sha256_helper_bytes": 32860124,
+          "gate3_sha256_helper_bytes": 32862299,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4443667,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4969802,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4967464,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 115311137,
+        "sha256_helper_calls": 991,
+        "write_attempt_bytes": 4970226
+      },
+      "maintenance_allocations": {
+        "bytes": 338209151,
+        "count": 174274
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 99929,
+          "gate3_read_bytes": 99929,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 251455,
+            "count": 1267
+          },
+          "gate3_allocations": {
+            "bytes": 251455,
+            "count": 1267
+          },
+          "gate2_sha256_helper_bytes": 162715,
+          "gate3_sha256_helper_bytes": 162715,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 101824,
+          "gate3_read_bytes": 102691,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 259779,
+            "count": 1341
+          },
+          "gate3_allocations": {
+            "bytes": 266454,
+            "count": 1380
+          },
+          "gate2_sha256_helper_bytes": 165502,
+          "gate3_sha256_helper_bytes": 167677,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 37143,
+          "gate3_read_bytes": 37143,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 37143,
+          "gate3_sha256_helper_bytes": 37143,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 8311857,
+          "gate3_read_bytes": 8311857,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 15249423,
+          "gate3_sha256_helper_bytes": 15249423,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4716308,
+          "gate3_read_bytes": 4717175,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 51124476,
+            "count": 28443
+          },
+          "gate3_allocations": {
+            "bytes": 51131615,
+            "count": 28502
+          },
+          "gate2_sha256_helper_bytes": 31905690,
+          "gate3_sha256_helper_bytes": 31907865,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4443667,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4716751,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4714413,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 113431154,
+        "sha256_helper_calls": 659,
+        "write_attempt_bytes": 4717175
+      },
+      "maintenance_allocations": {
+        "bytes": 324867583,
+        "count": 135387
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 131072,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 151326,
+          "gate3_read_bytes": 151326,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 350455,
+            "count": 911
+          },
+          "gate3_allocations": {
+            "bytes": 350455,
+            "count": 911
+          },
+          "gate2_sha256_helper_bytes": 279008,
+          "gate3_sha256_helper_bytes": 279008,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 153221,
+          "gate3_read_bytes": 154088,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 358779,
+            "count": 985
+          },
+          "gate3_allocations": {
+            "bytes": 365454,
+            "count": 1024
+          },
+          "gate2_sha256_helper_bytes": 281795,
+          "gate3_sha256_helper_bytes": 283970,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 23644,
+          "gate3_read_bytes": 23644,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 23644,
+          "gate3_sha256_helper_bytes": 23644,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 10050268,
+          "gate3_read_bytes": 10050268,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 19225708,
+          "gate3_sha256_helper_bytes": 19225708,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4613259,
+          "gate3_read_bytes": 4614126,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 50547468,
+            "count": 22702
+          },
+          "gate3_allocations": {
+            "bytes": 50554607,
+            "count": 22761
+          },
+          "gate2_sha256_helper_bytes": 31520492,
+          "gate3_sha256_helper_bytes": 31522667,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4443667,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4613702,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4611364,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 112674257,
+        "sha256_helper_calls": 503,
+        "write_attempt_bytes": 4614126
+      },
+      "maintenance_allocations": {
+        "bytes": 319006741,
+        "count": 117032
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 262144,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 273216,
+          "gate3_read_bytes": 273216,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 597079,
+            "count": 926
+          },
+          "gate3_allocations": {
+            "bytes": 597079,
+            "count": 926
+          },
+          "gate2_sha256_helper_bytes": 529090,
+          "gate3_sha256_helper_bytes": 529090,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 275111,
+          "gate3_read_bytes": 275978,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 605403,
+            "count": 1000
+          },
+          "gate3_allocations": {
+            "bytes": 612078,
+            "count": 1039
+          },
+          "gate2_sha256_helper_bytes": 531877,
+          "gate3_sha256_helper_bytes": 534052,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 17342,
+          "gate3_read_bytes": 17342,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 17342,
+          "gate3_sha256_helper_bytes": 17342,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 14255330,
+          "gate3_read_bytes": 14255330,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 27869006,
+          "gate3_sha256_helper_bytes": 27869006,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4557129,
+          "gate3_read_bytes": 4557996,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 50258252,
+            "count": 20048
+          },
+          "gate3_allocations": {
+            "bytes": 50265391,
+            "count": 20107
+          },
+          "gate2_sha256_helper_bytes": 31308576,
+          "gate3_sha256_helper_bytes": 31310751,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4443667,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4557572,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4555234,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 112256727,
+        "sha256_helper_calls": 431,
+        "write_attempt_bytes": 4557996
+      },
+      "maintenance_allocations": {
+        "bytes": 316167839,
+        "count": 108419
+      }
+    },
+    {
+      "fixture": {
+        "rows": 55,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1468,
+          "gate3_read_bytes": 2335,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2781,
+          "gate3_sha256_helper_bytes": 5397,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 64063,
+          "gate3_read_bytes": 64063,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 144137,
+            "count": 351
+          },
+          "gate3_allocations": {
+            "bytes": 144137,
+            "count": 351
+          },
+          "gate2_sha256_helper_bytes": 126849,
+          "gate3_sha256_helper_bytes": 126849,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 65955,
+          "gate3_read_bytes": 66822,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 152461,
+            "count": 425
+          },
+          "gate3_allocations": {
+            "bytes": 159136,
+            "count": 464
+          },
+          "gate2_sha256_helper_bytes": 129630,
+          "gate3_sha256_helper_bytes": 131805,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 1277,
+          "gate3_read_bytes": 1277,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 1277,
+          "gate3_sha256_helper_bytes": 1277,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 64063,
+          "gate3_read_bytes": 64063,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 126849,
+          "gate3_sha256_helper_bytes": 126849,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 65955,
+          "gate3_read_bytes": 66822,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 764423,
+            "count": 651
+          },
+          "gate3_allocations": {
+            "bytes": 771562,
+            "count": 710
+          },
+          "gate2_sha256_helper_bytes": 432693,
+          "gate3_sha256_helper_bytes": 434868,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 75346,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 66398,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 88736
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 14372
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21788
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 135775,
+        "rendered_state_validation_bytes": 64063,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:62787": 1,
+          "directory:0:1316": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1225": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 1736391,
+        "sha256_helper_calls": 215,
+        "write_attempt_bytes": 66822
+      },
+      "maintenance_allocations": {
+        "bytes": 4860889,
+        "count": 6553
+      }
+    },
+    {
+      "fixture": {
+        "rows": 220,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1469,
+          "gate3_read_bytes": 2336,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2783,
+          "gate3_sha256_helper_bytes": 5399,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 65510,
+          "gate3_read_bytes": 65510,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 147277,
+            "count": 395
+          },
+          "gate3_allocations": {
+            "bytes": 147277,
+            "count": 395
+          },
+          "gate2_sha256_helper_bytes": 128296,
+          "gate3_sha256_helper_bytes": 128296,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 67403,
+          "gate3_read_bytes": 68270,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 155601,
+            "count": 469
+          },
+          "gate3_allocations": {
+            "bytes": 162276,
+            "count": 508
+          },
+          "gate2_sha256_helper_bytes": 131079,
+          "gate3_sha256_helper_bytes": 133254,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 2724,
+          "gate3_read_bytes": 2724,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 2724,
+          "gate3_sha256_helper_bytes": 2724,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 319378,
+          "gate3_read_bytes": 319378,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 633308,
+          "gate3_sha256_helper_bytes": 633308,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 255761,
+          "gate3_read_bytes": 256628,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 3022249,
+            "count": 1793
+          },
+          "gate3_allocations": {
+            "bytes": 3029388,
+            "count": 1852
+          },
+          "gate2_sha256_helper_bytes": 1717516,
+          "gate3_sha256_helper_bytes": 1719691,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 253711,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 256204,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 277094
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 15819
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 325581,
+        "rendered_state_validation_bytes": 253868,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:251145": 1,
+          "directory:0:2763": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 6296271,
+        "sha256_helper_calls": 233,
+        "write_attempt_bytes": 256628
+      },
+      "maintenance_allocations": {
+        "bytes": 18292741,
+        "count": 11835
+      }
+    },
+    {
+      "fixture": {
+        "rows": 880,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1470,
+          "gate3_read_bytes": 2337,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2785,
+          "gate3_sha256_helper_bytes": 5401,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 71301,
+          "gate3_read_bytes": 71301,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 163135,
+            "count": 549
+          },
+          "gate3_allocations": {
+            "bytes": 163135,
+            "count": 549
+          },
+          "gate2_sha256_helper_bytes": 134087,
+          "gate3_sha256_helper_bytes": 134087,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 73195,
+          "gate3_read_bytes": 74062,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 171459,
+            "count": 623
+          },
+          "gate3_allocations": {
+            "bytes": 178134,
+            "count": 662
+          },
+          "gate2_sha256_helper_bytes": 136872,
+          "gate3_sha256_helper_bytes": 139047,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 8515,
+          "gate3_read_bytes": 8515,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 8515,
+          "gate3_sha256_helper_bytes": 8515,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 1512198,
+          "gate3_read_bytes": 1512198,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 2956276,
+          "gate3_sha256_helper_bytes": 2956276,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 1014985,
+          "gate3_read_bytes": 1015852,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 12063472,
+            "count": 6336
+          },
+          "gate3_allocations": {
+            "bytes": 12070611,
+            "count": 6395
+          },
+          "gate2_sha256_helper_bytes": 6856808,
+          "gate3_sha256_helper_bytes": 6858983,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 967171,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 1015428,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 1030526
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21610
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21790
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 1084805,
+        "rendered_state_validation_bytes": 1013091,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1004577": 1,
+          "data:0:1731": 15,
+          "directory:0:8554": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1227": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 24535794,
+        "sha256_helper_calls": 305,
+        "write_attempt_bytes": 1015852
+      },
+      "maintenance_allocations": {
+        "bytes": 72065351,
+        "count": 32865
+      }
+    },
+    {
+      "fixture": {
+        "rows": 3520,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 94650,
+          "gate3_read_bytes": 94650,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 226567,
+            "count": 1135
+          },
+          "gate3_allocations": {
+            "bytes": 226567,
+            "count": 1135
+          },
+          "gate2_sha256_helper_bytes": 157436,
+          "gate3_sha256_helper_bytes": 157436,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 96545,
+          "gate3_read_bytes": 97412,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 234891,
+            "count": 1209
+          },
+          "gate3_allocations": {
+            "bytes": 241566,
+            "count": 1248
+          },
+          "gate2_sha256_helper_bytes": 160223,
+          "gate3_sha256_helper_bytes": 162398,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 31864,
+          "gate3_read_bytes": 31864,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 31864,
+          "gate3_sha256_helper_bytes": 31864,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 6984318,
+          "gate3_read_bytes": 6984318,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 12948988,
+          "gate3_sha256_helper_bytes": 12948988,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4052063,
+          "gate3_read_bytes": 4052930,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 48224132,
+            "count": 24419
+          },
+          "gate3_allocations": {
+            "bytes": 48231271,
+            "count": 24478
+          },
+          "gate2_sha256_helper_bytes": 27414340,
+          "gate3_sha256_helper_bytes": 27416515,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 3821011,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4052506,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4044254
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 44959
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4121883,
+        "rendered_state_validation_bytes": 4050168,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4018305": 1,
+          "directory:0:31903": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 97494799,
+        "sha256_helper_calls": 593,
+        "write_attempt_bytes": 4052930
+      },
+      "maintenance_allocations": {
+        "bytes": 286995367,
+        "count": 116756
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1471,
+          "gate3_read_bytes": 2338,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2787,
+          "gate3_sha256_helper_bytes": 5403,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 99929,
+          "gate3_read_bytes": 99929,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 251455,
+            "count": 1267
+          },
+          "gate3_allocations": {
+            "bytes": 251455,
+            "count": 1267
+          },
+          "gate2_sha256_helper_bytes": 162715,
+          "gate3_sha256_helper_bytes": 162715,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 101824,
+          "gate3_read_bytes": 102691,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 259779,
+            "count": 1341
+          },
+          "gate3_allocations": {
+            "bytes": 266454,
+            "count": 1380
+          },
+          "gate2_sha256_helper_bytes": 165502,
+          "gate3_sha256_helper_bytes": 167677,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 37143,
+          "gate3_read_bytes": 37143,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 37143,
+          "gate3_sha256_helper_bytes": 37143,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 8311857,
+          "gate3_read_bytes": 8311857,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 15249423,
+          "gate3_sha256_helper_bytes": 15249423,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4716308,
+          "gate3_read_bytes": 4717175,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 51124476,
+            "count": 28443
+          },
+          "gate3_allocations": {
+            "bytes": 51131615,
+            "count": 28502
+          },
+          "gate2_sha256_helper_bytes": 31905690,
+          "gate3_sha256_helper_bytes": 31907865,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4443667,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4716751,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4714413,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 113431154,
+        "sha256_helper_calls": 659,
+        "write_attempt_bytes": 4717175
+      },
+      "maintenance_allocations": {
+        "bytes": 324867583,
+        "count": 135387
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 65536,
+        "l1_segments": 4,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 3108,
+          "gate3_read_bytes": 3975,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 15305,
+            "count": 124
+          },
+          "gate3_allocations": {
+            "bytes": 29297,
+            "count": 298
+          },
+          "gate2_sha256_helper_bytes": 6061,
+          "gate3_sha256_helper_bytes": 10495,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 2700,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 72758,
+          "gate3_read_bytes": 72758,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 169115,
+            "count": 549
+          },
+          "gate3_allocations": {
+            "bytes": 169115,
+            "count": 549
+          },
+          "gate2_sha256_helper_bytes": 135544,
+          "gate3_sha256_helper_bytes": 135544,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 76290,
+          "gate3_read_bytes": 77157,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 182990,
+            "count": 657
+          },
+          "gate3_allocations": {
+            "bytes": 190321,
+            "count": 751
+          },
+          "gate2_sha256_helper_bytes": 141605,
+          "gate3_sha256_helper_bytes": 144689,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 1350,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 9919,
+          "gate3_read_bytes": 9919,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 9919,
+          "gate3_sha256_helper_bytes": 9919,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 7184812,
+          "gate3_read_bytes": 7184812,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 13971274,
+          "gate3_sha256_helper_bytes": 13971274,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4723711,
+          "gate3_read_bytes": 4724578,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 51143636,
+            "count": 29213
+          },
+          "gate3_allocations": {
+            "bytes": 51152439,
+            "count": 29381
+          },
+          "gate2_sha256_helper_bytes": 31926644,
+          "gate3_sha256_helper_bytes": 31929728,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 1350,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4445485,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4724154,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 61,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 10,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4720179,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 113468914,
+        "sha256_helper_calls": 684,
+        "write_attempt_bytes": 4724578
+      },
+      "maintenance_allocations": {
+        "bytes": 325054820,
+        "count": 136677
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 65536,
+        "l1_segments": 16,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 9644,
+          "gate3_read_bytes": 10511,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 51109,
+            "count": 336
+          },
+          "gate3_allocations": {
+            "bytes": 84365,
+            "count": 952
+          },
+          "gate2_sha256_helper_bytes": 19133,
+          "gate3_sha256_helper_bytes": 30839,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 9972,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 65971,
+          "gate3_read_bytes": 65971,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 150731,
+            "count": 485
+          },
+          "gate3_allocations": {
+            "bytes": 150731,
+            "count": 485
+          },
+          "gate2_sha256_helper_bytes": 128757,
+          "gate3_sha256_helper_bytes": 128757,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 76039,
+          "gate3_read_bytes": 76906,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 198770,
+            "count": 732
+          },
+          "gate3_allocations": {
+            "bytes": 215733,
+            "count": 1047
+          },
+          "gate2_sha256_helper_bytes": 147890,
+          "gate3_sha256_helper_bytes": 154610,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 4986,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 3159,
+          "gate3_read_bytes": 3159,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 3159,
+          "gate3_sha256_helper_bytes": 3159,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 7013166,
+          "gate3_read_bytes": 7013166,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 13860886,
+          "gate3_sha256_helper_bytes": 13860886,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4752077,
+          "gate3_read_bytes": 4752944,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 51231180,
+            "count": 31986
+          },
+          "gate3_allocations": {
+            "bytes": 51253647,
+            "count": 32591
+          },
+          "gate2_sha256_helper_bytes": 32004897,
+          "gate3_sha256_helper_bytes": 32011617,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 4986,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4452757,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4752520,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 85,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 34,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4742009,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 113608548,
+        "sha256_helper_calls": 784,
+        "write_attempt_bytes": 4752944
+      },
+      "maintenance_allocations": {
+        "bytes": 325283704,
+        "count": 141415
+      }
+    },
+    {
+      "fixture": {
+        "rows": 4096,
+        "target_bytes": 65536,
+        "l1_segments": 64,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 35740,
+          "gate3_read_bytes": 36607,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 193349,
+            "count": 1170
+          },
+          "gate3_allocations": {
+            "bytes": 321677,
+            "count": 3546
+          },
+          "gate2_sha256_helper_bytes": 71325,
+          "gate3_sha256_helper_bytes": 112119,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 39060,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 64446,
+          "gate3_read_bytes": 64446,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 151939,
+            "count": 739
+          },
+          "gate3_allocations": {
+            "bytes": 151939,
+            "count": 739
+          },
+          "gate2_sha256_helper_bytes": 127232,
+          "gate3_sha256_helper_bytes": 127232,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 100610,
+          "gate3_read_bytes": 101477,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 336114,
+            "count": 1525
+          },
+          "gate3_allocations": {
+            "bytes": 400613,
+            "count": 2720
+          },
+          "gate2_sha256_helper_bytes": 198557,
+          "gate3_sha256_helper_bytes": 219821,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 19530,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 1639,
+          "gate3_read_bytes": 1639,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 1639,
+          "gate3_sha256_helper_bytes": 1639,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 7046471,
+          "gate3_read_bytes": 7046471,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 13927055,
+          "gate3_sha256_helper_bytes": 13927055,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 4963573,
+          "gate3_read_bytes": 4964440,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 52150116,
+            "count": 46964
+          },
+          "gate3_allocations": {
+            "bytes": 52236247,
+            "count": 49313
+          },
+          "gate2_sha256_helper_bytes": 32688177,
+          "gate3_sha256_helper_bytes": 32709441,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 19530,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 4481845,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 4964016,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 181,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 4703220
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 50238
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21791
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 130,
+        "range_get_attempts": 50,
+        "read_bytes": 4786128,
+        "rendered_state_validation_bytes": 4927409,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:4677271": 1,
+          "directory:0:37182": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1228": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 114896748,
+        "sha256_helper_calls": 1312,
+        "write_attempt_bytes": 4964440
+      },
+      "maintenance_allocations": {
+        "bytes": 327044912,
+        "count": 173936
+      }
+    },
+    {
+      "fixture": {
+        "rows": 256,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 0
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1469,
+          "gate3_read_bytes": 2336,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 9418,
+            "count": 72
+          },
+          "gate3_allocations": {
+            "bytes": 18002,
+            "count": 135
+          },
+          "gate2_sha256_helper_bytes": 2783,
+          "gate3_sha256_helper_bytes": 5399,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 882,
+            "canonical_root_hash_calls": 2,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 65945,
+          "gate3_read_bytes": 65945,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": {
+            "bytes": 148895,
+            "count": 407
+          },
+          "gate3_allocations": {
+            "bytes": 148895,
+            "count": 407
+          },
+          "gate2_sha256_helper_bytes": 128731,
+          "gate3_sha256_helper_bytes": 128731,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 67838,
+          "gate3_read_bytes": 68705,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 157219,
+            "count": 481
+          },
+          "gate3_allocations": {
+            "bytes": 163894,
+            "count": 520
+          },
+          "gate2_sha256_helper_bytes": 131514,
+          "gate3_sha256_helper_bytes": 133689,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "bloom_negative": {
+          "gate2_read_bytes": 3159,
+          "gate3_read_bytes": 3159,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 3159,
+          "gate3_sha256_helper_bytes": 3159,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "outside_bounds": {
+          "gate2_read_bytes": 0,
+          "gate3_read_bytes": 0,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 0,
+          "gate3_sha256_helper_bytes": 0,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 407507,
+          "gate3_read_bytes": 407507,
+          "additional_metadata_bytes": 0,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 805537,
+          "gate3_sha256_helper_bytes": 805537,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 0,
+            "canonical_root_hash_calls": 0,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 298246,
+          "gate3_read_bytes": 299113,
+          "additional_metadata_bytes": 867,
+          "gate2_allocations": {
+            "bytes": 3208388,
+            "count": 2098
+          },
+          "gate3_allocations": {
+            "bytes": 3215527,
+            "count": 2157
+          },
+          "gate2_sha256_helper_bytes": 2001894,
+          "gate3_sha256_helper_bytes": 2004069,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 441,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 292627,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 298689,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 319144
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 16254
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 368066,
+        "rendered_state_validation_bytes": 296353,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:293195": 1,
+          "directory:0:3198": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 7303194,
+        "sha256_helper_calls": 239,
+        "write_attempt_bytes": 299113
+      },
+      "maintenance_allocations": {
+        "bytes": 20794583,
+        "count": 13211
+      }
+    },
+    {
+      "fixture": {
+        "rows": 256,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 1
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 1724,
+          "gate3_read_bytes": 2298,
+          "additional_metadata_bytes": 574,
+          "gate2_allocations": {
+            "bytes": 10018,
+            "count": 75
+          },
+          "gate3_allocations": {
+            "bytes": 22972,
+            "count": 170
+          },
+          "gate2_sha256_helper_bytes": 3293,
+          "gate3_sha256_helper_bytes": 6115,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 1674,
+            "canonical_root_hash_calls": 4,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 72029,
+          "gate3_read_bytes": 72294,
+          "additional_metadata_bytes": 265,
+          "gate2_allocations": {
+            "bytes": 176094,
+            "count": 650
+          },
+          "gate3_allocations": {
+            "bytes": 179223,
+            "count": 669
+          },
+          "gate2_sha256_helper_bytes": 139574,
+          "gate3_sha256_helper_bytes": 140296,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 192,
+            "canonical_root_hash_calls": 1,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 74219,
+          "gate3_read_bytes": 75058,
+          "additional_metadata_bytes": 839,
+          "gate2_allocations": {
+            "bytes": 185060,
+            "count": 727
+          },
+          "gate3_allocations": {
+            "bytes": 197102,
+            "count": 800
+          },
+          "gate2_sha256_helper_bytes": 142867,
+          "gate3_sha256_helper_bytes": 145574,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 1029,
+            "canonical_root_hash_calls": 3,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 421917,
+          "gate3_read_bytes": 422712,
+          "additional_metadata_bytes": 795,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 830382,
+          "gate3_sha256_helper_bytes": 832548,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 576,
+            "canonical_root_hash_calls": 3,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 304627,
+          "gate3_read_bytes": 305466,
+          "additional_metadata_bytes": 839,
+          "gate2_allocations": {
+            "bytes": 3238947,
+            "count": 2399
+          },
+          "gate3_allocations": {
+            "bytes": 3256627,
+            "count": 2516
+          },
+          "gate2_sha256_helper_bytes": 2022108,
+          "gate3_sha256_helper_bytes": 2026229,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 2443,
+            "canonical_root_hash_calls": 5,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 292627,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 298689,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 319144
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 16254
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 368066,
+        "rendered_state_validation_bytes": 296353,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:293195": 1,
+          "directory:0:3198": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 7303194,
+        "sha256_helper_calls": 239,
+        "write_attempt_bytes": 299113
+      },
+      "maintenance_allocations": {
+        "bytes": 20794583,
+        "count": 13211
+      }
+    },
+    {
+      "fixture": {
+        "rows": 256,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 8
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 3558,
+          "gate3_read_bytes": 6113,
+          "additional_metadata_bytes": 2555,
+          "gate2_allocations": {
+            "bytes": 16060,
+            "count": 91
+          },
+          "gate3_allocations": {
+            "bytes": 51006,
+            "count": 419
+          },
+          "gate2_sha256_helper_bytes": 6961,
+          "gate3_sha256_helper_bytes": 19289,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 7218,
+            "canonical_root_hash_calls": 18,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 114911,
+          "gate3_read_bytes": 117031,
+          "additional_metadata_bytes": 2120,
+          "gate2_allocations": {
+            "bytes": 366781,
+            "count": 2351
+          },
+          "gate3_allocations": {
+            "bytes": 391813,
+            "count": 2503
+          },
+          "gate2_sha256_helper_bytes": 216063,
+          "gate3_sha256_helper_bytes": 221839,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 1536,
+            "canonical_root_hash_calls": 8,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 118935,
+          "gate3_read_bytes": 123610,
+          "additional_metadata_bytes": 4675,
+          "gate2_allocations": {
+            "bytes": 381797,
+            "count": 2445
+          },
+          "gate3_allocations": {
+            "bytes": 429778,
+            "count": 2778
+          },
+          "gate2_sha256_helper_bytes": 223024,
+          "gate3_sha256_helper_bytes": 237519,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 5145,
+            "canonical_root_hash_calls": 17,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 523669,
+          "gate3_read_bytes": 530029,
+          "additional_metadata_bytes": 6360,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 1006061,
+          "gate3_sha256_helper_bytes": 1023389,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 4608,
+            "canonical_root_hash_calls": 24,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 349343,
+          "gate3_read_bytes": 354018,
+          "additional_metadata_bytes": 4675,
+          "gate2_allocations": {
+            "bytes": 3454710,
+            "count": 4495
+          },
+          "gate3_allocations": {
+            "bytes": 3544547,
+            "count": 5040
+          },
+          "gate2_sha256_helper_bytes": 2164286,
+          "gate3_sha256_helper_bytes": 2190093,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 16457,
+            "canonical_root_hash_calls": 33,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 292627,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 298689,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 319144
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 16254
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 368066,
+        "rendered_state_validation_bytes": 296353,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:293195": 1,
+          "directory:0:3198": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 7303194,
+        "sha256_helper_calls": 239,
+        "write_attempt_bytes": 299113
+      },
+      "maintenance_allocations": {
+        "bytes": 20794583,
+        "count": 13211
+      }
+    },
+    {
+      "fixture": {
+        "rows": 256,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 16
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 6136,
+          "gate3_read_bytes": 10955,
+          "additional_metadata_bytes": 4819,
+          "gate2_allocations": {
+            "bytes": 27143,
+            "count": 114
+          },
+          "gate3_allocations": {
+            "bytes": 96169,
+            "count": 712
+          },
+          "gate2_sha256_helper_bytes": 12117,
+          "gate3_sha256_helper_bytes": 35309,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 13554,
+            "canonical_root_hash_calls": 34,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 163919,
+          "gate3_read_bytes": 168159,
+          "additional_metadata_bytes": 4240,
+          "gate2_allocations": {
+            "bytes": 584709,
+            "count": 4295
+          },
+          "gate3_allocations": {
+            "bytes": 634773,
+            "count": 4599
+          },
+          "gate2_sha256_helper_bytes": 303479,
+          "gate3_sha256_helper_bytes": 315031,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 3072,
+            "canonical_root_hash_calls": 16,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 170521,
+          "gate3_read_bytes": 179580,
+          "additional_metadata_bytes": 9059,
+          "gate2_allocations": {
+            "bytes": 610808,
+            "count": 4412
+          },
+          "gate3_allocations": {
+            "bytes": 706365,
+            "count": 5044
+          },
+          "gate2_sha256_helper_bytes": 315596,
+          "gate3_sha256_helper_bytes": 343563,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 9849,
+            "canonical_root_hash_calls": 33,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 639957,
+          "gate3_read_bytes": 652677,
+          "additional_metadata_bytes": 12720,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 1206837,
+          "gate3_sha256_helper_bytes": 1241493,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 9216,
+            "canonical_root_hash_calls": 48,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 400929,
+          "gate3_read_bytes": 409988,
+          "additional_metadata_bytes": 9059,
+          "gate2_allocations": {
+            "bytes": 3705465,
+            "count": 6894
+          },
+          "gate3_allocations": {
+            "bytes": 3884270,
+            "count": 7930
+          },
+          "gate2_sha256_helper_bytes": 2327738,
+          "gate3_sha256_helper_bytes": 2378329,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 32473,
+            "canonical_root_hash_calls": 65,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 292627,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 298689,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 319144
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 16254
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 368066,
+        "rendered_state_validation_bytes": 296353,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:293195": 1,
+          "directory:0:3198": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 7303194,
+        "sha256_helper_calls": 239,
+        "write_attempt_bytes": 299113
+      },
+      "maintenance_allocations": {
+        "bytes": 20794583,
+        "count": 13211
+      }
+    },
+    {
+      "fixture": {
+        "rows": 256,
+        "target_bytes": 65536,
+        "l1_segments": 1,
+        "l0_suffix": 31
+      },
+      "selected_data_unchanged": true,
+      "phases": {
+        "reader_open": {
+          "gate2_read_bytes": 9976,
+          "gate3_read_bytes": 19040,
+          "additional_metadata_bytes": 9064,
+          "gate2_allocations": {
+            "bytes": 48439,
+            "count": 146
+          },
+          "gate3_allocations": {
+            "bytes": 183073,
+            "count": 1245
+          },
+          "gate2_sha256_helper_bytes": 19797,
+          "gate3_sha256_helper_bytes": 63359,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 25434,
+            "canonical_root_hash_calls": 64,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "pinned_point": {
+          "gate2_read_bytes": 255809,
+          "gate3_read_bytes": 264024,
+          "additional_metadata_bytes": 8215,
+          "gate2_allocations": {
+            "bytes": 993324,
+            "count": 7940
+          },
+          "gate3_allocations": {
+            "bytes": 1090323,
+            "count": 8529
+          },
+          "gate2_sha256_helper_bytes": 467384,
+          "gate3_sha256_helper_bytes": 489766,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 5952,
+            "canonical_root_hash_calls": 31,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "current_point": {
+          "gate2_read_bytes": 266251,
+          "gate3_read_bytes": 283530,
+          "additional_metadata_bytes": 17279,
+          "gate2_allocations": {
+            "bytes": 1040719,
+            "count": 8089
+          },
+          "gate3_allocations": {
+            "bytes": 1226927,
+            "count": 9279
+          },
+          "gate2_sha256_helper_bytes": 487181,
+          "gate3_sha256_helper_bytes": 540408,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 18669,
+            "canonical_root_hash_calls": 63,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "complete_scan": {
+          "gate2_read_bytes": 857997,
+          "gate3_read_bytes": 882642,
+          "additional_metadata_bytes": 24645,
+          "gate2_allocations": null,
+          "gate3_allocations": null,
+          "gate2_sha256_helper_bytes": 1583292,
+          "gate3_sha256_helper_bytes": 1650438,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 17856,
+            "canonical_root_hash_calls": 93,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        },
+        "eager_begin": {
+          "gate2_read_bytes": 496659,
+          "gate3_read_bytes": 513938,
+          "additional_metadata_bytes": 17279,
+          "gate2_allocations": {
+            "bytes": 4176146,
+            "count": 11381
+          },
+          "gate3_allocations": {
+            "bytes": 4523212,
+            "count": 13335
+          },
+          "gate2_sha256_helper_bytes": 2632223,
+          "gate3_sha256_helper_bytes": 2729284,
+          "gate3_integrity": {
+            "canonical_root_hash_bytes": 62503,
+            "canonical_root_hash_calls": 125,
+            "rendered_state_validation_bytes": 0,
+            "rendered_state_validation_calls": 0,
+            "rendered_transaction_validation_bytes": 0,
+            "rendered_transaction_validation_calls": 0
+          }
+        }
+      },
+      "maintenance": {
+        "canonical_root_hash_bytes": 292627,
+        "canonical_root_hash_calls": 68,
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 1,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 298689,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 55,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 319144
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 16254
+          },
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 10413
+          },
+          "other": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 466
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 16,
+            "returned_bytes": 21789
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 4,
+        "range_get_attempts": 50,
+        "read_bytes": 368066,
+        "rendered_state_validation_bytes": 296353,
+        "rendered_state_validation_calls": 1,
+        "rendered_transaction_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "requested_ranges": {
+          "data:0:1731": 15,
+          "data:0:293195": 1,
+          "directory:0:3198": 1,
+          "directory:0:871": 8,
+          "directory:0:872": 7,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1226": 1,
+          "transaction:0:1371": 8,
+          "transaction:0:1373": 7
+        },
+        "sha256_helper_bytes": 7303194,
+        "sha256_helper_calls": 239,
+        "write_attempt_bytes": 299113
+      },
+      "maintenance_allocations": {
+        "bytes": 20794583,
+        "count": 13211
+      }
+    }
+  ]
+}

@@ -44,6 +44,9 @@ use arco_catalog::{
 };
 use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
+#[path = "support/integrity_oracle.rs"]
+mod integrity_oracle;
+use integrity_oracle::LogicalOracle;
 
 const RETENTION_GC_LOCK_PATH: &str = "locks/workspace-retention-gc.lock.json";
 const SNAP: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -190,6 +193,19 @@ impl StorageBackend for Backend {
         self.inner.get(path).await
     }
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("RANGE {path} {range:?}"));
+        if self
+            .denied
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| path.contains(s))
+        {
+            return Err(arco_core::Error::storage("reconciliation read denied"));
+        }
         self.inner.get_range(path, range).await
     }
     async fn put(
@@ -1012,16 +1028,20 @@ async fn released_source_while_waiting_cannot_publish_or_retry_an_export() {
 
 type Contents = BTreeMap<Vec<u8>, Bytes>;
 struct TokenOracle {
+    logical: LogicalOracle,
     token: StateToken,
     contents: Contents,
     until: DateTime<Utc>,
 }
 struct CheckpointOracle {
+    logical: LogicalOracle,
+    manifest_id: String,
     token: CheckpointToken,
     contents: Contents,
     until: DateTime<Utc>,
 }
 struct RootOracle {
+    logical: LogicalOracle,
     snapshot: CreateWorkspaceSnapshotRequest,
     export: Option<CreateWorkspaceExportRequest>,
     contents: Contents,
@@ -1089,7 +1109,14 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
     let mut random = seed;
     let mut now = f.start;
     let mut contents = Contents::from([(b"key".to_vec(), Bytes::from_static(b"value"))]);
+    let mut logical = LogicalOracle::new();
+    logical.commit(
+        vec![(b"key".to_vec(), Some(Bytes::from_static(b"value")))],
+        Vec::new(),
+        Vec::new(),
+    );
     let mut tokens = vec![TokenOracle {
+        logical: logical.clone(),
         token: f.store.current_state_token().await.unwrap(),
         contents: contents.clone(),
         until: now + chrono::Duration::days(30),
@@ -1129,10 +1156,34 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                 } else {
                     let value = Bytes::from(format!("{seed}-{step}"));
                     txn.put(&key, value.clone()).await.unwrap();
-                    contents.insert(key, value);
+                    contents.insert(key.clone(), value);
+                }
+                let write = (key.clone(), contents.get(&key).cloned());
+                let mut additions = Vec::new();
+                let mut trims = Vec::new();
+                if op == 0 && logical.outbox.is_empty() {
+                    let payload = Bytes::from(format!("incarnation-{seed}-{step}"));
+                    txn.stage_projection_outbox(
+                        arco_catalog::ControlMvpProjectionOutboxRecord::new(
+                            "model-event",
+                            payload.clone(),
+                        ),
+                    )
+                    .unwrap();
+                    additions.push(("model-event".to_string(), payload));
+                } else if op == 1
+                    && let Some((id, _, origin)) = logical.outbox.first()
+                {
+                    txn.trim_projection_outbox([arco_catalog::ControlMvpOutboxTrimTarget::new(
+                        id, *origin,
+                    )])
+                    .unwrap();
+                    trims.push((id.clone(), *origin));
                 }
                 let token = txn.commit().await.unwrap().state_token().clone();
+                logical.commit(vec![write], additions, trims);
                 tokens.push(TokenOracle {
+                    logical: logical.clone(),
                     token,
                     contents: contents.clone(),
                     until: now + chrono::Duration::days(30),
@@ -1145,6 +1196,14 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                     .await
                     .unwrap();
                 checkpoints.push(CheckpointOracle {
+                    logical: logical.clone(),
+                    manifest_id: f
+                        .store
+                        .current_state_token()
+                        .await
+                        .unwrap()
+                        .authority_manifest_id()
+                        .to_string(),
                     token,
                     contents: contents.clone(),
                     until: now + chrono::Duration::days(30),
@@ -1167,6 +1226,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                     .await
                     .unwrap();
                 roots.push(RootOracle {
+                    logical: logical.clone(),
                     snapshot: request,
                     export: None,
                     contents: contents.clone(),
@@ -1198,6 +1258,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                         .await
                         .unwrap();
                     roots.push(RootOracle {
+                        logical: source.logical.clone(),
                         snapshot: source.snapshot.clone(),
                         export: Some(request),
                         contents: source.contents.clone(),
@@ -1281,8 +1342,34 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
             .unwrap()
             .push(format!("acknowledged contents={contents:?}"));
         compare(f.store.as_ref(), &contents).await;
+        logical
+            .assert_manifest(
+                &f.storage,
+                f.store
+                    .current_state_token()
+                    .await
+                    .unwrap()
+                    .authority_manifest_id(),
+            )
+            .await;
+        let actual_outbox = f.store.current_projection_outbox().await.unwrap();
+        assert_eq!(
+            actual_outbox
+                .iter()
+                .map(|record| (
+                    record.record_id().to_string(),
+                    record.payload().clone(),
+                    record.origin_sequence().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            logical.outbox
+        );
         for token in &tokens {
             if now <= token.until {
+                token
+                    .logical
+                    .assert_manifest(&f.storage, token.token.authority_manifest_id())
+                    .await;
                 compare(
                     f.store.read_at(token.token.clone()).await.unwrap().as_ref(),
                     &token.contents,
@@ -1292,6 +1379,10 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
         }
         for checkpoint in &checkpoints {
             if now <= checkpoint.until {
+                checkpoint
+                    .logical
+                    .assert_manifest(&f.storage, &checkpoint.manifest_id)
+                    .await;
                 compare(
                     f.store
                         .read_checkpoint(checkpoint.token.clone())
@@ -1334,6 +1425,9 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                 );
             }
             for domain in domains {
+                root.logical
+                    .assert_manifest(&f.storage, domain.authority().manifest_id())
+                    .await;
                 compare(
                     f.store
                         .resolve_persisted_reference_at(domain.authority(), now)
@@ -1431,3 +1525,166 @@ async fn immutable_preconditions_and_transport_readback_require_exact_bytes() {
 
 #[path = "support/legacy_reclamation.rs"]
 mod legacy_reclamation;
+
+#[tokio::test]
+async fn independent_oracle_covers_empty_and_nonempty_restore_history() {
+    use arco_catalog::{
+        ControlMvpOutboxTrimTarget, ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant,
+        RestoreAttemptIdentity, StateRestoreParticipant as _,
+    };
+    #[derive(serde::Serialize)]
+    struct Notice<'a> {
+        restore_id: &'a str,
+        participant_attempt: u64,
+        domain: &'a str,
+        source_logical_sequence: u64,
+        result_logical_sequence: u64,
+    }
+    for empty in [false, true] {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let mut source = LogicalOracle::new();
+        let source_writes = vec![
+            (b"changed".to_vec(), Some(Bytes::from_static(b"source"))),
+            (b"keep".to_vec(), Some(Bytes::from_static(b"same"))),
+            (b"source-only".to_vec(), Some(Bytes::from_static(b"source"))),
+            (b"gone".to_vec(), None),
+        ];
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        for (key, value) in &source_writes {
+            match value {
+                Some(value) => tx.put(key, value.clone()).await.unwrap(),
+                None => tx.delete(key).await.unwrap(),
+            }
+        }
+        tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "event",
+            Bytes::from_static(b"source incarnation"),
+        ))
+        .unwrap();
+        tx.commit().await.unwrap();
+        source.commit(
+            source_writes.clone(),
+            vec![("event".into(), Bytes::from_static(b"source incarnation"))],
+            Vec::new(),
+        );
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reference = store
+            .persist_checkpoint_reference(&checkpoint, Utc::now() + chrono::Duration::days(1))
+            .await
+            .unwrap();
+        let mut expected = source.clone();
+        if empty {
+            storage
+                .delete(&store.paths().current_pointer())
+                .await
+                .unwrap();
+        } else {
+            let changes = vec![
+                (
+                    b"changed".to_vec(),
+                    Some(Bytes::from_static(b"destination")),
+                ),
+                (
+                    b"destination-only".to_vec(),
+                    Some(Bytes::from_static(b"extra")),
+                ),
+                (b"gone".to_vec(), Some(Bytes::from_static(b"resurrected"))),
+            ];
+            let mut tx = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            for (key, value) in &changes {
+                tx.put(key, value.clone().unwrap()).await.unwrap();
+            }
+            tx.trim_projection_outbox([ControlMvpOutboxTrimTarget::new("event", 1)])
+                .unwrap();
+            tx.commit().await.unwrap();
+            expected.commit(changes, Vec::new(), vec![("event".into(), 1)]);
+            let mut tx = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+                "event",
+                Bytes::from_static(b"destination incarnation"),
+            ))
+            .unwrap();
+            tx.commit().await.unwrap();
+            expected.commit(
+                Vec::new(),
+                vec![(
+                    "event".into(),
+                    Bytes::from_static(b"destination incarnation"),
+                )],
+                Vec::new(),
+            );
+        }
+        let restore_id = "rst_00000000000000000000000001";
+        let identity = RestoreAttemptIdentity::new(restore_id, 1, "catalog").unwrap();
+        let participant = ControlMvpRestoreParticipant::new(store.clone());
+        let plan = participant
+            .plan_restore(&reference, &identity, Utc::now())
+            .await
+            .unwrap();
+        participant.apply_restore(&plan, Utc::now()).await.unwrap();
+        let writes = if empty {
+            // Empty destination writes every visible source key over the retained source lineage.
+            source_writes
+                .into_iter()
+                .filter(|(_, value)| value.is_some())
+                .collect()
+        } else {
+            vec![
+                (b"changed".to_vec(), Some(Bytes::from_static(b"source"))),
+                (b"destination-only".to_vec(), None),
+                (b"gone".to_vec(), None),
+            ]
+        };
+        let notice = Bytes::from(
+            serde_json::to_vec(&Notice {
+                restore_id,
+                participant_attempt: 1,
+                domain: "catalog",
+                source_logical_sequence: source.sequence,
+                result_logical_sequence: expected.sequence + 1,
+            })
+            .unwrap(),
+        );
+        let request = format!("restore:{restore_id}:1:catalog");
+        expected.commit_with_request(
+            writes,
+            vec![(request.clone(), notice)],
+            Vec::new(),
+            Some(&request),
+        );
+        let token = store.current_state_token().await.unwrap();
+        expected
+            .assert_manifest(&storage, token.authority_manifest_id())
+            .await;
+        let actual = store.current_projection_outbox().await.unwrap();
+        assert_eq!(actual.len(), expected.outbox.len());
+        for (record, (id, payload, origin)) in actual.iter().zip(&expected.outbox) {
+            assert_eq!(record.record_id(), id);
+            assert_eq!(record.payload(), payload);
+            assert_eq!(record.origin_sequence(), Some(*origin));
+        }
+        assert_eq!(
+            store.get(b"changed").await.unwrap(),
+            Some(Bytes::from_static(b"source"))
+        );
+        assert_eq!(store.get(b"gone").await.unwrap(), None);
+    }
+}

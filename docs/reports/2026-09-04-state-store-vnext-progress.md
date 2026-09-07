@@ -2,12 +2,19 @@
 
 Baseline: `0235eb6c1552c5c87fe3a7638e10022889462b35` (PR #418).
 
-Updated 2026-09-06. This worktree implements reclamation fencing, protection
-from retained workspace roots, the deterministic operation-cost harness, and
-the Gate 0 publication/reclamation schedules and independent logical model.
-**Gate 0 passes locally** after resolving both retained-closure audit findings. Gates 2 through 7 remain
-outstanding. Provider qualification, deployment, writer revocation, cutover,
-and production readiness are unproven.
+Updated 2026-09-06. Gate 0 passes locally and Gate 1's original operation-cost
+baselines are preserved. **Gate 2 is complete locally**, with an approved fresh
+audit and a recoverable checkpoint; see [Gate 2 closeout](2026-09-06-gate2-closeout.md).
+**Gate 3 is complete locally**, with a fresh approval and all nine verification
+lanes passing; see [Gate 3 evidence and handoff](2026-09-06-gate3-integrity-roots.md).
+Its [format contract](../plans/state-store-integrity-format-v1.md) defines authority
+7 / restore 6. Gates 4–7 remain outstanding. Provider
+qualification, deployment, writer revocation, cutover and production readiness
+are unproven.
+
+The sections below retain the Gate 0/1 evidence and historical format transitions.
+Current Gate 2/3 evidence is recorded separately so the original baselines remain
+reviewable.
 
 ## Implemented behavior
 
@@ -192,14 +199,14 @@ Gate 2 only adapts existing maintenance readers/writers to the segment format;
 Gate 5 adds durable incremental internal maintenance. Neither gate restores the
 legacy compactor as the Tier-1 success gate or changes Tier-2 event contracts.
 
-After Gate 0 verification, the remaining implementation sequence is:
+Gates 2 and 3 are complete locally. Gate 2's authenticated blocks, directories,
+Bloom filters and selective readers are preserved in its approved archive.
+Gate 3 adds history/physical roots, rewrite equivalence and checkpoint evidence;
+its full differential, corruption, retention and cost matrix passes. Both gates
+retain eager transactions and the fenced control pointer as Tier-1 publication.
 
-2. Introduce the narrow range-read capability, independently decodable Arrow
-   blocks inside immutable segments, authenticated directories/footer metadata,
-   and cardinality-sized Bloom filters.
-3. Specify and implement separate logical-history and physical-layout roots,
-   maintenance semantic equivalence, and checkpoint validation records. Keep
-   eager full-state checks until differential/corruption validation passes.
+The remaining implementation sequence is:
+
 4. Implement lazy transactions with a pinned manifest and request-local overlay;
    logical conflicts must rerun the whole frozen catalog command.
 5. Implement durable incremental internal segment maintenance: the manifest
@@ -404,7 +411,8 @@ deployment, cutover, or production promotion were performed.
 Authority format 5, restore-plan format 4, `StateToken`, pin schemas, retention
 floors, hard caps, backpressure, and the separate writer epoch are unchanged by
 this continuation. Gate 1's stored full cost profile remains the regression
-baseline; Gates 2 through 7 remain the next implementation sequence.
+baseline. This paragraph records the Gate 0/1 checkpoint; the current gate status
+is at the top of this report.
 
 Follow-up local logs are retained at `/private/tmp/state-store-vnext-audit-fix-tests-final.log`,
 `/private/tmp/state-store-vnext-audit-fix-schedules-final.log`, and

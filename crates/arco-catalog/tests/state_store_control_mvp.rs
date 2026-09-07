@@ -1338,7 +1338,7 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        5,
+        6,
         plan.version(),
         "planning writes the current plan version"
     );
@@ -1655,6 +1655,7 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     object.remove("observed_writer_epoch");
     object.remove("observed_reclamation_generation");
     object.remove("checkpoint_interval");
+    object.remove("transaction_ref");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
@@ -3092,6 +3093,15 @@ impl StorageBackend for PointerWriteThenErrorBackend {
     }
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        if path.ends_with(&self.current_pointer)
+            && self.fired.load(Ordering::SeqCst)
+            && self.fail_next_pointer_read.swap(false, Ordering::SeqCst)
+        {
+            self.read_fault_fired.store(true, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(
+                "injected reconciliation pointer read error",
+            ));
+        }
         self.inner.get_range(path, range).await
     }
 

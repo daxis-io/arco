@@ -6,6 +6,8 @@
 
 - [Arco Tier-1 Single Authority Vision](2026-06-26-arco-tier1-single-authority-combined-vision.md)
 - [Olympia-Inspired Arco Strategy](2026-06-20-olympia-inspired-arco-strategy.md)
+- [Current local implementation progress](../reports/2026-09-04-state-store-vnext-progress.md)
+- [Block format 1](state-store-block-format-v1.md) and [authority 7 integrity encoding](state-store-integrity-format-v1.md)
 
 ## Purpose
 

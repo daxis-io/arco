@@ -1,6 +1,6 @@
 //! Object-store-backed control-state MVP.
 //!
-//! # Replay model (format version 6)
+//! # Replay model (format version 7)
 //!
 //! Every manifest anchors replay on an ordered set of checksummed, non-overlapping
 //! immutable Arrow IPC L1 segments and carries only the transaction suffix
@@ -57,9 +57,10 @@
 //!
 //! # Format versioning
 //!
-//! Format version 6 is the only supported on-disk format and is rooted beneath
+//! Format version 7 is the only supported on-disk format and is rooted beneath
 //! `control/v1/` on fresh roots. There is deliberately no migration path from
-//! version 5 without authenticated blocks, unfenced version 4, or older JSON-anchor
+//! version 6 without integrity roots, version 5 without authenticated blocks,
+//! unfenced version 4, or older JSON-anchor
 //! formats: unknown and old `format_version` values fail closed.
 //!
 //! Before active GC deletes a candidate page, it advances HEAD's checked
@@ -72,8 +73,7 @@
 //! Restore *plans* are versioned separately from on-disk state artifacts,
 //! because an in-flight restore attempt written by an older revision must
 //! still be readable by the recovery path that has to supersede it. Plan
-//! versions 1 and 2 (which name retired layouts) and version 3 (which predates
-//! reclamation fencing) are therefore decoded as legacy plans
+//! versions 1 through 5 are therefore decoded as legacy plans
 //! that can be inspected and superseded but can never be applied. See
 //! [`ControlMvpRestorePlan`].
 
@@ -122,8 +122,11 @@ use crate::workspace_snapshot::{
 };
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
+mod integrity;
+use integrity::{CheckpointValidation, HistoryAnchor, HistoryLink, RewriteEquivalence};
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 5;
+const RESTORE_PLAN_VERSION: u32 = 6;
+const RESTORE_PLAN_VERSION_V5: u32 = 5;
 const RESTORE_PLAN_VERSION_V4: u32 = 4;
 const RESTORE_PLAN_VERSION_V3: u32 = 3;
 /// Restore-plan versions that predate the `control/v1/` authority layout.
@@ -131,7 +134,7 @@ const RESTORE_PLAN_VERSION_V3: u32 = 3;
 /// dereferencing paths from the retired layout.
 const RESTORE_PLAN_VERSION_V1: u32 = 1;
 const RESTORE_PLAN_VERSION_V2: u32 = 2;
-const CONTROL_MVP_FORMAT_VERSION: u32 = 6;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 7;
 const SEGMENT_FORMAT_VERSION: u32 = 1;
 const BLOCK_TARGET_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 256 * 1024;
@@ -184,6 +187,19 @@ pub struct ControlMvpStateStore {
 }
 
 impl ControlMvpStateStore {
+    async fn get_json(&self, path: &str, limit: usize) -> Result<Bytes> {
+        let end = (limit as u64)
+            .checked_add(1)
+            .ok_or_else(|| invariant_violation("JSON probe overflow"))?;
+        let bytes = self.storage.get_range(path, 0..end).await?;
+        if bytes.len() > limit {
+            return Err(invariant_violation(format!(
+                "authority JSON {} exceeds {limit} byte bound",
+                path.to_ascii_lowercase()
+            )));
+        }
+        Ok(bytes)
+    }
     /// Stable implementation identifier for this MVP backend.
     pub const IMPLEMENTATION: &'static str = IMPLEMENTATION;
 
@@ -257,6 +273,14 @@ impl ControlMvpStateStore {
     #[must_use]
     pub fn take_test_authentication_work() -> (u64, u64) {
         TEST_SHA256_WORK.with(|work| work.replace((0, 0)))
+    }
+
+    /// Returns and resets canonical hash, rendered-state and rendered-transaction
+    /// validation counts and input bytes, in that order. Local instrumentation only.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn take_test_integrity_work() -> [u64; 6] {
+        TEST_INTEGRITY_WORK.with(|work| work.replace([0; 6]))
     }
 
     /// Sets bounded writer sizing for deterministic local scaling tests.
@@ -385,8 +409,7 @@ impl ControlMvpStateStore {
             }),
             Err(error) => {
                 if self
-                    .storage
-                    .get(&self.paths.current_pointer())
+                    .get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
                     .await
                     .is_ok_and(|current| current == claimed_bytes)
                 {
@@ -541,13 +564,14 @@ impl ControlMvpStateStore {
         let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
         let Some(pointer_meta) = pointer_meta else {
             return Ok(ControlMvpBase {
+                history_anchor: integrity::genesis(&ControlMvpScopeDoc::from(&self.scope)),
                 reclamation_generation: 0,
                 pointer_version: None,
                 manifest_id: None,
                 manifest_checksum_sha256: None,
                 writer_epoch: 0,
                 layout_generation: 0,
-                state: ReplayState::default(),
+                state: ReplayState::empty(&self.scope),
                 base_states: Vec::new(),
                 tx_refs: Vec::new(),
             });
@@ -555,10 +579,11 @@ impl ControlMvpStateStore {
 
         let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
-        let state = self.replay_manifest(&manifest).await?;
+        let state = self.replay_for_successor(&manifest).await?;
         let (base_states, tx_refs) = manifest.successor_anchor();
 
         Ok(ControlMvpBase {
+            history_anchor: manifest.successor_history_anchor(),
             reclamation_generation: pointer.reclamation_generation,
             pointer_version: Some(pointer_meta.version),
             manifest_id: Some(pointer.manifest_id),
@@ -592,7 +617,9 @@ impl ControlMvpStateStore {
     }
 
     async fn load_pointer(&self) -> Result<ControlMvpPointer> {
-        let bytes = self.storage.get(&self.paths.current_pointer()).await?;
+        let bytes = self
+            .get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
+            .await?;
         validate_persisted_json_size(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
         validate_version_header(&bytes, CONTROL_MVP_FORMAT_VERSION, "control MVP HEAD")?;
         let pointer: ControlMvpPointer =
@@ -661,16 +688,42 @@ impl ControlMvpStateStore {
 
     async fn replay_manifest(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
         let mut state = self.load_state_snapshots(&manifest.base_states).await?;
+        state.history_root.clone_from(&manifest.history_anchor.root);
         for tx_ref in &manifest.tx_refs {
             let tx = self.load_tx(tx_ref).await?;
             state.apply_tx(&tx)?;
         }
 
         let checksum = state.checksum()?;
-        if checksum != manifest.state_checksum_sha256 {
+        if checksum != manifest.state_checksum_sha256 || state.history_root != manifest.history_root
+        {
             return Err(invariant_violation(
                 "control MVP manifest state checksum does not match replay",
             ));
+        }
+        Ok(state)
+    }
+
+    async fn verify_materialized_state(
+        &self,
+        references: &[ControlMvpStateRef],
+        expected: &ReplayState,
+    ) -> Result<()> {
+        let mut actual = self.load_state_snapshots(references).await?;
+        actual.history_root.clone_from(&expected.history_root);
+        if actual != *expected || actual.checksum()? != expected.checksum()? {
+            return Err(invariant_violation(
+                "materialized successor base differs from parent state",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn replay_for_successor(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
+        let state = self.replay_manifest(manifest).await?;
+        if !manifest.anchor_states.is_empty() {
+            self.verify_materialized_state(&manifest.anchor_states, &state)
+                .await?;
         }
         Ok(state)
     }
@@ -683,57 +736,12 @@ impl ControlMvpStateStore {
             logical_sequence: first.logical_sequence,
             ..ReplayState::default()
         };
-        let mut expected_outbox_ordinal = 0_u64;
-        let mut expected_kv_ordinal = 0_u64;
         let indexes = self.load_l1_indexes(references).await?;
-        for (reference, (index_bytes, _index)) in references.iter().zip(indexes) {
-            if reference.logical_sequence != combined.logical_sequence {
-                return Err(invariant_violation(
-                    "control MVP L1 segment set mixes logical sequences",
-                ));
-            }
+        for (reference, (index_bytes, _)) in references.iter().zip(indexes) {
             let shard = self
                 .load_state_snapshot_from_index(reference, &index_bytes)
                 .await?;
-            if let Some(start) = shard.kv_start_ordinal {
-                if start != expected_kv_ordinal {
-                    return Err(invariant_violation("discontinuous global L1 KV ordinals"));
-                }
-                expected_kv_ordinal = expected_kv_ordinal
-                    .checked_add(shard.entries.len() as u64)
-                    .ok_or_else(|| invariant_violation("L1 KV ordinal overflow"))?;
-            }
-            for entry in shard.entries {
-                let tombstone = entry.value.is_none();
-                let value = StoredValue {
-                    bytes: Bytes::from(entry.value.unwrap_or_default()),
-                    generation: entry.generation,
-                    tombstone,
-                };
-                if combined.kv.insert(entry.key, value).is_some() {
-                    return Err(invariant_violation(
-                        "control MVP L1 segment set contains duplicate keys",
-                    ));
-                }
-            }
-            if let Some(start) = shard.outbox_start_ordinal {
-                if start != expected_outbox_ordinal {
-                    return Err(invariant_violation(
-                        "control MVP L1 segment set has discontinuous outbox ordinals",
-                    ));
-                }
-                expected_outbox_ordinal = expected_outbox_ordinal
-                    .checked_add(u64::try_from(shard.outbox.len()).map_err(|error| {
-                        segment_serialization_error("count L1 outbox rows", error)
-                    })?)
-                    .ok_or_else(|| invariant_violation("control MVP L1 outbox ordinal overflow"))?;
-                combined.outbox.extend(
-                    shard
-                        .outbox
-                        .iter()
-                        .map(ControlMvpOutboxStateEntry::to_record),
-                );
-            }
+            combined.append_snapshot(shard)?;
         }
         Ok(combined)
     }
@@ -805,6 +813,11 @@ impl ControlMvpStateStore {
             let loaded = self
                 .load_segment_index(&state_segment_reference(reference))
                 .await?;
+            if index_key_bounds(&loaded.1)? != state_reference_key_bounds(reference)? {
+                return Err(invariant_violation(
+                    "L1 directory bounds differ from owning reference",
+                ));
+            }
             match index_key_bounds(&loaded.1)? {
                 Some((min_key, max_key)) => {
                     if saw_keyless_segment
@@ -940,7 +953,7 @@ impl ControlMvpStateStore {
             &self.scope,
             target_limits,
         )?;
-        row_shards
+        let rendered = row_shards
             .into_iter()
             .enumerate()
             .map(|(ordinal, rows)| {
@@ -969,7 +982,78 @@ impl ControlMvpStateStore {
                     index_bytes,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        self.validate_rendered_state(state, &rendered)?;
+        Ok(rendered)
+    }
+
+    fn validate_rendered_state(
+        &self,
+        expected: &ReplayState,
+        rendered: &[RenderedControlMvpStateSegment],
+    ) -> Result<()> {
+        #[cfg(feature = "test-utils")]
+        record_integrity_work(
+            1,
+            rendered
+                .iter()
+                .map(|segment| segment.bytes.len() + segment.index_bytes.len())
+                .sum(),
+        );
+        let mut actual = ReplayState {
+            logical_sequence: expected.logical_sequence,
+            history_root: expected.history_root.clone(),
+            ..ReplayState::default()
+        };
+        for segment in rendered {
+            let reference = state_segment_reference(&segment.reference);
+            let rows = decode_segment_rows(
+                &segment.bytes,
+                &segment.index_bytes,
+                &reference,
+                &self.scope,
+            )?;
+            if segment_row_key_bounds_hex(&rows)
+                != (
+                    segment.reference.min_key_hex.clone(),
+                    segment.reference.max_key_hex.clone(),
+                )
+            {
+                return Err(invariant_violation(
+                    "rendered L1 bounds differ from owning reference",
+                ));
+            }
+            actual.append_snapshot(state_object_from_segment_rows(
+                &segment.reference,
+                rows,
+                &self.scope,
+            )?)?;
+        }
+        if actual != *expected || actual.checksum()? != expected.checksum()? {
+            return Err(invariant_violation(
+                "rendered rewrite is not equivalent to expected state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_rendered_transaction(
+        &self,
+        tx: &ControlMvpTxObject,
+        bytes: &[u8],
+        index: &[u8],
+    ) -> Result<()> {
+        #[cfg(feature = "test-utils")]
+        record_integrity_work(2, bytes.len() + index.len());
+        let rows = decode_segment_rows(bytes, index, &tx.l0_segment, &self.scope)?;
+        let mut decoded = tx.clone();
+        decoded.hydrate_from_segment_rows(rows)?;
+        if integrity::mutation_digest(&decoded) != tx.history.mutation_sha256 {
+            return Err(invariant_violation(
+                "rendered transaction differs from expected mutation",
+            ));
+        }
+        Ok(())
     }
 
     async fn write_l0_segment(
@@ -1034,10 +1118,21 @@ impl ControlMvpStateStore {
     }
 
     async fn load_tx_metadata(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
+        if tx_ref.size_bytes == 0 || tx_ref.size_bytes > MAX_TRANSACTION_JSON_BYTES as u64 {
+            return Err(invariant_violation("invalid transaction reference length"));
+        }
         let bytes = self
-            .storage
-            .get(&self.paths.tx_object(&tx_ref.tx_id))
+            .get_json(
+                &self.paths.tx_object(&tx_ref.tx_id),
+                usize::try_from(tx_ref.size_bytes)
+                    .map_err(|_| invariant_violation("transaction metadata length overflow"))?,
+            )
             .await?;
+        if bytes.len() as u64 != tx_ref.size_bytes {
+            return Err(invariant_violation(
+                "transaction length differs from owning reference",
+            ));
+        }
         validate_raw_checksum(
             &bytes,
             Some(&tx_ref.checksum_sha256),
@@ -1263,8 +1358,7 @@ impl ControlMvpStateStore {
                 // An exact immutable record proves publication, even if its PUT
                 // response was lost. Absence cannot prove a remote PUT is terminal.
                 if self
-                    .storage
-                    .get(&path)
+                    .get_json(&path, MAX_CONTROL_JSON_BYTES)
                     .await
                     .is_ok_and(|visible| visible == bytes)
                 {
@@ -1306,6 +1400,7 @@ impl ControlMvpStateStore {
     ) -> Result<(ControlMvpCheckpoint, Vec<RenderedControlMvpStateSegment>)> {
         let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
+        let expected_state = self.replay_manifest(&manifest).await?;
         let checkpoint_id = format!(
             "checkpoint-{:020}-rg-{:020}-{}",
             pointer.logical_sequence,
@@ -1320,8 +1415,7 @@ impl ControlMvpStateStore {
         } else if manifest.tx_refs.is_empty() && !manifest.base_states.is_empty() {
             (manifest.base_states.clone(), Vec::new())
         } else {
-            let state = self.replay_manifest(&manifest).await?;
-            let rendered = self.render_state_snapshots(&state, &checkpoint_id)?;
+            let rendered = self.render_state_snapshots(&expected_state, &checkpoint_id)?;
             let state_refs = rendered
                 .iter()
                 .map(|segment| segment.reference.clone())
@@ -1329,16 +1423,26 @@ impl ControlMvpStateStore {
             (state_refs, rendered)
         };
         if rendered.is_empty() {
-            let state = self.load_state_snapshots(&state_refs).await?;
-            if state.logical_sequence != manifest.logical_sequence
-                || state.checksum()? != manifest.state_checksum_sha256
-            {
+            let mut state = self.load_state_snapshots(&state_refs).await?;
+            state.history_root.clone_from(&manifest.history_root);
+            if state != expected_state || state.checksum()? != manifest.state_checksum_sha256 {
                 return Err(invariant_violation(
                     "checkpoint reused state differs from authority manifest",
                 ));
             }
         }
         let checkpoint = ControlMvpCheckpoint {
+            validation: CheckpointValidation {
+                encoding_version: 1,
+                source_manifest_sha256: pointer.manifest_checksum_sha256.clone(),
+                source_history_root: manifest.history_root.clone(),
+                source_physical_root: manifest.physical_root.clone(),
+                state_checksum_sha256: manifest.state_checksum_sha256.clone(),
+                checkpoint_physical_root: integrity::checkpoint_physical_digest(
+                    &ControlMvpScopeDoc::from(&self.scope),
+                    &state_refs,
+                )?,
+            },
             reclamation_generation: pointer.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -1350,6 +1454,8 @@ impl ControlMvpStateStore {
             states: state_refs,
             min_retention_seconds: opts.min_retention_seconds(),
         };
+        checkpoint.validate(&self.scope, &checkpoint.checkpoint_id)?;
+        checkpoint.validate_source(&manifest)?;
         encode_envelope_limited(
             "control-mvp-checkpoint",
             &checkpoint,
@@ -1362,8 +1468,10 @@ impl ControlMvpStateStore {
     async fn load_checkpoint(&self, token: &CheckpointToken) -> Result<ControlMvpCheckpoint> {
         let checkpoint_id = token.checkpoint_id();
         let bytes = self
-            .storage
-            .get(&self.paths.checkpoint_object(checkpoint_id))
+            .get_json(
+                &self.paths.checkpoint_object(checkpoint_id),
+                MAX_CONTROL_JSON_BYTES,
+            )
             .await?;
         validate_raw_checksum(
             &bytes,
@@ -1402,7 +1510,11 @@ impl ControlMvpStateStore {
             .ok_or_else(|| validation_failed("checkpoint retention deadline overflow"))?;
         if deadline <= now {
             let checkpoint_path = self.paths.checkpoint_object(&checkpoint.checkpoint_id);
-            let checksum = prefixed_sha256(&self.storage.get(&checkpoint_path).await?);
+            let checksum = prefixed_sha256(
+                &self
+                    .get_json(&checkpoint_path, MAX_CONTROL_JSON_BYTES)
+                    .await?,
+            );
             if !self
                 .externally_protected(now, |reference| {
                     reference.checkpoint_path() == Some(checkpoint_path.as_str())
@@ -1452,8 +1564,10 @@ impl ControlMvpStateStore {
         }) {
             let checksum = prefixed_sha256(
                 &self
-                    .storage
-                    .get(&self.paths.manifest_object(token.authority_manifest_id()))
+                    .get_json(
+                        &self.paths.manifest_object(token.authority_manifest_id()),
+                        MAX_CONTROL_JSON_BYTES,
+                    )
                     .await?,
             );
             let manifest_id = token.authority_manifest_id();
@@ -1601,7 +1715,7 @@ impl ControlMvpStateStore {
         let mut next = Some((id.to_string(), digest.to_string()));
         let mut visited = BTreeSet::new();
         let mut metadata_bytes = 0_usize;
-        let mut child: Option<(u64, u64, String, String, bool)> = None;
+        let mut child: Option<AncestorTransition> = None;
         while let Some((id, digest)) = next {
             if visited.len() >= max_manifests || metadata_bytes >= max_bytes {
                 return Err(ambiguous_authority_outcome(
@@ -1611,12 +1725,11 @@ impl ControlMvpStateStore {
             if !visited.insert(id.clone()) {
                 return Err(invariant_violation("cyclic authority lineage"));
             }
+            let remaining = max_bytes - metadata_bytes;
+            let probe_end = MAX_CONTROL_JSON_PROBE_BYTES.min(remaining as u64);
             let bytes = self
                 .storage
-                .get_range(
-                    &self.paths.manifest_object(&id),
-                    0..MAX_CONTROL_JSON_PROBE_BYTES,
-                )
+                .get_range(&self.paths.manifest_object(&id), 0..probe_end)
                 .await
                 .map_err(|error| {
                     ambiguous_authority_outcome(format!(
@@ -1626,7 +1739,9 @@ impl ControlMvpStateStore {
             metadata_bytes = metadata_bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| invariant_violation("ancestry metadata byte overflow"))?;
-            if metadata_bytes > max_bytes {
+            if metadata_bytes > max_bytes
+                || (bytes.len() == remaining && sha256_hex(&bytes) != digest)
+            {
                 return Err(ambiguous_authority_outcome(
                     "authenticated ancestry metadata budget exhausted",
                 ));
@@ -1639,24 +1754,27 @@ impl ControlMvpStateStore {
                 "authenticated ancestor",
             )?;
             manifest.validate(&self.scope, &id)?;
-            if let Some((sequence, layout, checksum, predecessor_digest, suffix_empty)) = child {
+            if let Some(child) = child {
                 let successor_digest = sha256_hex(&encode_json(
                     &manifest.successor_anchor(),
                     "lineage successor",
                 )?);
-                let mutation = manifest.logical_sequence.checked_add(1) == Some(sequence)
-                    && manifest.layout_generation == layout
-                    && !suffix_empty
-                    && successor_digest == predecessor_digest;
-                let maintenance = manifest.logical_sequence == sequence
-                    && manifest.layout_generation.checked_add(1) == Some(layout)
-                    && manifest.state_checksum_sha256 == checksum
-                    && suffix_empty
+                let mutation = manifest.logical_sequence.checked_add(1) == Some(child.sequence)
+                    && manifest.layout_generation == child.layout
+                    && child.equivalence.is_none()
+                    && successor_digest == child.predecessor_digest;
+                let maintenance = manifest.logical_sequence == child.sequence
+                    && manifest.layout_generation.checked_add(1) == Some(child.layout)
+                    && manifest.state_checksum_sha256 == child.checksum
+                    && child.equivalence.as_ref().is_some_and(|evidence| {
+                        evidence.source_physical_root == manifest.physical_root
+                    })
                     && manifest
                         .maintenance_intent
                         .as_ref()
-                        .is_some_and(|intent| intent.layout_generation() == layout);
-                if !mutation && !maintenance {
+                        .is_some_and(|intent| intent.layout_generation() == child.layout);
+                let history_matches = child.parent_history_root == manifest.history_root;
+                if (!mutation && !maintenance) || !history_matches {
                     return Err(invariant_violation(
                         "invalid authenticated ancestry transition",
                     ));
@@ -1673,13 +1791,17 @@ impl ControlMvpStateStore {
                 &(&manifest.base_states, prefix),
                 "lineage predecessor",
             )?);
-            child = Some((
-                manifest.logical_sequence,
-                manifest.layout_generation,
-                manifest.state_checksum_sha256,
+            child = Some(AncestorTransition {
+                sequence: manifest.logical_sequence,
+                layout: manifest.layout_generation,
+                checksum: manifest.state_checksum_sha256,
                 predecessor_digest,
-                manifest.tx_refs.is_empty(),
-            ));
+                parent_history_root: manifest.tx_refs.last().map_or_else(
+                    || manifest.history_root.clone(),
+                    |tx| tx.history.preceding_root.clone(),
+                ),
+                equivalence: manifest.equivalence,
+            });
             next = manifest
                 .base_manifest_id
                 .zip(manifest.parent_manifest_sha256);
@@ -1692,7 +1814,9 @@ impl ControlMvpStateStore {
         source: &PersistedAuthorityReference,
     ) -> Result<ControlMvpBase> {
         self.validate_restore_authority_format(source)?;
-        let manifest_bytes = self.storage.get(source.manifest_path()).await?;
+        let manifest_bytes = self
+            .get_json(source.manifest_path(), MAX_CONTROL_JSON_BYTES)
+            .await?;
         if prefixed_sha256(&manifest_bytes) != source.manifest_sha256() {
             return Err(invariant_violation(
                 "Control MVP restore source manifest checksum mismatch",
@@ -1710,9 +1834,10 @@ impl ControlMvpStateStore {
                 "Control MVP restore source manifest sequence mismatch",
             ));
         }
-        let state = self.replay_manifest(&manifest).await?;
+        let state = self.replay_for_successor(&manifest).await?;
         let (base_states, tx_refs) = manifest.successor_anchor();
         Ok(ControlMvpBase {
+            history_anchor: manifest.successor_history_anchor(),
             reclamation_generation: manifest.reclamation_generation,
             pointer_version: None,
             manifest_id: Some(manifest.manifest_id),
@@ -1743,13 +1868,14 @@ impl ControlMvpStateStore {
                 let candidate_parent = self.load_restore_source_lineage(source).await?;
                 return Ok(StableRestoreBase {
                     current: ControlMvpBase {
+                        history_anchor: integrity::genesis(&ControlMvpScopeDoc::from(&self.scope)),
                         reclamation_generation: 0,
                         pointer_version: None,
                         manifest_id: None,
                         manifest_checksum_sha256: None,
                         writer_epoch: 0,
                         layout_generation: 0,
-                        state: ReplayState::default(),
+                        state: ReplayState::empty(&self.scope),
                         base_states: Vec::new(),
                         tx_refs: Vec::new(),
                     },
@@ -1759,7 +1885,9 @@ impl ControlMvpStateStore {
                     pointer_bytes: Bytes::from_static(EMPTY_CURRENT_BASE_MARKER),
                 });
             };
-            let pointer_bytes = self.storage.get(&self.paths.current_pointer()).await?;
+            let pointer_bytes = self
+                .get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
+                .await?;
             let Some(after) = self.storage.head(&self.paths.current_pointer()).await? else {
                 continue;
             };
@@ -1775,9 +1903,10 @@ impl ControlMvpStateStore {
                     "Control MVP restore base pointer sequence mismatch",
                 ));
             }
-            let state = self.replay_manifest(&manifest).await?;
+            let state = self.replay_for_successor(&manifest).await?;
             let (base_states, tx_refs) = manifest.successor_anchor();
             let current = ControlMvpBase {
+                history_anchor: manifest.successor_history_anchor(),
                 reclamation_generation: pointer.reclamation_generation,
                 pointer_version: Some(before.version),
                 manifest_id: Some(pointer.manifest_id),
@@ -1876,7 +2005,9 @@ impl ControlMvpStateStore {
             .logical_sequence
             .checked_add(1)
             .ok_or_else(|| validation_failed("Control MVP restore sequence overflow"))?;
-        if result_sequence <= source.logical_sequence() {
+        if stable.current_base_kind == ControlMvpRestoreCurrentBaseKind::Empty
+            && result_sequence <= source.logical_sequence()
+        {
             return Err(validation_failed(
                 "Control MVP restore result must be newer than source authority",
             ));
@@ -1913,6 +2044,7 @@ impl ControlMvpStateStore {
             result_logical_sequence: result_sequence,
         };
         let mut tx = ControlMvpTxObject {
+            history: HistoryLink::default(),
             reclamation_generation: stable.current.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
@@ -1937,6 +2069,7 @@ impl ControlMvpStateStore {
             }],
             outbox_trim: Vec::new(),
         };
+        tx.history = HistoryLink::new(&tx, &stable.candidate_parent.state.history_root)?;
         let l0_rows = segment_rows_for_tx(&tx);
         let (l0_segment_bytes, l0_index_bytes, l0_reference) = encode_segment(
             &transaction_id,
@@ -1947,6 +2080,7 @@ impl ControlMvpStateStore {
             self.segment_limits,
         )?;
         tx.l0_segment = l0_reference;
+        self.validate_rendered_transaction(&tx, &l0_segment_bytes, &l0_index_bytes)?;
         let transaction_bytes = encode_envelope_limited(
             "control-mvp-tx",
             &tx,
@@ -1954,14 +2088,17 @@ impl ControlMvpStateStore {
             "Control MVP restore transaction",
         )?;
         let transaction_checksum = sha256_hex(&transaction_bytes);
-        let mut candidate_state = stable.candidate_parent.state.clone();
-        candidate_state.apply_tx(&tx)?;
-        let mut tx_refs = stable.candidate_parent.tx_refs.clone();
-        tx_refs.push(ControlMvpTxRef {
+        let transaction_ref = ControlMvpTxRef {
+            size_bytes: transaction_bytes.len() as u64,
+            history: tx.history.clone(),
             tx_id: transaction_id.clone(),
             sequence: result_sequence,
             checksum_sha256: transaction_checksum,
-        });
+        };
+        let mut candidate_state = stable.candidate_parent.state.clone();
+        candidate_state.apply_tx(&tx)?;
+        let mut tx_refs = stable.candidate_parent.tx_refs.clone();
+        tx_refs.push(transaction_ref.clone());
         let production_async_layout = checkpoint_interval == Self::DEFAULT_CHECKPOINT_INTERVAL;
         if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
             return Err(CatalogError::MaintenanceBackpressure {
@@ -1983,7 +2120,11 @@ impl ControlMvpStateStore {
             stable.candidate_parent.layout_generation,
             tx_refs.len(),
         )?;
-        let manifest = ControlMvpManifest {
+        let mut manifest = ControlMvpManifest {
+            history_anchor: stable.candidate_parent.history_anchor.clone(),
+            history_root: candidate_state.history_root.clone(),
+            physical_root: String::new(),
+            equivalence: None,
             parent_manifest_sha256: stable.candidate_parent.manifest_checksum_sha256.clone(),
             reclamation_generation: stable.current.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -2003,6 +2144,7 @@ impl ControlMvpStateStore {
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
         };
+        manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.scope, &manifest.manifest_id)?;
         let manifest_bytes = encode_envelope_limited(
             "control-mvp-manifest",
@@ -2026,6 +2168,7 @@ impl ControlMvpStateStore {
             encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "Control MVP restore head")?;
 
         Ok(RenderedControlMvpRestore {
+            transaction_ref,
             transaction_id,
             transaction_bytes,
             l0_segment_bytes,
@@ -2058,6 +2201,7 @@ impl ControlMvpStateStore {
             self.checkpoint_interval,
         )?;
         let plan = ControlMvpRestorePlan {
+            transaction_ref: Some(rendered.transaction_ref.clone()),
             record_type: RESTORE_PLAN_RECORD_TYPE.to_string(),
             version: RESTORE_PLAN_VERSION,
             implementation: IMPLEMENTATION.to_string(),
@@ -2570,8 +2714,7 @@ impl ControlMvpMaintenanceWorker {
                     .await?;
                 let visible = self
                     .store
-                    .storage
-                    .get(&self.store.paths.current_pointer())
+                    .get_json(&self.store.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
                     .await?;
                 let after = self
                     .store
@@ -2733,7 +2876,7 @@ impl ControlMvpMaintenanceWorker {
                         .ok_or_else(|| {
                             invariant_violation("noncanonical control MVP checkpoint path")
                         })?;
-                    let bytes = self.lifecycle.get_raw(&path).await?;
+                    let bytes = self.store.get_json(&path, MAX_CONTROL_JSON_BYTES).await?;
                     let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
                         &bytes,
                         "control-mvp-checkpoint",
@@ -2758,6 +2901,14 @@ impl ControlMvpMaintenanceWorker {
                             .is_none_or(|deadline| deadline >= now)
                     });
                     if retained_checkpoint {
+                        let source = self
+                            .store
+                            .load_manifest_with_expected_checksum(
+                                &checkpoint.manifest_id,
+                                Some(&checkpoint.manifest_checksum_sha256),
+                            )
+                            .await?;
+                        checkpoint.validate_source(&source)?;
                         retained_closure.insert(path);
                         self.protect_manifest_closure(
                             &checkpoint.manifest_id,
@@ -2805,11 +2956,7 @@ impl ControlMvpMaintenanceWorker {
             .store
             .load_manifest_with_expected_checksum(manifest_id, expected_digest)
             .await?;
-        for reference in manifest
-            .base_states
-            .iter()
-            .chain(manifest.anchor_states.iter())
-        {
+        for reference in manifest.owning_states() {
             Self::protect_segment(&self.store.paths, reference, protected);
         }
         for tx_ref in &manifest.tx_refs {
@@ -2852,7 +2999,7 @@ impl ControlMvpMaintenanceWorker {
         self.protect_manifest_closure(reference.manifest_id(), Some(checksum), &mut protected)
             .await?;
         if let Some(path) = reference.checkpoint_path() {
-            let bytes = self.store.storage.get(path).await?;
+            let bytes = self.store.get_json(path, MAX_CONTROL_JSON_BYTES).await?;
             if Some(prefixed_sha256(&bytes).as_str()) != reference.checkpoint_sha256() {
                 return Err(invariant_violation("retained checkpoint checksum mismatch"));
             }
@@ -2863,6 +3010,7 @@ impl ControlMvpMaintenanceWorker {
                 "retained checkpoint",
             )?;
             checkpoint.validate(&self.store.scope, &checkpoint.checkpoint_id)?;
+            checkpoint.validate_source(&manifest)?;
             if self
                 .store
                 .paths
@@ -2957,7 +3105,7 @@ impl ControlMvpMaintenanceWorker {
                     source_manifest.logical_sequence,
                 )
                 .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
-            let state = self.store.replay_manifest(&source_manifest).await?;
+            let state = self.store.replay_for_successor(&source_manifest).await?;
             let candidate_manifest_id = format!(
                 "manifest-{:020}-layout-{:020}-rg-{:020}-{}",
                 source_manifest.logical_sequence,
@@ -2972,7 +3120,22 @@ impl ControlMvpMaintenanceWorker {
                 .iter()
                 .map(|segment| segment.reference.clone())
                 .collect::<Vec<_>>();
-            let candidate_manifest = ControlMvpManifest {
+            let mut candidate_manifest = ControlMvpManifest {
+                history_anchor: HistoryAnchor {
+                    sequence: state.logical_sequence,
+                    root: state.history_root.clone(),
+                },
+                history_root: state.history_root.clone(),
+                physical_root: String::new(),
+                equivalence: Some(RewriteEquivalence {
+                    encoding_version: 1,
+                    source_manifest_id: source_manifest.manifest_id.clone(),
+                    source_manifest_sha256: pointer.manifest_checksum_sha256.clone(),
+                    source_history_root: source_manifest.history_root.clone(),
+                    source_physical_root: source_manifest.physical_root.clone(),
+                    logical_sequence: state.logical_sequence,
+                    state_checksum_sha256: state.checksum()?,
+                }),
                 parent_manifest_sha256: Some(pointer.manifest_checksum_sha256.clone()),
                 reclamation_generation: pointer.reclamation_generation,
                 format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -2989,6 +3152,7 @@ impl ControlMvpMaintenanceWorker {
                 state_checksum_sha256: source_manifest.state_checksum_sha256.clone(),
                 maintenance_intent: None,
             };
+            candidate_manifest.physical_root = candidate_manifest.physical_digest()?;
             candidate_manifest.validate(&self.store.scope, &candidate_manifest_id)?;
             let manifest_bytes = encode_envelope_limited(
                 "control-mvp-manifest",
@@ -3061,8 +3225,7 @@ impl ControlMvpMaintenanceWorker {
                 Err(error) => {
                     if self
                         .store
-                        .storage
-                        .get(&self.store.paths.current_pointer())
+                        .get_json(&self.store.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
                         .await
                         .is_ok_and(|visible| visible == pointer_bytes)
                     {
@@ -3257,11 +3420,13 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 4 binds the observed reclamation generation as well as exact HEAD
-/// identity. Versions 1 through 3 remain decodable only for supersession;
+/// Version 6 binds the exact transaction/history reference, observed reclamation
+/// generation and exact HEAD identity. Versions 1 through 5 are supersession-only;
 /// recovery must replan them before writing any artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_ref: Option<ControlMvpTxRef>,
     record_type: String,
     version: u32,
     implementation: String,
@@ -3295,6 +3460,8 @@ pub struct ControlMvpRestorePlan {
 /// version instead of letting Serde silently default it.
 #[derive(Deserialize)]
 struct ControlMvpRestorePlanWire {
+    #[serde(default)]
+    transaction_ref: Option<ControlMvpTxRef>,
     record_type: String,
     version: u32,
     implementation: String,
@@ -3373,6 +3540,13 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             _ => wire.checkpoint_interval,
         };
         Ok(Self {
+            transaction_ref: if wire.version == RESTORE_PLAN_VERSION {
+                Some(wire.transaction_ref.ok_or_else(|| {
+                    serde::de::Error::custom("restore plan lacks transaction history witness")
+                })?)
+            } else {
+                wire.transaction_ref
+            },
             record_type: wire.record_type,
             version: wire.version,
             implementation: wire.implementation,
@@ -3409,6 +3583,26 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
 }
 
 impl ControlMvpRestorePlan {
+    fn transaction_reference(&self) -> Result<&ControlMvpTxRef> {
+        let reference = self
+            .transaction_ref
+            .as_ref()
+            .ok_or_else(|| validation_failed("restore plan lacks transaction reference"))?;
+        if reference.tx_id != self.transaction_id
+            || reference.sequence != self.result_logical_sequence
+            || format!("sha256:{}", reference.checksum_sha256) != self.transaction_sha256
+            || reference.size_bytes == 0
+            || reference.size_bytes > MAX_TRANSACTION_JSON_BYTES as u64
+        {
+            return Err(invariant_violation(
+                "restore transaction reference mismatch",
+            ));
+        }
+        reference
+            .history
+            .validate(&ControlMvpScopeDoc::from(&self.scope), reference.sequence)?;
+        Ok(reference)
+    }
     /// Returns the durable plan version.
     #[must_use]
     pub const fn version(&self) -> u32 {
@@ -3425,6 +3619,7 @@ impl ControlMvpRestorePlan {
                 | RESTORE_PLAN_VERSION_V2
                 | RESTORE_PLAN_VERSION_V3
                 | RESTORE_PLAN_VERSION_V4
+                | RESTORE_PLAN_VERSION_V5
         )
     }
 
@@ -3516,6 +3711,7 @@ impl ControlMvpRestorePlan {
     }
 
     fn validate(&self, store: &ControlMvpStateStore) -> Result<()> {
+        self.transaction_reference()?;
         self.scope.validate()?;
         self.source.validate()?;
         let validated_identity = RestoreAttemptIdentity::new(
@@ -3554,7 +3750,8 @@ impl ControlMvpRestorePlan {
             || self.base_logical_sequence == 0
             || self.result_logical_sequence
                 != self.base_logical_sequence.checked_add(1).unwrap_or(0)
-            || self.result_logical_sequence <= self.source.logical_sequence()
+            || (self.current_base_kind == ControlMvpRestoreCurrentBaseKind::Empty
+                && self.result_logical_sequence <= self.source.logical_sequence())
         {
             return Err(validation_failed("invalid Control MVP restore plan"));
         }
@@ -3747,14 +3944,9 @@ impl ControlMvpRestoreParticipant {
     async fn inspect_visible_restore(
         &self,
         plan: &ControlMvpRestorePlan,
-        planned_checksum: &str,
     ) -> Result<RestoreParticipantInspection> {
-        let planned_tx_ref = ControlMvpTxRef {
-            tx_id: plan.transaction_id.clone(),
-            sequence: plan.result_logical_sequence,
-            checksum_sha256: planned_checksum.to_string(),
-        };
-        let tx = self.store.load_tx(&planned_tx_ref).await?;
+        let planned_tx_ref = plan.transaction_reference()?;
+        let tx = self.store.load_tx(planned_tx_ref).await?;
         let expected_request_id = format!(
             "restore:{}:{}:{}",
             plan.identity.restore_id(),
@@ -3790,8 +3982,7 @@ impl ControlMvpRestoreParticipant {
         }
         let manifest_bytes = self
             .store
-            .storage
-            .get(&plan.candidate_manifest_path)
+            .get_json(&plan.candidate_manifest_path, MAX_CONTROL_JSON_BYTES)
             .await?;
         if prefixed_sha256(&manifest_bytes) != plan.candidate_manifest_sha256 {
             return Err(invariant_violation(
@@ -3824,7 +4015,7 @@ impl ControlMvpRestoreParticipant {
             || manifest.anchor_states.is_empty() == should_anchor
             || manifest.tx_refs.len() != expected_prefix.len() + 1
             || manifest.tx_refs.get(..expected_prefix.len()) != Some(expected_prefix.as_slice())
-            || manifest.tx_refs.last() != Some(&planned_tx_ref)
+            || manifest.tx_refs.last() != Some(planned_tx_ref)
         {
             return Err(invariant_violation(
                 "visible restore candidate manifest does not extend the planned base",
@@ -4279,6 +4470,11 @@ impl ControlMvpTxn {
             self.base.state.validate_precondition(precondition)?;
         }
         validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
+        if self.base.tx_refs.is_empty() && !self.base.base_states.is_empty() {
+            self.store
+                .verify_materialized_state(&self.base.base_states, &self.base.state)
+                .await?;
+        }
 
         let next_sequence = next_logical_sequence(
             self.base.state.logical_sequence,
@@ -4326,6 +4522,7 @@ impl ControlMvpTxn {
             ));
         }
         let mut tx = ControlMvpTxObject {
+            history: HistoryLink::default(),
             reclamation_generation: self.base.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -4346,6 +4543,7 @@ impl ControlMvpTxn {
                 .collect(),
             outbox_trim: self.outbox_trim,
         };
+        tx.history = HistoryLink::new(&tx, &self.base.state.history_root)?;
         let l0_rows = segment_rows_for_tx(&tx);
         let (l0_bytes, l0_index_bytes, l0_reference) = encode_segment(
             &self.tx_id,
@@ -4356,6 +4554,8 @@ impl ControlMvpTxn {
             self.store.segment_limits,
         )?;
         tx.l0_segment = l0_reference.clone();
+        self.store
+            .validate_rendered_transaction(&tx, &l0_bytes, &l0_index_bytes)?;
         let tx_bytes = encode_envelope_limited(
             "control-mvp-tx",
             &tx,
@@ -4364,6 +4564,8 @@ impl ControlMvpTxn {
         )?;
         let tx_checksum = sha256_hex(&tx_bytes);
         let candidate_tx_ref = ControlMvpTxRef {
+            size_bytes: tx_bytes.len() as u64,
+            history: tx.history.clone(),
             tx_id: self.tx_id.clone(),
             sequence: next_sequence,
             checksum_sha256: tx_checksum.clone(),
@@ -4404,7 +4606,11 @@ impl ControlMvpTxn {
             tx_refs.len(),
         )?;
 
-        let manifest = ControlMvpManifest {
+        let mut manifest = ControlMvpManifest {
+            history_anchor: self.base.history_anchor.clone(),
+            history_root: candidate_state.history_root.clone(),
+            physical_root: String::new(),
+            equivalence: None,
             parent_manifest_sha256: self.base.manifest_checksum_sha256.clone(),
             reclamation_generation: self.base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
@@ -4421,6 +4627,7 @@ impl ControlMvpTxn {
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
         };
+        manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.store.scope, &manifest.manifest_id)?;
         let manifest_bytes = encode_envelope_limited(
             "control-mvp-manifest",
@@ -4501,8 +4708,7 @@ impl ControlMvpTxn {
                 // commitment. Anything else remains genuinely ambiguous.
                 let exact_pointer_match = self
                     .store
-                    .storage
-                    .get(&self.store.paths.current_pointer())
+                    .get_json(&self.store.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
                     .await
                     .is_ok_and(|current| current == pointer_bytes);
                 if exact_pointer_match {
@@ -4667,17 +4873,9 @@ impl ArcoStateReader for ControlMvpStateStore {
                 Some(&checkpoint.manifest_checksum_sha256),
             )
             .await?;
-        if manifest.logical_sequence != checkpoint.logical_sequence {
-            return Err(invariant_violation(
-                "control MVP checkpoint sequence does not match its authority manifest",
-            ));
-        }
-        let state = self.load_state_snapshots(&checkpoint.states).await?;
-        if state.checksum()? != manifest.state_checksum_sha256 {
-            return Err(invariant_violation(
-                "control MVP checkpoint snapshot is not the state named by its authority manifest",
-            ));
-        }
+        checkpoint.validate_source(&manifest)?;
+        let mut state = self.load_state_snapshots(&checkpoint.states).await?;
+        checkpoint.validate_state(&mut state)?;
         Ok(Box::new(ControlMvpRetainedReader {
             scope: self.scope.clone(),
             token: self
@@ -4793,7 +4991,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         self.validate_state_token_protection(token, Utc::now())
             .await?;
         let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
-        let bytes = self.storage.get(&manifest_path).await?;
+        let bytes = self
+            .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
+            .await?;
         validate_raw_checksum(
             &bytes,
             Some(token.manifest_witness()?),
@@ -4841,7 +5041,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             ));
         }
         let checkpoint_path = self.paths.checkpoint_object(token.checkpoint_id());
-        let checkpoint_bytes = self.storage.get(&checkpoint_path).await?;
+        let checkpoint_bytes = self
+            .get_json(&checkpoint_path, MAX_CONTROL_JSON_BYTES)
+            .await?;
         validate_raw_checksum(
             &checkpoint_bytes,
             Some(token.checkpoint_witness()?),
@@ -4858,7 +5060,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             .await?;
 
         let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
-        let manifest_bytes = self.storage.get(&manifest_path).await?;
+        let manifest_bytes = self
+            .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
+            .await?;
         validate_raw_checksum(
             &manifest_bytes,
             Some(&checkpoint.manifest_checksum_sha256),
@@ -4871,20 +5075,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             "control MVP manifest",
         )?;
         manifest.validate(&self.scope, &checkpoint.manifest_id)?;
-        if manifest.logical_sequence != checkpoint.logical_sequence {
-            return Err(invariant_violation(
-                "checkpoint logical sequence does not match manifest",
-            ));
-        }
-
-        let state = self.load_state_snapshots(&checkpoint.states).await?;
-        if state.logical_sequence != manifest.logical_sequence
-            || state.checksum()? != manifest.state_checksum_sha256
-        {
-            return Err(invariant_violation(
-                "persisted checkpoint state differs from authority manifest",
-            ));
-        }
+        checkpoint.validate_source(&manifest)?;
+        let mut state = self.load_state_snapshots(&checkpoint.states).await?;
+        checkpoint.validate_state(&mut state)?;
 
         PersistedAuthorityReference::new(
             IMPLEMENTATION,
@@ -4900,6 +5093,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         )
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the persisted-reference validation boundary together.
     async fn resolve_persisted_reference_at(
         &self,
         reference: &PersistedAuthorityReference,
@@ -4928,7 +5122,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "persisted authority manifest path is not canonical for this store",
             ));
         }
-        let manifest_bytes = self.storage.get(&manifest_path).await?;
+        let manifest_bytes = self
+            .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
+            .await?;
         if prefixed_sha256(&manifest_bytes) != reference.manifest_sha256() {
             return Err(invariant_violation(
                 "persisted authority manifest checksum mismatch",
@@ -4976,7 +5172,9 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                         "persisted checkpoint path is not canonical for this store",
                     ));
                 }
-                let checkpoint_bytes = self.storage.get(checkpoint_path).await?;
+                let checkpoint_bytes = self
+                    .get_json(checkpoint_path, MAX_CONTROL_JSON_BYTES)
+                    .await?;
                 if prefixed_sha256(&checkpoint_bytes) != reference.checkpoint_sha256().unwrap_or("")
                 {
                     return Err(invariant_violation(
@@ -4990,12 +5188,10 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                     "control MVP checkpoint",
                 )?;
                 checkpoint.validate(&self.scope, checkpoint_id)?;
+                checkpoint.validate_source(&manifest)?;
                 self.validate_checkpoint_protection(&checkpoint, now)
                     .await?;
-                if checkpoint.manifest_id != reference.manifest_id()
-                    || checkpoint.logical_sequence != reference.logical_sequence()
-                    || checkpoint.manifest_checksum_sha256 != sha256_hex(&manifest_bytes)
-                {
+                if checkpoint.manifest_checksum_sha256 != sha256_hex(&manifest_bytes) {
                     return Err(invariant_violation(
                         "persisted checkpoint does not match authority manifest",
                     ));
@@ -5048,21 +5244,13 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             .validate_restore_authority_format(plan.source())?;
         plan.validate(&self.store)?;
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
-        let planned_checksum = plan
-            .transaction_sha256
-            .strip_prefix("sha256:")
-            .ok_or_else(|| validation_failed("restore transaction digest is malformed"))?;
-        let planned_tx_ref = ControlMvpTxRef {
-            tx_id: plan.transaction_id.clone(),
-            sequence: plan.result_logical_sequence,
-            checksum_sha256: planned_checksum.to_string(),
-        };
+        let planned_tx_ref = plan.transaction_reference()?;
         let in_lineage = self
             .store
-            .tx_in_lineage(&stable.candidate_parent, &planned_tx_ref)
+            .tx_in_lineage(&stable.candidate_parent, planned_tx_ref)
             .await?;
         if in_lineage {
-            return self.inspect_visible_restore(plan, planned_checksum).await;
+            return self.inspect_visible_restore(plan).await;
         }
 
         let version_matches = stable.current_base_kind == plan.current_base_kind
@@ -5314,6 +5502,7 @@ impl ArcoStateTxn for ControlMvpTxn {
 
 #[derive(Debug, Clone)]
 struct ControlMvpBase {
+    history_anchor: HistoryAnchor,
     manifest_checksum_sha256: Option<String>,
     reclamation_generation: u64,
     pointer_version: Option<String>,
@@ -5325,6 +5514,15 @@ struct ControlMvpBase {
     tx_refs: Vec<ControlMvpTxRef>,
 }
 
+struct AncestorTransition {
+    sequence: u64,
+    layout: u64,
+    checksum: String,
+    predecessor_digest: String,
+    parent_history_root: String,
+    equivalence: Option<RewriteEquivalence>,
+}
+
 struct StableRestoreBase {
     current: ControlMvpBase,
     candidate_parent: ControlMvpBase,
@@ -5334,6 +5532,7 @@ struct StableRestoreBase {
 }
 
 struct RenderedControlMvpRestore {
+    transaction_ref: ControlMvpTxRef,
     transaction_id: String,
     transaction_bytes: Bytes,
     l0_segment_bytes: Bytes,
@@ -5480,15 +5679,66 @@ struct ControlMvpRestoreNotice {
     result_logical_sequence: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ReplayState {
+    history_root: String,
     logical_sequence: u64,
     kv: BTreeMap<Vec<u8>, StoredValue>,
     outbox: Vec<ControlMvpProjectionOutboxRecord>,
 }
 
 impl ReplayState {
+    fn append_snapshot(&mut self, shard: ControlMvpStateObject) -> Result<()> {
+        if shard.logical_sequence != self.logical_sequence
+            || shard
+                .kv_start_ordinal
+                .is_some_and(|start| start != self.kv.len() as u64)
+            || shard
+                .outbox_start_ordinal
+                .is_some_and(|start| start != self.outbox.len() as u64)
+        {
+            return Err(invariant_violation(
+                "discontinuous L1 shard sequence or ordinals",
+            ));
+        }
+        for entry in shard.entries {
+            let value = StoredValue {
+                tombstone: entry.value.is_none(),
+                bytes: Bytes::from(entry.value.unwrap_or_default()),
+                generation: entry.generation,
+            };
+            if self.kv.insert(entry.key, value).is_some() {
+                return Err(invariant_violation("duplicate L1 key"));
+            }
+        }
+        let mut ids = self
+            .outbox
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<BTreeSet<_>>();
+        for entry in shard.outbox {
+            if !ids.insert(entry.record_id.clone()) {
+                return Err(invariant_violation("duplicate L1 outbox incarnation"));
+            }
+            self.outbox.push(entry.to_record());
+        }
+        Ok(())
+    }
+    fn empty(scope: &StateScope) -> Self {
+        Self {
+            history_root: integrity::genesis(&ControlMvpScopeDoc::from(scope)).root,
+            ..Self::default()
+        }
+    }
     fn apply_tx(&mut self, tx: &ControlMvpTxObject) -> Result<()> {
+        tx.history.validate(&tx.scope, tx.sequence)?;
+        if tx.history.preceding_root != self.history_root
+            || integrity::mutation_digest(tx) != tx.history.mutation_sha256
+        {
+            return Err(invariant_violation(
+                "replayed mutation differs from logical history",
+            ));
+        }
         let expected =
             next_logical_sequence(self.logical_sequence, "replaying a control MVP transaction")?;
         if tx.sequence != expected {
@@ -5557,6 +5807,7 @@ impl ReplayState {
             self.outbox.push(entry.to_record_with_sequence(tx.sequence));
         }
         self.logical_sequence = tx.sequence;
+        self.history_root.clone_from(&tx.history.resulting_root);
         Ok(())
     }
 
@@ -5713,7 +5964,7 @@ impl ReplayState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredValue {
     bytes: Bytes,
     generation: u64,
@@ -5819,6 +6070,11 @@ impl ControlMvpPointer {
         }
         if self.writer_epoch == u64::MAX {
             return Err(terminal_published_writer_epoch());
+        }
+        if !integrity::valid_immutable_id(&self.manifest_id)
+            || !valid_raw_digest(&self.manifest_checksum_sha256)
+        {
+            return Err(invariant_violation("invalid pointer manifest reference"));
         }
         Ok(())
     }
@@ -5986,6 +6242,10 @@ impl ControlMvpStateObject {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpManifest {
+    history_anchor: HistoryAnchor,
+    history_root: String,
+    physical_root: String,
+    equivalence: Option<RewriteEquivalence>,
     parent_manifest_sha256: Option<String>,
     reclamation_generation: u64,
     format_version: u32,
@@ -6005,6 +6265,17 @@ struct ControlMvpManifest {
 
 impl ControlMvpManifest {
     fn validate(&self, scope: &StateScope, expected_manifest_id: &str) -> Result<()> {
+        if !integrity::valid_immutable_id(&self.manifest_id)
+            || self
+                .base_manifest_id
+                .as_deref()
+                .is_some_and(|id| !integrity::valid_immutable_id(id))
+            || !valid_raw_digest(&self.state_checksum_sha256)
+        {
+            return Err(invariant_violation(
+                "invalid manifest identity or state digest",
+            ));
+        }
         if self.format_version != CONTROL_MVP_FORMAT_VERSION {
             return Err(invariant_violation(
                 "control MVP manifest format version mismatch",
@@ -6046,59 +6317,36 @@ impl ControlMvpManifest {
         self.validate_replay_suffix(base_sequence)?;
         self.validate_anchor_states()?;
         self.validate_maintenance_intent(scope)?;
+        self.validate_integrity()?;
         Ok(())
     }
 
     fn validate_base_states(&self) -> Result<Option<u64>> {
-        let base_sequence = self
-            .base_states
-            .first()
-            .map(|reference| reference.logical_sequence);
-        if self
-            .base_states
-            .iter()
-            .any(|reference| Some(reference.logical_sequence) != base_sequence)
-        {
-            return Err(invariant_violation(
-                "control MVP manifest base L1 segments mix logical sequences",
-            ));
-        }
-        let mut prior_max = None;
-        let mut saw_keyless = false;
+        let sequence = integrity::validate_state_refs(&self.base_states)?;
+        integrity::validate_state_refs(&self.anchor_states)?;
         let mut ids = BTreeSet::new();
-        for reference in self.base_states.iter().chain(self.anchor_states.iter()) {
-            if reference.segment_size_bytes == 0
-                || reference.segment_size_bytes > MAX_SEGMENT_BYTES as u64
-                || reference.index_size_bytes == 0
-                || reference.index_size_bytes > MAX_SEGMENT_INDEX_BYTES as u64
-                || !valid_raw_digest(&reference.checksum_sha256)
-                || !valid_raw_digest(&reference.index_checksum_sha256)
-                || !ids.insert(&reference.state_id)
-            {
-                return Err(invariant_violation("invalid manifest owning reference"));
-            }
+        if self
+            .owning_states()
+            .any(|reference| !ids.insert(&reference.state_id))
+        {
+            return Err(invariant_violation("duplicate owning state identity"));
         }
-        for reference in &self.base_states {
-            match state_reference_key_bounds(reference)? {
-                Some((minimum, maximum)) => {
-                    if saw_keyless
-                        || prior_max
-                            .as_ref()
-                            .is_some_and(|prior: &Vec<u8>| prior.as_slice() >= minimum.as_slice())
-                    {
-                        return Err(invariant_violation(
-                            "control MVP manifest L1 key bounds overlap or are out of order",
-                        ));
-                    }
-                    prior_max = Some(maximum);
-                }
-                None => saw_keyless = true,
-            }
-        }
-        Ok(base_sequence)
+        Ok(sequence)
+    }
+
+    fn owning_states(&self) -> impl Iterator<Item = &ControlMvpStateRef> {
+        self.base_states.iter().chain(&self.anchor_states)
     }
 
     fn validate_replay_suffix(&self, base_sequence: Option<u64>) -> Result<()> {
+        let mut ids = BTreeSet::new();
+        if self.tx_refs.iter().any(|reference| {
+            !integrity::valid_immutable_id(&reference.tx_id) || !ids.insert(&reference.tx_id)
+        }) {
+            return Err(invariant_violation(
+                "duplicate or noncanonical transaction identity",
+            ));
+        }
         if self.tx_refs.windows(2).any(|pair| match pair {
             [first, second] => first.sequence.checked_add(1) != Some(second.sequence),
             _ => true,
@@ -6189,13 +6437,16 @@ impl ControlMvpManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlMvpTxRef {
+    size_bytes: u64,
+    history: HistoryLink,
     tx_id: String,
     sequence: u64,
     checksum_sha256: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpTxObject {
+    history: HistoryLink,
     reclamation_generation: u64,
     implementation: String,
     scope: ControlMvpScopeDoc,
@@ -6219,7 +6470,7 @@ struct ControlMvpTxObject {
     outbox_trim: Vec<ControlMvpOutboxTrimEntry>,
 }
 
-/// Exact event incarnation removed by a v4 L0 transaction row.
+/// Exact event incarnation removed by an identified L0 transaction row.
 #[derive(Debug, Clone)]
 struct ControlMvpOutboxTrimEntry {
     record_id: String,
@@ -6238,6 +6489,12 @@ impl ControlMvpOutboxTrimEntry {
 
 impl ControlMvpTxObject {
     fn validate(&self, scope: &StateScope, tx_ref: &ControlMvpTxRef) -> Result<()> {
+        self.history.validate(&self.scope, self.sequence)?;
+        if self.history != tx_ref.history {
+            return Err(invariant_violation(
+                "transaction history differs from owning reference",
+            ));
+        }
         if self.implementation != IMPLEMENTATION {
             return Err(invariant_violation(
                 "control MVP transaction implementation mismatch",
@@ -6421,7 +6678,7 @@ fn unwritten_l0_segment_ref(segment_id: &str, logical_sequence: u64) -> ControlM
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpWriteEntry {
     key: Vec<u8>,
     generation: u64,
@@ -7836,8 +8093,9 @@ struct ReplayStateDigestEntry {
     value: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpCheckpoint {
+    validation: CheckpointValidation,
     reclamation_generation: u64,
     format_version: u32,
     implementation: String,
@@ -7852,6 +8110,26 @@ struct ControlMvpCheckpoint {
 
 impl ControlMvpCheckpoint {
     fn validate(&self, scope: &StateScope, expected_checkpoint_id: &str) -> Result<()> {
+        if !integrity::valid_immutable_id(&self.checkpoint_id)
+            || !integrity::valid_immutable_id(&self.manifest_id)
+            || !valid_raw_digest(&self.manifest_checksum_sha256)
+        {
+            return Err(invariant_violation(
+                "invalid checkpoint root identity or digest",
+            ));
+        }
+        if self.validation.encoding_version != 1
+            || self.validation.source_manifest_sha256 != self.manifest_checksum_sha256
+            || !valid_raw_digest(&self.validation.source_history_root)
+            || !valid_raw_digest(&self.validation.source_physical_root)
+            || !valid_raw_digest(&self.validation.state_checksum_sha256)
+            || integrity::checkpoint_physical_digest(&self.scope, &self.states)?
+                != self.validation.checkpoint_physical_root
+        {
+            return Err(invariant_violation(
+                "invalid checkpoint validation evidence",
+            ));
+        }
         if self.format_version != CONTROL_MVP_FORMAT_VERSION {
             return Err(invariant_violation(
                 "control MVP checkpoint format version mismatch",
@@ -7966,7 +8244,10 @@ async fn put_immutable_matching(
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { .. } => {
-            let existing = storage.get(path).await?;
+            let probe_end = (bytes.len() as u64)
+                .checked_add(1)
+                .ok_or_else(|| invariant_violation("immutable readback length overflow"))?;
+            let existing = storage.get_range(path, 0..probe_end).await?;
             if existing == bytes {
                 Ok(())
             } else {
@@ -7991,7 +8272,10 @@ async fn put_restore_immutable(
     {
         WriteResult::Success { .. } => Ok(()),
         WriteResult::PreconditionFailed { .. } => {
-            let existing = storage.get(path).await?;
+            let probe_end = (bytes.len() as u64)
+                .checked_add(1)
+                .ok_or_else(|| invariant_violation("immutable readback length overflow"))?;
+            let existing = storage.get_range(path, 0..probe_end).await?;
             if existing == bytes {
                 Ok(())
             } else {
@@ -8153,6 +8437,18 @@ fn validate_persisted_json_size(bytes: &[u8], max_bytes: usize, context: &str) -
 #[cfg(feature = "test-utils")]
 thread_local! {
     static TEST_SHA256_WORK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    static TEST_INTEGRITY_WORK: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(clippy::indexing_slicing)] // Three internal kinds, each owning its count/byte pair.
+fn record_integrity_work(kind: usize, bytes: usize) {
+    TEST_INTEGRITY_WORK.with(|work| {
+        let mut counts = work.get();
+        counts[kind * 2] += 1;
+        counts[kind * 2 + 1] += bytes as u64;
+        work.set(counts);
+    });
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -8382,6 +8678,14 @@ mod tests {
         }
 
         async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            if path.ends_with("/head/current.json")
+                && self.fail_fence_readback.load(Ordering::SeqCst)
+                && !self.lose_head_response.load(Ordering::SeqCst)
+            {
+                return Err(arco_core::Error::storage(
+                    "injected unavailable fence readback",
+                ));
+            }
             self.inner.get_range(path, range).await
         }
 
@@ -8546,6 +8850,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "b"]
         );
+    }
+
+    #[tokio::test]
+    async fn committed_history_roots_advance_even_for_empty_mutations() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let token = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap()
+                .into_state_token();
+            let bytes = storage
+                .get_raw(&store.paths.manifest_object(token.authority_manifest_id()))
+                .await
+                .unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let root = doc["payload"]["history_root"]
+                .as_str()
+                .expect("durable logical-history root");
+            assert_eq!(root.len(), 64);
+            assert_eq!(doc["payload"]["physical_root"].as_str().unwrap().len(), 64);
+            roots.push(root.to_string());
+        }
+        assert_ne!(roots[0], roots[1]);
     }
 
     #[tokio::test]
@@ -10743,6 +11081,7 @@ mod tests {
     fn v4_l0_trim_rows_require_origin_sequence() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let mut tx = ControlMvpTxObject {
+            history: HistoryLink::default(),
             reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&scope),
@@ -10768,7 +11107,7 @@ mod tests {
                 logical_ordinal: 0,
                 origin_sequence: None,
             }])
-            .expect_err("v4 trim rows must identify the removed event incarnation");
+            .expect_err("trim rows must identify the removed event incarnation");
 
         assert!(matches!(error, CatalogError::InvariantViolation { .. }));
     }
@@ -10777,6 +11116,7 @@ mod tests {
     fn replay_rejects_sequence_zero_after_terminal_logical_sequence_without_panicking() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let tx = ControlMvpTxObject {
+            history: HistoryLink::default(),
             reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&scope),

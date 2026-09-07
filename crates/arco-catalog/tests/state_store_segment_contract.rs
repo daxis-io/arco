@@ -192,6 +192,8 @@ struct MirrorStateRef {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorTxRef {
+    size_bytes: u64,
+    history: MirrorHistoryLink,
     tx_id: String,
     sequence: u64,
     checksum_sha256: String,
@@ -210,6 +212,10 @@ struct MirrorSegmentRef {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorManifest {
+    history_anchor: MirrorHistoryAnchor,
+    history_root: String,
+    physical_root: String,
+    equivalence: Option<Value>,
     parent_manifest_sha256: Option<String>,
     reclamation_generation: u64,
     format_version: u32,
@@ -229,6 +235,7 @@ struct MirrorManifest {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorTransaction {
+    history: MirrorHistoryLink,
     reclamation_generation: u64,
     implementation: String,
     scope: MirrorScope,
@@ -240,14 +247,84 @@ struct MirrorTransaction {
     l0_segment: MirrorSegmentRef,
 }
 
+#[derive(Serialize, Deserialize)]
+struct MirrorHistoryAnchor {
+    sequence: u64,
+    root: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MirrorHistoryLink {
+    preceding_root: String,
+    mutation_sha256: String,
+    resulting_root: String,
+}
+
+// Independent format encoder keeps corruption fixtures coherent through the outer
+// physical commitment, so malformed-Arrow tests reach the intended decoder.
+fn fixture_physical_root(manifest: &MirrorManifest) -> String {
+    fn field(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    let mut out = Vec::new();
+    field(&mut out, b"arco/control-v1/manifest-layout");
+    out.extend_from_slice(&1_u32.to_be_bytes());
+    field(&mut out, manifest.implementation.as_bytes());
+    out.extend_from_slice(&manifest.format_version.to_be_bytes());
+    for component in [
+        &manifest.scope.tenant_id,
+        &manifest.scope.workspace_id,
+        &manifest.scope.domain,
+    ] {
+        field(&mut out, component.as_bytes());
+    }
+    for (role, states) in [(1_u8, &manifest.base_states), (2, &manifest.anchor_states)] {
+        out.push(role);
+        out.extend_from_slice(&(states.len() as u64).to_be_bytes());
+        for state in states {
+            field(&mut out, state.state_id.as_bytes());
+            for integer in [
+                state.logical_sequence,
+                state.segment_size_bytes,
+                state.index_size_bytes,
+            ] {
+                out.extend_from_slice(&integer.to_be_bytes());
+            }
+            out.extend_from_slice(&1_u32.to_be_bytes());
+            out.extend_from_slice(&1_u32.to_be_bytes());
+            for bound in [&state.min_key_hex, &state.max_key_hex] {
+                out.push(u8::from(bound.is_some()));
+                if let Some(bound) = bound {
+                    field(&mut out, &hex::decode(bound).expect("key bound"));
+                }
+            }
+            out.extend_from_slice(&hex::decode(&state.checksum_sha256).expect("state digest"));
+            out.extend_from_slice(
+                &hex::decode(&state.index_checksum_sha256).expect("index digest"),
+            );
+        }
+    }
+    out.push(3);
+    out.extend_from_slice(&(manifest.tx_refs.len() as u64).to_be_bytes());
+    for tx in &manifest.tx_refs {
+        field(&mut out, tx.tx_id.as_bytes());
+        out.extend_from_slice(&tx.sequence.to_be_bytes());
+        out.extend_from_slice(&tx.size_bytes.to_be_bytes());
+        out.extend_from_slice(&manifest.format_version.to_be_bytes());
+        out.extend_from_slice(&hex::decode(&tx.checksum_sha256).expect("tx digest"));
+    }
+    sha256(&out)
+}
+
 fn reseal_envelope(value: &mut Value) -> Bytes {
     let artifact_type = value["artifact_type"].as_str().expect("artifact type");
     let payload = if artifact_type == "control-mvp-manifest" {
-        serde_json::to_vec(
-            &serde_json::from_value::<MirrorManifest>(value["payload"].clone())
-                .expect("manifest payload"),
-        )
-        .expect("manifest payload bytes")
+        let mut manifest = serde_json::from_value::<MirrorManifest>(value["payload"].clone())
+            .expect("manifest payload");
+        manifest.physical_root = fixture_physical_root(&manifest);
+        value["payload"]["physical_root"] = Value::String(manifest.physical_root.clone());
+        serde_json::to_vec(&manifest).expect("manifest payload bytes")
     } else {
         assert_eq!(artifact_type, "control-mvp-tx", "test envelope type");
         serde_json::to_vec(
@@ -956,6 +1033,7 @@ async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
             .expect("trim manifest"),
     )
     .expect("trim manifest JSON");
+    manifest["payload"]["tx_refs"][0]["size_bytes"] = Value::from(transaction_bytes.len());
     manifest["payload"]["tx_refs"][0]["checksum_sha256"] =
         Value::String(sha256(&transaction_bytes));
     let manifest_bytes = reseal_envelope(&mut manifest);

@@ -198,6 +198,7 @@ struct MirrorSegmentRef {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorManifest {
+    reclamation_generation: u64,
     format_version: u32,
     implementation: String,
     scope: MirrorScope,
@@ -215,6 +216,7 @@ struct MirrorManifest {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorTransaction {
+    reclamation_generation: u64,
     implementation: String,
     scope: MirrorScope,
     tx_id: String,

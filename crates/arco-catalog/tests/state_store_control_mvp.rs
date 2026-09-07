@@ -1334,7 +1334,7 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        3,
+        4,
         plan.version(),
         "planning writes the current plan version"
     );
@@ -1374,9 +1374,9 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     // The current version, in contrast, still requires the field: an absent
     // observation must never be silently read as an observation of epoch 0.
     let mut truncated = downgraded;
-    truncated["version"] = Value::from(3_u64);
+    truncated["version"] = Value::from(4_u64);
     let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(truncated)
-        .expect_err("a v3 plan without observed_writer_epoch must fail closed");
+        .expect_err("a v4 plan without observed_writer_epoch must fail closed");
     assert!(
         error.to_string().contains("observed_writer_epoch"),
         "unexpected error: {error}"
@@ -1649,6 +1649,7 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     let mut wire = serde_json::to_value(&plan).expect("plan json");
     let object = wire.as_object_mut().expect("plan object");
     object.remove("observed_writer_epoch");
+    object.remove("observed_reclamation_generation");
     object.remove("checkpoint_interval");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
@@ -2093,7 +2094,7 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
 
     for (field, replacement) in [
         ("record_type", Value::String("other_plan".to_string())),
-        ("version", Value::from(4_u64)),
+        ("version", Value::from(5_u64)),
     ] {
         let mut value = serde_json::to_value(&plan).expect("plan json");
         value[field] = replacement;

@@ -1,6 +1,6 @@
 //! Object-store-backed control-state MVP.
 //!
-//! # Replay model (format version 4)
+//! # Replay model (format version 5)
 //!
 //! Every manifest anchors replay on an ordered set of checksummed, non-overlapping
 //! immutable Arrow IPC L1 segments and carries only the transaction suffix
@@ -57,16 +57,23 @@
 //!
 //! # Format versioning
 //!
-//! Format version 4 is the only supported on-disk format and is rooted beneath
-//! the fresh `control/v1/` prefix. There is deliberately no migration path from
-//! the version 3 shadow format or the older JSON-anchor formats: unknown and old
-//! `format_version` values fail closed instead of being migrated.
+//! Format version 5 is the only supported on-disk format and is rooted beneath
+//! `control/v1/` on fresh roots. There is deliberately no migration path from
+//! the unfenced version 4 format, version 3 shadow format, or older JSON-anchor
+//! formats: unknown and old `format_version` values fail closed.
+//!
+//! Before active GC deletes a candidate page, it advances HEAD's checked
+//! reclamation generation by exact-version CAS under retention coordination.
+//! Publishers pinned before that fence lose CAS and must regenerate artifacts.
+//! Candidate identities include staging generation; transactions also bind the
+//! exact observed HEAD version. A GC-only fence preserves the selected manifest,
+//! logical sequence, writer epoch, and physical layout.
 //!
 //! Restore *plans* are versioned separately from on-disk state artifacts,
 //! because an in-flight restore attempt written by an older revision must
 //! still be readable by the recovery path that has to supersede it. Plan
-//! version 1 (which predates `observed_writer_epoch`) and version 2 (which
-//! names the retired object layout) are therefore decoded as legacy plans
+//! versions 1 and 2 (which name retired layouts) and version 3 (which predates
+//! reclamation fencing) are therefore decoded as legacy plans
 //! that can be inspected and superseded but can never be applied. See
 //! [`ControlMvpRestorePlan`].
 
@@ -108,6 +115,7 @@ use super::{
     build_scan_page, build_scan_page_with_backend_boundary, scan_all_entries_bounded,
 };
 use crate::error::{CatalogError, Result};
+use crate::gc::reachability::RetainedAuthorityRoots;
 use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
 use crate::workspace_snapshot::{
     RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
@@ -115,13 +123,14 @@ use crate::workspace_snapshot::{
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 3;
+const RESTORE_PLAN_VERSION: u32 = 4;
+const RESTORE_PLAN_VERSION_V3: u32 = 3;
 /// Restore-plan versions that predate the `control/v1/` authority layout.
 /// They remain decodable only so recovery can safely supersede them without
 /// dereferencing paths from the retired layout.
 const RESTORE_PLAN_VERSION_V1: u32 = 1;
 const RESTORE_PLAN_VERSION_V2: u32 = 2;
-const CONTROL_MVP_FORMAT_VERSION: u32 = 4;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 5;
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SCAN_ARROW_BYTES: usize = MAX_SEGMENT_BYTES;
 const MAX_SEGMENT_INDEX_BYTES: usize = 512 * 1024;
@@ -376,6 +385,11 @@ impl ControlMvpStateStore {
             || Ulid::new().to_string().to_ascii_lowercase(),
             ToOwned::to_owned,
         );
+        let head_identity = sha256_hex(base.pointer_version.as_deref().unwrap_or("").as_bytes());
+        let suffix = format!(
+            "{suffix}-head-{head_identity}-rg-{:020}",
+            base.reclamation_generation
+        );
         let tx_id = request_id.clone().map_or_else(
             || format!("tx-{next_sequence:020}-{suffix}"),
             |request_id| format!("tx-{next_sequence:020}-{request_id}-{suffix}"),
@@ -422,6 +436,7 @@ impl ControlMvpStateStore {
         let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
         let Some(pointer_meta) = pointer_meta else {
             return Ok(ControlMvpBase {
+                reclamation_generation: 0,
                 pointer_version: None,
                 manifest_id: None,
                 writer_epoch: 0,
@@ -438,6 +453,7 @@ impl ControlMvpStateStore {
         let (base_states, tx_refs) = manifest.successor_anchor();
 
         Ok(ControlMvpBase {
+            reclamation_generation: pointer.reclamation_generation,
             pointer_version: Some(pointer_meta.version),
             manifest_id: Some(pointer.manifest_id),
             writer_epoch: pointer.writer_epoch,
@@ -1153,19 +1169,36 @@ impl ControlMvpStateStore {
             MAX_CONTROL_JSON_BYTES,
             "control MVP checkpoint",
         )?;
+        let path = self.paths.checkpoint_object(&checkpoint.checkpoint_id);
         match self
             .storage
             .put(
-                &self.paths.checkpoint_object(&checkpoint.checkpoint_id),
-                bytes,
+                &path,
+                bytes.clone(),
                 AuthorityWritePrecondition::DoesNotExist,
             )
-            .await?
+            .await
         {
-            WriteResult::Success { .. } => Ok(()),
-            WriteResult::PreconditionFailed { .. } => Err(precondition_failed(
+            Ok(WriteResult::Success { .. }) => Ok(()),
+            Ok(WriteResult::PreconditionFailed { .. }) => Err(precondition_failed(
                 "control MVP checkpoint object already exists",
             )),
+            Err(error) => {
+                // An exact immutable record proves publication, even if its PUT
+                // response was lost. Absence cannot prove a remote PUT is terminal.
+                if self
+                    .storage
+                    .get(&path)
+                    .await
+                    .is_ok_and(|visible| visible == bytes)
+                {
+                    Ok(())
+                } else {
+                    Err(ambiguous_authority_outcome(format!(
+                        "control MVP checkpoint publication could not be reconciled: {error}"
+                    )))
+                }
+            }
         }
     }
 
@@ -1176,8 +1209,24 @@ impl ControlMvpStateStore {
         &self,
         opts: &CheckpointOptions,
     ) -> Result<CheckpointToken> {
+        let (checkpoint, rendered) = self.prepare_checkpoint(opts).await?;
+        self.write_rendered_state_snapshots(&rendered).await?;
+        self.write_checkpoint(&checkpoint).await?;
+        Ok(self.checkpoint_token(checkpoint.checkpoint_id))
+    }
+
+    async fn prepare_checkpoint(
+        &self,
+        opts: &CheckpointOptions,
+    ) -> Result<(ControlMvpCheckpoint, Vec<RenderedControlMvpStateSegment>)> {
         let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
+        let checkpoint_id = format!(
+            "checkpoint-{:020}-rg-{:020}-{}",
+            pointer.logical_sequence,
+            pointer.reclamation_generation,
+            Ulid::new().to_string().to_ascii_lowercase()
+        );
         // Reuse the manifest's own anchored snapshot when it has one;
         // otherwise materialize the replay state as a new immutable snapshot
         // so checkpoint reads never replay history.
@@ -1187,19 +1236,15 @@ impl ControlMvpStateStore {
             (manifest.base_states.clone(), Vec::new())
         } else {
             let state = self.replay_manifest(&manifest).await?;
-            let rendered = self.render_state_snapshots(&state, &manifest.manifest_id)?;
+            let rendered = self.render_state_snapshots(&state, &checkpoint_id)?;
             let state_refs = rendered
                 .iter()
                 .map(|segment| segment.reference.clone())
                 .collect();
             (state_refs, rendered)
         };
-        let checkpoint_id = format!(
-            "checkpoint-{:020}-{}",
-            pointer.logical_sequence,
-            Ulid::new().to_string().to_ascii_lowercase()
-        );
         let checkpoint = ControlMvpCheckpoint {
+            reclamation_generation: pointer.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
@@ -1216,9 +1261,7 @@ impl ControlMvpStateStore {
             MAX_CONTROL_JSON_BYTES,
             "control MVP checkpoint",
         )?;
-        self.write_rendered_state_snapshots(&rendered).await?;
-        self.write_checkpoint(&checkpoint).await?;
-        Ok(self.checkpoint_token(checkpoint_id))
+        Ok((checkpoint, rendered))
     }
 
     async fn load_checkpoint(&self, checkpoint_id: &str) -> Result<ControlMvpCheckpoint> {
@@ -1234,6 +1277,128 @@ impl ControlMvpStateStore {
         )?;
         checkpoint.validate(&self.scope, checkpoint_id)?;
         Ok(checkpoint)
+    }
+
+    async fn validate_checkpoint_protection(
+        &self,
+        checkpoint: &ControlMvpCheckpoint,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let meta = self
+            .storage
+            .head(&self.paths.checkpoint_object(&checkpoint.checkpoint_id))
+            .await?
+            .ok_or_else(|| validation_failed("checkpoint protection is missing"))?;
+        let created = meta
+            .last_modified
+            .ok_or_else(|| validation_failed("checkpoint protection has no creation timestamp"))?;
+        let floor = u64::try_from(CONTROL_MVP_TOKEN_RETENTION_DAYS * 24 * 60 * 60)
+            .map_err(|_| invariant_violation("invalid checkpoint retention floor"))?;
+        let seconds = i64::try_from(checkpoint.min_retention_seconds.unwrap_or(floor).max(floor))
+            .map_err(|_| validation_failed("checkpoint retention interval overflow"))?;
+        let deadline = created
+            .checked_add_signed(ChronoDuration::seconds(seconds))
+            .ok_or_else(|| validation_failed("checkpoint retention deadline overflow"))?;
+        if deadline <= now {
+            let checkpoint_path = self.paths.checkpoint_object(&checkpoint.checkpoint_id);
+            let checksum = prefixed_sha256(&self.storage.get(&checkpoint_path).await?);
+            if !self
+                .externally_protected(now, |reference| {
+                    reference.checkpoint_path() == Some(checkpoint_path.as_str())
+                        && reference.checkpoint_sha256() == Some(checksum.as_str())
+                        && reference.manifest_id() == checkpoint.manifest_id
+                        && reference.logical_sequence() == checkpoint.logical_sequence
+                        && reference.manifest_sha256()
+                            == format!("sha256:{}", checkpoint.manifest_checksum_sha256)
+                })
+                .await?
+            {
+                return Err(validation_failed(
+                    "checkpoint protection expired; object existence cannot renew it",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // A caller can hold the identity of a staged manifest even when its CAS
+    // never landed. Only published lineage supplies source-protection evidence.
+    // The time floor keeps the historical manifest and all intervening links
+    // protected while a coordinated retained-root publication validates them.
+    async fn validate_state_token_protection(
+        &self,
+        token: &StateToken,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let pointer = self.load_pointer().await?;
+        if pointer.manifest_id == token.authority_manifest_id() {
+            return Ok(());
+        }
+        let meta = self
+            .storage
+            .head(&self.paths.manifest_object(token.authority_manifest_id()))
+            .await?
+            .ok_or_else(|| validation_failed("state token protection is missing"))?;
+        if meta.last_modified.is_none_or(|created| {
+            created <= now - ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS)
+        }) {
+            let checksum = prefixed_sha256(
+                &self
+                    .storage
+                    .get(&self.paths.manifest_object(token.authority_manifest_id()))
+                    .await?,
+            );
+            let manifest_id = token.authority_manifest_id();
+            if self
+                .externally_protected(now, |reference| {
+                    reference.manifest_id() == manifest_id
+                        && reference.logical_sequence() == token.logical_sequence()
+                        && reference.manifest_sha256() == checksum
+                })
+                .await?
+            {
+                return Ok(());
+            }
+            return Err(validation_failed("state token protection expired"));
+        }
+        let mut next = Some(pointer.manifest_id);
+        let mut visited = BTreeSet::new();
+        while let Some(id) = next {
+            if !visited.insert(id.clone()) {
+                return Err(invariant_violation("cyclic authority lineage"));
+            }
+            if id == token.authority_manifest_id() {
+                return Ok(());
+            }
+            let manifest = self.load_manifest(&id).await?;
+            if manifest.logical_sequence < token.logical_sequence() {
+                break;
+            }
+            next = manifest.base_manifest_id;
+        }
+        Err(validation_failed(
+            "state token has no acknowledged publication in authority lineage",
+        ))
+    }
+
+    async fn externally_protected(
+        &self,
+        now: DateTime<Utc>,
+        matches: impl Fn(&PersistedAuthorityReference) -> bool,
+    ) -> Result<bool> {
+        let mut roots = RetainedAuthorityRoots::new(&self.retention, now);
+        while let Some(root) = roots.next().await? {
+            for reference in root.authorities {
+                if reference.scope() == &self.scope
+                    && reference.implementation() == IMPLEMENTATION
+                    && matches(&reference)
+                {
+                    validate_control_mvp_authority_format(&self.paths, &reference)?;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn token(&self, manifest_id: String, logical_sequence: u64) -> StateToken {
@@ -1355,6 +1520,7 @@ impl ControlMvpStateStore {
         let state = self.replay_manifest(&manifest).await?;
         let (base_states, tx_refs) = manifest.successor_anchor();
         Ok(ControlMvpBase {
+            reclamation_generation: manifest.reclamation_generation,
             pointer_version: None,
             manifest_id: Some(manifest.manifest_id),
             writer_epoch: 0,
@@ -1383,6 +1549,7 @@ impl ControlMvpStateStore {
                 let candidate_parent = self.load_restore_source_lineage(source).await?;
                 return Ok(StableRestoreBase {
                     current: ControlMvpBase {
+                        reclamation_generation: 0,
                         pointer_version: None,
                         manifest_id: None,
                         writer_epoch: 0,
@@ -1416,6 +1583,7 @@ impl ControlMvpStateStore {
             let state = self.replay_manifest(&manifest).await?;
             let (base_states, tx_refs) = manifest.successor_anchor();
             let current = ControlMvpBase {
+                reclamation_generation: pointer.reclamation_generation,
                 pointer_version: Some(before.version),
                 manifest_id: Some(pointer.manifest_id),
                 writer_epoch: pointer.writer_epoch,
@@ -1529,6 +1697,7 @@ impl ControlMvpStateStore {
             result_sequence,
             Some(checkpoint_interval),
         );
+        let suffix = format!("{suffix}-rg-{:020}", stable.current.reclamation_generation);
         let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
         let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
         let outbox_record_id = format!(
@@ -1548,6 +1717,7 @@ impl ControlMvpStateStore {
             result_logical_sequence: result_sequence,
         };
         let mut tx = ControlMvpTxObject {
+            reclamation_generation: stable.current.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
             tx_id: transaction_id.clone(),
@@ -1618,6 +1788,7 @@ impl ControlMvpStateStore {
             tx_refs.len(),
         )?;
         let manifest = ControlMvpManifest {
+            reclamation_generation: stable.current.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
@@ -1643,6 +1814,7 @@ impl ControlMvpStateStore {
         )?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
         let pointer = ControlMvpPointer {
+            reclamation_generation: stable.current.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.scope),
@@ -1697,6 +1869,7 @@ impl ControlMvpStateStore {
             base_pointer_version: stable.current.pointer_version.clone(),
             observed_base_pointer_sha256: prefixed_sha256(&stable.pointer_bytes),
             observed_writer_epoch: stable.writer_epoch,
+            observed_reclamation_generation: stable.current.reclamation_generation,
             checkpoint_interval: Some(self.checkpoint_interval),
             base_manifest_id: stable
                 .candidate_parent
@@ -2013,9 +2186,9 @@ impl ControlMvpMaintenanceWorker {
     /// of age. Only immutable artifacts older than seven days are considered;
     /// missing object timestamps fail closed by retaining the object.
     ///
-    /// `additional_protected_paths` carries snapshot/export/restore-journal
-    /// closure discovered by the operator. Every path must be inside this
-    /// exact authority domain.
+    /// Active snapshot/export roots are loaded through the retention capability.
+    /// `additional_protected_paths` may conservatively protect extra operator
+    /// paths; every path must be inside this exact authority domain.
     ///
     /// # Errors
     ///
@@ -2095,7 +2268,7 @@ impl ControlMvpMaintenanceWorker {
         let mut epoch = match RetentionMutationEpoch::claim(
             self.lifecycle.clone(),
             &mut guard,
-            RetentionMutationKind::CatalogGc,
+            RetentionMutationKind::ControlGc,
             operation_id,
         )
         .await
@@ -2115,13 +2288,21 @@ impl ControlMvpMaintenanceWorker {
                 bytes_reclaimed: 0,
                 continuation: plan.continuation.clone(),
             };
+            // Fence the exact inventoried authority before authorizing any DELETE.
+            // Even a delayed DELETE can then affect only objects which publishers
+            // in the new generation cannot introduce into their closure.
+            let head_version = if plan.candidates.is_empty() {
+                plan.head_version.clone()
+            } else {
+                self.fence_reclamation(&plan.head_version).await?
+            };
             for candidate in &plan.candidates {
                 let head = self
                     .lifecycle
                     .head_raw(&self.store.paths.current_pointer())
                     .await?
                     .ok_or_else(|| invariant_violation("control MVP head disappeared during GC"))?;
-                if head.version != plan.head_version {
+                if head.version != head_version {
                     return Err(CatalogError::CasFailed {
                         message: "control MVP head advanced during GC revalidation".to_string(),
                     });
@@ -2149,6 +2330,66 @@ impl ControlMvpMaintenanceWorker {
         match (collection, settlement, release) {
             (Ok(outcome), Ok(()), Ok(())) => Ok(outcome),
             (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    async fn fence_reclamation(&self, observed_version: &str) -> Result<String> {
+        let pointer = self.store.load_pointer().await?;
+        let generation = pointer
+            .reclamation_generation
+            .checked_add(1)
+            .ok_or_else(|| invariant_violation("control MVP reclamation generation exhausted"))?;
+        let fenced = ControlMvpPointer {
+            reclamation_generation: generation,
+            ..pointer
+        };
+        let bytes = encode_json_limited(
+            &fenced,
+            MAX_HEAD_JSON_BYTES,
+            "control MVP reclamation fence",
+        )?;
+        match self
+            .store
+            .storage
+            .put(
+                &self.store.paths.current_pointer(),
+                bytes.clone(),
+                AuthorityWritePrecondition::MatchesVersion(observed_version.to_string()),
+            )
+            .await
+        {
+            Ok(WriteResult::Success { version }) => Ok(version),
+            Ok(WriteResult::PreconditionFailed { .. }) => Err(CatalogError::CasFailed {
+                message: "control MVP authority changed before reclamation fence".to_string(),
+            }),
+            Err(error) => {
+                // Pair the read-back bytes with an exact version. A later authority
+                // publication invalidates this plan even if its generation matches.
+                let before = self
+                    .store
+                    .storage
+                    .head(&self.store.paths.current_pointer())
+                    .await?;
+                let visible = self
+                    .store
+                    .storage
+                    .get(&self.store.paths.current_pointer())
+                    .await?;
+                let after = self
+                    .store
+                    .storage
+                    .head(&self.store.paths.current_pointer())
+                    .await?;
+                if let (Some(before), Some(after)) = (before, after)
+                    && before.version == after.version
+                    && visible == bytes
+                {
+                    return Ok(after.version);
+                }
+                Err(ambiguous_authority_outcome(format!(
+                    "control MVP reclamation fence could not be reconciled: {error}"
+                )))
+            }
         }
     }
 
@@ -2234,6 +2475,23 @@ impl ControlMvpMaintenanceWorker {
         self.protect_manifest_closure(&pointer.manifest_id, &mut current_closure)
             .await?;
         candidates.retain(|candidate| !current_closure.contains(&candidate.path));
+
+        // Inventory active external pins inside the same retention epoch as the
+        // fence. Caller-supplied paths are not a substitute for durable roots.
+        let mut roots = RetainedAuthorityRoots::new(&self.lifecycle, now);
+        while let Some(root) = roots.next().await? {
+            // Existing retained records may include provider objects that are
+            // not reachable through a domain authority. Preserve their exact
+            // paths as well, including records written by older publishers.
+            candidates.retain(|candidate| !root.required_paths.contains(&candidate.path));
+            for reference in root.authorities {
+                if reference.scope() != &self.store.scope {
+                    continue;
+                }
+                let closure = self.protected_reference_closure(&reference).await?;
+                candidates.retain(|candidate| !closure.contains(&candidate.path));
+            }
+        }
 
         // Stream every retained root through a page-sized inventory and a
         // single-root closure. Only the bounded candidate page survives across
@@ -2360,6 +2618,65 @@ impl ControlMvpMaintenanceWorker {
         Ok(())
     }
 
+    async fn protected_reference_closure(
+        &self,
+        reference: &PersistedAuthorityReference,
+    ) -> Result<BTreeSet<String>> {
+        if reference.implementation() != IMPLEMENTATION {
+            return Err(validation_failed(
+                "retained authority implementation does not match control store",
+            ));
+        }
+        validate_control_mvp_authority_format(&self.store.paths, reference)?;
+        let checksum = reference
+            .manifest_sha256()
+            .strip_prefix("sha256:")
+            .ok_or_else(|| validation_failed("retained manifest digest is malformed"))?;
+        let manifest = self
+            .store
+            .load_manifest_with_expected_checksum(reference.manifest_id(), Some(checksum))
+            .await?;
+        if manifest.logical_sequence != reference.logical_sequence() {
+            return Err(invariant_violation(
+                "retained manifest logical sequence mismatch",
+            ));
+        }
+        let mut protected = BTreeSet::new();
+        self.protect_manifest_closure(reference.manifest_id(), &mut protected)
+            .await?;
+        if let Some(path) = reference.checkpoint_path() {
+            let bytes = self.store.storage.get(path).await?;
+            if Some(prefixed_sha256(&bytes).as_str()) != reference.checkpoint_sha256() {
+                return Err(invariant_violation("retained checkpoint checksum mismatch"));
+            }
+            let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+                &bytes,
+                "control-mvp-checkpoint",
+                MAX_CONTROL_JSON_BYTES,
+                "retained checkpoint",
+            )?;
+            checkpoint.validate(&self.store.scope, &checkpoint.checkpoint_id)?;
+            if self
+                .store
+                .paths
+                .checkpoint_object(&checkpoint.checkpoint_id)
+                != path
+                || checkpoint.manifest_id != reference.manifest_id()
+                || checkpoint.manifest_checksum_sha256 != checksum
+                || checkpoint.logical_sequence != reference.logical_sequence()
+            {
+                return Err(invariant_violation(
+                    "retained checkpoint authority binding mismatch",
+                ));
+            }
+            protected.insert(path.to_string());
+            for segment in &checkpoint.states {
+                Self::protect_segment(&self.store.paths, segment, &mut protected);
+            }
+        }
+        Ok(protected)
+    }
+
     fn protect_segment(
         paths: &ControlMvpPaths,
         reference: &ControlMvpStateRef,
@@ -2432,9 +2749,10 @@ impl ControlMvpMaintenanceWorker {
             );
             let state = self.store.replay_manifest(&source_manifest).await?;
             let candidate_manifest_id = format!(
-                "manifest-{:020}-layout-{:020}-{}",
+                "manifest-{:020}-layout-{:020}-rg-{:020}-{}",
                 source_manifest.logical_sequence,
                 intent.layout_generation(),
+                pointer.reclamation_generation,
                 Ulid::new().to_string().to_ascii_lowercase()
             );
             let rendered = self
@@ -2445,6 +2763,7 @@ impl ControlMvpMaintenanceWorker {
                 .map(|segment| segment.reference.clone())
                 .collect::<Vec<_>>();
             let candidate_manifest = ControlMvpManifest {
+                reclamation_generation: pointer.reclamation_generation,
                 format_version: CONTROL_MVP_FORMAT_VERSION,
                 implementation: IMPLEMENTATION.to_string(),
                 scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -2467,6 +2786,7 @@ impl ControlMvpMaintenanceWorker {
                 "control MVP maintenance manifest",
             )?;
             let candidate_pointer = ControlMvpPointer {
+                reclamation_generation: pointer.reclamation_generation,
                 format_version: CONTROL_MVP_FORMAT_VERSION,
                 implementation: IMPLEMENTATION.to_string(),
                 scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -2719,16 +3039,9 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 3 is the version this revision plans in. Versions 1 and 2 carry
-/// paths from the retired authority layout and are still **decodable** so an
-/// in-flight attempt can be inspected, superseded, and safely replanned.
-///
-/// The migration is fail-closed. A decoded v1 plan records
-/// `observed_writer_epoch = 0` as "not observed". Both old versions reach
-/// exactly one terminal outcome at inspection:
-/// [`RestoreParticipantInspection::Superseded`]. They are never Ready and
-/// their object paths are never read or written. The driver replans them as a
-/// version 3 plan under the current layout.
+/// Version 4 binds the observed reclamation generation as well as exact HEAD
+/// identity. Versions 1 through 3 remain decodable only for supersession;
+/// recovery must replan them before writing any artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     record_type: String,
@@ -2741,6 +3054,7 @@ pub struct ControlMvpRestorePlan {
     base_pointer_version: Option<String>,
     observed_base_pointer_sha256: String,
     observed_writer_epoch: u64,
+    observed_reclamation_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_interval: Option<u64>,
     base_manifest_id: String,
@@ -2774,6 +3088,8 @@ struct ControlMvpRestorePlanWire {
     observed_base_pointer_sha256: String,
     #[serde(default)]
     observed_writer_epoch: Option<u64>,
+    #[serde(default)]
+    observed_reclamation_generation: Option<u64>,
     #[serde(default)]
     checkpoint_interval: Option<u64>,
     base_manifest_id: String,
@@ -2849,6 +3165,15 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             base_pointer_version: wire.base_pointer_version,
             observed_base_pointer_sha256: wire.observed_base_pointer_sha256,
             observed_writer_epoch,
+            observed_reclamation_generation: if wire.version == RESTORE_PLAN_VERSION {
+                wire.observed_reclamation_generation.ok_or_else(|| {
+                    serde::de::Error::custom(
+                        "control MVP restore plan is missing observed_reclamation_generation",
+                    )
+                })?
+            } else {
+                wire.observed_reclamation_generation.unwrap_or(0)
+            },
             checkpoint_interval,
             base_manifest_id: wire.base_manifest_id,
             base_logical_sequence: wire.base_logical_sequence,
@@ -2878,7 +3203,7 @@ impl ControlMvpRestorePlan {
     pub const fn is_legacy_version(&self) -> bool {
         matches!(
             self.version,
-            RESTORE_PLAN_VERSION_V1 | RESTORE_PLAN_VERSION_V2
+            RESTORE_PLAN_VERSION_V1 | RESTORE_PLAN_VERSION_V2 | RESTORE_PLAN_VERSION_V3
         )
     }
 
@@ -3023,6 +3348,7 @@ impl ControlMvpRestorePlan {
             self.result_logical_sequence,
             Some(checkpoint_interval),
         );
+        let suffix = format!("{suffix}-rg-{:020}", self.observed_reclamation_generation);
         let expected_transaction_id =
             format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
         let expected_manifest_id = format!(
@@ -3087,7 +3413,7 @@ impl ControlMvpRestorePlan {
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || !self.is_legacy_version()
             || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
-            || self.checkpoint_interval.is_some()
+            || (self.version != RESTORE_PLAN_VERSION_V3 && self.checkpoint_interval.is_some())
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -3288,6 +3614,7 @@ impl ControlMvpRestoreParticipant {
             }
         }
         let candidate_pointer = ControlMvpPointer {
+            reclamation_generation: manifest.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -3757,6 +4084,7 @@ impl ControlMvpTxn {
             ));
         }
         let mut tx = ControlMvpTxObject {
+            reclamation_generation: self.base.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             tx_id: self.tx_id.clone(),
@@ -3835,6 +4163,7 @@ impl ControlMvpTxn {
         )?;
 
         let manifest = ControlMvpManifest {
+            reclamation_generation: self.base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -3857,6 +4186,7 @@ impl ControlMvpTxn {
         )?;
         let manifest_checksum = sha256_hex(&manifest_bytes);
         let pointer = ControlMvpPointer {
+            reclamation_generation: self.base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -4123,7 +4453,6 @@ impl ArcoStateAdmin for ControlMvpStateStore {
             Ulid::new().to_string().to_ascii_lowercase()
         );
         let lifecycle = self.retention.clone();
-        let terminal_operation_id = operation_id.clone();
         let mut epoch = match RetentionMutationEpoch::claim(
             lifecycle,
             &mut guard,
@@ -4138,37 +4467,21 @@ impl ArcoStateAdmin for ControlMvpStateStore {
                 return Err(error);
             }
         };
-        let publication = epoch
-            .run_external_mutation(self.publish_checkpoint_under_retention(&opts))
-            .await;
-        let settlement = if publication.is_ok() {
-            epoch.settle().await
-        } else {
-            // Every checkpoint write above has finished before this branch is
-            // entered. Checkpoint publication is additive: a selected final
-            // checkpoint record is a retained root, while snapshots without
-            // that record are merely unreachable candidates. It is therefore
-            // safe to prove this exact operation terminal after a returned
-            // error. A process crash cannot execute this reconciliation and
-            // deliberately leaves the epoch in flight for operator recovery.
-            drop(epoch);
-            let terminal_operation_ids = BTreeSet::from([terminal_operation_id]);
-            match RetentionMutationEpoch::settle_terminal_matching(
-                self.retention.clone(),
-                &mut guard,
-                RetentionMutationKind::CatalogCheckpointPublish,
-                &terminal_operation_ids,
-            )
-            .await
-            {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(CatalogError::CasFailed {
-                    message: "checkpoint retention epoch changed before terminal settlement"
-                        .to_string(),
-                }),
-                Err(error) => Err(error),
-            }
-        };
+        let publication = async {
+            let (checkpoint, rendered) = self.prepare_checkpoint(&opts).await?;
+            // Incomplete segments do not publish protection. A failed staging
+            // write can leave only orphan objects, so it need not hold the epoch.
+            self.write_rendered_state_snapshots(&rendered).await?;
+            epoch
+                .run_external_mutation(self.write_checkpoint(&checkpoint))
+                .await?;
+            Ok(self.checkpoint_token(checkpoint.checkpoint_id))
+        }
+        .await;
+        // A transport error may return before a remote immutable PUT completes.
+        // Only successful publication (including exact readback reconciliation)
+        // permits settlement. Otherwise the durable epoch remains in flight.
+        let settlement = epoch.settle().await;
         let release = guard.release().await.map_err(CatalogError::from);
         match (publication, settlement, release) {
             (Ok(token), Ok(()), Ok(())) => Ok(token),
@@ -4194,6 +4507,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "StateToken scope does not match control MVP store",
             ));
         }
+        self.validate_state_token_protection(token, Utc::now())
+            .await?;
         let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
         let bytes = self.storage.get(&manifest_path).await?;
         let manifest: ControlMvpManifest = decode_envelope_limited(
@@ -4246,6 +4561,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             "control MVP checkpoint",
         )?;
         checkpoint.validate(&self.scope, token.checkpoint_id())?;
+        self.validate_checkpoint_protection(&checkpoint, Utc::now())
+            .await?;
 
         let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
         let manifest_bytes = self.storage.get(&manifest_path).await?;
@@ -4330,11 +4647,12 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
 
         match reference.reference_kind() {
             PersistedAuthorityKind::StateToken => {
-                self.read_at(self.token(
+                let token = self.token(
                     reference.manifest_id().to_string(),
                     reference.logical_sequence(),
-                ))
-                .await
+                );
+                self.validate_state_token_protection(&token, now).await?;
+                self.read_at(token).await
             }
             PersistedAuthorityKind::Checkpoint => {
                 let checkpoint_path = reference
@@ -4369,6 +4687,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                     "control MVP checkpoint",
                 )?;
                 checkpoint.validate(&self.scope, checkpoint_id)?;
+                self.validate_checkpoint_protection(&checkpoint, now)
+                    .await?;
                 if checkpoint.manifest_id != reference.manifest_id()
                     || checkpoint.logical_sequence != reference.logical_sequence()
                     || checkpoint.manifest_checksum_sha256 != sha256_hex(&manifest_bytes)
@@ -4679,6 +4999,7 @@ impl ArcoStateTxn for ControlMvpTxn {
 
 #[derive(Debug, Clone)]
 struct ControlMvpBase {
+    reclamation_generation: u64,
     pointer_version: Option<String>,
     manifest_id: Option<String>,
     writer_epoch: u64,
@@ -5068,6 +5389,7 @@ impl From<&StateScope> for ControlMvpScopeDoc {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpPointer {
+    reclamation_generation: u64,
     format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
@@ -5229,6 +5551,7 @@ impl ControlMvpStateObject {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ControlMvpManifest {
+    reclamation_generation: u64,
     format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
@@ -5398,6 +5721,7 @@ struct ControlMvpTxRef {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpTxObject {
+    reclamation_generation: u64,
     implementation: String,
     scope: ControlMvpScopeDoc,
     tx_id: String,
@@ -6684,6 +7008,7 @@ struct ReplayStateDigestEntry {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpCheckpoint {
+    reclamation_generation: u64,
     format_version: u32,
     implementation: String,
     scope: ControlMvpScopeDoc,
@@ -7108,7 +7433,7 @@ mod tests {
     use std::ops::Range;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition};
@@ -7122,6 +7447,14 @@ mod tests {
     struct PauseCheckpointPutBackend {
         inner: MemoryBackend,
         gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        gate_path: Mutex<String>,
+        delete_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+        pause_after_put: AtomicBool,
+        lose_head_response: AtomicBool,
+        defer_checkpoint: AtomicBool,
+        lose_checkpoint_response: AtomicBool,
+        deferred_checkpoint: Mutex<Option<(String, Bytes, WritePrecondition)>>,
+        fail_fence_readback: AtomicBool,
         arrow_gets: AtomicUsize,
     }
 
@@ -7130,6 +7463,14 @@ mod tests {
             Arc::new(Self {
                 inner: MemoryBackend::new(),
                 gate: Mutex::new(None),
+                gate_path: Mutex::new("/checkpoints/".to_string()),
+                delete_gate: Mutex::new(None),
+                pause_after_put: AtomicBool::new(false),
+                lose_head_response: AtomicBool::new(false),
+                defer_checkpoint: AtomicBool::new(false),
+                lose_checkpoint_response: AtomicBool::new(false),
+                deferred_checkpoint: Mutex::new(None),
+                fail_fence_readback: AtomicBool::new(false),
                 arrow_gets: AtomicUsize::new(0),
             })
         }
@@ -7153,6 +7494,14 @@ mod tests {
     #[async_trait]
     impl StorageBackend for PauseCheckpointPutBackend {
         async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            if path.ends_with("/head/current.json")
+                && self.fail_fence_readback.load(Ordering::SeqCst)
+                && !self.lose_head_response.load(Ordering::SeqCst)
+            {
+                return Err(arco_core::Error::storage(
+                    "injected unavailable fence readback",
+                ));
+            }
             if std::path::Path::new(path)
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("arrow"))
@@ -7172,17 +7521,55 @@ mod tests {
             data: Bytes,
             precondition: WritePrecondition,
         ) -> arco_core::Result<WriteResult> {
-            if path.contains("/checkpoints/") {
+            if path.contains("/checkpoints/") && self.defer_checkpoint.swap(false, Ordering::SeqCst)
+            {
+                *self.deferred_checkpoint.lock().unwrap() =
+                    Some((path.to_string(), data, precondition));
+                return Err(arco_core::Error::storage(
+                    "checkpoint PUT is still in flight",
+                ));
+            }
+            let result = if self.pause_after_put.load(Ordering::SeqCst) {
+                Some(
+                    self.inner
+                        .put(path, data.clone(), precondition.clone())
+                        .await,
+                )
+            } else {
+                None
+            };
+            if path.contains(&*self.gate_path.lock().unwrap()) {
                 let gate = self.gate.lock().expect("checkpoint gate").take();
                 if let Some((reached, release)) = gate {
                     let _ = reached.send(());
                     let _ = release.await;
                 }
             }
-            self.inner.put(path, data, precondition).await
+            let result = match result {
+                Some(result) => result,
+                None => self.inner.put(path, data, precondition).await,
+            };
+            if path.contains("/checkpoints/")
+                && self.lose_checkpoint_response.swap(false, Ordering::SeqCst)
+            {
+                return Err(arco_core::Error::storage(
+                    "injected lost checkpoint response",
+                ));
+            }
+            if path.ends_with("/head/current.json")
+                && self.lose_head_response.swap(false, Ordering::SeqCst)
+            {
+                return Err(arco_core::Error::storage("injected lost fence response"));
+            }
+            result
         }
 
         async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            let gate = self.delete_gate.lock().unwrap().take();
+            if let Some((reached, release)) = gate {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
             self.inner.delete(path).await
         }
 
@@ -7386,7 +7773,7 @@ mod tests {
     async fn individually_oversized_l1_row_precedes_every_candidate_artifact_write() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let (_bytes, probe_index, _reference) = encode_segment(
-            &"x".repeat(128),
+            &"x".repeat(256),
             ControlMvpSegmentLevel::L0,
             1,
             &scope,
@@ -7491,6 +7878,1028 @@ mod tests {
                 .expect("lineage lookup"),
             "physical-only publication must retain logical transaction lineage"
         );
+    }
+
+    #[tokio::test]
+    async fn released_external_pin_cannot_revive_still_present_checkpoint_bytes() {
+        use crate::workspace_snapshot::{
+            decode_retention_pin_revision, retention_pin_revision_path,
+        };
+        let (storage, store, reference) = externally_pinned_checkpoint().await;
+        let pin_id = "pin_00000000000000000000000001";
+        let pin = decode_retention_pin_revision(
+            &storage
+                .get_raw(&retention_pin_revision_path(pin_id, 1).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        publish_test_pin(
+            &storage,
+            &pin.release(2, Utc::now() + ChronoDuration::days(32))
+                .unwrap(),
+        )
+        .await;
+        let now = Utc::now() + ChronoDuration::days(33);
+        assert!(
+            storage
+                .head_raw(reference.checkpoint_path().unwrap())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .resolve_persisted_reference_at(&reference, now)
+                .await
+                .is_err()
+        );
+        let token = store.token(
+            reference.manifest_id().to_string(),
+            reference.logical_sequence(),
+        );
+        assert!(
+            store
+                .validate_state_token_protection(&token, now)
+                .await
+                .is_err(),
+            "released external evidence cannot renew an expired state token"
+        );
+        let worker =
+            ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone()).unwrap();
+        let plan = worker.plan_gc_at(now, Vec::new()).await.unwrap();
+        assert!(
+            plan.candidates()
+                .iter()
+                .any(|candidate| Some(candidate.path()) == reference.checkpoint_path())
+        );
+        worker.collect_gc_at(now, Vec::new()).await.unwrap();
+        assert!(
+            storage
+                .head_raw(reference.checkpoint_path().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_export_independently_protects_authority_across_selector_pages() {
+        use crate::workspace_snapshot::{
+            ExportManifest, RelocationPolicy, RequiredObject, RequiredObjectKind,
+            RetentionPinRevision, RetentionTarget, decode_retention_pin_revision,
+            decode_workspace_snapshot, encode_export_manifest, export_record_path,
+            retention_pin_revision_path, snapshot_record_path,
+        };
+        let (storage, store, reference) = externally_pinned_checkpoint().await;
+        let snapshot_id = "snap_00000000000000000000000001";
+        let source_pin = "pin_00000000000000000000000001";
+        let export_id = "exp_00000000000000000000000001";
+        let export_pin = "pin_00000000000000000000000002";
+        let snapshot_path = snapshot_record_path(snapshot_id).unwrap();
+        let bytes = storage.get_raw(&snapshot_path).await.unwrap();
+        let snapshot = decode_workspace_snapshot(&bytes).unwrap();
+        let export = ExportManifest::new(
+            export_id,
+            export_pin,
+            snapshot_id,
+            source_pin,
+            snapshot.scope().clone(),
+            snapshot.created_at(),
+            snapshot.retained_until(),
+            snapshot.domains().to_vec(),
+            Vec::new(),
+            snapshot.event_archives().to_vec(),
+            vec![
+                RequiredObject::new(
+                    snapshot_path,
+                    u64::try_from(bytes.len()).unwrap(),
+                    RequiredObjectKind::SnapshotRecord,
+                    prefixed_sha256(&bytes),
+                )
+                .unwrap(),
+            ],
+            Vec::new(),
+            RelocationPolicy::relative_to_caller_export_root(),
+        )
+        .unwrap();
+        storage
+            .put_raw(
+                &export_record_path(export_id).unwrap(),
+                Bytes::from(encode_export_manifest(&export).unwrap()),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        publish_test_pin(
+            &storage,
+            &RetentionPinRevision::new(
+                export_pin,
+                1,
+                RetentionTarget::export(export_id).unwrap(),
+                snapshot.created_at(),
+                snapshot.retained_until(),
+                None,
+            )
+            .unwrap(),
+        )
+        .await;
+        let pin = decode_retention_pin_revision(
+            &storage
+                .get_raw(&retention_pin_revision_path(source_pin, 1).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        publish_test_pin(
+            &storage,
+            &pin.release(2, Utc::now() + ChronoDuration::days(1))
+                .unwrap(),
+        )
+        .await;
+        // Fill a selector-inventory page with unselected revision objects.
+        for ordinal in 0..260 {
+            storage
+                .put_raw(
+                    &format!(
+                        "retention/pins/pin_00000000000000000000000000/revisions/{ordinal:020}.json"
+                    ),
+                    Bytes::new(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+        }
+        let now = Utc::now() + ChronoDuration::days(31);
+        let worker = ControlMvpMaintenanceWorker::new(storage, store.scope.clone()).unwrap();
+        worker.collect_gc_at(now, Vec::new()).await.unwrap();
+        assert_eq!(
+            store
+                .resolve_persisted_reference_at(&reference, now)
+                .await
+                .unwrap()
+                .get(b"historical")
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"retained"))
+        );
+    }
+
+    async fn publish_test_pin(
+        storage: &ScopedStorage,
+        pin: &crate::workspace_snapshot::RetentionPinRevision,
+    ) {
+        use crate::workspace_snapshot::{
+            RetentionPinLatest, encode_retention_pin_latest, encode_retention_pin_revision,
+            retention_pin_latest_path, retention_pin_revision_path,
+        };
+        let bytes = Bytes::from(encode_retention_pin_revision(pin).unwrap());
+        let path = retention_pin_revision_path(pin.pin_id(), pin.revision()).unwrap();
+        let latest =
+            RetentionPinLatest::new(pin.pin_id(), pin.revision(), &path, prefixed_sha256(&bytes))
+                .unwrap();
+        storage
+            .put_raw(&path, bytes, WritePrecondition::DoesNotExist)
+            .await
+            .unwrap();
+        storage
+            .put_raw(
+                &retention_pin_latest_path(pin.pin_id()).unwrap(),
+                Bytes::from(encode_retention_pin_latest(&latest).unwrap()),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_external_pin_protects_checkpoint_closure_after_intrinsic_expiry() {
+        let (storage, store, reference) = externally_pinned_checkpoint().await;
+        let now = Utc::now() + ChronoDuration::days(31);
+        let token = store.token(
+            reference.manifest_id().to_string(),
+            reference.logical_sequence(),
+        );
+        store
+            .validate_state_token_protection(&token, now)
+            .await
+            .expect("active external pin also protects the exact historical state token");
+        let worker =
+            ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone()).unwrap();
+        let checkpoint_path = reference.checkpoint_path().unwrap();
+        let plan = worker.plan_gc_at(now, Vec::new()).await.unwrap();
+        assert!(
+            !plan
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.path() == checkpoint_path),
+            "active workspace pin must protect checkpoint beyond its intrinsic lifetime"
+        );
+        worker.collect_gc_at(now, Vec::new()).await.unwrap();
+        let reader = store
+            .resolve_persisted_reference_at(&reference, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"historical").await.unwrap(),
+            Some(Bytes::from_static(b"retained"))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_external_pin_aborts_control_gc_before_any_delete() {
+        let (storage, store, _reference) = externally_pinned_checkpoint().await;
+        let selector =
+            crate::workspace_snapshot::retention_pin_latest_path("pin_00000000000000000000000001")
+                .unwrap();
+        storage
+            .put_raw(
+                &selector,
+                Bytes::from_static(b"corrupt"),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        let before = storage
+            .list_meta(&format!("{}/", store.paths.base_prefix()))
+            .await
+            .unwrap();
+        let worker =
+            ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone()).unwrap();
+        assert!(
+            worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                .await
+                .is_err(),
+            "invalid retained-root evidence must deny reclamation"
+        );
+        let after = storage
+            .list_meta(&format!("{}/", store.paths.base_prefix()))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), after.len());
+    }
+
+    async fn externally_pinned_checkpoint() -> (
+        ScopedStorage,
+        ControlMvpStateStore,
+        PersistedAuthorityReference,
+    ) {
+        use crate::workspace_snapshot::{
+            DomainAuthorityReference, DomainEventArchive, RetentionPinLatest, RetentionPinRevision,
+            RetentionTarget, WorkspaceScope, WorkspaceSnapshot, encode_retention_pin_latest,
+            encode_retention_pin_revision, encode_workspace_snapshot, retention_pin_latest_path,
+            retention_pin_revision_path, snapshot_record_path,
+        };
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap()
+        .with_checkpoint_interval(NonZeroU64::new(1).unwrap());
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"historical", Bytes::from_static(b"retained"))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let created = Utc::now();
+        let deadline = created + ChronoDuration::days(60);
+        let reference = store
+            .persist_checkpoint_reference(&checkpoint, deadline)
+            .await
+            .unwrap();
+        let scope = WorkspaceScope::new("tenant", "workspace").unwrap();
+        let snapshot_id = "snap_00000000000000000000000001";
+        let pin_id = "pin_00000000000000000000000001";
+        let snapshot = WorkspaceSnapshot::new(
+            snapshot_id,
+            pin_id,
+            scope.clone(),
+            created,
+            deadline,
+            None,
+            vec![DomainAuthorityReference::new("catalog", scope, reference.clone()).unwrap()],
+            Vec::new(),
+            vec![DomainEventArchive::empty("catalog").unwrap()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let pin = RetentionPinRevision::new(
+            pin_id,
+            1,
+            RetentionTarget::snapshot(snapshot_id).unwrap(),
+            created,
+            deadline,
+            None,
+        )
+        .unwrap();
+        let revision = Bytes::from(encode_retention_pin_revision(&pin).unwrap());
+        let revision_path = retention_pin_revision_path(pin_id, 1).unwrap();
+        let selector =
+            RetentionPinLatest::new(pin_id, 1, &revision_path, prefixed_sha256(&revision)).unwrap();
+        // This fixture installs already-published retained-root evidence. Service
+        // tests cover its coordinated publication; these tests exercise readers/GC.
+        for (path, bytes) in [
+            (
+                snapshot_record_path(snapshot_id).unwrap(),
+                Bytes::from(encode_workspace_snapshot(&snapshot).unwrap()),
+            ),
+            (revision_path, revision),
+            (
+                retention_pin_latest_path(pin_id).unwrap(),
+                Bytes::from(encode_retention_pin_latest(&selector).unwrap()),
+            ),
+        ] {
+            storage
+                .put_raw(&path, bytes, WritePrecondition::DoesNotExist)
+                .await
+                .unwrap();
+        }
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.delete(b"historical").await.unwrap();
+        txn.commit().await.unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        (storage, store, reference)
+    }
+
+    #[tokio::test]
+    async fn maintenance_crossing_reclamation_fence_regenerates_outputs() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            for ordinal in 0..L0_MAINTENANCE_INTENT_THRESHOLD {
+                let mut txn = store
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap();
+                txn.put(b"key", Bytes::from(ordinal.to_string()))
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+            }
+            let before = store.load_pointer().await.unwrap();
+            *backend.gate_path.lock().unwrap() = "/manifests/".to_string();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let (reached, release) = backend.arm();
+            let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope.clone()).unwrap();
+            let maintenance = tokio::spawn(async move { worker.consolidate_pending().await });
+            reached.await.unwrap();
+            let collector = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+            collector
+                .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            maintenance
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("regenerated maintenance publishes");
+            let selected = store.load_pointer().await.unwrap();
+            assert_eq!(selected.reclamation_generation, 1);
+            assert_eq!(selected.logical_sequence, before.logical_sequence);
+            assert_eq!(selected.writer_epoch, before.writer_epoch);
+            let manifest = store.load_manifest_for_pointer(&selected).await.unwrap();
+            assert_eq!(manifest.reclamation_generation, 1);
+            assert!(
+                manifest
+                    .base_states
+                    .iter()
+                    .all(|reference| reference.state_id.contains("rg-00000000000000000001"))
+            );
+            assert_eq!(store.get(b"key").await.unwrap(), Some(Bytes::from("15")));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_crossing_reclamation_fence_is_superseded() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            let checkpoint = store
+                .checkpoint(
+                    CheckpointOptions::default().with_min_retention_seconds(60 * 24 * 60 * 60),
+                )
+                .await
+                .unwrap();
+            let source = store
+                .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::days(60))
+                .await
+                .unwrap();
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            txn.put(b"live", Bytes::from_static(b"current"))
+                .await
+                .unwrap();
+            let current = txn.commit().await.unwrap().state_token().clone();
+            let participant = ControlMvpRestoreParticipant::new(store.clone());
+            let identity =
+                RestoreAttemptIdentity::new("rst_00000000000000000000000001", 1, "catalog")
+                    .unwrap();
+            let plan = participant
+                .plan_restore(&source, &identity, Utc::now())
+                .await
+                .unwrap();
+            storage
+                .put_raw(
+                    &store.paths.tx_object("orphan"),
+                    Bytes::new(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+            *backend.gate_path.lock().unwrap() = "/transactions/".to_string();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let (reached, release) = backend.arm();
+            let restore =
+                tokio::spawn(async move { participant.apply_restore(&plan, Utc::now()).await });
+            reached.await.unwrap();
+            let collector = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+            collector
+                .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            assert!(matches!(
+                restore.await.unwrap().unwrap(),
+                RestoreParticipantInspection::Superseded
+            ));
+            assert_eq!(store.current_state_token().await.unwrap(), current);
+            assert_eq!(
+                store.get(b"live").await.unwrap(),
+                Some(Bytes::from_static(b"current"))
+            );
+            let fresh = ControlMvpRestoreParticipant::new(store.clone())
+                .plan_restore(&source, &identity, Utc::now())
+                .await
+                .unwrap();
+            assert!(matches!(
+                ControlMvpRestoreParticipant::new(store)
+                    .apply_restore(&fresh, Utc::now())
+                    .await
+                    .unwrap(),
+                RestoreParticipantInspection::Visible { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn frozen_operation_retry_after_head_only_change_gets_fresh_artifact_identity() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let options = TxnOptions::default().with_operation_id("frozen-command");
+        let stale = store.begin_control_txn(options.clone()).await.unwrap();
+        let old_id = stale.tx_id.clone();
+        let claimed = store.claim_writer_authority().await.unwrap();
+        assert!(stale.commit().await.is_err());
+        let fresh = claimed.begin_control_txn(options).await.unwrap();
+        assert_ne!(
+            old_id, fresh.tx_id,
+            "identities bind the exact HEAD, not only its sequence and generation"
+        );
+        fresh.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reclamation_fence_racing_authority_invalidates_the_deletion_plan() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            let orphan = store.paths.tx_object("orphan");
+            storage
+                .put_raw(&orphan, Bytes::new(), WritePrecondition::DoesNotExist)
+                .await
+                .unwrap();
+            *backend.gate_path.lock().unwrap() = "/head/current.json".to_string();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let (reached, release) = backend.arm();
+            let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+            let collector = tokio::spawn(async move {
+                worker
+                    .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                    .await
+            });
+            reached.await.unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            assert!(matches!(
+                collector.await.unwrap(),
+                Err(CatalogError::CasFailed { .. })
+            ));
+            assert!(storage.head_raw(&orphan).await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_delete_with_concurrent_commit_aborts_remaining_page_and_restarts() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        for id in ["orphan-a", "orphan-b"] {
+            storage
+                .put_raw(
+                    &store.paths.tx_object(id),
+                    Bytes::new(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+        }
+        let (reached_tx, reached) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        *backend.delete_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope.clone()).unwrap();
+        let collector = tokio::spawn(async move {
+            worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await
+        });
+        reached.await.unwrap();
+        let mut fresh = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        fresh
+            .put(b"live", Bytes::from_static(b"after fence"))
+            .await
+            .unwrap();
+        let acknowledged = fresh.commit().await.unwrap().state_token().clone();
+        release.send(()).unwrap();
+        assert!(matches!(
+            collector.await.unwrap(),
+            Err(CatalogError::CasFailed { .. })
+        ));
+        assert!(
+            storage
+                .head_raw(&store.paths.tx_object("orphan-a"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .head_raw(&store.paths.tx_object("orphan-b"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let restarted = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+        assert_eq!(
+            restarted
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await
+                .unwrap()
+                .objects_deleted(),
+            1
+        );
+        assert_eq!(store.current_state_token().await.unwrap(), acknowledged);
+        assert_eq!(
+            store.get(b"live").await.unwrap(),
+            Some(Bytes::from_static(b"after fence"))
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_reference_preparation_rejects_an_unpublished_manifest() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope).unwrap();
+        let token = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap()
+            .state_token()
+            .clone();
+        let mut manifest = store
+            .load_manifest(token.authority_manifest_id())
+            .await
+            .unwrap();
+        manifest.manifest_id = "unpublished-manifest".to_string();
+        let bytes = encode_envelope_limited(
+            "control-mvp-manifest",
+            &manifest,
+            MAX_CONTROL_JSON_BYTES,
+            "unpublished manifest",
+        )
+        .unwrap();
+        storage
+            .put_raw(
+                &store.paths.manifest_object(&manifest.manifest_id),
+                bytes,
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let unacknowledged = store.token(manifest.manifest_id, manifest.logical_sequence);
+        assert!(
+            store
+                .persist_state_reference(&unacknowledged, Utc::now() + ChronoDuration::days(1))
+                .await
+                .is_err(),
+            "staging an artifact is not publication of a retained authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_checkpoint_cannot_be_revived_by_preparing_a_longer_reference() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reference = store
+            .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::days(60))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .resolve_persisted_reference_at(&reference, Utc::now() + ChronoDuration::days(31))
+                .await
+                .is_err(),
+            "a prepared reference is not a durable extension of checkpoint protection"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclamation_fence_rejects_commit_paused_before_and_after_artifact_put() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            let mut stale = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            stale
+                .put(b"key", Bytes::from_static(b"stale"))
+                .await
+                .unwrap();
+            let old_id = stale.tx_id.clone();
+            storage
+                .put_raw(
+                    &store.paths.tx_object("orphan"),
+                    Bytes::new(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+            *backend.gate_path.lock().unwrap() = "/transactions/".to_string();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let (reached, release) = backend.arm();
+            let task = tokio::spawn(stale.commit());
+            reached.await.unwrap();
+            let worker = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+            worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            assert!(matches!(
+                task.await.unwrap(),
+                Err(CatalogError::CasFailed { .. })
+            ));
+            let fresh = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            assert!(old_id.ends_with("-rg-00000000000000000000"));
+            assert!(fresh.tx_id.ends_with("-rg-00000000000000000001"));
+            fresh.commit().await.unwrap();
+            assert_eq!(store.get(b"key").await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_fence_lost_response_requires_exact_readback_before_delete() {
+        for fail_readback in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            let orphan = store.paths.tx_object("orphan");
+            storage
+                .put_raw(&orphan, Bytes::new(), WritePrecondition::DoesNotExist)
+                .await
+                .unwrap();
+            backend.lose_head_response.store(true, Ordering::SeqCst);
+            backend
+                .fail_fence_readback
+                .store(fail_readback, Ordering::SeqCst);
+            let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+            let result = worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await;
+            assert_eq!(result.is_err(), fail_readback);
+            assert_eq!(
+                storage.head_raw(&orphan).await.unwrap().is_some(),
+                fail_readback
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_generation_exhaustion_never_authorizes_delete() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let mut pointer = store.load_pointer().await.unwrap();
+        pointer.reclamation_generation = u64::MAX;
+        let bytes = encode_json(&pointer, "exhausted head").unwrap();
+        storage
+            .put_raw(
+                &store.paths.current_pointer(),
+                bytes.clone(),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        let orphan = store.paths.tx_object("orphan");
+        storage
+            .put_raw(&orphan, Bytes::new(), WritePrecondition::DoesNotExist)
+            .await
+            .unwrap();
+        let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+        assert!(
+            worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await
+                .is_err()
+        );
+        assert!(storage.head_raw(&orphan).await.unwrap().is_some());
+        assert_eq!(
+            storage
+                .get_raw(&store.paths.current_pointer())
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn reclamation_fence_invalidates_prepared_commit_without_changing_authority() {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+        let mut initial = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        initial
+            .put(b"live", Bytes::from_static(b"before"))
+            .await
+            .unwrap();
+        let token = initial.commit().await.unwrap().state_token().clone();
+        let before = store.load_pointer().await.unwrap();
+        let mut stale = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        stale
+            .put(b"live", Bytes::from_static(b"stale"))
+            .await
+            .unwrap();
+        storage
+            .put_raw(
+                &store.paths.tx_object("orphan"),
+                Bytes::new(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+        assert_eq!(
+            worker
+                .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
+                .await
+                .unwrap()
+                .objects_deleted(),
+            1
+        );
+        assert!(
+            matches!(stale.commit().await, Err(CatalogError::CasFailed { .. })),
+            "a transaction prepared before reclamation must rerun from the fenced HEAD"
+        );
+        assert_eq!(store.current_state_token().await.unwrap(), token);
+        let after = store.load_pointer().await.unwrap();
+        assert_eq!(before.writer_epoch, after.writer_epoch);
+        assert_eq!(
+            store.get(b"live").await.unwrap(),
+            Some(Bytes::from_static(b"before"))
+        );
+        let mut fresh = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        fresh
+            .put(b"live", Bytes::from_static(b"after"))
+            .await
+            .unwrap();
+        fresh.commit().await.unwrap();
+        assert_eq!(
+            store.get(b"live").await.unwrap(),
+            Some(Bytes::from_static(b"after"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_gc_epoch_recovery_cannot_reenable_pre_fence_candidates() {
+        use crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH;
+        let backend = PauseCheckpointPutBackend::new();
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        let mut stale = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        stale
+            .put(b"catalog/live", Bytes::from_static(b"stale"))
+            .await
+            .unwrap();
+        let orphan = store.paths.tx_object("orphan-before-recovery");
+        storage
+            .put_raw(&orphan, Bytes::new(), WritePrecondition::DoesNotExist)
+            .await
+            .unwrap();
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *backend.delete_gate.lock().unwrap() = Some((reached_tx, release_rx));
+        let first = ControlMvpMaintenanceWorker::new(storage.clone(), scope.clone()).unwrap();
+        let now = Utc::now() + ChronoDuration::days(8);
+        let first_task = tokio::spawn(async move { first.collect_gc_at(now, Vec::new()).await });
+        reached_rx.await.unwrap();
+        assert_eq!(
+            store.load_pointer().await.unwrap().reclamation_generation,
+            1
+        );
+
+        // Advance the fixture's durable epoch clock and expire its lease without
+        // completing the already-issued DELETE. A later collector may adopt it.
+        let mut epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        epoch["started_at"] = serde_json::to_value(Utc::now() - ChronoDuration::hours(1)).unwrap();
+        storage
+            .put_raw(
+                RETENTION_MUTATION_EPOCH_PATH,
+                Bytes::from(serde_json::to_vec(&epoch).unwrap()),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        storage.delete(RETENTION_GC_LOCK_PATH).await.unwrap();
+        let restarted = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+        assert_eq!(
+            restarted
+                .collect_gc_at(now, Vec::new())
+                .await
+                .unwrap()
+                .objects_deleted(),
+            1
+        );
+        assert_eq!(
+            store.load_pointer().await.unwrap().reclamation_generation,
+            2
+        );
+        assert!(matches!(
+            stale.commit().await,
+            Err(CatalogError::CasFailed { .. })
+        ));
+        let mut fresh = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        fresh
+            .put(b"catalog/live", Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+        let selected = fresh.commit().await.unwrap().state_token().clone();
+        release_tx.send(()).unwrap();
+        assert!(
+            first_task.await.unwrap().is_err(),
+            "the old collector cannot settle the adopted epoch"
+        );
+        assert_eq!(store.current_state_token().await.unwrap(), selected);
+        assert_eq!(
+            store.get(b"catalog/live").await.unwrap(),
+            Some(Bytes::from_static(b"fresh"))
+        );
+        assert!(storage.head_raw(&orphan).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -7686,76 +9095,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_publication_excludes_gc_until_the_retained_root_is_visible() {
+    async fn checkpoint_lost_response_reconciles_exact_immutable_record() {
         let backend = PauseCheckpointPutBackend::new();
-        let storage =
-            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
         let scope = StateScope::new("tenant", "workspace", "catalog");
-        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
-        let mut seed = store
+        let store = ControlMvpStateStore::new(storage.clone(), scope).unwrap();
+        store
             .begin_control_txn(TxnOptions::default())
             .await
-            .expect("begin seed");
-        seed.put(b"catalog/live", Bytes::from_static(b"old"))
+            .unwrap()
+            .commit()
             .await
-            .expect("stage seed");
-        seed.commit().await.expect("commit seed");
-
-        let (checkpoint_reached, release_checkpoint) = backend.arm();
-        let checkpoint_store = store.clone();
-        let checkpoint_scope = scope.clone();
-        let checkpoint_task = tokio::spawn(async move {
-            checkpoint_store
-                .checkpoint(
-                    CheckpointOptions::new(Some(checkpoint_scope))
-                        .with_min_retention_seconds(60 * 24 * 60 * 60),
-                )
+            .unwrap();
+        backend
+            .lose_checkpoint_response
+            .store(true, Ordering::SeqCst);
+        let token = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        store.read_checkpoint(token).await.unwrap();
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH)
                 .await
-        });
-        checkpoint_reached
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            epoch["state"], "IDLE",
+            "exact record reconciles the lost response"
+        );
+        store
+            .checkpoint(CheckpointOptions::default())
             .await
-            .expect("checkpoint reached publication");
+            .unwrap();
+    }
 
-        let mut advance = store
+    #[tokio::test]
+    async fn cancelled_checkpoint_publication_retains_durable_exclusion() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+            let (reached, _release) = backend.arm();
+            let task =
+                tokio::spawn(async move { store.checkpoint(CheckpointOptions::default()).await });
+            reached.await.unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let epoch: serde_json::Value = serde_json::from_slice(
+                &storage
+                    .get_raw(crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(epoch["state"], "IN_FLIGHT");
+            // Simulate lease expiry, retaining the durable publication epoch.
+            storage.delete(RETENTION_GC_LOCK_PATH).await.unwrap();
+            let worker = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+            assert!(
+                worker
+                    .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_transport_error_keeps_epoch_in_flight_until_remote_completion() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        let mut txn = store
             .begin_control_txn(TxnOptions::default())
             .await
-            .expect("begin advance");
-        advance
-            .put(b"catalog/live", Bytes::from_static(b"new"))
+            .unwrap();
+        txn.put(b"catalog/live", Bytes::from_static(b"retained"))
             .await
-            .expect("stage advance");
-        advance.commit().await.expect("advance authority");
-
-        let gc_worker =
-            ControlMvpMaintenanceWorker::new(storage, scope).expect("maintenance worker");
-        let gc_task = tokio::spawn(async move {
-            gc_worker
+            .unwrap();
+        txn.commit().await.unwrap();
+        backend.defer_checkpoint.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .checkpoint(CheckpointOptions::default())
+                .await
+                .is_err()
+        );
+        let epoch: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(crate::retention_coordination::RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            epoch["state"], "IN_FLIGHT",
+            "a returned transport error does not prove the remote PUT is terminal"
+        );
+        let worker = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
+        assert!(
+            worker
                 .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
                 .await
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !gc_task.is_finished(),
-            "GC must wait while checkpoint publication owns retention coordination"
+                .is_err(),
+            "GC cannot cross an uncertain publication epoch"
         );
-
-        release_checkpoint.send(()).expect("release checkpoint");
-        let checkpoint = checkpoint_task
+        let (path, bytes, condition) = backend.deferred_checkpoint.lock().unwrap().take().unwrap();
+        backend.inner.put(&path, bytes, condition).await.unwrap();
+        let checkpoint_id = path.rsplit('/').next().unwrap().trim_end_matches(".json");
+        let reader = store
+            .read_checkpoint(store.checkpoint_token(checkpoint_id.to_string()))
             .await
-            .expect("checkpoint task")
-            .expect("checkpoint publication");
-        gc_task.await.expect("GC task").expect("coordinated GC");
-        let retained = store
-            .read_checkpoint(checkpoint)
-            .await
-            .expect("successful checkpoint must remain readable");
+            .unwrap();
         assert_eq!(
-            Some(Bytes::from_static(b"old")),
-            retained
-                .get(b"catalog/live")
-                .await
-                .expect("checkpoint read")
+            reader.get(b"catalog/live").await.unwrap(),
+            Some(Bytes::from_static(b"retained"))
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_publication_excludes_gc_until_the_retained_root_is_visible() {
+        for after in [false, true] {
+            let backend = PauseCheckpointPutBackend::new();
+            backend.pause_after_put.store(after, Ordering::SeqCst);
+            let storage =
+                ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+            let scope = StateScope::new("tenant", "workspace", "catalog");
+            let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
+            let mut seed = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("begin seed");
+            seed.put(b"catalog/live", Bytes::from_static(b"old"))
+                .await
+                .expect("stage seed");
+            seed.commit().await.expect("commit seed");
+
+            let (checkpoint_reached, release_checkpoint) = backend.arm();
+            let checkpoint_store = store.clone();
+            let checkpoint_scope = scope.clone();
+            let checkpoint_task = tokio::spawn(async move {
+                checkpoint_store
+                    .checkpoint(
+                        CheckpointOptions::new(Some(checkpoint_scope))
+                            .with_min_retention_seconds(60 * 24 * 60 * 60),
+                    )
+                    .await
+            });
+            checkpoint_reached
+                .await
+                .expect("checkpoint reached publication");
+
+            let mut advance = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("begin advance");
+            advance
+                .put(b"catalog/live", Bytes::from_static(b"new"))
+                .await
+                .expect("stage advance");
+            advance.commit().await.expect("advance authority");
+
+            let gc_worker =
+                ControlMvpMaintenanceWorker::new(storage, scope).expect("maintenance worker");
+            let gc_task = tokio::spawn(async move {
+                gc_worker
+                    .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !gc_task.is_finished(),
+                "GC must wait while checkpoint publication owns retention coordination"
+            );
+
+            release_checkpoint.send(()).expect("release checkpoint");
+            let checkpoint = checkpoint_task
+                .await
+                .expect("checkpoint task")
+                .expect("checkpoint publication");
+            gc_task.await.expect("GC task").expect("coordinated GC");
+            let retained = store
+                .read_checkpoint(checkpoint)
+                .await
+                .expect("successful checkpoint must remain readable");
+            assert_eq!(
+                Some(Bytes::from_static(b"old")),
+                retained
+                    .get(b"catalog/live")
+                    .await
+                    .expect("checkpoint read")
+            );
+        }
     }
 
     #[tokio::test]
@@ -7934,6 +9478,7 @@ mod tests {
     fn v4_l0_trim_rows_require_origin_sequence() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let mut tx = ControlMvpTxObject {
+            reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&scope),
             tx_id: "tx-1".to_string(),
@@ -7967,6 +9512,7 @@ mod tests {
     fn replay_rejects_sequence_zero_after_terminal_logical_sequence_without_panicking() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let tx = ControlMvpTxObject {
+            reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&scope),
             tx_id: "tx-zero".to_string(),

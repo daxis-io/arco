@@ -22,9 +22,16 @@ API/domain service
   -> ArcoStateTxn
   -> object-store-backed control-store transaction
   -> fenced control manifest pointer CAS
-  -> StateToken returned to caller
-  -> async Parquet projection compactor
-  -> watermarked system tables, audit views, snapshots, exports
+  -> StateToken returned to caller (Tier-1 mutation success)
+
+Asynchronous derived publication:
+committed authority / outbox
+  -> Parquet projection compactor
+  -> watermarked system tables and audit views
+
+Retained workspace cuts:
+checkpoint/state token + projection watermarks + event archive boundaries
+  -> workspace snapshots and exports
 ```
 
 The current ledger + synchronous compactor + Parquet/JSON manifest path should be treated as a migration adapter, shadowing tool, and rollback aid. It should not remain a permanent peer authority after migration.
@@ -79,6 +86,43 @@ export-readable projection files
 The projection compactor remains the sole writer of public Parquet projection artifacts. It does not own the mutation-visible control root.
 
 The current synchronous-compactor authority path may remain behind `ArcoStateStore` during migration, but only as a temporary adapter. After a Tier-1 domain migrates, old-path authoritative writes for that domain must be disabled. After all targeted Tier-1 domains migrate, `arco-state-current` should be removed from production write paths.
+
+---
+
+## Publication compaction and internal segment maintenance
+
+Clarification recorded 2026-09-06: replacing the old Tier-1 compactor means
+replacing its role in establishing authoritative mutation visibility. It does
+not mean eliminating internal storage-engine segment consolidation.
+
+| Operation | Purpose | Relationship to Tier-1 mutation success |
+|---|---|---|
+| Legacy synchronous publication compaction | Fold ledger events into immutable Parquet snapshots and publish a manifest pointer. | Part of the old Tier-1 success path; retired as a write authority for each migrated domain. |
+| Asynchronous projection compaction | Derive watermarked Parquet system tables and other read surfaces from committed authority/outbox records. | Runs after authority commits; projection publication is not required to acknowledge that mutation. |
+| Internal control-store segment maintenance | Consolidate immutable segments representing already-committed state and bound replay/read costs. | Preserves logical contents and `logical_sequence`; publishes only an equivalent physical layout through the control store's fenced publication protocol. |
+
+The intended Tier-1 success boundary is the committed state-store transaction,
+fenced control pointer CAS, and returned `StateToken`. The projection compactor
+must not independently publish mutation-visible control state or become a second
+authority for a migrated domain.
+
+Tier-2 append-first event streams retain their own consistency and processing
+contracts. This change is not a blanket conversion of every Tier-2 event stream
+into a Tier-1 write. Immutable control segments, derived Parquet snapshots, and
+retained workspace snapshots also serve different purposes; immutability alone
+does not make them the same authority or publication mechanism.
+
+Internal maintenance can still affect write admission through bounded replay
+and segment-backpressure limits. Removing synchronous Parquet publication from
+the success path does not promise unlimited writes while internal maintenance
+is stalled.
+
+In the [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries),
+Gate 2 introduces block-addressable segments and only adapts existing maintenance
+read/write paths as needed for the format. Gate 5 makes internal segment
+maintenance incremental, durable, and resumable. It does not reintroduce the
+legacy event-to-Parquet publication dependency. Neither gate itself authorizes
+migration, provider qualification, or production cutover.
 
 ---
 

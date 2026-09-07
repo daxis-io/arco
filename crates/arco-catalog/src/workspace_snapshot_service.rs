@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use arco_core::ScopedStorage;
 use arco_core::lock::{DistributedLock, LockGuard};
-use arco_core::storage::{WritePrecondition, WriteResult};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -671,6 +670,8 @@ impl WorkspaceDomainRegistry {
 pub struct WorkspaceSnapshotService {
     storage: ScopedStorage,
     registry: WorkspaceDomainRegistry,
+    #[cfg(feature = "test-utils")]
+    clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
 }
 
 impl WorkspaceSnapshotService {
@@ -687,7 +688,29 @@ impl WorkspaceSnapshotService {
                 "snapshot service storage scope does not match domain registry",
             ));
         }
-        Ok(Self { storage, registry })
+        Ok(Self {
+            storage,
+            registry,
+            #[cfg(feature = "test-utils")]
+            clock: None,
+        })
+    }
+
+    /// Overrides the publication clock for deterministic retention schedules.
+    /// The test backend should use the same clock for object timestamps.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    fn now(&self) -> DateTime<Utc> {
+        #[cfg(feature = "test-utils")]
+        if let Some(clock) = &self.clock {
+            return clock();
+        }
+        Utc::now()
     }
 
     pub(crate) fn registry(&self) -> &WorkspaceDomainRegistry {
@@ -828,7 +851,7 @@ impl WorkspaceSnapshotService {
         &self,
         request: &CreateWorkspaceExportRequest,
     ) -> Result<ExportManifest> {
-        let operation_now = Utc::now();
+        let operation_now = self.now();
         validate_operation_retention("export", request.retained_until(), operation_now)?;
         let record_path = export_record_path(request.export_id())?;
         match self.storage.get_raw(&record_path).await {
@@ -854,6 +877,13 @@ impl WorkspaceSnapshotService {
             )
             .await?;
         let publication = async {
+            // The source may have expired or been released while this request
+            // waited for coordination. Object existence is not protection.
+            if self.derive_export_from_source(request, self.now()).await? != export {
+                return Err(precondition_failed(
+                    "export source changed before publication",
+                ));
+            }
             self.verify_retained_cut(
                 export.domains(),
                 export.projection_watermarks(),
@@ -1288,7 +1318,7 @@ impl WorkspaceSnapshotService {
         &self,
         request: &CreateWorkspaceSnapshotRequest,
     ) -> Result<WorkspaceSnapshot> {
-        let operation_now = Utc::now();
+        let operation_now = self.now();
         validate_operation_retention("snapshot", request.retained_until(), operation_now)?;
         let record_path = snapshot_record_path(request.snapshot_id())?;
         match self.storage.get_raw(&record_path).await {
@@ -1467,6 +1497,32 @@ impl WorkspaceSnapshotService {
         }
     }
 
+    async fn validate_retained_authority(&self, domain: &DomainAuthorityReference) -> Result<()> {
+        let Some(binding) = self.registry.get(domain.domain()) else {
+            return Err(validation(format!(
+                "retained cut names unknown domain {}",
+                domain.domain()
+            )));
+        };
+        if domain.scope() != self.registry.scope()
+            || domain.authority().scope() != binding.state_scope()
+            || domain.authority().implementation() != binding.capabilities().implementation()
+        {
+            return Err(validation(format!(
+                "retained authority is incompatible for domain {}",
+                domain.domain()
+            )));
+        }
+        // Callers publishing retained roots hold the durable retention epoch.
+        // Validate source lifetime here, after any wait for coordination;
+        // a checksum-correct object alone is not a durable pin.
+        binding
+            .authority_adapter
+            .resolve_persisted_reference_at(domain.authority(), self.now())
+            .await?;
+        Ok(())
+    }
+
     async fn verify_retained_cut(
         &self,
         domains: &[DomainAuthorityReference],
@@ -1477,6 +1533,26 @@ impl WorkspaceSnapshotService {
     ) -> Result<BTreeMap<String, RequiredObject>> {
         let mut required = BTreeMap::new();
         for object in objects {
+            // Control GC's non-revival guarantee applies only to validated
+            // authority references. Providers cannot turn a still-visible old
+            // generation artifact into a new retained root after a DELETE was
+            // authorized. This check also covers retries of older records.
+            if object.relative_path().starts_with("control/v1/")
+                && !domains.iter().any(|domain| {
+                    let authority = domain.authority();
+                    authority.implementation() == crate::ControlMvpStateStore::IMPLEMENTATION
+                        && ((object.kind() == RequiredObjectKind::AuthorityManifest
+                            && object.relative_path() == authority.manifest_path())
+                            || (object.kind() == RequiredObjectKind::Checkpoint
+                                && Some(object.relative_path()) == authority.checkpoint_path()))
+                })
+            {
+                return Err(validation(format!(
+                    "control required object is outside the declared authority references: {}",
+                    object.relative_path()
+                )));
+            }
+
             self.verify_and_insert_object(
                 &mut required,
                 object.relative_path(),
@@ -1487,21 +1563,7 @@ impl WorkspaceSnapshotService {
             .await?;
         }
         for domain in domains {
-            let Some(binding) = self.registry.get(domain.domain()) else {
-                return Err(validation(format!(
-                    "retained cut names unknown domain {}",
-                    domain.domain()
-                )));
-            };
-            if domain.scope() != self.registry.scope()
-                || domain.authority().scope() != binding.state_scope()
-                || domain.authority().implementation() != binding.capabilities().implementation()
-            {
-                return Err(validation(format!(
-                    "retained authority is incompatible for domain {}",
-                    domain.domain()
-                )));
-            }
+            self.validate_retained_authority(domain).await?;
             let manifest = required
                 .get(domain.authority().manifest_path())
                 .ok_or_else(|| validation("authority manifest is not a required object"))?;
@@ -1719,6 +1781,11 @@ impl WorkspaceSnapshotService {
             )
             .await?;
         let publication = async {
+            if self.derive_export_from_source(request, self.now()).await? != expected {
+                return Err(precondition_failed(
+                    "export source changed before retry publication",
+                ));
+            }
             self.verify_retained_cut(
                 expected.domains(),
                 expected.projection_watermarks(),
@@ -2035,6 +2102,12 @@ impl WorkspaceSnapshotService {
         usable_retention_deadline: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<()> {
+        let now = now.max(self.now());
+        if usable_retention_deadline <= now || expected_initial.retained_until() <= now {
+            return Err(precondition_failed(
+                "retained target expired before pin publication",
+            ));
+        }
         let pin_id = expected_initial.pin_id();
         let selector_path = retention_pin_latest_path(pin_id)?;
         match self.storage.get_raw(&selector_path).await {
@@ -2090,26 +2163,9 @@ impl WorkspaceSnapshotService {
         path: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        match epoch
-            .put_raw(
-                path,
-                Bytes::copy_from_slice(bytes),
-                WritePrecondition::DoesNotExist,
-            )
-            .await?
-        {
-            WriteResult::Success { .. } => Ok(()),
-            WriteResult::PreconditionFailed { .. } => {
-                let winner = self.storage.get_raw(path).await?;
-                if winner.as_ref() == bytes {
-                    Ok(())
-                } else {
-                    Err(precondition_failed(format!(
-                        "immutable object conflict at {path}"
-                    )))
-                }
-            }
-        }
+        epoch
+            .put_immutable_reconciled(path, Bytes::copy_from_slice(bytes))
+            .await
     }
 }
 

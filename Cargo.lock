@@ -64,6 +64,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,6 +247,7 @@ dependencies = [
 name = "arco-catalog"
 version = "0.3.0"
 dependencies = [
+ "allocation-counter",
  "arco-core",
  "arco-proto",
  "arrow 54.3.1",

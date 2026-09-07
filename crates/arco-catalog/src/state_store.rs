@@ -2335,10 +2335,13 @@ pub trait ArcoStateAdmin: Send + Sync {
     async fn checkpoint(&self, opts: CheckpointOptions) -> Result<CheckpointToken>;
 }
 
-/// Adapter between opaque state tokens and validated durable storage references.
+/// Adapter between opaque state tokens and prepared durable-storage references.
 ///
 /// This surface is deliberately separate from [`ArcoStateAdmin`] so backends
 /// without durable object references do not fabricate them.
+/// Preparing a reference does not publish a retention pin or extend the source's
+/// lifetime. A retained-root publisher must validate source protection again
+/// within its durable retention-coordinated operation before publishing the pin.
 #[async_trait]
 pub trait PersistedAuthorityAdapter: Send + Sync {
     /// Converts an opaque state token into a validated stable storage reference.

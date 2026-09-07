@@ -1,0 +1,1433 @@
+//! Deterministic remote publication schedules and an independent logical retention oracle.
+#![cfg(feature = "test-utils")]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#![allow(clippy::too_many_lines, clippy::unused_async)]
+
+use arco_catalog::retention_coordination::{
+    RETENTION_MUTATION_EPOCH_PATH, recover_stale_retention_epoch,
+};
+use arco_catalog::state_store::StateScope;
+use arco_catalog::workspace_snapshot::{
+    DomainAuthorityReference, DomainEventArchive, WorkspaceScope, export_record_path,
+    retention_pin_latest_path, retention_pin_revision_path, snapshot_record_path,
+};
+use arco_catalog::workspace_snapshot_service::{
+    CreateWorkspaceExportRequest, CreateWorkspaceSnapshotRequest, EventArchiveCapture,
+    EventArchiveProvider, ProjectionWatermarkCut, ProjectionWatermarkProvider,
+    WorkspaceDomainBinding, WorkspaceDomainRegistry, WorkspaceSnapshotService,
+};
+use arco_catalog::{
+    ArcoStateTxn as _, ControlMvpMaintenanceWorker, ControlMvpStateStore,
+    PersistedAuthorityAdapter as _, Result, TxnOptions,
+};
+use arco_core::{
+    ListPage, MemoryBackend, ObjectMeta, ScopedStorage, StorageBackend, WritePrecondition,
+    WriteResult,
+};
+use async_trait::async_trait;
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{Notify, Semaphore};
+
+use arco_catalog::workspace_snapshot::{
+    RetentionPinLatest, RetentionPinRevision, decode_retention_pin_revision,
+    encode_retention_pin_latest, encode_retention_pin_revision,
+};
+use arco_catalog::{
+    ArcoStateAdmin as _, ArcoStateReader, CheckpointOptions, CheckpointToken, StateToken,
+};
+use futures::FutureExt as _;
+use sha2::{Digest as _, Sha256};
+
+const RETENTION_GC_LOCK_PATH: &str = "locks/workspace-retention-gc.lock.json";
+const SNAP: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const EXP: &str = "exp_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+const PIN: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+const EPIN: &str = "pin_01ARZ3NDEKTSV4RRFFQ69G5FAY";
+
+#[derive(Clone, Copy, Debug)]
+enum Fault {
+    PauseBefore,
+    PauseAfter,
+    LostResponse,
+    DelayedError,
+    Unreadable,
+    IdenticalWinner,
+    DifferentWinner,
+    DifferentLostResponse,
+}
+
+#[derive(Debug)]
+struct Schedule {
+    needle: String,
+    skip: std::sync::atomic::AtomicUsize,
+    fault: Fault,
+    issued: Notify,
+    apply: Semaphore,
+    applied: Notify,
+    respond: Semaphore,
+    finished: Notify,
+}
+impl Schedule {
+    fn new(needle: String, skip: usize, fault: Fault) -> Arc<Self> {
+        Arc::new(Self {
+            needle,
+            skip: std::sync::atomic::AtomicUsize::new(skip),
+            fault,
+            issued: Notify::new(),
+            apply: Semaphore::new(0),
+            applied: Notify::new(),
+            respond: Semaphore::new(0),
+            finished: Notify::new(),
+        })
+    }
+    async fn issued(&self) {
+        guard(self.issued.notified()).await;
+    }
+    async fn finish(&self) {
+        self.apply.add_permits(1);
+        self.respond.add_permits(1);
+        guard(self.finished.notified()).await;
+    }
+}
+async fn guard<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(20), future)
+        .await
+        .expect("schedule deadlock")
+}
+
+#[derive(Debug)]
+struct Backend {
+    inner: Arc<MemoryBackend>,
+    armed: Mutex<Option<Arc<Schedule>>>,
+    denied: Arc<Mutex<Option<String>>>,
+    trace: Arc<Mutex<Vec<String>>>,
+    now: Arc<Mutex<DateTime<Utc>>>,
+    timestamps: Arc<Mutex<BTreeMap<String, DateTime<Utc>>>>,
+    authorized_deletes: Arc<Mutex<BTreeSet<String>>>,
+}
+impl Backend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(MemoryBackend::new()),
+            armed: Mutex::new(None),
+            denied: Arc::new(Mutex::new(None)),
+            trace: Arc::new(Mutex::new(Vec::new())),
+            now: Arc::new(Mutex::new(Utc::now())),
+            timestamps: Arc::new(Mutex::new(BTreeMap::new())),
+            authorized_deletes: Arc::new(Mutex::new(BTreeSet::new())),
+        })
+    }
+    fn arm(&self, needle: String, skip: usize, fault: Fault) -> Arc<Schedule> {
+        let schedule = Schedule::new(needle, skip, fault);
+        *self.armed.lock().unwrap() = Some(schedule.clone());
+        schedule
+    }
+    fn take(&self, path: &str) -> Option<Arc<Schedule>> {
+        let mut armed = self.armed.lock().unwrap();
+        if let Some(s) = armed.as_mut() {
+            if path.contains(&s.needle) {
+                if s.skip.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    s.skip.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                } else {
+                    return armed.take();
+                }
+            }
+        }
+        None
+    }
+    fn meta(&self, mut meta: ObjectMeta) -> ObjectMeta {
+        meta.last_modified = self
+            .timestamps
+            .lock()
+            .unwrap()
+            .get(&meta.path)
+            .copied()
+            .or(meta.last_modified);
+        meta
+    }
+    async fn expire_lease(&self, storage: &ScopedStorage) {
+        if let Ok(bytes) = storage.get_raw(RETENTION_GC_LOCK_PATH).await {
+            let mut value: arco_core::lock::LockInfo = serde_json::from_slice(&bytes).unwrap();
+            value.expires_at = Utc::now() - chrono::Duration::seconds(1);
+            storage
+                .put_raw(
+                    RETENTION_GC_LOCK_PATH,
+                    Bytes::from(serde_json::to_vec(&value).unwrap()),
+                    WritePrecondition::None,
+                )
+                .await
+                .unwrap();
+            let stored: arco_core::lock::LockInfo =
+                serde_json::from_slice(&storage.get_raw(RETENTION_GC_LOCK_PATH).await.unwrap())
+                    .unwrap();
+            assert!(
+                stored.is_expired(),
+                "fixture must expire the actual serialized lease"
+            );
+        }
+    }
+}
+#[async_trait]
+impl StorageBackend for Backend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.trace.lock().unwrap().push(format!("GET {path}"));
+        if self
+            .denied
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| path.contains(s))
+        {
+            return Err(arco_core::Error::storage("reconciliation read denied"));
+        }
+        self.inner.get(path).await
+    }
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("ISSUE PUT {path} {precondition:?}"));
+        let Some(schedule) = self.take(path) else {
+            let result = self.inner.put(path, data, precondition).await;
+            if matches!(result, Ok(WriteResult::Success { .. })) {
+                self.timestamps
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_owned(), *self.now.lock().unwrap());
+            }
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("APPLY PUT {path} {result:?}"));
+            return result;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let inner = self.inner.clone();
+        let denied = self.denied.clone();
+        let trace = self.trace.clone();
+        let timestamps = self.timestamps.clone();
+        let now = self.now.clone();
+        let path = path.to_owned();
+        // The remote task owns the request. Dropping/aborting its caller cannot cancel it.
+        tokio::spawn(async move {
+            schedule.issued.notify_one();
+            let mut tx = Some(tx);
+            if matches!(schedule.fault, Fault::DelayedError) {
+                tx.take()
+                    .unwrap()
+                    .send(Err(arco_core::Error::storage(
+                        "transport failed; remote request pending",
+                    )))
+                    .ok();
+            }
+            if matches!(schedule.fault, Fault::PauseBefore | Fault::DelayedError) {
+                schedule.apply.acquire().await.unwrap().forget();
+            }
+            if matches!(
+                schedule.fault,
+                Fault::IdenticalWinner | Fault::DifferentWinner
+            ) {
+                let winner = if matches!(schedule.fault, Fault::IdenticalWinner) {
+                    data.clone()
+                } else {
+                    Bytes::from_static(b"different immutable bytes")
+                };
+                inner
+                    .put(&path, winner, WritePrecondition::DoesNotExist)
+                    .await
+                    .unwrap();
+            }
+            let data = if matches!(schedule.fault, Fault::DifferentLostResponse) {
+                Bytes::from_static(b"different immutable bytes")
+            } else {
+                data
+            };
+            let result = inner.put(&path, data, precondition).await;
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("APPLY PUT {path} {result:?}"));
+            if matches!(result, Ok(WriteResult::Success { .. })) {
+                timestamps
+                    .lock()
+                    .unwrap()
+                    .insert(path.clone(), *now.lock().unwrap());
+            }
+            if matches!(schedule.fault, Fault::Unreadable) {
+                *denied.lock().unwrap() = Some(path.clone());
+            }
+            schedule.applied.notify_one();
+            if matches!(schedule.fault, Fault::PauseAfter | Fault::PauseBefore) {
+                schedule.respond.acquire().await.unwrap().forget();
+            }
+            if let Some(tx) = tx {
+                let result = if matches!(
+                    schedule.fault,
+                    Fault::LostResponse | Fault::Unreadable | Fault::DifferentLostResponse
+                ) {
+                    Err(arco_core::Error::storage(
+                        "remote application succeeded; response lost",
+                    ))
+                } else {
+                    result
+                };
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(format!("RESPONSE PUT {path} {result:?}"));
+                tx.send(result).ok();
+            }
+            schedule.finished.notify_one();
+        });
+        rx.await.expect("remote response sender")
+    }
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        let version = self.inner.head(path).await?.map(|meta| meta.version);
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("ISSUE DELETE {path} {version:?}"));
+        if path.contains("/control/v1/") {
+            self.authorized_deletes
+                .lock()
+                .unwrap()
+                .insert(path.to_owned());
+        }
+        let Some(schedule) = self.take(path) else {
+            return self.inner.delete(path).await;
+        };
+        let inner = self.inner.clone();
+        let trace = self.trace.clone();
+        let path = path.to_owned();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            schedule.issued.notify_one();
+            let mut tx = Some(tx);
+            if matches!(schedule.fault, Fault::DelayedError) {
+                tx.take()
+                    .unwrap()
+                    .send(Err(arco_core::Error::storage(
+                        "DELETE transport failed; remote operation pending",
+                    )))
+                    .ok();
+            }
+            if matches!(schedule.fault, Fault::PauseBefore | Fault::DelayedError) {
+                schedule.apply.acquire().await.unwrap().forget();
+            }
+            let result = inner.delete(&path).await;
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("APPLY DELETE {path} {result:?}"));
+            schedule.applied.notify_one();
+            if matches!(schedule.fault, Fault::PauseBefore | Fault::PauseAfter) {
+                schedule.respond.acquire().await.unwrap().forget();
+            }
+            if let Some(tx) = tx {
+                tx.send(result).ok();
+            }
+            schedule.finished.notify_one();
+        });
+        rx.await.expect("remote DELETE response")
+    }
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        Ok(self
+            .inner
+            .list(prefix)
+            .await?
+            .into_iter()
+            .map(|m| self.meta(m))
+            .collect())
+    }
+    async fn list_page(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        let mut page = self.inner.list_page(prefix, after, limit).await?;
+        for meta in &mut page.objects {
+            *meta = self.meta(meta.clone());
+        }
+        Ok(page)
+    }
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        Ok(self.inner.head(path).await?.map(|m| self.meta(m)))
+    }
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[derive(Debug)]
+struct EmptyProviders;
+#[async_trait]
+impl ProjectionWatermarkProvider for EmptyProviders {
+    async fn capture(&self, _: &DomainAuthorityReference) -> Result<ProjectionWatermarkCut> {
+        ProjectionWatermarkCut::new(Vec::new(), Vec::new(), Vec::new())
+    }
+}
+#[async_trait]
+impl EventArchiveProvider for EmptyProviders {
+    async fn capture(&self, authority: &DomainAuthorityReference) -> Result<EventArchiveCapture> {
+        EventArchiveCapture::new(DomainEventArchive::empty(authority.domain())?, Vec::new())
+    }
+}
+struct Fixture {
+    backend: Arc<Backend>,
+    storage: ScopedStorage,
+    store: Arc<ControlMvpStateStore>,
+    service: Arc<WorkspaceSnapshotService>,
+    worker: ControlMvpMaintenanceWorker,
+    start: DateTime<Utc>,
+}
+impl Fixture {
+    async fn new() -> Self {
+        let backend = Backend::new();
+        let start = *backend.now.lock().unwrap();
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = Arc::new(ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap());
+        let registry = WorkspaceDomainRegistry::new(
+            WorkspaceScope::new("tenant", "workspace").unwrap(),
+            vec![
+                WorkspaceDomainBinding::new(
+                    scope.clone(),
+                    store.clone(),
+                    store.clone(),
+                    Arc::new(EmptyProviders),
+                    Arc::new(EmptyProviders),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let clock = backend.now.clone();
+        let service = Arc::new(
+            WorkspaceSnapshotService::new(storage.clone(), registry)
+                .unwrap()
+                .with_clock(Arc::new(move || *clock.lock().unwrap())),
+        );
+        let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+        let f = Self {
+            backend,
+            storage,
+            store,
+            service,
+            worker,
+            start,
+        };
+        f.commit(b"value").await;
+        f
+    }
+    async fn commit(&self, value: &[u8]) {
+        let mut txn = self
+            .store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"key", Bytes::copy_from_slice(value))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+    fn snapshot(&self) -> CreateWorkspaceSnapshotRequest {
+        CreateWorkspaceSnapshotRequest::new(
+            SNAP,
+            PIN,
+            self.start,
+            self.start + chrono::Duration::days(90),
+            None,
+        )
+        .unwrap()
+    }
+    fn export(&self) -> CreateWorkspaceExportRequest {
+        CreateWorkspaceExportRequest::new(
+            EXP,
+            EPIN,
+            SNAP,
+            PIN,
+            self.start,
+            self.start + chrono::Duration::days(60),
+        )
+        .unwrap()
+    }
+    async fn epoch(&self) -> String {
+        let value: serde_json::Value = serde_json::from_slice(
+            &self
+                .storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        value.get("state").unwrap().as_str().unwrap().to_owned()
+    }
+    async fn age_epoch(&self) {
+        let mut epoch: serde_json::Value = serde_json::from_slice(
+            &self
+                .storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        *epoch.get_mut("started_at").unwrap() =
+            serde_json::to_value(Utc::now() - chrono::Duration::hours(1)).unwrap();
+        self.storage
+            .put_raw(
+                RETENTION_MUTATION_EPOCH_PATH,
+                Bytes::from(serde_json::to_vec(&epoch).unwrap()),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+    }
+    async fn assert_protected(&self, export: bool) {
+        self.worker
+            .collect_gc_at(self.start + chrono::Duration::days(31), Vec::new())
+            .await
+            .unwrap();
+        let domains = if export {
+            self.service
+                .get_export(EXP)
+                .await
+                .unwrap()
+                .domains()
+                .to_vec()
+        } else {
+            self.service
+                .get_snapshot(SNAP)
+                .await
+                .unwrap()
+                .domains()
+                .to_vec()
+        };
+        for domain in domains {
+            let reader = self
+                .store
+                .resolve_persisted_reference_at(
+                    domain.authority(),
+                    self.start + chrono::Duration::days(31),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                reader.get(b"key").await.unwrap(),
+                Some(Bytes::from_static(b"value"))
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Class {
+    Snapshot,
+    SnapshotRetry,
+    Export,
+    ExportRetry,
+}
+impl Class {
+    fn export(self) -> bool {
+        matches!(self, Self::Export | Self::ExportRetry)
+    }
+    fn retry(self) -> bool {
+        matches!(self, Self::SnapshotRetry | Self::ExportRetry)
+    }
+    fn boundaries(self) -> Vec<String> {
+        let pin = if self.export() { EPIN } else { PIN };
+        let mut paths = vec![
+            retention_pin_revision_path(pin, 1).unwrap(),
+            retention_pin_latest_path(pin).unwrap(),
+        ];
+        if !self.retry() {
+            paths.insert(
+                0,
+                if self.export() {
+                    export_record_path(EXP).unwrap()
+                } else {
+                    snapshot_record_path(SNAP).unwrap()
+                },
+            );
+        }
+        paths
+    }
+    async fn setup(self, f: &Fixture) -> Option<Bytes> {
+        if self.export() || self.retry() {
+            f.service.create_snapshot(&f.snapshot()).await.unwrap();
+        }
+        if matches!(self, Self::ExportRetry) {
+            f.service.export_snapshot(&f.export()).await.unwrap();
+        }
+        if self.retry() {
+            let pin = if self.export() { EPIN } else { PIN };
+            f.storage
+                .delete(&retention_pin_latest_path(pin).unwrap())
+                .await
+                .unwrap();
+            f.storage
+                .delete(&retention_pin_revision_path(pin, 1).unwrap())
+                .await
+                .unwrap();
+            let path = if self.export() {
+                export_record_path(EXP).unwrap()
+            } else {
+                snapshot_record_path(SNAP).unwrap()
+            };
+            let bytes = f.storage.get_raw(&path).await.unwrap();
+            f.commit(b"successor").await;
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+    async fn publish(
+        self,
+        service: &WorkspaceSnapshotService,
+        snapshot: &CreateWorkspaceSnapshotRequest,
+        export: &CreateWorkspaceExportRequest,
+    ) -> Result<()> {
+        if self.export() {
+            service.export_snapshot(export).await.map(|_| ())
+        } else {
+            service.create_snapshot(snapshot).await.map(|_| ())
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_immutable_readback_reconciles_all_publication_classes() {
+    for class in [
+        Class::Snapshot,
+        Class::SnapshotRetry,
+        Class::Export,
+        Class::ExportRetry,
+    ] {
+        for boundary in class.boundaries() {
+            let f = Fixture::new().await;
+            let original = class.setup(&f).await;
+            let schedule = f.backend.arm(boundary.clone(), 0, Fault::LostResponse);
+            let result = class.publish(&f.service, &f.snapshot(), &f.export()).await;
+            assert!(
+                result.is_ok(),
+                "{class:?} {boundary}: {result:?}\n{:?}",
+                f.backend.trace.lock().unwrap()
+            );
+            schedule.finish().await;
+            assert_eq!(f.epoch().await, "IDLE");
+            class
+                .publish(&f.service, &f.snapshot(), &f.export())
+                .await
+                .unwrap();
+            if let Some(original) = original {
+                let path = if class.export() {
+                    export_record_path(EXP).unwrap()
+                } else {
+                    snapshot_record_path(SNAP).unwrap()
+                };
+                assert_eq!(
+                    f.storage.get_raw(&path).await.unwrap(),
+                    original,
+                    "retry preserves cut and pin identity"
+                );
+            }
+            f.assert_protected(class.export()).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn unresolved_publications_exclude_gc_even_after_cancellation_and_lease_expiry() {
+    for class in [
+        Class::Snapshot,
+        Class::SnapshotRetry,
+        Class::Export,
+        Class::ExportRetry,
+    ] {
+        for boundary in class.boundaries() {
+            for fault in [
+                Fault::PauseBefore,
+                Fault::PauseAfter,
+                Fault::DelayedError,
+                Fault::Unreadable,
+            ] {
+                let f = Fixture::new().await;
+                class.setup(&f).await;
+                let schedule = f.backend.arm(boundary.clone(), 0, fault);
+                let service = f.service.clone();
+                let snapshot = f.snapshot();
+                let export = f.export();
+                let task =
+                    tokio::spawn(async move { class.publish(&service, &snapshot, &export).await });
+                schedule.issued().await;
+                if matches!(fault, Fault::PauseAfter) {
+                    guard(schedule.applied.notified()).await;
+                }
+                if matches!(fault, Fault::PauseBefore | Fault::PauseAfter) {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    assert!(guard(task).await.unwrap().is_err());
+                }
+                *f.backend.denied.lock().unwrap() = None;
+                f.backend.expire_lease(&f.storage).await;
+                f.age_epoch().await;
+                assert_eq!(
+                    f.epoch().await,
+                    "IN_FLIGHT",
+                    "{class:?} {boundary} {fault:?}"
+                );
+                let result = f
+                    .worker
+                    .collect_gc_at(f.start + chrono::Duration::days(31), Vec::new())
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "unresolved publication cannot authorize GC"
+                );
+                assert!(f.backend.authorized_deletes.lock().unwrap().is_empty());
+                // Resolve every outstanding remote operation BEFORE operator recovery.
+                schedule.finish().await;
+                *f.backend.denied.lock().unwrap() = None;
+                recover_stale_retention_epoch(
+                    &f.storage,
+                    "all simulated publication operations completed and reconciled",
+                )
+                .await
+                .unwrap();
+                class
+                    .publish(&f.service, &f.snapshot(), &f.export())
+                    .await
+                    .unwrap();
+                f.assert_protected(class.export()).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn expiration_while_waiting_for_coordination_rejects_every_publication_class() {
+    for class in [
+        Class::Snapshot,
+        Class::SnapshotRetry,
+        Class::Export,
+        Class::ExportRetry,
+    ] {
+        let f = Fixture::new().await;
+        class.setup(&f).await;
+        let schedule = f
+            .backend
+            .arm(RETENTION_GC_LOCK_PATH.to_owned(), 0, Fault::PauseBefore);
+        let service = f.service.clone();
+        let snapshot = f.snapshot();
+        let export = f.export();
+        let task = tokio::spawn(async move { class.publish(&service, &snapshot, &export).await });
+        schedule.issued().await;
+        *f.backend.now.lock().unwrap() = f.start + chrono::Duration::days(91);
+        schedule.finish().await;
+        assert!(
+            guard(task).await.unwrap().is_err(),
+            "{class:?}: retention expired while acquiring coordination"
+        );
+        let pin = if class.export() { EPIN } else { PIN };
+        assert!(
+            f.storage
+                .head_raw(&retention_pin_latest_path(pin).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_artifacts_and_record_obey_publication_exclusion() {
+    for boundary in [
+        "/segments/l1/state-checkpoint-",
+        "/indexes/state-checkpoint-",
+        "/checkpoints/checkpoint-",
+    ] {
+        for fault in [
+            Fault::PauseBefore,
+            Fault::PauseAfter,
+            Fault::LostResponse,
+            Fault::DelayedError,
+            Fault::Unreadable,
+        ] {
+            let f = Fixture::new().await;
+            let schedule = f.backend.arm(boundary.to_owned(), 0, fault);
+            let service = f.service.clone();
+            let request = f.snapshot();
+            let task = tokio::spawn(async move { service.create_snapshot(&request).await });
+            schedule.issued().await;
+            if matches!(fault, Fault::PauseAfter) {
+                guard(schedule.applied.notified()).await;
+            }
+            let success =
+                matches!(fault, Fault::LostResponse) && boundary.contains("/checkpoints/");
+            if matches!(fault, Fault::PauseBefore | Fault::PauseAfter) {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert_eq!(
+                    guard(task).await.unwrap().is_ok(),
+                    success,
+                    "{boundary} {fault:?}"
+                );
+            }
+            *f.backend.denied.lock().unwrap() = None;
+            f.backend.expire_lease(&f.storage).await;
+            if !success {
+                f.age_epoch().await;
+                assert_eq!(f.epoch().await, "IN_FLIGHT");
+                assert!(
+                    f.worker
+                        .collect_gc_at(f.start + chrono::Duration::days(31), Vec::new())
+                        .await
+                        .is_err()
+                );
+            }
+            schedule.finish().await;
+            *f.backend.denied.lock().unwrap() = None;
+            if !success {
+                recover_stale_retention_epoch(
+                    &f.storage,
+                    "checkpoint remote task completed; partial cut reconciled",
+                )
+                .await
+                .unwrap();
+            }
+            f.service.create_snapshot(&f.snapshot()).await.unwrap();
+            f.assert_protected(false).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn lost_epoch_claim_and_settlement_responses_are_conservative() {
+    for class in [
+        Class::Snapshot,
+        Class::SnapshotRetry,
+        Class::Export,
+        Class::ExportRetry,
+    ] {
+        for skip in [0, 1] {
+            for fault in [
+                Fault::LostResponse,
+                Fault::Unreadable,
+                Fault::DelayedError,
+                Fault::PauseBefore,
+                Fault::PauseAfter,
+            ] {
+                let f = Fixture::new().await;
+                class.setup(&f).await;
+                let schedule = f
+                    .backend
+                    .arm(RETENTION_MUTATION_EPOCH_PATH.to_owned(), skip, fault);
+                let service = f.service.clone();
+                let snapshot = f.snapshot();
+                let export = f.export();
+                let task =
+                    tokio::spawn(async move { class.publish(&service, &snapshot, &export).await });
+                schedule.issued().await;
+                if matches!(fault, Fault::PauseAfter) {
+                    guard(schedule.applied.notified()).await;
+                }
+                if matches!(fault, Fault::PauseBefore | Fault::PauseAfter) {
+                    task.abort();
+                    assert!(task.await.unwrap_err().is_cancelled());
+                } else {
+                    assert!(guard(task).await.unwrap().is_err());
+                }
+                *f.backend.denied.lock().unwrap() = None;
+                f.backend.expire_lease(&f.storage).await;
+                // A not-yet-applied claim cannot have issued any publication. A
+                // landed settlement means every preceding mutation completed.
+                if skip == 0
+                    && matches!(
+                        fault,
+                        Fault::LostResponse | Fault::Unreadable | Fault::PauseAfter
+                    )
+                    || skip == 1 && matches!(fault, Fault::DelayedError | Fault::PauseBefore)
+                {
+                    assert_eq!(f.epoch().await, "IN_FLIGHT");
+                    assert!(
+                        f.worker
+                            .collect_gc_at(f.start + chrono::Duration::days(31), Vec::new())
+                            .await
+                            .is_err()
+                    );
+                }
+                schedule.finish().await;
+                *f.backend.denied.lock().unwrap() = None;
+                recover_stale_retention_epoch(
+                    &f.storage,
+                    "epoch remote task terminal; no publication requests pending",
+                )
+                .await
+                .unwrap();
+                class
+                    .publish(&f.service, &f.snapshot(), &f.export())
+                    .await
+                    .unwrap();
+                f.assert_protected(class.export()).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn delayed_delete_survives_collector_cancellation_restart_and_new_retained_publication() {
+    let f = Fixture::new().await;
+    let orphan = f.store.paths().tx_object("orphan-before-restart");
+    f.storage
+        .put_raw(&orphan, Bytes::new(), WritePrecondition::DoesNotExist)
+        .await
+        .unwrap();
+    let schedule = f.backend.arm(orphan.clone(), 0, Fault::PauseBefore);
+    let worker = ControlMvpMaintenanceWorker::new(
+        f.storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+    )
+    .unwrap();
+    let now = f.start + chrono::Duration::days(8);
+    let task = tokio::spawn(async move { worker.collect_gc_at(now, Vec::new()).await });
+    schedule.issued().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    f.backend.expire_lease(&f.storage).await;
+    let mut epoch: serde_json::Value = serde_json::from_slice(
+        &f.storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    *epoch.get_mut("started_at").unwrap() =
+        serde_json::to_value(Utc::now() - chrono::Duration::hours(1)).unwrap();
+    f.storage
+        .put_raw(
+            RETENTION_MUTATION_EPOCH_PATH,
+            Bytes::from(serde_json::to_vec(&epoch).unwrap()),
+            WritePrecondition::None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        f.worker
+            .collect_gc_at(now, Vec::new())
+            .await
+            .unwrap()
+            .objects_deleted(),
+        1
+    );
+    f.commit(b"value").await;
+    f.service.create_snapshot(&f.snapshot()).await.unwrap();
+    f.service.export_snapshot(&f.export()).await.unwrap();
+    schedule.finish().await;
+    assert!(f.storage.head_raw(&orphan).await.unwrap().is_none());
+    f.assert_protected(false).await;
+    f.assert_protected(true).await;
+}
+
+async fn release_pin(f: &Fixture, pin: &str, now: DateTime<Utc>) {
+    let revision = decode_retention_pin_revision(
+        &f.storage
+            .get_raw(&retention_pin_revision_path(pin, 1).unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let released = revision.release(2, now).unwrap();
+    select_revision(f, &released).await;
+}
+async fn select_revision(f: &Fixture, revision: &RetentionPinRevision) {
+    let bytes = encode_retention_pin_revision(revision).unwrap();
+    let path = retention_pin_revision_path(revision.pin_id(), revision.revision()).unwrap();
+    f.storage
+        .put_raw(
+            &path,
+            Bytes::copy_from_slice(&bytes),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    let selector = RetentionPinLatest::new(
+        revision.pin_id(),
+        revision.revision(),
+        path,
+        format!("sha256:{}", hex::encode(Sha256::digest(&bytes))),
+    )
+    .unwrap();
+    f.storage
+        .put_raw(
+            &retention_pin_latest_path(revision.pin_id()).unwrap(),
+            Bytes::from(encode_retention_pin_latest(&selector).unwrap()),
+            WritePrecondition::None,
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn released_source_while_waiting_cannot_publish_or_retry_an_export() {
+    for class in [Class::Export, Class::ExportRetry] {
+        let f = Fixture::new().await;
+        class.setup(&f).await;
+        let schedule = f
+            .backend
+            .arm(RETENTION_GC_LOCK_PATH.to_owned(), 0, Fault::PauseBefore);
+        let service = f.service.clone();
+        let snapshot = f.snapshot();
+        let export = f.export();
+        let task = tokio::spawn(async move { class.publish(&service, &snapshot, &export).await });
+        schedule.issued().await;
+        release_pin(&f, PIN, f.start).await;
+        schedule.finish().await;
+        assert!(guard(task).await.unwrap().is_err());
+        assert!(
+            f.storage
+                .head_raw(&retention_pin_latest_path(EPIN).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+type Contents = BTreeMap<Vec<u8>, Bytes>;
+struct TokenOracle {
+    token: StateToken,
+    contents: Contents,
+    until: DateTime<Utc>,
+}
+struct CheckpointOracle {
+    token: CheckpointToken,
+    contents: Contents,
+    until: DateTime<Utc>,
+}
+struct RootOracle {
+    snapshot: CreateWorkspaceSnapshotRequest,
+    export: Option<CreateWorkspaceExportRequest>,
+    contents: Contents,
+    released: bool,
+    bytes: Bytes,
+}
+impl RootOracle {
+    fn until(&self) -> DateTime<Utc> {
+        self.export.as_ref().map_or(
+            self.snapshot.retained_until(),
+            CreateWorkspaceExportRequest::retained_until,
+        )
+    }
+    fn pin(&self) -> &str {
+        self.export
+            .as_ref()
+            .map_or(self.snapshot.pin_id(), CreateWorkspaceExportRequest::pin_id)
+    }
+    fn active(&self, now: DateTime<Utc>) -> bool {
+        !self.released && now < self.until()
+    }
+    async fn publish(&self, f: &Fixture) -> Result<()> {
+        if let Some(export) = &self.export {
+            f.service.export_snapshot(export).await.map(|_| ())
+        } else {
+            f.service.create_snapshot(&self.snapshot).await.map(|_| ())
+        }
+    }
+    async fn path_bytes(&self, f: &Fixture) -> Bytes {
+        let path = self.export.as_ref().map_or_else(
+            || snapshot_record_path(self.snapshot.snapshot_id()).unwrap(),
+            |e| export_record_path(e.export_id()).unwrap(),
+        );
+        f.storage.get_raw(&path).await.unwrap()
+    }
+}
+async fn compare(reader: &dyn ArcoStateReader, expected: &Contents) {
+    for key in [b"key".as_slice(), b"a", b"b", b"c"] {
+        assert_eq!(
+            reader.get(key).await.unwrap(),
+            expected.get(key).cloned(),
+            "logical oracle key {key:?}"
+        );
+    }
+}
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+// Keep operation generation and oracle updates together for schedule review.
+#[allow(clippy::cognitive_complexity)]
+async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
+    let mut f = Fixture::new().await;
+    let orphan = f.store.paths().tx_object("model-orphan");
+    f.storage
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    let mut random = seed;
+    let mut now = f.start;
+    let mut contents = Contents::from([(b"key".to_vec(), Bytes::from_static(b"value"))]);
+    let mut tokens = vec![TokenOracle {
+        token: f.store.current_state_token().await.unwrap(),
+        contents: contents.clone(),
+        until: now + chrono::Duration::days(30),
+    }];
+    let mut checkpoints: Vec<CheckpointOracle> = Vec::new();
+    let mut roots: Vec<RootOracle> = Vec::new();
+    let mut counts = [0_u32; 12];
+    for step in 0..64 {
+        // Each seed exercises every operation family once, then a fixed PRNG
+        // drives ordering. The oracle never calls the collector's planner.
+        let op = if step < 12 {
+            step
+        } else {
+            usize::try_from(next_random(&mut random) % 12).unwrap()
+        };
+        *counts.get_mut(op).unwrap() += 1;
+        trace.lock().unwrap().push(format!(
+            "seed={seed} step={step} op={op} now={now} keys={:?}",
+            contents.keys().collect::<Vec<_>>()
+        ));
+        match op {
+            0..=2 => {
+                // Maintenance runs before the existing L0 backpressure limit.
+                f.worker.consolidate_pending().await.unwrap();
+                let mut txn = f
+                    .store
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap();
+                let key = [b"a", b"b", b"c"]
+                    .get(usize::try_from(next_random(&mut random) % 3).unwrap())
+                    .unwrap()
+                    .to_vec();
+                if op == 2 {
+                    txn.delete(&key).await.unwrap();
+                    contents.remove(&key);
+                } else {
+                    let value = Bytes::from(format!("{seed}-{step}"));
+                    txn.put(&key, value.clone()).await.unwrap();
+                    contents.insert(key, value);
+                }
+                let token = txn.commit().await.unwrap().state_token().clone();
+                tokens.push(TokenOracle {
+                    token,
+                    contents: contents.clone(),
+                    until: now + chrono::Duration::days(30),
+                });
+            }
+            3 => {
+                let token = f
+                    .store
+                    .checkpoint(CheckpointOptions::default())
+                    .await
+                    .unwrap();
+                checkpoints.push(CheckpointOracle {
+                    token,
+                    contents: contents.clone(),
+                    until: now + chrono::Duration::days(30),
+                });
+            }
+            4 => {
+                let id = ulid::Ulid::from(u128::from(seed) * 1000 + u128::try_from(step).unwrap());
+                let request = CreateWorkspaceSnapshotRequest::new(
+                    format!("snap_{id}"),
+                    format!("pin_{id}"),
+                    now,
+                    now + chrono::Duration::days(40),
+                    None,
+                )
+                .unwrap();
+                f.service.create_snapshot(&request).await.unwrap();
+                let bytes = f
+                    .storage
+                    .get_raw(&snapshot_record_path(request.snapshot_id()).unwrap())
+                    .await
+                    .unwrap();
+                roots.push(RootOracle {
+                    snapshot: request,
+                    export: None,
+                    contents: contents.clone(),
+                    released: false,
+                    bytes,
+                });
+            }
+            5 => {
+                if let Some(source) = roots
+                    .iter()
+                    .rev()
+                    .find(|r| r.export.is_none() && r.active(now))
+                {
+                    let id =
+                        ulid::Ulid::from(u128::from(seed) * 1000 + u128::try_from(step).unwrap());
+                    let request = CreateWorkspaceExportRequest::new(
+                        format!("exp_{id}"),
+                        format!("pin_{id}"),
+                        source.snapshot.snapshot_id(),
+                        source.pin(),
+                        now,
+                        source.until(),
+                    )
+                    .unwrap();
+                    f.service.export_snapshot(&request).await.unwrap();
+                    let bytes = f
+                        .storage
+                        .get_raw(&export_record_path(request.export_id()).unwrap())
+                        .await
+                        .unwrap();
+                    roots.push(RootOracle {
+                        snapshot: source.snapshot.clone(),
+                        export: Some(request),
+                        contents: source.contents.clone(),
+                        released: false,
+                        bytes,
+                    });
+                }
+            }
+            6 => {
+                if !roots.is_empty() {
+                    let i = usize::try_from(next_random(&mut random)).unwrap() % roots.len();
+                    let root = roots.get(i).unwrap();
+                    let source_active = root.export.as_ref().is_none_or(|e| {
+                        roots.iter().any(|r| {
+                            r.export.is_none()
+                                && r.snapshot.snapshot_id() == e.snapshot_id()
+                                && r.active(now)
+                        })
+                    });
+                    if root.active(now) && source_active {
+                        f.storage
+                            .delete(&retention_pin_latest_path(root.pin()).unwrap())
+                            .await
+                            .unwrap();
+                        f.storage
+                            .delete(&retention_pin_revision_path(root.pin(), 1).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        root.publish(&f).await.is_ok(),
+                        root.active(now) && source_active
+                    );
+                    assert_eq!(
+                        root.path_bytes(&f).await,
+                        root.bytes,
+                        "retry must preserve original cut and pin identity"
+                    );
+                }
+            }
+            7 => {
+                if let Some(root) = roots.iter_mut().find(|r| r.active(now)) {
+                    release_pin(&f, root.pin(), now).await;
+                    root.released = true;
+                }
+            }
+            8 => {
+                now += chrono::Duration::days(11);
+                *f.backend.now.lock().unwrap() = now;
+            }
+            9 => {
+                f.worker.consolidate_pending().await.unwrap();
+            }
+            10 => {
+                let mut cursor = None;
+                loop {
+                    let result = f
+                        .worker
+                        .collect_gc_page_at(now, Vec::new(), cursor.as_deref())
+                        .await
+                        .unwrap();
+                    cursor = result.continuation().map(str::to_owned);
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+            11 => {
+                f.store = Arc::new(
+                    ControlMvpStateStore::new(
+                        f.storage.clone(),
+                        StateScope::new("tenant", "workspace", "catalog"),
+                    )
+                    .unwrap(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        trace
+            .lock()
+            .unwrap()
+            .push(format!("acknowledged contents={contents:?}"));
+        compare(f.store.as_ref(), &contents).await;
+        for token in &tokens {
+            if now <= token.until {
+                compare(
+                    f.store.read_at(token.token.clone()).await.unwrap().as_ref(),
+                    &token.contents,
+                )
+                .await;
+            }
+        }
+        for checkpoint in &checkpoints {
+            if now <= checkpoint.until {
+                compare(
+                    f.store
+                        .read_checkpoint(checkpoint.token.clone())
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    &checkpoint.contents,
+                )
+                .await;
+            }
+        }
+        for root in roots.iter().filter(|r| r.active(now)) {
+            let (domains, required) = if let Some(export) = &root.export {
+                let record = f.service.get_export(export.export_id()).await.unwrap();
+                (
+                    record.domains().to_vec(),
+                    record.required_objects().to_vec(),
+                )
+            } else {
+                let record = f
+                    .service
+                    .get_snapshot(root.snapshot.snapshot_id())
+                    .await
+                    .unwrap();
+                (
+                    record.domains().to_vec(),
+                    record.required_objects().to_vec(),
+                )
+            };
+            for object in required {
+                assert!(
+                    !f.backend
+                        .authorized_deletes
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.ends_with(object.relative_path())),
+                    "retained reference revived a deletion-authorized object: {}",
+                    object.relative_path()
+                );
+            }
+            for domain in domains {
+                compare(
+                    f.store
+                        .resolve_persisted_reference_at(domain.authority(), now)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    &root.contents,
+                )
+                .await;
+            }
+        }
+    }
+    assert!(counts.into_iter().all(|count| count > 0));
+    assert!(
+        f.storage.head_raw(&orphan).await.unwrap().is_none(),
+        "model must perform real reclamation"
+    );
+}
+
+#[tokio::test]
+async fn independent_reclamation_model_32_seeds_of_64_operations() {
+    for seed in 1..=32 {
+        let trace = Mutex::new(Vec::new());
+        let result = std::panic::AssertUnwindSafe(run_model(seed, &trace))
+            .catch_unwind()
+            .await;
+        assert!(
+            result.is_ok(),
+            "model failed seed={seed}\n{}",
+            trace.lock().unwrap().join("\n")
+        );
+    }
+}
+
+#[tokio::test]
+async fn immutable_preconditions_and_transport_readback_require_exact_bytes() {
+    for class in [
+        Class::Snapshot,
+        Class::SnapshotRetry,
+        Class::Export,
+        Class::ExportRetry,
+    ] {
+        for boundary in class.boundaries() {
+            for fault in [
+                Fault::IdenticalWinner,
+                Fault::DifferentWinner,
+                Fault::DifferentLostResponse,
+            ] {
+                let f = Fixture::new().await;
+                class.setup(&f).await;
+                let schedule = f.backend.arm(boundary.clone(), 0, fault);
+                let result = class.publish(&f.service, &f.snapshot(), &f.export()).await;
+                schedule.finish().await;
+                match fault {
+                    Fault::IdenticalWinner => {
+                        result.unwrap();
+                        assert_eq!(f.epoch().await, "IDLE");
+                        f.assert_protected(class.export()).await;
+                    }
+                    Fault::DifferentWinner => {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(arco_catalog::CatalogError::PreconditionFailed { .. })
+                            ),
+                            "{class:?} {boundary}: {result:?}"
+                        );
+                        assert_eq!(
+                            f.epoch().await,
+                            "IDLE",
+                            "terminal create conflict needs no recovery"
+                        );
+                    }
+                    Fault::DifferentLostResponse => {
+                        assert!(result.is_err());
+                        assert_eq!(
+                            f.epoch().await,
+                            "IN_FLIGHT",
+                            "different readback cannot resolve transport uncertainty"
+                        );
+                        assert!(
+                            f.worker
+                                .collect_gc_at(f.start + chrono::Duration::days(31), Vec::new())
+                                .await
+                                .is_err()
+                        );
+                        assert!(f.backend.authorized_deletes.lock().unwrap().is_empty());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[path = "support/legacy_reclamation.rs"]
+mod legacy_reclamation;

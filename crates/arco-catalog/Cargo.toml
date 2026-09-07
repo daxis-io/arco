@@ -69,6 +69,7 @@ proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+allocation-counter = "0.8.1"
 arco-proto = { path = "../arco-proto" }
 tokio-test = { workspace = true }
 criterion = { workspace = true }

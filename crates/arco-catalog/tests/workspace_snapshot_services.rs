@@ -2370,6 +2370,55 @@ async fn retention_coordination_lease_loss_blocks_publication_and_gc_deletion() 
 }
 
 #[tokio::test]
+async fn export_revalidates_source_protection_after_acquiring_retention_coordination() {
+    for retry in [false, true] {
+        let (backend, storage, registry) = service_fixture(&["catalog"]).await;
+        let service = WorkspaceSnapshotService::new(storage.clone(), registry).expect("service");
+        let request = CreateWorkspaceSnapshotRequest::new(
+            SNAPSHOT_ID,
+            PIN_ID,
+            ts(1_600_000_000),
+            ts(2_100_000_000),
+            None,
+        )
+        .expect("snapshot request");
+        service.create_snapshot(&request).await.expect("snapshot");
+        if retry {
+            service
+                .export_snapshot(&export_request())
+                .await
+                .expect("first export");
+            storage
+                .delete(&retention_pin_latest_path(EXPORT_PIN_ID).expect("path"))
+                .await
+                .expect("simulate interrupted pin publication");
+        }
+        backend.pause_put("locks/workspace-retention-gc.lock.json");
+        let task = tokio::spawn(async move { service.export_snapshot(&export_request()).await });
+        tokio::time::timeout(Duration::from_secs(2), backend.wait_for_paused_put())
+            .await
+            .expect("export reached coordination after source validation");
+        let released = read_pin_revision(&storage, PIN_ID, 1)
+            .await
+            .release(2, ts(1_700_000_000))
+            .expect("release source protection");
+        select_pin_revision(&storage, &released).await;
+        backend.resume_paused_put();
+        assert!(
+            task.await.expect("export task").is_err(),
+            "still-present source bytes must not revive released protection"
+        );
+        assert!(
+            storage
+                .head_raw(&retention_pin_latest_path(EXPORT_PIN_ID).expect("path"))
+                .await
+                .expect("head")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn export_retry_revalidates_a_missing_closure_before_reactivating_the_pin() {
     let (backend, storage, registry) = service_fixture(&["catalog"]).await;
     let mutation_storage = storage.clone();

@@ -434,16 +434,48 @@ impl Reconciler {
     /// Returns an error if the retention lock or durable mutation epoch cannot
     /// be claimed, if the protection inventory cannot be validated, or if a
     /// candidate cannot be inspected (fail closed: nothing is deleted in those
-    /// cases). A failure to delete one authorized candidate is *not* fatal: it
-    /// is counted in `failed_count` and the pass continues, so one unlucky
-    /// object can neither skip the remaining repairs nor strand the durable
-    /// mutation epoch in flight.
+    /// cases). An individual DELETE failure is counted and the pass continues,
+    /// but settlement then fails and leaves the epoch in flight. Legacy objects
+    /// have no generation fence: pending remote deletes must finish before a
+    /// later retained reference can safely be published.
     #[allow(clippy::cognitive_complexity)]
     pub async fn repair_with_scope(
         &self,
         report: &ReconciliationReport,
         scope: RepairScope,
     ) -> Result<RepairResult> {
+        let domain =
+            Self::parse_domain(&report.domain).ok_or_else(|| CatalogError::Validation {
+                message: "repair report has an unknown domain".to_string(),
+            })?;
+        let legacy_prefix = match domain {
+            CatalogDomain::Executions => CatalogPaths::state_dir(domain),
+            _ => format!("snapshots/{}/", domain.as_str()),
+        };
+        // Reports may be supplied by callers. Validate the complete candidate
+        // set before authorizing any deletion, including candidates later skipped.
+        for issue in &report.issues {
+            if issue.repairable
+                && scope.allows_issue(issue.issue_type)
+                && matches!(
+                    issue.issue_type,
+                    IssueType::OrphanedSnapshot | IssueType::OldSnapshotVersion
+                )
+            {
+                ScopedStorage::validate_path(&issue.path)?;
+                if !issue.path.starts_with(&legacy_prefix)
+                    || issue.path.len() == legacy_prefix.len()
+                    || issue.path.contains("//")
+                {
+                    return Err(CatalogError::Validation {
+                        message: format!(
+                            "repair candidate is outside the canonical legacy namespace: {}",
+                            issue.path
+                        ),
+                    });
+                }
+            }
+        }
         let mut result = RepairResult {
             domain: report.domain.clone(),
             repaired_at: Utc::now(),
@@ -453,16 +485,12 @@ impl Reconciler {
         };
 
         let (visible_snapshot_version, protected_paths, snapshot_prefix) =
-            if let Some(domain) = Self::parse_domain(&report.domain) {
-                self.load_expected_paths(domain).await?.map_or_else(
-                    || (report.manifest_snapshot_version, HashSet::new(), None),
-                    |(version, expected, prefix)| {
-                        (version, expected.into_iter().collect(), Some(prefix))
-                    },
-                )
-            } else {
-                (report.manifest_snapshot_version, HashSet::new(), None)
-            };
+            self.load_expected_paths(domain).await?.map_or_else(
+                || (report.manifest_snapshot_version, HashSet::new(), None),
+                |(version, expected, prefix)| {
+                    (version, expected.into_iter().collect(), Some(prefix))
+                },
+            );
         let retained_versions = if let Some(prefix) = snapshot_prefix.as_deref() {
             self.retained_versions(prefix, visible_snapshot_version)
                 .await?
@@ -683,12 +711,10 @@ impl Reconciler {
             }
 
             // A per-object delete failure is counted and the pass continues.
-            // Aborting here would abandon every remaining authorized candidate
-            // and -- because the abort propagates before settlement -- strand
-            // the durable epoch IN_FLIGHT, wedging GC, repair, snapshot,
-            // export, and restore until a recovery path runs. Protection,
-            // lock, and epoch errors above still fail the whole pass closed.
-            match epoch.delete_reclaimable(&issue.path).await {
+            // Remaining candidates can be processed, but the uncertainty marker
+            // prevents settlement until operator recovery resolves remote work.
+            // Protection, lock, and epoch errors above fail the pass closed.
+            match epoch.delete(&issue.path).await {
                 Ok(()) => {
                     result.repaired_count += 1;
                     Self::record_repair_metric(report_domain, issue.issue_type, "repaired");
@@ -1896,6 +1922,47 @@ mod tests {
             .expect("recently written candidate must survive within the minimum age window");
     }
 
+    #[tokio::test]
+    async fn supplied_repair_report_cannot_escape_legacy_domain_namespace() {
+        for (domain, path) in [
+            ("catalog", "control/v1/catalog/manifests/forged.json"),
+            ("catalog", "retention/coordination/mutation-epoch.json"),
+            ("catalog", "retention/pins/forged/latest.json"),
+            ("catalog", "snapshots/lineage/v1/old.parquet"),
+            ("catalog", "state/executions/snapshot_v1_old.parquet"),
+            ("unknown", "snapshots/catalog/v1/old.parquet"),
+            ("catalog", "snapshots/catalog/../lineage/v1/old.parquet"),
+        ] {
+            let storage =
+                ScopedStorage::new(Arc::new(MemoryBackend::new()), "acme", "prod").unwrap();
+            let valid = seed_current_v2_head_with_old_v1_files(&storage, &["valid.parquet"]).await;
+            let reconciler =
+                Reconciler::new(storage.clone()).with_min_age_before_delete(Duration::zero());
+            let mut report = reconciler.check(CatalogDomain::Catalog).await.unwrap();
+            report.domain = domain.to_string();
+            report.issues.push(ReconciliationIssue {
+                issue_type: IssueType::OrphanedSnapshot,
+                path: path.to_string(),
+                description: "untrusted supplied candidate".to_string(),
+                severity: Severity::Warning,
+                repairable: true,
+            });
+            assert!(
+                reconciler
+                    .repair_with_scope(&report, RepairScope::Full)
+                    .await
+                    .is_err(),
+                "must reject {domain}: {path}"
+            );
+            for path in valid {
+                assert!(
+                    storage.head_raw(&path).await.unwrap().is_some(),
+                    "validate entire report before first delete"
+                );
+            }
+        }
+    }
+
     /// A backend that fails `delete` for one exact path and otherwise defers.
     #[derive(Debug)]
     struct FailingDeleteBackend {
@@ -1971,16 +2038,9 @@ mod tests {
         }
     }
 
-    /// One object that will not delete must not abandon the rest of the pass,
-    /// and must never strand the durable epoch IN_FLIGHT.
-    ///
-    /// Aborting on the first delete error left
-    /// `{"state":"IN_FLIGHT","operation_kind":"catalog_repair"}` behind, after
-    /// which every GC pass, repair retry, snapshot, export, and restore failed
-    /// with "a retention mutation epoch is already in flight" -- forever, and
-    /// re-failing on each 300s automation retry.
+    /// Continue the pass, but preserve exclusion after an ambiguous legacy DELETE.
     #[tokio::test]
-    async fn repair_counts_a_failed_delete_continues_the_pass_and_settles_the_epoch() {
+    async fn repair_continues_after_failed_delete_but_retains_uncertain_epoch() {
         let backend = Arc::new(FailingDeleteBackend::new("undeletable.parquet"));
         let storage = ScopedStorage::new(backend, "acme", "prod").expect("storage");
         let old_paths = seed_current_v2_head_with_old_v1_files(
@@ -1997,16 +2057,11 @@ mod tests {
             .check(CatalogDomain::Catalog)
             .await
             .expect("check");
-        let result = reconciler
+        reconciler
             .repair_with_scope(&report, RepairScope::Full)
             .await
-            .expect("one failed delete must not fail the whole pass");
+            .expect_err("uncertain legacy DELETE must prevent settlement");
 
-        assert_eq!(result.failed_count, 1, "the failure must be counted");
-        assert_eq!(
-            result.repaired_count, 1,
-            "the remaining authorized candidate must still be repaired"
-        );
         storage
             .get_raw(&undeletable)
             .await
@@ -2028,11 +2083,11 @@ mod tests {
         )
         .expect("epoch json");
         assert_eq!(
-            epoch["state"], "IDLE",
-            "a per-object delete failure must not strand the workspace exclusion record"
+            epoch["state"], "IN_FLIGHT",
+            "an unresolved legacy DELETE must retain workspace exclusion"
         );
 
-        // Nothing is wedged: GC and a repair retry both still claim the epoch.
+        // Both entry points remain excluded until every remote mutation is resolved.
         gc::GarbageCollector::new(
             storage.clone(),
             gc::RetentionPolicy {
@@ -2044,7 +2099,7 @@ mod tests {
         )
         .collect()
         .await
-        .expect("GC must not be wedged by a failed repair delete");
+        .expect_err("GC must not bypass an unresolved legacy DELETE");
         let retry_report = reconciler
             .check(CatalogDomain::Catalog)
             .await
@@ -2052,7 +2107,7 @@ mod tests {
         reconciler
             .repair_with_scope(&retry_report, RepairScope::Full)
             .await
-            .expect("a healthy repair retry must not be wedged");
+            .expect_err("repair retry must not bypass an unresolved legacy DELETE");
     }
 
     /// A holder that dies between claiming the durable epoch and settling it
@@ -2101,7 +2156,7 @@ mod tests {
 
         let recovered = crate::retention_coordination::recover_stale_retention_epoch(
             &storage,
-            "holder confirmed dead during incident 4711",
+            "holder dead; no publication mutations were issued in incident 4711",
         )
         .await
         .expect("recovery")

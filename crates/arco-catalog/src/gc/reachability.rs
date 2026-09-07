@@ -1,6 +1,6 @@
 //! Deterministic protection graph for retained workspace roots.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
@@ -8,6 +8,7 @@ use sha2::{Digest as _, Sha256};
 use arco_core::ScopedStorage;
 
 use crate::error::{CatalogError, Result};
+use crate::state_store::PersistedAuthorityReference;
 use crate::workspace_snapshot::{
     EventArchiveCut, ExportManifest, RetentionPinLatest, RetentionPinRevision, RetentionStatus,
     RetentionTarget, WorkspaceSnapshot, decode_retention_pin_latest, decode_retention_pin_revision,
@@ -284,6 +285,126 @@ pub async fn load_selected_retention_pin(
     let mut selected = SelectedRetentionPin::from_revision_bytes(selector, &revision_bytes)?;
     selected.validate()?;
     Ok(selected)
+}
+
+/// One active retained root, including provider objects outside its authority closure.
+pub struct RetainedAuthorityRoot {
+    pub(crate) authorities: Vec<PersistedAuthorityReference>,
+    pub(crate) required_paths: BTreeSet<String>,
+}
+
+/// Streams validated retained authority roots, holding one selector page and
+/// one target's authority references at a time. Mutating callers must own the
+/// durable retention epoch for the entire traversal and publication/deletion.
+pub struct RetainedAuthorityRoots<'a> {
+    storage: &'a ScopedStorage,
+    now: DateTime<Utc>,
+    cursor: Option<String>,
+    pending: VecDeque<String>,
+    exhausted: bool,
+}
+
+impl<'a> RetainedAuthorityRoots<'a> {
+    pub(crate) fn new(storage: &'a ScopedStorage, now: DateTime<Utc>) -> Self {
+        Self {
+            storage,
+            now,
+            cursor: None,
+            pending: VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<RetainedAuthorityRoot>> {
+        loop {
+            if let Some(pin_id) = self.pending.pop_front() {
+                let selected = load_selected_retention_pin(self.storage, &pin_id).await?;
+                if selected.status_at(self.now)? != RetentionStatus::Active {
+                    continue;
+                }
+                let (scope, domains, required_paths) = match selected.latest_revision()?.target() {
+                    RetentionTarget::Snapshot(id) => {
+                        let bytes = self.storage.get_raw(&snapshot_record_path(id)?).await?;
+                        let snapshot =
+                            crate::workspace_snapshot::decode_workspace_snapshot(&bytes)?;
+                        validate_snapshot_pin_binding(&selected, &snapshot)?;
+                        (
+                            snapshot.scope().clone(),
+                            snapshot.domains().to_vec(),
+                            snapshot
+                                .required_objects()
+                                .iter()
+                                .map(|object| object.relative_path().to_owned())
+                                .chain(
+                                    snapshot
+                                        .compatibility_artifacts()
+                                        .iter()
+                                        .map(|artifact| artifact.relative_path().to_owned()),
+                                )
+                                .collect(),
+                        )
+                    }
+                    RetentionTarget::Export(id) => {
+                        let bytes = self.storage.get_raw(&export_record_path(id)?).await?;
+                        let export = crate::workspace_snapshot::decode_export_manifest(&bytes)?;
+                        validate_export_pin_binding(&selected, &export)?;
+                        (
+                            export.scope().clone(),
+                            export.domains().to_vec(),
+                            export
+                                .required_objects()
+                                .iter()
+                                .map(|object| object.relative_path().to_owned())
+                                .chain(
+                                    export
+                                        .compatibility_artifacts()
+                                        .iter()
+                                        .map(|artifact| artifact.relative_path().to_owned()),
+                                )
+                                .collect(),
+                        )
+                    }
+                };
+                if scope.tenant_id() != self.storage.tenant_id()
+                    || scope.workspace_id() != self.storage.workspace_id()
+                {
+                    return Err(validation(
+                        "retained authority root scope does not match storage",
+                    ));
+                }
+                return Ok(Some(RetainedAuthorityRoot {
+                    authorities: domains
+                        .into_iter()
+                        .map(|domain| domain.authority().clone())
+                        .collect(),
+                    required_paths,
+                }));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            let page = self
+                .storage
+                .list_page_meta("retention/pins/", self.cursor.as_deref(), 256)
+                .await?;
+            for object in page.objects {
+                let path = object.path.as_str();
+                if !path.ends_with("/latest.json") {
+                    continue;
+                }
+                let id = path
+                    .strip_prefix("retention/pins/")
+                    .and_then(|suffix| suffix.strip_suffix("/latest.json"))
+                    .ok_or_else(|| validation("noncanonical retention pin selector path"))?;
+                if pin_latest_path(id)? != path {
+                    return Err(validation("noncanonical retention pin selector path"));
+                }
+                self.pending.push_back(id.to_string());
+            }
+            self.exhausted = page.next_start_after.is_none();
+            self.cursor = page.next_start_after;
+        }
+    }
 }
 
 /// Deterministic exact-object and prefix protection computed before deletion.

@@ -56,6 +56,50 @@ fn metastore_scope_facades_accept_explicit_scope_without_moving_workspace_paths(
 }
 
 #[test]
+fn metastore_scope_facades_preserve_workspace_context_at_metastore_root() {
+    let scope =
+        ControlPlaneScope::new("acme", "notebooks", "lakehouse_prod").expect("explicit scope");
+    let storage = ScopedStorage::new_metastore_scoped(Arc::new(MemoryBackend::new()), &scope)
+        .expect("metastore storage");
+
+    let results = [
+        (
+            "writer",
+            CatalogWriter::try_new_with_scope(storage.clone(), scope.clone())
+                .map(|writer| writer.scope().clone()),
+        ),
+        (
+            "reader",
+            CatalogReader::try_new_with_scope(storage.clone(), scope.clone())
+                .map(|reader| reader.scope().clone()),
+        ),
+        (
+            "compactor",
+            Tier1Compactor::try_new_with_scope(storage.clone(), scope.clone())
+                .map(|compactor| compactor.scope().clone()),
+        ),
+    ];
+    for (name, result) in results {
+        assert_eq!(result.as_ref().ok(), Some(&scope), "{name}: {result:?}");
+    }
+    assert_eq!(storage.workspace_id(), "notebooks");
+    assert_eq!(
+        storage.manifest_root(),
+        "tenant=acme/metastore=lakehouse_prod/manifests/root.manifest.json"
+    );
+
+    // A shared authority root does not replace the facade's execution context.
+    for mismatch in [
+        ControlPlaneScope::new("other", "notebooks", "lakehouse_prod").expect("scope"),
+        ControlPlaneScope::new("acme", "pipelines", "lakehouse_prod").expect("scope"),
+    ] {
+        assert!(CatalogWriter::try_new_with_scope(storage.clone(), mismatch.clone()).is_err());
+        assert!(CatalogReader::try_new_with_scope(storage.clone(), mismatch.clone()).is_err());
+        assert!(Tier1Compactor::try_new_with_scope(storage.clone(), mismatch).is_err());
+    }
+}
+
+#[test]
 fn metastore_scope_facades_reject_storage_scope_mismatches() {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "acme", "notebooks").expect("storage");

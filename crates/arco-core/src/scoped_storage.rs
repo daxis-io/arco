@@ -39,6 +39,9 @@ use async_trait::async_trait;
 pub struct ScopedStorage {
     backend: Arc<dyn StorageBackend>,
     scope: AuthorityScope,
+    // Metastore roots retain the caller's execution context for legacy consumers.
+    // Durable paths and event validation use `scope`, not this workspace context.
+    workspace_context: Option<String>,
 }
 
 /// Metadata about an object relative to the scoped storage root.
@@ -87,10 +90,14 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::workspace(tenant_id, workspace_id)?,
+            workspace_context: None,
         })
     }
 
     /// Creates metastore-scoped storage from a validated scope.
+    ///
+    /// Retains the scope's workspace as execution context for [`Self::workspace_id`].
+    /// The workspace does not affect the metastore authority root or storage paths.
     ///
     /// # Errors
     ///
@@ -104,6 +111,7 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::from_metastore_scope(scope),
+            workspace_context: Some(scope.workspace_id().to_string()),
         })
     }
 
@@ -119,6 +127,7 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::tenant_identity(tenant_id)?,
+            workspace_context: None,
         })
     }
 
@@ -179,11 +188,17 @@ impl ScopedStorage {
         self.scope.tenant_id()
     }
 
-    /// Returns the workspace dimension (legacy accessor; see
-    /// [`AuthorityScope::workspace_dimension`]).
+    /// Returns the workspace ID for legacy consumers.
+    ///
+    /// Workspace-rooted storage returns its workspace ID. Metastore-rooted storage
+    /// returns the execution workspace supplied to [`Self::new_metastore_scoped`].
+    /// Identity-rooted storage has no workspace and returns its tenant ID only for
+    /// shape compatibility. Use [`Self::scope`] for durable authority validation.
     #[must_use]
     pub fn workspace_id(&self) -> &str {
-        self.scope.workspace_dimension()
+        self.workspace_context
+            .as_deref()
+            .unwrap_or_else(|| self.scope.workspace_dimension())
     }
 
     /// Returns the backend for advanced operations.

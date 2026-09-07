@@ -234,6 +234,87 @@ async fn metastore_ledger_persists_storage_governance_events_and_replays_state()
 }
 
 #[tokio::test]
+async fn metastore_ledger_shares_authority_across_workspace_contexts() -> Result<()> {
+    let backend = Arc::new(MemoryBackend::new());
+    let notebooks = ControlPlaneScope::new("tenant1", "notebooks", "lakehouse")?;
+    let pipelines = ControlPlaneScope::new("tenant1", "pipelines", "lakehouse")?;
+    let first_storage = ScopedStorage::new_metastore_scoped(backend.clone(), &notebooks)?;
+    let second_storage = ScopedStorage::new_metastore_scoped(backend, &pipelines)?;
+    let first_ledger = MetastoreLedger::new(first_storage);
+    let second_ledger = MetastoreLedger::new(second_storage);
+    let first = scoped_storage_credential_event(&notebooks, "event_001", 1, "cred_01");
+    let second = scoped_storage_credential_event(&pipelines, "event_002", 2, "cred_02");
+
+    first_ledger.append_event(&first).await?;
+    // Event workspace is provenance, independent of the storage handle's context.
+    first_ledger.append_event(&second).await?;
+    second_ledger.append_event(&second).await?;
+
+    let events = second_ledger.load_events().await?;
+    assert_eq!(events, vec![first, second]);
+    assert_eq!(second_ledger.replay().await?.storage_credentials.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metastore_ledger_rejects_wrong_authority_before_storage_io() -> Result<()> {
+    let backend = Arc::new(SpyBackend::new(Arc::new(MemoryBackend::new())));
+    let scope = ControlPlaneScope::new("tenant1", "notebooks", "lakehouse")?;
+    let storage = ScopedStorage::new_metastore_scoped(backend.clone(), &scope)?;
+    let ledger = MetastoreLedger::new(storage);
+
+    for wrong in [
+        ControlPlaneScope::new("other", "notebooks", "lakehouse")?,
+        ControlPlaneScope::new("tenant1", "notebooks", "other")?,
+    ] {
+        let event = scoped_storage_credential_event(&wrong, "event_001", 1, "cred_01");
+        assert!(matches!(
+            ledger.append_event(&event).await,
+            Err(CatalogError::Validation { .. })
+        ));
+    }
+    let mut unscoped = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
+    unscoped.scope = None;
+    assert!(matches!(
+        ledger.append_event(&unscoped).await,
+        Err(CatalogError::Validation { .. })
+    ));
+    assert!(
+        backend.ops().is_empty(),
+        "rejected events must not touch storage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_ledger_preserves_workspace_authority_checks() -> Result<()> {
+    let backend = Arc::new(SpyBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(backend.clone(), "tenant1", "notebooks")?;
+    let ledger = MetastoreLedger::new(storage);
+    for (sequence, metastore) in [(1, "lakehouse"), (2, "other")] {
+        let scope = ControlPlaneScope::new("tenant1", "notebooks", metastore)?;
+        let event = scoped_storage_credential_event(&scope, metastore, sequence, metastore);
+        ledger.append_event(&event).await?;
+    }
+    backend.clear_ops();
+    for wrong in [
+        ControlPlaneScope::new("other", "notebooks", "lakehouse")?,
+        ControlPlaneScope::new("tenant1", "pipelines", "lakehouse")?,
+    ] {
+        let event = scoped_storage_credential_event(&wrong, "event_003", 3, "cred_03");
+        assert!(matches!(
+            ledger.append_event(&event).await,
+            Err(CatalogError::Validation { .. })
+        ));
+    }
+    assert!(
+        backend.ops().is_empty(),
+        "rejected events must not touch storage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn metastore_ledger_rejects_unscoped_durable_events() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;

@@ -1654,7 +1654,11 @@ impl KvPair {
     }
 }
 
-/// Authority scope addressed by state-store tokens and transactions.
+/// Legacy workspace authority scope addressed by state-store tokens and transactions.
+///
+/// This persisted shape cannot represent tenant identity or metastore root kinds.
+/// Non-workspace control stores remain disabled until a versioned scope encoding
+/// carries `AuthorityScope` throughout the token and retained-reference protocols.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateScope {
     tenant_id: String,

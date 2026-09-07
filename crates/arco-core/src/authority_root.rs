@@ -1,4 +1,7 @@
-//! Typed authority root for scoped stores.
+//! Typed authority identity and path construction.
+//!
+//! This is groundwork for additional authority families. It does not define a
+//! persisted `StateScope` encoding or enable tenant identity in legacy stores.
 
 use crate::{
     ControlPlaneScope,
@@ -7,6 +10,7 @@ use crate::{
 
 /// The authority kind a scoped store is rooted at.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthorityRoot {
     /// 'tenant={t}/identity' - tenant identity authority root.
     TenantIdentity,
@@ -111,18 +115,21 @@ impl AuthorityScope {
         &self.root
     }
 
-    /// Returns the workspace dimension for the legacy accessor shape.
-    ///
-    /// Workspace root: returns the workspace ID.
-    /// Metastore root: returns the metastore ID for shape compatibility only.
-    /// Identity root: returns the tenant ID for shape compatibility only.
-    /// The metastore and tenant IDs must not be used for validation.
-    #[allow(clippy::must_use_candidate)]
-    pub fn workspace_dimension(&self) -> &str {
+    /// Returns a workspace ID only for a workspace authority root.
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&str> {
         match &self.root {
-            AuthorityRoot::TenantIdentity => self.tenant_id(),
-            AuthorityRoot::Metastore { metastore_id } => metastore_id,
-            AuthorityRoot::Workspace { workspace_id } => workspace_id,
+            AuthorityRoot::Workspace { workspace_id } => Some(workspace_id),
+            _ => None,
+        }
+    }
+
+    /// Returns a metastore ID only for a metastore authority root.
+    #[must_use]
+    pub fn metastore_id(&self) -> Option<&str> {
+        match &self.root {
+            AuthorityRoot::Metastore { metastore_id } => Some(metastore_id),
+            _ => None,
         }
     }
 
@@ -140,18 +147,23 @@ impl AuthorityScope {
         }
     }
 
-    /// Whether an event scope is accepted by this authority root.
+    /// Whether the supplied dimensions match this durable authority root.
     ///
-    /// The event's `workspace_id` is asserted only for a workspace-rooted
-    /// authority. A metastore-rooted authority is a shared store that any
-    /// bound workspace may write, so the event workspace is provenance
-    /// (recorded for audit), not a durability-boundary check (see
-    /// the mutation path section in the metastore-scope-architecture.md).
-    /// A tenant-identity authority is tenant-scoped, so neither workspace nor
-    /// metastore is asserted. The tenant dimension is always enforced.
+    /// Tenant must match for every root; workspace matches only for a workspace root and
+    /// metastore matches only for a metastore root. For identity, tenant alone
+    /// identifies the root. Workspace provenance does not change a metastore key.
     ///
+    /// This is not authorization or mutation-family validation. It checks no
+    /// principal privileges, workspace bindings, or storage permissions. Domain
+    /// services must authorize before acquiring a writer capability, and each
+    /// store must restrict which authority families and mutations it supports.
     #[must_use]
-    pub fn accepts_scope(&self, tenant_id: &str, workspace_id: &str, metastore_id: &str) -> bool {
+    pub fn matches_durable_root(
+        &self,
+        tenant_id: &str,
+        workspace_id: &str,
+        metastore_id: &str,
+    ) -> bool {
         if tenant_id != self.tenant_id {
             return false;
         }
@@ -232,42 +244,59 @@ mod tests {
     }
 
     #[test]
-    fn workspace_dimension_returns_legacy_shim_per_root() {
-        assert_eq!(
-            AuthorityScope::workspace("acme", "prod")
-                .unwrap()
-                .workspace_dimension(),
-            "prod"
-        );
-        assert_eq!(
-            AuthorityScope::metastore("acme", "lakehouse")
-                .unwrap()
-                .workspace_dimension(),
-            "lakehouse"
-        );
-        assert_eq!(
-            AuthorityScope::tenant_identity("acme")
-                .unwrap()
-                .workspace_dimension(),
-            "acme"
-        );
+    fn root_specific_ids_never_synthesize_a_workspace() {
+        let workspace = AuthorityScope::workspace("acme", "notebooks").unwrap();
+        assert_eq!(workspace.workspace_id(), Some("notebooks"));
+        assert_eq!(workspace.metastore_id(), None);
+        let metastore = AuthorityScope::metastore("acme", "lakehouse").unwrap();
+        assert_eq!(metastore.workspace_id(), None);
+        assert_eq!(metastore.metastore_id(), Some("lakehouse"));
+        let identity = AuthorityScope::tenant_identity("acme").unwrap();
+        assert_eq!(identity.workspace_id(), None);
+        assert_eq!(identity.metastore_id(), None);
     }
 
     #[test]
-    fn accepts_scope_enforces_only_the_root_dimensions() {
+    fn equal_textual_ids_do_not_alias_authority_roots() {
+        let identity = AuthorityScope::tenant_identity("acme").unwrap();
+        let metastore = AuthorityScope::metastore("acme", "acme").unwrap();
+        let workspace = AuthorityScope::workspace("acme", "acme").unwrap();
+        for (left, right) in [
+            (&identity, &workspace),
+            (&metastore, &workspace),
+            (&identity, &metastore),
+        ] {
+            assert_ne!(left, right);
+            assert_ne!(left.prefix(), right.prefix());
+        }
+    }
+
+    #[test]
+    fn shared_metastore_preserves_distinct_request_provenance() {
+        let notebooks = ControlPlaneScope::new("acme", "notebooks", "lakehouse").unwrap();
+        let pipelines = ControlPlaneScope::new("acme", "pipelines", "lakehouse").unwrap();
+        assert_ne!(notebooks.workspace_id(), pipelines.workspace_id());
+        let first = AuthorityScope::from_metastore_scope(&notebooks);
+        let second = AuthorityScope::from_metastore_scope(&pipelines);
+        assert_eq!(first, second);
+        assert_eq!(first.prefix(), second.prefix());
+    }
+
+    #[test]
+    fn matches_durable_root_enforces_only_the_root_dimensions() {
         let ws = AuthorityScope::workspace("acme", "prod").unwrap();
-        assert!(ws.accepts_scope("acme", "prod", "prod"));
-        assert!(!ws.accepts_scope("acme", "staging", "prod"));
-        assert!(!ws.accepts_scope("globex", "prod", "prod"));
+        assert!(ws.matches_durable_root("acme", "prod", "prod"));
+        assert!(!ws.matches_durable_root("acme", "staging", "prod"));
+        assert!(!ws.matches_durable_root("globex", "prod", "prod"));
 
         let ms = AuthorityScope::metastore("acme", "lakehouse").unwrap();
-        assert!(ms.accepts_scope("acme", "notebooks", "lakehouse"));
-        assert!(!ms.accepts_scope("acme", "notebooks", "other-metastore"));
-        assert!(!ms.accepts_scope("globex", "notebooks", "lakehouse"));
+        assert!(ms.matches_durable_root("acme", "notebooks", "lakehouse"));
+        assert!(!ms.matches_durable_root("acme", "notebooks", "other-metastore"));
+        assert!(!ms.matches_durable_root("globex", "notebooks", "lakehouse"));
 
         let id = AuthorityScope::tenant_identity("acme").unwrap();
-        assert!(id.accepts_scope("acme", "any-workspace", "any-metastore"));
-        assert!(!id.accepts_scope("globex", "any-workspace", "any-metastore"));
+        assert!(id.matches_durable_root("acme", "any-workspace", "any-metastore"));
+        assert!(!id.matches_durable_root("globex", "any-workspace", "any-metastore"));
     }
 
     #[test]

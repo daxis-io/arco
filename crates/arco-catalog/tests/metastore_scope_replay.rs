@@ -92,11 +92,23 @@ fn metastore_scope_facades_preserve_workspace_context_at_metastore_root() {
     for mismatch in [
         ControlPlaneScope::new("other", "notebooks", "lakehouse_prod").expect("scope"),
         ControlPlaneScope::new("acme", "pipelines", "lakehouse_prod").expect("scope"),
+        ControlPlaneScope::new("acme", "notebooks", "other").expect("scope"),
     ] {
         assert!(CatalogWriter::try_new_with_scope(storage.clone(), mismatch.clone()).is_err());
         assert!(CatalogReader::try_new_with_scope(storage.clone(), mismatch.clone()).is_err());
         assert!(Tier1Compactor::try_new_with_scope(storage.clone(), mismatch).is_err());
     }
+}
+
+#[test]
+fn metastore_scope_convenience_facades_retain_both_known_ids() {
+    let scope =
+        ControlPlaneScope::new("acme", "notebooks", "lakehouse_prod").expect("explicit scope");
+    let storage = ScopedStorage::new_metastore_scoped(Arc::new(MemoryBackend::new()), &scope)
+        .expect("metastore storage");
+    assert_eq!(CatalogWriter::new(storage.clone()).scope(), &scope);
+    assert_eq!(CatalogReader::new(storage.clone()).scope(), &scope);
+    assert_eq!(Tier1Compactor::new(storage).scope(), &scope);
 }
 
 #[test]

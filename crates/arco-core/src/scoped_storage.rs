@@ -5,10 +5,13 @@
 //! typed-authority root the storage was constructed for.
 //!
 //! ```text
-//! tenant={t}/identity          tenant identity authority root
 //! tenant={t}/metastore={m}/    metastore / catalog authority root
 //! tenant={t}/workspace={w}/    workspace / execution root
 //! ```
+//!
+//! Tenant identity has a typed root value but cannot be constructed through this
+//! legacy storage API. Its separate mutation API and root-aware state protocol
+//! must be implemented before identity storage is enabled.
 //!
 //! The key=value path format provides:
 //! - Operational ergonomics (grep-friendly: `tenant=acme` is self-documenting)
@@ -41,7 +44,7 @@ pub struct ScopedStorage {
     scope: AuthorityScope,
     // Metastore roots retain the caller's execution context for legacy consumers.
     // Durable paths and event validation use `scope`, not this workspace context.
-    workspace_context: Option<String>,
+    workspace_context: String,
 }
 
 /// Metadata about an object relative to the scoped storage root.
@@ -87,10 +90,11 @@ impl ScopedStorage {
         tenant_id: impl Into<String>,
         workspace_id: impl Into<String>,
     ) -> Result<Self> {
+        let workspace_context = workspace_id.into();
         Ok(Self {
             backend,
-            scope: AuthorityScope::workspace(tenant_id, workspace_id)?,
-            workspace_context: None,
+            scope: AuthorityScope::workspace(tenant_id, workspace_context.clone())?,
+            workspace_context,
         })
     }
 
@@ -111,23 +115,7 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::from_metastore_scope(scope),
-            workspace_context: Some(scope.workspace_id().to_string()),
-        })
-    }
-
-    /// Creates tenant-identity scoped storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the tenant id is invalid.
-    pub fn new_identity_scoped(
-        backend: Arc<dyn StorageBackend>,
-        tenant_id: impl Into<String>,
-    ) -> Result<Self> {
-        Ok(Self {
-            backend,
-            scope: AuthorityScope::tenant_identity(tenant_id)?,
-            workspace_context: None,
+            workspace_context: scope.workspace_id().to_string(),
         })
     }
 
@@ -192,13 +180,11 @@ impl ScopedStorage {
     ///
     /// Workspace-rooted storage returns its workspace ID. Metastore-rooted storage
     /// returns the execution workspace supplied to [`Self::new_metastore_scoped`].
-    /// Identity-rooted storage has no workspace and returns its tenant ID only for
-    /// shape compatibility. Use [`Self::scope`] for durable authority validation.
+    /// This is request provenance, not the durable authority identity. Use
+    /// [`Self::scope`] and its root-specific accessors for authority validation.
     #[must_use]
     pub fn workspace_id(&self) -> &str {
-        self.workspace_context
-            .as_deref()
-            .unwrap_or_else(|| self.scope.workspace_dimension())
+        &self.workspace_context
     }
 
     /// Returns the backend for advanced operations.

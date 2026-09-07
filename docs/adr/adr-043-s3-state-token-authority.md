@@ -36,9 +36,13 @@ part of `StateToken`, `control/v1`, or transaction identity.
 
 This ADR fixes the following invariants.
 
-1. There is one metastore authority root per `(tenant_id, workspace_id)`, one
-   root per managed Delta table, and separate roots for Flow, lineage, and
-   projection acknowledgements. No operation claims atomicity across roots.
+1. The first metastore pilot uses one workspace-as-metastore compatibility
+   root per `(tenant_id, workspace_id)`, with `metastore_id = workspace_id`.
+   The target metastore authority is keyed by `(tenant_id, metastore_id)`;
+   [ADR-044](adr-044-tenant-level-identity-authority.md) adds a separate tenant
+   identity authority. Managed Delta tables each have a separate root, as do
+   Flow, lineage, and projection acknowledgements. No operation claims
+   atomicity across roots.
 2. Canonical state lives beneath a fresh `control/v1/` prefix. Old control
    layouts are neither read nor migrated by this release.
 3. Transaction envelopes, manifests, checkpoints, and the mutable head are
@@ -92,6 +96,22 @@ This ADR fixes the following invariants.
     30 days, and pre-cutover exports plus legacy authority artifacts are kept
     indefinitely. Projection p99 lag must be at most 10 seconds, with no normal
     interval above 60 seconds, throughout a seven-consecutive-day soak.
+
+### Scope compatibility boundary
+
+The current persisted `StateScope` encodes tenant, workspace, and domain. It
+identifies the workspace-shaped pilot, not every target authority family.
+Adding an `AuthorityScope` prefix does not extend `StateToken` semantics:
+`ControlMvpStateStore` rejects metastore physical roots, and legacy scoped
+storage cannot construct tenant identity roots. Existing workspace path bytes
+and token encodings remain unchanged.
+
+Before enabling either target root in `control/v1`, the
+[versioned authority-scope follow-up](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1)
+must propagate root kind and identifiers through every persisted authority
+reference and scope comparison. Old workspace records must not be decoded as
+identity or metastore roots by relabeling an ID. The pilot's seeded root and
+hard-cut/provider qualification requirements continue to apply.
 
 ### Layout
 

@@ -60,6 +60,25 @@ fn store(storage: ScopedStorage) -> ControlMvpStateStore {
 }
 
 #[test]
+fn legacy_state_scope_rejects_metastore_physical_roots() {
+    let backend = Arc::new(MemoryBackend::new());
+    for workspace in ["notebooks", "lakehouse"] {
+        let request = arco_core::ControlPlaneScope::new("acme", workspace, "lakehouse")
+            .expect("request scope");
+        let metastore = ScopedStorage::new_metastore_scoped(backend.clone(), &request)
+            .expect("metastore storage");
+        let state_scope = StateScope::new("acme", workspace, "catalog");
+        assert!(
+            ControlMvpStateStore::new(metastore, state_scope.clone()).is_err(),
+            "legacy StateScope must not alias a metastore root"
+        );
+        let workspace_storage =
+            ScopedStorage::new(backend.clone(), "acme", workspace).expect("workspace storage");
+        assert!(ControlMvpStateStore::new(workspace_storage, state_scope).is_ok());
+    }
+}
+
+#[test]
 fn restore_paths_reject_separators_and_dot_segments_before_interpolation() {
     for domain in [".", "..", "../other", "a/b", r"a\b"] {
         let (_backend, storage) = storage();

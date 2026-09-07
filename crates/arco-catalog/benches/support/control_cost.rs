@@ -48,6 +48,12 @@ impl Profile {
 pub struct BackendCounts {
     pub sha256_helper_calls: u64,
     pub sha256_helper_bytes: u64,
+    pub canonical_root_hash_calls: u64,
+    pub canonical_root_hash_bytes: u64,
+    pub rendered_state_validation_calls: u64,
+    pub rendered_state_validation_bytes: u64,
+    pub rendered_transaction_validation_calls: u64,
+    pub rendered_transaction_validation_bytes: u64,
     pub object_reads: BTreeMap<String, ObjectReadCounts>,
     pub requested_ranges: BTreeMap<String, u64>,
     pub logical_storage_calls: u64,
@@ -101,6 +107,12 @@ impl BackendCounts {
     }
 
     fn add(&mut self, other: &Self) {
+        self.canonical_root_hash_calls += other.canonical_root_hash_calls;
+        self.canonical_root_hash_bytes += other.canonical_root_hash_bytes;
+        self.rendered_state_validation_calls += other.rendered_state_validation_calls;
+        self.rendered_state_validation_bytes += other.rendered_state_validation_bytes;
+        self.rendered_transaction_validation_calls += other.rendered_transaction_validation_calls;
+        self.rendered_transaction_validation_bytes += other.rendered_transaction_validation_bytes;
         self.sha256_helper_calls += other.sha256_helper_calls;
         self.sha256_helper_bytes += other.sha256_helper_bytes;
         for (class, read) in &other.object_reads {
@@ -156,6 +168,20 @@ impl CountingBackend {
             let (calls, bytes) = ControlMvpStateStore::take_test_authentication_work();
             result.sha256_helper_calls = calls;
             result.sha256_helper_bytes = bytes;
+            let [
+                root_calls,
+                root_bytes,
+                state_calls,
+                state_bytes,
+                tx_calls,
+                tx_bytes,
+            ] = ControlMvpStateStore::take_test_integrity_work();
+            result.canonical_root_hash_calls = root_calls;
+            result.canonical_root_hash_bytes = root_bytes;
+            result.rendered_state_validation_calls = state_calls;
+            result.rendered_state_validation_bytes = state_bytes;
+            result.rendered_transaction_validation_calls = tx_calls;
+            result.rendered_transaction_validation_bytes = tx_bytes;
             result
         };
         result
@@ -909,7 +935,11 @@ async fn scaling_fixture(
         .unwrap()
         .with_test_segment_sizing(rows.div_ceil(segments), target)
         .unwrap();
-    worker.consolidate_pending().await.unwrap().unwrap();
+    backend.take();
+    let (maintenance, maintenance_allocations) =
+        measure_allocations(worker.consolidate_pending()).await;
+    maintenance.unwrap().unwrap();
+    let maintenance_cost = backend.take();
     for _ in 0..suffix {
         let mut tx = store
             .begin_control_txn(TxnOptions::default())
@@ -943,6 +973,12 @@ async fn scaling_fixture(
         operations: BTreeMap::new(),
         allocations: BTreeMap::new(),
     };
+    sample
+        .operations
+        .insert("maintenance".to_string(), maintenance_cost);
+    sample
+        .allocations
+        .insert("maintenance".to_string(), maintenance_allocations);
     for reference in refs {
         sample.encoded_data_bytes +=
             usize::try_from(reference["segment_size_bytes"].as_u64().unwrap()).unwrap();

@@ -117,15 +117,18 @@ and segment-backpressure limits. Removing synchronous Parquet publication from
 the success path does not promise unlimited writes while internal maintenance
 is stalled.
 
-In the [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries),
-The [Gate 2 block format contract](state-store-block-format-v1.md) specifies
-authenticated root witnesses, bounded directories, independent IPC blocks and
-selective readers; its [local evidence](../reports/2026-09-06-gate2-authenticated-block-reads.md)
-records qualification separately from implementation. Gate 2 introduces block-addressable segments and only adapts existing maintenance
-read/write paths as needed for the format. Gate 5 makes internal segment
-maintenance incremental, durable, and resumable. It does not reintroduce the
-legacy event-to-Parquet publication dependency. Neither gate itself authorizes
-migration, provider qualification, or production cutover.
+The [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries)
+separates the implementation gates. The [Gate 2 block format contract](state-store-block-format-v1.md)
+specifies authenticated root witnesses, bounded directories, independent IPC
+blocks and selective readers; its [local evidence](../reports/2026-09-06-gate2-closeout.md)
+records the approved checkpoint. The [Gate 3 integrity contract](state-store-integrity-format-v1.md)
+defines scope-bound logical history, physical ownership roots, and exact rendered
+rewrite validation in authority format 7 and restore-plan format 6.
+
+Gates 2 and 3 adapt the existing eager transaction and maintenance paths. Gate 4
+introduces lazy transactions; Gate 5 makes maintenance incremental, durable and
+resumable. Gates 6 and 7 cover caches and provider qualification. None of these
+local implementation gates authorizes migration or production cutover.
 
 ---
 

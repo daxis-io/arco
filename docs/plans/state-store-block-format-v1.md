@@ -1,6 +1,8 @@
 # Control authority block format 1
 
 Gate 2 authority envelopes and HEAD use version 6; restore plans use version 5.
+Gate 3 supersedes those outer versions with authority 7 / restore 6, while
+retaining this segment/directory format 1; see [integrity encoding 1](state-store-integrity-format-v1.md).
 Segment directories independently use version 1. Older/unknown authority headers
 are rejected before typed payload decoding or following owning references. Older
 restore plans remain readable solely for supersession. Continuations use AES-GCM

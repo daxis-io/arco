@@ -7607,7 +7607,7 @@ async fn workspace_restore_recovery_migrates_v1_and_v2_participant_plans_and_rep
             .find(|participant| participant["domain"] == "c")
             .expect("domain c is replanned rather than carried");
         assert_eq!(
-            serde_json::Value::from(4_u64),
+            serde_json::Value::from(5_u64),
             replanned["plan"]["version"],
             "a superseded v{legacy_version} plan must be replaced by a current-version plan"
         );

@@ -1,0 +1,16 @@
+{
+  "verification": "Independent Python implementation of format-v1 hash and bit encoding; same fixed probes as Rust unit test",
+  "present_keys": 4096,
+  "filter_bytes": 5120,
+  "probes": 7,
+  "false_negatives": 0,
+  "absent_probes": 100000,
+  "false_positives": 848,
+  "false_positive_fraction": 0.00848,
+  "filter_sha256": "9efb666d21e48edd4fd534551dfafba0d140511bcda01dcb458d66497567e30c",
+  "present_key_formula": "UTF-8 bytes of present-{i:024}, i in 0..4096 (exclusive upper bound)",
+  "absent_key_formula": "UTF-8 bytes of absent--{i:024}, i in 0..100000 (exclusive upper bound)",
+  "hash_version": 1,
+  "encoding_contract": "../plans/state-store-block-format-v1.md#bloom-encoding",
+  "bit_numbering": "LSB-first within each byte, byte index floor(bit/8)"
+}

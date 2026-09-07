@@ -107,3 +107,17 @@ async fn operation_allocation_counts_follow_future_polls_across_suspension() {
     assert!(allocations.count >= 1);
     assert!(allocations.bytes >= 4096);
 }
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "explicit scaling lane: cargo test --test control_cost_smoke --features test-utils authenticated_block_scaling_acceptance -- --ignored"]
+async fn authenticated_block_scaling_acceptance() {
+    let samples = Box::pin(control_cost::run_scaling()).await;
+    if let Ok(path) = std::env::var("ARCO_SCALING_REPORT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&samples).expect("encode scaling report"),
+        )
+        .expect("write scaling report");
+    }
+}

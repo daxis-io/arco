@@ -152,11 +152,19 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 fn bloom_bits_hex(keys: &[&[u8]]) -> String {
-    let mut bits = [0_u8; 32];
+    if keys.is_empty() {
+        return String::new();
+    }
+    let mut bits = vec![0_u8; (keys.len() * 10).div_ceil(8)];
     for key in keys {
         let digest = Sha256::digest(key);
-        for byte in digest.iter().take(3) {
-            let bit = usize::from(*byte) % (bits.len() * 8);
+        let first = u64::from_be_bytes(digest[..8].try_into().expect("first hash word"));
+        let second = u64::from_be_bytes(digest[8..16].try_into().expect("second hash word")) | 1;
+        for probe in 0_u64..7 {
+            let bit = usize::try_from(
+                first.wrapping_add(probe.wrapping_mul(second)) % (bits.len() * 8) as u64,
+            )
+            .expect("bounded Bloom bit");
             bits[bit / 8] |= 1 << (bit % 8);
         }
     }
@@ -172,6 +180,8 @@ struct MirrorScope {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorStateRef {
+    segment_size_bytes: u64,
+    index_size_bytes: u64,
     state_id: String,
     logical_sequence: u64,
     checksum_sha256: String,
@@ -189,6 +199,8 @@ struct MirrorTxRef {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorSegmentRef {
+    segment_size_bytes: u64,
+    index_size_bytes: u64,
     segment_id: String,
     level: String,
     logical_sequence: u64,
@@ -198,6 +210,7 @@ struct MirrorSegmentRef {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorManifest {
+    parent_manifest_sha256: Option<String>,
     reclamation_generation: u64,
     format_version: u32,
     implementation: String,
@@ -288,12 +301,22 @@ async fn install_malformed_l1(
         .and_then(|key| std::str::from_utf8(key).ok())
         .map_or(Value::Null, |key| Value::String(key.to_string()));
     index["bloomBitsHex"] = Value::String(bloom_bits_hex(index_keys));
-    index["recordBatchOffsets"] = Value::Array(
-        footer_blocks(&malformed)
-            .into_iter()
-            .map(|(offset, _, _)| Value::from(offset))
-            .collect(),
+    index["bloomMode"] = Value::String(
+        if index_keys.is_empty() {
+            "Empty"
+        } else {
+            "Enabled"
+        }
+        .to_string(),
     );
+    index["bloomProbes"] = Value::from(if index_keys.is_empty() { 0 } else { 7 });
+    index["distinctKvKeys"] = Value::from(index_keys.len());
+    index["recordBatchOffsets"] = serde_json::json!([0]);
+    index["blocks"] = serde_json::json!([{
+        "offset": 0, "length": malformed.len(), "recordKind": u8::from(index_keys.is_empty()),
+        "minKeyHex": hex::encode(min_key.unwrap_or(b"outbox")), "maxKeyHex": hex::encode(max_key.unwrap_or(b"outbox")),
+        "rowCount": row_count, "minOrdinal": 0, "maxOrdinal": row_count.saturating_sub(1), "checksumSha256": sha256(&malformed)
+    }]);
     let index_bytes = Bytes::from(serde_json::to_vec(&index).expect("state index bytes"));
 
     let manifest_path = paths.manifest_object(selected_manifest_id);
@@ -304,6 +327,8 @@ async fn install_malformed_l1(
             .expect("selected manifest"),
     )
     .expect("manifest JSON");
+    manifest["payload"]["base_states"][0]["segment_size_bytes"] = Value::from(malformed.len());
+    manifest["payload"]["base_states"][0]["index_size_bytes"] = Value::from(index_bytes.len());
     manifest["payload"]["base_states"][0]["checksum_sha256"] = Value::String(sha256(&malformed));
     manifest["payload"]["base_states"][0]["index_checksum_sha256"] =
         Value::String(sha256(&index_bytes));
@@ -525,7 +550,11 @@ async fn commit_persists_indexed_l0_and_l1_arrow_segments() {
             Some(u64::try_from(segment.len()).expect("segment length"))
         );
         for (stored, (actual, metadata_length, body_length)) in offsets.iter().zip(blocks) {
-            assert_eq!(stored.as_u64().expect("stored batch offset"), actual);
+            assert_eq!(stored.as_u64().expect("stored file offset"), 0);
+            assert_eq!(
+                index["blocks"][0]["length"].as_u64().unwrap(),
+                segment.len() as u64
+            );
             assert!(
                 actual > 0,
                 "Arrow record-batch offset is not the file start"
@@ -902,18 +931,18 @@ async fn checksum_coherent_null_origin_l0_trim_fails_closed_without_a_panic() {
         serde_json::from_slice(&storage.get_raw(&index_path).await.expect("trim index"))
             .expect("trim index JSON");
     index["segmentChecksumSha256"] = Value::String(sha256(&malformed));
-    index["recordBatchOffsets"] = Value::Array(
-        footer_blocks(&malformed)
-            .into_iter()
-            .map(|(offset, _, _)| Value::from(offset))
-            .collect(),
-    );
+    index["segmentSizeBytes"] = Value::from(malformed.len());
+    index["recordBatchOffsets"] = serde_json::json!([0]);
+    index["blocks"][0]["length"] = Value::from(malformed.len());
+    index["blocks"][0]["checksumSha256"] = Value::String(sha256(&malformed));
     let index_bytes = Bytes::from(serde_json::to_vec(&index).expect("index bytes"));
 
     let tx_path = paths.tx_object(&tx_id);
     let mut transaction: Value =
         serde_json::from_slice(&storage.get_raw(&tx_path).await.expect("trim transaction"))
             .expect("trim transaction JSON");
+    transaction["payload"]["l0_segment"]["segment_size_bytes"] = Value::from(malformed.len());
+    transaction["payload"]["l0_segment"]["index_size_bytes"] = Value::from(index_bytes.len());
     transaction["payload"]["l0_segment"]["checksum_sha256"] = Value::String(sha256(&malformed));
     transaction["payload"]["l0_segment"]["index_checksum_sha256"] =
         Value::String(sha256(&index_bytes));
@@ -1004,5 +1033,7 @@ async fn corrupted_segment_index_fails_closed_before_state_is_returned() {
         .get(b"catalogs/sales")
         .await
         .expect_err("corrupt index must fail closed");
-    assert!(error.to_string().contains("segment index"));
+    assert!(
+        (error.to_string().contains("segment index") || error.to_string().contains("directory"))
+    );
 }

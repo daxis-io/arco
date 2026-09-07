@@ -1649,7 +1649,8 @@ impl ProjectionOutboxWorker {
                 .await?;
             }
         }
-        txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))?;
+        txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))
+            .await?;
         let token = txn.commit().await?.into_state_token();
         Ok(ProjectionOutboxTrimReport {
             trimmed_record_ids,
@@ -2223,6 +2224,7 @@ mod tests {
             record_id.to_string(),
             Bytes::from_static(payload),
         ))
+        .await
         .expect("stage outbox record");
         txn.commit()
             .await
@@ -2860,7 +2862,8 @@ mod tests {
             .expect("begin");
 
         assert_precondition_failed(
-            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-unknown", 1)]),
+            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-unknown", 1)])
+                .await,
             "not present in current state",
         );
     }
@@ -3172,7 +3175,8 @@ mod tests {
         assert_precondition_failed(
             txn.trim_projection_outbox(
                 captured.iter().map(ProjectionOutboxDeliveryId::trim_target),
-            ),
+            )
+            .await,
             "a different incarnation of the same record id",
         );
 
@@ -3202,7 +3206,8 @@ mod tests {
             .expect("begin");
 
         assert_precondition_failed(
-            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-1", 99)]),
+            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-1", 99)])
+                .await,
             "a different incarnation of the same record id",
         );
     }
@@ -3630,6 +3635,7 @@ mod tests {
             "record-2",
             Bytes::from_static(b"{}"),
         ))
+        .await
         .expect("stage record-2");
         txn.commit().await.expect("commit record-2");
         let report = worker
@@ -3648,6 +3654,7 @@ mod tests {
             "record-3",
             Bytes::from_static(b"{}"),
         ))
+        .await
         .expect("stage record-3");
         txn.commit().await.expect("commit record-3");
         let pinned = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")

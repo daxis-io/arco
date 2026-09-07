@@ -107,6 +107,7 @@ async fn seed_source_record_in_domain(backend: Arc<dyn StorageBackend>, domain: 
         "record-1",
         Bytes::from_static(b"{}"),
     ))
+    .await
     .expect("stage outbox record");
     txn.commit().await.expect("commit source record");
 }

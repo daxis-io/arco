@@ -1169,6 +1169,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                             payload.clone(),
                         ),
                     )
+                    .await
                     .unwrap();
                     additions.push(("model-event".to_string(), payload));
                 } else if op == 1
@@ -1177,6 +1178,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                     txn.trim_projection_outbox([arco_catalog::ControlMvpOutboxTrimTarget::new(
                         id, *origin,
                     )])
+                    .await
                     .unwrap();
                     trims.push((id.clone(), *origin));
                 }
@@ -1569,6 +1571,7 @@ async fn independent_oracle_covers_empty_and_nonempty_restore_history() {
             "event",
             Bytes::from_static(b"source incarnation"),
         ))
+        .await
         .unwrap();
         tx.commit().await.unwrap();
         source.commit(
@@ -1610,6 +1613,7 @@ async fn independent_oracle_covers_empty_and_nonempty_restore_history() {
                 tx.put(key, value.clone().unwrap()).await.unwrap();
             }
             tx.trim_projection_outbox([ControlMvpOutboxTrimTarget::new("event", 1)])
+                .await
                 .unwrap();
             tx.commit().await.unwrap();
             expected.commit(changes, Vec::new(), vec![("event".into(), 1)]);
@@ -1621,6 +1625,7 @@ async fn independent_oracle_covers_empty_and_nonempty_restore_history() {
                 "event",
                 Bytes::from_static(b"destination incarnation"),
             ))
+            .await
             .unwrap();
             tx.commit().await.unwrap();
             expected.commit(

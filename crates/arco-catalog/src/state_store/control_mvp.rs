@@ -122,8 +122,11 @@ use crate::workspace_snapshot::{
 };
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
+mod cost;
 mod integrity;
+mod lazy;
 use integrity::{CheckpointValidation, HistoryAnchor, HistoryLink, RewriteEquivalence};
+use lazy::{TransactionBase, TransactionReads};
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 6;
 const RESTORE_PLAN_VERSION_V5: u32 = 5;
@@ -430,7 +433,11 @@ impl ControlMvpStateStore {
         self.paths.clone()
     }
 
-    /// Begins a concrete control-MVP transaction.
+    /// Pins a concrete control-MVP transaction without reconstructing data.
+    ///
+    /// Reads authenticate selected immutable evidence on demand. The pin does
+    /// not renew retention. Commit freshly validates the complete pinned state
+    /// and every required anchor before publishing candidate artifacts.
     ///
     /// # Errors
     ///
@@ -446,10 +453,10 @@ impl ControlMvpStateStore {
             ));
         }
 
-        let base = self.load_current_base_state().await?;
-        validate_publication_epoch(self.writer_epoch, base.writer_epoch)?;
+        let base = self.pin_transaction_base().await?;
+        validate_publication_epoch(self.writer_epoch, base.writer_epoch())?;
         let next_sequence = next_logical_sequence(
-            base.state.logical_sequence,
+            base.logical_sequence(),
             "beginning a control MVP transaction",
         )?;
         let request_id = opts.request_id().map(ToOwned::to_owned);
@@ -457,10 +464,10 @@ impl ControlMvpStateStore {
             || Ulid::new().to_string().to_ascii_lowercase(),
             ToOwned::to_owned,
         );
-        let head_identity = sha256_hex(base.pointer_version.as_deref().unwrap_or("").as_bytes());
+        let head_identity = sha256_hex(base.pointer_version().unwrap_or("").as_bytes());
         let suffix = format!(
             "{suffix}-head-{head_identity}-rg-{:020}",
-            base.reclamation_generation
+            base.reclamation_generation()
         );
         let tx_id = request_id.clone().map_or_else(
             || format!("tx-{next_sequence:020}-{suffix}"),
@@ -471,6 +478,10 @@ impl ControlMvpStateStore {
         Ok(ControlMvpTxn {
             store: self.clone(),
             base,
+            reads: TransactionReads::default(),
+            nonce: Ulid::new().0,
+            #[cfg(any(test, feature = "test-utils"))]
+            eager_base: None,
             request_id,
             tx_id,
             manifest_id,
@@ -561,39 +572,7 @@ impl ControlMvpStateStore {
     }
 
     async fn load_current_base_state(&self) -> Result<ControlMvpBase> {
-        let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
-        let Some(pointer_meta) = pointer_meta else {
-            return Ok(ControlMvpBase {
-                history_anchor: integrity::genesis(&ControlMvpScopeDoc::from(&self.scope)),
-                reclamation_generation: 0,
-                pointer_version: None,
-                manifest_id: None,
-                manifest_checksum_sha256: None,
-                writer_epoch: 0,
-                layout_generation: 0,
-                state: ReplayState::empty(&self.scope),
-                base_states: Vec::new(),
-                tx_refs: Vec::new(),
-            });
-        };
-
-        let pointer = self.load_pointer().await?;
-        let manifest = self.load_manifest_for_pointer(&pointer).await?;
-        let state = self.replay_for_successor(&manifest).await?;
-        let (base_states, tx_refs) = manifest.successor_anchor();
-
-        Ok(ControlMvpBase {
-            history_anchor: manifest.successor_history_anchor(),
-            reclamation_generation: pointer.reclamation_generation,
-            pointer_version: Some(pointer_meta.version),
-            manifest_id: Some(pointer.manifest_id),
-            manifest_checksum_sha256: Some(pointer.manifest_checksum_sha256),
-            writer_epoch: pointer.writer_epoch,
-            layout_generation: manifest.layout_generation,
-            state,
-            base_states,
-            tx_refs,
-        })
+        self.pin_transaction_base().await?.materialize(self).await
     }
 
     async fn load_state_at_token(&self, token: &StateToken) -> Result<ReplayState> {
@@ -1170,6 +1149,18 @@ impl ControlMvpStateStore {
         manifest: &ControlMvpManifest,
         key: &[u8],
     ) -> Result<Option<Bytes>> {
+        Ok(self
+            .get_versioned_from_manifest(manifest, key)
+            .await?
+            .filter(|value| !value.tombstone)
+            .map(|value| value.bytes))
+    }
+
+    async fn get_versioned_from_manifest(
+        &self,
+        manifest: &ControlMvpManifest,
+        key: &[u8],
+    ) -> Result<Option<StoredValue>> {
         let mut selected = None;
         for reference in &manifest.base_states {
             let bounds = state_reference_key_bounds(reference)?;
@@ -1200,9 +1191,7 @@ impl ControlMvpStateStore {
                 });
             }
         }
-        Ok(selected
-            .filter(|value| !value.tombstone)
-            .map(|value| value.bytes))
+        Ok(selected)
     }
 
     fn validate_manifest_read_metadata(&self, manifest: &ControlMvpManifest) -> Result<()> {
@@ -1235,29 +1224,8 @@ impl ControlMvpStateStore {
         request.validate_for_scope(&self.scope)?;
         let prefix = request.prefix();
         let start_after = request.effective_start_after();
-        let mut cursors = Vec::new();
-        let mut base_refs = std::collections::VecDeque::new();
-        let mut base_bounds = BTreeMap::new();
-        for reference in &manifest.base_states {
-            let bounds = state_reference_key_bounds(reference)?;
-            if key_bounds_overlap_prefix(bounds.as_ref(), prefix)
-                && bounds
-                    .as_ref()
-                    .is_some_and(|(_, max)| start_after.is_none_or(|start| max.as_slice() > start))
-            {
-                base_bounds.insert(reference.state_id.clone(), bounds.clone());
-                base_refs.push_back(state_segment_reference(reference));
-            }
-        }
-        let mut base_cursor = BlockScanCursor::new(base_refs);
-        base_cursor.expected_bounds = base_bounds;
-        cursors.push(base_cursor);
-        for reference in &manifest.tx_refs {
-            let tx = self.load_tx_metadata(reference).await?;
-            cursors.push(BlockScanCursor::new(std::collections::VecDeque::from([
-                tx.l0_segment
-            ])));
-        }
+        let mut stream =
+            lazy::ResolvedRows::new(self, Some(manifest), prefix, start_after, None).await?;
         let mut budget = BlockScanBudget {
             blocks: 64,
             segments: request.max_segments(),
@@ -1268,13 +1236,7 @@ impl ControlMvpStateStore {
         let mut boundary = None;
         let mut has_more = false;
         loop {
-            let mut ready = true;
-            for cursor in &mut cursors {
-                if !cursor.fill(self, prefix, start_after, &mut budget).await? {
-                    ready = false;
-                    break;
-                }
-            }
+            let ready = stream.fill(self, &mut budget).await?;
             if !ready {
                 if boundary.is_none() {
                     return Err(CatalogError::MaintenanceBackpressure {
@@ -1286,26 +1248,14 @@ impl ControlMvpStateStore {
                 has_more = true;
                 break;
             }
-            let Some(key) = cursors
-                .iter()
-                .filter_map(|cursor| cursor.rows.front().map(|row| &row.key))
-                .min()
-                .cloned()
-            else {
+            let Some(key) = stream.key().map(<[u8]>::to_vec) else {
                 break;
             };
-            let mut selected = None;
-            for cursor in &mut cursors {
-                if cursor.rows.front().is_some_and(|row| row.key == key) {
-                    selected = cursor.rows.pop_front();
-                }
-            }
-            let row =
-                selected.ok_or_else(|| invariant_violation("scan merge lost selected row"))?;
+            let row = stream
+                .take(&key)
+                .ok_or_else(|| invariant_violation("scan merge lost selected row"))?;
             if !row.tombstone {
-                let value = row
-                    .value
-                    .ok_or_else(|| invariant_violation("visible scan row has no value"))?;
+                let value = row.bytes;
                 let size = key
                     .len()
                     .checked_add(value.len())
@@ -1317,12 +1267,12 @@ impl ControlMvpStateStore {
                 logical_bytes = logical_bytes.saturating_add(size);
                 entries.push(KvPair::new(
                     key.clone(),
-                    VersionedValue::new(Bytes::from(value), Some(row.generation)),
+                    VersionedValue::new(value, Some(row.generation)),
                 ));
             }
             boundary = Some(key);
             if entries.len() >= request.max_rows() || logical_bytes >= request.max_bytes() {
-                has_more = cursors.iter().any(BlockScanCursor::may_have_more);
+                has_more = stream.may_have_more();
                 break;
             }
         }
@@ -4155,7 +4105,11 @@ impl ControlMvpProjectionOutboxRecord {
 /// Concrete control-MVP transaction with MVP-only staging helpers.
 pub struct ControlMvpTxn {
     store: ControlMvpStateStore,
-    base: ControlMvpBase,
+    base: TransactionBase,
+    reads: TransactionReads,
+    nonce: u128,
+    #[cfg(any(test, feature = "test-utils"))]
+    eager_base: Option<ControlMvpBase>,
     request_id: Option<String>,
     tx_id: String,
     manifest_id: String,
@@ -4187,7 +4141,7 @@ impl ControlMvpTxn {
 
     pub(crate) fn predicted_state_token(&self) -> Result<StateToken> {
         let predicted_sequence = next_logical_sequence(
-            self.base.state.logical_sequence,
+            self.base.logical_sequence(),
             "predicting a control MVP transaction token",
         )?;
         Ok(self
@@ -4213,29 +4167,14 @@ impl ControlMvpTxn {
     /// Returns [`CatalogError::AlreadyExists`] when the record id is already
     /// retained in the transaction's base outbox or staged in this
     /// transaction.
-    pub fn stage_projection_outbox(
+    pub async fn stage_projection_outbox(
         &mut self,
         record: ControlMvpProjectionOutboxRecord,
     ) -> Result<()> {
-        let duplicate = self
-            .base
-            .state
-            .outbox
-            .iter()
-            .map(|existing| existing.record_id.as_str())
-            .chain(self.outbox.iter().map(|staged| staged.record_id.as_str()))
-            .chain(
-                self.projection_intents
-                    .iter()
-                    .map(|intent| intent.intent_id.as_str()),
-            )
-            .any(|existing| existing == record.record_id);
-        if duplicate {
-            return Err(CatalogError::AlreadyExists {
-                entity: "projection outbox record".to_string(),
-                name: record.record_id,
-            });
-        }
+        self.ensure_outbox_id_available(&record.record_id, "projection outbox record")
+            .await?;
+        self.reads
+            .reserve(record.record_id.len() + record.payload.len() + 96, 1)?;
         self.outbox.push(record);
         Ok(())
     }
@@ -4251,7 +4190,7 @@ impl ControlMvpTxn {
     ///
     /// Returns a validation error for an invalid version-one envelope or an
     /// already-retained/staged intent identifier.
-    pub fn stage_projection_intent(
+    pub async fn stage_projection_intent(
         &mut self,
         intent_id: impl Into<String>,
         projection_kind: impl Into<String>,
@@ -4263,7 +4202,7 @@ impl ControlMvpTxn {
             payload,
         };
         let predicted_sequence = next_logical_sequence(
-            self.base.state.logical_sequence,
+            self.base.logical_sequence(),
             "predicting a control MVP projection token",
         )?;
         let predicted_token = self
@@ -4275,25 +4214,12 @@ impl ControlMvpTxn {
             &predicted_token,
             staged.payload.clone(),
         )?;
-        let duplicate = self
-            .base
-            .state
-            .outbox
-            .iter()
-            .map(|record| record.record_id.as_str())
-            .chain(self.outbox.iter().map(|record| record.record_id.as_str()))
-            .chain(
-                self.projection_intents
-                    .iter()
-                    .map(|intent| intent.intent_id.as_str()),
-            )
-            .any(|existing| existing == staged.intent_id);
-        if duplicate {
-            return Err(CatalogError::AlreadyExists {
-                entity: "projection intent".to_string(),
-                name: staged.intent_id,
-            });
-        }
+        self.ensure_outbox_id_available(&staged.intent_id, "projection intent")
+            .await?;
+        self.reads.reserve(
+            staged.intent_id.len() + staged.projection_kind.len() + staged.payload.len() + 96,
+            1,
+        )?;
         self.projection_intents.push(staged);
         Ok(())
     }
@@ -4318,49 +4244,50 @@ impl ControlMvpTxn {
     /// Returns a precondition failure when a record id is not present in the
     /// transaction's base outbox, when it is present under a different origin
     /// sequence than the target observed, or when it is trimmed twice.
-    pub fn trim_projection_outbox(
+    pub async fn trim_projection_outbox(
         &mut self,
         targets: impl IntoIterator<Item = ControlMvpOutboxTrimTarget>,
     ) -> Result<()> {
+        let mut staged = BTreeMap::new();
+        let mut bytes = 0_usize;
         for target in targets {
-            let Some(present) = self
-                .base
-                .state
-                .outbox
-                .iter()
-                .find(|record| record.record_id == target.record_id)
-            else {
-                return Err(precondition_failed(&format!(
-                    "cannot trim projection outbox record {}: not present in current state",
-                    target.record_id
-                )));
-            };
-            if present.origin_sequence != Some(target.origin_sequence) {
-                return Err(precondition_failed(&format!(
-                    "cannot trim projection outbox event {}: record {} is currently retained as \
-                     event {} (a different incarnation of the same record id)",
-                    target.event_id(),
-                    target.record_id,
-                    present
-                        .event_id()
-                        .unwrap_or_else(|| "<uncommitted>".to_string()),
-                )));
-            }
             if self
                 .outbox_trim
                 .iter()
-                .any(|staged| staged.record_id() == target.record_id)
+                .any(|entry| entry.record_id == target.record_id)
+                || staged.contains_key(&target.record_id)
             {
-                return Err(precondition_failed(&format!(
-                    "projection outbox record {} is already staged for trimming",
-                    target.record_id
-                )));
+                return Err(precondition_failed(
+                    "projection outbox record is already staged for trimming",
+                ));
             }
-            self.outbox_trim.push(ControlMvpOutboxTrimEntry {
-                record_id: target.record_id,
-                origin_sequence: target.origin_sequence,
-            });
+            let present = self
+                .base_outbox_record(&target.record_id)
+                .await?
+                .ok_or_else(|| {
+                    precondition_failed(
+                        "cannot trim projection outbox record: not present in current state",
+                    )
+                })?;
+            if present.origin_sequence != Some(target.origin_sequence) {
+                return Err(precondition_failed(
+                    "cannot trim a different incarnation of the same record id",
+                ));
+            }
+            bytes = bytes.saturating_add(target.record_id.len() + 96);
+            self.reads.check_essential(bytes, staged.len() + 1)?;
+            staged.insert(
+                target.record_id.clone(),
+                ControlMvpOutboxTrimEntry {
+                    record_id: target.record_id,
+                    origin_sequence: target.origin_sequence,
+                },
+            );
         }
+        // No mutation before all awaited validation completes: errors and
+        // cancellation cannot expose a partially staged batch.
+        self.reads.reserve(bytes, staged.len())?;
+        self.outbox_trim.extend(staged.into_values());
         Ok(())
     }
 
@@ -4371,113 +4298,48 @@ impl ControlMvpTxn {
     /// Returns an error when artifact writes fail, preconditions are not met, or
     /// pointer CAS publication loses to another writer.
     pub async fn commit(self) -> Result<CommitOutcome> {
-        self.commit_inner().await
-    }
-
-    fn get_inner(&self, key: &[u8]) -> Option<VersionedValue> {
-        if let Some(write) = self.writes.get(key) {
-            return match write {
-                StagedWrite::Put(bytes) => Some(VersionedValue::new(bytes.clone(), None)),
-                StagedWrite::Delete => None,
-            };
-        }
-        self.base
-            .state
-            .kv
-            .get(key)
-            .filter(|value| !value.tombstone)
-            .map(|value| VersionedValue::new(value.bytes.clone(), Some(value.generation)))
-    }
-
-    fn scan_prefix_inner(&self, prefix: &[u8]) -> Vec<KvPair> {
-        let mut entries = self
-            .base
-            .state
-            .kv
-            .iter()
-            .filter(|(key, value)| key.starts_with(prefix) && !value.tombstone)
-            .map(|(key, value)| {
-                (
-                    key.clone(),
-                    VersionedValue::new(value.bytes.clone(), Some(value.generation)),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        for (key, write) in &self.writes {
-            if key.starts_with(prefix) {
-                match write {
-                    StagedWrite::Put(bytes) => {
-                        entries.insert(key.clone(), VersionedValue::new(bytes.clone(), None));
-                    }
-                    StagedWrite::Delete => {
-                        entries.remove(key);
-                    }
-                }
-            }
-        }
-
-        entries
-            .into_iter()
-            .map(|(key, value)| KvPair::new(key, value))
-            .collect()
-    }
-
-    fn put_inner(&mut self, key: &[u8], value: Bytes) {
-        self.writes.insert(key.to_vec(), StagedWrite::Put(value));
-    }
-
-    fn delete_inner(&mut self, key: &[u8]) {
-        self.writes.insert(key.to_vec(), StagedWrite::Delete);
-    }
-
-    fn assert_absent_inner(&mut self, key: &[u8]) -> Result<()> {
-        let witness = self.base.state.point_witness(key);
-        if matches!(witness, PointWitness::Present(_)) {
-            return Err(precondition_failed(
-                "cannot assert absence for a present control MVP key",
-            ));
-        }
-        self.preconditions.push(Precondition::Absent {
-            key: key.to_vec(),
-            witness,
-        });
-        Ok(())
-    }
-
-    fn assert_generation_inner(&mut self, key: &[u8], generation: u64) -> Result<()> {
-        if self.base.state.point_witness(key) != PointWitness::Present(generation) {
-            return Err(precondition_failed(
-                "cannot assert a control MVP key generation that is not currently present",
-            ));
-        }
-        self.preconditions.push(Precondition::Generation {
-            key: key.to_vec(),
-            expected: generation,
-        });
-        Ok(())
-    }
-
-    /// Returns the current transaction-base witness for a key range.
-    #[must_use]
-    pub(crate) fn range_witness(&self, range: &KeyRange) -> u64 {
-        self.base.state.range_witness(range)
+        Box::pin(self.commit_inner()).await
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn commit_inner(self) -> Result<CommitOutcome> {
+    #[allow(unused_mut, reason = "test-only eager reference consumes its snapshot")]
+    async fn commit_inner(mut self) -> Result<CommitOutcome> {
+        // This is the complete Gate 3 publication boundary. Selective caches
+        // never substitute for replay or redundant-anchor equivalence checks.
+        #[cfg(any(test, feature = "test-utils"))]
+        let base = match self.eager_base.take() {
+            Some(base) => base,
+            None => {
+                cost::phase(
+                    "commit_replay",
+                    self.base.materialize_for_commit(&self.store),
+                )
+                .await?
+            }
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let base = cost::phase(
+            "commit_replay",
+            self.base.materialize_for_commit(&self.store),
+        )
+        .await?;
+        self.reads.validate(&base.state)?;
         for precondition in &self.preconditions {
-            self.base.state.validate_precondition(precondition)?;
+            base.state.validate_precondition(precondition)?;
         }
-        validate_publication_epoch(self.store.writer_epoch, self.base.writer_epoch)?;
-        if self.base.tx_refs.is_empty() && !self.base.base_states.is_empty() {
-            self.store
-                .verify_materialized_state(&self.base.base_states, &self.base.state)
-                .await?;
+        validate_publication_epoch(self.store.writer_epoch, base.writer_epoch)?;
+        if base.tx_refs.is_empty() && !base.base_states.is_empty() {
+            cost::phase(
+                "commit_replay",
+                self.store
+                    .verify_materialized_state(&base.base_states, &base.state),
+            )
+            .await?;
         }
 
+        let rendering_phase = cost::PhaseGuard::enter("candidate_rendering");
         let next_sequence = next_logical_sequence(
-            self.base.state.logical_sequence,
+            base.state.logical_sequence,
             "committing a control MVP transaction",
         )?;
         let mut committed_token = self.store.token(self.manifest_id.clone(), next_sequence);
@@ -4523,11 +4385,11 @@ impl ControlMvpTxn {
         }
         let mut tx = ControlMvpTxObject {
             history: HistoryLink::default(),
-            reclamation_generation: self.base.reclamation_generation,
+            reclamation_generation: base.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             tx_id: self.tx_id.clone(),
-            base_manifest_id: self.base.manifest_id.clone(),
+            base_manifest_id: base.manifest_id.clone(),
             sequence: next_sequence,
             writer_epoch: self.store.writer_epoch,
             request_id: self.request_id.clone(),
@@ -4543,7 +4405,7 @@ impl ControlMvpTxn {
                 .collect(),
             outbox_trim: self.outbox_trim,
         };
-        tx.history = HistoryLink::new(&tx, &self.base.state.history_root)?;
+        tx.history = HistoryLink::new(&tx, &base.state.history_root)?;
         let l0_rows = segment_rows_for_tx(&tx);
         let (l0_bytes, l0_index_bytes, l0_reference) = encode_segment(
             &self.tx_id,
@@ -4570,10 +4432,10 @@ impl ControlMvpTxn {
             sequence: next_sequence,
             checksum_sha256: tx_checksum.clone(),
         };
-        let mut candidate_state = self.base.state.clone();
+        let mut candidate_state = base.state.clone();
         candidate_state.apply_tx(&tx)?;
 
-        let mut tx_refs = self.base.tx_refs.clone();
+        let mut tx_refs = base.tx_refs.clone();
         tx_refs.push(candidate_tx_ref.clone());
 
         let production_async_layout =
@@ -4602,26 +4464,26 @@ impl ControlMvpTxn {
             &self.store.scope,
             &self.manifest_id,
             next_sequence,
-            self.base.layout_generation,
+            base.layout_generation,
             tx_refs.len(),
         )?;
 
         let mut manifest = ControlMvpManifest {
-            history_anchor: self.base.history_anchor.clone(),
+            history_anchor: base.history_anchor.clone(),
             history_root: candidate_state.history_root.clone(),
             physical_root: String::new(),
             equivalence: None,
-            parent_manifest_sha256: self.base.manifest_checksum_sha256.clone(),
-            reclamation_generation: self.base.reclamation_generation,
+            parent_manifest_sha256: base.manifest_checksum_sha256.clone(),
+            reclamation_generation: base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
             manifest_id: self.manifest_id.clone(),
             logical_sequence: next_sequence,
-            base_manifest_id: self.base.manifest_id,
+            base_manifest_id: base.manifest_id,
             writer_epoch: self.store.writer_epoch,
-            layout_generation: self.base.layout_generation,
-            base_states: self.base.base_states,
+            layout_generation: base.layout_generation,
+            base_states: base.base_states,
             anchor_states,
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
@@ -4638,7 +4500,7 @@ impl ControlMvpTxn {
         let manifest_checksum = sha256_hex(&manifest_bytes);
         committed_token.expected_manifest_sha256 = Some(manifest_checksum.clone());
         let pointer = ControlMvpPointer {
-            reclamation_generation: self.base.reclamation_generation,
+            reclamation_generation: base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
             scope: ControlMvpScopeDoc::from(&self.store.scope),
@@ -4649,7 +4511,7 @@ impl ControlMvpTxn {
         };
         let pointer_bytes =
             encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
-        let precondition = self.base.pointer_version.map_or(
+        let precondition = base.pointer_version.map_or(
             AuthorityWritePrecondition::DoesNotExist,
             AuthorityWritePrecondition::MatchesVersion,
         );
@@ -4657,48 +4519,53 @@ impl ControlMvpTxn {
         // Candidate replay, required-anchor rendering, manifest encoding, and
         // head encoding all complete before the first immutable artifact is
         // published. A capacity failure therefore leaves no orphan candidate.
-        put_immutable(
-            &self.store.storage,
-            &self.store.paths.tx_object(&self.tx_id),
-            tx_bytes,
-            "control MVP transaction object already exists",
-        )
-        .await?;
-        self.store
-            .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
-            .await?;
-        for rendered in rendered_anchor {
-            put_immutable_matching(
+        drop(rendering_phase);
+        cost::phase("candidate_publication", async {
+            put_immutable(
                 &self.store.storage,
-                &self.store.paths.state_object(&rendered.reference.state_id),
-                rendered.bytes,
-                "control MVP L1 segment already exists with different bytes",
+                &self.store.paths.tx_object(&self.tx_id),
+                tx_bytes,
+                "control MVP transaction object already exists",
             )
             .await?;
-            put_immutable_matching(
+            self.store
+                .write_l0_segment(&l0_reference, l0_bytes, l0_index_bytes)
+                .await?;
+            for rendered in rendered_anchor {
+                put_immutable_matching(
+                    &self.store.storage,
+                    &self.store.paths.state_object(&rendered.reference.state_id),
+                    rendered.bytes,
+                    "control MVP L1 segment already exists with different bytes",
+                )
+                .await?;
+                put_immutable_matching(
+                    &self.store.storage,
+                    &self.store.paths.segment_index(&rendered.reference.state_id),
+                    rendered.index_bytes,
+                    "control MVP L1 segment index already exists with different bytes",
+                )
+                .await?;
+            }
+            put_immutable(
                 &self.store.storage,
-                &self.store.paths.segment_index(&rendered.reference.state_id),
-                rendered.index_bytes,
-                "control MVP L1 segment index already exists with different bytes",
+                &self.store.paths.manifest_object(&self.manifest_id),
+                manifest_bytes,
+                "control MVP manifest object already exists",
             )
             .await?;
-        }
-        put_immutable(
-            &self.store.storage,
-            &self.store.paths.manifest_object(&self.manifest_id),
-            manifest_bytes,
-            "control MVP manifest object already exists",
-        )
+            Ok::<(), CatalogError>(())
+        })
         .await?;
-        let pointer_write = self
-            .store
-            .storage
-            .put(
+        let pointer_write = cost::phase(
+            "head_cas",
+            self.store.storage.put(
                 &self.store.paths.current_pointer(),
                 pointer_bytes.clone(),
                 precondition,
-            )
-            .await;
+            ),
+        )
+        .await;
         match pointer_write {
             Err(error) => {
                 // S3 may accept a conditional PUT and lose the response. The
@@ -5388,118 +5255,6 @@ impl ArcoStateStore for ControlMvpStateStore {
     }
 }
 
-#[async_trait]
-impl ArcoStateTxn for ControlMvpTxn {
-    async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
-        Ok(self.get_inner(key))
-    }
-
-    async fn scan(&mut self, request: ScanRequest) -> Result<ScanPage> {
-        let observed_token = self
-            .base
-            .manifest_id
-            .as_ref()
-            .map(|manifest_id| -> Result<StateToken> {
-                Ok(self
-                    .store
-                    .token(manifest_id.clone(), self.base.state.logical_sequence)
-                    .with_manifest_witness(self.base.manifest_checksum_sha256.clone().ok_or_else(
-                        || invariant_violation("transaction base has no manifest witness"),
-                    )?))
-            })
-            .transpose()?;
-        let entries = self.scan_prefix_inner(request.prefix());
-        build_scan_page(&self.store.scope, request, observed_token, entries)
-    }
-
-    async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
-        self.put_inner(key, value);
-        Ok(())
-    }
-
-    async fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.delete_inner(key);
-        Ok(())
-    }
-
-    async fn assert_absent(&mut self, key: &[u8]) -> Result<()> {
-        self.assert_absent_inner(key)
-    }
-
-    async fn assert_generation(&mut self, key: &[u8], generation: u64) -> Result<()> {
-        self.assert_generation_inner(key, generation)
-    }
-
-    async fn assert_range_empty(&mut self, range: KeyRange) -> Result<()> {
-        if self.base.state.range_has_entries(&range) {
-            return Err(precondition_failed(
-                "cannot assert a non-empty control MVP range",
-            ));
-        }
-        let witness = self.base.state.range_witness(&range);
-        self.preconditions
-            .push(Precondition::RangeEmpty { range, witness });
-        Ok(())
-    }
-
-    async fn assert_range_unchanged(
-        &mut self,
-        range: KeyRange,
-        observed_generation: u64,
-    ) -> Result<()> {
-        if self.base.state.range_witness(&range) != observed_generation {
-            return Err(precondition_failed(
-                "cannot assert a stale control MVP range witness",
-            ));
-        }
-        self.preconditions.push(Precondition::RangeUnchanged {
-            range,
-            witness: observed_generation,
-        });
-        Ok(())
-    }
-
-    async fn read_set(
-        &mut self,
-        keys: &[Vec<u8>],
-        ranges: &[KeyRange],
-    ) -> Result<PredicateInputSet> {
-        let witness = self.base.state.predicate_witness(keys, ranges);
-        Ok(PredicateInputSet::with_model_witness(
-            keys.to_vec(),
-            ranges.to_vec(),
-            witness,
-        ))
-    }
-
-    async fn assert_inputs_unchanged(&mut self, inputs: PredicateInputSet) -> Result<()> {
-        let witness = inputs
-            .model_witness()
-            .ok_or_else(|| precondition_failed("predicate input set has no control MVP witness"))?;
-        if self
-            .base
-            .state
-            .predicate_witness(inputs.point_keys(), inputs.ranges())
-            != witness
-        {
-            return Err(precondition_failed(
-                "cannot assert stale control MVP predicate inputs",
-            ));
-        }
-        self.preconditions
-            .push(Precondition::Predicate { inputs, witness });
-        Ok(())
-    }
-
-    async fn commit(self: Box<Self>) -> Result<CommitOutcome> {
-        (*self).commit_inner().await
-    }
-
-    async fn rollback(self: Box<Self>) -> Result<()> {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone)]
 struct ControlMvpBase {
     history_anchor: HistoryAnchor,
@@ -5554,6 +5309,7 @@ struct BlockScanBudget {
 type BinaryKeyBounds = Option<(Vec<u8>, Vec<u8>)>;
 
 struct BlockScanCursor {
+    range: Option<KeyRange>,
     expected_bounds: BTreeMap<String, BinaryKeyBounds>,
     references: std::collections::VecDeque<ControlMvpSegmentRef>,
     current: Option<(ControlMvpSegmentRef, ControlMvpSegmentIndex, usize, bool)>,
@@ -5563,6 +5319,7 @@ struct BlockScanCursor {
 impl BlockScanCursor {
     fn new(references: std::collections::VecDeque<ControlMvpSegmentRef>) -> Self {
         Self {
+            range: None,
             expected_bounds: BTreeMap::new(),
             references,
             current: None,
@@ -5608,7 +5365,11 @@ impl BlockScanCursor {
                 continue;
             };
             let bounds = block_key_bounds(block)?;
-            if block.record_kind != Some(SEGMENT_RECORD_KV)
+            if self.range.as_ref().is_some_and(|range| {
+                bounds.as_ref().is_none_or(|(min, max)| {
+                    max.as_slice() < range.start() || min.as_slice() >= range.end()
+                })
+            }) || block.record_kind != Some(SEGMENT_RECORD_KV)
                 || !key_bounds_overlap_prefix(bounds.as_ref(), prefix)
                 || bounds
                     .as_ref()
@@ -5635,7 +5396,10 @@ impl BlockScanCursor {
                 .await?
                 .into_iter()
                 .filter(|row| {
-                    row.key.starts_with(prefix)
+                    self.range
+                        .as_ref()
+                        .is_none_or(|range| key_in_range(&row.key, range))
+                        && row.key.starts_with(prefix)
                         && start.is_none_or(|start| row.key.as_slice() > start)
                 })
                 .collect();
@@ -5689,6 +5453,8 @@ struct ReplayState {
 
 impl ReplayState {
     fn append_snapshot(&mut self, shard: ControlMvpStateObject) -> Result<()> {
+        #[cfg(feature = "test-utils")]
+        cost::record(8, shard.entries.len() + shard.outbox.len());
         if shard.logical_sequence != self.logical_sequence
             || shard
                 .kv_start_ordinal
@@ -5731,6 +5497,8 @@ impl ReplayState {
         }
     }
     fn apply_tx(&mut self, tx: &ControlMvpTxObject) -> Result<()> {
+        #[cfg(feature = "test-utils")]
+        cost::record(8, tx.writes.len() + tx.outbox.len() + tx.outbox_trim.len());
         tx.history.validate(&tx.scope, tx.sequence)?;
         if tx.history.preceding_root != self.history_root
             || integrity::mutation_digest(tx) != tx.history.mutation_sha256
@@ -5901,7 +5669,7 @@ impl ReplayState {
         {
             hash_bytes(&mut hasher, key);
             hash_u64(&mut hasher, value.generation);
-            hasher.update([u8::from(value.tombstone)]);
+            hash_tag(&mut hasher, u8::from(value.tombstone));
         }
         digest_u64(hasher)
     }
@@ -5914,13 +5682,13 @@ impl ReplayState {
         for key in sorted_keys {
             hash_bytes(&mut hasher, key);
             match self.point_witness(key) {
-                PointWitness::Absent => hasher.update([0]),
+                PointWitness::Absent => hash_tag(&mut hasher, 0),
                 PointWitness::Present(generation) => {
-                    hasher.update([1]);
+                    hash_tag(&mut hasher, 1);
                     hash_u64(&mut hasher, generation);
                 }
                 PointWitness::Tombstone(generation) => {
-                    hasher.update([2]);
+                    hash_tag(&mut hasher, 2);
                     hash_u64(&mut hasher, generation);
                 }
             }
@@ -5942,6 +5710,8 @@ impl ReplayState {
     }
 
     fn checksum(&self) -> Result<String> {
+        #[cfg(feature = "test-utils")]
+        cost::record(9, 1);
         let digest = ReplayStateDigest {
             logical_sequence: self.logical_sequence,
             entries: self
@@ -5960,6 +5730,8 @@ impl ReplayState {
                 .collect(),
         };
         let bytes = encode_json_vec(&digest, "control MVP replay digest")?;
+        #[cfg(feature = "test-utils")]
+        cost::record(12, bytes.len());
         Ok(sha256_hex(&bytes))
     }
 }
@@ -6641,6 +6413,11 @@ fn validate_unique_hydrated_rows(
         .iter()
         .map(|(_, entry)| entry.record_id())
         .collect::<BTreeSet<_>>();
+    if !trim_ids.is_disjoint(&outbox_ids) {
+        return Err(invariant_violation(
+            "outbox ID cannot be trimmed and added in one transaction",
+        ));
+    }
     if trim_ids.len() != outbox_trim.len() {
         return Err(invariant_violation(
             "control MVP L0 segment contains duplicate outbox-trim rows",
@@ -8321,6 +8098,11 @@ where
         )));
     }
     let payload_bytes = encode_json_vec(&envelope.payload, context)?;
+    #[cfg(feature = "test-utils")]
+    {
+        cost::record(13, 1);
+        cost::record(14, payload_bytes.len());
+    }
     let checksum = sha256_hex(&payload_bytes);
     if checksum != envelope.checksum_sha256 {
         return Err(invariant_violation(format!("{context} checksum mismatch")));
@@ -8371,6 +8153,11 @@ fn valid_raw_digest(digest: &str) -> bool {
 
 fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) -> Result<()> {
     if let Some(expected) = expected {
+        #[cfg(feature = "test-utils")]
+        {
+            cost::record(13, 1);
+            cost::record(14, bytes.len());
+        }
         let actual = sha256_hex(bytes);
         if actual != expected {
             return Err(invariant_violation(format!("{context} mismatch")));
@@ -8443,6 +8230,8 @@ thread_local! {
 #[cfg(feature = "test-utils")]
 #[allow(clippy::indexing_slicing)] // Three internal kinds, each owning its count/byte pair.
 fn record_integrity_work(kind: usize, bytes: usize) {
+    cost::record(2 + kind * 2, 1);
+    cost::record(3 + kind * 2, bytes);
     TEST_INTEGRITY_WORK.with(|work| {
         let mut counts = work.get();
         counts[kind * 2] += 1;
@@ -8452,6 +8241,11 @@ fn record_integrity_work(kind: usize, bytes: usize) {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    {
+        cost::record(0, 1);
+        cost::record(1, bytes.len());
+    }
     #[cfg(feature = "test-utils")]
     TEST_SHA256_WORK.with(|work| {
         let (calls, total) = work.get();
@@ -8526,6 +8320,8 @@ fn restore_identity_suffix(
 }
 
 fn digest_u64(hasher: Sha256) -> u64 {
+    #[cfg(feature = "test-utils")]
+    cost::record(10, 1);
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 8];
     for (target, source) in bytes.iter_mut().zip(digest.iter()) {
@@ -8538,12 +8334,22 @@ fn key_in_range(key: &[u8], range: &KeyRange) -> bool {
     key >= range.start() && key < range.end()
 }
 
+fn hash_tag(hasher: &mut Sha256, tag: u8) {
+    #[cfg(feature = "test-utils")]
+    cost::record(11, 1);
+    hasher.update([tag]);
+}
+
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    #[cfg(feature = "test-utils")]
+    cost::record(11, bytes.len());
     hash_u64(hasher, bytes.len() as u64);
     hasher.update(bytes);
 }
 
 fn hash_u64(hasher: &mut Sha256, value: u64) {
+    #[cfg(feature = "test-utils")]
+    cost::record(11, 8);
     hasher.update(value.to_be_bytes());
 }
 
@@ -8829,6 +8635,7 @@ mod tests {
                 id,
                 Bytes::from_static(b"payload"),
             ))
+            .await
             .unwrap();
         }
         tx.commit().await.unwrap();
@@ -11210,6 +11017,7 @@ mod tests {
             .await
             .unwrap();
         tx.stage_projection_intent("projection", "test", Bytes::from_static(b"payload"))
+            .await
             .unwrap();
         let first = tx.commit().await.unwrap();
         for _ in 0..2 {

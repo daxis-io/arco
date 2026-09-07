@@ -118,6 +118,7 @@ async fn control_commit_returns_and_durably_records_projection_intent() {
         "system_catalog_tables",
         Bytes::from_static(br#"{"table_id":"table-1"}"#),
     )
+    .await
     .expect("stage projection intent");
 
     let outcome = txn.commit().await.expect("commit");

@@ -1153,9 +1153,19 @@ pub const MAX_SCAN_PAGE_ROWS: usize = 1_000_000;
 pub struct ScanContinuation {
     scope: StateScope,
     prefix: Vec<u8>,
-    observed_token: StateToken,
+    origin: ScanContinuationOrigin,
     exclusive_last_key: Vec<u8>,
     query_binding: Option<Vec<u8>>,
+}
+
+/// Transaction origins are process-local and deliberately have no wire encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScanContinuationOrigin {
+    Authority(StateToken),
+    Transaction {
+        nonce: u128,
+        base: Option<StateToken>,
+    },
 }
 
 const SCAN_CONTINUATION_VERSION: u32 = 3;
@@ -1225,15 +1235,16 @@ struct ScanContinuationEnvelope {
 
 impl ScanContinuation {
     pub(crate) fn encode_opaque(&self, key: &ScanContinuationKey) -> Result<String> {
+        let observed_token = self.observed_token()?;
         let envelope = ScanContinuationEnvelope {
-            manifest_sha256: self.observed_token.manifest_witness()?.to_string(),
+            manifest_sha256: observed_token.manifest_witness()?.to_string(),
             version: SCAN_CONTINUATION_VERSION,
             tenant_id: self.scope.tenant_id().to_string(),
             workspace_id: self.scope.workspace_id().to_string(),
             domain: self.scope.domain().to_string(),
             prefix_hex: hex::encode(&self.prefix),
-            manifest_id: self.observed_token.authority_manifest_id().to_string(),
-            logical_sequence: self.observed_token.logical_sequence(),
+            manifest_id: observed_token.authority_manifest_id().to_string(),
+            logical_sequence: observed_token.logical_sequence(),
             exclusive_last_key_hex: hex::encode(&self.exclusive_last_key),
             query_binding_hex: self.query_binding.as_ref().map(hex::encode),
         };
@@ -1348,12 +1359,12 @@ impl ScanContinuation {
         let scope = StateScope::new(envelope.tenant_id, envelope.workspace_id, envelope.domain);
         scope.validate()?;
         Ok(Self {
-            observed_token: StateToken {
+            origin: ScanContinuationOrigin::Authority(StateToken {
                 scope: scope.clone(),
                 logical_sequence: envelope.logical_sequence,
                 authority_manifest_id: envelope.manifest_id,
                 expected_manifest_sha256: Some(envelope.manifest_sha256),
-            },
+            }),
             scope,
             prefix,
             exclusive_last_key,
@@ -1361,8 +1372,14 @@ impl ScanContinuation {
         })
     }
 
-    pub(crate) const fn observed_token(&self) -> &StateToken {
-        &self.observed_token
+    pub(crate) fn observed_token(&self) -> Result<&StateToken> {
+        match &self.origin {
+            ScanContinuationOrigin::Authority(token) => Ok(token),
+            ScanContinuationOrigin::Transaction { .. } => Err(CatalogError::Validation {
+                message: "transaction scan continuations have no public or wire authority"
+                    .to_string(),
+            }),
+        }
     }
 
     pub(crate) fn bind_query(mut self, query_binding: Option<&[u8]>) -> Self {
@@ -1468,6 +1485,14 @@ impl ScanRequest {
     }
 
     fn validate_for_scope(&self, scope: &StateScope) -> Result<()> {
+        self.validate_for_origin(scope, None)
+    }
+
+    fn validate_for_origin(
+        &self,
+        scope: &StateScope,
+        transaction_nonce: Option<u128>,
+    ) -> Result<()> {
         if self.max_rows == 0 || self.max_rows > MAX_SCAN_PAGE_ROWS {
             return Err(CatalogError::Validation {
                 message: format!("scan max_rows must be between 1 and {MAX_SCAN_PAGE_ROWS}"),
@@ -1495,6 +1520,19 @@ impl ScanRequest {
             });
         }
         if let Some(token) = &self.token {
+            let valid_origin = match (&token.origin, transaction_nonce) {
+                (ScanContinuationOrigin::Authority(_), None) => true,
+                (ScanContinuationOrigin::Transaction { nonce, .. }, Some(expected)) => {
+                    *nonce == expected
+                }
+                _ => false,
+            };
+            if !valid_origin {
+                return Err(CatalogError::Validation {
+                    message: "scan continuation belongs to a different reader or transaction"
+                        .to_string(),
+                });
+            }
             if self.start_after.is_some() {
                 return Err(CatalogError::Validation {
                     message: "scan continuation cannot be combined with start_after".to_string(),
@@ -1520,7 +1558,10 @@ impl ScanRequest {
     }
 
     fn continuation_token(&self) -> Option<&StateToken> {
-        self.token.as_ref().map(|token| &token.observed_token)
+        self.token.as_ref().and_then(|token| match &token.origin {
+            ScanContinuationOrigin::Authority(token) => Some(token),
+            ScanContinuationOrigin::Transaction { base, .. } => base.as_ref(),
+        })
     }
 
     fn effective_start_after(&self) -> Option<&[u8]> {
@@ -1555,8 +1596,9 @@ impl ScanPage {
 
     /// Returns the authority cut observed by this page.
     ///
-    /// An empty, never-committed backend has no authority token and returns
-    /// `None`; any non-empty page is always bound to a token.
+    /// A never-committed backend has no durable authority token. Transaction
+    /// pages may contain staged genesis values while returning `None`; their
+    /// continuations are bound to that in-memory transaction only.
     #[must_use]
     pub const fn observed_token(&self) -> Option<&StateToken> {
         self.observed_token.as_ref()
@@ -1633,7 +1675,7 @@ pub(crate) fn build_scan_page(
         Some(ScanContinuation {
             scope: scope.clone(),
             prefix: request.prefix,
-            observed_token: observed_token.clone(),
+            origin: ScanContinuationOrigin::Authority(observed_token.clone()),
             exclusive_last_key,
             query_binding: None,
         })
@@ -1677,7 +1719,7 @@ pub(crate) fn build_scan_page_with_backend_boundary(
         page.continuation = Some(ScanContinuation {
             scope: scope.clone(),
             prefix,
-            observed_token,
+            origin: ScanContinuationOrigin::Authority(observed_token),
             exclusive_last_key,
             query_binding: None,
         });

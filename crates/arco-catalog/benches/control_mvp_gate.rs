@@ -25,6 +25,15 @@ fn main() {
         );
         return;
     }
+    #[cfg(feature = "test-utils")]
+    if std::env::args().any(|argument| argument == "--lazy-transactions") {
+        let report = runtime.block_on(Box::pin(control_cost::run_lazy_scaling()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("lazy report")
+        );
+        return;
+    }
     let report = runtime.block_on(control_cost::run(profile));
     // Verify accounting even when the benchmark is invoked outside cargo test.
     let probe = runtime.block_on(control_cost::probe_backend_accounting(1));

@@ -118,8 +118,12 @@ history link. Old plans cannot become publishable by relying on missing fields.
 ## Access and retention boundaries
 
 Reader opening authenticates the selected root and local metadata. Point reads
-and scans authenticate selected directories/blocks. Eager begin, checkpoint
-creation/read/persistence, maintenance and restore retain whole-state checks.
+and scans authenticate selected directories/blocks. Gate 4 transaction begin
+pins authenticated metadata only. Commit freshly authenticates the pinned
+manifest, reconstructs with `replay_for_successor`, checks redundant anchors, and
+revalidates promoted bases before publishing anything. Checkpoint
+creation/read/persistence, reconciliation, complete outbox inspection, maintenance
+and restore retain whole-state checks.
 Ordinary witnessed historical reads do not recursively fetch predecessors.
 Parent links remain resolution metadata, not retention pins.
 
@@ -129,5 +133,60 @@ budgets are ambiguous outcomes; digest, history, cycle and transition mismatches
 are integrity errors. Neither becomes a successful acknowledgment or false
 supersession. HEAD-only writer/reclamation advances preserve both integrity roots.
 
-All evidence in this gate is local. Provider qualification, lazy transactions,
-durable incremental maintenance and caches remain later gates.
+All evidence is local. Gate 4 adds the transaction access contract below; provider
+qualification, durable incremental maintenance and caches remain outstanding.
+
+
+## Gate 4 transaction access contract
+
+Transaction begin reads HEAD metadata, the pointer, and its authenticated manifest.
+Genesis reads HEAD metadata only. A private genesis/manifest pin records exact
+HEAD version, writer and reclamation fences, sequence, manifest digest, and the
+manifest history/layout commitments. It contains no partial replay state.
+
+Point observations distinguish never-present, live generation, and tombstone
+generation. Staged values have no committed generation; staged deletes read as
+absence. Overlay-only point reads record their local origin. Explicit assertions
+always inspect the pinned base, even after a write/delete. Completed range
+fingerprints preserve the existing encoding, include tombstones and gaps, and
+are reused within the request. A retained tombstone makes range-empty fail.
+Empty and reversed half-open ranges remain empty. Wide ranges hash resolved
+rows in bounded chunks without collecting a full result or imposing a total
+range traversal limit.
+
+Public and transaction scans share an authenticated ordered row stream. The
+transaction merges staged writes before page limits, and records base evidence
+through the last fully resolved key. A terminal page records remaining-prefix
+exhaustion. Every transaction cursor carries a private, fresh in-memory origin,
+optional base authority, scope, prefix, and exclusive boundary. It works only in
+that transaction, cannot be encoded as an opaque public continuation, and is
+rejected by public readers. No continuation v3 fields change. Genesis may return
+staged values and a local cursor without a durable `StateToken`. Inserts, updates,
+and deletes above the boundary affect subsequent pages; keys at/below it are
+never revisited. Empty pages can make progress over tombstones or staged deletes.
+
+`stage_projection_outbox`, `stage_projection_intent`, and
+`trim_projection_outbox` are async source API changes; crate-local
+`range_witness` is async and fallible. `ArcoStateTxn` signatures are unchanged.
+Outbox lookup visits all L1 owners including keyless shards, since manifest bounds
+and Bloom filters cover only KV keys. It fetches matching outbox blocks and
+applies exact L0 trims before additions. A multi-target trim stages nothing until
+all validation completes; errors and cancellation preserve batch atomicity.
+Commit independently rejects duplicate IDs, invalid incarnations, and a trim and
+addition of the same ID in one transaction.
+
+The retained overlay, observations and optional memo payloads are accounted
+against 64 MiB and one million entries. Essential growth can evict optional memo
+values; an unadmittable operation fails with `MaintenanceBackpressure` before
+staging. This accounting is not an RSS bound. Existing object, raw Arrow, page,
+segment and block caps continue to apply. Commit reconstruction is measured
+separately and retains the complete semantic checksum, history, physical root,
+rendered transaction/anchor validation, capacity-before-PUT, fencing and exact
+HEAD CAS boundary. CAS failure consumes the attempt; catalog retries rerun the
+frozen command and regenerate all outputs and candidate identities.
+
+Pins are nondurable and provide no deadline or retention renewal. A required
+object that is missing or corrupt fails closed when accessed. A memoized read
+may remain available, but commit bypasses the memo and freshly authenticates the
+manifest and all reconstruction/validation inputs. Unrelated corruption may be
+deferred until commit; it never becomes negative evidence or a publishable base.

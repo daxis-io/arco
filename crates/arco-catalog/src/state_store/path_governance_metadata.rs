@@ -353,7 +353,7 @@ pub(super) async fn stage_path_governance_declaration(
         ));
     }
 
-    let descendant_witness = txn.range_witness(&keys.descendant_range);
+    let descendant_witness = txn.range_witness(&keys.descendant_range).await?;
     txn.assert_absent(&keys.record_key).await?;
     txn.assert_absent(&keys.exact_path_key).await?;
     for ancestor_key in &keys.ancestor_path_keys {
@@ -886,12 +886,12 @@ mod tests {
         let storage = storage();
         let writer = writer(storage.clone());
         let store = ControlMvpStateStore::new(storage, metadata_scope()).expect("control store");
-        let txn = store
+        let mut txn = store
             .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
             .await
             .expect("begin transaction");
         let range = descendant_conflict_range("gs://bucket/warehouse/orders/");
-        let stale_witness = txn.range_witness(&range);
+        let stale_witness = txn.range_witness(&range).await.expect("witness");
 
         writer
             .declare_path(declaration(

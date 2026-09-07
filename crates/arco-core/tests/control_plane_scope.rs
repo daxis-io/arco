@@ -52,6 +52,13 @@ async fn control_plane_scope_scoped_storage_can_be_constructed_for_metastore_sco
     let storage = ScopedStorage::new_metastore_scoped(backend.clone(), &scope)
         .expect("metastore-scoped storage");
 
+    assert_eq!(storage.workspace_id(), "prod");
+    assert_eq!(storage.clone().workspace_id(), "prod");
+    assert_eq!(
+        storage.scope().prefix(),
+        "tenant=acme/metastore=lakehouse-prod"
+    );
+
     storage
         .put_raw(
             "ledger/event-01.json",

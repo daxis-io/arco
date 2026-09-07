@@ -176,11 +176,13 @@ impl ControlMvpStateStore {
     /// # Errors
     ///
     /// Returns validation errors when the storage scope does not match the state
-    /// scope or when the domain cannot be represented as a safe object path.
+    /// scope, the physical root is not a workspace, or the domain cannot be
+    /// represented as a safe object path. Non-workspace roots require the future
+    /// versioned authority-scope format; they must not alias legacy `StateScope`.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         scope.validate()?;
         if storage.tenant_id() != scope.tenant_id()
-            || storage.workspace_id() != scope.workspace_id()
+            || storage.scope().workspace_id() != Some(scope.workspace_id())
         {
             return Err(validation_failed(
                 "control MVP storage scope does not match StateScope",

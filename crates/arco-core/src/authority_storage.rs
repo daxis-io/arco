@@ -52,7 +52,15 @@ impl ScopedAuthorityStore {
         self.storage.tenant_id()
     }
 
-    /// Returns the workspace ID enforced by the underlying scope.
+    /// Returns the typed physical authority root.
+    #[must_use]
+    pub fn scope(&self) -> &crate::AuthorityScope {
+        self.storage.scope()
+    }
+
+    /// Returns the legacy request workspace context, not the physical root ID.
+    /// Use [`Self::scope`] for authority identity; state kernels must reject root
+    /// families that their persisted scope representation cannot distinguish.
     #[must_use]
     pub fn workspace_id(&self) -> &str {
         self.storage.workspace_id()
@@ -110,6 +118,7 @@ mod tests {
 
         assert_eq!(authority.tenant_id(), "tenant");
         assert_eq!(authority.workspace_id(), "workspace");
+        assert_eq!(authority.scope().workspace_id(), Some("workspace"));
         let created = authority
             .put(
                 "control/v1/domains/catalog/current.json",

@@ -14,6 +14,149 @@ fn fixture() -> (ScopedStorage, ControlMvpStateStore) {
     (storage, store)
 }
 
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn retained_suffix_rewrite_binds_both_cuts_and_traverses_publish_history() {
+    let (storage, store) = fixture();
+    for _ in 0..16 {
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+    }
+    let render_source = manifest(&store).await;
+    let render_digest = store.load_pointer().await.unwrap().manifest_checksum_sha256;
+    let state = store.replay_for_successor(&render_source).await.unwrap();
+    let rendered = store
+        .render_state_snapshots(&state, "retained-suffix-rewrite")
+        .unwrap();
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    tx.put(b"later", Bytes::from_static(b"preserved"))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let source = manifest(&store).await;
+    let source_digest = store.load_pointer().await.unwrap().manifest_checksum_sha256;
+    let mut candidate = source.clone();
+    candidate.manifest_id = "retained-suffix-rewrite".into();
+    candidate.base_manifest_id = Some(source.manifest_id.clone());
+    candidate.parent_manifest_sha256 = Some(source_digest.clone());
+    candidate.layout_generation += 1;
+    candidate.base_states = rendered.iter().map(|r| r.reference.clone()).collect();
+    candidate.anchor_states.clear();
+    candidate.tx_refs = source.tx_refs[render_source.tx_refs.len()..].to_vec();
+    candidate.history_anchor = HistoryAnchor {
+        sequence: state.logical_sequence,
+        root: state.history_root,
+    };
+    candidate.maintenance_intent = None;
+    candidate.equivalence = Some(
+        serde_json::from_value(serde_json::json!({
+            "encoding_version":2,
+            "source_manifest_id":source.manifest_id,
+            "source_manifest_sha256":source_digest,
+            "source_history_root":source.history_root,
+            "source_physical_root":source.physical_root,
+            "logical_sequence":source.logical_sequence,
+            "state_checksum_sha256":source.state_checksum_sha256,
+            "render_source": {
+                "manifest_id":render_source.manifest_id,
+                "manifest_sha256":render_digest,
+                "logical_sequence":render_source.logical_sequence,
+                "history_anchor":render_source.history_anchor,
+                "history_root":render_source.history_root,
+                "physical_root":render_source.physical_root,
+                "state_checksum_sha256":render_source.state_checksum_sha256,
+                "base_states":render_source.base_states,
+                "anchor_states":render_source.anchor_states,
+                "tx_refs":render_source.tx_refs
+            }
+        }))
+        .unwrap(),
+    );
+    candidate.physical_root = candidate.physical_digest().unwrap();
+    candidate
+        .validate(&store.scope, &candidate.manifest_id)
+        .expect("v2 retained suffix is valid");
+    store
+        .write_rendered_state_snapshots(&rendered)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.replay_for_successor(&candidate).await.unwrap(),
+        store.replay_for_successor(&source).await.unwrap()
+    );
+    let bytes = encode_envelope("control-mvp-manifest", &candidate).unwrap();
+    let digest = sha256_hex(&bytes);
+    storage
+        .put_raw(
+            &store.paths.manifest_object(&candidate.manifest_id),
+            bytes,
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .resolve_ancestor(&candidate.manifest_id, &digest, |m, _| {
+                (m.manifest_id == render_source.manifest_id).then_some(())
+            })
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let mut invalid = candidate.clone();
+    invalid.equivalence.as_mut().unwrap().encoding_version = 1;
+    assert!(
+        invalid
+            .validate(&store.scope, &invalid.manifest_id)
+            .is_err()
+    );
+    for (field, value) in [
+        ("history_root", "invalid-digest".to_string()),
+        ("physical_root", "invalid-digest".to_string()),
+        ("manifest_sha256", "invalid-digest".to_string()),
+    ] {
+        let mut forged = serde_json::to_value(&candidate).unwrap();
+        forged["equivalence"]["render_source"][field] = serde_json::json!(value);
+        let result = serde_json::from_value::<ControlMvpManifest>(forged)
+            .map_err(|e| invariant_violation(e.to_string()))
+            .and_then(|m| m.validate(&store.scope, &m.manifest_id));
+        assert!(result.is_err(), "forged render source {field}");
+    }
+    // A retained suffix must not mask a corrupted render cut by overwriting it.
+    let mut forged_base = store.replay_for_successor(&render_source).await.unwrap();
+    forged_base.kv.insert(
+        b"later".to_vec(),
+        StoredValue {
+            bytes: Bytes::from_static(b"masked corruption"),
+            generation: 1,
+            tombstone: false,
+        },
+    );
+    let forged_rows = store
+        .render_state_snapshots(&forged_base, "masked-render-cut")
+        .unwrap();
+    store
+        .write_rendered_state_snapshots(&forged_rows)
+        .await
+        .unwrap();
+    let mut forged = candidate;
+    forged.base_states = forged_rows.iter().map(|r| r.reference.clone()).collect();
+    forged.physical_root = forged.physical_digest().unwrap();
+    forged.validate(&store.scope, &forged.manifest_id).unwrap();
+    assert!(
+        store.replay_for_successor(&forged).await.is_err(),
+        "the valid later write must not hide a different materialized render cut"
+    );
+}
+
 async fn manifest(store: &ControlMvpStateStore) -> ControlMvpManifest {
     store
         .load_manifest_for_pointer(&store.load_pointer().await.unwrap())
@@ -191,7 +334,7 @@ async fn local_manifest_validation_rejects_invalid_owning_metadata() {
     );
     ControlMvpMaintenanceWorker::new(storage, store.scope.clone())
         .unwrap()
-        .consolidate_pending()
+        .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
         .await
         .unwrap()
         .unwrap();
@@ -387,7 +530,10 @@ async fn maintenance_rejects_corrupt_redundant_inline_anchor() {
         .unwrap();
     let worker = ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone()).unwrap();
     assert!(
-        worker.consolidate_pending().await.is_err(),
+        worker
+            .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
+            .await
+            .is_err(),
         "maintenance must verify every owning source state"
     );
     assert_eq!(
@@ -449,7 +595,11 @@ async fn convergent_state_preserves_distinct_history_and_equivalent_layouts_pres
             .unwrap()
             .with_test_segment_sizing(rows, target)
             .unwrap();
-        worker.consolidate_pending().await.unwrap().unwrap();
+        worker
+            .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
+            .await
+            .unwrap()
+            .unwrap();
         let after = manifest(&store).await;
         assert_eq!(before.history_root, after.history_root);
         assert_eq!(before.state_checksum_sha256, after.state_checksum_sha256);
@@ -495,7 +645,7 @@ async fn forged_equivalence_and_checkpoint_layout_evidence_is_rejected() {
     let source = manifest(&store).await;
     ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone())
         .unwrap()
-        .consolidate_pending()
+        .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
         .await
         .unwrap()
         .unwrap();

@@ -41,7 +41,9 @@ pub use control_mvp::{
     ControlMvpGcCandidate, ControlMvpGcOutcome, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
     ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
     ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
-    ControlMvpStateStore, ControlMvpTxn, control_mvp_outbox_event_id,
+    ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding, DurableMaintenanceWorker,
+    MaintenanceJobId, MaintenanceProgress, MaintenanceStatus, PreparedMaintenance,
+    control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

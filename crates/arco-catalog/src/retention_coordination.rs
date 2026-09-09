@@ -73,6 +73,8 @@ pub enum RetentionMutationKind {
     CatalogGc,
     /// Control authority GC with a generation fence and exact-version revalidation.
     ControlGc,
+    /// Activation of a descriptor-identified internal maintenance retention root.
+    MaintenanceRootPublish,
     /// A reconciler repair pass deleting orphaned or superseded artifacts
     /// (reclamation only).
     CatalogRepair,
@@ -190,13 +192,60 @@ impl RetentionMutationEpoch {
         operation_kind: RetentionMutationKind,
         operation_id: impl Into<String>,
     ) -> Result<Self> {
+        Self::claim_inner(
+            storage,
+            guard,
+            operation_kind,
+            operation_id.into(),
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Replays only an independently authenticated, immutable maintenance-root
+    /// operation. Replacing the epoch fences the old holder's delayed settlement;
+    /// every delayed root PUT still has identical bytes and an immutable condition.
+    pub(crate) async fn claim_maintenance_root(
+        storage: ScopedStorage,
+        guard: &mut LockGuard<ScopedStorage>,
+        job_id: &str,
+        execution_admission: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Self> {
+        Self::claim_inner(
+            storage,
+            guard,
+            RetentionMutationKind::MaintenanceRootPublish,
+            job_id.into(),
+            true,
+            execution_admission,
+        )
+        .await
+    }
+
+    async fn claim_inner(
+        storage: ScopedStorage,
+        guard: &mut LockGuard<ScopedStorage>,
+        operation_kind: RetentionMutationKind,
+        operation_id: String,
+        replay_maintenance_root: bool,
+        execution_admission: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    ) -> Result<Self> {
+        let mut original_submission = None;
         let (epoch, precondition) = match storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? {
             None => (1, WritePrecondition::DoesNotExist),
             Some(meta) => {
                 let previous_bytes = storage.get_raw(RETENTION_MUTATION_EPOCH_PATH).await?;
                 let previous = decode_record(&previous_bytes)?;
                 let mut observed_version = meta.version;
-                if previous.state == RetentionMutationState::InFlight {
+                let identical_root = replay_maintenance_root
+                    && operation_kind == RetentionMutationKind::MaintenanceRootPublish
+                    && previous.operation_kind == operation_kind
+                    && previous.operation_id == operation_id;
+                if identical_root && previous.state == RetentionMutationState::InFlight {
+                    original_submission = Some(previous.started_at);
+                }
+                if previous.state == RetentionMutationState::InFlight && !identical_root {
                     match adopt_stale_reclamation_epoch(
                         &storage,
                         guard,
@@ -225,13 +274,25 @@ impl RetentionMutationEpoch {
                 (epoch, WritePrecondition::MatchesVersion(observed_version))
             }
         };
-        let record = RetentionMutationEpochRecord::in_flight(
+        let mut record = RetentionMutationEpochRecord::in_flight(
             epoch,
             guard.holder_id(),
             operation_kind,
             operation_id,
         )?;
+        // New maintenance claims use the same effective clock as worker admission.
+        // Repeated exact repair retains proof of the original submission.
+        let admission =
+            execution_admission.map(|(now, deadline)| (now.max(record.started_at), deadline));
+        if let Some(started_at) = original_submission.or_else(|| admission.map(|(now, _)| now)) {
+            record.started_at = started_at;
+        }
         let bytes = encode_record(&record)?;
+        if admission.is_some_and(|(now, deadline)| now.max(Utc::now()) >= deadline) {
+            return Err(CatalogError::PreconditionFailed {
+                message: "maintenance execution expired before root submission".into(),
+            });
+        }
 
         let claimed_version = match storage
             .put_raw(
@@ -368,6 +429,33 @@ impl RetentionMutationEpoch {
         Err(CatalogError::CasFailed {
             message: "retention mutation epoch was unstable during terminal precheck".to_string(),
         })
+    }
+
+    /// Authenticates the original activation submission before permitting exact
+    /// repair after expiry. Call while holding retention coordination.
+    pub(crate) async fn maintenance_root_submitted_before(
+        storage: &ScopedStorage,
+        job_id: &str,
+        created_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(before) = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? else {
+            return Ok(false);
+        };
+        let bytes = storage.get_raw(RETENTION_MUTATION_EPOCH_PATH).await?;
+        let after = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await?;
+        if after.as_ref().map(|meta| &meta.version) != Some(&before.version) {
+            return Err(CatalogError::CasFailed {
+                message: "retention epoch changed during maintenance submission authentication"
+                    .into(),
+            });
+        }
+        let record = decode_record(&bytes)?;
+        Ok(record.state == RetentionMutationState::InFlight
+            && record.operation_kind == RetentionMutationKind::MaintenanceRootPublish
+            && record.operation_id == job_id
+            && record.started_at >= created_at
+            && record.started_at < expires_at)
     }
 
     /// Settles a previously uncertain epoch only after its owning workflow has

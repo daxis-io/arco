@@ -8,6 +8,8 @@
 
 **Related documents:**
 
+- [Gate 5 maintenance qualification](../reports/2026-09-09-gate5-maintenance-qualification.md)
+
 - [Olympia-Inspired Arco Strategy](2026-06-20-olympia-inspired-arco-strategy.md)
 - [Arco Tier-1 Control Store Strategy](2026-06-25-arco-tier1-control-store-strategy.md)
 
@@ -117,7 +119,7 @@ and segment-backpressure limits. Removing synchronous Parquet publication from
 the success path does not promise unlimited writes while internal maintenance
 is stalled.
 
-The [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries)
+The [state-store vNext qualification report](../reports/2026-09-09-gate5-maintenance-qualification.md)
 separates the implementation gates. The [Gate 2 block format contract](state-store-block-format-v1.md)
 specifies authenticated root witnesses, bounded directories, independent IPC
 blocks and selective readers; its [local evidence](../reports/2026-09-06-gate2-closeout.md)
@@ -129,6 +131,20 @@ Gates 2 and 3 adapt the existing eager transaction and maintenance paths. Gate 4
 introduces lazy transactions; Gate 5 makes maintenance incremental, durable and
 resumable. Gates 6 and 7 cover caches and provider qualification. None of these
 local implementation gates authorizes migration or production cutover.
+
+The Gate 5 candidate binds durable jobs to an independently configured authority
+and an externally supplied descriptor digest. Immutable plans and receipt chains
+support one-shard advances and completed-output reuse across compatible descendants.
+Execution expires 24 hours after creation; retention ends after eight days. Recovery
+requires fresh time admission under retention coordination unless authenticated
+prior submission permits exact repair with the original bytes and deadlines.
+New activation epochs record the admitted effective clock, preserving recoverability
+for supplied logical clocks without allowing stale time to bypass wall-clock expiry.
+Publication validates full current-state equivalence before one fenced HEAD CAS.
+Generic catalog GC validates and discards one maintenance closure at a time;
+dedicated control GC streams protection over its bounded candidate page. The
+[qualification report](../reports/2026-09-09-gate5-maintenance-qualification.md) records
+the retained bounds, passing local verification and independent audit.
 
 ---
 

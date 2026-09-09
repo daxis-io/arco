@@ -4,6 +4,53 @@
 #[path = "../benches/support/control_cost.rs"]
 mod control_cost;
 
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn eager_maintenance_fixtures_validate_binary_keys_and_outbox() {
+    Box::pin(control_cost::eager_fixture_smoke()).await;
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "explicit selected disabled-filter source baseline"]
+async fn eager_maintenance_disabled_source_baseline() {
+    let report = Box::pin(control_cost::eager_disabled_source()).await;
+    if let Ok(path) = std::env::var("ARCO_EAGER_DISABLED_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "explicit Gate 5 eager baseline matrix"]
+async fn eager_maintenance_baseline() {
+    let report = Box::pin(control_cost::run_eager_matrix()).await;
+    assert_eq!(report["samples"].as_array().unwrap().len(), 86);
+    if let Ok(path) = std::env::var("ARCO_EAGER_MAINTENANCE_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "explicit Gate 5 eager interruption baseline"]
+async fn eager_maintenance_schedule_baseline() {
+    let report = Box::pin(control_cost::run_eager_schedules()).await;
+    assert_eq!(report["samples"].as_array().unwrap().len(), 8);
+    if let Ok(path) = std::env::var("ARCO_EAGER_SCHEDULE_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn operation_cost_smoke_executes_and_validates_historical_contents() {
     assert!(
@@ -52,7 +99,7 @@ async fn operation_cost_smoke_executes_and_validates_historical_contents() {
         .iter()
         .find(|operation| operation.phase == "gc")
         .expect("gc");
-    assert_eq!(gc.backend.delete_attempts, 1);
+    assert!(gc.backend.delete_attempts >= 1);
     assert!(gc.backend.list_page_attempts > 0);
     let commit = report
         .operations
@@ -131,4 +178,77 @@ async fn lazy_transaction_scaling_acceptance() {
         std::fs::write(path, serde_json::to_vec_pretty(&report).expect("report"))
             .expect("write report");
     }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn durable_maintenance_fixtures_obey_frozen_cost_bounds() {
+    Box::pin(control_cost::durable_fixture_smoke()).await;
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "full Gate 5 durable scaling acceptance"]
+async fn durable_maintenance_scaling_acceptance() {
+    let report = Box::pin(control_cost::run_durable_matrix()).await;
+    if let Ok(path) = std::env::var("ARCO_MAINTENANCE_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert_eq!(report["samples"].as_array().unwrap().len(), 86);
+    assert!(
+        report["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|sample| sample["measured"]["violations"]
+                .as_array()
+                .unwrap()
+                .is_empty()),
+        "frozen acceptance violations: {report}"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "Gate 5 durable resume, interruption and reuse acceptance"]
+async fn durable_maintenance_resume_acceptance() {
+    let report = Box::pin(control_cost::run_durable_schedules()).await;
+    if let Ok(path) = std::env::var("ARCO_MAINTENANCE_RESUME_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert_eq!(report["samples"].as_array().unwrap().len(), 15);
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+#[ignore = "Gate 5 measured abandonment, invalidation and expired GC lifecycle"]
+async fn durable_maintenance_lifecycle_acceptance() {
+    let report = Box::pin(control_cost::run_durable_lifecycle()).await;
+    if let Ok(path) = std::env::var("ARCO_MAINTENANCE_LIFECYCLE_REPORT") {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+        std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 3);
+    for name in [
+        "active_abandon",
+        "reclamation_invalidation",
+        "expired_collection",
+    ] {
+        assert!(samples.iter().any(|sample| sample["schedule"] == name));
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn durable_maintenance_job_capacity_rejects_before_any_put() {
+    Box::pin(control_cost::durable_plan_capacity_rejects_without_puts()).await;
 }

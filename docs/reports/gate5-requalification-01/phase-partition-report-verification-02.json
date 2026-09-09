@@ -1,0 +1,26 @@
+{
+  "source_manifest_sha256": "2a3c4e9c32ab02f616810c0bb07d448ac1d34dccd45570a37be601f6fd9d537e",
+  "reports": [
+    {
+      "report": "docs/reports/2026-09-08-gate5-maintenance-scaling-requalification-02.json",
+      "sha256": "6278e98238f3d41d2daea7ccecca56f4ef14fe157e736468c45b8624782b3b14",
+      "parent_records_checked": 2194,
+      "integer_partitions_checked": 72402,
+      "all_exact": true
+    },
+    {
+      "report": "docs/reports/2026-09-08-gate5-maintenance-resume-requalification-02.json",
+      "sha256": "be049ad1f97046ad4efb4321d6a66eaaf3f11d773271712d55483490e76937fa",
+      "parent_records_checked": 178,
+      "integer_partitions_checked": 5874,
+      "all_exact": true
+    },
+    {
+      "report": "docs/reports/2026-09-08-gate5-maintenance-lifecycle-requalification-02.json",
+      "sha256": "cc47301e50119ab3032a2158516d94ef747b00ed47a2b0195c54ba07d1680d18",
+      "parent_records_checked": 23,
+      "integer_partitions_checked": 759,
+      "all_exact": true
+    }
+  ]
+}

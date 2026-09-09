@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::ops::Range;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -22,6 +22,20 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
+
+#[path = "durable_maintenance.rs"]
+mod durable_maintenance;
+#[cfg(feature = "test-utils")]
+#[path = "maintenance_cost.rs"]
+#[allow(dead_code)] // Shared benchmark module; acceptance tests call these entry points.
+mod maintenance_cost;
+#[cfg(feature = "test-utils")]
+#[allow(unused_imports)] // The benchmark and acceptance test use different entry points.
+pub use maintenance_cost::{
+    durable_fixture_smoke, durable_plan_capacity_rejects_without_puts, eager_disabled_source,
+    eager_fixture_smoke, run_durable_lifecycle, run_durable_matrix, run_durable_schedules,
+    run_eager_matrix, run_eager_schedules,
+};
 
 #[derive(Clone, Copy, Serialize)]
 pub struct Profile {
@@ -48,10 +62,15 @@ impl Profile {
 pub struct BackendCounts {
     pub phases: BTreeMap<String, BackendCounts>,
     pub replayed_rows: u64,
+    pub maintenance_render_rows: u64,
     pub full_checksum_calls: u64,
     pub full_checksum_bytes: u64,
     pub digest_validation_hash_calls: u64,
     pub digest_validation_hash_bytes: u64,
+    pub retention_hash_calls: u64,
+    pub retention_hash_bytes: u64,
+    pub bloom_hash_calls: u64,
+    pub bloom_hash_bytes: u64,
     pub witness_hash_calls: u64,
     pub witness_hash_bytes: u64,
     pub sha256_helper_calls: u64,
@@ -63,6 +82,7 @@ pub struct BackendCounts {
     pub rendered_transaction_validation_calls: u64,
     pub rendered_transaction_validation_bytes: u64,
     pub object_reads: BTreeMap<String, ObjectReadCounts>,
+    pub object_writes: BTreeMap<String, u64>,
     pub requested_ranges: BTreeMap<String, u64>,
     pub logical_storage_calls: u64,
     pub get_attempts: u64,
@@ -116,10 +136,15 @@ impl BackendCounts {
 
     fn add(&mut self, other: &Self) {
         self.replayed_rows += other.replayed_rows;
+        self.maintenance_render_rows += other.maintenance_render_rows;
         self.full_checksum_calls += other.full_checksum_calls;
         self.full_checksum_bytes += other.full_checksum_bytes;
         self.digest_validation_hash_calls += other.digest_validation_hash_calls;
         self.digest_validation_hash_bytes += other.digest_validation_hash_bytes;
+        self.retention_hash_calls += other.retention_hash_calls;
+        self.retention_hash_bytes += other.retention_hash_bytes;
+        self.bloom_hash_calls += other.bloom_hash_calls;
+        self.bloom_hash_bytes += other.bloom_hash_bytes;
         self.witness_hash_calls += other.witness_hash_calls;
         self.witness_hash_bytes += other.witness_hash_bytes;
         for (name, phase) in &other.phases {
@@ -139,6 +164,9 @@ impl BackendCounts {
             entry.ranges += read.ranges;
             entry.returned_bytes += read.returned_bytes;
             entry.failures += read.failures;
+        }
+        for (path, bytes) in &other.object_writes {
+            *self.object_writes.entry(path.clone()).or_default() += bytes;
         }
         for (range, count) in &other.requested_ranges {
             *self.requested_ranges.entry(range.clone()).or_default() += count;
@@ -163,7 +191,14 @@ struct CountingBackend {
     inner: MemoryBackend,
     counts: Mutex<BackendCounts>,
     get_repetitions: usize,
+    #[cfg(feature = "test-utils")]
+    selected_read_repetitions: AtomicUsize,
     lose_head_response: AtomicBool,
+    pause_l1: AtomicBool,
+    pause_publication_manifest: AtomicBool,
+    l1_entered: tokio::sync::Notify,
+    l1_release: tokio::sync::Notify,
+    fail_put_countdown: AtomicUsize,
 }
 
 impl CountingBackend {
@@ -172,14 +207,21 @@ impl CountingBackend {
             inner: MemoryBackend::new(),
             counts: Mutex::new(BackendCounts::default()),
             get_repetitions,
+            #[cfg(feature = "test-utils")]
+            selected_read_repetitions: AtomicUsize::new(1),
             lose_head_response: AtomicBool::new(false),
+            pause_l1: AtomicBool::new(false),
+            pause_publication_manifest: AtomicBool::new(false),
+            l1_entered: tokio::sync::Notify::new(),
+            l1_release: tokio::sync::Notify::new(),
+            fail_put_countdown: AtomicUsize::new(0),
         }
     }
     fn count(&self, update: impl Fn(&mut BackendCounts)) {
         let mut counts = self.counts.lock().unwrap();
         update(&mut counts);
         #[cfg(feature = "test-utils")]
-        if ControlMvpStateStore::test_cost_phase() != "request" {
+        {
             update(
                 counts
                     .phases
@@ -199,10 +241,15 @@ impl CountingBackend {
                 result.digest_validation_hash_calls += work[13];
                 result.digest_validation_hash_bytes += work[14];
                 result.replayed_rows += work[8];
+                result.maintenance_render_rows += work[19];
                 result.full_checksum_calls += work[9];
+                result.retention_hash_calls += work[17];
+                result.retention_hash_bytes += work[18];
+                result.bloom_hash_calls += work[15];
+                result.bloom_hash_bytes += work[16];
                 result.witness_hash_calls += work[10];
                 result.witness_hash_bytes += work[11];
-                if name != "request" {
+                {
                     let phase = result.phases.entry(name.to_string()).or_default();
                     phase.sha256_helper_calls = work[0];
                     phase.sha256_helper_bytes = work[1];
@@ -216,7 +263,12 @@ impl CountingBackend {
                     phase.digest_validation_hash_calls = work[13];
                     phase.digest_validation_hash_bytes = work[14];
                     phase.replayed_rows = work[8];
+                    phase.maintenance_render_rows = work[19];
                     phase.full_checksum_calls = work[9];
+                    phase.retention_hash_calls = work[17];
+                    phase.retention_hash_bytes = work[18];
+                    phase.bloom_hash_calls = work[15];
+                    phase.bloom_hash_bytes = work[16];
                     phase.witness_hash_calls = work[10];
                     phase.witness_hash_bytes = work[11];
                 }
@@ -269,26 +321,35 @@ impl StorageBackend for CountingBackend {
         result
     }
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
-        self.count(|count| {
-            count.logical_storage_calls += 1;
-            count.range_get_attempts += 1;
-        });
-        let range_key = format!("{}:{}:{}", object_class(path), range.start, range.end);
-        let result = self.inner.get_range(path, range).await;
-        self.count(|count| {
-            *count.requested_ranges.entry(range_key.clone()).or_default() += 1;
-            let read = count
-                .object_reads
-                .entry(object_class(path).to_string())
-                .or_default();
-            read.ranges += 1;
-            match &result {
-                Ok(bytes) => read.returned_bytes += bytes.len() as u64,
-                Err(_) => read.failures += 1,
+        self.count(|count| count.logical_storage_calls += 1);
+        let repetitions = 1;
+        #[cfg(feature = "test-utils")]
+        let repetitions =
+            if ControlMvpStateStore::test_cost_phase() == "maintenance-selected-data-reads" {
+                self.selected_read_repetitions.load(Ordering::SeqCst)
+            } else {
+                repetitions
+            };
+        let range_key = format!("{path}:{}:{}", range.start, range.end);
+        let mut result = Err(arco_core::Error::storage("range probe has no repetitions"));
+        for _ in 0..repetitions {
+            self.count(|count| count.range_get_attempts += 1);
+            result = self.inner.get_range(path, range.clone()).await;
+            self.count(|count| {
+                *count.requested_ranges.entry(range_key.clone()).or_default() += 1;
+                let read = count
+                    .object_reads
+                    .entry(object_class(path).to_string())
+                    .or_default();
+                read.ranges += 1;
+                match &result {
+                    Ok(bytes) => read.returned_bytes += bytes.len() as u64,
+                    Err(_) => read.failures += 1,
+                }
+            });
+            if let Ok(bytes) = &result {
+                self.count(|count| count.read_bytes += u64::try_from(bytes.len()).unwrap());
             }
-        });
-        if let Ok(bytes) = &result {
-            self.count(|count| count.read_bytes += u64::try_from(bytes.len()).unwrap());
         }
         result
     }
@@ -298,17 +359,38 @@ impl StorageBackend for CountingBackend {
         bytes: Bytes,
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
+        if (path.contains("/segments/l1/") && self.pause_l1.swap(false, Ordering::SeqCst))
+            || (path.contains("/manifests/maintenance-")
+                && self
+                    .pause_publication_manifest
+                    .swap(false, Ordering::SeqCst))
+        {
+            self.l1_entered.notify_one();
+            self.l1_release.notified().await;
+        }
         let head = path.ends_with("/head/current.json");
         self.count(|count| {
             count.logical_storage_calls += 1;
             count.put_attempts += 1;
             count.write_attempt_bytes += u64::try_from(bytes.len()).unwrap();
+            *count.object_writes.entry(path.to_string()).or_default() += bytes.len() as u64;
             if head {
                 count.head_cas_attempts += 1;
             } else if matches!(precondition, WritePrecondition::DoesNotExist) {
                 count.immutable_write_attempt_bytes += u64::try_from(bytes.len()).unwrap();
             }
         });
+        if self
+            .fail_put_countdown
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok_and(|left| left == 1)
+        {
+            return Err(arco_core::Error::storage(
+                "injected pre-application PUT interruption",
+            ));
+        }
         let result = self.inner.put(path, bytes, precondition).await?;
         if matches!(result, WriteResult::PreconditionFailed { .. }) {
             self.count(|count| count.precondition_failures += 1);
@@ -542,7 +624,7 @@ async fn read_contents(reader: &dyn ArcoStateReader) -> Contents {
 async fn maintain(
     recorder: &mut Recorder,
     backend: &CountingBackend,
-    worker: &ControlMvpMaintenanceWorker,
+    worker: &arco_catalog::DurableMaintenanceWorker,
     contents: &Contents,
 ) {
     recorder
@@ -555,8 +637,7 @@ async fn maintain(
                 .sum(),
             false,
             async {
-                worker
-                    .consolidate_pending()
+                durable_maintenance::consolidate_pending(worker)
                     .await
                     .unwrap()
                     .expect("maintenance threshold reached");
@@ -601,7 +682,7 @@ async fn setup_and_reads(
     recorder: &mut Recorder,
     backend: &CountingBackend,
     state: &ControlMvpStateStore,
-    worker: &ControlMvpMaintenanceWorker,
+    worker: &arco_catalog::DurableMaintenanceWorker,
     expected: &mut Contents,
     history: &mut Vec<(StateToken, Contents)>,
     pending: &mut usize,
@@ -671,6 +752,12 @@ pub async fn run(profile: Profile) -> CostReport {
     let backend = Arc::new(CountingBackend::new(1));
     let state = store(backend.clone());
     let worker = ControlMvpMaintenanceWorker::new(scoped(backend.clone()), scope()).unwrap();
+    let durable_worker = arco_catalog::DurableMaintenanceWorker::new(
+        scoped(backend.clone()),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+    )
+    .unwrap();
     let mut recorder = Recorder::default();
     let mut expected = Contents::new();
     let mut history = Vec::new();
@@ -681,7 +768,7 @@ pub async fn run(profile: Profile) -> CostReport {
         &mut recorder,
         &backend,
         &state,
-        &worker,
+        &durable_worker,
         &mut expected,
         &mut history,
         &mut pending,
@@ -749,7 +836,7 @@ pub async fn run(profile: Profile) -> CostReport {
     expected.insert(key.to_vec(), Bytes::from_static(b"retried"));
     pending += 2;
     if pending >= 16 {
-        maintain(&mut recorder, &backend, &worker, &expected).await;
+        maintain(&mut recorder, &backend, &durable_worker, &expected).await;
         pending = 0;
     }
 
@@ -787,7 +874,7 @@ pub async fn run(profile: Profile) -> CostReport {
             .unwrap();
         pending += 1;
     }
-    maintain(&mut recorder, &backend, &worker, &expected).await;
+    maintain(&mut recorder, &backend, &durable_worker, &expected).await;
     verify_history(&mut recorder, &backend, &state, &history).await;
 
     verify_retention_and_recovery(
@@ -925,7 +1012,14 @@ async fn verify_retention_and_recovery(
                     break;
                 }
             }
-            assert_eq!(deleted, 1);
+            assert!(deleted >= 1);
+            assert!(
+                scoped(backend.clone())
+                    .head(&orphan)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         })
         .await;
     verify_history(recorder, backend, state, history).await;
@@ -993,13 +1087,17 @@ async fn scaling_fixture(
         }
         tx.commit().await.unwrap();
     }
-    let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope)
-        .unwrap()
-        .with_test_segment_sizing(rows.div_ceil(segments), target)
-        .unwrap();
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope,
+        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+    )
+    .unwrap()
+    .with_test_segment_sizing(rows.div_ceil(segments), target)
+    .unwrap();
     backend.take();
     let (maintenance, maintenance_allocations) =
-        measure_allocations(worker.consolidate_pending()).await;
+        measure_allocations(Box::pin(durable_maintenance::consolidate_pending(&worker))).await;
     maintenance.unwrap().unwrap();
     let maintenance_cost = backend.take();
     for _ in 0..suffix {

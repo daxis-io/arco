@@ -122,11 +122,18 @@ use crate::workspace_snapshot::{
 };
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
-mod cost;
+pub(crate) mod cost;
+#[cfg(feature = "test-utils")]
+mod eager_reference;
 mod integrity;
 mod lazy;
+pub(crate) mod maintenance;
 use integrity::{CheckpointValidation, HistoryAnchor, HistoryLink, RewriteEquivalence};
 use lazy::{TransactionBase, TransactionReads};
+pub use maintenance::{
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
+    MaintenanceStatus, PreparedMaintenance,
+};
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 6;
 const RESTORE_PLAN_VERSION_V5: u32 = 5;
@@ -290,7 +297,7 @@ impl ControlMvpStateStore {
     ///
     /// # Errors
     /// Returns validation errors for values outside production reader caps.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_test_segment_sizing(mut self, l1_rows: usize, block_target: usize) -> Result<Self> {
         if l1_rows == 0
             || l1_rows > MAX_SEGMENT_ROWS / 2
@@ -668,6 +675,17 @@ impl ControlMvpStateStore {
     async fn replay_manifest(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
         let mut state = self.load_state_snapshots(&manifest.base_states).await?;
         state.history_root.clone_from(&manifest.history_anchor.root);
+        if let Some(render) = manifest
+            .equivalence
+            .as_ref()
+            .and_then(|e| e.render_source.as_ref())
+            && (state.logical_sequence != render.logical_sequence
+                || state.checksum()? != render.state_checksum_sha256)
+        {
+            return Err(invariant_violation(
+                "materialized rewrite differs from its render cut",
+            ));
+        }
         for tx_ref in &manifest.tx_refs {
             let tx = self.load_tx(tx_ref).await?;
             state.apply_tx(&tx)?;
@@ -742,37 +760,41 @@ impl ControlMvpStateStore {
         &self,
         reference: &ControlMvpSegmentRef,
     ) -> Result<(Bytes, ControlMvpSegmentIndex)> {
-        if reference.index_size_bytes == 0
-            || reference.index_size_bytes > MAX_SEGMENT_INDEX_BYTES as u64
-        {
-            return Err(invariant_violation("invalid declared directory length"));
-        }
-        let probe_end = reference
-            .index_size_bytes
-            .checked_add(1)
-            .ok_or_else(|| invariant_violation("index probe overflow"))?;
-        let index_bytes = self
-            .storage
-            .get_range(
-                &self.paths.segment_index(&reference.segment_id),
-                0..probe_end,
-            )
-            .await?;
-        if index_bytes.len() as u64 != reference.index_size_bytes {
-            return Err(invariant_violation(
-                "directory length differs from owning reference",
-            ));
-        }
-        validate_raw_checksum(
-            &index_bytes,
-            Some(&reference.index_checksum_sha256),
-            "control MVP segment index reference checksum",
-        )?;
-        validate_version_header(&index_bytes, SEGMENT_FORMAT_VERSION, "segment directory")?;
-        let index: ControlMvpSegmentIndex = decode_json(&index_bytes, "control MVP segment index")?;
-        validate_segment_index_identity(&index, reference, &self.scope)?;
-        validate_segment_index_key_metadata(&index)?;
-        Ok((index_bytes, index))
+        cost::selection_read("maintenance-source-metadata", async {
+            if reference.index_size_bytes == 0
+                || reference.index_size_bytes > MAX_SEGMENT_INDEX_BYTES as u64
+            {
+                return Err(invariant_violation("invalid declared directory length"));
+            }
+            let probe_end = reference
+                .index_size_bytes
+                .checked_add(1)
+                .ok_or_else(|| invariant_violation("index probe overflow"))?;
+            let index_bytes = self
+                .storage
+                .get_range(
+                    &self.paths.segment_index(&reference.segment_id),
+                    0..probe_end,
+                )
+                .await?;
+            if index_bytes.len() as u64 != reference.index_size_bytes {
+                return Err(invariant_violation(
+                    "directory length differs from owning reference",
+                ));
+            }
+            validate_raw_checksum(
+                &index_bytes,
+                Some(&reference.index_checksum_sha256),
+                "control MVP segment index reference checksum",
+            )?;
+            validate_version_header(&index_bytes, SEGMENT_FORMAT_VERSION, "segment directory")?;
+            let index: ControlMvpSegmentIndex =
+                decode_json(&index_bytes, "control MVP segment index")?;
+            validate_segment_index_identity(&index, reference, &self.scope)?;
+            validate_segment_index_key_metadata(&index)?;
+            Ok((index_bytes, index))
+        })
+        .await
     }
 
     async fn load_l1_indexes(
@@ -822,32 +844,35 @@ impl ControlMvpStateStore {
         reference: &ControlMvpSegmentRef,
         block: &ControlMvpBlock,
     ) -> Result<Vec<ControlMvpSegmentRow>> {
-        let path = match reference.level {
-            ControlMvpSegmentLevel::L0 => self.paths.l0_segment_object(&reference.segment_id),
-            ControlMvpSegmentLevel::L1 => self.paths.state_object(&reference.segment_id),
-        };
-        let end = block
-            .offset
-            .checked_add(block.length)
-            .ok_or_else(|| invariant_violation("block range overflow"))?;
-        let bytes = self.storage.get_range(&path, block.offset..end).await?;
-        let rows = decode_block_rows(&bytes, block)?;
-        for row in &rows {
-            if row.logical_sequence != reference.logical_sequence {
-                return Err(invariant_violation("block sequence mismatch"));
+        cost::selection_read("maintenance-selected-data-reads", async {
+            let path = match reference.level {
+                ControlMvpSegmentLevel::L0 => self.paths.l0_segment_object(&reference.segment_id),
+                ControlMvpSegmentLevel::L1 => self.paths.state_object(&reference.segment_id),
+            };
+            let end = block
+                .offset
+                .checked_add(block.length)
+                .ok_or_else(|| invariant_violation("block range overflow"))?;
+            let bytes = self.storage.get_range(&path, block.offset..end).await?;
+            let rows = decode_block_rows(&bytes, block)?;
+            for row in &rows {
+                if row.logical_sequence != reference.logical_sequence {
+                    return Err(invariant_violation("block sequence mismatch"));
+                }
+                if row.record_kind == SEGMENT_RECORD_KV
+                    && (row.generation == 0
+                        || row.generation > reference.logical_sequence
+                        || (reference.level == ControlMvpSegmentLevel::L0
+                            && row.generation != reference.logical_sequence)
+                        || row.tombstone != row.value.is_none()
+                        || row.origin_sequence.is_some())
+                {
+                    return Err(invariant_violation("invalid selected KV row"));
+                }
             }
-            if row.record_kind == SEGMENT_RECORD_KV
-                && (row.generation == 0
-                    || row.generation > reference.logical_sequence
-                    || (reference.level == ControlMvpSegmentLevel::L0
-                        && row.generation != reference.logical_sequence)
-                    || row.tombstone != row.value.is_none()
-                    || row.origin_sequence.is_some())
-            {
-                return Err(invariant_violation("invalid selected KV row"));
-            }
-        }
-        Ok(rows)
+            Ok(rows)
+        })
+        .await
     }
 
     async fn indexed_point(
@@ -1654,6 +1679,7 @@ impl ControlMvpStateStore {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn resolve_ancestor_bounded<T>(
         &self,
         id: &str,
@@ -1746,10 +1772,14 @@ impl ControlMvpStateStore {
                 layout: manifest.layout_generation,
                 checksum: manifest.state_checksum_sha256,
                 predecessor_digest,
-                parent_history_root: manifest.tx_refs.last().map_or_else(
-                    || manifest.history_root.clone(),
-                    |tx| tx.history.preceding_root.clone(),
-                ),
+                parent_history_root: manifest
+                    .tx_refs
+                    .last()
+                    .filter(|_| manifest.equivalence.is_none())
+                    .map_or_else(
+                        || manifest.history_root.clone(),
+                        |tx| tx.history.preceding_root.clone(),
+                    ),
                 equivalence: manifest.equivalence,
             });
             next = manifest
@@ -2331,6 +2361,13 @@ fn layout_maintenance_intent_for_manifest(
 /// API request code receives [`ControlMvpStateStore`], not this type. Operators
 /// construct the worker explicitly so consolidation has an independently
 /// auditable identity and never becomes an implicit mutation fallback.
+///
+/// ```compile_fail
+/// use arco_catalog::{ControlMvpMaintenanceWorker, DurableAuthorityBinding};
+/// fn fixture(worker: &ControlMvpMaintenanceWorker) {
+///     let _ = worker.test_consolidate_pending(DurableAuthorityBinding::new([17; 32]));
+/// }
+/// ```
 pub struct ControlMvpMaintenanceWorker {
     store: ControlMvpStateStore,
     lifecycle: ScopedStorage,
@@ -2453,7 +2490,7 @@ impl ControlMvpMaintenanceWorker {
     ///
     /// # Errors
     /// Returns validation errors for sizing outside production reader caps.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_test_segment_sizing(mut self, rows: usize, target: usize) -> Result<Self> {
         self.store = self.store.with_test_segment_sizing(rows, target)?;
         Ok(self)
@@ -2691,6 +2728,11 @@ impl ControlMvpMaintenanceWorker {
         additional_protected_paths: impl IntoIterator<Item = String>,
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcPlan> {
+        if let Some(cursor) = continuation {
+            if let Some(plan) = maintenance::expired_pin_page(self, now, cursor).await? {
+                return Ok(plan);
+            }
+        }
         let base_prefix = format!("{}/", self.store.paths.base_prefix());
         let mut protected = BTreeSet::new();
         for path in additional_protected_paths {
@@ -2707,7 +2749,10 @@ impl ControlMvpMaintenanceWorker {
             .lifecycle
             .list_page_meta(&base_prefix, continuation, CONTROL_MVP_GC_PAGE_SIZE)
             .await?;
-        let next_continuation = inventory_page.next_start_after.clone();
+        let next_continuation = inventory_page
+            .next_start_after
+            .clone()
+            .or_else(|| Some(maintenance::pin_gc_cursor().to_string()));
 
         let Some(head) = self
             .lifecycle
@@ -2779,6 +2824,12 @@ impl ControlMvpMaintenanceWorker {
             // not reachable through a domain authority. Preserve their exact
             // paths as well, including records written by older publishers.
             candidates.retain(|candidate| !root.required_paths.contains(&candidate.path));
+            candidates.retain(|candidate| {
+                !root
+                    .protected_prefixes
+                    .iter()
+                    .any(|prefix| candidate.path.starts_with(prefix))
+            });
             for reference in root.authorities {
                 if reference.scope() != &self.store.scope {
                     continue;
@@ -2993,6 +3044,7 @@ impl ControlMvpMaintenanceWorker {
 
     fn is_gc_managed_immutable(base_prefix: &str, path: &str) -> bool {
         [
+            "maintenance/",
             "manifests/",
             "transactions/",
             "segments/l0/",
@@ -3023,182 +3075,18 @@ impl ControlMvpMaintenanceWorker {
         Ok(manifest.maintenance_intent)
     }
 
-    /// Consolidates the currently selected suffix into a checksummed L1 shard set.
-    ///
-    /// Publication uses the exact observed head version. A conflict triggers a
-    /// fresh read and replan; the worker never overwrites a newer logical state.
-    /// The returned token has the same logical sequence as the source token.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed corruption, storage, ambiguity, or repeated-CAS errors.
-    #[allow(clippy::too_many_lines)]
-    pub async fn consolidate_pending(&self) -> Result<Option<ControlMvpMaintenanceOutcome>> {
-        for _attempt in 0..4 {
-            let Some(head) = self
-                .store
-                .storage
-                .head(&self.store.paths.current_pointer())
-                .await?
-            else {
-                return Ok(None);
-            };
-            let pointer = self.store.load_pointer().await?;
-            let source_manifest = self.store.load_manifest_for_pointer(&pointer).await?;
-            let Some(intent) = source_manifest.maintenance_intent.clone() else {
-                return Ok(None);
-            };
-            let source_token = self
-                .store
-                .token(
-                    source_manifest.manifest_id.clone(),
-                    source_manifest.logical_sequence,
-                )
-                .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
-            let state = self.store.replay_for_successor(&source_manifest).await?;
-            let candidate_manifest_id = format!(
-                "manifest-{:020}-layout-{:020}-rg-{:020}-{}",
-                source_manifest.logical_sequence,
-                intent.layout_generation(),
-                pointer.reclamation_generation,
-                Ulid::new().to_string().to_ascii_lowercase()
-            );
-            let rendered = self
-                .store
-                .render_state_snapshots(&state, &candidate_manifest_id)?;
-            let base_states = rendered
-                .iter()
-                .map(|segment| segment.reference.clone())
-                .collect::<Vec<_>>();
-            let mut candidate_manifest = ControlMvpManifest {
-                history_anchor: HistoryAnchor {
-                    sequence: state.logical_sequence,
-                    root: state.history_root.clone(),
-                },
-                history_root: state.history_root.clone(),
-                physical_root: String::new(),
-                equivalence: Some(RewriteEquivalence {
-                    encoding_version: 1,
-                    source_manifest_id: source_manifest.manifest_id.clone(),
-                    source_manifest_sha256: pointer.manifest_checksum_sha256.clone(),
-                    source_history_root: source_manifest.history_root.clone(),
-                    source_physical_root: source_manifest.physical_root.clone(),
-                    logical_sequence: state.logical_sequence,
-                    state_checksum_sha256: state.checksum()?,
-                }),
-                parent_manifest_sha256: Some(pointer.manifest_checksum_sha256.clone()),
-                reclamation_generation: pointer.reclamation_generation,
-                format_version: CONTROL_MVP_FORMAT_VERSION,
-                implementation: IMPLEMENTATION.to_string(),
-                scope: ControlMvpScopeDoc::from(&self.store.scope),
-                manifest_id: candidate_manifest_id.clone(),
-                logical_sequence: source_manifest.logical_sequence,
-                base_manifest_id: Some(source_manifest.manifest_id.clone()),
-                writer_epoch: pointer.writer_epoch,
-                layout_generation: intent.layout_generation(),
-                base_states,
-                anchor_states: Vec::new(),
-                tx_refs: Vec::new(),
-                state_checksum_sha256: source_manifest.state_checksum_sha256.clone(),
-                maintenance_intent: None,
-            };
-            candidate_manifest.physical_root = candidate_manifest.physical_digest()?;
-            candidate_manifest.validate(&self.store.scope, &candidate_manifest_id)?;
-            let manifest_bytes = encode_envelope_limited(
-                "control-mvp-manifest",
-                &candidate_manifest,
-                MAX_CONTROL_JSON_BYTES,
-                "control MVP maintenance manifest",
-            )?;
-            let candidate_pointer = ControlMvpPointer {
-                reclamation_generation: pointer.reclamation_generation,
-                format_version: CONTROL_MVP_FORMAT_VERSION,
-                implementation: IMPLEMENTATION.to_string(),
-                scope: ControlMvpScopeDoc::from(&self.store.scope),
-                manifest_id: candidate_manifest_id.clone(),
-                logical_sequence: source_manifest.logical_sequence,
-                manifest_checksum_sha256: sha256_hex(&manifest_bytes),
-                writer_epoch: pointer.writer_epoch,
-            };
-            let pointer_bytes = encode_json_limited(
-                &candidate_pointer,
-                MAX_HEAD_JSON_BYTES,
-                "control MVP maintenance head",
-            )?;
-
-            for segment in &rendered {
-                put_immutable_matching(
-                    &self.store.storage,
-                    &self.store.paths.state_object(&segment.reference.state_id),
-                    segment.bytes.clone(),
-                    "control MVP maintenance L1 segment already exists with different bytes",
-                )
-                .await?;
-                put_immutable_matching(
-                    &self.store.storage,
-                    &self.store.paths.segment_index(&segment.reference.state_id),
-                    segment.index_bytes.clone(),
-                    "control MVP maintenance L1 index already exists with different bytes",
-                )
-                .await?;
-            }
-            put_immutable_matching(
-                &self.store.storage,
-                &self.store.paths.manifest_object(&candidate_manifest_id),
-                manifest_bytes,
-                "control MVP maintenance manifest already exists with different bytes",
-            )
-            .await?;
-            let publish = self
-                .store
-                .storage
-                .put(
-                    &self.store.paths.current_pointer(),
-                    pointer_bytes.clone(),
-                    AuthorityWritePrecondition::MatchesVersion(head.version),
-                )
-                .await;
-            match publish {
-                Ok(WriteResult::Success { .. }) => {
-                    return Ok(Some(ControlMvpMaintenanceOutcome {
-                        source_token,
-                        selected_token: self
-                            .store
-                            .token(candidate_manifest_id, source_manifest.logical_sequence)
-                            .with_manifest_witness(
-                                candidate_pointer.manifest_checksum_sha256.clone(),
-                            ),
-                        layout_generation: intent.layout_generation(),
-                    }));
-                }
-                Ok(WriteResult::PreconditionFailed { .. }) => {}
-                Err(error) => {
-                    if self
-                        .store
-                        .get_json(&self.store.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
-                        .await
-                        .is_ok_and(|visible| visible == pointer_bytes)
-                    {
-                        return Ok(Some(ControlMvpMaintenanceOutcome {
-                            source_token,
-                            selected_token: self
-                                .store
-                                .token(candidate_manifest_id, source_manifest.logical_sequence)
-                                .with_manifest_witness(
-                                    candidate_pointer.manifest_checksum_sha256.clone(),
-                                ),
-                            layout_generation: intent.layout_generation(),
-                        }));
-                    }
-                    return Err(ambiguous_authority_outcome(format!(
-                        "control MVP maintenance head CAS outcome is unknown: {error}"
-                    )));
-                }
-            }
-        }
-        Err(CatalogError::CasFailed {
-            message: "control MVP maintenance head changed during four replans".to_string(),
-        })
+    #[cfg(test)]
+    async fn test_consolidate_pending(
+        &self,
+        binding: DurableAuthorityBinding,
+    ) -> Result<Option<ControlMvpMaintenanceOutcome>> {
+        let worker = DurableMaintenanceWorker::new(
+            self.lifecycle.clone(),
+            self.store.scope.clone(),
+            binding,
+        )?
+        .with_fixture_store(self.store.clone());
+        Box::pin(fixture_driver::consolidate_pending(&worker)).await
     }
 }
 
@@ -7278,6 +7166,11 @@ fn segment_verifier_options() -> VerifierOptions {
 // SHA-256 always contains 32 bytes; probe positions are reduced to the byte-bounded filter.
 #[allow(clippy::indexing_slicing)]
 fn bloom_positions(key: &[u8], bits: usize) -> impl Iterator<Item = usize> {
+    #[cfg(feature = "test-utils")]
+    {
+        cost::record(15, 1);
+        cost::record(16, key.len());
+    }
     let digest = Sha256::digest(key);
     let mut first = [0; 8];
     first.copy_from_slice(&digest[..8]);
@@ -9250,7 +9143,7 @@ mod tests {
         let planned = source_manifest.tx_refs[0].clone();
         ControlMvpMaintenanceWorker::new(storage, scope)
             .expect("maintenance worker")
-            .consolidate_pending()
+            .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
             .await
             .expect("maintenance")
             .expect("selected layout");
@@ -9642,6 +9535,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_maintenance_recovery_reauthenticates_after_waiting_for_gc() {
+        let backend = PauseCheckpointPutBackend::new();
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        for _ in 0..16 {
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+        let worker = DurableMaintenanceWorker::new(
+            storage.clone(),
+            scope.clone(),
+            DurableAuthorityBinding::new([31; 32]),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let plan = worker.prepare_at(now).await.unwrap().unwrap();
+        worker.start_at(&plan, now).await.unwrap();
+        let pin_paths = storage
+            .list_meta("retention/pins/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|object| object.path.to_string())
+            .collect::<Vec<_>>();
+        assert!(!pin_paths.is_empty());
+        *backend.gate_path.lock().unwrap() = RETENTION_GC_LOCK_PATH.into();
+        let (reached, release) = backend.arm();
+        let expired = now + ChronoDuration::days(9);
+        let id = plan.job_id().clone();
+        let recovery =
+            tokio::spawn(async move { worker.recover_activation_at(&id, expired).await });
+        // The backend pauses the lock PUT after the descriptor and every plan page
+        // have been read, but before recovery owns retention coordination.
+        reached.await.unwrap();
+        let collector = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
+        let mut cursor = None;
+        loop {
+            let page = collector
+                .collect_gc_page_at(expired, Vec::new(), cursor.as_deref())
+                .await
+                .unwrap();
+            cursor = page.continuation().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        for path in &pin_paths {
+            assert!(storage.head_raw(path).await.unwrap().is_none());
+        }
+        let descriptor = format!(
+            "{}/maintenance/{}/descriptor.json",
+            store.paths.base_prefix(),
+            plan.job_id().as_str()
+        );
+        assert!(storage.head_raw(&descriptor).await.unwrap().is_none());
+        release.send(()).unwrap();
+        assert!(recovery.await.unwrap().is_err());
+        for path in &pin_paths {
+            assert!(
+                storage.head_raw(path).await.unwrap().is_none(),
+                "recovery published a pin after GC removed its authenticated plan"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn maintenance_crossing_reclamation_fence_regenerates_outputs() {
         for after in [false, true] {
             let backend = PauseCheckpointPutBackend::new();
@@ -9663,11 +9628,37 @@ mod tests {
             backend.pause_after_put.store(after, Ordering::SeqCst);
             let (reached, release) = backend.arm();
             let worker = ControlMvpMaintenanceWorker::new(storage.clone(), scope.clone()).unwrap();
-            let maintenance = tokio::spawn(async move { worker.consolidate_pending().await });
+            let maintenance = tokio::spawn(async move {
+                worker
+                    .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
+                    .await
+            });
             reached.await.unwrap();
+            let prior_outputs = storage
+                .list_meta(&format!("{}/segments/l1/", store.paths.base_prefix()))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|object| object.path.to_string())
+                .collect::<BTreeSet<_>>();
+            assert!(!prior_outputs.is_empty());
+            // Force an eligible deletion while the maintenance pin is still live.
+            // At 31 days the fixed job evidence is correctly collectible and cannot
+            // authorize an automatic retry of the missing job.
+            storage
+                .put_raw(
+                    &store.paths.state_object("reclamation-fence-orphan"),
+                    Bytes::from_static(b"orphan"),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
             let collector = ControlMvpMaintenanceWorker::new(storage, scope).unwrap();
             collector
-                .collect_gc_at(Utc::now() + ChronoDuration::days(31), Vec::new())
+                .collect_gc_at(
+                    Utc::now() + ChronoDuration::days(7) + ChronoDuration::hours(1),
+                    Vec::new(),
+                )
                 .await
                 .unwrap();
             release.send(()).unwrap();
@@ -9682,12 +9673,9 @@ mod tests {
             assert_eq!(selected.writer_epoch, before.writer_epoch);
             let manifest = store.load_manifest_for_pointer(&selected).await.unwrap();
             assert_eq!(manifest.reclamation_generation, 1);
-            assert!(
-                manifest
-                    .base_states
-                    .iter()
-                    .all(|reference| reference.state_id.contains("rg-00000000000000000001"))
-            );
+            assert!(manifest.base_states.iter().all(|reference| {
+                !prior_outputs.contains(&store.paths.state_object(&reference.state_id))
+            }));
             assert_eq!(store.get(b"key").await.unwrap(), Some(Bytes::from("15")));
         }
     }
@@ -11225,4 +11213,13 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod fixture_driver {
+    use crate as arco_catalog;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/benches/support/durable_maintenance.rs"
+    ));
 }

@@ -474,7 +474,11 @@ async fn maintenance_preserves_pinned_reads_but_consumes_old_cas_attempt() {
     tx.get(&0_u32.to_be_bytes()).await.unwrap();
     let before = store.current_state_token().await.unwrap();
     let worker = ControlMvpMaintenanceWorker::new(storage, store.scope.clone()).unwrap();
-    worker.consolidate_pending().await.unwrap().unwrap();
+    worker
+        .test_consolidate_pending(crate::DurableAuthorityBinding::new([17; 32]))
+        .await
+        .unwrap()
+        .unwrap();
     let after = store.current_state_token().await.unwrap();
     assert_eq!(before.logical_sequence(), after.logical_sequence());
     assert_ne!(

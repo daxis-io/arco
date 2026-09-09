@@ -1254,6 +1254,8 @@ pub enum RetentionTarget {
     Snapshot(String),
     /// An immutable export manifest.
     Export(String),
+    /// An internal maintenance root; it grants GC protection, never retained-cut access.
+    Maintenance(String),
 }
 
 impl RetentionTarget {
@@ -1288,6 +1290,21 @@ impl RetentionTarget {
         match self {
             Self::Snapshot(id) => validate_id(id, "snap_", "snapshot target"),
             Self::Export(id) => validate_id(id, "exp_", "export target"),
+            Self::Maintenance(id) => {
+                let (domain, job) = id
+                    .split_once('/')
+                    .ok_or_else(|| validation("invalid maintenance target"))?;
+                crate::state_store::StateScope::new("maintenance", "maintenance", domain)
+                    .validate()?;
+                if job.len() != 64
+                    || !job
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    return Err(validation("invalid maintenance target"));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1295,7 +1312,7 @@ impl RetentionTarget {
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
-            Self::Snapshot(id) | Self::Export(id) => id,
+            Self::Snapshot(id) | Self::Export(id) | Self::Maintenance(id) => id,
         }
     }
 }
@@ -1454,6 +1471,18 @@ impl RetentionPinRevision {
             return Err(validation("pin revision must be positive"));
         }
         self.target.validate()?;
+        if matches!(self.target, RetentionTarget::Maintenance(_))
+            && (self.revision != 1
+                || self.released_at.is_some()
+                || self
+                    .created_at
+                    .checked_add_signed(chrono::Duration::days(8))
+                    != Some(self.retained_until))
+        {
+            return Err(validation(
+                "maintenance retention is fixed at creation plus eight days",
+            ));
+        }
         if self.retained_until <= self.created_at {
             return Err(validation("pin retained_until must be after created_at"));
         }
@@ -1687,6 +1716,8 @@ fn pin_revision_relative_path(pin_id: &str, revision: u64) -> String {
 }
 
 fn pin_revision_sha256(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    crate::state_store::control_mvp::cost::record_retention_hash(bytes.len());
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))

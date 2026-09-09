@@ -8,7 +8,7 @@ use std::{
 #[cfg(feature = "test-utils")]
 thread_local! {
     static PHASE: Cell<&'static str> = const { Cell::new("request") };
-    static WORK: RefCell<BTreeMap<&'static str,[u64;15]>> = const { RefCell::new(BTreeMap::new()) };
+    static WORK: RefCell<BTreeMap<&'static str,[u64;20]>> = const { RefCell::new(BTreeMap::new()) };
 }
 pub(super) struct PhaseGuard {
     #[cfg(feature = "test-utils")]
@@ -17,6 +17,10 @@ pub(super) struct PhaseGuard {
 impl PhaseGuard {
     pub(super) fn enter(phase: &'static str) -> Self {
         let _ = phase;
+        #[cfg(feature = "test-utils")]
+        WORK.with(|work| {
+            work.borrow_mut().entry(phase).or_default();
+        });
         Self {
             #[cfg(feature = "test-utils")]
             prior: PHASE.with(|p| p.replace(phase)),
@@ -55,6 +59,24 @@ pub(super) fn current() -> &'static str {
     PHASE.with(Cell::get)
 }
 #[cfg(feature = "test-utils")]
-pub(super) fn take() -> BTreeMap<&'static str, [u64; 15]> {
+pub(super) fn take() -> BTreeMap<&'static str, [u64; 20]> {
     WORK.with(|work| std::mem::take(&mut *work.borrow_mut()))
+}
+
+/// Direct SHA work in retained-root codecs, separate from control-store helpers.
+#[cfg(feature = "test-utils")]
+pub fn record_retention_hash(bytes: usize) {
+    record(17, 1);
+    record(18, bytes);
+}
+
+/// Subdivide shared reads only while selecting a maintenance unit. Other callers
+/// retain their enclosing operation/reconstruction phase.
+pub(super) async fn selection_read<F: Future>(name: &'static str, future: F) -> F::Output {
+    #[cfg(feature = "test-utils")]
+    if current() == "maintenance-selection" {
+        return phase(name, future).await;
+    }
+    let _ = name;
+    future.await
 }

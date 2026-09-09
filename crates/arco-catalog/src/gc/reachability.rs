@@ -288,9 +288,11 @@ pub async fn load_selected_retention_pin(
 }
 
 /// One active retained root, including provider objects outside its authority closure.
+#[derive(Debug, Clone)]
 pub struct RetainedAuthorityRoot {
     pub(crate) authorities: Vec<PersistedAuthorityReference>,
     pub(crate) required_paths: BTreeSet<String>,
+    pub(crate) protected_prefixes: Vec<String>,
 }
 
 /// Streams validated retained authority roots, holding one selector page and
@@ -315,10 +317,23 @@ impl<'a> RetainedAuthorityRoots<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // Each retained-root variant is validated at the same streaming boundary.
     pub(crate) async fn next(&mut self) -> Result<Option<RetainedAuthorityRoot>> {
         loop {
             if let Some(pin_id) = self.pending.pop_front() {
                 let selected = load_selected_retention_pin(self.storage, &pin_id).await?;
+                if let RetentionTarget::Maintenance(id) = selected.latest_revision()?.target() {
+                    if selected.status_at(self.now)? != RetentionStatus::Active {
+                        continue;
+                    }
+                    return crate::state_store::control_mvp::maintenance::retention_root(
+                        self.storage,
+                        id,
+                        &selected,
+                    )
+                    .await
+                    .map(Some);
+                }
                 if selected.status_at(self.now)? != RetentionStatus::Active {
                     continue;
                 }
@@ -364,6 +379,9 @@ impl<'a> RetainedAuthorityRoots<'a> {
                                 .collect(),
                         )
                     }
+                    RetentionTarget::Maintenance(_) => {
+                        return Err(validation("maintenance target dispatch mismatch"));
+                    }
                 };
                 if scope.tenant_id() != self.storage.tenant_id()
                     || scope.workspace_id() != self.storage.workspace_id()
@@ -378,6 +396,7 @@ impl<'a> RetainedAuthorityRoots<'a> {
                         .map(|domain| domain.authority().clone())
                         .collect(),
                     required_paths,
+                    protected_prefixes: Vec::new(),
                 }));
             }
             if self.exhausted {
@@ -511,6 +530,9 @@ pub(super) fn build_protection_set(
                 validate_export_pin_binding(selected, export)?;
                 protect_export(&mut protection, export)?;
             }
+            // The inventory loader has authenticated and discarded the closure.
+            // These objects are outside generic GC and Full repair namespaces.
+            RetentionTarget::Maintenance(_) => {}
         }
     }
     Ok(protection)
@@ -669,6 +691,8 @@ fn validate_digest(value: &str) -> Result<()> {
 }
 
 pub fn sha256_digest(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    crate::state_store::control_mvp::cost::record_retention_hash(bytes.len());
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))

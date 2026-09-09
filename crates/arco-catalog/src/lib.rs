@@ -152,14 +152,15 @@ pub use state_store::{
     CheckpointToken, CommitOutcome, ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker,
     ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
     ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
-    CurrentStateStore, KeyRange, KvPair, LayoutMaintenanceIntentV1, LayoutMaintenanceReason,
-    MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_ROWS, MAX_SCAN_PAGE_SEGMENTS, ModelCommitRecord,
-    ModelStateStore, ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind,
-    PersistedAuthorityReference, PersistedRestoreParticipantPlan, PredicateInputSet,
-    ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
-    RestoredAuthorityEvidence, ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant,
-    StateScope, StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions,
-    VersionedValue, control_mvp_outbox_event_id,
+    CurrentStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, KeyRange, KvPair,
+    LayoutMaintenanceIntentV1, LayoutMaintenanceReason, MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_ROWS,
+    MAX_SCAN_PAGE_SEGMENTS, MaintenanceJobId, MaintenanceProgress, MaintenanceStatus,
+    ModelCommitRecord, ModelStateStore, ModelWrite, PersistedAuthorityAdapter,
+    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
+    PredicateInputSet, PreparedMaintenance, ProjectionIntentV1, RestoreAttemptIdentity,
+    RestoreParticipantInspection, RestoredAuthorityEvidence, ScanContinuation, ScanPage,
+    ScanRequest, StateRestoreParticipant, StateScope, StateStoreBindingIdentity,
+    StateStoreCapabilities, StateToken, TxnOptions, VersionedValue, control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

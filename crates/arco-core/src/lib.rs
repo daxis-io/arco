@@ -150,3 +150,31 @@ pub use task_tokens::{
     mint_task_token_for_attempt,
 };
 pub use tenant::TenantId;
+
+/// Opt-in deterministic inputs for credential-free measurement fixtures.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod test_inputs;
+
+#[inline]
+pub(crate) fn wall_clock() -> chrono::DateTime<chrono::Utc> {
+    #[cfg(feature = "test-utils")]
+    {
+        test_inputs::now()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        chrono::Utc::now()
+    }
+}
+#[inline]
+pub(crate) fn fresh_nonce() -> ulid::Ulid {
+    #[cfg(feature = "test-utils")]
+    {
+        test_inputs::nonce()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        ulid::Ulid::new()
+    }
+}

@@ -40,10 +40,11 @@ pub(crate) mod workspace_binding_metadata;
 pub use control_mvp::{
     ControlMvpGcCandidate, ControlMvpGcOutcome, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
     ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
-    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
-    ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding, DurableMaintenanceWorker,
-    MaintenanceJobId, MaintenanceProgress, MaintenanceStatus, PreparedMaintenance,
-    control_mvp_outbox_event_id,
+    ControlMvpProjectionOutboxRecord, ControlMvpReadCache, ControlMvpReadCacheConfig,
+    ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics, ControlMvpRestoreParticipant,
+    ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding,
+    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress, MaintenanceStatus,
+    PreparedMaintenance, control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

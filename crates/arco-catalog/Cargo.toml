@@ -23,7 +23,7 @@ aws = ["arco-core/aws"]
 azure = ["arco-core/azure"]
 jwt-aws-lc = ["arco-core/jwt-aws-lc"]
 jwt-rust-crypto = ["jwt-aws-lc"]
-test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile"]
+test-utils = ["arco-core/test-utils", "dep:proptest", "dep:tempfile", "dep:allocation-counter"]
 
 [dependencies]
 arco-core = { path = "../arco-core", default-features = false, features = ["sync-compaction"] }
@@ -65,6 +65,7 @@ ulid = { workspace = true }
 uuid = { workspace = true }
 
 # Optional test utilities
+allocation-counter = { version = "0.8.1", optional = true }
 proptest = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 

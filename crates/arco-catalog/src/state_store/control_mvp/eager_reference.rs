@@ -6,9 +6,9 @@ use super::{
     ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpManifest,
     ControlMvpPointer, ControlMvpScopeDoc, HistoryAnchor, IMPLEMENTATION,
     LayoutMaintenanceIntentV1, LayoutMaintenanceReason, MAX_CONTROL_JSON_BYTES,
-    MAX_HEAD_JSON_BYTES, Result, RewriteEquivalence, Ulid, WriteResult,
-    ambiguous_authority_outcome, encode_envelope_limited, encode_json_limited, invariant_violation,
-    put_immutable_matching, sha256_hex,
+    MAX_HEAD_JSON_BYTES, Result, RewriteEquivalence, WriteResult, ambiguous_authority_outcome,
+    encode_envelope_limited, encode_json_limited, invariant_violation, put_immutable_matching,
+    sha256_hex,
 };
 
 impl ControlMvpMaintenanceWorker {
@@ -61,7 +61,7 @@ impl ControlMvpMaintenanceWorker {
                 source_manifest.logical_sequence,
                 intent.layout_generation(),
                 pointer.reclamation_generation,
-                Ulid::new().to_string().to_ascii_lowercase()
+                super::cost::nonce().to_string().to_ascii_lowercase()
             );
             let rendered = self
                 .store

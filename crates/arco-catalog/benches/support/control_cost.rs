@@ -1,5 +1,7 @@
 //! Shared deterministic workload and `StorageBackend`-boundary accounting.
 //! No provider latency, pricing, or cache evidence is inferred.
+// Measurement fixtures deliberately remain on one thread for allocation accounting and fixed inputs.
+#![allow(clippy::future_not_send)]
 #![allow(missing_docs, clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::collections::BTreeMap;
@@ -22,6 +24,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::Serialize;
+
+#[path = "read_cache_cost.rs"]
+#[allow(dead_code)]
+pub mod read_cache_cost;
 
 #[path = "durable_maintenance.rs"]
 mod durable_maintenance;
@@ -60,6 +66,25 @@ impl Profile {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BackendCounts {
+    pub decoder_scratch_allocation_calls: u64,
+    pub decoder_scratch_allocation_bytes: u64,
+    pub request_copy_allocation_calls: u64,
+    pub request_copy_allocation_bytes: u64,
+    pub error_fanout_allocation_calls: u64,
+    pub error_fanout_allocation_bytes: u64,
+    pub decoded_row_allocation_calls: u64,
+    pub decoded_row_allocation_bytes: u64,
+    pub json_decode_allocation_calls: u64,
+    pub json_decode_allocation_bytes: u64,
+    pub cache_copy_allocation_calls: u64,
+    pub cache_copy_allocation_bytes: u64,
+    pub backend_allocation_calls: u64,
+    pub backend_allocation_bytes: u64,
+    pub block_decode_calls: u64,
+    pub block_decode_bytes: u64,
+    pub metadata_decode_calls: u64,
+    pub metadata_decode_bytes: u64,
+
     pub phases: BTreeMap<String, BackendCounts>,
     pub replayed_rows: u64,
     pub maintenance_render_rows: u64,
@@ -88,6 +113,10 @@ pub struct BackendCounts {
     pub get_attempts: u64,
     pub range_get_attempts: u64,
     pub head_attempts: u64,
+    /// Returned `ObjectMeta` struct plus owned string capacities; not wire bytes.
+    pub head_metadata_bytes: u64,
+    pub head_missing: u64,
+    pub head_failures: u64,
     pub put_attempts: u64,
     pub list_attempts: u64,
     pub list_page_attempts: u64,
@@ -135,6 +164,25 @@ impl BackendCounts {
     }
 
     fn add(&mut self, other: &Self) {
+        self.decoder_scratch_allocation_calls += other.decoder_scratch_allocation_calls;
+        self.decoder_scratch_allocation_bytes += other.decoder_scratch_allocation_bytes;
+        self.request_copy_allocation_calls += other.request_copy_allocation_calls;
+        self.request_copy_allocation_bytes += other.request_copy_allocation_bytes;
+        self.error_fanout_allocation_calls += other.error_fanout_allocation_calls;
+        self.error_fanout_allocation_bytes += other.error_fanout_allocation_bytes;
+        self.decoded_row_allocation_calls += other.decoded_row_allocation_calls;
+        self.decoded_row_allocation_bytes += other.decoded_row_allocation_bytes;
+        self.json_decode_allocation_calls += other.json_decode_allocation_calls;
+        self.json_decode_allocation_bytes += other.json_decode_allocation_bytes;
+        self.cache_copy_allocation_calls += other.cache_copy_allocation_calls;
+        self.cache_copy_allocation_bytes += other.cache_copy_allocation_bytes;
+        self.backend_allocation_calls += other.backend_allocation_calls;
+        self.backend_allocation_bytes += other.backend_allocation_bytes;
+        self.block_decode_calls += other.block_decode_calls;
+        self.block_decode_bytes += other.block_decode_bytes;
+        self.metadata_decode_calls += other.metadata_decode_calls;
+        self.metadata_decode_bytes += other.metadata_decode_bytes;
+
         self.replayed_rows += other.replayed_rows;
         self.maintenance_render_rows += other.maintenance_render_rows;
         self.full_checksum_calls += other.full_checksum_calls;
@@ -175,6 +223,9 @@ impl BackendCounts {
         self.get_attempts += other.get_attempts;
         self.range_get_attempts += other.range_get_attempts;
         self.head_attempts += other.head_attempts;
+        self.head_metadata_bytes += other.head_metadata_bytes;
+        self.head_missing += other.head_missing;
+        self.head_failures += other.head_failures;
         self.put_attempts += other.put_attempts;
         self.list_attempts += other.list_attempts;
         self.list_page_attempts += other.list_page_attempts;
@@ -237,6 +288,23 @@ impl CountingBackend {
             let mut result = result;
             let (calls, bytes) = ControlMvpStateStore::take_test_authentication_work();
             for (name, work) in ControlMvpStateStore::take_test_phase_work() {
+                result.decoder_scratch_allocation_calls += work[24];
+                result.decoder_scratch_allocation_bytes += work[25];
+                result.request_copy_allocation_calls += work[26];
+                result.request_copy_allocation_bytes += work[27];
+                result.error_fanout_allocation_calls += work[28];
+                result.error_fanout_allocation_bytes += work[29];
+                result.decoded_row_allocation_calls += work[30];
+                result.decoded_row_allocation_bytes += work[31];
+                result.json_decode_allocation_calls += work[32];
+                result.json_decode_allocation_bytes += work[33];
+                result.cache_copy_allocation_calls += work[34];
+                result.cache_copy_allocation_bytes += work[35];
+                result.block_decode_calls += work[20];
+                result.block_decode_bytes += work[21];
+                result.metadata_decode_calls += work[22];
+                result.metadata_decode_bytes += work[23];
+
                 result.full_checksum_bytes += work[12];
                 result.digest_validation_hash_calls += work[13];
                 result.digest_validation_hash_bytes += work[14];
@@ -251,6 +319,23 @@ impl CountingBackend {
                 result.witness_hash_bytes += work[11];
                 {
                     let phase = result.phases.entry(name.to_string()).or_default();
+                    phase.decoder_scratch_allocation_calls = work[24];
+                    phase.decoder_scratch_allocation_bytes = work[25];
+                    phase.request_copy_allocation_calls = work[26];
+                    phase.request_copy_allocation_bytes = work[27];
+                    phase.error_fanout_allocation_calls = work[28];
+                    phase.error_fanout_allocation_bytes = work[29];
+                    phase.decoded_row_allocation_calls = work[30];
+                    phase.decoded_row_allocation_bytes = work[31];
+                    phase.json_decode_allocation_calls = work[32];
+                    phase.json_decode_allocation_bytes = work[33];
+                    phase.cache_copy_allocation_calls = work[34];
+                    phase.cache_copy_allocation_bytes = work[35];
+                    phase.block_decode_calls = work[20];
+                    phase.block_decode_bytes = work[21];
+                    phase.metadata_decode_calls = work[22];
+                    phase.metadata_decode_bytes = work[23];
+
                     phase.sha256_helper_calls = work[0];
                     phase.sha256_helper_bytes = work[1];
                     phase.canonical_root_hash_calls = work[2];
@@ -302,7 +387,12 @@ impl StorageBackend for CountingBackend {
         let mut result = Err(arco_core::Error::storage("GET probe has no repetitions"));
         for _ in 0..self.get_repetitions {
             self.count(|count| count.get_attempts += 1);
-            result = self.inner.get(path).await;
+            let (value, allocations) = measure_allocations(self.inner.get(path)).await;
+            result = value;
+            self.count(|count| {
+                count.backend_allocation_calls += allocations.count;
+                count.backend_allocation_bytes += allocations.bytes;
+            });
             self.count(|count| {
                 let read = count
                     .object_reads
@@ -334,7 +424,13 @@ impl StorageBackend for CountingBackend {
         let mut result = Err(arco_core::Error::storage("range probe has no repetitions"));
         for _ in 0..repetitions {
             self.count(|count| count.range_get_attempts += 1);
-            result = self.inner.get_range(path, range.clone()).await;
+            let (value, allocations) =
+                measure_allocations(self.inner.get_range(path, range.clone())).await;
+            result = value;
+            self.count(|count| {
+                count.backend_allocation_calls += allocations.count;
+                count.backend_allocation_bytes += allocations.bytes;
+            });
             self.count(|count| {
                 *count.requested_ranges.entry(range_key.clone()).or_default() += 1;
                 let read = count
@@ -410,7 +506,23 @@ impl StorageBackend for CountingBackend {
             count.logical_storage_calls += 1;
             count.head_attempts += 1;
         });
-        self.inner.head(path).await
+        let (result, allocations) = measure_allocations(self.inner.head(path)).await;
+        self.count(|count| {
+            count.backend_allocation_calls += allocations.count;
+            count.backend_allocation_bytes += allocations.bytes;
+            match &result {
+                Ok(Some(meta)) => {
+                    count.head_metadata_bytes += (size_of::<ObjectMeta>()
+                        + meta.path.capacity()
+                        + meta.version.capacity()
+                        + meta.etag.as_ref().map_or(0, String::capacity))
+                        as u64;
+                }
+                Ok(None) => count.head_missing += 1,
+                Err(_) => count.head_failures += 1,
+            }
+        });
+        result
     }
     async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
         self.count(|count| {
@@ -500,6 +612,8 @@ pub struct OperationCost {
 
 #[derive(Serialize)]
 pub struct CostReport {
+    pub store_cache: serde_json::Value,
+    pub maintenance_cache: serde_json::Value,
     pub format_version: u32,
     pub profile: Profile,
     pub backend_kind: &'static str,
@@ -595,7 +709,9 @@ fn scope() -> StateScope {
     StateScope::new("bench-tenant", "bench-workspace", "catalog")
 }
 fn store(backend: Arc<CountingBackend>) -> ControlMvpStateStore {
-    ControlMvpStateStore::new(scoped(backend), scope()).unwrap()
+    ControlMvpStateStore::new(scoped(backend), scope())
+        .map(configured_store)
+        .unwrap()
 }
 
 async fn read_contents(reader: &dyn ArcoStateReader) -> Contents {
@@ -748,16 +864,20 @@ async fn setup_and_reads(
 
 #[allow(clippy::too_many_lines)]
 pub async fn run(profile: Profile) -> CostReport {
+    #[cfg(feature = "test-utils")]
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     assert!(profile.setup_commits >= 32 && profile.samples > 0);
     let backend = Arc::new(CountingBackend::new(1));
     let state = store(backend.clone());
     let worker = ControlMvpMaintenanceWorker::new(scoped(backend.clone()), scope()).unwrap();
-    let durable_worker = arco_catalog::DurableMaintenanceWorker::new(
-        scoped(backend.clone()),
-        scope(),
-        arco_catalog::DurableAuthorityBinding::new([17; 32]),
-    )
-    .unwrap();
+    let durable_worker = configured_worker(
+        arco_catalog::DurableMaintenanceWorker::new(
+            scoped(backend.clone()),
+            scope(),
+            arco_catalog::DurableAuthorityBinding::new([17; 32]),
+        )
+        .unwrap(),
+    );
     let mut recorder = Recorder::default();
     let mut expected = Contents::new();
     let mut history = Vec::new();
@@ -890,12 +1010,14 @@ pub async fn run(profile: Profile) -> CostReport {
     verify_backpressure(&mut recorder).await;
 
     CostReport {
+        store_cache: store_statistics(&state),
+        maintenance_cache: worker_statistics(&durable_worker),
         format_version: 1,
         profile,
         backend_kind: "MemoryBackend",
         request_accounting: "StorageBackend API attempts; no network transport or retries",
         allocation_accounting: "Rust allocator calls during future polls; excludes spawned work",
-        cache_accounting: "disabled; no cache hits",
+        cache_accounting: "explicit store/maintenance mode; null statistics means disabled",
         provider_qualification: "not_run",
         operations: recorder.finish(),
         validated_historical_tokens: history.len(),
@@ -1000,7 +1122,7 @@ async fn verify_retention_and_recovery(
             loop {
                 let outcome = worker
                     .collect_gc_page_at(
-                        Utc::now() + ChronoDuration::days(8),
+                        input_now() + ChronoDuration::days(8),
                         Vec::new(),
                         cursor.as_deref(),
                     )
@@ -1069,10 +1191,40 @@ async fn scaling_fixture(
     suffix: usize,
     lazy: bool,
 ) -> ScalingSample {
+    scaling_fixture_with_store(rows, segments, target, suffix, lazy)
+        .await
+        .0
+}
+
+#[cfg(feature = "test-utils")]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::indexing_slicing
+)]
+async fn scaling_fixture_with_store(
+    rows: usize,
+    segments: usize,
+    target: usize,
+    suffix: usize,
+    lazy: bool,
+) -> (ScalingSample, ControlMvpStateStore, Arc<CountingBackend>) {
+    #[cfg(feature = "test-utils")]
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let backend = Arc::new(CountingBackend::new(1));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
     let scope = StateScope::new("tenant", "workspace", "catalog");
-    let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+    // Gate 5 construction admits at most 64 source blocks per output unit.
+    // Keep this output-layout fixture's source below that bound, so the requested
+    // owner count measures output sizing rather than selected-input splitting.
+    let store = ControlMvpStateStore::new(storage.clone(), scope.clone())
+        .map(configured_store)
+        .unwrap()
+        .with_test_segment_sizing(
+            rows,
+            (rows.div_ceil(segments) * 512).clamp(8192, 256 * 1024),
+        )
+        .unwrap();
     for sequence in 0..16 {
         let mut tx = store
             .begin_control_txn(TxnOptions::default())
@@ -1087,14 +1239,16 @@ async fn scaling_fixture(
         }
         tx.commit().await.unwrap();
     }
-    let worker = arco_catalog::DurableMaintenanceWorker::new(
-        storage.clone(),
-        scope,
-        arco_catalog::DurableAuthorityBinding::new([17; 32]),
-    )
-    .unwrap()
-    .with_test_segment_sizing(rows.div_ceil(segments), target)
-    .unwrap();
+    let worker = configured_worker(
+        arco_catalog::DurableMaintenanceWorker::new(
+            storage.clone(),
+            scope,
+            arco_catalog::DurableAuthorityBinding::new([17; 32]),
+        )
+        .unwrap()
+        .with_test_segment_sizing(rows.div_ceil(segments), target)
+        .unwrap(),
+    );
     backend.take();
     let (maintenance, maintenance_allocations) =
         measure_allocations(Box::pin(durable_maintenance::consolidate_pending(&worker))).await;
@@ -1271,12 +1425,13 @@ async fn scaling_fixture(
     if lazy {
         Box::pin(lazy_transaction_costs(&store, &backend, &mut sample)).await;
     }
-    sample
+    (sample, store, backend)
 }
 
 #[cfg(feature = "test-utils")]
 #[allow(clippy::indexing_slicing)]
 pub async fn run_scaling() -> serde_json::Value {
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let mut samples = Vec::new();
     for target in [32, 64, 128, 256] {
         samples.push(Box::pin(scaling_fixture(4096, 1, target * 1024, 0, false)).await);
@@ -1324,6 +1479,7 @@ async fn exceptional_scaling_costs() -> serde_json::Value {
             storage.clone(),
             StateScope::new("tenant", "workspace", "catalog"),
         )
+        .map(configured_store)
         .unwrap();
         let mut tx = store
             .begin_control_txn(TxnOptions::default())
@@ -1368,7 +1524,8 @@ async fn exceptional_scaling_costs() -> serde_json::Value {
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
     let store =
         ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
-            .unwrap();
+            .unwrap()
+            .without_read_cache();
     let mut first = store
         .begin_control_txn(TxnOptions::default())
         .await
@@ -1590,7 +1747,9 @@ async fn lazy_transaction_costs(
     // both intentionally hit the retained 32-L0 capacity gate).
     for eager in [true, false] {
         let copy = Arc::new(CountingBackend::new(1));
-        for object in backend.inner.list("").await.unwrap() {
+        let mut objects = backend.inner.list("").await.unwrap();
+        objects.sort_by(|a, b| a.path.cmp(&b.path));
+        for object in objects {
             copy.inner
                 .put(
                     &object.path,
@@ -1604,6 +1763,7 @@ async fn lazy_transaction_costs(
             ScopedStorage::new(copy.clone(), "tenant", "workspace").unwrap(),
             StateScope::new("tenant", "workspace", "catalog"),
         )
+        .map(configured_store)
         .unwrap();
         copy.take();
         let (tx, allocation) = measure_allocations(async {
@@ -1667,6 +1827,7 @@ async fn lazy_transaction_costs(
 
 #[cfg(feature = "test-utils")]
 pub async fn run_lazy_scaling() -> serde_json::Value {
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let mut samples = Vec::new();
     for target in [32, 64, 128, 256] {
         samples.push(Box::pin(scaling_fixture(4096, 1, target * 1024, 0, true)).await);
@@ -1684,6 +1845,25 @@ pub async fn run_lazy_scaling() -> serde_json::Value {
     serde_json::json!({"exceptional_cases":exceptional,"samples":samples,"acceptance":"all executable assertions passed","counter_nesting":"phases partition totals; canonical hashes are included in SHA helper work; rendered validation includes replay/checksum work; cumulative allocations are allocator requests, not RSS","reference":"real test-only eager snapshot begin and pre-Gate-4 reads/preconditions; matched independent MemoryBackend fixtures for no-read lifecycle","no_read_suffix_31":"both lifecycles fail capacity before first PUT, as required"})
 }
 
+#[cfg(all(test, feature = "test-utils"))]
+#[tokio::test]
+async fn independent_fixture_copies_have_identical_publication_work() {
+    let mut expected = None;
+    for _ in 0..4 {
+        let sample = scaling_fixture(64, 1, 64 * 1024, 0, true).await;
+        let writes = &sample
+            .operations
+            .get("eager_no_read_commit")
+            .unwrap()
+            .object_writes;
+        if let Some(expected) = &expected {
+            assert_eq!(writes, expected);
+        } else {
+            expected = Some(writes.clone());
+        }
+    }
+}
+
 #[cfg(feature = "test-utils")]
 #[allow(clippy::indexing_slicing)]
 async fn lazy_exceptional_costs() -> serde_json::Value {
@@ -1694,6 +1874,7 @@ async fn lazy_exceptional_costs() -> serde_json::Value {
         StateScope::new("tenant", "workspace", "catalog"),
     )
     .unwrap()
+    .without_read_cache()
     .with_checkpoint_interval(std::num::NonZeroU64::new(1).unwrap())
     .with_test_segment_sizing(8, 8192)
     .unwrap();
@@ -1751,4 +1932,55 @@ async fn lazy_exceptional_costs() -> serde_json::Value {
             <= 1
     );
     serde_json::json!({"genesis":genesis,"keyless_outbox_id":{"backend":lookup,"allocations":allocation,"expected_selected_outbox_blocks":1,"expected_kv_blocks":0}})
+}
+
+fn configured_worker(
+    worker: arco_catalog::DurableMaintenanceWorker,
+) -> arco_catalog::DurableMaintenanceWorker {
+    match std::env::var("ARCO_MAINTENANCE_CACHE_MODE").as_deref() {
+        Ok("enabled") => worker,
+        Ok("pressure") => worker
+            .with_read_cache_config(arco_catalog::ControlMvpReadCacheConfig {
+                metadata_bytes: 1024 * 1024,
+                decoded_bytes: 4 * 1024 * 1024,
+            })
+            .unwrap(),
+        _ => worker.without_read_cache(),
+    }
+}
+fn worker_statistics(worker: &arco_catalog::DurableMaintenanceWorker) -> serde_json::Value {
+    worker
+        .read_cache()
+        .map_or(serde_json::Value::Null, |cache| {
+            serde_json::to_value(cache.statistics()).unwrap()
+        })
+}
+
+fn configured_store(store: ControlMvpStateStore) -> ControlMvpStateStore {
+    match std::env::var("ARCO_STATE_READ_CACHE_MODE").as_deref() {
+        Ok("enabled") => store,
+        Ok("pressure") => store
+            .with_read_cache_config(arco_catalog::ControlMvpReadCacheConfig {
+                metadata_bytes: 1024 * 1024,
+                decoded_bytes: 4 * 1024 * 1024,
+            })
+            .unwrap(),
+        _ => store.without_read_cache(),
+    }
+}
+fn store_statistics(store: &ControlMvpStateStore) -> serde_json::Value {
+    store.read_cache().map_or(serde_json::Value::Null, |cache| {
+        serde_json::to_value(cache.statistics()).unwrap()
+    })
+}
+
+fn input_now() -> chrono::DateTime<Utc> {
+    #[cfg(feature = "test-utils")]
+    {
+        arco_core::test_inputs::now()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        Utc::now()
+    }
 }

@@ -703,7 +703,7 @@ impl Descriptor {
     }
 
     fn live(&self, now: DateTime<Utc>) -> Result<()> {
-        if now < self.created_at || now.max(Utc::now()) >= self.expires_at {
+        if now < self.created_at || now.max(cost::now()) >= self.expires_at {
             return Err(precondition_failed(
                 "maintenance execution lifetime expired or clock precedes creation",
             ));
@@ -1074,10 +1074,12 @@ pub async fn retention_root(
             .split_once('/')
             .ok_or_else(|| validation_failed("invalid maintenance GC target"))?;
         let id = MaintenanceJobId::parse(id)?;
+        // GC has no independently configured worker binding; interpret pins directly.
         let store = ControlMvpStateStore::new(
             storage.clone(),
             StateScope::new(storage.tenant_id(), storage.workspace_id(), domain),
-        )?;
+        )?
+        .without_read_cache();
         let bytes = store
             .get_json(&descriptor_path(&store, id.as_str()), MAX_PLAN_PAGE_BYTES)
             .await?;
@@ -1221,10 +1223,37 @@ impl DurableMaintenanceWorker {
         scope: StateScope,
         binding: DurableAuthorityBinding,
     ) -> Result<Self> {
-        Ok(Self {
-            worker: ControlMvpMaintenanceWorker::new(storage, scope)?,
-            binding,
-        })
+        let mut worker = ControlMvpMaintenanceWorker::new(storage, scope)?;
+        worker.store.cache_namespace = Some(binding);
+        worker.store = worker
+            .store
+            .with_read_cache_config(super::ControlMvpReadCacheConfig::default())?;
+        Ok(Self { worker, binding })
+    }
+
+    /// Configures an empty cache for authenticated maintenance reads.
+    ///
+    /// # Errors
+    /// Rejects nonzero capacities that cannot fund handle administration.
+    pub fn with_read_cache_config(
+        mut self,
+        config: super::ControlMvpReadCacheConfig,
+    ) -> Result<Self> {
+        self.worker.store = self.worker.store.with_read_cache_config(config)?;
+        Ok(self)
+    }
+
+    /// Uses direct reads while retaining all durable authority checks.
+    #[must_use]
+    pub fn without_read_cache(mut self) -> Self {
+        self.worker.store = self.worker.store.without_read_cache();
+        self
+    }
+
+    /// Returns the shared read cache for statistics and compatible store reuse.
+    #[must_use]
+    pub fn read_cache(&self) -> Option<super::ControlMvpReadCache> {
+        self.worker.store.read_cache()
     }
 
     /// Configures deterministic local fixture sizing.
@@ -1378,7 +1407,7 @@ impl DurableMaintenanceWorker {
                 retained_until: now
                     .checked_add_signed(ChronoDuration::days(8))
                     .ok_or_else(|| invariant_violation("retention overflow"))?,
-                nonce: Ulid::new().to_string(),
+                nonce: cost::nonce().to_string(),
                 seed: String::new(),
                 block_target: store.segment_limits.block_target,
                 pages: Vec::new(),
@@ -1417,7 +1446,7 @@ impl DurableMaintenanceWorker {
             let descriptor = &plan.descriptor;
             let id = &plan.id;
             descriptor.validate(&store.scope, self.binding)?;
-            descriptor.live(now.max(Utc::now()))?;
+            descriptor.live(now.max(cost::now()))?;
             let activation = activation_bytes(descriptor, id)?;
             self.compatible(descriptor).await?;
             immutable_reconciled(
@@ -1438,7 +1467,7 @@ impl DurableMaintenanceWorker {
                 )
                 .await?;
             }
-            descriptor.live(now.max(Utc::now()))?;
+            descriptor.live(now.max(cost::now()))?;
             Box::pin(self.activate(id, descriptor, activation, now)).await?;
             LoadedJob::load(store, id, self.binding).await?.progress(id)
         })
@@ -1800,7 +1829,7 @@ impl DurableMaintenanceWorker {
                 page.construct(&render_store, &source),
             )
             .await?;
-            job.descriptor.live(now.max(Utc::now()))?;
+            job.descriptor.live(now.max(cost::now()))?;
             immutable_reconciled(
                 &render_store,
                 &render_store
@@ -1809,7 +1838,7 @@ impl DurableMaintenanceWorker {
                 rendered.bytes,
             )
             .await?;
-            job.descriptor.live(now.max(Utc::now()))?;
+            job.descriptor.live(now.max(cost::now()))?;
             immutable_reconciled(
                 &render_store,
                 &render_store
@@ -1818,7 +1847,7 @@ impl DurableMaintenanceWorker {
                 rendered.index_bytes,
             )
             .await?;
-            job.descriptor.live(now.max(Utc::now()))?;
+            job.descriptor.live(now.max(cost::now()))?;
             self.compatible(&job.descriptor).await?;
             self.select_revision(
                 id,
@@ -1847,7 +1876,7 @@ impl DurableMaintenanceWorker {
         deadline: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let check_deadline = || {
-            if deadline.is_some_and(|expiry| Utc::now() >= expiry) {
+            if deadline.is_some_and(|expiry| cost::now() >= expiry) {
                 Err(precondition_failed(
                     "maintenance progress execution deadline passed",
                 ))
@@ -1979,7 +2008,7 @@ fn prepare_submission(
         receipt: None,
         attempt: Some(attempt.into()),
         submissions: last.submissions + 1,
-        submission_nonce: Some(Ulid::new().to_string()),
+        submission_nonce: Some(cost::nonce().to_string()),
     };
     let (bytes, selector) = revision_bytes(&revision)?;
     Ok((revision, bytes, selector))
@@ -2125,11 +2154,11 @@ impl DurableMaintenanceWorker {
                 // candidate reconstruction, not a second collection of rendered objects.
                 cost::phase("maintenance-completed-output-reuse", async {
                     for page in &job.pages {
-                        let (index, _) = store
+                        let (index, directory) = store
                             .load_segment_index(&state_segment_reference(&page.output))
                             .await?;
                         let snapshot = store
-                            .load_state_snapshot_from_index(&page.output, &index)
+                            .load_state_snapshot_from_index(&page.output, &index, &directory)
                             .await?;
                         candidate_state.append_snapshot(snapshot)?;
                     }
@@ -2358,7 +2387,7 @@ impl DurableMaintenanceWorker {
                                 "published maintenance evidence disappeared",
                             ));
                         }
-                        let status = if now.max(Utc::now()) >= job.descriptor.expires_at {
+                        let status = if now.max(cost::now()) >= job.descriptor.expires_at {
                             MaintenanceStatus::Superseded
                         } else {
                             MaintenanceStatus::ReadyToPublish
@@ -2380,7 +2409,7 @@ impl DurableMaintenanceWorker {
                                 "pending maintenance candidate cannot be identically reconstructed",
                             ));
                         }
-                        job.descriptor.live(now.max(Utc::now()))?;
+                        job.descriptor.live(now.max(cost::now()))?;
                         let digest = job
                             .last()?
                             .1
@@ -2415,7 +2444,7 @@ impl DurableMaintenanceWorker {
             let attempt_digest = sha256_hex(&attempt_bytes);
             let submission = prepare_submission(id, &job, &attempt_digest)?;
             // Admission is complete before any immutable publication artifact PUT.
-            job.descriptor.live(now.max(Utc::now()))?;
+            job.descriptor.live(now.max(cost::now()))?;
             immutable_reconciled(
                 &self.worker.store,
                 &attempt_path(&self.worker.store, id.as_str(), &attempt_digest),
@@ -2459,7 +2488,7 @@ impl DurableMaintenanceWorker {
         candidate: PublicationCandidate,
         now: DateTime<Utc>,
     ) -> Result<Option<ControlMvpMaintenanceOutcome>> {
-        job.descriptor.live(now.max(Utc::now()))?;
+        job.descriptor.live(now.max(cost::now()))?;
         let store = &self.worker.store;
         immutable_reconciled(
             store,
@@ -2467,7 +2496,7 @@ impl DurableMaintenanceWorker {
             candidate.manifest,
         )
         .await?;
-        job.descriptor.live(now.max(Utc::now()))?;
+        job.descriptor.live(now.max(cost::now()))?;
         let result = cost::phase(
             "maintenance-HEAD-CAS",
             store.storage.put(
@@ -2490,7 +2519,7 @@ impl DurableMaintenanceWorker {
                     Ok(Some(self.publication_outcome(job, &candidate.attempt)))
                 }
                 Ok(PublicationObservation::Consumed) => {
-                    let status = if now.max(Utc::now()) >= job.descriptor.expires_at {
+                    let status = if now.max(cost::now()) >= job.descriptor.expires_at {
                         MaintenanceStatus::Superseded
                     } else {
                         MaintenanceStatus::ReadyToPublish
@@ -2643,7 +2672,7 @@ impl DurableMaintenanceWorker {
             let bytes = activation_bytes(&descriptor, id)?;
             Box::pin(self.activate(id, &descriptor, bytes, now)).await?;
             let job = LoadedJob::load(&self.worker.store, id, self.binding).await?;
-            if now.max(Utc::now()) < descriptor.expires_at {
+            if now.max(cost::now()) < descriptor.expires_at {
                 self.verify_pin(&descriptor, id, now).await?;
             }
             job.progress(id)
@@ -2654,7 +2683,8 @@ impl DurableMaintenanceWorker {
 
 impl DurableMaintenanceWorker {
     #[cfg(test)]
-    pub(super) fn with_fixture_store(mut self, store: ControlMvpStateStore) -> Self {
+    pub(super) fn with_fixture_store(mut self, mut store: ControlMvpStateStore) -> Self {
+        store.cache_namespace = Some(self.binding);
         self.worker.store = store;
         self
     }

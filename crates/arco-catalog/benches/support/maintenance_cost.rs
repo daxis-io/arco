@@ -6,7 +6,7 @@ use super::{
     ScopedStorage, StateScope, TxnOptions, measure_allocations, scaling_key,
 };
 
-async fn all_contents(reader: &dyn ArcoStateReader) -> Contents {
+pub(super) async fn all_contents(reader: &dyn ArcoStateReader) -> Contents {
     let mut contents = BTreeMap::new();
     let mut continuation = None;
     loop {
@@ -57,6 +57,7 @@ async fn maintenance_case(
     case: &str,
     durable: bool,
 ) -> serde_json::Value {
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let backend = Arc::new(CountingBackend::new(1));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
     let scope = StateScope::new("tenant", "workspace", "catalog");
@@ -146,14 +147,16 @@ async fn maintenance_case(
     assert_eq!(expected.len(), live_rows);
     let expected_outbox = store.current_projection_outbox().await.unwrap();
     if durable {
-        let maintenance = arco_catalog::DurableMaintenanceWorker::new(
-            storage.clone(),
-            scope,
-            arco_catalog::DurableAuthorityBinding::new([21; 32]),
-        )
-        .unwrap()
-        .with_test_segment_sizing((rows + outbox_rows).max(1).div_ceil(owners), target)
-        .unwrap();
+        let maintenance = super::configured_worker(
+            arco_catalog::DurableMaintenanceWorker::new(
+                storage.clone(),
+                scope,
+                arco_catalog::DurableAuthorityBinding::new([21; 32]),
+            )
+            .unwrap()
+            .with_test_segment_sizing((rows + outbox_rows).max(1).div_ceil(owners), target)
+            .unwrap(),
+        );
         let measured = durable_job_cost(&maintenance, &backend).await;
         assert_eq!(
             store
@@ -417,6 +420,8 @@ pub async fn run_eager_schedules() -> serde_json::Value {
 
 #[derive(Default, serde::Serialize)]
 struct DurableCost {
+    elapsed_nanos: u128,
+    cache: serde_json::Value,
     total: super::BackendCounts,
     allocations: super::Allocations,
     phases: Vec<serde_json::Value>,
@@ -430,7 +435,10 @@ impl DurableCost {
         backend: &Arc<CountingBackend>,
         operation: impl Future<Output = T>,
     ) -> T {
+        let started = std::time::Instant::now();
         let (result, allocations) = Box::pin(measure_allocations(operation)).await;
+        let elapsed_nanos = started.elapsed().as_nanos();
+        self.elapsed_nanos += elapsed_nanos;
         let mut counts = backend.take();
         // Each invocation explicitly reports even phases that did no work.
         for phase in MAINTENANCE_PHASES {
@@ -440,7 +448,7 @@ impl DurableCost {
         self.allocations.count += allocations.count;
         self.allocations.bytes += allocations.bytes;
         self.phases
-            .push(serde_json::json!({"phase":name,"cost":counts,"allocations":allocations}));
+            .push(serde_json::json!({"phase":name,"cost":counts,"allocations":allocations,"elapsed_nanos":elapsed_nanos}));
         result
     }
 }
@@ -450,7 +458,7 @@ async fn durable_job_cost(
     worker: &arco_catalog::DurableMaintenanceWorker,
     backend: &Arc<CountingBackend>,
 ) -> DurableCost {
-    let now = chrono::Utc::now();
+    let now = super::input_now();
     backend.take();
     let mut cost = DurableCost::default();
     let normal = cost
@@ -557,6 +565,7 @@ async fn durable_job_cost(
         cost.violations
             .push("publication rewrote completed output".into());
     }
+    cost.cache = super::worker_statistics(worker);
     cost
 }
 
@@ -665,7 +674,8 @@ fn compare_durable_case(
         "eager_hash_bytes":hash_bytes(eager_cost),"new_hash_bytes":hash_bytes(&total),"measured":measured})
 }
 
-pub async fn durable_fixture_smoke() {
+pub async fn durable_fixture_smoke() -> Vec<serde_json::Value> {
+    let mut samples = Vec::new();
     for case in ["kv", "empty", "outbox", "keyless"] {
         let sample = Box::pin(maintenance_case(64 * 1024, 1, 1, case, true)).await;
         eprintln!("durable fixture: {sample}");
@@ -675,7 +685,9 @@ pub async fn durable_fixture_smoke() {
                 .unwrap()
                 .is_empty()
         );
+        samples.push(sample);
     }
+    samples
 }
 
 pub async fn run_durable_matrix() -> serde_json::Value {
@@ -709,6 +721,7 @@ pub async fn run_durable_matrix() -> serde_json::Value {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)] // Explicit fault schedule table.
 pub async fn run_durable_schedules() -> serde_json::Value {
     use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let mut samples = Vec::new();
     for schedule in [
         "none",
@@ -730,7 +743,9 @@ pub async fn run_durable_schedules() -> serde_json::Value {
         let backend = Arc::new(CountingBackend::new(1));
         let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
         let scope = StateScope::new("tenant", "workspace", "catalog");
-        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone())
+            .map(super::configured_store)
+            .unwrap();
         for sequence in 0..16 {
             let mut tx = store
                 .begin_control_txn(TxnOptions::default())
@@ -743,16 +758,18 @@ pub async fn run_durable_schedules() -> serde_json::Value {
             }
             tx.commit().await.unwrap();
         }
-        let worker = DurableMaintenanceWorker::new(
-            storage.clone(),
-            scope.clone(),
-            DurableAuthorityBinding::new([22; 32]),
-        )
-        .unwrap()
-        .with_test_segment_sizing(2, 8 * 1024)
-        .unwrap();
+        let worker = super::configured_worker(
+            DurableMaintenanceWorker::new(
+                storage.clone(),
+                scope.clone(),
+                DurableAuthorityBinding::new([22; 32]),
+            )
+            .unwrap()
+            .with_test_segment_sizing(2, 8 * 1024)
+            .unwrap(),
+        );
         backend.take();
-        let now = chrono::Utc::now();
+        let now = super::input_now();
         let mut cost = DurableCost::default();
         let plan = cost
             .measure("prepare", &backend, Box::pin(worker.prepare_at(now)))
@@ -820,9 +837,10 @@ pub async fn run_durable_schedules() -> serde_json::Value {
             }).await;
             assert_eq!(cost.phases.last().unwrap()["cost"]["put_attempts"], 0);
         }
-        let restarted =
+        let restarted = super::configured_worker(
             DurableMaintenanceWorker::new(storage, scope, DurableAuthorityBinding::new([22; 32]))
-                .unwrap();
+                .unwrap(),
+        );
         for _ in 0..3 {
             let progress = cost
                 .measure(
@@ -948,6 +966,7 @@ pub async fn run_durable_schedules() -> serde_json::Value {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)] // Explicit measured lifecycle schedules.
 pub async fn run_durable_lifecycle() -> serde_json::Value {
     use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
+    let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
     let mut samples = Vec::new();
     for schedule in [
         "active_abandon",
@@ -957,7 +976,9 @@ pub async fn run_durable_lifecycle() -> serde_json::Value {
         let backend = Arc::new(CountingBackend::new(1));
         let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
         let scope = StateScope::new("tenant", "workspace", "catalog");
-        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone())
+            .map(super::configured_store)
+            .unwrap();
         for sequence in 0..16 {
             let mut tx = store
                 .begin_control_txn(TxnOptions::default())
@@ -978,17 +999,19 @@ pub async fn run_durable_lifecycle() -> serde_json::Value {
             )
             .await
             .unwrap();
-        let worker = DurableMaintenanceWorker::new(
-            storage.clone(),
-            scope.clone(),
-            DurableAuthorityBinding::new([27; 32]),
-        )
-        .unwrap()
-        .with_test_segment_sizing(2, 8 * 1024)
-        .unwrap();
+        let worker = super::configured_worker(
+            DurableMaintenanceWorker::new(
+                storage.clone(),
+                scope.clone(),
+                DurableAuthorityBinding::new([27; 32]),
+            )
+            .unwrap()
+            .with_test_segment_sizing(2, 8 * 1024)
+            .unwrap(),
+        );
         let collector = ControlMvpMaintenanceWorker::new(storage.clone(), scope).unwrap();
         backend.take();
-        let now = chrono::Utc::now();
+        let now = super::input_now();
         let mut cost = DurableCost::default();
         let plan = cost
             .measure("prepare", &backend, Box::pin(worker.prepare_at(now)))
@@ -1136,13 +1159,14 @@ pub async fn durable_plan_capacity_rejects_without_puts() {
         }
         tx.commit().await.unwrap();
     }
-    let worker =
+    let worker = super::configured_worker(
         DurableMaintenanceWorker::new(storage, scope, DurableAuthorityBinding::new([28; 32]))
             .unwrap()
             .with_test_segment_sizing(1, 8 * 1024)
-            .unwrap();
+            .unwrap(),
+    );
     backend.take();
-    let error = worker.prepare_at(chrono::Utc::now()).await.err().unwrap();
+    let error = worker.prepare_at(super::input_now()).await.err().unwrap();
     assert!(
         matches!(error, CatalogError::MaintenanceBackpressure { ref message }
         if message == "maintenance plan exceeds job capacity")
@@ -1203,13 +1227,15 @@ async fn phase_partitions_detect_selected_read_amplification_and_report_zero_wor
             }
             tx.commit().await.unwrap();
         }
-        let worker = arco_catalog::DurableMaintenanceWorker::new(
-            storage,
-            scope,
-            arco_catalog::DurableAuthorityBinding::new([17; 32]),
-        )
-        .unwrap();
-        let now = chrono::Utc::now();
+        let worker = super::configured_worker(
+            arco_catalog::DurableMaintenanceWorker::new(
+                storage,
+                scope,
+                arco_catalog::DurableAuthorityBinding::new([17; 32]),
+            )
+            .unwrap(),
+        );
+        let now = super::input_now();
         let plan = worker.prepare_at(now).await.unwrap().unwrap();
         worker.start_at(&plan, now).await.unwrap();
         backend.take();

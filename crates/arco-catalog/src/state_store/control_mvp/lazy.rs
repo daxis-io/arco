@@ -161,7 +161,7 @@ impl ControlMvpStateStore {
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     #[must_use]
-    pub fn take_test_phase_work() -> BTreeMap<&'static str, [u64; 20]> {
+    pub fn take_test_phase_work() -> BTreeMap<&'static str, [u64; 36]> {
         cost::take()
     }
 

@@ -127,6 +127,11 @@ pub(crate) mod cost;
 mod eager_reference;
 mod integrity;
 mod lazy;
+mod read_cache;
+pub use read_cache::{
+    ControlMvpReadCache, ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics,
+    ControlMvpReadCacheStatistics,
+};
 pub(crate) mod maintenance;
 use integrity::{CheckpointValidation, HistoryAnchor, HistoryLink, RewriteEquivalence};
 use lazy::{TransactionBase, TransactionReads};
@@ -194,6 +199,8 @@ pub struct ControlMvpStateStore {
     writer_epoch: u64,
     segment_limits: SegmentLimits,
     l1_test_rows: Option<usize>,
+    read_cache: Option<ControlMvpReadCache>,
+    cache_namespace: Option<DurableAuthorityBinding>,
 }
 
 impl ControlMvpStateStore {
@@ -222,7 +229,8 @@ impl ControlMvpStateStore {
     ///
     /// Returns validation errors when the storage scope does not match the state
     /// scope, the physical root is not a workspace, or the domain cannot be
-    /// represented as a safe object path. Non-workspace roots require the future
+    /// represented as a safe object path, or default cache administration cannot
+    /// fit its byte capacity. Non-workspace roots require the future
     /// versioned authority-scope format; they must not alias legacy `StateScope`.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         scope.validate()?;
@@ -238,7 +246,7 @@ impl ControlMvpStateStore {
         ScopedStorage::validate_path(&paths.current_pointer())?;
         let binding_identity = StateStoreBindingIdentity::from_scoped_storage(&storage);
 
-        Ok(Self {
+        let store = Self {
             storage: ScopedAuthorityStore::new(storage.clone()),
             retention: storage,
             binding_identity,
@@ -248,7 +256,10 @@ impl ControlMvpStateStore {
             writer_epoch: 0,
             segment_limits: PRODUCTION_SEGMENT_LIMITS,
             l1_test_rows: None,
-        })
+            read_cache: None,
+            cache_namespace: None,
+        };
+        store.with_read_cache_config(ControlMvpReadCacheConfig::default())
     }
 
     /// Sets the automatic replay-anchor interval in committed transactions.
@@ -468,7 +479,7 @@ impl ControlMvpStateStore {
         )?;
         let request_id = opts.request_id().map(ToOwned::to_owned);
         let suffix = opts.operation_id().map_or_else(
-            || Ulid::new().to_string().to_ascii_lowercase(),
+            || cost::nonce().to_string().to_ascii_lowercase(),
             ToOwned::to_owned,
         );
         let head_identity = sha256_hex(base.pointer_version().unwrap_or("").as_bytes());
@@ -486,7 +497,7 @@ impl ControlMvpStateStore {
             store: self.clone(),
             base,
             reads: TransactionReads::default(),
-            nonce: Ulid::new().0,
+            nonce: cost::nonce().0,
             #[cfg(any(test, feature = "test-utils"))]
             eager_base: None,
             request_id,
@@ -734,9 +745,9 @@ impl ControlMvpStateStore {
             ..ReplayState::default()
         };
         let indexes = self.load_l1_indexes(references).await?;
-        for (reference, (index_bytes, _)) in references.iter().zip(indexes) {
+        for (reference, (index_bytes, index)) in references.iter().zip(indexes) {
             let shard = self
-                .load_state_snapshot_from_index(reference, &index_bytes)
+                .load_state_snapshot_from_index(reference, &index_bytes, &index)
                 .await?;
             combined.append_snapshot(shard)?;
         }
@@ -747,16 +758,55 @@ impl ControlMvpStateStore {
         &self,
         reference: &ControlMvpStateRef,
         index_bytes: &[u8],
+        index: &ControlMvpSegmentIndex,
     ) -> Result<ControlMvpStateObject> {
         let segment_reference = state_segment_reference(reference);
-        let bytes = self.load_complete_segment(&segment_reference).await?;
-        let rows = decode_segment_rows(&bytes, index_bytes, &segment_reference, &self.scope)?;
+        let rows = if self.read_cache.is_some() {
+            Box::pin(self.cached_complete_rows(&segment_reference, index_bytes, index)).await?
+        } else {
+            let bytes = self.load_complete_segment(&segment_reference).await?;
+            decode_segment_rows(&bytes, index_bytes, &segment_reference, &self.scope)?
+        };
         let snapshot = state_object_from_segment_rows(reference, rows, &self.scope)?;
         snapshot.validate(&self.scope, reference)?;
         Ok(snapshot)
     }
 
     async fn load_segment_index(
+        &self,
+        reference: &ControlMvpSegmentRef,
+    ) -> Result<(Bytes, ControlMvpSegmentIndex)> {
+        if self.read_cache.is_none() {
+            return self.load_segment_index_direct(reference).await;
+        }
+        cost::selection_read(
+            "maintenance-source-metadata",
+            Box::pin(self.cached_directory(reference)),
+        )
+        .await
+    }
+    async fn load_block(
+        &self,
+        reference: &ControlMvpSegmentRef,
+        block: &ControlMvpBlock,
+    ) -> Result<Vec<ControlMvpSegmentRow>> {
+        if self.read_cache.is_none() {
+            return self.load_block_direct(reference, block).await;
+        }
+        cost::selection_read(
+            "maintenance-selected-data-reads",
+            Box::pin(self.cached_block(reference, block)),
+        )
+        .await
+    }
+    async fn load_tx_metadata(&self, reference: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
+        if self.read_cache.is_none() {
+            return self.load_tx_metadata_direct(reference).await;
+        }
+        Box::pin(self.cached_transaction(reference)).await
+    }
+
+    async fn load_segment_index_direct(
         &self,
         reference: &ControlMvpSegmentRef,
     ) -> Result<(Bytes, ControlMvpSegmentIndex)> {
@@ -839,7 +889,7 @@ impl ControlMvpStateStore {
         Ok(indexes)
     }
 
-    async fn load_block(
+    async fn load_block_direct(
         &self,
         reference: &ControlMvpSegmentRef,
         block: &ControlMvpBlock,
@@ -1086,6 +1136,10 @@ impl ControlMvpStateStore {
         &self,
         reference: &ControlMvpSegmentRef,
     ) -> Result<Vec<ControlMvpSegmentRow>> {
+        if self.read_cache.is_some() {
+            let (index_bytes, index) = self.load_segment_index(reference).await?;
+            return Box::pin(self.cached_complete_rows(reference, &index_bytes, &index)).await;
+        }
         let bytes = self.load_complete_segment(reference).await?;
         let (index_bytes, _) = self.load_segment_index(reference).await?;
         decode_segment_rows(&bytes, &index_bytes, reference, &self.scope)
@@ -1121,7 +1175,10 @@ impl ControlMvpStateStore {
         Ok(tx)
     }
 
-    async fn load_tx_metadata(&self, tx_ref: &ControlMvpTxRef) -> Result<ControlMvpTxObject> {
+    async fn load_tx_metadata_direct(
+        &self,
+        tx_ref: &ControlMvpTxRef,
+    ) -> Result<ControlMvpTxObject> {
         if tx_ref.size_bytes == 0 || tx_ref.size_bytes > MAX_TRANSACTION_JSON_BYTES as u64 {
             return Err(invariant_violation("invalid transaction reference length"));
         }
@@ -1380,7 +1437,7 @@ impl ControlMvpStateStore {
             "checkpoint-{:020}-rg-{:020}-{}",
             pointer.logical_sequence,
             pointer.reclamation_generation,
-            Ulid::new().to_string().to_ascii_lowercase()
+            cost::nonce().to_string().to_ascii_lowercase()
         );
         // Reuse the manifest's own anchored snapshot when it has one;
         // otherwise materialize the replay state as a new immutable snapshot
@@ -2503,7 +2560,7 @@ impl ControlMvpMaintenanceWorker {
     /// Returns validation errors when storage and state scope differ.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         Ok(Self {
-            store: ControlMvpStateStore::new(storage.clone(), scope)?,
+            store: ControlMvpStateStore::new(storage.clone(), scope)?.without_read_cache(),
             lifecycle: storage,
         })
     }
@@ -4677,7 +4734,7 @@ impl ArcoStateAdmin for ControlMvpStateStore {
                 .map_err(CatalogError::from)?;
         let operation_id = format!(
             "control-v1-checkpoint-{}",
-            Ulid::new().to_string().to_ascii_lowercase()
+            cost::nonce().to_string().to_ascii_lowercase()
         );
         let lifecycle = self.retention.clone();
         let mut epoch = match RetentionMutationEpoch::claim(
@@ -4733,7 +4790,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         token: &StateToken,
         retention_deadline: DateTime<Utc>,
     ) -> Result<PersistedAuthorityReference> {
-        if retention_deadline <= Utc::now() {
+        if retention_deadline <= cost::now() {
             return Err(validation_failed(
                 "persisted authority retention deadline must be in the future",
             ));
@@ -4743,7 +4800,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                 "StateToken scope does not match control MVP store",
             ));
         }
-        self.validate_state_token_protection(token, Utc::now())
+        self.validate_state_token_protection(token, cost::now())
             .await?;
         let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
         let bytes = self
@@ -4785,7 +4842,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         token: &CheckpointToken,
         retention_deadline: DateTime<Utc>,
     ) -> Result<PersistedAuthorityReference> {
-        if retention_deadline <= Utc::now() {
+        if retention_deadline <= cost::now() {
             return Err(validation_failed(
                 "persisted authority retention deadline must be in the future",
             ));
@@ -4811,7 +4868,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             "control MVP checkpoint",
         )?;
         checkpoint.validate(&self.scope, token.checkpoint_id())?;
-        self.validate_checkpoint_protection(&checkpoint, Utc::now())
+        self.validate_checkpoint_protection(&checkpoint, cost::now())
             .await?;
 
         let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
@@ -5018,7 +5075,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         if version_matches && bytes_match && manifest_matches {
             let source_values = self
                 .store
-                .restore_source_values(&plan.source, Utc::now())
+                .restore_source_values(&plan.source, cost::now())
                 .await?;
             let rendered = self.store.render_restore_candidate(
                 &plan.source,
@@ -6959,6 +7016,7 @@ fn build_segment_index(
 #[derive(Debug)]
 struct ArrowSegmentPreflight {
     record_batch_offsets: Vec<u64>,
+    row_count: u64,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7041,6 +7099,7 @@ fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
         ));
     }
     let mut offsets = Vec::with_capacity(1);
+    let mut row_count = 0;
     let footer_start = u64::try_from(footer_start)
         .map_err(|error| segment_serialization_error("convert Arrow footer offset", error))?;
     for block in batches {
@@ -7104,6 +7163,8 @@ fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
         {
             return Err(invariant_violation("Arrow batch buffers are out of bounds"));
         }
+        row_count = u64::try_from(batch.length())
+            .map_err(|_| invariant_violation("negative Arrow row count"))?;
         offsets.push(offset);
     }
     if offsets.is_empty() {
@@ -7113,6 +7174,7 @@ fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
     }
     Ok(ArrowSegmentPreflight {
         record_batch_offsets: offsets,
+        row_count,
     })
 }
 
@@ -7411,10 +7473,21 @@ fn decode_block_rows(bytes: &[u8], block: &ControlMvpBlock) -> Result<Vec<Contro
         return Err(invariant_violation("block length mismatch"));
     }
     validate_raw_checksum(bytes, Some(&block.checksum_sha256), "block digest")?;
-    if preflight_arrow_segment(bytes)?.record_batch_offsets.len() != 1 {
+    let preflight = preflight_arrow_segment(bytes)?;
+    if preflight.row_count != block.row_count {
+        return Err(invariant_violation(
+            "authenticated block row count differs from Arrow metadata",
+        ));
+    }
+    if preflight.record_batch_offsets.len() != 1 {
         return Err(invariant_violation("block must contain one batch"));
     }
-    let batches =
+    #[cfg(feature = "test-utils")]
+    {
+        cost::record(20, 1);
+        cost::record(21, bytes.len());
+    }
+    let batches = cost::allocated(24, || {
         catch_unwind(AssertUnwindSafe(|| -> Result<Vec<RecordBatch>> {
             let mut reader = FileReaderBuilder::new()
                 .with_max_footer_fb_tables(MAX_SEGMENT_FOOTER_TABLES)
@@ -7429,7 +7502,8 @@ fn decode_block_rows(bytes: &[u8], block: &ControlMvpBlock) -> Result<Vec<Contro
             }
             Ok(batches)
         }))
-        .map_err(|_| invariant_violation("control MVP Arrow reader panicked after preflight"))??;
+    })
+    .map_err(|_| invariant_violation("control MVP Arrow reader panicked after preflight"))??;
     let [batch] = batches.as_slice() else {
         return Err(invariant_violation(
             "control MVP segment must contain exactly one record batch",
@@ -7440,7 +7514,7 @@ fn decode_block_rows(bytes: &[u8], block: &ControlMvpBlock) -> Result<Vec<Contro
             "control MVP Arrow segment exceeds the supported row limit",
         ));
     }
-    let rows = decode_segment_batch(batch)?;
+    let rows = cost::allocated(30, || decode_segment_batch(batch))?;
     if block_metadata(block.offset, bytes, &rows) != *block {
         return Err(invariant_violation("decoded block metadata mismatch"));
     }
@@ -8040,8 +8114,9 @@ fn validate_version_header(bytes: &[u8], expected: u32, context: &str) -> Result
 fn valid_raw_digest(digest: &str) -> bool {
     digest.len() == 64
         && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            .as_bytes()
+            .iter()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) -> Result<()> {
@@ -8079,8 +8154,18 @@ fn decode_json<T>(bytes: &[u8], context: &str) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    serde_json::from_slice(bytes).map_err(|error| CatalogError::Serialization {
-        message: format!("failed to deserialize {context}: {error}"),
+    #[cfg(feature = "test-utils")]
+    if matches!(
+        context,
+        "control MVP segment index" | "control MVP transaction"
+    ) {
+        cost::record(22, 1);
+        cost::record(23, bytes.len());
+    }
+    cost::allocated(32, || serde_json::from_slice(bytes)).map_err(|error| {
+        CatalogError::Serialization {
+            message: format!("failed to deserialize {context}: {error}"),
+        }
     })
 }
 

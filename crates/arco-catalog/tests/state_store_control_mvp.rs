@@ -3198,6 +3198,7 @@ struct CountingGetBackend {
     inner: Arc<dyn StorageBackend>,
     get_calls: AtomicUsize,
     pause_at: AtomicUsize,
+    pause_reads: AtomicUsize,
     paused: Notify,
     get_paths: Mutex<Vec<String>>,
 }
@@ -3208,6 +3209,7 @@ impl CountingGetBackend {
             inner,
             get_calls: AtomicUsize::new(0),
             pause_at: AtomicUsize::new(0),
+            pause_reads: AtomicUsize::new(0),
             paused: Notify::new(),
             get_paths: Mutex::new(Vec::new()),
         }
@@ -3215,7 +3217,8 @@ impl CountingGetBackend {
 
     async fn pause_if_armed(&self) {
         if self.pause_at.load(Ordering::SeqCst) != 0
-            && self.get_calls() == self.pause_at.load(Ordering::SeqCst)
+            && self.pause_reads.fetch_add(1, Ordering::SeqCst) + 1
+                == self.pause_at.load(Ordering::SeqCst)
         {
             self.paused.notify_one();
             std::future::pending::<()>().await;
@@ -3228,6 +3231,7 @@ impl CountingGetBackend {
 
     fn reset(&self) {
         self.get_calls.store(0, Ordering::SeqCst);
+        self.pause_reads.store(0, Ordering::SeqCst);
         self.get_paths.lock().expect("get paths lock").clear();
     }
 
@@ -3276,6 +3280,7 @@ impl StorageBackend for CountingGetBackend {
     }
 
     async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.pause_if_armed().await;
         self.inner.head(path).await
     }
 

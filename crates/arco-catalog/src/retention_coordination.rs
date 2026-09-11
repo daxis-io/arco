@@ -115,7 +115,7 @@ impl RetentionMutationEpochRecord {
             holder_id: holder_id.into(),
             operation_kind,
             operation_id: operation_id.into(),
-            started_at: Utc::now(),
+            started_at: wall_clock(),
             completed_at: None,
         };
         record.validate()?;
@@ -123,7 +123,7 @@ impl RetentionMutationEpochRecord {
     }
 
     fn completed(&self) -> Result<Self> {
-        let completed_at = Utc::now().max(self.started_at);
+        let completed_at = wall_clock().max(self.started_at);
         let record = Self {
             state: RetentionMutationState::Idle,
             completed_at: Some(completed_at),
@@ -251,7 +251,7 @@ impl RetentionMutationEpoch {
                         guard,
                         &previous,
                         &observed_version,
-                        Utc::now(),
+                        wall_clock(),
                     )
                     .await?
                     {
@@ -288,7 +288,7 @@ impl RetentionMutationEpoch {
             record.started_at = started_at;
         }
         let bytes = encode_record(&record)?;
-        if admission.is_some_and(|(now, deadline)| now.max(Utc::now()) >= deadline) {
+        if admission.is_some_and(|(now, deadline)| now.max(wall_clock()) >= deadline) {
             return Err(CatalogError::PreconditionFailed {
                 message: "maintenance execution expired before root submission".into(),
             });
@@ -687,7 +687,7 @@ async fn recover_stale_epoch_while_locked(
         operation_kind: record.operation_kind,
         operation_id: record.operation_id.clone(),
         started_at: record.started_at,
-        in_flight_for_secs: Utc::now()
+        in_flight_for_secs: wall_clock()
             .signed_duration_since(record.started_at)
             .num_seconds(),
         operator_override: true,
@@ -843,6 +843,18 @@ fn validate_identity(value: &str, field: &str) -> Result<()> {
 fn validation(message: impl Into<String>) -> CatalogError {
     CatalogError::Validation {
         message: message.into(),
+    }
+}
+
+#[inline]
+fn wall_clock() -> DateTime<Utc> {
+    #[cfg(feature = "test-utils")]
+    {
+        arco_core::test_inputs::now()
+    }
+    #[cfg(not(feature = "test-utils"))]
+    {
+        Utc::now()
     }
 }
 

@@ -34,7 +34,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use ulid::Ulid;
 
 use crate::error::{Error, Result};
 use crate::publish::{FencingToken, PermitIssuer};
@@ -84,7 +83,7 @@ impl LockInfo {
     /// Creates a new lock info with the given holder ID, TTL, and sequence number.
     #[must_use]
     pub fn new(holder_id: impl Into<String>, ttl: Duration, sequence_number: u64) -> Self {
-        let now = Utc::now();
+        let now = crate::wall_clock();
         Self {
             holder_id: holder_id.into(),
             expires_at: now
@@ -98,13 +97,13 @@ impl LockInfo {
     /// Returns whether this lock has expired.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        Utc::now() >= self.expires_at
+        crate::wall_clock() >= self.expires_at
     }
 
     /// Returns the remaining TTL, or zero if expired.
     #[must_use]
     pub fn remaining_ttl(&self) -> Duration {
-        let remaining = self.expires_at - Utc::now();
+        let remaining = self.expires_at - crate::wall_clock();
         let millis = remaining.num_milliseconds();
         if millis <= 0 {
             Duration::ZERO
@@ -144,7 +143,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
         Self {
             storage,
             lock_path: lock_path.into(),
-            holder_id: Ulid::new().to_string(),
+            holder_id: crate::fresh_nonce().to_string(),
         }
     }
 
@@ -351,7 +350,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
 
         let broken_info = LockInfo {
             holder_id: info.holder_id,
-            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            expires_at: crate::wall_clock() - chrono::Duration::seconds(1),
             acquired_at: info.acquired_at,
             sequence_number: info.sequence_number,
             operation: Some(FORCE_BREAK_OPERATION.to_string()),
@@ -490,7 +489,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                 // Preserve sequence_number so next acquisition can increment it
                 let expired_info = LockInfo {
                     holder_id: self.holder_id.clone(),
-                    expires_at: Utc::now() - chrono::Duration::seconds(1),
+                    expires_at: crate::wall_clock() - chrono::Duration::seconds(1),
                     acquired_at: info.acquired_at,
                     sequence_number: info.sequence_number,
                     operation: None,
@@ -575,7 +574,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
         }
 
         let mut renewed = info;
-        renewed.expires_at = Utc::now()
+        renewed.expires_at = crate::wall_clock()
             + chrono::Duration::from_std(additional_ttl).unwrap_or(chrono::Duration::seconds(30));
         let lock_bytes =
             Bytes::from(serde_json::to_vec(&renewed).map_err(|e| Error::Internal {
@@ -631,7 +630,8 @@ impl<S: StorageBackend + ?Sized> Drop for LockGuard<S> {
                                 if info.holder_id == holder {
                                     let expired = LockInfo {
                                         holder_id: holder,
-                                        expires_at: Utc::now() - chrono::Duration::seconds(1),
+                                        expires_at: crate::wall_clock()
+                                            - chrono::Duration::seconds(1),
                                         acquired_at: info.acquired_at,
                                         sequence_number: info.sequence_number,
                                         operation: None,

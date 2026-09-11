@@ -132,6 +132,32 @@ introduces lazy transactions; Gate 5 makes maintenance incremental, durable and
 resumable. Gates 6 and 7 cover caches and provider qualification. None of these
 local implementation gates authorizes migration or production cutover.
 
+The [Gate 6 contract](2026-09-09-state-store-vnext-gate-6.md) adds process-local
+ownership of authenticated directories, unhydrated transaction metadata, decoded
+blocks and complete-segment certificates. Each shared handle retains its backend
+and typed scope identity. Default capacities are 32 MiB for metadata and 128 MiB
+for decoded rows, including reservations and nonresident leases. FIFO eviction,
+record limits, eight active loads and bounded shared-future participation keep
+cache-owned work within the configured budgets. Zero capacity disables caches;
+nonzero metadata capacity must fund handle administration and retained identity.
+
+Every substitution requires an independent fresh HEAD matching the admitted
+version and size. Admission brackets existing authentication with two agreeing
+HEAD observations. A complete-segment certificate can only follow full raw-byte
+validation, rebuilt directory equality and validation of every block; selective
+hits cannot mint one. Durable maintenance uses its independently supplied authority
+binding as an additional cache namespace. Manifests, retention evidence, maintenance
+control records and reconciliation remain uncached. Logical replay, context-dependent
+hydration, history/state checksums, writer fencing and publication CAS remain
+mandatory. Local cache qualification is separate from Gate 7 provider evidence. The
+[dated Gate 6 qualification report](../reports/2026-09-10-gate6-read-cache-qualification.md)
+records corrected local acceptance, historical unaffected CI-derived lanes,
+independent audit findings, and preserved failures. Cold point/scan qualification
+uses 200 fresh observations per operation within each of five runs, with retained
+raw durations and independently checked percentiles; the earlier singleton p99
+claim is superseded. The external closeout binds the final
+audit disposition and recovery seal to the final source manifest.
+
 The Gate 5 candidate binds durable jobs to an independently configured authority
 and an externally supplied descriptor digest. Immutable plans and receipt chains
 support one-shard advances and completed-output reuse across compatible descendants.

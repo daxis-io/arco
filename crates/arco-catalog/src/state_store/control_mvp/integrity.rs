@@ -105,10 +105,10 @@ impl Canonical {
         if !valid_raw_digest(value) {
             return Err(invariant_violation("invalid canonical digest"));
         }
-        self.0.extend_from_slice(
-            &hex::decode(value)
-                .map_err(|error| segment_serialization_error("canonical digest", error))?,
-        );
+        let mut decoded = [0; 32];
+        hex::decode_to_slice(value, &mut decoded)
+            .map_err(|error| segment_serialization_error("canonical digest", error))?;
+        self.0.extend_from_slice(&decoded);
         Ok(())
     }
     fn finish(self) -> String {
@@ -238,8 +238,14 @@ pub(super) fn validate_state_refs(states: &[ControlMvpStateRef]) -> Result<Optio
 pub(super) fn valid_immutable_id(value: &str) -> bool {
     !value.trim().is_empty()
         && !matches!(value, "." | "..")
-        && !value.contains(['/', '\\', '%'])
-        && !value.chars().any(char::is_control)
+        && if value.is_ascii() {
+            !value
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, 0..=31 | 127 | b'/' | b'\\' | b'%'))
+        } else {
+            !value.contains(['/', '\\', '%']) && !value.chars().any(char::is_control)
+        }
 }
 
 impl ControlMvpManifest {

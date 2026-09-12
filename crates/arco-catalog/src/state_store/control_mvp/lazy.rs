@@ -5,14 +5,14 @@ use super::hash_tag;
 use super::{
     ArcoStateTxn, BTreeMap, BTreeSet, BlockScanBudget, BlockScanCursor, Bytes, CatalogError,
     CommitOutcome, ControlMvpBase, ControlMvpManifest, ControlMvpProjectionOutboxRecord,
-    ControlMvpScopeDoc, ControlMvpSegmentIndex, ControlMvpSegmentLevel, ControlMvpSegmentRef,
-    ControlMvpSegmentRow, ControlMvpStateStore, ControlMvpTxn, Digest, KeyRange, KvPair,
-    MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_ROWS, PointWitness, Precondition, PredicateInputSet,
-    ReplayState, Result, SEGMENT_RECORD_OUTBOX, SEGMENT_RECORD_OUTBOX_TRIM, ScanPage, ScanRequest,
-    Sha256, StagedWrite, StateToken, StoredValue, VersionedValue, async_trait, block_key_bounds,
-    digest_u64, hash_bytes, hash_u64, index_key_bounds, integrity, invariant_violation,
-    key_bounds_overlap_prefix, precondition_failed, state_reference_key_bounds,
-    state_segment_reference, stored_row_value, validation_failed,
+    ControlMvpSegmentIndex, ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow,
+    ControlMvpStateStore, ControlMvpTxn, Digest, KeyRange, KvPair, MAX_SCAN_ARROW_BYTES,
+    MAX_SEGMENT_ROWS, PointWitness, Precondition, PredicateInputSet, ReplayState, Result,
+    SEGMENT_RECORD_OUTBOX, SEGMENT_RECORD_OUTBOX_TRIM, ScanPage, ScanRequest, Sha256, StagedWrite,
+    StateToken, StoredValue, VersionedValue, async_trait, block_key_bounds, digest_u64, hash_bytes,
+    hash_u64, index_key_bounds, integrity, invariant_violation, key_bounds_overlap_prefix,
+    precondition_failed, state_reference_key_bounds, state_segment_reference, stored_row_value,
+    validation_failed,
 };
 #[cfg(feature = "test-utils")]
 use super::{TxnOptions, cost};
@@ -99,8 +99,8 @@ impl TransactionBase {
     pub(super) async fn materialize(&self, store: &ControlMvpStateStore) -> Result<ControlMvpBase> {
         let (state, history_anchor, base_states, tx_refs) = match self.manifest() {
             None => (
-                ReplayState::empty(&store.scope),
-                integrity::genesis(&ControlMvpScopeDoc::from(&store.scope)),
+                ReplayState::empty(&store.scope)?,
+                integrity::genesis(&store.scope)?,
                 Vec::new(),
                 Vec::new(),
             ),

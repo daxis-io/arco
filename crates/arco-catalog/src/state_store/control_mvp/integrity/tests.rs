@@ -34,8 +34,8 @@ fn canonical_hashes_match_independent_binary_vectors() {
             .unwrap()
             .to_string()
     };
-    let scope = ControlMvpScopeDoc::from(&StateScope::new("tenant", "workspace", "catalog"));
-    assert_eq!(genesis(&scope).root, expected("genesis"));
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    assert_eq!(genesis(&scope).unwrap().root, expected("genesis"));
     let mut tx = ControlMvpTxObject {
         history: HistoryLink::default(),
         reclamation_generation: 0,
@@ -51,9 +51,9 @@ fn canonical_hashes_match_independent_binary_vectors() {
         outbox: Vec::new(),
         outbox_trim: Vec::new(),
     };
-    assert_eq!(mutation_digest(&tx), expected("empty_mutation"));
+    assert_eq!(mutation_digest(&tx).unwrap(), expected("empty_mutation"));
     assert_eq!(
-        HistoryLink::new(&tx, &genesis(&scope).root)
+        HistoryLink::new(&tx, &genesis(&scope).unwrap().root)
             .unwrap()
             .resulting_root,
         expected("empty_commit_history")
@@ -75,9 +75,9 @@ fn canonical_hashes_match_independent_binary_vectors() {
         record_id: "event".to_string(),
         payload: vec![255],
     }];
-    assert_eq!(mutation_digest(&tx), expected("one_mutation"));
+    assert_eq!(mutation_digest(&tx).unwrap(), expected("one_mutation"));
     assert_eq!(
-        HistoryLink::new(&tx, &genesis(&scope).root)
+        HistoryLink::new(&tx, &genesis(&scope).unwrap().root)
             .unwrap()
             .resulting_root,
         expected("one_commit_history")
@@ -85,13 +85,117 @@ fn canonical_hashes_match_independent_binary_vectors() {
     tx.tx_id = "other-physical-tx".to_string();
     tx.writer_epoch = 12;
     tx.reclamation_generation = 32;
-    assert_eq!(mutation_digest(&tx), expected("one_mutation"));
+    assert_eq!(mutation_digest(&tx).unwrap(), expected("one_mutation"));
     assert_eq!(
         checkpoint_physical_digest(&scope, &[]).unwrap(),
         expected("empty_checkpoint_layout")
     );
-    let other = ControlMvpScopeDoc::from(&StateScope::new("other", "workspace", "catalog"));
-    assert_ne!(genesis(&scope), genesis(&other));
+    let other = StateScope::new("other", "workspace", "catalog");
+    assert_ne!(genesis(&scope).unwrap(), genesis(&other).unwrap());
+}
+
+#[test]
+fn workspace_and_metastore_digests_diverge_for_equal_textual_ids() {
+    let wks = StateScope::new("acme", "prod", "catalog");
+    let mts = StateScope::metastore("acme", "prod", "catalog");
+
+    assert_ne!(
+        genesis(&wks).unwrap(),
+        genesis(&mts).unwrap(),
+        "equal textual ids must not share a genesis root"
+    );
+    assert_ne!(
+        checkpoint_physical_digest(&wks, &[]).unwrap(),
+        checkpoint_physical_digest(&mts, &[]).unwrap(),
+        "equal textual ids must not share a checkpoint layout digest"
+    );
+
+    let tx_for = |scope: &StateScope| ControlMvpTxObject {
+        history: HistoryLink::default(),
+        reclamation_generation: 0,
+        implementation: IMPLEMENTATION.to_string(),
+        scope: scope.clone(),
+        tx_id: "physical-tx".to_string(),
+        base_manifest_id: None,
+        sequence: 1,
+        writer_epoch: 0,
+        request_id: None,
+        l0_segment: unwritten_l0_segment_ref("physical-tx", 1),
+        writes: Vec::new(),
+        outbox: Vec::new(),
+        outbox_trim: Vec::new(),
+    };
+    assert_ne!(
+        mutation_digest(&tx_for(&wks)).unwrap(),
+        mutation_digest(&tx_for(&mts)).unwrap(),
+        "equal textual ids must not share a mutation digest"
+    );
+}
+
+#[test]
+fn control_mvp_envelope_accepts_legacy_workspace_scope() {
+    let value = serde_json::json!({
+        "reclamation_generation": 0,
+        "format_version": CONTROL_MVP_FORMAT_VERSION,
+        "implementation": IMPLEMENTATION,
+        "scope": { "tenant_id": "acme", "workspace_id": "prod", "domain": "catalog" },
+        "manifest_id": "manifest-1",
+        "logical_sequence": 1,
+        "manifest_checksum_sha256": "0".repeat(64),
+        "writer_epoch": 0
+    });
+
+    let pointer: ControlMvpPointer = serde_json::from_value(value).unwrap();
+    assert!(matches!(
+        pointer.scope.root(),
+        AuthorityRoot::Workspace { .. }
+    ));
+    assert_eq!(pointer.scope.workspace_id(), Some("prod"));
+}
+
+#[test]
+fn control_mvp_envelope_scope_is_versioned_and_round_trips() {
+    let scope = StateScope::new("acme", "prod", "catalog");
+    let pointer = ControlMvpPointer {
+        reclamation_generation: 0,
+        format_version: CONTROL_MVP_FORMAT_VERSION,
+        implementation: IMPLEMENTATION.to_string(),
+        scope: scope.clone(),
+        manifest_id: "manifest-1".to_string(),
+        logical_sequence: 1,
+        manifest_checksum_sha256: "0".repeat(64),
+        writer_epoch: 0,
+    };
+
+    let value = serde_json::to_value(&pointer).unwrap();
+    assert_eq!(value["scope"]["scope_version"].as_u64(), Some(2));
+    assert_eq!(value["scope"]["root_kind"].as_str(), Some("workspace"));
+    assert_eq!(value["scope"]["workspace_id"].as_str(), Some("prod"));
+    assert!(value["scope"].get("metastore_id").is_none());
+
+    let decoded: ControlMvpPointer = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.scope, scope);
+}
+
+#[test]
+fn control_mvp_envelope_rejects_cross_root_scope() {
+    let wks = StateScope::new("acme", "prod", "catalog");
+    let mts = StateScope::metastore("acme", "prod", "catalog");
+
+    let pointer = ControlMvpPointer {
+        reclamation_generation: 0,
+        format_version: CONTROL_MVP_FORMAT_VERSION,
+        implementation: IMPLEMENTATION.to_string(),
+        scope: wks,
+        manifest_id: "manifest-1".to_string(),
+        logical_sequence: 1,
+        manifest_checksum_sha256: "0".repeat(64),
+        writer_epoch: 0,
+    };
+    assert!(
+        pointer.validate(&mts).is_err(),
+        "a workspace envelope must not validate against a metastore root"
+    );
 }
 
 #[tokio::test]
@@ -560,7 +664,7 @@ async fn forged_equivalence_and_checkpoint_layout_evidence_is_rejected() {
 #[tokio::test]
 async fn rendered_outbox_order_and_incarnations_are_part_of_equivalence() {
     let (_, store) = fixture();
-    let mut expected = ReplayState::empty(&store.scope);
+    let mut expected = ReplayState::empty(&store.scope).unwrap();
     expected.logical_sequence = 4;
     expected.outbox = vec![
         ControlMvpOutboxEntry {
@@ -644,7 +748,7 @@ async fn coherent_data_and_semantic_checksum_replacement_cannot_rewrite_history(
         )
         .await
         .unwrap();
-    let mut expected = ReplayState::empty(&store.scope);
+    let mut expected = ReplayState::empty(&store.scope).unwrap();
     let mut altered = tx.clone();
     altered.history = HistoryLink::new(&altered, &expected.history_root).unwrap();
     expected.apply_tx(&altered).unwrap();
@@ -659,7 +763,7 @@ async fn coherent_data_and_semantic_checksum_replacement_cannot_rewrite_history(
 #[tokio::test]
 async fn rendered_rewrites_reject_lost_altered_and_duplicated_rows() {
     let (_, store) = fixture();
-    let mut expected = ReplayState::empty(&store.scope);
+    let mut expected = ReplayState::empty(&store.scope).unwrap();
     expected.logical_sequence = 2;
     for key in [b"a", b"b"] {
         expected.kv.insert(

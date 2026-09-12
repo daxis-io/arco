@@ -11311,3 +11311,6 @@ mod fixture_driver {
 
 #[cfg(test)]
 mod gate7_capacity;
+
+#[cfg(test)]
+mod capacity_design;

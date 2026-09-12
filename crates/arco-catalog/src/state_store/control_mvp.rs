@@ -11308,3 +11308,6 @@ mod fixture_driver {
         "/benches/support/durable_maintenance.rs"
     ));
 }
+
+#[cfg(test)]
+mod gate7_capacity;

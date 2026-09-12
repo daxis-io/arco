@@ -108,12 +108,50 @@ async fn guard<T>(future: impl Future<Output = T>) -> T {
         .expect("schedule deadlock")
 }
 
+/// Unbuffered live evidence survives cancellation or process termination.
+#[derive(Debug, Default)]
+struct EventTrace {
+    events: Vec<String>,
+    live: Option<std::fs::File>,
+}
+impl EventTrace {
+    fn push(&mut self, event: String) {
+        if let Some(file) = &mut self.live {
+            use std::io::Write as _;
+            writeln!(file, "{event}").unwrap();
+        }
+        self.events.push(event);
+    }
+    fn attach(&mut self, path: &std::path::Path, identity: &str) {
+        self.live = Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap(),
+        );
+        self.push(identity.to_owned());
+        self.live.as_ref().unwrap().sync_all().unwrap();
+    }
+}
+impl std::ops::Deref for EventTrace {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+impl std::ops::DerefMut for EventTrace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
 #[derive(Debug)]
 struct Backend {
     inner: Arc<MemoryBackend>,
     armed: Mutex<Option<Arc<Schedule>>>,
     denied: Arc<Mutex<Option<String>>>,
-    trace: Arc<Mutex<Vec<String>>>,
+    trace: Arc<Mutex<EventTrace>>,
     now: Arc<Mutex<DateTime<Utc>>>,
     timestamps: Arc<Mutex<BTreeMap<String, DateTime<Utc>>>>,
     authorized_deletes: Arc<Mutex<BTreeSet<String>>>,
@@ -124,13 +162,17 @@ impl Backend {
             inner: Arc::new(MemoryBackend::new()),
             armed: Mutex::new(None),
             denied: Arc::new(Mutex::new(None)),
-            trace: Arc::new(Mutex::new(Vec::new())),
+            trace: Arc::new(Mutex::new(EventTrace::default())),
             now: Arc::new(Mutex::new(Utc::now())),
             timestamps: Arc::new(Mutex::new(BTreeMap::new())),
             authorized_deletes: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
     fn arm(&self, needle: String, skip: usize, fault: Fault) -> Arc<Schedule> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("ARM {needle} skip={skip} fault={fault:?}"));
         let schedule = Schedule::new(needle, skip, fault);
         *self.armed.lock().unwrap() = Some(schedule.clone());
         schedule
@@ -358,6 +400,17 @@ impl StorageBackend for Backend {
                 schedule.respond.acquire().await.unwrap().forget();
             }
             if let Some(tx) = tx {
+                let result = if matches!(schedule.fault, Fault::LostResponse) {
+                    Err(arco_core::Error::storage(
+                        "remote DELETE applied; response lost",
+                    ))
+                } else {
+                    result
+                };
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(format!("RESPONSE DELETE {path} {result:?}"));
                 tx.send(result).ok();
             }
             schedule.finished.notify_one();
@@ -1609,7 +1662,7 @@ async fn durable_model_step(
     trace
         .lock()
         .unwrap()
-        .extend(std::mem::take(&mut *f.backend.trace.lock().unwrap()));
+        .extend(std::mem::take(&mut f.backend.trace.lock().unwrap().events));
     match operation {
         Ok(true) => *job = None,
         Ok(false) => {}
@@ -2126,3 +2179,9 @@ async fn durable_maintenance_remote_faults_at_every_write_class() {
         }
     }
 }
+
+#[path = "support/gate7_model.rs"]
+mod gate7_model;
+
+#[path = "support/gate7_schedules.rs"]
+mod gate7_schedules;

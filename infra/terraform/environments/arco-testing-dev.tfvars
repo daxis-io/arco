@@ -19,10 +19,10 @@ api_code_version        = "bootstrap-infra-only"
 compactor_tenant_id    = "tenant-dev"
 compactor_workspace_id = "workspace-dev"
 
-task_token_secret   = "dev-arco-task-token-secret"
-task_token_issuer   = "https://arco.dev/task-token"
-task_token_audience = "arco-worker-callback"
-task_token_ttl_secs = 2400
+task_token_secret_name = "arco-task-token-secret"
+task_token_issuer      = "https://arco.dev/task-token"
+task_token_audience    = "arco-worker-callback"
+task_token_ttl_secs    = 2400
 
 api_min_instances             = 0
 api_max_instances             = 1
@@ -35,11 +35,12 @@ compactor_cpu                 = "1"
 compactor_memory              = "512Mi"
 
 api_public           = false
+api_debug            = false
 compactor_ingress    = "INGRESS_TRAFFIC_ALL" # Anti-entropy Cloud Run job calls compactor via run.app; IAM still gates access.
 allowed_cors_origins = "*"
-jwt_secret_name      = ""
-jwt_issuer           = ""
-jwt_audience         = ""
+jwt_secret_name      = "arco-jwt-secret"
+jwt_issuer           = "https://arco.dev"
+jwt_audience         = "arco-api"
 vpc_connector_name   = ""
 
 flow_dispatch_queue_name = "arco-flow-dispatch-dev"

@@ -23,6 +23,8 @@ use arco_api::context::RequestContext;
 use arco_api::routes::tasks::task_auth_middleware;
 use arco_api::server::AppState;
 
+const TEST_TASK_TOKEN_SECRET: &str = "test-task-token-secret-at-least-32-bytes";
+
 fn make_state() -> Arc<AppState> {
     let config = Config {
         debug: false,
@@ -34,7 +36,7 @@ fn make_state() -> Arc<AppState> {
             ..JwtConfig::default()
         },
         task_token: TaskTokenConfig {
-            hs256_secret: "task-secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: Some("https://issuer.task".to_string()),
             audience: Some("arco-worker-callback".to_string()),
             ttl_seconds: 900,
@@ -58,7 +60,7 @@ fn token_with_claims(tenant: &str, workspace: &str, task_id: &str, exp: usize) -
     jsonwebtoken::encode(
         &Header::new(Algorithm::HS256),
         &claims,
-        &EncodingKey::from_secret(b"task-secret"),
+        &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
     )
     .expect("token")
 }

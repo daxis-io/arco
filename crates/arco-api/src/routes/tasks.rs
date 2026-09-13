@@ -672,6 +672,8 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
+    const TEST_TASK_TOKEN_SECRET: &str = "test-task-token-secret-at-least-32-bytes";
+
     fn task_row(run_id: &str, task_key: &str) -> TaskRow {
         TaskRow {
             run_id: run_id.to_string(),
@@ -931,7 +933,7 @@ mod tests {
 
     fn test_task_token_config() -> TaskTokenConfig {
         TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,
@@ -942,7 +944,7 @@ mod tests {
         jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"test-secret"),
+            &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
         )
         .expect("token")
     }
@@ -1019,7 +1021,7 @@ mod tests {
     #[test]
     fn test_jwt_task_token_validator_accepts_valid_token() {
         let config = TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,
@@ -1041,7 +1043,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"test-secret"),
+            &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
         )
         .expect("token");
 
@@ -1054,7 +1056,7 @@ mod tests {
     #[test]
     fn test_jwt_task_token_validator_rejects_task_id_mismatch() {
         let config = TaskTokenConfig {
-            hs256_secret: "test-secret".to_string(),
+            hs256_secret: TEST_TASK_TOKEN_SECRET.to_string(),
             issuer: None,
             audience: None,
             ttl_seconds: 900,
@@ -1076,7 +1078,7 @@ mod tests {
         let token = jsonwebtoken::encode(
             &Header::new(Algorithm::HS256),
             &claims,
-            &EncodingKey::from_secret(b"test-secret"),
+            &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
         )
         .expect("token");
 
@@ -1198,7 +1200,7 @@ mod tests {
             debug: false,
             ..Default::default()
         };
-        config.task_token.hs256_secret = "test-secret".to_string();
+        config.task_token.hs256_secret = TEST_TASK_TOKEN_SECRET.to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1227,7 +1229,7 @@ mod tests {
             debug: false,
             ..Default::default()
         };
-        config.task_token.hs256_secret = "test-secret".to_string();
+        config.task_token.hs256_secret = TEST_TASK_TOKEN_SECRET.to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()
@@ -1261,7 +1263,7 @@ mod tests {
                 iss: None,
                 aud: None,
             },
-            &EncodingKey::from_secret(b"test-secret"),
+            &EncodingKey::from_secret(TEST_TASK_TOKEN_SECRET.as_bytes()),
         )?;
 
         let request = AxumRequest::builder()
@@ -1326,7 +1328,7 @@ mod tests {
             posture: Posture::Private,
             ..Default::default()
         };
-        config.task_token.hs256_secret = "test-secret".to_string();
+        config.task_token.hs256_secret = TEST_TASK_TOKEN_SECRET.to_string();
         let state = Arc::new(AppState::with_memory_storage(config));
 
         let app = Router::new()

@@ -97,7 +97,7 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "ARCO_DEBUG"
-        value = var.environment == "dev" && !var.api_public ? "true" : "false"
+        value = var.api_debug ? "true" : "false"
       }
 
       env {
@@ -115,9 +115,17 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.jwt_audience
       }
 
-      env {
-        name  = "ARCO_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -198,6 +206,21 @@ resource "google_cloud_run_v2_service" "api" {
   }
 
   lifecycle {
+    precondition {
+      condition     = !var.api_debug || (var.environment == "dev" && !var.api_public)
+      error_message = "api_debug trusts client-supplied identity and is permitted only for a private dev service."
+    }
+
+    precondition {
+      condition     = var.api_debug || var.jwt_secret_name != ""
+      error_message = "api_debug = false requires jwt_secret_name so deployed requests use application authentication."
+    }
+
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "API task callbacks require task_token_secret_name for authenticated worker updates."
+    }
+
     ignore_changes = [
       # Ignore client-side changes to these fields
       client,
@@ -640,9 +663,17 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
         value = google_service_account.flow_task_invoker.email
       }
 
-      env {
-        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -673,6 +704,11 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "flow dispatcher requires task_token_secret_name for authenticated API callbacks."
+    }
+
     ignore_changes = [
       client,
       client_version,
@@ -813,9 +849,17 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
         value = google_service_account.flow_task_invoker.email
       }
 
-      env {
-        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -846,6 +890,11 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "flow sweeper requires task_token_secret_name for authenticated API callbacks."
+    }
+
     ignore_changes = [
       client,
       client_version,

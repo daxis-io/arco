@@ -219,6 +219,10 @@ fn grpc_status_label(code: GrpcCode) -> &'static str {
 /// Handler for the `/metrics` endpoint.
 ///
 /// Returns Prometheus-formatted metrics text.
+#[expect(
+    clippy::unused_async,
+    reason = "Preserve the asynchronous response interface used by the authenticated metrics route"
+)]
 pub async fn serve_metrics() -> impl IntoResponse {
     prometheus_handle().map_or_else(
         || {

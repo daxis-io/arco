@@ -67,6 +67,7 @@ jobs:
           github_token: ${{ github.token }}
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: bash tools/test_ci_certification_contracts.sh
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity

@@ -250,6 +250,8 @@ struct CountingBackend {
     l1_entered: tokio::sync::Notify,
     l1_release: tokio::sync::Notify,
     fail_put_countdown: AtomicUsize,
+    pause_cache_payload: AtomicBool,
+    cache_payload_release: tokio::sync::Notify,
 }
 
 impl CountingBackend {
@@ -266,6 +268,8 @@ impl CountingBackend {
             l1_entered: tokio::sync::Notify::new(),
             l1_release: tokio::sync::Notify::new(),
             fail_put_countdown: AtomicUsize::new(0),
+            pause_cache_payload: AtomicBool::new(false),
+            cache_payload_release: tokio::sync::Notify::new(),
         }
     }
     fn count(&self, update: impl Fn(&mut BackendCounts)) {
@@ -276,7 +280,11 @@ impl CountingBackend {
             update(
                 counts
                     .phases
-                    .entry(ControlMvpStateStore::test_cost_phase().to_string())
+                    .entry(
+                        arco_catalog::catalog_authority::projection_measurement::current()
+                            .unwrap_or_else(ControlMvpStateStore::test_cost_phase)
+                            .to_string(),
+                    )
                     .or_default(),
             );
         }
@@ -383,6 +391,12 @@ impl CountingBackend {
 #[async_trait]
 impl StorageBackend for CountingBackend {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        if self.pause_cache_payload.load(Ordering::SeqCst)
+            && matches!(object_class(path), "transaction" | "directory" | "data")
+        {
+            self.cache_payload_release.notified().await;
+        }
+
         self.count(|count| count.logical_storage_calls += 1);
         let mut result = Err(arco_core::Error::storage("GET probe has no repetitions"));
         for _ in 0..self.get_repetitions {
@@ -411,6 +425,12 @@ impl StorageBackend for CountingBackend {
         result
     }
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        if self.pause_cache_payload.load(Ordering::SeqCst)
+            && matches!(object_class(path), "transaction" | "directory" | "data")
+        {
+            self.cache_payload_release.notified().await;
+        }
+
         self.count(|count| count.logical_storage_calls += 1);
         let repetitions = 1;
         #[cfg(feature = "test-utils")]
@@ -1984,3 +2004,8 @@ fn input_now() -> chrono::DateTime<Utc> {
         Utc::now()
     }
 }
+
+#[cfg(feature = "test-utils")]
+#[path = "runtime_reuse_cost.rs"]
+#[allow(dead_code)] // Shared helper; only the runtime driver calls these entry points.
+pub mod runtime_reuse_cost;

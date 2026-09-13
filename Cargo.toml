@@ -21,7 +21,7 @@ members = [
     "crates/arco-storage",
     "tools/xtask",
 ]
-exclude = ["vendor/thrift-0.17.1"]
+exclude = ["vendor/thrift-0.17.1", "vendor/object_store-0.11.2"]
 
 [workspace.package]
 version = "0.3.0"
@@ -167,6 +167,8 @@ debug = true
 debug = true
 
 [patch.crates-io]
+# Gate 7 uses an opt-in no-redirect client; production defaults remain upstream.
+object_store = { path = "vendor/object_store-0.11.2" }
 # Backport apache/thrift@d5152211af61f850ec393604316804096dd4632e while
 # crates.io has no fixed Rust release for GHSA-2f9f-gq7v-9h6m.
 thrift = { path = "vendor/thrift-0.17.1" }

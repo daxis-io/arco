@@ -123,6 +123,11 @@ use crate::workspace_snapshot::{
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 pub(crate) mod cost;
+#[allow(
+    dead_code,
+    reason = "Directory integration with authority publication is the next capacity slice"
+)]
+pub(crate) mod directory;
 #[cfg(feature = "test-utils")]
 mod eager_reference;
 mod integrity;
@@ -11308,3 +11313,9 @@ mod fixture_driver {
         "/benches/support/durable_maintenance.rs"
     ));
 }
+
+#[cfg(test)]
+mod gate7_capacity;
+
+#[cfg(test)]
+mod capacity_design;

@@ -551,11 +551,18 @@ dependencies = [
 name = "arco-storage-s3"
 version = "0.3.0"
 dependencies = [
+ "arco-catalog",
  "arco-core",
  "arco-storage-object-store",
  "async-trait",
  "bytes",
+ "chrono",
+ "futures",
+ "http",
  "object_store",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "ulid",
 ]
@@ -4129,8 +4136,6 @@ dependencies = [
 [[package]]
 name = "object_store"
 version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cfccb68961a56facde1163f9319e0d15743352344e7808a11795fb99698dcaf"
 dependencies = [
  "async-trait",
  "base64",

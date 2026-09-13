@@ -3691,6 +3691,43 @@ impl ControlCatalogAuthority {
     }
 }
 
+/// Synthetic capacity inventory using the production record and key encoders.
+/// These rows are not evidence of executed catalog mutations.
+#[cfg(test)]
+pub(crate) fn capacity_fixture_record(
+    template: &[u8],
+    receipt: bool,
+    ordinal: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let identity = format!("{ordinal:064x}");
+    let manifest = format!(
+        "manifest-{ordinal:020}-op-{ordinal:032x}-0001-head-{ordinal:064x}-rg-{0:020}",
+        0
+    );
+    if receipt {
+        let mut record: IdempotencyReceiptV1 = decode_json(template, "capacity receipt")?;
+        record.logical_sequence = ordinal;
+        assert_eq!(record.authority_manifest_id.len(), manifest.len());
+        record.authority_manifest_id = manifest;
+        record.request_digest.clone_from(&identity);
+        Ok((
+            receipt_key(&record.operation_family, &identity),
+            encode_json(&record, "capacity receipt")?.to_vec(),
+        ))
+    } else {
+        let mut record: CatalogAuditRecordV1 = decode_json(template, "capacity audit")?;
+        record.logical_sequence = ordinal;
+        assert_eq!(record.authority_manifest_id.len(), manifest.len());
+        record.authority_manifest_id = manifest;
+        record.request_digest = identity;
+        record.operation_id = format!("op-{ordinal:032x}");
+        Ok((
+            audit_key(&record.operation_id),
+            encode_json(&record, "capacity audit")?.to_vec(),
+        ))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod runtime_cache_tests;

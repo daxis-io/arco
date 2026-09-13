@@ -764,3 +764,14 @@ one product contract layer:
 ```
 
 This gives Arco the production-grade mutation model from the Tier-1 control-store strategy and the crisp file-native product semantics from the Olympia-inspired strategy, without locking the team into maintaining two permanent Tier-1 write paths.
+
+### Gate 7 qualification prerequisite
+
+The [Gate 7 execution contract](2026-09-10-state-store-vnext-gate-7.md) freezes
+additional restore/outbox/failure models, integrated S3 evidence and a dedicated-host
+604,800-second pilot. [Local qualification status](../reports/2026-09-10-gate7-state-store-qualification.md)
+records a confirmed capacity blocker: the selected pilot retains at least 2,419,200
+receipt/audit rows, exceeding restore's unchanged one-million-row aggregate bound.
+This requires architectural follow-up; it does not authorize raising limits, dropping
+records or rotating roots. Local evidence, remote CI, real S3 and pilot completion
+remain separate states. No deployment or cutover is implied.

@@ -72,8 +72,8 @@ above, but the current publication attempt was refused under that original
 boundary. The following evidence is therefore local only and must not be
 treated as remote or default-branch proof:
 
-- #351: local commit `a6bf008c` on
-  `codex/audit-remediation-repair-body-identity` keeps same-body repair working,
+- #351: local commit `a6bf008c` in the
+  `audit-remediation-repair-body-identity` worktree keeps same-body repair working,
   rejects a repair-pending replay whose request hash differs, and proves the
   predecessor remains repair-pending with no visible receipt. Formatting,
   metadata, and diff checks pass; Rust execution is disk-gated below 40 GiB.
@@ -83,7 +83,7 @@ treated as remote or default-branch proof:
   test-only lint policy. Formatting, metadata, and diff checks pass. The repair
   is not committed or pushed.
 - #352 and #353: the local
-  `codex/audit-remediation-root-identity-scope` worktree reserves the
+  `audit-remediation-root-identity-scope` worktree reserves the
   `root:` participant-key namespace from caller-supplied idempotency keys and
   scopes root, orchestration-resume, and orchestration-repair lock objects
   before handing them to the raw backend. Regressions cover caller-key
@@ -91,14 +91,14 @@ treated as remote or default-branch proof:
   placement, and the shared scoped-lock path validator. Formatting, metadata,
   and diff checks pass; the changes are uncommitted and Rust execution remains
   disk-gated.
-- #354: the local `codex/audit-remediation-browser-artifact-policy` worktree
+- #354: the local `audit-remediation-browser-artifact-policy` worktree
   makes browser-direct catalog artifacts an explicit four-file allowlist and
   keeps raw `commits.parquet` snapshots internal even when they are present in
   the current snapshot. The regression proves the internal file still exists,
   is absent from discovery, and is rejected by the browser URL route without
   minting a URL. Formatting, metadata, and diff checks pass; the changes are
   uncommitted and Rust execution remains disk-gated.
-- #342: the local `codex/audit-remediation-legacy-entity-idempotency` worktree
+- #342: the local `audit-remediation-legacy-entity-idempotency` worktree
   moves legacy namespace/table entity reservation, stale recovery, and marker
   finalization behind writer-owned entry points while preserving API request
   hashes, configured stale timeouts, conflict semantics, and `Retry-After` for
@@ -106,7 +106,7 @@ treated as remote or default-branch proof:
   stale reserved marker and require replay to return the same entity ID and
   finalize the marker. Formatting, metadata, and diff checks pass; the changes
   are uncommitted and Rust execution remains disk-gated.
-- #346: the local `codex/audit-remediation-stable-repair-task-id` worktree
+- #346: the local `audit-remediation-stable-repair-task-id` worktree
   derives the repair Cloud Tasks name from the original dispatch and stable
   attempt identity, eliminating the fresh ULID that created a new live delivery
   on every sweep. The regression requires repeated sweeps of one attempt to

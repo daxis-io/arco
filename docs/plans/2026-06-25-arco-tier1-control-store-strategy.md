@@ -6,6 +6,8 @@
 
 - [Arco Tier-1 Single Authority Vision](2026-06-26-arco-tier1-single-authority-combined-vision.md)
 - [Olympia-Inspired Arco Strategy](2026-06-20-olympia-inspired-arco-strategy.md)
+- [Current local implementation progress](../reports/2026-09-04-state-store-vnext-progress.md)
+- [Block format 1](state-store-block-format-v1.md) and [authority 7 integrity encoding](state-store-integrity-format-v1.md)
 
 ## Purpose
 
@@ -1419,10 +1421,21 @@ mutation authorities.
 
 ## Compaction
 
-The compactor should have two independent jobs, but not uncontrolled write
-authority over the same head.
+The state store replaces the legacy synchronous event-to-Parquet publication
+path as Tier-1 mutation authority. Two distinct background operations remain:
+internal control-store segment maintenance and derived Parquet projection
+publication. These are separate responsibilities, not a requirement for one
+compactor process or a second mutation authority. The
+[single-authority design](2026-06-26-arco-tier1-single-authority-combined-vision.md#publication-compaction-and-internal-segment-maintenance)
+defines this distinction and its Tier-2 and snapshot boundaries.
 
-Control-store compaction:
+Internal segment maintenance reorganizes already-committed state while
+preserving logical contents and `logical_sequence`. Projection publication
+produces watermarked read surfaces after authority commits. Tier-1 mutation
+acknowledgment does not wait for Parquet projection publication; existing
+internal replay/segment backpressure still bounds write admission.
+
+Control-store segment maintenance:
 
 ```text
 txlog + L0 segments

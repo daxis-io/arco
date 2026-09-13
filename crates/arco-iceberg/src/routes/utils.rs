@@ -4,6 +4,28 @@ use crate::error::{IcebergError, IcebergResult};
 use crate::idempotency::IdempotencyMarker;
 use crate::state::IcebergConfig;
 use crate::types::NamespaceIdent;
+use arco_catalog::CatalogListRequest;
+
+const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_PAGE_SIZE: usize = 1_000;
+
+pub fn catalog_list_request(
+    page_token: Option<String>,
+    page_size: Option<u32>,
+) -> IcebergResult<CatalogListRequest> {
+    let size = match page_size {
+        Some(0) => {
+            return Err(IcebergError::BadRequest {
+                message: "pageSize must be greater than zero".to_string(),
+                error_type: "BadRequestException",
+            });
+        }
+        Some(size) => (size as usize).min(MAX_PAGE_SIZE),
+        None => DEFAULT_PAGE_SIZE,
+    };
+    let request = CatalogListRequest::new(size).map_err(IcebergError::from)?;
+    Ok(page_token.map_or(request.clone(), |token| request.with_page_token(token)))
+}
 
 /// Validates the catalog prefix in the request path.
 pub fn ensure_prefix(prefix: &str, config: &IcebergConfig) -> IcebergResult<()> {
@@ -62,7 +84,10 @@ pub fn commit_idempotency_key(key: Option<String>) -> IcebergResult<String> {
     Ok(key)
 }
 
-/// Applies page token and size to a vector of items.
+/// Applies the legacy Iceberg numeric offset token and size to sorted items.
+///
+/// Control-authority routes use authority-pinned opaque continuations instead;
+/// this helper preserves the established wire contract for unbound roots.
 pub fn paginate<T>(
     mut items: Vec<T>,
     page_token: Option<String>,
@@ -84,8 +109,8 @@ pub fn paginate<T>(
                 error_type: "BadRequestException",
             });
         }
-        Some(size) => size as usize,
-        None => items.len(),
+        Some(size) => (size as usize).min(MAX_PAGE_SIZE),
+        None => DEFAULT_PAGE_SIZE,
     };
 
     if start > items.len() {
@@ -95,7 +120,7 @@ pub fn paginate<T>(
         });
     }
 
-    let end = (start + size).min(items.len());
+    let end = start.saturating_add(size).min(items.len());
     let next = if end < items.len() {
         Some(end.to_string())
     } else {
@@ -133,5 +158,20 @@ mod tests {
         let (page, next) = paginate(vec![1, 2, 3], None, Some(2)).expect("paginate");
         assert_eq!(page, vec![1, 2]);
         assert_eq!(next, Some("2".to_string()));
+    }
+
+    #[test]
+    fn paginate_defaults_to_one_hundred_rows() {
+        let (page, next) = paginate((0..101).collect::<Vec<_>>(), None, None).expect("paginate");
+        assert_eq!(page.len(), 100);
+        assert_eq!(next, Some("100".to_string()));
+    }
+
+    #[test]
+    fn paginate_caps_requested_size_at_one_thousand_rows() {
+        let (page, next) =
+            paginate((0..1001).collect::<Vec<_>>(), None, Some(2_000)).expect("paginate");
+        assert_eq!(page.len(), 1_000);
+        assert_eq!(next, Some("1000".to_string()));
     }
 }

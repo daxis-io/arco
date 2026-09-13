@@ -17,11 +17,12 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use arco_catalog::CatalogReader;
+use arco_catalog::CatalogAuthority;
 use arco_core::{DeltaPaths, TableFormat};
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
+use crate::routes::catalog_authority;
 use crate::server::AppState;
 
 const MAX_DELTA_STAGE_BYTES: usize = 5 * 1024 * 1024;
@@ -77,13 +78,15 @@ pub(crate) async fn stage_commit_payload(
     Path(table_id): Path<String>,
     Json(req): Json<StageCommitRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
     let table_id =
         Uuid::parse_str(&table_id).map_err(|_| ApiError::bad_request("table_id must be a UUID"))?;
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    let authority = catalog_authority::resolve_read(&state, &ctx)?;
     let paths =
-        resolve_delta_table_paths(storage.clone(), &ctx.tenant, &ctx.workspace, table_id).await?;
+        resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
 
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
     let staged = coordinator
@@ -146,6 +149,7 @@ pub(crate) async fn commit_staged(
     Path(table_id): Path<String>,
     Json(req): Json<CommitRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
     let table_id =
         Uuid::parse_str(&table_id).map_err(|_| ApiError::bad_request("table_id must be a UUID"))?;
 
@@ -177,8 +181,9 @@ pub(crate) async fn commit_staged(
         ));
     }
 
+    let authority = catalog_authority::resolve_read(&state, &ctx)?;
     let paths =
-        resolve_delta_table_paths(storage.clone(), &ctx.tenant, &ctx.workspace, table_id).await?;
+        resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
 
     let committed = coordinator
@@ -196,13 +201,12 @@ pub(crate) async fn commit_staged(
 }
 
 async fn resolve_delta_table_paths(
-    storage: arco_core::ScopedStorage,
+    authority: &CatalogAuthority,
     tenant: &str,
     workspace: &str,
     table_id: Uuid,
 ) -> Result<DeltaPaths, ApiError> {
-    let reader = CatalogReader::new(storage);
-    let table = reader
+    let table = authority
         .get_table_by_id(&table_id.to_string())
         .await
         .map_err(ApiError::from)?

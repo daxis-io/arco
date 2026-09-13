@@ -1,0 +1,164 @@
+{
+  "cwd": "/Users/ethanurbanski/arco/.worktrees/state-store-vnext",
+  "base_commit": "0235eb6c1552c5c87fe3a7638e10022889462b35",
+  "environment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "log_directory": "/private/tmp/arco-gate3-verification-20260906-122723",
+  "tested_source": {
+    "aggregate": "798b4953f5049c43829b17db0ef72fb1f0fbf2e216b758c138c68b12b6aeb0ec",
+    "files": {
+      "Cargo.lock": "7c3771e3605f5c0dd0a6f52b72c153e9dd8aa59fade37a4641fef3eaf8900d76",
+      "crates/arco-catalog/Cargo.toml": "294aefd2b21608e354b6443763aec25ab6fb38138490b0882f4753134447d492",
+      "crates/arco-catalog/benches/control_mvp_gate.rs": "e168490165141bd7f09e38f27fc2c3a24cfb9ee7f0c276073c4da1a72cb6d37a",
+      "crates/arco-catalog/benches/support/control_cost.rs": "d5da5474c467be86b7946a851f2ef807d72eb5c9b13a4af2c129cf2297b5b517",
+      "crates/arco-catalog/src/catalog_authority.rs": "67fd8f59190c9dae13222d204aebeb9863de240bf2206bfe24e2b5c1a51ba9be",
+      "crates/arco-catalog/src/gc/reachability.rs": "cd70790dc821acfcbc1be65ea188fbef5f750e8f40fb5c489afccfe09e449269",
+      "crates/arco-catalog/src/reconciler.rs": "e3ec49320f2bf2ef4a5fd95de9e2c002ced284f7e613005b4c5c15dd78da6b8b",
+      "crates/arco-catalog/src/retention_coordination.rs": "007eb2f65d455e443ed20ff0a7eec595519cc3aad130970a3ad927c7fc606356",
+      "crates/arco-catalog/src/state_store.rs": "e6ce43cc281ec05583373b083da0938ce19d31991189ca64f44302c8c7da6fc3",
+      "crates/arco-catalog/src/state_store/control_mvp.rs": "b24b7690359d4f3239ac2a53a2279cb6e55af1d9bd22dd3cd12a50410efdc0cb",
+      "crates/arco-catalog/src/state_store/control_mvp/integrity.rs": "a99cb9421db5d335e10b19f019dd6f66af75402712151a148e057b9da7a7b38f",
+      "crates/arco-catalog/src/state_store/control_mvp/integrity/tests.rs": "f6861a034694ab8c53b8c3b544bf560a7e7076a558880085e9ede061771a09f5",
+      "crates/arco-catalog/src/state_store/model.rs": "7177bc2cf03a13e053338657817de7d0cc6fa19b6ee251cb95d87dfa483013db",
+      "crates/arco-catalog/src/workspace_snapshot_service.rs": "433d98a7d8f8d58dd0ffe934a72e2e56718079914092b779b03a0ff613cc314d",
+      "crates/arco-catalog/tests/control_cost_smoke.rs": "912b1de4ae950398a2e5b48ff0e2c7e9ce60947560f59ed0b2d931940966e359",
+      "crates/arco-catalog/tests/state_store_control_mvp.rs": "6127a901f65200f714576ad3f6a54cddcba0b329dc145c0583fcbe77cf29a223",
+      "crates/arco-catalog/tests/state_store_reclamation_schedules.rs": "539a9f8a6e0ae534fc42faeaca7a2c42b447ec028b3fe897ee5a3b3e07d0b88f",
+      "crates/arco-catalog/tests/state_store_segment_contract.rs": "eeae11c29a2476a3961a3db5fa435a749686a89759705e0324d98a52f467d44d",
+      "crates/arco-catalog/tests/support/integrity_oracle.rs": "79e0243a462aafd16797e7b74e7b48d5725a54445b52fbaef6a59bae78c2eb45",
+      "crates/arco-catalog/tests/support/legacy_reclamation.rs": "2397e071c1e046307741d0d9bac697ce68cc6f10fa55577990af9ac9f30b4735",
+      "crates/arco-catalog/tests/workspace_snapshot_restore.rs": "b309b10bc27cd172cb5b20187aece985ddb0dc2dbd9405404bde043e7cef4e85",
+      "crates/arco-catalog/tests/workspace_snapshot_services.rs": "cb99e0b04925f298a7bba868f8274bfc02a05814b42d5b2f9af915cd0375fb9d",
+      "crates/arco-core/src/authority_storage.rs": "9b167beb76c213c32375d85cd6c316e942fe86a656dc90d5dd6550616ef5f557",
+      "docs/reports/2026-09-06-gate3-canonical-vectors.json": "78c5ae885073642e73366877c83f40f24cdd9ec463e6dd1fc408a795d5fdc382"
+    }
+  },
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--test",
+        "state_store_reclamation_schedules",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 148.7979700565338
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--lib",
+        "--tests",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 171.9188528060913
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--lib",
+        "--tests",
+        "--benches",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 9.600594997406006
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--bench",
+        "control_mvp_gate",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 37.577924966812134
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 1.2716810703277588
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.05772686004638672
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--test",
+        "control_cost_smoke",
+        "authenticated_block_scaling_acceptance",
+        "--locked",
+        "--",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "seconds": 248.5540590286255
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-core",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 1.6442911624908447
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "-p",
+        "arco-api",
+        "--all-targets",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 11.545348882675171
+    }
+  ]
+}

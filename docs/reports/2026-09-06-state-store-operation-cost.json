@@ -1,0 +1,677 @@
+{
+  "format_version": 1,
+  "profile": {
+    "setup_commits": 256,
+    "samples": 200
+  },
+  "backend_kind": "MemoryBackend",
+  "request_accounting": "StorageBackend API attempts; no network transport or retries",
+  "allocation_accounting": "Rust allocator calls during future polls; excludes spawned work",
+  "cache_accounting": "disabled; no cache hits",
+  "provider_qualification": "not_run",
+  "operations": [
+    {
+      "phase": "ambiguous_commit_reconciliation",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 6,
+        "get_attempts": 1,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 479,
+        "write_attempt_bytes": 9298,
+        "immutable_write_attempt_bytes": 8819
+      },
+      "logical_payload_bytes": 30,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 6,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 479,
+        "denominator": 30
+      },
+      "write_amplification": {
+        "numerator": 9298,
+        "denominator": 30
+      },
+      "allocations": {
+        "count": 454,
+        "bytes": 136825
+      },
+      "latency_p50_micros": 761,
+      "latency_p99_micros": 761
+    },
+    {
+      "phase": "begin",
+      "samples": 456,
+      "backend": {
+        "logical_storage_calls": 12410,
+        "get_attempts": 11954,
+        "range_get_attempts": 0,
+        "head_attempts": 456,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 19445221,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 12410,
+        "denominator": 456
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 1007559,
+        "bytes": 118403513
+      },
+      "latency_p50_micros": 2987,
+      "latency_p99_micros": 5736
+    },
+    {
+      "phase": "checkpoint",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 12,
+        "get_attempts": 4,
+        "range_get_attempts": 0,
+        "head_attempts": 2,
+        "put_attempts": 6,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 2078,
+        "write_attempt_bytes": 2276,
+        "immutable_write_attempt_bytes": 1617
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 12,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 455,
+        "bytes": 34289
+      },
+      "latency_p50_micros": 428,
+      "latency_p99_micros": 428
+    },
+    {
+      "phase": "commit",
+      "samples": 200,
+      "backend": {
+        "logical_storage_calls": 1000,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 1000,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 200,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 1728312,
+        "immutable_write_attempt_bytes": 1632512
+      },
+      "logical_payload_bytes": 6000,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 1000,
+        "denominator": 200
+      },
+      "read_amplification": {
+        "numerator": 0,
+        "denominator": 6000
+      },
+      "write_amplification": {
+        "numerator": 1728312,
+        "denominator": 6000
+      },
+      "allocations": {
+        "count": 86698,
+        "bytes": 26515794
+      },
+      "latency_p50_micros": 680,
+      "latency_p99_micros": 956
+    },
+    {
+      "phase": "conflict_retry",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 37,
+        "get_attempts": 31,
+        "range_get_attempts": 0,
+        "head_attempts": 1,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 50587,
+        "write_attempt_bytes": 9035,
+        "immutable_write_attempt_bytes": 8556
+      },
+      "logical_payload_bytes": 24,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 37,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 50587,
+        "denominator": 24
+      },
+      "write_amplification": {
+        "numerator": 9035,
+        "denominator": 24
+      },
+      "allocations": {
+        "count": 3048,
+        "bytes": 432573
+      },
+      "latency_p50_micros": 4277,
+      "latency_p99_micros": 4277
+    },
+    {
+      "phase": "contention_loser",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 6,
+        "get_attempts": 1,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 1,
+        "read_bytes": 479,
+        "write_attempt_bytes": 8778,
+        "immutable_write_attempt_bytes": 8299
+      },
+      "logical_payload_bytes": 22,
+      "abandoned_immutable_bytes": 8299,
+      "discarded_candidates": 1,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 6,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 479,
+        "denominator": 22
+      },
+      "write_amplification": {
+        "numerator": 8778,
+        "denominator": 22
+      },
+      "allocations": {
+        "count": 450,
+        "bytes": 127912
+      },
+      "latency_p50_micros": 739,
+      "latency_p99_micros": 739
+    },
+    {
+      "phase": "contention_winner",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 5,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 8778,
+        "immutable_write_attempt_bytes": 8299
+      },
+      "logical_payload_bytes": 23,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 5,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 0,
+        "denominator": 23
+      },
+      "write_amplification": {
+        "numerator": 8778,
+        "denominator": 23
+      },
+      "allocations": {
+        "count": 436,
+        "bytes": 127227
+      },
+      "latency_p50_micros": 773,
+      "latency_p99_micros": 773
+    },
+    {
+      "phase": "expected_backpressure",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 0,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 0,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 295,
+        "bytes": 89022
+      },
+      "latency_p50_micros": 282,
+      "latency_p99_micros": 282
+    },
+    {
+      "phase": "gc",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 29321,
+        "get_attempts": 29191,
+        "range_get_attempts": 0,
+        "head_attempts": 34,
+        "put_attempts": 49,
+        "list_attempts": 0,
+        "list_page_attempts": 46,
+        "delete_attempts": 1,
+        "head_cas_attempts": 1,
+        "precondition_failures": 8,
+        "read_bytes": 38059068,
+        "write_attempt_bytes": 10373,
+        "immutable_write_attempt_bytes": 1448
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 29321,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 1692851,
+        "bytes": 260858928
+      },
+      "latency_p50_micros": 2664868,
+      "latency_p99_micros": 2664868
+    },
+    {
+      "phase": "maintenance",
+      "samples": 29,
+      "backend": {
+        "logical_storage_calls": 1651,
+        "get_attempts": 1506,
+        "range_get_attempts": 0,
+        "head_attempts": 29,
+        "put_attempts": 116,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 29,
+        "precondition_failures": 0,
+        "read_bytes": 2474755,
+        "write_attempt_bytes": 176231,
+        "immutable_write_attempt_bytes": 163564
+      },
+      "logical_payload_bytes": 13864,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 1651,
+        "denominator": 29
+      },
+      "read_amplification": {
+        "numerator": 2474755,
+        "denominator": 13864
+      },
+      "write_amplification": {
+        "numerator": 176231,
+        "denominator": 13864
+      },
+      "allocations": {
+        "count": 141580,
+        "bytes": 19867668
+      },
+      "latency_p50_micros": 6594,
+      "latency_p99_micros": 6968
+    },
+    {
+      "phase": "maintenance_fill_commit",
+      "samples": 5,
+      "backend": {
+        "logical_storage_calls": 25,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 25,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 5,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 44629,
+        "immutable_write_attempt_bytes": 42234
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 25,
+        "denominator": 5
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 2160,
+        "bytes": 680560
+      },
+      "latency_p50_micros": 801,
+      "latency_p99_micros": 883
+    },
+    {
+      "phase": "point_read",
+      "samples": 3200,
+      "backend": {
+        "logical_storage_calls": 68800,
+        "get_attempts": 65600,
+        "range_get_attempts": 0,
+        "head_attempts": 3200,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 76912000,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 38400,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 68800,
+        "denominator": 3200
+      },
+      "read_amplification": {
+        "numerator": 76912000,
+        "denominator": 38400
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 38400
+      },
+      "allocations": {
+        "count": 3332800,
+        "bytes": 328196800
+      },
+      "latency_p50_micros": 1718,
+      "latency_p99_micros": 1994
+    },
+    {
+      "phase": "recovery",
+      "samples": 1,
+      "backend": {
+        "logical_storage_calls": 19,
+        "get_attempts": 17,
+        "range_get_attempts": 0,
+        "head_attempts": 2,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 30909,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 19,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 2044,
+        "bytes": 262889
+      },
+      "latency_p50_micros": 2679,
+      "latency_p99_micros": 2679
+    },
+    {
+      "phase": "retained_validation",
+      "samples": 912,
+      "backend": {
+        "logical_storage_calls": 115324,
+        "get_attempts": 115324,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 175128470,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 427040,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 115324,
+        "denominator": 912
+      },
+      "read_amplification": {
+        "numerator": 175128470,
+        "denominator": 427040
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 427040
+      },
+      "allocations": {
+        "count": 9937522,
+        "bytes": 1053507922
+      },
+      "latency_p50_micros": 14463,
+      "latency_p99_micros": 28991
+    },
+    {
+      "phase": "scan",
+      "samples": 200,
+      "backend": {
+        "logical_storage_calls": 22000,
+        "get_attempts": 21800,
+        "range_get_attempts": 0,
+        "head_attempts": 200,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 36232600,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 96000,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 22000,
+        "denominator": 200
+      },
+      "read_amplification": {
+        "numerator": 36232600,
+        "denominator": 96000
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 96000
+      },
+      "allocations": {
+        "count": 2045800,
+        "bytes": 221810000
+      },
+      "latency_p50_micros": 13800,
+      "latency_p99_micros": 14274
+    },
+    {
+      "phase": "setup_commit",
+      "samples": 256,
+      "backend": {
+        "logical_storage_calls": 1280,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 1280,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 256,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 2214376,
+        "immutable_write_attempt_bytes": 2091860
+      },
+      "logical_payload_bytes": 7570,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 1280,
+        "denominator": 256
+      },
+      "read_amplification": {
+        "numerator": 0,
+        "denominator": 7570
+      },
+      "write_amplification": {
+        "numerator": 2214376,
+        "denominator": 7570
+      },
+      "allocations": {
+        "count": 110512,
+        "bytes": 33769478
+      },
+      "latency_p50_micros": 679,
+      "latency_p99_micros": 1013
+    },
+    {
+      "phase": "stage_write",
+      "samples": 456,
+      "backend": {
+        "logical_storage_calls": 0,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 13570,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 0,
+        "denominator": 456
+      },
+      "read_amplification": {
+        "numerator": 0,
+        "denominator": 13570
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 13570
+      },
+      "allocations": {
+        "count": 912,
+        "bytes": 296400
+      },
+      "latency_p50_micros": 1,
+      "latency_p99_micros": 3
+    }
+  ],
+  "validated_historical_tokens": 456,
+  "expected_backpressure_observed": true
+}

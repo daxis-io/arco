@@ -11,7 +11,7 @@
 //! 1. Lock acquisition writes a lock file with the holder's ID and expiry time
 //! 2. The write uses `DoesNotExist` precondition - only one writer can succeed
 //! 3. If lock exists, check if expired - if so, take it over
-//! 4. Lock release deletes the lock file (or leaves for TTL cleanup)
+//! 4. Lock release expires the lock record in place, preserving its fencing sequence
 //!
 //! # Example
 //!
@@ -51,6 +51,9 @@ const BACKOFF_BASE: Duration = Duration::from_millis(100);
 
 /// Maximum backoff duration.
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// Operation recorded when an operator force-breaks a lock.
+const FORCE_BREAK_OPERATION: &str = "force-break";
 
 /// Lock file contents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,11 +330,53 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
     /// This should only be used for recovery when a lock is known to be stale
     /// but hasn't expired (e.g., crashed holder with long TTL).
     ///
+    /// The record is expired in place via CAS rather than deleted. This
+    /// preserves its fencing sequence so the next holder always outranks the
+    /// holder being broken.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the lock could not be broken.
+    /// Returns an error if the lock could not be broken. A concurrent record
+    /// change returns [`Error::PreconditionFailed`] and is safe to retry.
     pub async fn force_break(&self) -> Result<()> {
-        self.storage.delete(&self.lock_path).await
+        // Bind the sequence decision to the version used for the CAS, matching
+        // the acquisition ordering. A change between HEAD and GET fails the
+        // precondition instead of overwriting the newer owner.
+        let Some(meta) = self.storage.head(&self.lock_path).await? else {
+            return Ok(());
+        };
+        let Some(info) = self.read_lock().await? else {
+            return Ok(());
+        };
+
+        let broken_info = LockInfo {
+            holder_id: info.holder_id,
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            acquired_at: info.acquired_at,
+            sequence_number: info.sequence_number,
+            operation: Some(FORCE_BREAK_OPERATION.to_string()),
+        };
+        let broken_bytes =
+            Bytes::from(
+                serde_json::to_vec(&broken_info).map_err(|error| Error::Internal {
+                    message: format!("serialize broken lock: {error}"),
+                })?,
+            );
+
+        match self
+            .storage
+            .put(
+                &self.lock_path,
+                broken_bytes,
+                WritePrecondition::MatchesVersion(meta.version),
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(()),
+            WriteResult::PreconditionFailed { .. } => Err(Error::PreconditionFailed {
+                message: "lock changed while force-breaking it".into(),
+            }),
+        }
     }
 
     /// Checks if the lock is currently held (regardless of holder).
@@ -873,18 +918,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_force_break() {
+    async fn force_break_preserves_the_fencing_sequence() {
         let backend = Arc::new(MemoryBackend::new());
-        let lock = DistributedLock::new(backend.clone(), "test.lock");
 
-        let _guard = lock
+        for expected in 1..=3_u64 {
+            let lock = DistributedLock::new(backend.clone(), "test.lock");
+            let guard = lock
+                .acquire(Duration::from_secs(30), 1)
+                .await
+                .expect("acquire");
+            assert_eq!(guard.fencing_token().sequence(), expected);
+            guard.release().await.expect("release");
+        }
+
+        let stale_lock = DistributedLock::new(backend.clone(), "test.lock");
+        let stale_guard = stale_lock
+            .acquire(Duration::from_secs(300), 1)
+            .await
+            .expect("stale acquire");
+        assert_eq!(stale_guard.fencing_token().sequence(), 4);
+        assert!(stale_lock.is_locked().await.expect("check"));
+
+        stale_lock.force_break().await.expect("break");
+        assert!(!stale_lock.is_locked().await.expect("check2"));
+        let broken_bytes = backend.get("test.lock").await.expect("broken lock");
+        let broken: LockInfo = serde_json::from_slice(&broken_bytes).expect("parse broken lock");
+        assert_eq!(broken.sequence_number, 4);
+        assert_eq!(broken.operation.as_deref(), Some(FORCE_BREAK_OPERATION));
+
+        let new_lock = DistributedLock::new(backend.clone(), "test.lock");
+        let new_guard = new_lock
             .acquire(Duration::from_secs(30), 1)
             .await
-            .expect("acquire");
-        assert!(lock.is_locked().await.expect("check"));
+            .expect("acquire after break");
+        assert_eq!(new_guard.fencing_token().sequence(), 5);
+        assert!(new_guard.fencing_token() > stale_guard.fencing_token());
 
-        lock.force_break().await.expect("break");
-        assert!(!lock.is_locked().await.expect("check2"));
+        stale_guard
+            .release()
+            .await
+            .expect("stale release must be a no-op");
+        let current_bytes = backend.get("test.lock").await.expect("current lock");
+        let current: LockInfo = serde_json::from_slice(&current_bytes).expect("parse current lock");
+        assert_eq!(current.holder_id, new_guard.holder_id());
+        assert_eq!(current.sequence_number, 5);
+
+        new_guard.release().await.expect("release new holder");
+    }
+
+    #[tokio::test]
+    async fn force_break_without_a_lock_record_is_a_noop() {
+        let backend = Arc::new(MemoryBackend::new());
+        let lock = DistributedLock::new(backend, "test.lock");
+
+        lock.force_break().await.expect("break missing lock");
+        assert!(!lock.is_locked().await.expect("check"));
+    }
+
+    #[tokio::test]
+    async fn force_break_cas_loss_preserves_the_concurrent_owner() {
+        let backend = Arc::new(PauseAfterGetBackend::default());
+        let initial_lock = DistributedLock::new(backend.clone(), "test.lock");
+        let initial_guard = initial_lock
+            .acquire(Duration::from_secs(300), 1)
+            .await
+            .expect("initial acquire");
+
+        backend.pause_after_next_get("test.lock");
+        let breaker_backend = backend.clone();
+        let break_task = tokio::spawn(async move {
+            DistributedLock::new(breaker_backend, "test.lock")
+                .force_break()
+                .await
+        });
+        backend.wait_for_paused_get().await;
+
+        let meta = backend
+            .inner
+            .head("test.lock")
+            .await
+            .expect("head")
+            .expect("lock metadata");
+        let concurrent = LockInfo::new("concurrent-owner", Duration::from_secs(300), 99);
+        let concurrent_bytes = Bytes::from(serde_json::to_vec(&concurrent).expect("serialize"));
+        let write = backend
+            .inner
+            .put(
+                "test.lock",
+                concurrent_bytes,
+                WritePrecondition::MatchesVersion(meta.version),
+            )
+            .await
+            .expect("concurrent write");
+        assert!(matches!(write, WriteResult::Success { .. }));
+
+        backend.resume_paused_get();
+        let result = break_task.await.expect("break task");
+        assert!(matches!(result, Err(Error::PreconditionFailed { .. })));
+
+        let current_bytes = backend.inner.get("test.lock").await.expect("current lock");
+        let current: LockInfo = serde_json::from_slice(&current_bytes).expect("parse current lock");
+        assert_eq!(current.holder_id, "concurrent-owner");
+        assert_eq!(current.sequence_number, 99);
+
+        drop(initial_guard);
     }
 
     #[tokio::test]

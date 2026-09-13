@@ -2,6 +2,8 @@
 #![allow(missing_docs)]
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 use serde::Deserialize;
 
@@ -200,6 +202,50 @@ fn request_time_correctness_never_depends_on_listing() {
             provider.id
         );
     }
+}
+
+#[test]
+fn object_store_memory_evidence_names_the_owning_semantic_test() {
+    const EXPECTED_PATH: &str = "crates/arco-storage-object-store/tests/adapter_contract.rs";
+
+    let matrix = provider_matrix();
+    let provider = matrix
+        .providers
+        .iter()
+        .find(|provider| provider.id == "object-store-memory-backend")
+        .expect("object-store memory provider");
+    for (semantic, evidence) in [
+        ("conditional_create", &provider.evidence.conditional_create),
+        ("pointer_cas", &provider.evidence.pointer_cas),
+        (
+            "stable_version_token",
+            &provider.evidence.stable_version_token,
+        ),
+        (
+            "addressed_read_after_write",
+            &provider.evidence.addressed_read_after_write,
+        ),
+    ] {
+        assert_eq!(
+            evidence,
+            &[EXPECTED_PATH],
+            "object-store-memory {semantic} evidence must name its owning adapter test"
+        );
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("arco-core must live under the workspace root");
+    let source = fs::read_to_string(root.join(EXPECTED_PATH)).expect("read adapter evidence");
+    assert!(
+        source.contains("translates_create_compare_and_swap_range_and_delete"),
+        "adapter evidence must exercise create, CAS, range reads, delete, and recreate"
+    );
+    assert!(
+        source.contains("stale-after-recreate"),
+        "adapter evidence must reject a token retained across delete and recreate"
+    );
 }
 
 #[test]

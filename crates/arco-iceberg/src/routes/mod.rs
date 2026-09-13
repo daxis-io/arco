@@ -1,5 +1,6 @@
 //! Route handlers for Iceberg REST Catalog endpoints.
 
+pub(crate) mod authority;
 pub mod catalog;
 pub mod config;
 pub mod namespaces;

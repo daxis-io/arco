@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
-    CheckpointToken, KeyRange, KvPair, PredicateInputSet, StateScope, StateStoreCapabilities,
-    StateToken, TxnOptions, VersionedValue,
+    CheckpointToken, CommitOutcome, KeyRange, KvPair, PredicateInputSet, ScanPage, ScanRequest,
+    StateScope, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue, build_scan_page,
 };
 use crate::error::{CatalogError, Result};
 
@@ -104,6 +104,7 @@ impl ModelStateStore {
 
     fn token(&self, logical_sequence: u64) -> StateToken {
         StateToken {
+            expected_manifest_sha256: None,
             scope: self.scope.clone(),
             logical_sequence,
             authority_manifest_id: format!("model-state-{logical_sequence:020}"),
@@ -214,6 +215,7 @@ struct StoredValue {
 #[derive(Debug)]
 struct ModelTxn {
     store: ModelStateStore,
+    base_token: StateToken,
     request_id: Option<String>,
     preconditions: Vec<Precondition>,
     writes: BTreeMap<Vec<u8>, StagedWrite>,
@@ -443,19 +445,57 @@ impl ArcoStateReader for ModelStateStore {
             .map(|value| value.bytes.clone()))
     }
 
-    async fn scan_prefix(&self, prefix: &[u8]) -> Result<Vec<KvPair>> {
-        let inner = lock_model_state(&self.inner);
-        Ok(inner
-            .kv
-            .iter()
-            .filter(|(key, value)| key.starts_with(prefix) && !value.tombstone)
-            .map(|(key, value)| {
-                KvPair::new(
-                    key.clone(),
-                    VersionedValue::new(value.bytes.clone(), Some(value.generation)),
-                )
-            })
-            .collect())
+    async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
+        request.validate_for_scope(&self.scope)?;
+        let observed_token = request.continuation_token().cloned().unwrap_or_else(|| {
+            let inner = lock_model_state(&self.inner);
+            self.token(inner.logical_sequence)
+        });
+        if observed_token.scope() != &self.scope {
+            return Err(validation_failed(
+                "scan continuation StateToken scope does not match model store",
+            ));
+        }
+        if observed_token.authority_manifest_id()
+            != self
+                .token(observed_token.logical_sequence())
+                .authority_manifest_id()
+        {
+            return Err(validation_failed(
+                "scan continuation authority manifest does not match model token format",
+            ));
+        }
+
+        let records = {
+            let inner = lock_model_state(&self.inner);
+            if observed_token.logical_sequence() > inner.logical_sequence {
+                return Err(precondition_failed(
+                    "scan continuation is ahead of the current model sequence",
+                ));
+            }
+            inner
+                .log
+                .iter()
+                .filter(|record| record.sequence <= observed_token.logical_sequence())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let retained = Self::replay_from_committed_records(self.scope.clone(), records)?;
+        let entries = {
+            let inner = lock_model_state(&retained.inner);
+            inner
+                .kv
+                .iter()
+                .filter(|(_key, value)| !value.tombstone)
+                .map(|(key, value)| {
+                    KvPair::new(
+                        key.clone(),
+                        VersionedValue::new(value.bytes.clone(), Some(value.generation)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        build_scan_page(&self.scope, request, Some(observed_token), entries)
     }
 
     async fn read_at(&self, token: StateToken) -> Result<Box<dyn ArcoStateReader>> {
@@ -517,6 +557,7 @@ impl ArcoStateAdmin for ModelStateStore {
 #[async_trait]
 impl ArcoStateStore for ModelStateStore {
     async fn begin_txn(&self, opts: TxnOptions) -> Result<Box<dyn ArcoStateTxn>> {
+        opts.validate()?;
         if let Some(scope) = opts.scope()
             && scope != &self.scope
         {
@@ -526,6 +567,10 @@ impl ArcoStateStore for ModelStateStore {
         }
 
         Ok(Box::new(ModelTxn {
+            base_token: {
+                let inner = lock_model_state(&self.inner);
+                self.token(inner.logical_sequence)
+            },
             store: self.clone(),
             request_id: opts.request_id().map(ToOwned::to_owned),
             preconditions: Vec::new(),
@@ -552,13 +597,32 @@ impl ArcoStateTxn for ModelTxn {
             .map(|value| VersionedValue::new(value.bytes.clone(), Some(value.generation))))
     }
 
-    async fn scan_prefix(&mut self, prefix: &[u8]) -> Result<Vec<KvPair>> {
+    async fn scan(&mut self, request: ScanRequest) -> Result<ScanPage> {
+        request.validate_for_scope(&self.store.scope)?;
+        if request
+            .continuation_token()
+            .is_some_and(|token| token != &self.base_token)
+        {
+            return Err(validation_failed(
+                "transaction scan continuation does not match its base authority",
+            ));
+        }
         let mut entries = {
             let inner = lock_model_state(&self.store.inner);
-            inner
+            let records = inner
+                .log
+                .iter()
+                .filter(|record| record.sequence <= self.base_token.logical_sequence())
+                .cloned()
+                .collect::<Vec<_>>();
+            drop(inner);
+            let retained =
+                ModelStateStore::replay_from_committed_records(self.store.scope.clone(), records)?;
+            let retained = lock_model_state(&retained.inner);
+            retained
                 .kv
                 .iter()
-                .filter(|(key, value)| key.starts_with(prefix) && !value.tombstone)
+                .filter(|(_key, value)| !value.tombstone)
                 .map(|(key, value)| {
                     (
                         key.clone(),
@@ -569,7 +633,7 @@ impl ArcoStateTxn for ModelTxn {
         };
 
         for (key, write) in &self.writes {
-            if key.starts_with(prefix) {
+            if key.starts_with(request.prefix()) {
                 match write {
                     StagedWrite::Put(bytes) => {
                         entries.insert(key.clone(), VersionedValue::new(bytes.clone(), None));
@@ -581,10 +645,16 @@ impl ArcoStateTxn for ModelTxn {
             }
         }
 
-        Ok(entries
+        let entries = entries
             .into_iter()
             .map(|(key, value)| KvPair::new(key, value))
-            .collect())
+            .collect::<Vec<_>>();
+        build_scan_page(
+            &self.store.scope,
+            request,
+            Some(self.base_token.clone()),
+            entries,
+        )
     }
 
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
@@ -697,7 +767,7 @@ impl ArcoStateTxn for ModelTxn {
         Ok(())
     }
 
-    async fn commit(self: Box<Self>) -> Result<StateToken> {
+    async fn commit(self: Box<Self>) -> Result<CommitOutcome> {
         let store = self.store.clone();
         let next_sequence = {
             let mut inner = lock_model_state(&store.inner);
@@ -753,7 +823,7 @@ impl ArcoStateTxn for ModelTxn {
             next_sequence
         };
 
-        Ok(store.token(next_sequence))
+        Ok(CommitOutcome::new(store.token(next_sequence), Vec::new()))
     }
 
     async fn rollback(self: Box<Self>) -> Result<()> {

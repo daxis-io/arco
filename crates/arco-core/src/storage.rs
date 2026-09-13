@@ -18,13 +18,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
-use http::Method;
-use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as ObjectStorePath;
-use object_store::signer::Signer as ObjectStoreSigner;
-use object_store::{DynObjectStore, PutMode, PutOptions, UpdateVersion};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::{
@@ -40,6 +33,7 @@ use crate::error::{Error, Result};
 /// The version token is opaque - backends interpret it according to their semantics:
 /// - GCS: Numeric generation as string
 /// - S3: `ETag` or version ID
+/// - Azure: `ETag`
 #[derive(Debug, Clone)]
 pub enum WritePrecondition {
     /// Write only if object does not exist.
@@ -79,11 +73,34 @@ pub struct ObjectMeta {
     /// This is an opaque string that backends interpret:
     /// - GCS: Numeric generation as string
     /// - S3: `ETag` or version ID
+    /// - Azure: `ETag`
     pub version: String,
     /// Last modification timestamp.
     pub last_modified: Option<DateTime<Utc>>,
     /// Entity tag for cache validation.
     pub etag: Option<String>,
+}
+
+/// One bounded, lexicographically ordered page of object metadata.
+#[derive(Debug, Clone)]
+pub struct ListPage {
+    /// Objects in strictly increasing path order.
+    pub objects: Vec<ObjectMeta>,
+    /// Exclusive path cursor for the next page.
+    ///
+    /// A full page carries a cursor even when it was the final page. In that
+    /// exact-multiple case, the following request returns an empty page with no
+    /// cursor and establishes exhaustion without reading ahead.
+    pub next_start_after: Option<String>,
+}
+
+impl ListPage {
+    fn empty() -> Self {
+        Self {
+            objects: Vec::new(),
+            next_start_after: None,
+        }
+    }
 }
 
 /// Storage backend trait for object storage.
@@ -129,6 +146,32 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// the results (e.g., by `path` or `last_modified`).
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
 
+    /// Lists one bounded page under `prefix`, starting strictly after
+    /// `start_after` in lexicographic path order.
+    ///
+    /// Implementations must return at most `limit` objects. A full page returns
+    /// the final path as [`ListPage::next_start_after`]; a short page proves
+    /// exhaustion and returns no cursor. A zero limit performs no listing and
+    /// returns an empty exhausted page.
+    ///
+    /// The default deliberately fails closed. Falling back to [`Self::list`]
+    /// would make a nominally bounded scan enumerate the entire prefix.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        validate_page_cursor(prefix, start_after)?;
+        if limit == 0 {
+            return Ok(ListPage::empty());
+        }
+        let _ = (prefix, start_after);
+        Err(Error::storage(
+            "bounded ordered listing is not supported by this storage backend",
+        ))
+    }
+
     /// Gets object metadata without reading content.
     ///
     /// Returns `None` if object doesn't exist.
@@ -140,354 +183,60 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String>;
 }
 
-/// Storage backend adapter for [`object_store`] implementations.
-///
-/// This bridges the Arco `StorageBackend` contract (CAS writes, listing, signed URLs)
-/// onto an `object_store::ObjectStore`.
-///
-/// ## Version Tokens
-///
-/// Object stores provide conditional update semantics using a combination of:
-/// - `e_tag` (HTTP etag)
-/// - `version` (backend-specific version ID)
-///
-/// Arco exposes these as an opaque `String` version token. This adapter encodes
-/// the pair `{e_tag, version}` as a JSON string so callers can preserve both.
-#[derive(Debug, Clone)]
-pub struct ObjectStoreBackend {
-    store: Arc<DynObjectStore>,
-    signer: Option<Arc<dyn ObjectStoreSigner>>,
+fn validate_page_cursor(prefix: &str, start_after: Option<&str>) -> Result<()> {
+    let Some(start_after) = start_after else {
+        return Ok(());
+    };
+    let boundary = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    };
+    if !prefix.is_empty() && start_after != prefix && !start_after.starts_with(&boundary) {
+        return Err(Error::InvalidInput(format!(
+            "list cursor '{start_after}' is outside prefix '{prefix}'"
+        )));
+    }
+    Ok(())
 }
 
-impl ObjectStoreBackend {
-    /// Creates a new backend adapter.
-    #[must_use]
-    pub fn new(store: Arc<DynObjectStore>, signer: Option<Arc<dyn ObjectStoreSigner>>) -> Self {
-        Self { store, signer }
+fn validate_ordered_page(
+    prefix: &str,
+    start_after: Option<&str>,
+    limit: usize,
+    objects: &[ObjectMeta],
+) -> Result<()> {
+    if objects.len() > limit {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' returned {} objects for limit {limit}",
+            objects.len()
+        )));
     }
-
-    /// Creates a Google Cloud Storage backend for the given bucket.
-    ///
-    /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
-    /// `gs://` prefix (`gs://my-bucket`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the GCS client cannot be configured.
-    pub fn gcs(bucket: &str) -> Result<Self> {
-        let bucket = normalize_bucket("gs://", bucket);
-        if bucket.is_empty() {
-            return Err(Error::InvalidInput(
-                "ARCO_STORAGE_BUCKET cannot be empty".to_string(),
-            ));
-        }
-
-        let gcs = object_store::gcp::GoogleCloudStorageBuilder::new()
-            .with_bucket_name(&bucket)
-            .build()
-            .map_err(|e| {
-                Error::storage_with_source(format!("failed to configure GCS bucket '{bucket}'"), e)
-            })?;
-
-        let gcs = Arc::new(gcs);
-        let store: Arc<DynObjectStore> = gcs.clone();
-        let signer: Arc<dyn ObjectStoreSigner> = gcs;
-        Ok(Self::new(store, Some(signer)))
+    if let (Some(start_after), Some(first)) = (start_after, objects.first())
+        && first.path.as_str() <= start_after
+    {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' returned non-exclusive path '{}' after '{start_after}'",
+            first.path
+        )));
     }
-
-    /// Creates an Amazon S3 backend for the given bucket.
-    ///
-    /// `bucket` may be provided as a bare bucket name (`my-bucket`) or with a
-    /// `s3://` prefix (`s3://my-bucket`).
-    ///
-    /// # Certification status
-    ///
-    /// **NOT certified for production use.** This provider has no CAS
-    /// conformance evidence: the only test exercising the CAS/precondition
-    /// contract against real S3 (`s3_backend_satisfies_storage_conformance` in
-    /// `tests/storage_backend_conformance.rs`) is `#[ignore]`d, and the
-    /// scheduled runner (`.github/workflows/s3-conformance.yml`) has never
-    /// passed against a real bucket. Until it does, the version-fenced CAS
-    /// semantics the publish protocol depends on are UNVERIFIED on S3.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the S3 client cannot be configured.
-    pub fn s3(bucket: &str) -> Result<Self> {
-        let bucket = normalize_bucket("s3://", bucket);
-        if bucket.is_empty() {
-            return Err(Error::InvalidInput(
-                "ARCO_STORAGE_BUCKET cannot be empty".to_string(),
-            ));
-        }
-
-        let s3 = AmazonS3Builder::from_env()
-            .with_bucket_name(&bucket)
-            .build()
-            .map_err(|e| {
-                Error::storage_with_source(format!("failed to configure S3 bucket '{bucket}'"), e)
-            })?;
-
-        let s3 = Arc::new(s3);
-        let store: Arc<DynObjectStore> = s3.clone();
-        let signer: Arc<dyn ObjectStoreSigner> = s3;
-        Ok(Self::new(store, Some(signer)))
+    if let Some((left, right)) = objects.windows(2).find_map(|window| match window {
+        [left, right] if left.path >= right.path => Some((left, right)),
+        _ => None,
+    }) {
+        return Err(Error::storage(format!(
+            "bounded list for '{prefix}' was not strictly ordered: '{}' then '{}'",
+            left.path, right.path
+        )));
     }
-
-    /// Creates a storage backend from a bucket string, inferring the provider.
-    ///
-    /// Defaults to GCS when no scheme prefix is provided.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the backend cannot be configured.
-    pub fn from_bucket(bucket: &str) -> Result<Self> {
-        let trimmed = bucket.trim();
-        if trimmed.starts_with("s3://") || trimmed.starts_with("s3a://") {
-            return Self::s3(trimmed);
-        }
-        if trimmed.starts_with("gs://") || trimmed.starts_with("gcs://") {
-            return Self::gcs(trimmed);
-        }
-
-        Self::gcs(trimmed)
-    }
+    Ok(())
 }
 
-fn normalize_bucket(prefix: &str, raw: &str) -> String {
-    let trimmed = raw.trim();
-    let no_prefix = trimmed
-        .strip_prefix(prefix)
-        .or_else(|| match prefix {
-            "gs://" => trimmed.strip_prefix("gcs://"),
-            "s3://" => trimmed.strip_prefix("s3a://"),
-            _ => None,
-        })
-        .unwrap_or(trimmed);
-
-    no_prefix
-        .split_once('/')
-        .map_or(no_prefix, |(bucket, _)| bucket)
-        .trim()
-        .to_string()
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct VersionToken {
-    e_tag: Option<String>,
-    version: Option<String>,
-}
-
-impl VersionToken {
-    fn from_parts(e_tag: Option<String>, version: Option<String>) -> Self {
-        Self { e_tag, version }
-    }
-
-    fn to_update_version(&self) -> UpdateVersion {
-        UpdateVersion {
-            e_tag: self.e_tag.clone(),
-            version: self.version.clone(),
-        }
-    }
-
-    fn encode(&self) -> String {
-        match serde_json::to_string(self) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to serialize version token; falling back to raw version");
-                self.version.clone().unwrap_or_default()
-            }
-        }
-    }
-
-    fn decode(token: &str) -> Self {
-        let token = token.trim();
-        if token.is_empty() {
-            return Self::from_parts(None, None);
-        }
-
-        // Prefer the structured encoding used by this adapter.
-        if let Ok(v) = serde_json::from_str::<Self>(token) {
-            return v;
-        }
-
-        // Backwards/interop fallback: treat the token as a raw `version` string.
-        Self::from_parts(None, Some(token.to_string()))
-    }
-}
-
-fn map_object_store_error(err: object_store::Error) -> Error {
-    match err {
-        object_store::Error::NotFound { path, .. } => Error::NotFound(path),
-        object_store::Error::InvalidPath { source } => {
-            Error::InvalidInput(format!("invalid object store path: {source}"))
-        }
-        err @ object_store::Error::PermissionDenied { .. } => {
-            Error::storage_with_source("permission denied".to_string(), err)
-        }
-        err @ object_store::Error::Unauthenticated { .. } => {
-            Error::storage_with_source("unauthenticated".to_string(), err)
-        }
-        err => Error::storage_with_source("object store error".to_string(), err),
-    }
-}
-
-fn is_object_store_write_precondition_failure(
-    precondition: &WritePrecondition,
-    err: &object_store::Error,
-) -> bool {
-    match precondition {
-        WritePrecondition::None => false,
-        WritePrecondition::DoesNotExist => matches!(
-            err,
-            object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }
-        ),
-        WritePrecondition::MatchesVersion(_) => match err {
-            object_store::Error::Precondition { .. } | object_store::Error::NotFound { .. } => true,
-            object_store::Error::Generic { source, .. } => {
-                let message = source.to_string();
-                message.contains("ETag required for conditional update")
-                    || message.contains("MissingETag")
-            }
-            _ => false,
-        },
-    }
-}
-
-fn object_store_meta_to_meta(meta: object_store::ObjectMeta) -> ObjectMeta {
-    let version = VersionToken::from_parts(meta.e_tag.clone(), meta.version.clone()).encode();
-    ObjectMeta {
-        path: meta.location.to_string(),
-        size: u64::try_from(meta.size).unwrap_or(u64::MAX),
-        version,
-        last_modified: Some(meta.last_modified),
-        etag: meta.e_tag,
-    }
-}
-
-#[async_trait]
-impl StorageBackend for ObjectStoreBackend {
-    async fn get(&self, path: &str) -> Result<Bytes> {
-        let location = ObjectStorePath::from(path);
-        let result = self
-            .store
-            .get(&location)
-            .await
-            .map_err(map_object_store_error)?;
-        result.bytes().await.map_err(map_object_store_error)
-    }
-
-    async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
-        let meta = self
-            .head(path)
-            .await?
-            .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))?;
-
-        let size_usize = usize::try_from(meta.size).map_err(|_| {
-            Error::InvalidInput(format!(
-                "object size too large for range requests: {}",
-                meta.size
-            ))
-        })?;
-
-        let start = usize::try_from(range.start)
-            .map_err(|_| Error::InvalidInput(format!("range start too large: {}", range.start)))?;
-
-        if start > size_usize {
-            return Err(Error::InvalidInput(format!(
-                "range start {start} exceeds object length {size_usize}"
-            )));
-        }
-
-        let end = usize::try_from(range.end)
-            .unwrap_or(usize::MAX)
-            .min(size_usize);
-
-        if end < start {
-            return Err(Error::InvalidInput(format!(
-                "range end {end} is before start {start}"
-            )));
-        }
-
-        let location = ObjectStorePath::from(path);
-        self.store
-            .get_range(&location, start..end)
-            .await
-            .map_err(map_object_store_error)
-    }
-
-    async fn put(
-        &self,
-        path: &str,
-        data: Bytes,
-        precondition: WritePrecondition,
-    ) -> Result<WriteResult> {
-        let location = ObjectStorePath::from(path);
-        let opts = match &precondition {
-            WritePrecondition::DoesNotExist => PutOptions::from(PutMode::Create),
-            WritePrecondition::MatchesVersion(token) => {
-                let token = VersionToken::decode(token);
-                PutOptions::from(PutMode::Update(token.to_update_version()))
-            }
-            WritePrecondition::None => PutOptions::default(),
-        };
-
-        match self.store.put_opts(&location, data.into(), opts).await {
-            Ok(result) => {
-                let version = VersionToken::from_parts(result.e_tag, result.version).encode();
-                Ok(WriteResult::Success { version })
-            }
-            Err(e) if is_object_store_write_precondition_failure(&precondition, &e) => {
-                let current = self.head(path).await?;
-                let current_version = current.map_or_else(String::new, |m| m.version);
-                Ok(WriteResult::PreconditionFailed { current_version })
-            }
-            Err(e) => Err(map_object_store_error(e)),
-        }
-    }
-
-    async fn delete(&self, path: &str) -> Result<()> {
-        let location = ObjectStorePath::from(path);
-        match self.store.delete(&location).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(map_object_store_error(e)),
-        }
-    }
-
-    async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
-        let prefix = ObjectStorePath::from(prefix);
-        let metas = self
-            .store
-            .list(Some(&prefix))
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(map_object_store_error)?;
-
-        Ok(metas.into_iter().map(object_store_meta_to_meta).collect())
-    }
-
-    async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
-        let location = ObjectStorePath::from(path);
-        match self.store.head(&location).await {
-            Ok(meta) => Ok(Some(object_store_meta_to_meta(meta))),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(map_object_store_error(e)),
-        }
-    }
-
-    async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
-        let Some(signer) = self.signer.as_ref() else {
-            return Err(Error::storage(
-                "signed URLs are not supported by this storage backend".to_string(),
-            ));
-        };
-
-        let location = ObjectStorePath::from(path);
-        let url = signer
-            .signed_url(Method::GET, &location, expiry)
-            .await
-            .map_err(map_object_store_error)?;
-        Ok(url.to_string())
+fn next_start_after(objects: &[ObjectMeta], limit: usize) -> Option<String> {
+    if objects.len() == limit {
+        objects.last().map(|meta| meta.path.clone())
+    } else {
+        None
     }
 }
 
@@ -631,6 +380,33 @@ impl StorageBackend for MemoryBackend {
                 etag: Some(format!("\"{}\"", obj.version)),
             })
             .collect())
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        validate_page_cursor(prefix, start_after)?;
+        if limit == 0 {
+            return Ok(ListPage::empty());
+        }
+
+        let mut objects = self.list(prefix).await?;
+        objects.sort_by(|left, right| left.path.cmp(&right.path));
+        if let Some(start_after) = start_after {
+            let first = objects.partition_point(|meta| meta.path.as_str() <= start_after);
+            objects.drain(..first);
+        }
+        objects.truncate(limit);
+        validate_ordered_page(prefix, start_after, limit, &objects)?;
+
+        let next_start_after = next_start_after(&objects, limit);
+        Ok(ListPage {
+            objects,
+            next_start_after,
+        })
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
@@ -954,6 +730,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_page_is_exclusive_and_exact_multiples_end_empty() {
+        let backend = MemoryBackend::new();
+        for index in 0..6 {
+            backend
+                .put(
+                    &format!("ledger/evt-{index:02}.json"),
+                    Bytes::from_static(b"event"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("seed page object");
+        }
+
+        let first = backend
+            .list_page("ledger/", None, 3)
+            .await
+            .expect("first page");
+        let first_paths: Vec<&str> = first
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            first_paths,
+            [
+                "ledger/evt-00.json",
+                "ledger/evt-01.json",
+                "ledger/evt-02.json"
+            ]
+        );
+        assert_eq!(
+            first.next_start_after.as_deref(),
+            Some("ledger/evt-02.json")
+        );
+
+        let second = backend
+            .list_page("ledger/", first.next_start_after.as_deref(), 3)
+            .await
+            .expect("second page");
+        let second_paths: Vec<&str> = second
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            second_paths,
+            [
+                "ledger/evt-03.json",
+                "ledger/evt-04.json",
+                "ledger/evt-05.json"
+            ]
+        );
+        assert_eq!(
+            second.next_start_after.as_deref(),
+            Some("ledger/evt-05.json")
+        );
+
+        let exhausted = backend
+            .list_page("ledger/", second.next_start_after.as_deref(), 3)
+            .await
+            .expect("exhaustion page");
+        assert!(exhausted.objects.is_empty());
+        assert!(exhausted.next_start_after.is_none());
+    }
+
+    #[tokio::test]
     async fn test_delete() {
         let backend = MemoryBackend::new();
 
@@ -973,27 +815,5 @@ mod tests {
         run_precondition_conformance(&backend, "memory")
             .await
             .expect("memory backend must satisfy precondition conformance");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires ARCO_TEST_GCS_BUCKET and cloud credentials"]
-    async fn test_gcs_backend_precondition_conformance_harness() {
-        let bucket = std::env::var("ARCO_TEST_GCS_BUCKET")
-            .expect("ARCO_TEST_GCS_BUCKET must be set for this test");
-        let backend = ObjectStoreBackend::gcs(&bucket).expect("gcs backend");
-        run_precondition_conformance(&backend, "gcs")
-            .await
-            .expect("gcs backend must satisfy precondition conformance");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires ARCO_TEST_S3_BUCKET and cloud credentials"]
-    async fn test_s3_backend_precondition_conformance_harness() {
-        let bucket = std::env::var("ARCO_TEST_S3_BUCKET")
-            .expect("ARCO_TEST_S3_BUCKET must be set for this test");
-        let backend = ObjectStoreBackend::s3(&bucket).expect("s3 backend");
-        run_precondition_conformance(&backend, "s3")
-            .await
-            .expect("s3 backend must satisfy precondition conformance");
     }
 }

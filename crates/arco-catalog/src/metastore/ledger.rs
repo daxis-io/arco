@@ -40,6 +40,19 @@ pub struct MetastoreLedger {
 
 impl MetastoreLedger {
     /// Creates a metastore ledger over scoped storage.
+    ///
+    /// Tenant identity cannot be constructed through the legacy storage API.
+    /// Its future ledger requires a separate typed identity mutation envelope.
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use arco_core::{MemoryBackend, ScopedStorage};
+    /// use arco_catalog::metastore::ledger::MetastoreLedger;
+    /// let storage = ScopedStorage::new_identity_scoped(
+    ///     Arc::new(MemoryBackend::new()), "acme",
+    /// ).unwrap();
+    /// let ledger = MetastoreLedger::new(storage);
+    /// ```
     #[must_use]
     pub fn new(storage: ScopedStorage) -> Self {
         Self { storage }
@@ -550,6 +563,14 @@ impl MetastoreLedger {
     }
 
     fn validate_event_scope(&self, event: &MetastoreEvent) -> Result<()> {
+        if !matches!(
+            self.storage.scope().root(),
+            arco_core::AuthorityRoot::Workspace { .. } | arco_core::AuthorityRoot::Metastore { .. }
+        ) {
+            return Err(CatalogError::Validation {
+                message: "metastore ledger requires a workspace or metastore authority root".into(),
+            });
+        }
         let Some(scope) = event.scope.as_ref() else {
             return Err(CatalogError::Validation {
                 message: format!(
@@ -558,19 +579,16 @@ impl MetastoreLedger {
                 ),
             });
         };
-        if scope.tenant_id != self.storage.tenant_id() {
+        if !self.storage.scope().matches_durable_root(
+            &scope.tenant_id,
+            &scope.workspace_id,
+            &scope.metastore_id,
+        ) {
             return Err(CatalogError::Validation {
                 message: format!(
-                    "metastore event '{}' tenant scope does not match storage scope",
-                    event.event_id
-                ),
-            });
-        }
-        if scope.workspace_id != self.storage.workspace_id() {
-            return Err(CatalogError::Validation {
-                message: format!(
-                    "metastore event '{}' workspace scope does not match storage scope",
-                    event.event_id
+                    "metastore event '{}' scope does not match storage authority '{}'",
+                    event.event_id,
+                    self.storage.scope().prefix()
                 ),
             });
         }

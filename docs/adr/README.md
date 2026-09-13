@@ -30,7 +30,7 @@ Each ADR follows this structure:
 | [015](adr-015-postgres-store.md) | Postgres orchestration store | Superseded |
 | [016](adr-016-tenant-quotas.md) | Tenant quotas and fairness | Deprecated |
 | [017](adr-017-cloud-tasks-dispatcher.md) | Cloud Tasks dispatcher | Accepted |
-| [018](adr-018-tier1-write-path.md) | Tier-1 write path architecture | Accepted |
+| [018](adr-018-tier1-write-path.md) | Tier-1 write path architecture | Accepted legacy path per uncut root |
 | [019](adr-019-existence-privacy.md) | Existence privacy | Accepted |
 | [020](adr-020-orchestration-domain.md) | Orchestration as unified domain | Accepted |
 | [021](adr-021-cloud-tasks-naming.md) | Cloud Tasks naming convention | Accepted |
@@ -55,3 +55,5 @@ Each ADR follows this structure:
 | [040](adr-040-execution-locations.md) | Execution Locations | Accepted |
 | [041](adr-041-tiered-object-storage-orchestration-event-log.md) | Tiered Object-Storage Orchestration Event Log | Accepted |
 | [042](adr-042-lineage-observation-projection.md) | Lineage Observation And Projection Architecture | Proposed |
+| [043](adr-043-s3-state-token-authority.md) | S3 StateToken Authority | Accepted |
+| [044](adr-044-tenant-level-identity-authority.md) | Tenant Level Identity Authority | Accepted |

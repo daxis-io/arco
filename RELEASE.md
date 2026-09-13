@@ -33,6 +33,8 @@ cargo xtask proto-breaking-check
 cargo xtask ci-parity
 cargo xtask uc-openapi-inventory
 git diff --exit-code -- docs/guide/src/reference/unity-catalog-openapi-inventory.md
+cargo xtask uc-delta-openapi-inventory
+git diff --exit-code -- docs/guide/src/reference/unity-catalog-delta-openapi-inventory.md
 cargo check --workspace --all-features
 cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
 cd docs/guide && mdbook build

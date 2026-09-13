@@ -2,11 +2,9 @@ name: S3 Storage Conformance
 
 # Evidence-integrity companion to adr-034-gcs-conformance.yml (#366).
 #
-# ObjectStoreBackend::s3 exists in crates/arco-core/src/storage.rs, but the
-# only test that exercises the CAS/precondition contract against real S3
-# (s3_backend_satisfies_storage_conformance) is #[ignore]d and, before this
-# workflow, had no runner anywhere. Until this workflow passes against a real
-# bucket, the S3 provider is NOT certified for production use.
+# The S3 adapter and its ignored live CAS test are owned by arco-storage-s3.
+# Until this workflow passes against a real bucket, the S3 provider is NOT
+# certified for production use.
 #
 # TRIGGER POLICY: dispatch-only, deliberately. A missing configuration here is
 # a loud failure and never a green skip — but no AWS bucket or credentials are
@@ -51,6 +49,14 @@ jobs:
         with:
           cache-targets: "false"
 
+      - name: Verify S3 conformance test discovery
+        run: |
+          discovered_tests="$(
+            cargo test --locked -p arco-storage-s3 --test live_conformance -- --ignored --list |
+              grep -Fxc 's3_backend_satisfies_storage_conformance: test'
+          )"
+          test "$discovered_tests" -eq 1
+
       # Static-key auth only for now: AmazonS3Builder::from_env reads the AWS_*
       # environment variables directly, so no third-party credentials action is
       # required. When AWS OIDC infra exists, add a role-assumption mode here
@@ -80,8 +86,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
-          cargo test --locked -p arco-core --test storage_backend_conformance \
-            s3_backend_satisfies_storage_conformance -- --ignored --nocapture
+          cargo test --locked -p arco-storage-s3 --test live_conformance \
+            s3_backend_satisfies_storage_conformance -- --ignored --exact --nocapture
 
       - name: Fail on missing S3 conformance configuration
         if: steps.prereq.outputs.configured != 'true'

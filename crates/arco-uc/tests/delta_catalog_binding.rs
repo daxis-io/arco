@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use arco_catalog::{
-    CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
+    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogWriter, ColumnDefinition,
+    RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
 };
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, WritePrecondition};
@@ -37,6 +38,18 @@ struct Harness {
 fn make_harness() -> Harness {
     let backend = Arc::new(MemoryBackend::new());
     let state = UnityCatalogState::new(backend.clone());
+    let router = unity_catalog_router(state);
+    let storage = ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage");
+    Harness { router, storage }
+}
+
+fn make_control_v1_harness() -> Harness {
+    let backend = Arc::new(MemoryBackend::new());
+    let bindings =
+        CatalogAuthorityBindings::new([CatalogAuthorityBinding::control_v1(TENANT, WORKSPACE)])
+            .expect("exact control/v1 binding");
+    let state =
+        UnityCatalogState::new(backend.clone()).with_catalog_authority_bindings(Arc::new(bindings));
     let router = unity_catalog_router(state);
     let storage = ScopedStorage::new(backend, TENANT, WORKSPACE).expect("scoped storage");
     Harness { router, storage }
@@ -260,6 +273,36 @@ async fn uc_delta_preview_rejects_unknown_table_before_existing_state() -> Resul
         "unknown table must not stage payloads"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_v1_root_rejects_delta_commit_before_catalog_or_storage_access()
+-> Result<(), String> {
+    let harness = make_control_v1_harness();
+    let table_id = Uuid::now_v7();
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/path",
+            "commit_info": commit_info(0)
+        }),
+        Some(&Uuid::now_v7().to_string()),
+        Some("req-control-v1-disabled"),
+    )
+    .await?;
+
+    assert_error(
+        &response,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "CATALOG_AUTHORITY_TABLE_COMMIT_DISABLED",
+        "req-control-v1-disabled",
+    );
+    assert!(!response.body_text.contains("StateToken"));
+    assert_no_delta_side_effects(&harness.storage, table_id).await?;
     Ok(())
 }
 

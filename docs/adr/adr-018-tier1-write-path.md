@@ -2,9 +2,15 @@
 
 ## Status
 
-Accepted
+Accepted (active legacy path until each authority root cuts over)
 
 ## Context
+
+ADR-043 is the canonical target authority decision. This ADR continues to
+describe the active catalog write path for every root that has not completed an
+ADR-043 hard cut. It is superseded separately for each bound root only after the
+old writer has been revoked and `control/v1` has accepted authority. It is not a
+fallback after that point.
 
 Gate 5 hardening requires "IAM-enforced sole writer for state files" but the current
 `Tier1Writer` writes Parquet snapshots directly to `snapshots/{domain}/`. This creates

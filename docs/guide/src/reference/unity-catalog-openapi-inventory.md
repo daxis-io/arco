@@ -1,6 +1,6 @@
 # Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)
 
-**Spec SHA256:** `129c4155257f89d599e03833fffc9d2534432307a3497df3921ecdebfe5d7f15`  
+**Spec SHA256:** `c31a5807e3732a176848e3b1b328be76f78bc9aad502a71ca4e80578b5a8cde0`  
 **Spec fixture:** `crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml`  
 **Spec title:** Unity Catalog API  
 **Spec version:** 0.1  
@@ -36,6 +36,8 @@ Clients are expected to do active backfill of the commit after committing to UC.
 most cases the number of unbackfilled commits should be close to zero or one. But if
 clients misbehave and unbackfilled commits accumulate beyond the limit, server will
 reject further commits until more backfill is done.
+Replaying an already-accepted commit (same version and file-name) is an idempotent no-op
+that returns 200, so a client that lost the response can safely resend.
 WARNING: This API is experimental and may change in future versions.
 
 

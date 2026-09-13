@@ -1,8 +1,17 @@
-//! Tenant + workspace scoped storage with architecture-aligned path layout.
+//! Scope-rooted storage over a typed [`AuthorityScope`].
 //!
-//! This module enforces the documented storage layout for multi-tenant, multi-workspace
-//! catalog operations. All paths are prefixed with `tenant={tenant}/workspace={workspace}/`.
-//! Per unified platform design: tenant + workspace = primary scoping boundary.
+//! This module enforces the documented storage layout for multi-tenant,
+//! multi-workspace catalog operations. Every path is prefixed with the
+//! typed-authority root the storage was constructed for.
+//!
+//! ```text
+//! tenant={t}/metastore={m}/    metastore / catalog authority root
+//! tenant={t}/workspace={w}/    workspace / execution root
+//! ```
+//!
+//! Tenant identity has a typed root value but cannot be constructed through this
+//! legacy storage API. Its separate mutation API and root-aware state protocol
+//! must be implemented before identity storage is enabled.
 //!
 //! The key=value path format provides:
 //! - Operational ergonomics (grep-friendly: `tenant=acme` is self-documenting)
@@ -12,37 +21,36 @@
 //! # Security
 //!
 //! This module enforces strict path isolation:
-//! - All paths are prefixed with tenant/workspace scope
+//! - All paths are prefixed with the authority-root scope
 //! - Path traversal attempts (`..`) are rejected
-//! - Tenant/workspace IDs are validated at construction
+//! - Scope IDs are validated at construction
 
 use bytes::Bytes;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::authority_root::AuthorityScope;
 use crate::catalog_paths::{CatalogDomain, CatalogPaths};
 use crate::control_plane_scope::ControlPlaneScope;
 use crate::error::{Error, Result};
-use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use crate::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use async_trait::async_trait;
 
-/// Tenant + workspace scoped storage wrapper.
-///
-/// Enforces isolation by prefixing all paths with `tenant={tenant}/workspace={workspace}/`.
-/// Path helpers align with the documented catalog storage layout.
+/// A scoped storage wrapper.
 #[derive(Clone)]
 pub struct ScopedStorage {
     backend: Arc<dyn StorageBackend>,
-    tenant_id: String,
-    workspace_id: String,
-    scope_prefix: String,
+    scope: AuthorityScope,
+    // Metastore roots retain the caller's execution context for legacy consumers.
+    // Durable paths and event validation use `scope`, not this workspace context.
+    workspace_context: String,
 }
 
-/// Metadata about an object relative to a tenant/workspace scope.
+/// Metadata about an object relative to the scoped storage root.
 #[derive(Debug, Clone)]
 pub struct ScopedObjectMeta {
-    /// Object path relative to the scope (no `tenant=.../workspace=.../` prefix).
+    /// Object path relative to the scope root (no `tenant=…` authority prefix).
     pub path: ScopedPath,
     /// Object size in bytes.
     pub size: u64,
@@ -54,6 +62,15 @@ pub struct ScopedObjectMeta {
     pub etag: Option<String>,
 }
 
+/// One bounded page of metadata relative to the scoped storage root.
+#[derive(Debug, Clone)]
+pub struct ScopedListPage {
+    /// Objects in strictly increasing scope-relative path order.
+    pub objects: Vec<ScopedObjectMeta>,
+    /// Exclusive scope-relative path cursor for the next page.
+    pub next_start_after: Option<String>,
+}
+
 fn scoped_list_boundary(prefix: &str) -> String {
     if prefix.is_empty() || prefix.ends_with('/') {
         prefix.to_string()
@@ -63,33 +80,28 @@ fn scoped_list_boundary(prefix: &str) -> String {
 }
 
 impl ScopedStorage {
-    /// Creates a new scoped storage wrapper.
+    /// Creates workspace-scoped storage.
     ///
     /// # Errors
     ///
     /// Returns an error if `tenant_id` or `workspace_id` is invalid.
-    /// IDs must be non-empty, ASCII lowercase alphanumeric (plus `-` and `_`),
-    /// and must not contain path separators or other control characters.
     pub fn new(
         backend: Arc<dyn StorageBackend>,
         tenant_id: impl Into<String>,
         workspace_id: impl Into<String>,
     ) -> Result<Self> {
-        let tenant_id = tenant_id.into();
-        let workspace_id = workspace_id.into();
-
-        Self::validate_id(&tenant_id, "tenant_id")?;
-        Self::validate_id(&workspace_id, "workspace_id")?;
-
+        let workspace_context = workspace_id.into();
         Ok(Self {
             backend,
-            scope_prefix: format!("tenant={tenant_id}/workspace={workspace_id}"),
-            tenant_id,
-            workspace_id,
+            scope: AuthorityScope::workspace(tenant_id, workspace_context.clone())?,
+            workspace_context,
         })
     }
 
-    /// Creates storage rooted at the metastore authority prefix for a validated scope.
+    /// Creates metastore-scoped storage from a validated scope.
+    ///
+    /// Retains the scope's workspace as execution context for [`Self::workspace_id`].
+    /// The workspace does not affect the metastore authority root or storage paths.
     ///
     /// # Errors
     ///
@@ -102,44 +114,9 @@ impl ScopedStorage {
     ) -> Result<Self> {
         Ok(Self {
             backend,
-            tenant_id: scope.tenant_id().to_string(),
-            workspace_id: scope.workspace_id().to_string(),
-            scope_prefix: scope.metastore_storage_prefix(),
+            scope: AuthorityScope::from_metastore_scope(scope),
+            workspace_context: scope.workspace_id().to_string(),
         })
-    }
-
-    /// Validates an ID for use in paths.
-    fn validate_id(id: &str, field: &str) -> Result<()> {
-        if id.is_empty() {
-            return Err(Error::InvalidId {
-                message: format!("{field} cannot be empty"),
-            });
-        }
-
-        if id.contains('/') || id.contains('\\') {
-            return Err(Error::InvalidId {
-                message: format!("{field} cannot contain path separators"),
-            });
-        }
-
-        if id.contains('\n') || id.contains('\r') || id.contains('\0') {
-            return Err(Error::InvalidId {
-                message: format!("{field} cannot contain control characters"),
-            });
-        }
-
-        if !id
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        {
-            return Err(Error::InvalidId {
-                message: format!(
-                    "{field} contains invalid characters (allowed: a-z, 0-9, '-', '_')"
-                ),
-            });
-        }
-
-        Ok(())
     }
 
     /// Validates a relative path for traversal and encoding attacks.
@@ -187,16 +164,27 @@ impl ScopedStorage {
         Ok(())
     }
 
+    /// Returns the typed authority scope.
+    #[must_use]
+    pub fn scope(&self) -> &AuthorityScope {
+        &self.scope
+    }
+
     /// Returns the tenant ID.
     #[must_use]
     pub fn tenant_id(&self) -> &str {
-        &self.tenant_id
+        self.scope.tenant_id()
     }
 
-    /// Returns the workspace ID.
+    /// Returns the workspace ID for legacy consumers.
+    ///
+    /// Workspace-rooted storage returns its workspace ID. Metastore-rooted storage
+    /// returns the execution workspace supplied to [`Self::new_metastore_scoped`].
+    /// This is request provenance, not the durable authority identity. Use
+    /// [`Self::scope`] and its root-specific accessors for authority validation.
     #[must_use]
     pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
+        &self.workspace_context
     }
 
     /// Returns the backend for advanced operations.
@@ -207,8 +195,8 @@ impl ScopedStorage {
 
     // === Path Construction ===
 
-    fn scope_prefix(&self) -> &str {
-        &self.scope_prefix
+    fn scope_prefix(&self) -> String {
+        self.scope.prefix()
     }
 
     fn scoped_path(&self, path: &str) -> String {
@@ -600,6 +588,92 @@ impl ScopedStorage {
             .collect())
     }
 
+    /// Lists one bounded metadata page at a scope-relative prefix.
+    ///
+    /// `start_after` is an exclusive scope-relative path cursor returned by the
+    /// previous page. The bound is delegated to the backend; this method never
+    /// falls back to [`Self::list_meta`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a path is unsafe, the cursor is outside `prefix`,
+    /// or the backend cannot provide bounded ordered listing.
+    pub async fn list_page_meta(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ScopedListPage> {
+        Self::validate_path(prefix)?;
+        if let Some(start_after) = start_after {
+            Self::validate_path(start_after)?;
+            let boundary = scoped_list_boundary(prefix);
+            if !prefix.is_empty() && start_after != prefix && !start_after.starts_with(&boundary) {
+                return Err(Error::InvalidInput(format!(
+                    "list cursor '{start_after}' is outside prefix '{prefix}'"
+                )));
+            }
+        }
+
+        let full_prefix = self.scoped_path(prefix);
+        let scope_prefix = format!("{}/", self.scope_prefix());
+        let boundary_prefix = scoped_list_boundary(&full_prefix);
+        let full_start_after = start_after.map(|path| self.scoped_path(path));
+        let page = self
+            .backend
+            .list_page(&full_prefix, full_start_after.as_deref(), limit)
+            .await?;
+
+        let mut objects = Vec::with_capacity(page.objects.len());
+        for meta in page.objects {
+            if !prefix.is_empty()
+                && meta.path != full_prefix
+                && !meta.path.starts_with(&boundary_prefix)
+            {
+                return Err(Error::storage(format!(
+                    "bounded list returned path '{}' outside prefix '{full_prefix}'",
+                    meta.path
+                )));
+            }
+            let relative =
+                meta.path
+                    .strip_prefix(&scope_prefix)
+                    .ok_or_else(|| Error::TenantIsolation {
+                        message: format!(
+                            "bounded list returned path '{}' outside scope '{}'",
+                            meta.path,
+                            self.scope_prefix()
+                        ),
+                    })?;
+            objects.push(ScopedObjectMeta {
+                path: ScopedPath(relative.to_string()),
+                size: meta.size,
+                version: meta.version,
+                last_modified: meta.last_modified,
+                etag: meta.etag,
+            });
+        }
+        let next_start_after = page
+            .next_start_after
+            .map(|cursor| {
+                cursor
+                    .strip_prefix(&scope_prefix)
+                    .map(ToString::to_string)
+                    .ok_or_else(|| Error::TenantIsolation {
+                        message: format!(
+                            "bounded list cursor '{cursor}' is outside scope '{}'",
+                            self.scope_prefix()
+                        ),
+                    })
+            })
+            .transpose()?;
+
+        Ok(ScopedListPage {
+            objects,
+            next_start_after,
+        })
+    }
+
     /// Gets metadata at a scope-relative path.
     ///
     /// # Errors
@@ -679,6 +753,29 @@ impl StorageBackend for ScopedStorage {
                 etag: meta.etag,
             })
             .collect())
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage> {
+        let page = self.list_page_meta(prefix, start_after, limit).await?;
+        Ok(ListPage {
+            objects: page
+                .objects
+                .into_iter()
+                .map(|meta| ObjectMeta {
+                    path: meta.path.to_string(),
+                    size: meta.size,
+                    version: meta.version,
+                    last_modified: meta.last_modified,
+                    etag: meta.etag,
+                })
+                .collect(),
+            next_start_after: page.next_start_after,
+        })
     }
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
@@ -1032,6 +1129,64 @@ mod tests {
                 .all(|m| !m.path.as_str().contains("manifests_backup")),
             "same-scope sibling metadata must not leak through scoped listing"
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_page_meta_keeps_cursor_scope_relative() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+        for index in 0..3 {
+            storage
+                .put_raw(
+                    &format!("ledger/catalog/evt-{index:02}.json"),
+                    Bytes::from_static(b"event"),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("seed scoped page");
+        }
+
+        let first = storage
+            .list_page_meta("ledger/catalog/", None, 2)
+            .await
+            .expect("first scoped page");
+        let paths: Vec<&str> = first
+            .objects
+            .iter()
+            .map(|meta| meta.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["ledger/catalog/evt-00.json", "ledger/catalog/evt-01.json"]
+        );
+        assert_eq!(
+            first.next_start_after.as_deref(),
+            Some("ledger/catalog/evt-01.json")
+        );
+
+        let second = storage
+            .list_page_meta("ledger/catalog/", first.next_start_after.as_deref(), 2)
+            .await
+            .expect("second scoped page");
+        assert_eq!(second.objects.len(), 1);
+        assert_eq!(
+            second.objects.first().map(|meta| meta.path.as_str()),
+            Some("ledger/catalog/evt-02.json")
+        );
+        assert!(second.next_start_after.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_page_meta_rejects_cursor_outside_prefix() {
+        let backend = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(backend, "acme", "production").unwrap();
+
+        let error = storage
+            .list_page_meta("ledger/catalog/", Some("ledger/lineage/evt-00.json"), 2)
+            .await
+            .expect_err("cursor outside prefix must fail");
+
+        assert!(error.to_string().contains("outside prefix"));
     }
 
     #[tokio::test]

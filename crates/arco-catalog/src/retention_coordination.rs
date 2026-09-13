@@ -22,7 +22,7 @@ const VERSION: u32 = 1;
 /// The one workspace-scoped durable exclusion record.
 pub const RETENTION_MUTATION_EPOCH_PATH: &str = "retention/coordination/mutation-epoch.json";
 
-/// How long a reclamation epoch must have been in flight before a later lease
+/// How long a generation-fenced control GC epoch must be in flight before a later lease
 /// holder may adopt (settle) it without an operator decision.
 ///
 /// Generous relative to the 30s retention lease: a live pass renews nothing
@@ -57,6 +57,8 @@ pub struct RecoveredRetentionEpoch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionMutationKind {
+    /// Publication of a catalog checkpoint retained root.
+    CatalogCheckpointPublish,
     /// First publication of a workspace snapshot's retained root.
     WorkspaceSnapshotFinalize,
     /// Retry of a workspace snapshot publication.
@@ -67,8 +69,10 @@ pub enum RetentionMutationKind {
     WorkspaceExportRetry,
     /// Application of a workspace restore plan.
     WorkspaceRestoreApply,
-    /// A catalog garbage collection pass (reclamation only).
+    /// Legacy catalog garbage collection; delayed deletes require operator recovery.
     CatalogGc,
+    /// Control authority GC with a generation fence and exact-version revalidation.
+    ControlGc,
     /// A reconciler repair pass deleting orphaned or superseded artifacts
     /// (reclamation only).
     CatalogRepair,
@@ -176,7 +180,7 @@ impl RetentionMutationEpoch {
     /// later lease holder must observe it and abort without product mutation.
     ///
     /// One narrow exception keeps a dead holder from wedging the workspace
-    /// forever: an aged in-flight *reclamation* epoch whose holder provably no
+    /// forever: an aged in-flight `ControlGc` epoch whose holder provably no
     /// longer owns the retention lease is adopted and settled first (see
     /// `adopt_stale_reclamation_epoch`). Every other in-flight record still
     /// fails closed and requires `recover_stale_retention_epoch`.
@@ -261,18 +265,50 @@ impl RetentionMutationEpoch {
         })
     }
 
-    /// Executes one exact put while retaining uncertainty on transport failure.
-    pub(crate) async fn put_raw(
+    /// Creates an immutable publication object, reconciling only exact bytes.
+    /// A cancelled request or an unresolved transport error keeps the epoch in
+    /// flight. A later exact write never clears an earlier uncertain mutation.
+    pub(crate) async fn put_immutable_reconciled(
         &mut self,
         path: &str,
-        data: Bytes,
-        precondition: WritePrecondition,
-    ) -> Result<WriteResult> {
-        match self.storage.put_raw(path, data, precondition).await {
-            Ok(result) => Ok(result),
+        bytes: Bytes,
+    ) -> Result<()> {
+        let previously_uncertain = self.uncertain_mutation;
+        self.uncertain_mutation = true;
+        match self
+            .storage
+            .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+            .await
+        {
+            Ok(WriteResult::Success { .. }) => {
+                self.uncertain_mutation = previously_uncertain;
+                Ok(())
+            }
+            Ok(WriteResult::PreconditionFailed { .. }) => {
+                // The failed precondition is terminal, but cancellation of its
+                // readback must still leave the invocation unresolved.
+                let readback = self.storage.get_raw(path).await;
+                self.uncertain_mutation = previously_uncertain;
+                if readback? == bytes {
+                    Ok(())
+                } else {
+                    Err(CatalogError::PreconditionFailed {
+                        message: format!("immutable object conflict at {path}"),
+                    })
+                }
+            }
             Err(error) => {
-                self.uncertain_mutation = true;
-                Err(error.into())
+                if self
+                    .storage
+                    .get_raw(path)
+                    .await
+                    .is_ok_and(|visible| visible == bytes)
+                {
+                    self.uncertain_mutation = previously_uncertain;
+                    Ok(())
+                } else {
+                    Err(error.into())
+                }
             }
         }
     }
@@ -418,8 +454,13 @@ impl RetentionMutationEpoch {
 
     /// Executes one exact delete while retaining uncertainty on transport failure.
     pub(crate) async fn delete(&mut self, path: &str) -> Result<()> {
+        let previously_uncertain = self.uncertain_mutation;
+        self.uncertain_mutation = true;
         match self.storage.delete(path).await {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.uncertain_mutation = previously_uncertain;
+                Ok(())
+            }
             Err(error) => {
                 self.uncertain_mutation = true;
                 Err(CatalogError::CasFailed {
@@ -431,24 +472,17 @@ impl RetentionMutationEpoch {
         }
     }
 
-    /// Deletes one object the caller has already proven reclaimable, reporting
-    /// a transport failure without tainting the epoch.
-    ///
-    /// Unlike `delete`, this never leaves the epoch in flight. It is only for
-    /// candidates that cleared the fail-closed protection set, the current-head
-    /// recheck, and the minimum-age guard: such an object is authorized for
-    /// deletion, so *both* outcomes of an uncertain delete are acceptable, and
-    /// any retained root published afterwards revalidates its own closure. A
-    /// per-object transport failure is therefore a counted failure, not a
-    /// reason to strand the workspace-wide exclusion record (which nothing but
-    /// `recover_stale_retention_epoch` could then clear).
-    ///
-    /// Takes `&mut self` deliberately, like every other mutation on this type:
-    /// deletions must be serialized through the one epoch handle rather than
-    /// issued concurrently from shared references, even though this particular
-    /// call keeps no uncertainty state of its own.
+    /// Deletes a control object after generation fencing and exact-version
+    /// revalidation. The fence prevents any later retained root from reviving
+    /// the candidate, so an ambiguous DELETE can safely outlive this epoch.
+    /// Legacy objects have no such fence and must use `delete` instead.
     #[allow(clippy::needless_pass_by_ref_mut)]
     pub(crate) async fn delete_reclaimable(&mut self, path: &str) -> Result<()> {
+        if self.record.operation_kind != RetentionMutationKind::ControlGc {
+            return Err(CatalogError::Validation {
+                message: "untracked deletion requires a generation-fenced control GC epoch".into(),
+            });
+        }
         self.storage
             .delete(path)
             .await
@@ -492,7 +526,11 @@ impl RetentionMutationEpoch {
 }
 
 /// Settles a stale in-flight retention mutation epoch after an operator has
-/// verified that its holder is dead.
+/// verified that its holder is dead and resolved all of its remote mutations.
+///
+/// Every pending request must have completed or been definitively
+/// cancelled at the backend before clearing a publication or legacy reclamation epoch. Lease expiry,
+/// process death, and absent readback do not prove that a remote PUT or DELETE is terminal.
 ///
 /// This is the documented recovery path for the failure mode where a process
 /// crashes (or a mutation outcome stays uncertain) between claiming the durable
@@ -506,9 +544,9 @@ impl RetentionMutationEpoch {
 /// audit event (`arco_retention_epoch_recovered_total`) carrying the discarded
 /// holder identity and the operator's reason.
 ///
-/// Prefer letting automated adoption handle aged `CatalogGc` / `CatalogRepair`
-/// records (see `RetentionMutationEpoch::claim`); this override exists for the
-/// publication kinds, whose partial mutations an operator must assess first.
+/// Only generation-fenced `ControlGc` records can be adopted automatically.
+/// Publication and legacy `CatalogGc` / `CatalogRepair` records require this
+/// override after every remote mutation has been resolved.
 ///
 /// # Errors
 ///
@@ -584,14 +622,12 @@ async fn recover_stale_epoch_while_locked(
 /// Adopts an aged in-flight reclamation epoch whose holder provably lost the
 /// retention lease, returning the settled record's new object version.
 ///
-/// Scope is deliberately narrow. `CatalogGc` and `CatalogRepair` only delete
-/// objects that already cleared the fail-closed protection set, so a partially
-/// applied pass leaves no half-written product state and a later pass simply
-/// re-derives its candidates. The publication kinds
-/// (`WorkspaceSnapshotFinalize`, `WorkspaceExportFinalize`, their retries, and
-/// `WorkspaceRestoreApply`) can leave partial retained roots and are never
-/// adopted here: they keep failing closed until their own reconciliation
-/// (`settle_terminal_matching`) or an operator override settles them.
+/// Only `ControlGc` is eligible: its generation fence prevents a retained root
+/// from reviving any deletion-authorized candidate. Legacy `CatalogGc` and
+/// `CatalogRepair` have no such fence; a DELETE can still apply after lease
+/// expiry and race a new retained reference. Old records are never inferred to
+/// represent fenced control GC. Publication and legacy reclamation remain
+/// excluded until exact terminal reconciliation or explicit operator recovery.
 ///
 /// Both guards must hold: the record has been in flight for at least
 /// `STALE_RECLAMATION_EPOCH_MIN_AGE_SECS`, and the adopting caller currently
@@ -603,10 +639,7 @@ async fn adopt_stale_reclamation_epoch(
     observed_version: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
-    if !matches!(
-        previous.operation_kind,
-        RetentionMutationKind::CatalogGc | RetentionMutationKind::CatalogRepair
-    ) {
+    if !matches!(previous.operation_kind, RetentionMutationKind::ControlGc) {
         return Ok(None);
     }
     let in_flight_for = now.signed_duration_since(previous.started_at);
@@ -761,6 +794,147 @@ mod tests {
         .expect("epoch JSON")
     }
 
+    #[derive(Debug, Default)]
+    struct PausedReadbackBackend {
+        inner: MemoryBackend,
+        reached: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl arco_core::StorageBackend for PausedReadbackBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            if path.ends_with("retention/exact.json") {
+                self.reached.notify_one();
+                return std::future::pending().await;
+            }
+            self.inner.get(path).await
+        }
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            bytes: Bytes,
+            condition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, bytes, condition).await
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            if path.ends_with("snapshots/catalog/v1/paused-delete") {
+                self.reached.notify_one();
+                return std::future::pending().await;
+            }
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<arco_core::ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: std::time::Duration,
+        ) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_borrowed_legacy_delete_prevents_settlement_after_later_success() {
+        let backend = Arc::new(PausedReadbackBackend::default());
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let mut guard = acquire(&storage).await;
+        let mut epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::CatalogRepair,
+            "cancel-delete",
+        )
+        .await
+        .unwrap();
+        let mut deletion = Box::pin(epoch.delete("snapshots/catalog/v1/paused-delete"));
+        tokio::select! {
+            result = &mut deletion => panic!("delete must pause: {result:?}"),
+            () = backend.reached.notified() => {},
+        }
+        drop(deletion);
+        epoch.delete("snapshots/catalog/v1/absent").await.unwrap();
+        assert!(
+            epoch.settle().await.is_err(),
+            "later success cannot clear prior DELETE uncertainty"
+        );
+        assert_eq!(read_epoch(&storage).await["state"], "IN_FLIGHT");
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_immutable_precondition_readback_cannot_settle_the_epoch() {
+        let backend = Arc::new(PausedReadbackBackend::default());
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        storage
+            .put_raw(
+                "retention/exact.json",
+                Bytes::from_static(b"exact"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let mut guard = acquire(&storage).await;
+        let mut epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotRetry,
+            SNAPSHOT_ID,
+        )
+        .await
+        .unwrap();
+        let mut publication = Box::pin(
+            epoch.put_immutable_reconciled("retention/exact.json", Bytes::from_static(b"exact")),
+        );
+        tokio::select! {
+            result = &mut publication => panic!("readback must pause: {result:?}"),
+            () = backend.reached.notified() => {},
+        }
+        drop(publication);
+        assert!(
+            epoch.settle().await.is_err(),
+            "cancelling reconciliation must retain uncertainty"
+        );
+        assert_eq!(read_epoch(&storage).await["state"], "IN_FLIGHT");
+        guard.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_immutable_success_never_clears_an_earlier_uncertain_mutation() {
+        let storage = storage();
+        let mut guard = acquire(&storage).await;
+        let mut epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            SNAPSHOT_ID,
+        )
+        .await
+        .unwrap();
+        epoch.mark_uncertain();
+        for _ in 0..2 {
+            epoch
+                .put_immutable_reconciled("retention/exact.json", Bytes::from_static(b"exact"))
+                .await
+                .unwrap();
+        }
+        assert!(epoch.settle().await.is_err());
+        assert_eq!(read_epoch(&storage).await["state"], "IN_FLIGHT");
+        guard.release().await.unwrap();
+    }
+
     #[tokio::test]
     async fn settlement_is_exact_cas_and_the_next_claim_is_monotonic() {
         let storage = storage();
@@ -799,7 +973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_epoch_advances_after_the_released_lock_record_is_deleted() {
+    async fn durable_epoch_and_fencing_sequence_advance_after_force_break() {
         let storage = storage();
         let mut first_guard = acquire(&storage).await;
         assert_eq!(first_guard.fencing_token().sequence(), 1);
@@ -822,8 +996,8 @@ mod tests {
         let mut recreated_guard = acquire(&storage).await;
         assert_eq!(
             recreated_guard.fencing_token().sequence(),
-            1,
-            "a recreated lease demonstrates why its sequence cannot number durable epochs"
+            2,
+            "force-break must preserve the lock record so fencing tokens never regress"
         );
         let second_epoch = RetentionMutationEpoch::claim(
             storage.clone(),
@@ -1012,7 +1186,7 @@ mod tests {
             started_at: Utc::now() - in_flight_for,
             completed_at: None,
         };
-        storage
+        let result = storage
             .put_raw(
                 RETENTION_MUTATION_EPOCH_PATH,
                 Bytes::from(encode_record(&stale).expect("encode stale record")),
@@ -1020,38 +1194,97 @@ mod tests {
             )
             .await
             .expect("seed stale epoch");
+        assert!(
+            matches!(result, WriteResult::Success { .. }),
+            "stale epoch must be created"
+        );
     }
 
-    /// A crashed GC or repair pass must not wedge the workspace forever: the
-    /// next lease holder adopts an aged reclamation epoch, because holding the
-    /// single-holder retention lease proves the recorded holder does not.
+    /// Only generation-fenced control GC permits automatic stale adoption.
     #[tokio::test]
     async fn an_aged_stale_reclamation_epoch_is_adopted_by_the_next_lease_holder() {
-        for kind in [
-            RetentionMutationKind::CatalogRepair,
+        let storage = storage();
+        seed_dead_holder_epoch(
+            &storage,
+            RetentionMutationKind::ControlGc,
+            Duration::seconds(STALE_RECLAMATION_EPOCH_MIN_AGE_SECS + 60),
+        )
+        .await;
+
+        let mut guard = acquire(&storage).await;
+        let adopted = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
             RetentionMutationKind::CatalogGc,
+            "recovered-gc",
+        )
+        .await
+        .expect("an aged reclamation epoch must be adoptable");
+        assert_eq!(read_epoch(&storage).await["epoch"], Value::from(8_u64));
+        adopted.settle().await.expect("settle adopted epoch");
+        assert_eq!(read_epoch(&storage).await["state"], Value::from("IDLE"));
+        guard.release().await.expect("release lease");
+    }
+
+    #[tokio::test]
+    async fn legacy_epochs_are_never_adopted_and_cannot_use_fenced_deletion() {
+        for kind in [
+            RetentionMutationKind::CatalogGc,
+            RetentionMutationKind::CatalogRepair,
         ] {
             let storage = storage();
+            let candidate = "snapshots/catalog/v1/legacy.bin";
+            storage
+                .put_raw(
+                    candidate,
+                    Bytes::from_static(b"legacy"),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("seed candidate");
+            let mut guard = acquire(&storage).await;
+            let mut epoch =
+                RetentionMutationEpoch::claim(storage.clone(), &mut guard, kind, "legacy-delete")
+                    .await
+                    .expect("claim");
+            epoch
+                .delete_reclaimable(candidate)
+                .await
+                .expect_err("legacy epoch cannot use fenced delete");
+            assert!(storage.head_raw(candidate).await.expect("head").is_some());
+            epoch.settle().await.expect("no mutation was issued");
+            guard.release().await.expect("release");
+            let storage = self::storage();
             seed_dead_holder_epoch(
                 &storage,
                 kind,
-                Duration::seconds(STALE_RECLAMATION_EPOCH_MIN_AGE_SECS + 60),
+                Duration::seconds(STALE_RECLAMATION_EPOCH_MIN_AGE_SECS * 10),
             )
             .await;
-
+            let before = storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("before");
             let mut guard = acquire(&storage).await;
-            let adopted = RetentionMutationEpoch::claim(
-                storage.clone(),
-                &mut guard,
-                RetentionMutationKind::CatalogGc,
-                "recovered-gc",
-            )
-            .await
-            .expect("an aged reclamation epoch must be adoptable");
-            assert_eq!(read_epoch(&storage).await["epoch"], Value::from(8_u64));
-            adopted.settle().await.expect("settle adopted epoch");
-            assert_eq!(read_epoch(&storage).await["state"], Value::from("IDLE"));
-            guard.release().await.expect("release lease");
+            assert!(
+                RetentionMutationEpoch::claim(
+                    storage.clone(),
+                    &mut guard,
+                    RetentionMutationKind::ControlGc,
+                    "blocked-control-gc",
+                )
+                .await
+                .is_err(),
+                "even an old legacy record is not evidence of fenced deletion"
+            );
+            assert_eq!(
+                before,
+                storage
+                    .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                    .await
+                    .expect("after")
+            );
+            guard.release().await.expect("release");
         }
     }
 
@@ -1063,7 +1296,7 @@ mod tests {
         let recent = storage();
         seed_dead_holder_epoch(
             &recent,
-            RetentionMutationKind::CatalogRepair,
+            RetentionMutationKind::ControlGc,
             Duration::seconds(5),
         )
         .await;
@@ -1138,10 +1371,13 @@ mod tests {
         )
         .await;
 
-        let recovered = recover_stale_retention_epoch(&storage, "holder pid 9182 confirmed dead")
-            .await
-            .expect("recovery")
-            .expect("a stale in-flight epoch must be reported");
+        let recovered = recover_stale_retention_epoch(
+            &storage,
+            "holder dead; no remote publication requests remain pending",
+        )
+        .await
+        .expect("recovery")
+        .expect("a stale in-flight epoch must be reported");
         assert_eq!(recovered.epoch, 7);
         assert_eq!(
             recovered.operation_kind,

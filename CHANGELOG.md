@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: crate-private with zero production callers, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
 
 ### Changed
+- **Breaking for Rust 0.3.0:** moved the published
+  `arco_core::ObjectStoreBackend` adapter to
+  `arco_storage_object_store::ObjectStoreBackend`. Runtime callers that used
+  `ObjectStoreBackend::from_bucket` must use `arco_storage::from_bucket`;
+  custom adapters must depend on `arco-storage-object-store` and provide an
+  explicit single-attempt conditional-write client.
 - deps(rust): bumped `serde_with` from 3.16.1 to 3.21.0 (#321).
 
 ## [0.2.1] - 2026-06-27

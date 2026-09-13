@@ -160,26 +160,29 @@ impl Tier1Compactor {
     ///
     /// # Panics
     ///
-    /// Panics if the already-validated scoped storage IDs cannot form a
-    /// workspace alias scope.
+    /// Panics if the already-validated authority and request context IDs cannot
+    /// form a control-plane scope. Workspace roots retain the metastore alias;
+    /// metastore roots retain their explicit metastore ID.
     #[must_use]
     #[allow(clippy::expect_used)]
     pub fn new(storage: ScopedStorage) -> Self {
-        let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
-            .expect("ScopedStorage tenant/workspace IDs are already validated");
+        let workspace_id = storage.workspace_id();
+        let metastore_id = storage.scope().metastore_id().unwrap_or(workspace_id);
+        let scope = ControlPlaneScope::new(storage.tenant_id(), workspace_id, metastore_id)
+            .expect("ScopedStorage authority and workspace context IDs are already validated");
         Self::new_with_scope(storage, scope)
     }
 
     /// Creates a new Tier-1 compactor with an explicit control-plane scope.
     ///
-    /// The supplied storage remains rooted at its current workspace prefix. This
-    /// keeps Task 3 as an API-threading change only; moving durable catalog paths
-    /// to metastore prefixes is handled by the later path migration tasks.
+    /// The supplied storage retains its current authority prefix and request
+    /// workspace context. A metastore root must also match the explicit
+    /// metastore ID; workspace roots retain the compatibility mapping.
     ///
     /// # Panics
     ///
-    /// Panics if the explicit scope does not match the scoped storage tenant and
-    /// workspace.
+    /// Panics if the explicit scope does not match the storage authority and
+    /// request workspace context.
     #[must_use]
     #[allow(clippy::expect_used)]
     pub fn new_with_scope(storage: ScopedStorage, scope: ControlPlaneScope) -> Self {
@@ -191,8 +194,8 @@ impl Tier1Compactor {
     ///
     /// # Errors
     ///
-    /// Returns an error when the storage tenant/workspace does not match the
-    /// execution tenant/workspace carried by the explicit scope.
+    /// Returns an error when the explicit scope does not match the storage
+    /// tenant, request workspace, or a metastore root's metastore ID.
     pub fn try_new_with_scope(
         storage: ScopedStorage,
         scope: ControlPlaneScope,
@@ -985,6 +988,19 @@ fn validate_storage_scope(storage: &ScopedStorage, scope: &ControlPlaneScope) ->
                 "storage workspace '{}' does not match control-plane workspace '{}'",
                 storage.workspace_id(),
                 scope.workspace_id()
+            ),
+        });
+    }
+    if storage
+        .scope()
+        .metastore_id()
+        .is_some_and(|id| id != scope.metastore_id())
+    {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "storage authority '{}' does not match control-plane metastore '{}'",
+                storage.scope().prefix(),
+                scope.metastore_id()
             ),
         });
     }

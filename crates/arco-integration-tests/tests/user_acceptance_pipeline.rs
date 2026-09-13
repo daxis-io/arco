@@ -43,7 +43,7 @@ use tower::ServiceExt as _;
 use ulid::Ulid;
 
 use arco_api::server::ServerBuilder;
-use arco_core::storage::{MemoryBackend, ObjectStoreBackend, StorageBackend, WritePrecondition};
+use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
 use arco_core::{ScopedStorage, TaskTokenConfig, mint_task_token_for_attempt};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::callbacks::{
@@ -66,6 +66,7 @@ use arco_flow::orchestration::worker_contract::{
     WorkerDispatchEnvelope, callback_task_id, parse_callback_task_id,
 };
 use arco_flow::orchestration_manifest_pointer_path;
+use arco_storage::from_bucket;
 
 const DEFAULT_TENANT: &str = "acceptance-tenant";
 const DEFAULT_WORKSPACE: &str = "analytics-workspace";
@@ -85,7 +86,7 @@ async fn user_acceptance_schedule_tick_is_queryable_after_manifest_deploy() {
 
 #[tokio::test]
 async fn user_acceptance_backfill_request_is_queryable_after_chunk_planning() {
-    assert_backfill_workflow(AcceptanceHarness::new()).await;
+    Box::pin(assert_backfill_workflow(AcceptanceHarness::new())).await;
 }
 
 #[tokio::test]
@@ -620,9 +621,7 @@ fn deployed_failure_exit_error_includes_artifact_path() {
 #[ignore = "requires ARCO_UAT_STORAGE_BUCKET and cloud credentials"]
 async fn live_user_acceptance_pipeline_runs_against_durable_storage() {
     let config = LiveAcceptanceConfig::from_env().expect("live UAT config");
-    let backend: Arc<dyn StorageBackend> = Arc::new(
-        ObjectStoreBackend::from_bucket(&config.bucket).expect("configure durable storage backend"),
-    );
+    let backend = from_bucket(&config.bucket).expect("configure durable storage backend");
 
     let pipeline_identity = config.identity("pipeline");
     let pipeline_proof = assert_cataloged_pipeline_workflow(AcceptanceHarness::with_backend(
@@ -637,10 +636,10 @@ async fn live_user_acceptance_pipeline_runs_against_durable_storage() {
     ))
     .await;
     let backfill_identity = config.identity("backfill");
-    let backfill_proof = assert_backfill_workflow(AcceptanceHarness::with_backend(
+    let backfill_proof = Box::pin(assert_backfill_workflow(AcceptanceHarness::with_backend(
         backend.clone(),
         backfill_identity.clone(),
-    ))
+    )))
     .await;
     let sensor_identity = config.identity("sensor");
     let sensor_proof =

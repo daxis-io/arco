@@ -1,7 +1,7 @@
 //! Catalog authority selection and the `control/v1` catalog domain adapter.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -36,6 +36,12 @@ use crate::writer::{
     Schema, SchemaPatch, Table, TablePatch,
 };
 use crate::{CatalogReader, SyncCompactor};
+
+#[cfg(not(feature = "test-utils"))]
+pub(crate) mod projection_measurement;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod projection_measurement;
 
 const OBJECT_KEY_TAG: u8 = 1;
 const NAME_INDEX_KEY_TAG: u8 = 2;
@@ -147,11 +153,21 @@ impl CatalogAuthorityBinding {
 ///
 /// Unlisted roots always resolve to legacy authority. The registry deliberately
 /// supports no wildcard or prefix forms, so a pilot binding cannot overlap a
-/// customer root by construction.
+/// customer root by construction. Clones retain one authenticated cache per control
+/// root. The registry divides 32 MiB metadata and 128 MiB decoded capacity equally
+/// among configured control roots, leaving remainders unused. Separate registries
+/// start cold and have independent budgets; these capacities are not an RSS bound.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogAuthorityBindings {
-    exact: BTreeMap<(String, String), CatalogAuthorityKind>,
+    exact: Arc<BTreeMap<(String, String), CatalogAuthorityEntry>>,
+    read_cache_config: crate::ControlMvpReadCacheConfig,
     continuation_key: Option<ScanContinuationKey>,
+}
+
+#[derive(Debug)]
+struct CatalogAuthorityEntry {
+    kind: CatalogAuthorityKind,
+    read_cache: Mutex<Option<crate::ControlMvpReadCache>>,
 }
 
 /// Bounded catalog list request shared by native, UC, and Iceberg adapters.
@@ -257,7 +273,16 @@ impl CatalogAuthorityBindings {
         for binding in bindings {
             StateScope::new(&binding.tenant_id, &binding.workspace_id, "catalog").validate()?;
             let key = (binding.tenant_id, binding.workspace_id);
-            if exact.insert(key.clone(), binding.kind).is_some() {
+            if exact
+                .insert(
+                    key.clone(),
+                    CatalogAuthorityEntry {
+                        kind: binding.kind,
+                        read_cache: Mutex::new(None),
+                    },
+                )
+                .is_some()
+            {
                 return Err(CatalogError::Validation {
                     message: format!(
                         "duplicate catalog authority binding for tenant={} workspace={}",
@@ -268,7 +293,7 @@ impl CatalogAuthorityBindings {
         }
         let has_control_binding = exact
             .values()
-            .any(|kind| *kind == CatalogAuthorityKind::ControlV1);
+            .any(|entry| entry.kind == CatalogAuthorityKind::ControlV1);
         let continuation_key = match (has_control_binding, supplied_continuation_key) {
             (true, Some(key)) => Some(key),
             (true, None) => Some(ScanContinuationKey::generate()?),
@@ -280,8 +305,17 @@ impl CatalogAuthorityBindings {
             }
             (false, None) => None,
         };
+        let roots = exact
+            .values()
+            .filter(|entry| entry.kind == CatalogAuthorityKind::ControlV1)
+            .count();
+        let capacity = crate::ControlMvpReadCacheConfig::default();
         Ok(Self {
-            exact,
+            exact: Arc::new(exact),
+            read_cache_config: crate::ControlMvpReadCacheConfig {
+                metadata_bytes: capacity.metadata_bytes.checked_div(roots).unwrap_or(0),
+                decoded_bytes: capacity.decoded_bytes.checked_div(roots).unwrap_or(0),
+            },
             continuation_key,
         })
     }
@@ -291,8 +325,57 @@ impl CatalogAuthorityBindings {
     pub fn resolve(&self, tenant_id: &str, workspace_id: &str) -> CatalogAuthorityKind {
         self.exact
             .get(&(tenant_id.to_string(), workspace_id.to_string()))
-            .copied()
-            .unwrap_or(CatalogAuthorityKind::Legacy)
+            .map_or(CatalogAuthorityKind::Legacy, |entry| entry.kind)
+    }
+
+    // Called only after ordinary authority construction validates the exact scope.
+    // The lock covers selection/initialization, and no I/O. An incompatible backend
+    // stays direct and cannot replace the first retained handle.
+    fn reuse_read_cache(
+        &self,
+        root: &(String, String),
+        store: ControlMvpStateStore,
+    ) -> ControlMvpStateStore {
+        let Some(entry) = self.exact.get(root) else {
+            return store.without_read_cache();
+        };
+        let store = store.without_read_cache();
+        let mut retained = entry
+            .read_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cache) = retained.as_ref() {
+            return store
+                .clone()
+                .with_read_cache(cache.clone())
+                .unwrap_or(store);
+        }
+        // Only the cache configuration is fallible here; scope/constructor errors
+        // have already propagated. An unfundable fixed share uses direct reads.
+        let configured = store
+            .clone()
+            .with_read_cache_config(self.read_cache_config)
+            .unwrap_or(store);
+        *retained = configured.read_cache();
+        configured
+    }
+
+    /// Returns per-root cache accounting for local qualification only.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn test_read_cache_statistics(&self) -> Vec<crate::ControlMvpReadCacheStatistics> {
+        self.exact
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .read_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map(crate::ControlMvpReadCache::statistics)
+            })
+            .collect()
     }
 
     fn control_continuation_key(
@@ -819,50 +902,75 @@ impl CatalogProjectionMaterializer {
                     .to_string(),
             });
         }
-        let token = self
-            .source
-            .resolve_projection_source(record, intent)
-            .await?;
-        let reader = self.source.read_at(token).await?;
-        let state = catalog_state_from_reader(reader.as_ref()).await?;
-        let directory = format!(
-            "control/v1/projections/catalog-parquet/{:020}-{}/",
-            intent.source_logical_sequence(),
-            intent.source_authority_manifest_id()
-        );
-        let snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
-            &self.storage,
-            intent.source_logical_sequence(),
-            &directory,
-            &state,
-        )
+        let state = projection_measurement::phase("projection-source", async {
+            let token = self
+                .source
+                .resolve_projection_source(record, intent)
+                .await?;
+            let reader = self.source.read_at(token).await?;
+            let state = catalog_state_from_reader(reader.as_ref()).await?;
+            Ok::<_, CatalogError>(state)
+        })
         .await?;
-        let manifest_path = format!("{directory}manifest.json");
-        let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
-            CatalogError::Serialization {
-                message: format!("catalog projection manifest encode failed: {error}"),
-            }
-        })?);
-        match self
-            .storage
-            .put_raw(
-                &manifest_path,
-                manifest_bytes.clone(),
-                WritePrecondition::DoesNotExist,
+        projection_measurement::phase("projection-publication", async {
+            let directory = format!(
+                "control/v1/projections/catalog-parquet/{:020}-{}/",
+                intent.source_logical_sequence(),
+                intent.source_authority_manifest_id()
+            );
+            let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
+                &self.storage,
+                intent.source_logical_sequence(),
+                &directory,
+                &state,
             )
-            .await?
-        {
-            WriteResult::Success { .. } => {}
-            WriteResult::PreconditionFailed { .. } => {
-                if self.storage.get_raw(&manifest_path).await? != manifest_bytes {
-                    return Err(CatalogError::PreconditionFailed {
-                        message: "catalog projection manifest already exists with different bytes"
-                            .to_string(),
-                    });
+            .await?;
+            let manifest_path = format!("{directory}manifest.json");
+            let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
+                CatalogError::Serialization {
+                    message: format!("catalog projection manifest encode failed: {error}"),
+                }
+            })?);
+            match self
+                .storage
+                .put_raw(
+                    &manifest_path,
+                    manifest_bytes.clone(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await?
+            {
+                WriteResult::Success { .. } => {}
+                WriteResult::PreconditionFailed { .. } => {
+                    let existing = self.storage.get_raw(&manifest_path).await?;
+                    let published: crate::manifest::SnapshotInfo =
+                        serde_json::from_slice(&existing).map_err(|error| {
+                            CatalogError::Serialization {
+                                message: format!(
+                                    "catalog projection manifest decode failed: {error}"
+                                ),
+                            }
+                        })?;
+                    // At-least-once delivery retains the first publication time.
+                    // Every other manifest field and all immutable file bytes must agree.
+                    snapshot.published_at = published.published_at;
+                    let retry_bytes = serde_json::to_vec(&snapshot).map_err(|error| {
+                        CatalogError::Serialization {
+                            message: format!("catalog projection manifest encode failed: {error}"),
+                        }
+                    })?;
+                    if existing.as_ref() != retry_bytes {
+                        return Err(CatalogError::PreconditionFailed {
+                            message:
+                                "catalog projection manifest already exists with different bytes"
+                                    .to_string(),
+                        });
+                    }
                 }
             }
-        }
-        Ok(manifest_path)
+            Ok(manifest_path)
+        })
+        .await
     }
 }
 
@@ -884,27 +992,31 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
             if let Ok(intent) = serde_json::from_slice(record.payload()) {
                 intent
             } else {
-                self.status
-                    .record_projection_quarantine(
+                projection_measurement::phase(
+                    "projection-status-ack",
+                    self.status.record_projection_quarantine(
                         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
                         source_sequence,
                         record.record_id(),
                         "INVALID_PROJECTION_INTENT",
                         at_ms,
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 return Ok(ProjectionOutboxProcessDisposition::Quarantined);
             };
         match self.materialize(&intent, record).await {
             Ok(manifest_path) => {
-                self.status
-                    .record_projection_success(
+                projection_measurement::phase(
+                    "projection-status-ack",
+                    self.status.record_projection_success(
                         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
                         intent.source_logical_sequence(),
                         &manifest_path,
                         at_ms,
-                    )
-                    .await?;
+                    ),
+                )
+                .await?;
                 Ok(ProjectionOutboxProcessDisposition::Materialized)
             }
             Err(error) => {
@@ -916,26 +1028,30 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                         | CatalogError::AmbiguousAuthorityOutcome { .. }
                 );
                 if retryable {
-                    self.status
-                        .record_projection_failure(
+                    projection_measurement::phase(
+                        "projection-status-ack",
+                        self.status.record_projection_failure(
                             CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
                             intent.source_logical_sequence(),
                             "CATALOG_PROJECTION_FAILED",
                             true,
                             at_ms,
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     Err(error)
                 } else {
-                    self.status
-                        .record_projection_quarantine(
+                    projection_measurement::phase(
+                        "projection-status-ack",
+                        self.status.record_projection_quarantine(
                             CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
                             source_sequence,
                             record.record_id(),
                             "INCOMPATIBLE_PROJECTION_INTENT",
                             at_ms,
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await?;
                     Ok(ProjectionOutboxProcessDisposition::Quarantined)
                 }
             }
@@ -1525,9 +1641,14 @@ impl CatalogAuthority {
         bindings: &CatalogAuthorityBindings,
     ) -> Result<Self> {
         let key = bindings.control_continuation_key(scope.tenant_id(), scope.workspace_id())?;
-        Ok(Self::ControlV1(Box::new(
-            ControlCatalogAuthority::new_with_continuation_key(storage, scope, key)?,
-        )))
+        let root = (
+            scope.tenant_id().to_string(),
+            scope.workspace_id().to_string(),
+        );
+        let mut authority =
+            ControlCatalogAuthority::new_with_continuation_key(storage, scope, key)?;
+        authority.store = bindings.reuse_read_cache(&root, authority.store);
+        Ok(Self::ControlV1(Box::new(authority)))
     }
 
     /// Returns the selected durable authority kind.
@@ -4245,6 +4366,7 @@ mod bounded_record_tests {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod bounded_catalog_tests {
     use super::*;
+    use crate::state_store::ArcoStateAdmin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arco_core::MemoryBackend;
@@ -4332,6 +4454,80 @@ mod bounded_catalog_tests {
                     .is_some_and(|id| id.len() == 64)
             );
             assert!(record.get("authorityManifestId").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_worker_cannot_handle_or_ack_synthetic_bounded_catalog() {
+        #[derive(Default)]
+        struct Handler(AtomicUsize);
+        #[async_trait::async_trait]
+        impl ProjectionOutboxHandler for Handler {
+            async fn process(
+                &self,
+                _record: &crate::ControlMvpProjectionOutboxRecord,
+            ) -> Result<ProjectionOutboxProcessDisposition> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ProjectionOutboxProcessDisposition::Materialized)
+            }
+        }
+        for config in [
+            None,
+            Some(crate::ControlMvpReadCacheConfig::default()),
+            Some(crate::ControlMvpReadCacheConfig {
+                metadata_bytes: 1024 * 1024,
+                decoded_bytes: 4 * 1024 * 1024,
+            }),
+        ] {
+            let storage =
+                ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+            let notifier = Arc::new(RecordingNotifierV2::default());
+            let authority = ControlCatalogAuthority::new_synthetic_bounded(
+                storage.clone(),
+                StateScope::new("tenant", "workspace", "catalog"),
+                notifier.clone(),
+            )
+            .unwrap()
+            .with_synthetic_bounded_read_cache(config)
+            .unwrap();
+            authority
+                .create_catalog("bounded", None, WriteOptions::default())
+                .await
+                .unwrap();
+            assert!(authority.get_catalog("bounded").await.unwrap().is_some());
+            assert_eq!(notifier.calls.load(Ordering::SeqCst), 1);
+            let before = storage
+                .get_raw("control/v1/domains/catalog/head/current.json")
+                .await
+                .unwrap();
+            let worker = ProjectionOutboxWorker::new(storage.clone(), "catalog", "legacy").unwrap();
+            let handler = Handler::default();
+            assert!(matches!(
+                worker.drain(&handler).await,
+                Err(CatalogError::UnsupportedAuthorityFormat { .. })
+            ));
+            assert_eq!(handler.0.load(Ordering::SeqCst), 0);
+            assert_eq!(notifier.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                storage
+                    .get_raw("control/v1/domains/catalog/head/current.json")
+                    .await
+                    .unwrap(),
+                before
+            );
+            let acknowledgements = ControlMvpStateStore::new(
+                storage,
+                StateScope::new("tenant", "workspace", PROJECTION_OUTBOX_ACK_DOMAIN),
+            )
+            .unwrap();
+            assert!(matches!(
+                acknowledgements.current_state_token().await,
+                Err(CatalogError::NotFound { .. })
+            ));
+            if let Some(stats) = authority.synthetic_bounded_read_cache_statistics() {
+                assert_eq!(stats.underestimates, 0);
+                assert_eq!(stats.active_loads, 0);
+            }
         }
     }
 
@@ -4693,3 +4889,7 @@ mod bounded_catalog_tests {
         assert_eq!(catalog.updated_at, 42);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod runtime_cache_tests;

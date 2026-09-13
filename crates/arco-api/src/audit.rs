@@ -18,6 +18,8 @@ pub const REASON_PATH_TRAVERSAL: &str = "path_traversal";
 pub const REASON_NOT_IN_ALLOWLIST: &str = "not_in_allowlist";
 pub const REASON_INTERNAL_ARTIFACT: &str = "internal_artifact";
 pub const REASON_UNKNOWN_DOMAIN: &str = "unknown_domain";
+pub const REASON_TOO_MANY_PATHS: &str = "too_many_paths";
+pub const REASON_RATE_LIMITED: &str = "rate_limited";
 /// The principal carried the configured control-store operator group.
 pub const REASON_OPERATOR_GROUP: &str = "operator_group_match";
 /// The principal authenticated but carried no operator group.

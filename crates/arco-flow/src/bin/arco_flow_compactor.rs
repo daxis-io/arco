@@ -714,19 +714,32 @@ fn load_tenant_secret() -> Result<Vec<u8>> {
     Ok(secret)
 }
 
-fn build_internal_auth() -> Result<Option<Arc<InternalAuthState>>> {
+fn build_internal_auth() -> Result<Arc<InternalAuthState>> {
     let config = InternalOidcConfig::from_env().map_err(|e| Error::configuration(e.to_string()))?;
-    let Some(config) = config else {
-        return Ok(None);
-    };
+    build_internal_auth_from_config(config)
+}
+
+fn build_internal_auth_from_config(
+    config: Option<InternalOidcConfig>,
+) -> Result<Arc<InternalAuthState>> {
+    let config = config.ok_or_else(|| {
+        Error::configuration(
+            "internal auth is required for /compact, /rebuild, and /internal/reconcile; configure ARCO_INTERNAL_AUTH_ISSUER, ARCO_INTERNAL_AUTH_AUDIENCE, and an allowed principal",
+        )
+    })?;
+    if !config.enforce {
+        return Err(Error::configuration(
+            "flow compactor internal auth must enforce failures; set ARCO_INTERNAL_AUTH_ENFORCE=true",
+        ));
+    }
 
     let enforce = config.enforce;
     let verifier =
         InternalOidcVerifier::new(config).map_err(|e| Error::configuration(e.to_string()))?;
-    Ok(Some(Arc::new(InternalAuthState {
+    Ok(Arc::new(InternalAuthState {
         verifier: Arc::new(verifier),
         enforce,
-    })))
+    }))
 }
 
 async fn internal_auth_middleware(
@@ -761,41 +774,20 @@ async fn internal_auth_middleware(
     }
 }
 
-fn build_router(state: AppState, internal_auth: Option<Arc<InternalAuthState>>) -> Router {
-    let compact_route = internal_auth.clone().map_or_else(
-        || post(compact_handler),
-        |auth| {
-            post(compact_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let rebuild_route = internal_auth.clone().map_or_else(
-        || post(rebuild_handler),
-        |auth| {
-            post(rebuild_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
-    let reconcile_route = internal_auth.map_or_else(
-        || post(reconcile_handler),
-        |auth| {
-            post(reconcile_handler).route_layer(middleware::from_fn_with_state(
-                auth,
-                internal_auth_middleware,
-            ))
-        },
-    );
+fn build_router(state: AppState, internal_auth: Arc<InternalAuthState>) -> Router {
+    let mutation_routes = Router::new()
+        .route("/compact", post(compact_handler))
+        .route("/rebuild", post(rebuild_handler))
+        .route("/internal/reconcile", post(reconcile_handler))
+        .route_layer(middleware::from_fn_with_state(
+            internal_auth,
+            internal_auth_middleware,
+        ));
 
     Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/compact", compact_route)
-        .route("/rebuild", rebuild_route)
-        .route("/internal/reconcile", reconcile_route)
+        .merge(mutation_routes)
         .with_state(state)
 }
 
@@ -938,6 +930,50 @@ mod tests {
             verifier: Arc::new(verifier),
             enforce: true,
         })
+    }
+
+    fn test_report_only_internal_auth_state() -> Arc<InternalAuthState> {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://flow-compactor.internal",
+            "test-secret",
+            BTreeSet::from([String::from("svc-flow-compactor")]),
+            BTreeSet::new(),
+            false,
+        );
+        let verifier = InternalOidcVerifier::new(config).expect("test verifier");
+        Arc::new(InternalAuthState {
+            verifier: Arc::new(verifier),
+            enforce: false,
+        })
+    }
+
+    #[test]
+    fn startup_rejects_missing_internal_auth_configuration() {
+        let error = build_internal_auth_from_config(None)
+            .err()
+            .expect("flow compactor must not start without internal auth");
+        assert!(error.to_string().contains("ARCO_INTERNAL_AUTH_ISSUER"));
+    }
+
+    #[test]
+    fn startup_rejects_report_only_internal_auth() {
+        let config = InternalOidcConfig::hs256_for_tests(
+            "https://accounts.google.com",
+            "https://flow-compactor.internal",
+            "test-secret",
+            BTreeSet::from([String::from("svc-flow-compactor")]),
+            BTreeSet::new(),
+            false,
+        );
+        let error = build_internal_auth_from_config(Some(config))
+            .err()
+            .expect("flow compactor must not start in report-only mode");
+        assert!(
+            error
+                .to_string()
+                .contains("ARCO_INTERNAL_AUTH_ENFORCE=true")
+        );
     }
 
     async fn seed_orphaned_orchestration_manifest(state: &AppState) -> String {
@@ -1135,8 +1171,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_endpoint_returns_report_when_auth_disabled() {
-        let router = build_router(test_state(), None);
+    async fn reconcile_endpoint_returns_report_in_explicit_test_report_only_mode() {
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
         let response = router
             .oneshot(
                 Request::builder()
@@ -1156,7 +1192,7 @@ mod tests {
         init_metrics();
         arco_flow::metrics::register_metrics();
         record_orch_compactor_contract_rejection("compact", "legacy_epoch_alias");
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
         let response = router
             .oneshot(
                 Request::builder()
@@ -1187,7 +1223,7 @@ mod tests {
     async fn reconcile_endpoint_defaults_to_full_scope() {
         let state = test_state();
         let orphan_manifest_path = seed_orphaned_orchestration_manifest(&state).await;
-        let router = build_router(state.clone(), None);
+        let router = build_router(state.clone(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1223,7 +1259,7 @@ mod tests {
     async fn reconcile_endpoint_accepts_camel_case_full_scope() {
         let state = test_state();
         let orphan_manifest_path = seed_orphaned_orchestration_manifest(&state).await;
-        let router = build_router(state.clone(), None);
+        let router = build_router(state.clone(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1259,7 +1295,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_endpoint_requires_auth_when_internal_auth_enforced() {
-        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let router = build_router(test_state(), test_internal_auth_state());
         let response = router
             .oneshot(
                 Request::builder()
@@ -1276,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_endpoint_requires_auth_when_internal_auth_enforced() {
-        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let router = build_router(test_state(), test_internal_auth_state());
         let response = router
             .oneshot(
                 Request::builder()
@@ -1296,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebuild_endpoint_requires_auth_when_internal_auth_enforced() {
-        let router = build_router(test_state(), Some(test_internal_auth_state()));
+        let router = build_router(test_state(), test_internal_auth_state());
         let response = router
             .oneshot(
                 Request::builder()
@@ -1316,7 +1352,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_request_contract_rejects_compact_requests_without_fencing() {
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1336,7 +1372,7 @@ mod tests {
     #[tokio::test]
     async fn default_request_contract_rejects_legacy_epoch_payload_and_records_metric() {
         let handle = init_metrics();
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1365,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn request_contract_rejects_lock_path_without_fencing_token_and_records_metric() {
         let handle = init_metrics();
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1396,7 +1432,7 @@ mod tests {
     #[tokio::test]
     async fn request_contract_rejects_fencing_token_without_lock_path_and_records_metric() {
         let handle = init_metrics();
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(
@@ -1426,7 +1462,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_request_contract_rejects_rebuild_epoch_payload() {
-        let router = build_router(test_state(), None);
+        let router = build_router(test_state(), test_report_only_internal_auth_state());
 
         let response = router
             .oneshot(

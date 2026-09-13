@@ -997,3 +997,122 @@ async fn internal_state_token_is_absent_from_structured_protocol_logs() -> Resul
     );
     Ok(())
 }
+
+#[derive(Default)]
+struct CacheReadBackend {
+    inner: MemoryBackend,
+    payloads: std::sync::atomic::AtomicUsize,
+    heads: std::sync::atomic::AtomicUsize,
+}
+impl CacheReadBackend {
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // Canonical immutable object paths.
+    fn payload(&self, path: &str) {
+        if path.contains("/transactions/")
+            || path.contains("/indexes/")
+            || path.ends_with(".arrow")
+            || path.ends_with(".index.json")
+        {
+            self.payloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+#[async_trait::async_trait]
+impl StorageBackend for CacheReadBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.payload(path);
+        self.inner.get(path).await
+    }
+    async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> arco_core::Result<Bytes> {
+        self.payload(path);
+        self.inner.get_range(path, range).await
+    }
+    async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::storage::ObjectMeta>> {
+        self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.head(path).await
+    }
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: arco_core::storage::WritePrecondition,
+    ) -> arco_core::Result<arco_core::storage::WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<arco_core::storage::ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+    async fn signed_url(
+        &self,
+        path: &str,
+        expiry: std::time::Duration,
+    ) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        continuation: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<arco_core::storage::ListPage> {
+        self.inner.list_page(prefix, continuation, limit).await
+    }
+}
+
+#[tokio::test]
+async fn native_warmth_is_reused_by_first_uc_and_iceberg_requests() -> Result<()> {
+    use arco_api::server::AppState;
+    use arco_catalog::{
+        CatalogProjectionNotifier, ControlCatalogAuthority, ProjectionIntentV1, StateScope,
+        WriteOptions,
+    };
+    use std::sync::atomic::Ordering;
+    struct Quiet;
+    impl CatalogProjectionNotifier for Quiet {
+        fn notify(&self, _: &ProjectionIntentV1) -> arco_catalog::Result<()> {
+            Ok(())
+        }
+    }
+    let backend = Arc::new(CacheReadBackend::default());
+    let config = pilot_config();
+    let bindings = protocol_bindings(&config);
+    let storage = arco_core::ScopedStorage::new(backend.clone(), TENANT, WORKSPACE)?;
+    ControlCatalogAuthority::new(storage, StateScope::new(TENANT, WORKSPACE, "catalog"))?
+        .with_projection_notifier(Arc::new(Quiet))
+        .create_catalog("default", None, WriteOptions::default())
+        .await?;
+    let state = Arc::new(
+        AppState::new(config, backend.clone()).with_catalog_authority_bindings(bindings.clone()),
+    );
+    let native = arco_api::routes::api_v1_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            arco_api::context::auth_middleware,
+        ))
+        .with_state(state);
+    let uc = unity_catalog_router(
+        UnityCatalogState::new(backend.clone()).with_catalog_authority_bindings(bindings.clone()),
+    );
+    let iceberg = iceberg_router(
+        IcebergState::new(backend.clone()).with_catalog_authority_bindings(bindings),
+    );
+    let (status, _) = call(native.clone(), Method::GET, "/catalogs", None).await?;
+    assert_eq!(status, StatusCode::OK);
+    for (router, path) in [
+        (native, "/catalogs"),
+        (uc, "/catalogs"),
+        (iceberg, "/v1/arco/namespaces"),
+    ] {
+        backend.payloads.store(0, Ordering::SeqCst);
+        backend.heads.store(0, Ordering::SeqCst);
+        let (status, body) = call(router, Method::GET, path, None).await?;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(backend.payloads.load(Ordering::SeqCst), 0, "{path}");
+        assert!(backend.heads.load(Ordering::SeqCst) > 0, "{path}");
+    }
+    Ok(())
+}

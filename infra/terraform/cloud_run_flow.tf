@@ -11,6 +11,20 @@ locals {
   flow_worker_service_url                = "https://arco-flow-worker-${var.environment}-${local.project_number}.${var.region}.run.app"
   flow_worker_dispatch_url               = "${local.flow_worker_service_url}/dispatch"
   flow_timer_ingest_internal_url         = "${local.flow_timer_ingest_service_url}/internal/timers/fired"
+  compactor_service_url                  = "https://arco-compactor-${var.environment}-${local.project_number}.${var.region}.run.app"
+  flow_compactor_service_url             = "https://arco-flow-compactor-${var.environment}-${local.project_number}.${var.region}.run.app"
+
+  compactor_internal_auth_allowed_emails = join(",", [
+    google_service_account.api.email,
+    google_service_account.compactor.email,
+    google_service_account.compactor_antientropy.email,
+    google_service_account.invoker.email,
+  ])
+  flow_compactor_internal_auth_allowed_emails = join(",", compact([
+    google_service_account.api.email,
+    google_service_account.flow_controller.email,
+    local.flow_services_enabled ? google_service_account.flow_timer_ingest[0].email : "",
+  ]))
 }
 
 resource "google_cloud_run_v2_service" "flow_timer_ingest" {

@@ -151,6 +151,22 @@ resource "google_secret_manager_secret" "tenant_secret" {
   }
 }
 
+resource "google_secret_manager_secret" "task_token_secret" {
+  count     = var.task_token_secret_name != "" ? 1 : 0
+  project   = var.project_id
+  secret_id = var.task_token_secret_name
+
+  replication {
+    auto {}
+  }
+
+  labels = {
+    environment = var.environment
+    service     = "arco"
+    component   = "task-token"
+  }
+}
+
 resource "google_secret_manager_secret" "flow_worker_dispatch_secret" {
   count     = var.flow_worker_dispatch_secret_name != "" && local.flow_services_enabled ? 1 : 0
   project   = var.project_id

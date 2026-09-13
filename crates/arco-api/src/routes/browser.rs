@@ -16,6 +16,7 @@
 //! 5. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
 //! 6. **TTL bounded**: Maximum 1 hour, default 15 minutes
 //! 7. **No data proxying**: Only URLs returned, never actual data
+//! 8. **Work bounded**: At most 25 submitted paths, deduplicated before signing
 //!
 //! ## Log Redaction Policy
 //!
@@ -37,7 +38,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::post;
@@ -51,12 +52,17 @@ use arco_core::CatalogDomain;
 use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::error::ApiErrorBody;
+use crate::rate_limit::RateLimitResult;
 use crate::server::AppState;
 
 /// Maximum TTL for signed URLs (1 hour).
 const MAX_TTL_SECONDS: u64 = 3600;
 /// Default TTL for signed URLs (15 minutes).
 const DEFAULT_TTL_SECONDS: u64 = 900;
+/// Maximum number of paths accepted in one request.
+const MAX_MINT_PATHS: usize = 25;
+/// Maximum JSON body accepted by the URL-minting route.
+const MAX_MINT_REQUEST_BYTES: usize = 128 * 1024;
 
 /// Request to mint signed URLs.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -64,6 +70,7 @@ pub struct MintUrlsRequest {
     /// Catalog domain (e.g., "catalog", "lineage").
     pub domain: String,
     /// Paths to mint URLs for (must be in manifest allowlist).
+    /// At most 25 paths may be submitted; duplicates yield one URL.
     pub paths: Vec<String>,
     /// Optional TTL in seconds (max 3600, default 900).
     pub ttl_seconds: Option<u64>,
@@ -89,7 +96,9 @@ pub struct SignedUrl {
 
 /// Creates browser routes.
 pub fn routes() -> Router<Arc<AppState>> {
-    Router::new().route("/browser/urls", post(mint_urls))
+    Router::new()
+        .route("/browser/urls", post(mint_urls))
+        .layer(DefaultBodyLimit::max(MAX_MINT_REQUEST_BYTES))
 }
 
 /// Mint signed URLs for browser-based reads.
@@ -155,14 +164,15 @@ pub(crate) async fn mint_urls(
         .min(MAX_TTL_SECONDS);
     let ttl = Duration::from_secs(ttl_seconds);
 
-    // SECURITY: Validate all user-provided paths FIRST (before any I/O)
-    reject_disallowed_paths(&state, &ctx, &req)?;
+    let paths = prepare_mint_paths(&req, state.as_ref(), &ctx)?;
+    reserve_minting_quota(state.as_ref(), &ctx, &req.domain, paths.len()).await?;
 
     tracing::info!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         domain = %req.domain,
         paths_count = req.paths.len(),
+        unique_paths_count = paths.len(),
         ttl_seconds = ttl_seconds,
         // DO NOT log: req.paths (may contain sensitive data)
         // DO NOT log: response.urls (contains signed URLs)
@@ -187,7 +197,7 @@ pub(crate) async fn mint_urls(
         .collect();
 
     // Validate ALL requested paths are in allowlist
-    for path in &req.paths {
+    for path in &paths {
         if !mintable_set.contains(path) {
             crate::audit::emit_url_mint_deny(
                 state.audit(),
@@ -203,19 +213,18 @@ pub(crate) async fn mint_urls(
     }
 
     // Mint signed URLs
-    let paths_to_mint = req.paths.clone();
     let signed = reader
-        .mint_signed_urls_with_allowlist(paths_to_mint, &mintable_set, ttl)
+        .mint_signed_urls_with_allowlist(paths, &mintable_set, ttl)
         .await
         .map_err(ApiError::from)?;
 
     // Record metrics for signed URL minting
-    crate::metrics::record_signed_url_minted();
+    crate::metrics::record_signed_urls_minted(signed.len());
     crate::audit::emit_url_mint_allow(
         state.audit(),
         &ctx,
         &req.domain,
-        req.paths.len(),
+        signed.len(),
         &state.config.audit,
     );
 
@@ -230,20 +239,26 @@ pub(crate) async fn mint_urls(
     Ok((StatusCode::OK, Json(MintUrlsResponse { urls, ttl_seconds })))
 }
 
-/// Rejects traversal attempts and internal projection-only artifacts before
-/// any storage I/O.
-///
-/// The raw `commits.parquet` artifact carries the private commit-authority
-/// columns (`manifest_id`, `event_witnesses_json`) that the
-/// `system.catalog.commits` projection deliberately redacts. Minting a signed
-/// URL for it would hand out the unredacted bytes and defeat that projection,
-/// so it is refused with a typed error pointing readers at the projection.
-fn reject_disallowed_paths(
+fn prepare_mint_paths(
+    req: &MintUrlsRequest,
     state: &AppState,
     ctx: &RequestContext,
-    req: &MintUrlsRequest,
-) -> Result<(), ApiError> {
-    for path in &req.paths {
+) -> Result<Vec<String>, ApiError> {
+    if req.paths.len() > MAX_MINT_PATHS {
+        crate::audit::emit_url_mint_deny(
+            state.audit(),
+            ctx,
+            &req.domain,
+            crate::audit::REASON_TOO_MANY_PATHS,
+            &state.config.audit,
+        );
+        return Err(ApiError::bad_request(format!(
+            "At most {MAX_MINT_PATHS} paths may be submitted per request"
+        )));
+    }
+
+    let paths = dedup_paths(&req.paths);
+    for path in &paths {
         if let Err(err) = arco_core::ScopedStorage::validate_path(path) {
             crate::audit::emit_url_mint_deny(
                 state.audit(),
@@ -255,8 +270,7 @@ fn reject_disallowed_paths(
             return Err(ApiError::forbidden(format!("Invalid path '{path}': {err}")));
         }
     }
-
-    for path in &req.paths {
+    for path in &paths {
         if is_projection_only_artifact(path) {
             crate::audit::emit_url_mint_deny(
                 state.audit(),
@@ -271,10 +285,52 @@ fn reject_disallowed_paths(
             )));
         }
     }
-
-    Ok(())
+    Ok(paths)
 }
 
+async fn reserve_minting_quota(
+    state: &AppState,
+    ctx: &RequestContext,
+    domain: &str,
+    unique_path_count: usize,
+) -> Result<(), ApiError> {
+    let additional_paths = u32::try_from(unique_path_count.saturating_sub(1))
+        .map_err(|_| ApiError::bad_request("Too many unique paths"))?;
+    let RateLimitResult::Limited {
+        limit,
+        retry_after_secs,
+    } = state
+        .rate_limit()
+        .check_url_minting_additional_paths(&ctx.tenant, additional_paths)
+        .await
+    else {
+        return Ok(());
+    };
+
+    crate::metrics::record_rate_limit_hit("/api/v1/browser/urls");
+    crate::audit::emit_url_mint_deny(
+        state.audit(),
+        ctx,
+        domain,
+        crate::audit::REASON_RATE_LIMITED,
+        &state.config.audit,
+    );
+    Err(ApiError::from_status_and_message(
+        StatusCode::TOO_MANY_REQUESTS.as_u16(),
+        format!("URL minting limit of {limit} physical paths per minute exceeded"),
+    )
+    .with_retry_after(retry_after_secs.max(1)))
+}
+
+/// Collapses duplicate paths while preserving first-seen order.
+fn dedup_paths(paths: &[String]) -> Vec<String> {
+    let mut seen = HashSet::with_capacity(paths.len());
+    paths
+        .iter()
+        .filter(|path| seen.insert(path.as_str()))
+        .cloned()
+        .collect()
+}
 /// Returns true for snapshot artifacts whose raw bytes must never be minted
 /// because a redacted system-table projection is their only public surface.
 ///
@@ -286,7 +342,6 @@ fn reject_disallowed_paths(
 fn is_projection_only_artifact(path: &str) -> bool {
     arco_catalog::is_projection_only_artifact(path)
 }
-
 /// Parse domain string to `CatalogDomain`.
 fn parse_domain(domain: &str) -> Result<CatalogDomain, ApiError> {
     match domain.to_lowercase().as_str() {
@@ -339,5 +394,37 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mint_urls_rejects_bodies_over_explicit_limit() {
+        let config = Config {
+            debug: true,
+            ..Config::default()
+        };
+        let state = Arc::new(AppState::with_memory_storage(config));
+        let app = routes().with_state(state);
+
+        let body = serde_json::json!({
+            "domain": "catalog",
+            "paths": ["a".repeat(MAX_MINT_REQUEST_BYTES + 1)],
+            "ttlSeconds": 300
+        })
+        .to_string();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/browser/urls")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-tenant-id", "acme")
+                    .header("x-workspace-id", "analytics")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

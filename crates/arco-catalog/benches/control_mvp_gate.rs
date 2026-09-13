@@ -3,7 +3,9 @@
 //! Run: `cargo bench -p arco-catalog --bench control_mvp_gate [-- --smoke]`
 #![allow(missing_docs, clippy::expect_used, clippy::print_stdout)]
 
+// The harness-free benchmark uses only part of the shared test support.
 #[path = "support/control_cost.rs"]
+#[allow(dead_code, unused_imports)]
 mod control_cost;
 
 fn main() {

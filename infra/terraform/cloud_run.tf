@@ -97,7 +97,7 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "ARCO_DEBUG"
-        value = var.environment == "dev" && !var.api_public ? "true" : "false"
+        value = var.api_debug ? "true" : "false"
       }
 
       env {
@@ -115,9 +115,17 @@ resource "google_cloud_run_v2_service" "api" {
         value = var.jwt_audience
       }
 
-      env {
-        name  = "ARCO_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -142,12 +150,22 @@ resource "google_cloud_run_v2_service" "api" {
 
       env {
         name  = "ARCO_COMPACTOR_URL"
-        value = google_cloud_run_v2_service.compactor.uri
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUTH_MODE"
+        value = "gcp_id_token"
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUTH_AUDIENCE"
+        value = local.compactor_service_url
       }
 
       env {
         name  = "ARCO_ORCH_COMPACTOR_URL"
-        value = google_cloud_run_v2_service.flow_compactor.uri
+        value = local.flow_compactor_service_url
       }
 
       env {
@@ -198,6 +216,21 @@ resource "google_cloud_run_v2_service" "api" {
   }
 
   lifecycle {
+    precondition {
+      condition     = !var.api_debug || (var.environment == "dev" && !var.api_public)
+      error_message = "api_debug trusts client-supplied identity and is permitted only for a private dev service."
+    }
+
+    precondition {
+      condition     = var.api_debug || var.jwt_secret_name != ""
+      error_message = "api_debug = false requires jwt_secret_name so deployed requests use application authentication."
+    }
+
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "API task callbacks require task_token_secret_name for authenticated worker updates."
+    }
+
     ignore_changes = [
       # Ignore client-side changes to these fields
       client,
@@ -324,6 +357,38 @@ resource "google_cloud_run_v2_service" "compactor" {
       env {
         name  = "ARCO_COMPACTOR_REPAIR_AUTOMATION_DOMAINS"
         value = var.compactor_repair_automation_domains
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ENFORCE"
+        value = "true"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ISSUER"
+        value = "https://accounts.google.com"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_AUDIENCE"
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ALLOWED_EMAILS"
+        value = local.compactor_internal_auth_allowed_emails
+      }
+
+      # Anti-entropy re-enters /internal/notify through Cloud Run. Use the canonical
+      # service URL so the client mints an ID token instead of calling loopback without auth.
+      env {
+        name  = "ARCO_COMPACTOR_URL"
+        value = local.compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_COMPACTOR_AUDIENCE"
+        value = local.compactor_service_url
       }
 
       # Compaction interval (seconds)
@@ -457,6 +522,26 @@ resource "google_cloud_run_v2_service" "flow_compactor" {
       env {
         name  = "ARCO_FLOW_COMPACTOR_REPAIR_AUTOMATION_SCOPE"
         value = var.flow_compactor_repair_automation_scope
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ENFORCE"
+        value = "true"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ISSUER"
+        value = "https://accounts.google.com"
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_AUDIENCE"
+        value = local.flow_compactor_service_url
+      }
+
+      env {
+        name  = "ARCO_INTERNAL_AUTH_ALLOWED_EMAILS"
+        value = local.flow_compactor_internal_auth_allowed_emails
       }
 
       env {
@@ -640,9 +725,17 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
         value = google_service_account.flow_task_invoker.email
       }
 
-      env {
-        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -673,6 +766,11 @@ resource "google_cloud_run_v2_service" "flow_dispatcher" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "flow dispatcher requires task_token_secret_name for authenticated API callbacks."
+    }
+
     ignore_changes = [
       client,
       client_version,
@@ -813,9 +911,17 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
         value = google_service_account.flow_task_invoker.email
       }
 
-      env {
-        name  = "ARCO_FLOW_TASK_TOKEN_SECRET"
-        value = var.task_token_secret
+      dynamic "env" {
+        for_each = length(google_secret_manager_secret.task_token_secret) > 0 ? [1] : []
+        content {
+          name = "ARCO_FLOW_TASK_TOKEN_SECRET"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.task_token_secret[0].secret_id
+              version = "latest"
+            }
+          }
+        }
       }
 
       env {
@@ -846,6 +952,11 @@ resource "google_cloud_run_v2_service" "flow_sweeper" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.task_token_secret_name != ""
+      error_message = "flow sweeper requires task_token_secret_name for authenticated API callbacks."
+    }
+
     ignore_changes = [
       client,
       client_version,

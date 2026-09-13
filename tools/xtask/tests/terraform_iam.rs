@@ -79,6 +79,33 @@ fn flow_worker_dispatch_secret_is_wired_to_producers_and_worker() {
 }
 
 #[test]
+fn task_token_secret_is_wired_only_to_api_and_flow_controller() {
+    let terraform = terraform_text(["variables.tf", "main.tf", "iam.tf", "cloud_run.tf"]);
+
+    assert!(terraform.contains("variable \"task_token_secret_name\""));
+    assert!(terraform.contains("google_secret_manager_secret\" \"task_token_secret\""));
+
+    let api_access = resource_block(
+        &terraform,
+        "google_secret_manager_secret_iam_member",
+        "api_task_token_secret",
+    )
+    .expect("API task-token Secret Manager grant should exist");
+    assert!(api_access.contains("google_service_account.api.email"));
+
+    let controller_access = resource_block(
+        &terraform,
+        "google_secret_manager_secret_iam_member",
+        "flow_controller_task_token_secret",
+    )
+    .expect("flow controller task-token Secret Manager grant should exist");
+    assert!(controller_access.contains("google_service_account.flow_controller.email"));
+
+    assert!(!terraform.contains("variable \"task_token_secret\""));
+    assert!(!terraform.contains("value = var.task_token_secret"));
+}
+
+#[test]
 fn state_store_prefix_has_exactly_one_writer() {
     let terraform = terraform_iam_text();
 

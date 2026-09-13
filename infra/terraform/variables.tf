@@ -149,11 +149,10 @@ variable "compactor_workspace_id" {
 # Task Callback Token Configuration
 # ============================================================================
 
-variable "task_token_secret" {
-  description = "HS256 secret used by flow dispatchers/sweepers to mint task callback tokens and by the API to validate them"
+variable "task_token_secret_name" {
+  description = "Secret Manager secret containing the HS256 task-callback signing key; Terraform manages the container but secret versions are provisioned and rotated separately"
   type        = string
   default     = ""
-  sensitive   = true
 }
 
 variable "task_token_issuer" {
@@ -408,6 +407,12 @@ variable "flow_worker_dispatch_secret_name" {
 
 variable "api_public" {
   description = "Whether API is publicly accessible (false = internal only)"
+  type        = bool
+  default     = false
+}
+
+variable "api_debug" {
+  description = "Explicitly trust client-supplied identity headers for a private dev-only API; never inferred from environment or ingress"
   type        = bool
   default     = false
 }

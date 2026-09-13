@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::HeaderName;
-use axum::http::{HeaderMap, HeaderValue, Request};
+use axum::http::{HeaderMap, HeaderValue, Method, Request};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -98,7 +98,7 @@ pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     let request_id =
         request_id_from_headers(&parts.headers).unwrap_or_else(|| ulid::Ulid::new().to_string());
 
-    if iceberg_public_path(parts.uri.path()) {
+    if iceberg_public_route(&parts.method, parts.uri.path()) {
         let mut response = next.run(Request::from_parts(parts, body)).await;
         add_request_id_header(&mut response, &request_id);
         return response;
@@ -119,8 +119,8 @@ pub async fn context_middleware(req: Request<Body>, next: Next) -> Response {
     response
 }
 
-fn iceberg_public_path(path: &str) -> bool {
-    path.ends_with("/v1/config") || path.ends_with("/openapi.json")
+fn iceberg_public_route(method: &Method, path: &str) -> bool {
+    matches!(*method, Method::GET | Method::HEAD) && matches!(path, "/v1/config" | "/openapi.json")
 }
 
 #[cfg(test)]
@@ -145,5 +145,14 @@ mod tests {
         let headers = HeaderMap::new();
         let err = IcebergRequestContext::from_headers(&headers).expect_err("missing");
         assert!(matches!(err, IcebergError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn public_routes_match_only_exact_router_endpoints() {
+        assert!(iceberg_public_route(&Method::GET, "/v1/config"));
+        assert!(iceberg_public_route(&Method::HEAD, "/openapi.json"));
+        assert!(!iceberg_public_route(&Method::POST, "/v1/config"));
+        assert!(!iceberg_public_route(&Method::GET, "/private/v1/config"));
+        assert!(!iceberg_public_route(&Method::GET, "/catalog/openapi.json"));
     }
 }

@@ -56,6 +56,22 @@ resource "google_secret_manager_secret_iam_member" "compactor_tenant_secret" {
   member    = "serviceAccount:${google_service_account.compactor.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "api_task_token_secret" {
+  count     = length(google_secret_manager_secret.task_token_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.task_token_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_secret_manager_secret_iam_member" "flow_controller_task_token_secret" {
+  count     = length(google_secret_manager_secret.task_token_secret) > 0 ? 1 : 0
+  project   = var.project_id
+  secret_id = google_secret_manager_secret.task_token_secret[0].secret_id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
 resource "google_secret_manager_secret_iam_member" "flow_controller_worker_dispatch_secret" {
   count     = length(google_secret_manager_secret.flow_worker_dispatch_secret) > 0 ? 1 : 0
   project   = var.project_id
@@ -224,6 +240,15 @@ resource "google_cloud_run_v2_service_iam_member" "api_compactor_invoker" {
   member   = "serviceAccount:${google_service_account.api.email}"
 }
 
+resource "google_cloud_run_v2_service_iam_member" "compactor_self_invoker" {
+  count    = var.environment != "" ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.compactor.email}"
+}
+
 resource "google_cloud_run_v2_service_iam_member" "api_flow_compactor_invoker" {
   count    = var.environment != "" ? 1 : 0
   project  = var.project_id
@@ -231,6 +256,24 @@ resource "google_cloud_run_v2_service_iam_member" "api_flow_compactor_invoker" {
   name     = google_cloud_run_v2_service.flow_compactor.name
   role     = "roles/run.invoker"
   member   = "serviceAccount:${google_service_account.api.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_controller_flow_compactor_invoker" {
+  count    = local.flow_services_enabled || local.flow_automation_reconciler_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_controller.email}"
+}
+
+resource "google_cloud_run_v2_service_iam_member" "flow_timer_ingest_flow_compactor_invoker" {
+  count    = local.flow_services_enabled ? 1 : 0
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.flow_compactor.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.flow_timer_ingest[0].email}"
 }
 
 resource "google_cloud_run_v2_service_iam_member" "compactor_antientropy_invoker" {

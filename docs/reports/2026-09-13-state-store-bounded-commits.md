@@ -1,18 +1,20 @@
 # Authority 8 bounded catalog commits — Step 2
 
-Status: implementation and the complete local scaling matrix pass. Production
-capacity remediation, durable large restore and provider qualification remain
-outside this slice. Final independent audit and archive admission are separate
-publication gates, recorded in the accompanying evidence package.
+The complete Step 2 local scaling matrix passed on commit
+`24d8d80a236417c9f917b7dca23ce096eaa1952c`. The measurements and original verification
+results below belong to that exact source. This branch now also integrates main at
+`fa87b28f5a53da59e8c4d8e8eb4957dd4ba0ab86`; its separate integration checks do not
+transfer those quantitative performance results to the combined source. Durable
+large restore and provider qualification remain outside Step 2.
 
 ## Source and authority boundary
 
 The implementation starts exactly at `e29a5f6a3f99c4050a78a794a85c7e125a421a12`
 on branch `feat/state-store-bounded-commits-20260912-01`. That is PR #429's pinned
-head; subsequent integration changes and PR #430's runtime-cache commit
-`0da54a1ca5101e5d523b18f7aa116eb4ace059b8` are not incorporated. Both PRs have since
-merged into main. This branch preserves the requested source identity and needs
-integration review against current main. Cargo dependencies are unchanged and locked.
+head. At the measured Step 2 commit, subsequent integration changes and PR #430's
+runtime-cache commit `0da54a1ca5101e5d523b18f7aa116eb4ace059b8` were not incorporated.
+The subsequent merge of main incorporates both PRs while preserving the measured
+commit and its evidence archive. Cargo dependencies remain unchanged and locked.
 
 [The frozen contract](../plans/2026-09-12-state-bounded-commits.md), amendment 22,
 has SHA-256 `84117e3d9fb3099bdf7f3f2bfcd5981fc578b34bd5cbdbb3f5c9509e8baf3cce`.
@@ -245,3 +247,33 @@ continuations stay pinned. Conversion must verify the initial outbox bijection.
 Occupancy rebalancing and repacking remain deferred. Durable large restore, full
 lifecycle integration, complete pilot execution, provider qualification, deployment
 and production cutover remain later work.
+
+## Current-main integration
+
+The integration combines Step 2 commit `24d8d80a236417c9f917b7dca23ce096eaa1952c`
+with main `fa87b28f5a53da59e8c4d8e8eb4957dd4ba0ab86`. Runtime-cache construction and
+synthetic authority-8 catalog construction coexist. A new regression exercises the
+real legacy projection worker against authority 8 in disabled, default and pressure
+cache modes: it rejects the format before invoking the handler or acknowledging work.
+
+Local integration evidence includes 1,404 passing core/feature catalog tests, the
+additional projection-worker regression, 976 passing default catalog tests, five
+API protocol tests, independent logical validation of six published catalog tuples,
+and all nine oversized-singleton cases. The feature suite precedes the final
+test-only regression; that regression recompiles and passes separately. Final
+static checks, all-axes preflight, source manifests, audit and archive receipts are
+recorded under `/private/tmp/arco-state-integration-restore-20260913-01`.
+
+The independent integration audit requires a 180-request preflight across every
+fixture/cache/scenario combination. It does not require repeating the historical
+180,000-request matrix for integration correctness because the bounded primitives
+and matrix scenarios are unchanged. Any quantitative performance acceptance claim
+for this combined source requires a new complete matrix. Compiler diagnostics, a
+missing offline dependency-cache entry and the initial all-target benchmark lint
+failure remain retained. The benchmark fix is confined to allowing intentionally
+unused shared test support at the harness-free benchmark inclusion.
+
+Production remains authority 7, restore-plan 6 remains unchanged, and authority-8
+lifecycle operations remain unsupported here. Step 3 is developed separately from
+this integration; neither this report nor the integration establishes durable large
+restore, continuous pilot execution, provider qualification or production cutover.

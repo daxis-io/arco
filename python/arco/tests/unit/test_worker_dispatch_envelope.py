@@ -164,7 +164,6 @@ def test_dispatch_worker_uses_envelope_token_and_callback_url() -> None:
         workspace_id="workspace-b",
     )
     worker.worker_id = "worker-1"
-    worker._fallback_task_token = "fallback-token"
     worker._client = fake_client
     worker._assets = {"analytics.daily_sales": asset_fn}
     worker._partitioned_assets = set()
@@ -211,7 +210,6 @@ def _worker_for_scope_validation(*, api_url: str) -> DispatchWorker:
         workspace_id="workspace-b",
     )
     worker.worker_id = "worker-1"
-    worker._fallback_task_token = "fallback-token"
     worker._client = _RejectingClient()
     worker._assets = {}
     worker._partitioned_assets = set()

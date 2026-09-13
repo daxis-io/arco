@@ -79,6 +79,7 @@
 //! `arco_control_store_outbox_drained_records_total`,
 //! `arco_control_store_outbox_trimmed_records_total`.
 
+use crate::catalog_authority::projection_measurement::phase as projection_phase;
 use std::collections::BTreeSet;
 
 use arco_core::ScopedStorage;
@@ -1473,7 +1474,10 @@ impl ProjectionOutboxWorker {
         &self,
         handler: &dyn ProjectionOutboxHandler,
     ) -> Result<ProjectionOutboxDrainReport> {
-        if self.consumer_binding().await?.is_some() {
+        if projection_phase("projection-discovery", self.consumer_binding())
+            .await?
+            .is_some()
+        {
             return Err(invariant_violation(
                 "fixed projection consumer cannot use a source root with generic binding metadata",
             ));
@@ -1487,11 +1491,17 @@ impl ProjectionOutboxWorker {
         handler: &dyn ProjectionOutboxHandler,
         incarnation: u64,
     ) -> Result<ProjectionOutboxDrainReport> {
-        let outbox = self.source.current_projection_outbox().await?;
-        let acked = self
-            .acks
-            .acknowledged_event_ids(&self.consumer_id, incarnation)
-            .await?;
+        let outbox = projection_phase(
+            "projection-discovery",
+            self.source.current_projection_outbox(),
+        )
+        .await?;
+        let acked = projection_phase(
+            "projection-discovery",
+            self.acks
+                .acknowledged_event_ids(&self.consumer_id, incarnation),
+        )
+        .await?;
         let mut drained_record_ids = Vec::new();
         let mut drained_event_ids = Vec::new();
         let mut quarantined_record_ids = Vec::new();
@@ -1510,14 +1520,16 @@ impl ProjectionOutboxWorker {
                 quarantined_event_ids.push(event_id);
                 continue;
             }
-            self.acks
-                .acknowledge(&ProjectionOutboxDeliveryId::new(
+            projection_phase(
+                "projection-status-ack",
+                self.acks.acknowledge(&ProjectionOutboxDeliveryId::new(
                     self.consumer_id.clone(),
                     incarnation,
                     record.record_id().to_string(),
                     origin_sequence,
-                ))
-                .await?;
+                )),
+            )
+            .await?;
             drained_record_ids.push(record.record_id().to_string());
             drained_event_ids.push(event_id);
         }
@@ -1527,10 +1539,11 @@ impl ProjectionOutboxWorker {
             quarantined_record_ids,
             quarantined_event_ids,
             already_acknowledged,
-            latest_projected_sequence: self
-                .acks
-                .latest_projected_sequence(&self.consumer_id)
-                .await?,
+            latest_projected_sequence: projection_phase(
+                "projection-status-ack",
+                self.acks.latest_projected_sequence(&self.consumer_id),
+            )
+            .await?,
         })
     }
 

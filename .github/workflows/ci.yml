@@ -67,6 +67,7 @@ jobs:
           github_token: ${{ github.token }}
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: bash tools/test_ci_certification_contracts.sh
       - run: cargo xtask doctor
       - run: cargo xtask adr-check
       - run: cargo xtask verify-integrity
@@ -180,6 +181,8 @@ jobs:
           cache-dependency-path: |
             python/arco/pyproject.toml
             python/arco/uv.lock
+      - name: Run qualification tooling unit tests
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - name: Install uv
         run: |
           python -m pip install --upgrade pip

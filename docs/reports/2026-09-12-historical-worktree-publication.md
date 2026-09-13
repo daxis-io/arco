@@ -18,7 +18,7 @@ this does not assert the code is defective or that the underlying issue is solve
 - PR #429 contains the complete measured state-store series through the bounded directory; PR #430 contains runtime-cache reuse. Their exact source snapshots and all six phase branches were pushed earlier in this publication task.
 - Fast-forwarded existing PRs #376, #377, #394, #395, and #396 with their previously local integration/lint commits. All five passed fresh workspace formatting and diff checks; the CI certification contract script and four affected worker Python tests also passed. These updates retain their original commits. Full Rust CI on the updated heads is pending, not claimed passing.
 - Publish the completed historical remediation-ledger update and this inventory through existing documentation PR #374. Historical findings keep their original checkpoint date and are not current issue-closure claims.
-- Raw `.ai`, `.closeout`, and Gate 5 qualification artifacts stay in their retained evidence locations. They are not blindly staged as source.
+- Raw agent-run logs, `.closeout`, and Gate 5 qualification artifacts stay in their retained evidence locations. They are not blindly staged as source.
 - No new provider testing, infrastructure deployment, or resource creation is part of this publication.
 
 ## Dispositions
@@ -39,7 +39,7 @@ Disposition | Worktrees
 
 | Worktree | Head | Disposition | Evidence / remaining work |
 |---|---|---|---|
-| `arco` | `8acff327` | Superseded | Diverged July main and original audit copy; corrected audit is already on main. Keep raw .ai evidence local. |
+| `arco` | `8acff327` | Superseded | Diverged July main and original audit copy; corrected audit is already on main. Keep raw agent-run evidence local. |
 | `arco-control-state-pr-stack` | `f21b50b9` | Unavailable | Prunable/missing Git worktree metadata; preserved without mutation. |
 | `arco-pr-landing-sim-20260803` | `71b29a39` | Unavailable | Prunable/missing Git worktree metadata; preserved without mutation. |
 | `audit-fixes` | `c3c0867c` | Validation/integration outstanding | Large mixed dirty patch quarry; no final current-source validation closure found. |

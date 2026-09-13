@@ -123,6 +123,8 @@ use crate::workspace_snapshot::{
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 pub(crate) mod cost;
+#[cfg(feature = "test-utils")]
+pub use cost::BoundedWork;
 #[allow(
     dead_code,
     reason = "Directory integration with authority publication is the next capacity slice"
@@ -131,7 +133,22 @@ pub(crate) mod directory;
 #[cfg(feature = "test-utils")]
 mod eager_reference;
 mod integrity;
+#[allow(dead_code, reason = "V2 codecs await bounded authority integration")]
+mod logical_v2;
+pub use logical_v2::ProjectionIntentV2;
+#[allow(dead_code, reason = "authority-8 integration in progress")]
+mod bounded;
 mod lazy;
+#[allow(
+    dead_code,
+    reason = "physical descriptors await authority-8 integration"
+)]
+mod physical;
+#[cfg(feature = "test-utils")]
+pub use bounded::SyntheticKvEntry;
+pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
+#[cfg(test)]
+mod authority8_tests;
 mod read_cache;
 pub use read_cache::{
     ControlMvpReadCache, ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics,
@@ -200,20 +217,119 @@ pub struct ControlMvpStateStore {
     binding_identity: StateStoreBindingIdentity,
     scope: StateScope,
     paths: ControlMvpPaths,
+    authority_format: u32,
     checkpoint_interval: u64,
     writer_epoch: u64,
     segment_limits: SegmentLimits,
     l1_test_rows: Option<usize>,
     read_cache: Option<ControlMvpReadCache>,
     cache_namespace: Option<DurableAuthorityBinding>,
+    bounded_recovery_bytes: Option<Arc<std::sync::Mutex<usize>>>,
 }
 
 impl ControlMvpStateStore {
+    fn reject_bounded_v1(&self, operation: &str) -> Result<()> {
+        if self.authority_format == 8 {
+            return Err(CatalogError::UnsupportedAuthorityFormat {
+                message: format!("authority-8 does not support {operation}"),
+            });
+        }
+        Ok(())
+    }
+
+    async fn require_legacy_lifecycle(&self, operation: &str) -> Result<()> {
+        self.reject_bounded_v1(operation)?;
+        self.load_pinned_pointer().await?;
+        Ok(())
+    }
+
+    async fn authenticated_token_format(&self, token: &StateToken) -> Result<u32> {
+        #[derive(Deserialize)]
+        struct Format {
+            format_version: u32,
+        }
+        if token.scope() != &self.scope {
+            return Err(validation_failed("retained token scope mismatch"));
+        }
+        let witness = token.manifest_witness()?;
+        let bytes = self
+            .get_json(
+                &self.paths.manifest_object(token.authority_manifest_id()),
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        validate_raw_checksum(&bytes, Some(witness), "retained manifest format witness")?;
+        let header: Format = decode_json(&bytes, "retained manifest format")?;
+        if !matches!(header.format_version, 7 | 8) {
+            return Err(CatalogError::UnsupportedAuthorityFormat {
+                message: "unsupported retained authority format".into(),
+            });
+        }
+        Ok(header.format_version)
+    }
+
+    async fn scan_bounded_base(
+        &self,
+        base: &bounded::Base,
+        request: ScanRequest,
+    ) -> Result<ScanPage> {
+        request.validate_for_scope(&self.scope)?;
+        let end = lazy::prefix_end(request.prefix());
+        let rows = base
+            .range(
+                self,
+                request
+                    .effective_start_after()
+                    .unwrap_or_else(|| request.prefix()),
+                end.as_deref(),
+            )
+            .await?;
+        build_scan_page(
+            &self.scope,
+            request,
+            base.token(self),
+            rows.into_iter().filter_map(|(key, value)| {
+                (!value.tombstone).then(|| {
+                    KvPair::new(
+                        key,
+                        VersionedValue::new(value.bytes, Some(value.generation)),
+                    )
+                })
+            }),
+        )
+    }
+
     async fn get_json(&self, path: &str, limit: usize) -> Result<Bytes> {
         let end = (limit as u64)
             .checked_add(1)
             .ok_or_else(|| invariant_violation("JSON probe overflow"))?;
+        // Reserve before I/O. An error or cancellation conservatively retains
+        // the reservation; successful reads refund the unused probe capacity.
+        if let Some(budget) = &self.bounded_recovery_bytes {
+            let mut remaining = budget
+                .lock()
+                .map_err(|_| invariant_violation("recovery evidence budget lock poisoned"))?;
+            let probe = usize::try_from(end)
+                .map_err(|_| invariant_violation("recovery JSON probe does not fit usize"))?;
+            *remaining = remaining.checked_sub(probe).ok_or_else(|| {
+                CatalogError::AmbiguousAuthorityOutcome {
+                    message: "bounded recovery evidence byte budget exhausted before read".into(),
+                }
+            })?;
+        }
         let bytes = self.storage.get_range(path, 0..end).await?;
+        if let Some(budget) = &self.bounded_recovery_bytes {
+            let unused = usize::try_from(end)
+                .ok()
+                .and_then(|probe| probe.checked_sub(bytes.len()))
+                .ok_or_else(|| invariant_violation("recovery JSON read exceeded reserved probe"))?;
+            let mut remaining = budget
+                .lock()
+                .map_err(|_| invariant_violation("recovery evidence budget lock poisoned"))?;
+            *remaining = remaining
+                .checked_add(unused)
+                .ok_or_else(|| invariant_violation("recovery evidence budget refund overflow"))?;
+        }
         if bytes.len() > limit {
             return Err(invariant_violation(format!(
                 "authority JSON {} exceeds {limit} byte bound",
@@ -257,14 +373,27 @@ impl ControlMvpStateStore {
             binding_identity,
             scope,
             paths,
+            authority_format: CONTROL_MVP_FORMAT_VERSION,
             checkpoint_interval: Self::DEFAULT_CHECKPOINT_INTERVAL,
             writer_epoch: 0,
             segment_limits: PRODUCTION_SEGMENT_LIMITS,
             l1_test_rows: None,
             read_cache: None,
             cache_namespace: None,
+            bounded_recovery_bytes: None,
         };
         store.with_read_cache_config(ControlMvpReadCacheConfig::default())
+    }
+
+    /// Creates an explicit synthetic authority-8 store.
+    ///
+    /// # Errors
+    /// Returns the same scope and cache validation errors as `new`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_synthetic_bounded(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+        let mut store = Self::new(storage, scope)?;
+        store.authority_format = 8;
+        Ok(store)
     }
 
     /// Sets the automatic replay-anchor interval in committed transactions.
@@ -394,13 +523,27 @@ impl ControlMvpStateStore {
     /// publish [`u64::MAX`] (which no later claim could supersede), and a CAS
     /// error when another writer moved the pointer concurrently.
     pub async fn claim_writer_authority(mut self) -> Result<Self> {
-        let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
-        let Some(pointer_meta) = pointer_meta else {
-            return Err(validation_failed(
-                "cannot claim a control MVP writer epoch before the first commit",
-            ));
+        let (pointer, pointer_version) = if self.authority_format == 8 {
+            let base = self.pin_bounded_base().await?;
+            let bytes = base.pointer_bytes().ok_or_else(|| {
+                validation_failed("cannot claim a control MVP writer epoch before the first commit")
+            })?;
+            let version = base.pointer_version().ok_or_else(|| {
+                invariant_violation("bounded writer claim has no pinned HEAD version")
+            })?;
+            (
+                decode_json(bytes, "bounded writer claim HEAD")?,
+                version.to_owned(),
+            )
+        } else {
+            let pointer_meta = self.storage.head(&self.paths.current_pointer()).await?;
+            let Some(pointer_meta) = pointer_meta else {
+                return Err(validation_failed(
+                    "cannot claim a control MVP writer epoch before the first commit",
+                ));
+            };
+            (self.load_pointer().await?, pointer_meta.version)
         };
-        let pointer = self.load_pointer().await?;
         let claimed_epoch = pointer
             .writer_epoch
             .checked_add(1)
@@ -422,7 +565,7 @@ impl ControlMvpStateStore {
             .put(
                 &self.paths.current_pointer(),
                 claimed_bytes.clone(),
-                AuthorityWritePrecondition::MatchesVersion(pointer_meta.version),
+                AuthorityWritePrecondition::MatchesVersion(pointer_version),
             )
             .await;
         match pointer_write {
@@ -434,11 +577,16 @@ impl ControlMvpStateStore {
                 message: "control MVP writer epoch claim lost a pointer race".to_string(),
             }),
             Err(error) => {
-                if self
-                    .get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
-                    .await
-                    .is_ok_and(|current| current == claimed_bytes)
-                {
+                let committed = if self.authority_format == 8 {
+                    self.load_pinned_pointer().await.is_ok_and(|current| {
+                        current.is_some_and(|(_, _, bytes)| bytes == claimed_bytes)
+                    })
+                } else {
+                    self.get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
+                        .await
+                        .is_ok_and(|current| current == claimed_bytes)
+                };
+                if committed {
                     self.writer_epoch = claimed_epoch;
                     Ok(self)
                 } else {
@@ -502,6 +650,8 @@ impl ControlMvpStateStore {
             store: self.clone(),
             base,
             reads: TransactionReads::default(),
+            logical_operation: None,
+            bounded_trims: Vec::new(),
             nonce: cost::nonce().0,
             #[cfg(any(test, feature = "test-utils"))]
             eager_base: None,
@@ -522,6 +672,7 @@ impl ControlMvpStateStore {
     ///
     /// Returns an error when visible artifacts are corrupt or unavailable.
     pub async fn current_projection_outbox(&self) -> Result<Vec<ControlMvpProjectionOutboxRecord>> {
+        self.require_legacy_lifecycle("V1 outbox reads").await?;
         let token = self.current_state_token().await;
         match token {
             Ok(token) => self.projection_outbox_at(token).await,
@@ -619,15 +770,72 @@ impl ControlMvpStateStore {
     }
 
     async fn load_pointer(&self) -> Result<ControlMvpPointer> {
-        let bytes = self
-            .get_json(&self.paths.current_pointer(), MAX_HEAD_JSON_BYTES)
-            .await?;
-        validate_persisted_json_size(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
-        validate_version_header(&bytes, CONTROL_MVP_FORMAT_VERSION, "control MVP HEAD")?;
-        let pointer: ControlMvpPointer =
-            decode_json_limited(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
-        pointer.validate(&self.scope)?;
-        Ok(pointer)
+        self.load_pinned_pointer()
+            .await?
+            .map(|(pointer, _, _)| pointer)
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "control MVP HEAD".into(),
+                name: self.paths.current_pointer(),
+            })
+    }
+
+    async fn load_pinned_pointer(&self) -> Result<Option<(ControlMvpPointer, String, Bytes)>> {
+        let path = self.paths.current_pointer();
+        for attempt in 0..3 {
+            let Some(before) = self.storage.head(&path).await? else {
+                if attempt == 0 {
+                    return Ok(None);
+                }
+                return Err(invariant_violation(
+                    "selected HEAD disappeared while pinning",
+                ));
+            };
+            if before.version.is_empty() {
+                return Err(invariant_violation("invalid HEAD version"));
+            }
+            if before.size > MAX_HEAD_JSON_BYTES as u64 {
+                return Err(invariant_violation(format!(
+                    "control MVP mutable head exceeds {MAX_HEAD_JSON_BYTES} bytes"
+                )));
+            }
+            let bytes = self
+                .get_json(&path, MAX_HEAD_JSON_BYTES)
+                .await
+                .map_err(|error| {
+                    if matches!(error, CatalogError::NotFound { .. }) {
+                        invariant_violation("selected HEAD bytes disappeared while pinning")
+                    } else {
+                        error
+                    }
+                })?;
+            let after =
+                self.storage.head(&path).await?.ok_or_else(|| {
+                    invariant_violation("selected HEAD disappeared while pinning")
+                })?;
+            if after.version.is_empty() {
+                return Err(invariant_violation("empty HEAD version after pointer read"));
+            }
+            if before.version != after.version {
+                continue;
+            }
+            if before.size != after.size || after.size != bytes.len() as u64 {
+                return Err(invariant_violation("HEAD size differs from pinned bytes"));
+            }
+            validate_version_header(&bytes, self.authority_format, "control MVP HEAD")?;
+            let pointer: ControlMvpPointer =
+                decode_json_limited(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
+            pointer.validate_versioned(&self.scope, self.authority_format)?;
+            return Ok(Some((pointer, before.version, bytes)));
+        }
+        if self.authority_format == CONTROL_MVP_FORMAT_VERSION {
+            // Preserve the format-7 restore preflight conflict classification.
+            return Err(CatalogError::CasFailed {
+                message: "HEAD pin retry budget exhausted".into(),
+            });
+        }
+        Err(CatalogError::AmbiguousAuthorityOutcome {
+            message: "HEAD pin retry budget exhausted".into(),
+        })
     }
 
     async fn load_manifest_for_pointer(
@@ -2610,6 +2818,9 @@ impl ControlMvpMaintenanceWorker {
         additional_protected_paths: impl IntoIterator<Item = String>,
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcPlan> {
+        self.store
+            .require_legacy_lifecycle("plan_gc_page_at")
+            .await?;
         self.plan_gc_page_inner(now, additional_protected_paths, continuation)
             .await
     }
@@ -2645,6 +2856,9 @@ impl ControlMvpMaintenanceWorker {
         additional_protected_paths: impl IntoIterator<Item = String>,
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcOutcome> {
+        self.store
+            .require_legacy_lifecycle("collect_gc_page_at")
+            .await?;
         let protected = additional_protected_paths.into_iter().collect::<Vec<_>>();
         let mut guard =
             DistributedLock::new(Arc::new(self.lifecycle.clone()), RETENTION_GC_LOCK_PATH)
@@ -3124,6 +3338,9 @@ impl ControlMvpMaintenanceWorker {
     ///
     /// Returns an error when the current head or manifest is unavailable or corrupt.
     pub async fn pending_intent(&self) -> Result<Option<LayoutMaintenanceIntentV1>> {
+        self.store
+            .require_legacy_lifecycle("pending_intent")
+            .await?;
         let Some(_) = self
             .store
             .storage
@@ -4057,6 +4274,8 @@ pub struct ControlMvpTxn {
     store: ControlMvpStateStore,
     base: TransactionBase,
     reads: TransactionReads,
+    logical_operation: Option<logical_v2::Operation>,
+    bounded_trims: Vec<logical_v2::Trim>,
     nonce: u128,
     #[cfg(any(test, feature = "test-utils"))]
     eager_base: Option<ControlMvpBase>,
@@ -4076,7 +4295,144 @@ struct StagedProjectionIntent {
     payload: Bytes,
 }
 
+/// Successful synthetic authority-8 publication and its logical envelopes.
+#[derive(Debug)]
+pub struct CommitOutcomeV2 {
+    token: StateToken,
+    projection_intents: Vec<ProjectionIntentV2>,
+    logical_commit_id: String,
+}
+impl CommitOutcomeV2 {
+    /// Returns the committed authority token.
+    #[must_use]
+    pub const fn token(&self) -> &StateToken {
+        &self.token
+    }
+    /// Returns the committed logical projection envelopes.
+    #[must_use]
+    pub fn projection_intents(&self) -> &[ProjectionIntentV2] {
+        &self.projection_intents
+    }
+    /// Returns the physical-layout-independent logical commit identity.
+    #[must_use]
+    pub fn logical_commit_id(&self) -> &str {
+        &self.logical_commit_id
+    }
+}
+
 impl ControlMvpTxn {
+    /// Freezes the stable operation identity for an explicit synthetic V2 transaction.
+    ///
+    /// # Errors
+    /// Rejects a V1 transaction, a malformed identity, or replacement of an already frozen identity.
+    #[cfg(feature = "test-utils")]
+    pub fn set_logical_operation_v2(&mut self, id: &str, family: &str, digest: &str) -> Result<()> {
+        self.set_logical_operation(id, family, digest)
+    }
+
+    pub(crate) fn set_logical_operation(
+        &mut self,
+        id: &str,
+        family: &str,
+        digest: &str,
+    ) -> Result<()> {
+        if self.store.authority_format != 8 || self.logical_operation.is_some() {
+            return Err(unsupported(
+                "setting a V2 operation on V1 or replacing a frozen operation",
+            ));
+        }
+        let operation = logical_v2::Operation {
+            operation_id: id.into(),
+            family: family.into(),
+            request_digest: digest.into(),
+        };
+        let TransactionBase::Bounded(base) = &self.base else {
+            return Err(unsupported("V2 logical operation on V1 base"));
+        };
+        let prior = if base.logical_sequence() == 0 {
+            logical_v2::genesis(&self.store.scope)
+        } else {
+            base.logical_history().to_owned()
+        };
+        logical_v2::commit_id(
+            &self.store.scope,
+            &prior,
+            base.logical_sequence() + 1,
+            &operation,
+        )?;
+        self.logical_operation = Some(operation);
+        Ok(())
+    }
+    pub(crate) fn logical_commit_id(&self) -> Result<String> {
+        let TransactionBase::Bounded(base) = &self.base else {
+            return Err(unsupported("V2 identity on V1 base"));
+        };
+        let operation = self
+            .logical_operation
+            .as_ref()
+            .ok_or_else(|| validation_failed("missing frozen V2 logical operation"))?;
+        let prior = if base.logical_sequence() == 0 {
+            logical_v2::genesis(&self.store.scope)
+        } else {
+            base.logical_history().to_owned()
+        };
+        logical_v2::commit_id(
+            &self.store.scope,
+            &prior,
+            next_logical_sequence(base.logical_sequence(), "V2 identity")?,
+            operation,
+        )
+    }
+    /// Stages an authority-8 projection envelope for the frozen logical operation.
+    ///
+    /// # Errors
+    /// Returns an error for a V1 base, malformed envelope, duplicate ID, or capacity exhaustion.
+    pub async fn stage_projection_intent_v2(
+        &mut self,
+        intent_id: impl Into<String>,
+        projection_kind: impl Into<String>,
+        payload: Bytes,
+    ) -> Result<()> {
+        let staged = StagedProjectionIntent {
+            intent_id: intent_id.into(),
+            projection_kind: projection_kind.into(),
+            payload,
+        };
+        ProjectionIntentV2::new(
+            &staged.intent_id,
+            &staged.projection_kind,
+            self.store.scope.clone(),
+            self.base.logical_sequence() + 1,
+            self.logical_commit_id()?,
+            self.projection_intents.len() as u64,
+            &staged.payload,
+        )?;
+        self.ensure_outbox_id_available(&staged.intent_id, "V2 projection intent")
+            .await?;
+        self.reads.reserve(
+            staged.intent_id.len() + staged.projection_kind.len() + staged.payload.len() + 96,
+            1,
+        )?;
+        self.projection_intents.push(staged);
+        Ok(())
+    }
+    /// Publishes a synthetic authority-8 transaction.
+    ///
+    /// # Errors
+    /// Returns validation, integrity, capacity, conflict, or unresolved publication errors.
+    pub async fn commit_v2(self) -> Result<CommitOutcomeV2> {
+        if self.store.authority_format != 8 {
+            return Err(unsupported("V2 commit on V1 authority"));
+        }
+        let (token, projection_intents, logical_commit_id) =
+            Box::pin(self.store.clone().commit_bounded(self)).await?;
+        Ok(CommitOutcomeV2 {
+            token,
+            projection_intents,
+            logical_commit_id,
+        })
+    }
+
     /// Returns the immutable transaction object identifier this transaction will write.
     #[must_use]
     pub fn tx_id(&self) -> &str {
@@ -4121,6 +4477,7 @@ impl ControlMvpTxn {
         &mut self,
         record: ControlMvpProjectionOutboxRecord,
     ) -> Result<()> {
+        self.store.reject_bounded_v1("V1 outbox staging")?;
         self.ensure_outbox_id_available(&record.record_id, "projection outbox record")
             .await?;
         self.reads
@@ -4146,6 +4503,7 @@ impl ControlMvpTxn {
         projection_kind: impl Into<String>,
         payload: Bytes,
     ) -> Result<()> {
+        self.store.reject_bounded_v1("V1 projection staging")?;
         let staged = StagedProjectionIntent {
             intent_id: intent_id.into(),
             projection_kind: projection_kind.into(),
@@ -4198,6 +4556,7 @@ impl ControlMvpTxn {
         &mut self,
         targets: impl IntoIterator<Item = ControlMvpOutboxTrimTarget>,
     ) -> Result<()> {
+        self.store.reject_bounded_v1("V1 outbox trimming")?;
         let mut staged = BTreeMap::new();
         let mut bytes = 0_usize;
         for target in targets {
@@ -4254,6 +4613,7 @@ impl ControlMvpTxn {
     #[allow(clippy::too_many_lines)]
     #[allow(unused_mut, reason = "test-only eager reference consumes its snapshot")]
     async fn commit_inner(mut self) -> Result<CommitOutcome> {
+        self.store.reject_bounded_v1("V1 commit")?;
         // This is the complete Gate 3 publication boundary. Selective caches
         // never substitute for replay or redundant-anchor equivalence checks.
         #[cfg(any(test, feature = "test-utils"))]
@@ -4586,6 +4946,15 @@ impl ControlMvpTxn {
 #[async_trait]
 impl ArcoStateReader for ControlMvpStateStore {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.authority_format == 8 {
+            return Ok(self
+                .pin_bounded_base()
+                .await?
+                .get(self, key)
+                .await?
+                .filter(|value| !value.tombstone)
+                .map(|value| value.bytes));
+        }
         let Some(_pointer_meta) = self.storage.head(&self.paths.current_pointer()).await? else {
             return Ok(None);
         };
@@ -4596,6 +4965,15 @@ impl ArcoStateReader for ControlMvpStateStore {
 
     async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
         request.validate_for_scope(&self.scope)?;
+        if let Some(token) = request.continuation_token() {
+            if self.authenticated_token_format(token).await? == 8 {
+                let base = self.read_bounded_token(token).await?;
+                return self.scan_bounded_base(&base, request).await;
+            }
+        } else if self.authority_format == 8 {
+            let base = self.pin_bounded_base().await?;
+            return self.scan_bounded_base(&base, request).await;
+        }
         let (manifest, observed_token) = if let Some(token) = request.continuation_token() {
             let manifest = self
                 .load_manifest_with_expected_checksum(
@@ -4636,6 +5014,17 @@ impl ArcoStateReader for ControlMvpStateStore {
             return Err(validation_failed(
                 "StateToken scope does not match control MVP store",
             ));
+        }
+        if self.authenticated_token_format(&token).await? == 8 {
+            let base = self.read_bounded_token(&token).await?;
+            return Ok(Box::new(ControlMvpRetainedReader {
+                scope: self.scope.clone(),
+                token,
+                source: ControlMvpRetainedSource::Bounded {
+                    store: Box::new(self.clone()),
+                    base: Box::new(base),
+                },
+            }));
         }
         let manifest = self
             .load_manifest_with_expected_checksum(
@@ -4706,10 +5095,22 @@ impl ArcoStateReader for ControlMvpStateStore {
 #[async_trait]
 impl ArcoStateAdmin for ControlMvpStateStore {
     fn capabilities(&self) -> StateStoreCapabilities {
-        StateStoreCapabilities::control_mvp(Self::IMPLEMENTATION)
+        if self.authority_format == 8 {
+            StateStoreCapabilities::deterministic_model(Self::IMPLEMENTATION)
+        } else {
+            StateStoreCapabilities::control_mvp(Self::IMPLEMENTATION)
+        }
     }
 
     async fn current_state_token(&self) -> Result<StateToken> {
+        if self.authority_format == 8 {
+            return self.pin_bounded_base().await?.token(self).ok_or_else(|| {
+                CatalogError::NotFound {
+                    entity: "bounded HEAD".into(),
+                    name: self.paths.current_pointer(),
+                }
+            });
+        }
         let pointer = self.load_pointer().await?;
         self.load_manifest_for_pointer(&pointer).await?;
         Ok(self
@@ -4718,6 +5119,8 @@ impl ArcoStateAdmin for ControlMvpStateStore {
     }
 
     async fn checkpoint(&self, opts: CheckpointOptions) -> Result<CheckpointToken> {
+        self.require_legacy_lifecycle("checkpoint publication")
+            .await?;
         if let Some(scope) = opts.scope()
             && scope != &self.scope
         {
@@ -4795,6 +5198,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         token: &StateToken,
         retention_deadline: DateTime<Utc>,
     ) -> Result<PersistedAuthorityReference> {
+        self.reject_bounded_v1("persist_state_reference")?;
         if retention_deadline <= cost::now() {
             return Err(validation_failed(
                 "persisted authority retention deadline must be in the future",
@@ -4847,6 +5251,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         token: &CheckpointToken,
         retention_deadline: DateTime<Utc>,
     ) -> Result<PersistedAuthorityReference> {
+        self.reject_bounded_v1("persist_checkpoint_reference")?;
         if retention_deadline <= cost::now() {
             return Err(validation_failed(
                 "persisted authority retention deadline must be in the future",
@@ -5043,6 +5448,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         identity: &RestoreAttemptIdentity,
         now: DateTime<Utc>,
     ) -> Result<PersistedRestoreParticipantPlan> {
+        self.store.require_legacy_lifecycle("plan_restore").await?;
         Ok(PersistedRestoreParticipantPlan::ControlMvp(
             self.store.build_restore_plan(source, identity, now).await?,
         ))
@@ -5052,6 +5458,9 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         &self,
         plan: &PersistedRestoreParticipantPlan,
     ) -> Result<RestoreParticipantInspection> {
+        self.store
+            .require_legacy_lifecycle("inspect_restore")
+            .await?;
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
         if plan.is_legacy_version() {
             plan.validate_legacy_for_supersession(&self.store)?;
@@ -5113,6 +5522,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         persisted: &PersistedRestoreParticipantPlan,
         now: DateTime<Utc>,
     ) -> Result<RestoreParticipantInspection> {
+        self.store.require_legacy_lifecycle("apply_restore").await?;
         let PersistedRestoreParticipantPlan::ControlMvp(plan) = persisted;
         if plan.is_legacy_version() {
             plan.validate_legacy_for_supersession(&self.store)?;
@@ -5777,7 +6187,11 @@ struct ControlMvpPointer {
 
 impl ControlMvpPointer {
     fn validate(&self, scope: &StateScope) -> Result<()> {
-        if self.format_version != CONTROL_MVP_FORMAT_VERSION {
+        self.validate_versioned(scope, CONTROL_MVP_FORMAT_VERSION)
+    }
+
+    fn validate_versioned(&self, scope: &StateScope, format: u32) -> Result<()> {
+        if self.format_version != format {
             return Err(invariant_violation(
                 "control MVP pointer format version mismatch",
             ));
@@ -7519,6 +7933,11 @@ fn decode_block_rows(bytes: &[u8], block: &ControlMvpBlock) -> Result<Vec<Contro
             "control MVP Arrow segment exceeds the supported row limit",
         ));
     }
+    #[cfg(feature = "test-utils")]
+    cost::bounded_work(BoundedWork {
+        decoded_rows: batch.num_rows() as u64,
+        ..Default::default()
+    });
     let rows = cost::allocated(30, || decode_segment_batch(batch))?;
     if block_metadata(block.offset, bytes, &rows) != *block {
         return Err(invariant_violation("decoded block metadata mismatch"));
@@ -7910,6 +8329,10 @@ struct ControlMvpRetainedReader {
 
 #[derive(Clone)]
 enum ControlMvpRetainedSource {
+    Bounded {
+        store: Box<ControlMvpStateStore>,
+        base: Box<bounded::Base>,
+    },
     Manifest {
         store: Box<ControlMvpStateStore>,
         manifest: Box<ControlMvpManifest>,
@@ -7921,6 +8344,11 @@ enum ControlMvpRetainedSource {
 impl ArcoStateReader for ControlMvpRetainedReader {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         match &self.source {
+            ControlMvpRetainedSource::Bounded { store, base } => Ok(base
+                .get(store, key)
+                .await?
+                .filter(|value| !value.tombstone)
+                .map(|value| value.bytes)),
             ControlMvpRetainedSource::Manifest { store, manifest } => {
                 store.get_from_manifest(manifest, key).await
             }
@@ -7935,6 +8363,9 @@ impl ArcoStateReader for ControlMvpRetainedReader {
     async fn scan(&self, request: ScanRequest) -> Result<ScanPage> {
         request.validate_for_scope(&self.scope)?;
         match &self.source {
+            ControlMvpRetainedSource::Bounded { store, base } => {
+                store.scan_bounded_base(base, request).await
+            }
             ControlMvpRetainedSource::Manifest { store, manifest } => {
                 store
                     .scan_manifest_page(manifest, request, self.token.clone())
@@ -8223,17 +8654,19 @@ fn record_integrity_work(kind: usize, bytes: usize) {
     });
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    #[cfg(feature = "test-utils")]
-    {
-        cost::record(0, 1);
-        cost::record(1, bytes.len());
-    }
-    #[cfg(feature = "test-utils")]
+#[cfg(feature = "test-utils")]
+pub(crate) fn record_sha256_work(bytes: usize) {
+    cost::record(0, 1);
+    cost::record(1, bytes);
     TEST_SHA256_WORK.with(|work| {
         let (calls, total) = work.get();
-        work.set((calls + 1, total + bytes.len() as u64));
+        work.set((calls + 1, total + bytes as u64));
     });
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    record_sha256_work(bytes.len());
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
@@ -8411,6 +8844,10 @@ mod tests {
         deferred_checkpoint: Mutex<Option<(String, Bytes, WritePrecondition)>>,
         fail_fence_readback: AtomicBool,
         arrow_gets: AtomicUsize,
+        head_puts: AtomicUsize,
+        put_attempts: AtomicUsize,
+        evidence_gets: AtomicUsize,
+        fail_head_before: AtomicBool,
     }
 
     impl PauseCheckpointPutBackend {
@@ -8427,6 +8864,10 @@ mod tests {
                 deferred_checkpoint: Mutex::new(None),
                 fail_fence_readback: AtomicBool::new(false),
                 arrow_gets: AtomicUsize::new(0),
+                head_puts: AtomicUsize::new(0),
+                put_attempts: AtomicUsize::new(0),
+                evidence_gets: AtomicUsize::new(0),
+                fail_head_before: AtomicBool::new(false),
             })
         }
 
@@ -8446,9 +8887,192 @@ mod tests {
         }
     }
 
+    fn bounded_fault_store() -> (Arc<PauseCheckpointPutBackend>, ControlMvpStateStore) {
+        let backend = PauseCheckpointPutBackend::new();
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        (backend, store)
+    }
+
+    async fn bounded_fault_txn(store: &ControlMvpStateStore, id: &str) -> ControlMvpTxn {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation(id, "fault-test", &"bc".repeat(32))
+            .unwrap();
+        txn.put(b"key", Bytes::copy_from_slice(id.as_bytes()))
+            .await
+            .unwrap();
+        txn
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_recovery_finds_lost_response_after_head_advances() {
+        let (backend, store) = bounded_fault_store();
+        let first = bounded_fault_txn(&store, "first").await;
+        let candidate = first.candidate_manifest_id().to_owned();
+        backend.lose_head_response.store(true, Ordering::SeqCst);
+        let _ = first.commit_v2().await;
+        assert_eq!(backend.head_puts.load(Ordering::SeqCst), 1);
+        bounded_fault_txn(&store, "second")
+            .await
+            .commit_v2()
+            .await
+            .unwrap();
+        let restarted = ControlMvpStateStore::new_synthetic_bounded(
+            store.retention.clone(),
+            store.scope.clone(),
+        )
+        .unwrap();
+        let recovered = restarted.reconcile_candidate_v2(&candidate).await.unwrap();
+        let CandidateRecoveryV2::Committed(token) = recovered else {
+            panic!("lost response must recover exact committed candidate: {recovered:?}");
+        };
+        assert_eq!(token.logical_sequence(), 1);
+        assert_eq!(
+            restarted
+                .read_at(token)
+                .await
+                .unwrap()
+                .get(b"key")
+                .await
+                .unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        assert_eq!(
+            backend.head_puts.load(Ordering::SeqCst),
+            2,
+            "recovery must not resubmit HEAD"
+        );
+    }
+
+    async fn cancelled_bounded_candidate(
+        after: bool,
+    ) -> (Arc<PauseCheckpointPutBackend>, ControlMvpStateStore, String) {
+        let (backend, store) = bounded_fault_store();
+        let txn = bounded_fault_txn(&store, "cancelled").await;
+        let candidate = txn.candidate_manifest_id().to_owned();
+        *backend.gate_path.lock().unwrap() = "/head/current.json".into();
+        backend.pause_after_put.store(after, Ordering::SeqCst);
+        let (reached, release) = backend.arm();
+        let task = tokio::spawn(txn.commit_v2());
+        tokio::time::timeout(Duration::from_secs(10), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(release);
+        (backend, store, candidate)
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_cancelled_before_head_remains_unresolved_then_superseded() {
+        let (backend, store, candidate) = cancelled_bounded_candidate(false).await;
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Unresolved
+        ));
+        assert_eq!(backend.head_puts.load(Ordering::SeqCst), 1);
+        bounded_fault_txn(&store, "competitor")
+            .await
+            .commit_v2()
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Superseded(_)
+        ));
+        assert_eq!(backend.head_puts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_cancelled_after_head_recovers_committed_without_resubmission() {
+        let (backend, store, candidate) = cancelled_bounded_candidate(true).await;
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Committed(_)
+        ));
+        assert_eq!(backend.head_puts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_before_write_failure_and_missing_evidence_are_unresolved() {
+        let (backend, store) = bounded_fault_store();
+        let txn = bounded_fault_txn(&store, "before-write").await;
+        let candidate = txn.candidate_manifest_id().to_owned();
+        backend.fail_head_before.store(true, Ordering::SeqCst);
+        assert!(txn.commit_v2().await.is_err());
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Unresolved
+        ));
+        store
+            .retention
+            .delete(&format!(
+                "{}/prepared/{candidate}.json",
+                store.paths.base_prefix()
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Unresolved
+        ));
+        assert_eq!(backend.head_puts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_reconciliation_is_read_only_with_an_absent_original_head() {
+        let (backend, store) = bounded_fault_store();
+        let txn = bounded_fault_txn(&store, "read-only-recovery").await;
+        let candidate = txn.candidate_manifest_id().to_owned();
+        backend.fail_head_before.store(true, Ordering::SeqCst);
+        assert!(txn.commit_v2().await.is_err());
+        let before = backend.put_attempts.load(Ordering::SeqCst);
+        assert!(matches!(
+            store.reconcile_candidate_v2(&candidate).await.unwrap(),
+            CandidateRecoveryV2::Unresolved
+        ));
+        assert_eq!(
+            backend.put_attempts.load(Ordering::SeqCst),
+            before,
+            "recovery must only read retained evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_candidate_recovery_budget_covers_prepare_and_validation_before_reads() {
+        let (backend, store) = bounded_fault_store();
+        let txn = bounded_fault_txn(&store, "budgeted-recovery").await;
+        let candidate = txn.candidate_manifest_id().to_owned();
+        txn.commit_v2().await.unwrap();
+        for (budget, expected_gets) in [(0, 0), (MAX_CONTROL_JSON_BYTES + 1, 1)] {
+            let before = backend.evidence_gets.load(Ordering::SeqCst);
+            let result = store
+                .reconcile_candidate_v2_with_budget(&candidate, budget)
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, CandidateRecoveryV2::Unresolved),
+                "insufficient evidence budget must stay unresolved: {result:?}"
+            );
+            assert_eq!(
+                backend.evidence_gets.load(Ordering::SeqCst) - before,
+                expected_gets,
+                "reject the next evidence GET before exceeding its reserved budget"
+            );
+        }
+    }
+
     #[async_trait]
     impl StorageBackend for PauseCheckpointPutBackend {
         async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.evidence_gets.fetch_add(1, Ordering::SeqCst);
             if path.ends_with("/head/current.json")
                 && self.fail_fence_readback.load(Ordering::SeqCst)
                 && !self.lose_head_response.load(Ordering::SeqCst)
@@ -8467,6 +9091,7 @@ mod tests {
         }
 
         async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.evidence_gets.fetch_add(1, Ordering::SeqCst);
             if path.ends_with("/head/current.json")
                 && self.fail_fence_readback.load(Ordering::SeqCst)
                 && !self.lose_head_response.load(Ordering::SeqCst)
@@ -8484,6 +9109,15 @@ mod tests {
             data: Bytes,
             precondition: WritePrecondition,
         ) -> arco_core::Result<WriteResult> {
+            self.put_attempts.fetch_add(1, Ordering::SeqCst);
+            if path.ends_with("/head/current.json") {
+                self.head_puts.fetch_add(1, Ordering::SeqCst);
+                if self.fail_head_before.swap(false, Ordering::SeqCst) {
+                    return Err(arco_core::Error::storage(
+                        "injected failure before HEAD submission",
+                    ));
+                }
+            }
             if path.contains("/checkpoints/") && self.defer_checkpoint.swap(false, Ordering::SeqCst)
             {
                 *self.deferred_checkpoint.lock().unwrap() =

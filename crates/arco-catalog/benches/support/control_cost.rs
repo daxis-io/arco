@@ -66,6 +66,18 @@ impl Profile {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BackendCounts {
+    /// Arrow rows decoded while authenticating bounded physical blocks.
+    pub decoded_rows: u64,
+    /// Rows examined by authority-8 transition proofs.
+    pub transition_proof_rows: u64,
+    /// Unique physical blocks selected by a bounded operation.
+    pub selected_blocks: u64,
+    /// Physical blocks rewritten by a bounded operation.
+    pub rewritten_blocks: u64,
+    /// Directory child references decoded or encoded by bounded operations.
+    pub directory_references: u64,
+    /// Leaves presented to the streaming directory builder.
+    pub streaming_builder_inputs: u64,
     pub decoder_scratch_allocation_calls: u64,
     pub decoder_scratch_allocation_bytes: u64,
     pub request_copy_allocation_calls: u64,
@@ -107,6 +119,8 @@ pub struct BackendCounts {
     pub rendered_transaction_validation_calls: u64,
     pub rendered_transaction_validation_bytes: u64,
     pub object_reads: BTreeMap<String, ObjectReadCounts>,
+    /// Per-path-class physical I/O. Historical `object_reads` remains intact.
+    pub object_class_io: BTreeMap<String, ObjectClassCounts>,
     pub object_writes: BTreeMap<String, u64>,
     pub requested_ranges: BTreeMap<String, u64>,
     pub logical_storage_calls: u64,
@@ -122,6 +136,7 @@ pub struct BackendCounts {
     pub list_page_attempts: u64,
     pub delete_attempts: u64,
     pub head_cas_attempts: u64,
+    pub head_cas_attempt_bytes: u64,
     pub precondition_failures: u64,
     pub read_bytes: u64,
     pub write_attempt_bytes: u64,
@@ -134,6 +149,32 @@ pub struct ObjectReadCounts {
     pub ranges: u64,
     pub returned_bytes: u64,
     pub failures: u64,
+}
+
+/// Attempts and bytes grouped by the authenticated artifact class.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ObjectClassCounts {
+    pub full_get_attempts: u64,
+    pub range_get_attempts: u64,
+    pub read_bytes: u64,
+    pub read_failures: u64,
+    pub head_attempts: u64,
+    pub head_metadata_bytes: u64,
+    pub head_missing: u64,
+    pub head_failures: u64,
+    pub put_attempts: u64,
+    pub write_attempt_bytes: u64,
+}
+
+/// Exact private-memory HEAD replacement performed between bounded fixture runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct FixtureHeadReset {
+    /// Number of successful fixture-only HEAD resets issued by this backend.
+    pub reset_count: u64,
+    /// Version that the replacement condition matched.
+    pub previous_version: String,
+    /// Version assigned to the restored HEAD bytes.
+    pub replacement_version: String,
 }
 
 // Authority paths have canonical lowercase extensions.
@@ -152,6 +193,26 @@ fn object_class(path: &str) -> &'static str {
     }
 }
 
+fn physical_object_class(path: &str) -> &'static str {
+    if path.contains("/directory/v1/") && path.contains("/pages/") {
+        "directory_page"
+    } else if path.contains("/directory/v1/") && path.contains("/keys/") {
+        "external_fence"
+    } else if path.contains("/physical/descriptors/") {
+        "physical_descriptor"
+    } else if path.contains("/projection-sources/") {
+        "projection_source"
+    } else if path.contains("/transitions/") {
+        "transition_proof"
+    } else if path.contains("/prepared/") {
+        "prepared_candidate"
+    } else if path.contains("/transactions/") {
+        "transaction_manifest"
+    } else {
+        object_class(path)
+    }
+}
+
 impl BackendCounts {
     pub fn requests(&self) -> u64 {
         self.get_attempts
@@ -164,6 +225,12 @@ impl BackendCounts {
     }
 
     fn add(&mut self, other: &Self) {
+        self.decoded_rows += other.decoded_rows;
+        self.transition_proof_rows += other.transition_proof_rows;
+        self.selected_blocks += other.selected_blocks;
+        self.rewritten_blocks += other.rewritten_blocks;
+        self.directory_references += other.directory_references;
+        self.streaming_builder_inputs += other.streaming_builder_inputs;
         self.decoder_scratch_allocation_calls += other.decoder_scratch_allocation_calls;
         self.decoder_scratch_allocation_bytes += other.decoder_scratch_allocation_bytes;
         self.request_copy_allocation_calls += other.request_copy_allocation_calls;
@@ -213,6 +280,19 @@ impl BackendCounts {
             entry.returned_bytes += read.returned_bytes;
             entry.failures += read.failures;
         }
+        for (class, io) in &other.object_class_io {
+            let total = self.object_class_io.entry(class.clone()).or_default();
+            total.full_get_attempts += io.full_get_attempts;
+            total.range_get_attempts += io.range_get_attempts;
+            total.read_bytes += io.read_bytes;
+            total.read_failures += io.read_failures;
+            total.head_attempts += io.head_attempts;
+            total.head_metadata_bytes += io.head_metadata_bytes;
+            total.head_missing += io.head_missing;
+            total.head_failures += io.head_failures;
+            total.put_attempts += io.put_attempts;
+            total.write_attempt_bytes += io.write_attempt_bytes;
+        }
         for (path, bytes) in &other.object_writes {
             *self.object_writes.entry(path.clone()).or_default() += bytes;
         }
@@ -231,6 +311,7 @@ impl BackendCounts {
         self.list_page_attempts += other.list_page_attempts;
         self.delete_attempts += other.delete_attempts;
         self.head_cas_attempts += other.head_cas_attempts;
+        self.head_cas_attempt_bytes += other.head_cas_attempt_bytes;
         self.precondition_failures += other.precondition_failures;
         self.read_bytes += other.read_bytes;
         self.write_attempt_bytes += other.write_attempt_bytes;
@@ -238,7 +319,7 @@ impl BackendCounts {
     }
 }
 
-struct CountingBackend {
+pub struct CountingBackend {
     inner: MemoryBackend,
     counts: Mutex<BackendCounts>,
     get_repetitions: usize,
@@ -250,10 +331,12 @@ struct CountingBackend {
     l1_entered: tokio::sync::Notify,
     l1_release: tokio::sync::Notify,
     fail_put_countdown: AtomicUsize,
+    nested_allocation_measurement: AtomicBool,
+    fixture_head_resets: AtomicUsize,
 }
 
 impl CountingBackend {
-    fn new(get_repetitions: usize) -> Self {
+    pub fn new(get_repetitions: usize) -> Self {
         Self {
             inner: MemoryBackend::new(),
             counts: Mutex::new(BackendCounts::default()),
@@ -266,6 +349,8 @@ impl CountingBackend {
             l1_entered: tokio::sync::Notify::new(),
             l1_release: tokio::sync::Notify::new(),
             fail_put_countdown: AtomicUsize::new(0),
+            nested_allocation_measurement: AtomicBool::new(true),
+            fixture_head_resets: AtomicUsize::new(0),
         }
     }
     fn count(&self, update: impl Fn(&mut BackendCounts)) {
@@ -281,7 +366,9 @@ impl CountingBackend {
             );
         }
     }
-    fn take(&self) -> BackendCounts {
+    // The flat field bridge preserves the existing counter layout and phase accounting.
+    #[allow(clippy::too_many_lines)]
+    pub fn take(&self) -> BackendCounts {
         let result = std::mem::take(&mut *self.counts.lock().unwrap());
         #[cfg(feature = "test-utils")]
         let result = {
@@ -358,6 +445,22 @@ impl CountingBackend {
                     phase.witness_hash_bytes = work[11];
                 }
             }
+            for (name, work) in ControlMvpStateStore::take_test_bounded_work() {
+                result.decoded_rows += work.decoded_rows;
+                result.transition_proof_rows += work.transition_proof_rows;
+                result.selected_blocks += work.selected_blocks;
+                result.rewritten_blocks += work.rewritten_blocks;
+                result.directory_references += work.directory_references;
+                result.streaming_builder_inputs += work.streaming_builder_inputs;
+
+                let phase = result.phases.entry(name.to_string()).or_default();
+                phase.decoded_rows += work.decoded_rows;
+                phase.transition_proof_rows += work.transition_proof_rows;
+                phase.selected_blocks += work.selected_blocks;
+                phase.rewritten_blocks += work.rewritten_blocks;
+                phase.directory_references += work.directory_references;
+                phase.streaming_builder_inputs += work.streaming_builder_inputs;
+            }
             result.sha256_helper_calls = calls;
             result.sha256_helper_bytes = bytes;
             let [
@@ -378,6 +481,65 @@ impl CountingBackend {
         };
         result
     }
+    /// Disable nested backend scopes while an outer bounded-request peak is measured.
+    /// The caller restores the returned prior state after that one synthetic request.
+    #[allow(dead_code)] // Used by the separate authority-8 integration harness.
+    pub fn set_nested_allocation_measurement(&self, enabled: bool) -> bool {
+        self.nested_allocation_measurement
+            .swap(enabled, Ordering::SeqCst)
+    }
+    /// Replaces only the mutable authority HEAD in the private fixture backend.
+    ///
+    /// The caller supplies the observed current version, so a concurrent or
+    /// accidental mutation cannot be hidden by a benchmark reset. This bypasses
+    /// normal counters; fixture restoration is not a measured catalog operation.
+    pub async fn replace_head_for_bounded_fixture(
+        &self,
+        path: &str,
+        expected_version: &str,
+        bytes: Bytes,
+    ) -> arco_core::Result<FixtureHeadReset> {
+        if !path.ends_with("/head/current.json") || expected_version.is_empty() {
+            return Err(arco_core::Error::InvalidInput(
+                "fixture reset accepts only a versioned authority HEAD".into(),
+            ));
+        }
+        match self
+            .inner
+            .put(
+                path,
+                bytes,
+                WritePrecondition::MatchesVersion(expected_version.to_owned()),
+            )
+            .await?
+        {
+            WriteResult::Success { version } => Ok(FixtureHeadReset {
+                reset_count: self
+                    .fixture_head_resets
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1) as u64,
+                previous_version: expected_version.to_owned(),
+                replacement_version: version,
+            }),
+            WriteResult::PreconditionFailed { current_version } => {
+                Err(arco_core::Error::PreconditionFailed {
+                    message: format!(
+                        "fixture HEAD reset expected version {expected_version}, observed {current_version}"
+                    ),
+                })
+            }
+        }
+    }
+    async fn measure_backend_allocations<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> (T, Allocations) {
+        if self.nested_allocation_measurement.load(Ordering::SeqCst) {
+            measure_allocations(operation).await
+        } else {
+            (operation.await, Allocations::default())
+        }
+    }
 }
 
 #[async_trait]
@@ -387,7 +549,7 @@ impl StorageBackend for CountingBackend {
         let mut result = Err(arco_core::Error::storage("GET probe has no repetitions"));
         for _ in 0..self.get_repetitions {
             self.count(|count| count.get_attempts += 1);
-            let (value, allocations) = measure_allocations(self.inner.get(path)).await;
+            let (value, allocations) = self.measure_backend_allocations(self.inner.get(path)).await;
             result = value;
             self.count(|count| {
                 count.backend_allocation_calls += allocations.count;
@@ -402,6 +564,15 @@ impl StorageBackend for CountingBackend {
                 match &result {
                     Ok(bytes) => read.returned_bytes += bytes.len() as u64,
                     Err(_) => read.failures += 1,
+                }
+                let io = count
+                    .object_class_io
+                    .entry(physical_object_class(path).to_string())
+                    .or_default();
+                io.full_get_attempts += 1;
+                match &result {
+                    Ok(bytes) => io.read_bytes += bytes.len() as u64,
+                    Err(_) => io.read_failures += 1,
                 }
             });
             if let Ok(bytes) = &result {
@@ -424,8 +595,9 @@ impl StorageBackend for CountingBackend {
         let mut result = Err(arco_core::Error::storage("range probe has no repetitions"));
         for _ in 0..repetitions {
             self.count(|count| count.range_get_attempts += 1);
-            let (value, allocations) =
-                measure_allocations(self.inner.get_range(path, range.clone())).await;
+            let (value, allocations) = self
+                .measure_backend_allocations(self.inner.get_range(path, range.clone()))
+                .await;
             result = value;
             self.count(|count| {
                 count.backend_allocation_calls += allocations.count;
@@ -441,6 +613,15 @@ impl StorageBackend for CountingBackend {
                 match &result {
                     Ok(bytes) => read.returned_bytes += bytes.len() as u64,
                     Err(_) => read.failures += 1,
+                }
+                let io = count
+                    .object_class_io
+                    .entry(physical_object_class(path).to_string())
+                    .or_default();
+                io.range_get_attempts += 1;
+                match &result {
+                    Ok(bytes) => io.read_bytes += bytes.len() as u64,
+                    Err(_) => io.read_failures += 1,
                 }
             });
             if let Ok(bytes) = &result {
@@ -470,8 +651,15 @@ impl StorageBackend for CountingBackend {
             count.put_attempts += 1;
             count.write_attempt_bytes += u64::try_from(bytes.len()).unwrap();
             *count.object_writes.entry(path.to_string()).or_default() += bytes.len() as u64;
+            let io = count
+                .object_class_io
+                .entry(physical_object_class(path).to_string())
+                .or_default();
+            io.put_attempts += 1;
+            io.write_attempt_bytes += bytes.len() as u64;
             if head {
                 count.head_cas_attempts += 1;
+                count.head_cas_attempt_bytes += bytes.len() as u64;
             } else if matches!(precondition, WritePrecondition::DoesNotExist) {
                 count.immutable_write_attempt_bytes += u64::try_from(bytes.len()).unwrap();
             }
@@ -506,20 +694,45 @@ impl StorageBackend for CountingBackend {
             count.logical_storage_calls += 1;
             count.head_attempts += 1;
         });
-        let (result, allocations) = measure_allocations(self.inner.head(path)).await;
+        let (result, allocations) = self
+            .measure_backend_allocations(self.inner.head(path))
+            .await;
         self.count(|count| {
             count.backend_allocation_calls += allocations.count;
             count.backend_allocation_bytes += allocations.bytes;
             match &result {
                 Ok(Some(meta)) => {
-                    count.head_metadata_bytes += (size_of::<ObjectMeta>()
+                    let metadata_bytes = (size_of::<ObjectMeta>()
                         + meta.path.capacity()
                         + meta.version.capacity()
                         + meta.etag.as_ref().map_or(0, String::capacity))
                         as u64;
+                    count.head_metadata_bytes += metadata_bytes;
+                    let io = count
+                        .object_class_io
+                        .entry(physical_object_class(path).to_string())
+                        .or_default();
+                    io.head_attempts += 1;
+                    io.head_metadata_bytes += metadata_bytes;
                 }
-                Ok(None) => count.head_missing += 1,
-                Err(_) => count.head_failures += 1,
+                Ok(None) => {
+                    count.head_missing += 1;
+                    let io = count
+                        .object_class_io
+                        .entry(physical_object_class(path).to_string())
+                        .or_default();
+                    io.head_attempts += 1;
+                    io.head_missing += 1;
+                }
+                Err(_) => {
+                    count.head_failures += 1;
+                    let io = count
+                        .object_class_io
+                        .entry(physical_object_class(path).to_string())
+                        .or_default();
+                    io.head_attempts += 1;
+                    io.head_failures += 1;
+                }
             }
         });
         result
@@ -570,6 +783,52 @@ pub struct Allocations {
     pub bytes: u64,
 }
 
+/// Request allocation totals and conservative ownership reporting.
+#[derive(Debug, Default, Serialize)]
+pub struct RequestAllocations {
+    pub count: u64,
+    pub bytes: u64,
+    /// Conservative upper bound on request-owned bytes: cumulative allocations
+    /// performed while polling this request. This is not an exact resident peak.
+    pub peak_owned_bytes: u64,
+    /// Best-effort net allocator watermark across polls, for diagnosis only.
+    /// A pre-existing allocation freed during the request can reduce this value.
+    pub net_poll_peak_bytes: u64,
+}
+
+/// Measures every poll of one request.
+///
+/// `allocation_counter` attributes deallocations of pre-existing warm objects to
+/// the current scope. Cumulative request allocations are therefore the smallest
+/// safe upper bound available here; `net_poll_peak_bytes` remains diagnostic.
+pub async fn measure_request_allocations<T>(
+    operation: impl Future<Output = T>,
+) -> (T, RequestAllocations) {
+    let mut operation = pin!(operation);
+    let mut allocations = RequestAllocations::default();
+    let mut live_owned_bytes = 0_u64;
+    let value = poll_fn(|context| {
+        let mut result = Poll::Pending;
+        let info = allocation_counter::measure(|| {
+            result = operation.as_mut().poll(context);
+        });
+        allocations.count += info.count_total;
+        allocations.bytes += info.bytes_total;
+        allocations.peak_owned_bytes = allocations.bytes;
+        allocations.net_poll_peak_bytes = allocations
+            .net_poll_peak_bytes
+            .max(live_owned_bytes.saturating_add(info.bytes_max));
+        live_owned_bytes = if info.bytes_current.is_negative() {
+            live_owned_bytes.saturating_sub(info.bytes_current.unsigned_abs())
+        } else {
+            live_owned_bytes.saturating_add(info.bytes_current.unsigned_abs())
+        };
+        result
+    })
+    .await;
+    (value, allocations)
+}
+
 // Measure each future poll on its executing thread. Counting across await
 // suspension would also count unrelated executor work. Spawned work is excluded;
 // this deterministic MemoryBackend workload executes on the calling thread.
@@ -587,6 +846,155 @@ pub async fn measure_allocations<T>(operation: impl Future<Output = T>) -> (T, A
     })
     .await;
     (value, allocations)
+}
+
+#[cfg(test)]
+mod request_peak_tests {
+    use super::{CountingBackend, measure_request_allocations};
+    use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn memory_backend_insertion_does_not_copy_retained_inventory() {
+        let backend = arco_core::MemoryBackend::new();
+        for ordinal in 0..4096 {
+            backend
+                .put(
+                    &format!("retained/{ordinal:08}"),
+                    Bytes::from_static(b"immutable"),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("seed retained inventory");
+        }
+        for ordinal in 4096..9096 {
+            let (result, allocations) = measure_request_allocations(async {
+                backend
+                    .put(
+                        &format!("retained/{ordinal:08}"),
+                        Bytes::from_static(b"immutable"),
+                        WritePrecondition::DoesNotExist,
+                    )
+                    .await
+            })
+            .await;
+            assert!(matches!(result, Ok(WriteResult::Success { .. })));
+            assert!(
+                allocations.peak_owned_bytes <= 16 * 1024,
+                "one tiny fixture PUT must not allocate for its retained inventory: ordinal={ordinal}, {allocations:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_peak_includes_owned_bytes_retained_across_polls() {
+        let ((), allocations) = measure_request_allocations(async {
+            let bytes = std::hint::black_box(vec![0_u8; 4096]);
+            tokio::task::yield_now().await;
+            std::hint::black_box(bytes);
+        })
+        .await;
+        assert!(allocations.peak_owned_bytes >= 4096, "{allocations:?}");
+    }
+
+    #[tokio::test]
+    async fn request_peak_does_not_lose_live_bytes_when_a_prewarmed_object_is_evicted() {
+        let prewarmed = vec![0_u8; 16 * 1024];
+        let ((), allocations) = measure_request_allocations(async move {
+            let retained = std::hint::black_box(vec![0_u8; 4 * 1024]);
+            drop(prewarmed);
+            tokio::task::yield_now().await;
+            let later = std::hint::black_box(vec![0_u8; 8 * 1024]);
+            std::hint::black_box((retained, later));
+        })
+        .await;
+
+        assert!(allocations.peak_owned_bytes >= 12 * 1024, "{allocations:?}");
+    }
+
+    #[tokio::test]
+    async fn fixture_head_reset_is_versioned_and_cannot_touch_immutable_paths() {
+        let backend = CountingBackend::new(1);
+        let head = "control/v1/domains/catalog/head/current.json";
+        let version = match backend
+            .inner
+            .put(head, Bytes::from_static(b"new"), WritePrecondition::None)
+            .await
+            .expect("seed HEAD")
+        {
+            WriteResult::Success { version } => version,
+            WriteResult::PreconditionFailed { .. } => panic!("unconditional seed must succeed"),
+        };
+
+        let reset = backend
+            .replace_head_for_bounded_fixture(head, &version, Bytes::from_static(b"saved"))
+            .await
+            .expect("versioned reset");
+        assert_eq!(reset.reset_count, 1);
+        assert_eq!(reset.previous_version, version);
+        assert_eq!(
+            backend.inner.get(head).await.expect("restored HEAD"),
+            b"saved"[..]
+        );
+        assert!(
+            backend
+                .replace_head_for_bounded_fixture(
+                    "control/v1/domains/catalog/manifests/immutable.json",
+                    &reset.replacement_version,
+                    Bytes::from_static(b"forbidden"),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn backend_take_reports_bounded_streaming_work() {
+        use arco_catalog::state_store::SyntheticKvEntry;
+        use arco_catalog::{ControlMvpStateStore, StateScope};
+        use arco_core::ScopedStorage;
+        use std::sync::Arc;
+
+        let backend = Arc::new(CountingBackend::new(1));
+        let storage = ScopedStorage::new(backend.clone(), "bounded-tenant", "bounded-workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("bounded-tenant", "bounded-workspace", "catalog"),
+        )
+        .expect("synthetic authority-8 store");
+
+        // Drain any thread-local work left by an earlier support test before
+        // establishing this operation's expected bounded physical path.
+        let _ = backend.take();
+        store
+            .install_synthetic_genesis(
+                "counter-fixture",
+                1,
+                1,
+                [SyntheticKvEntry {
+                    key: b"k".to_vec(),
+                    generation: 1,
+                    value: Some(b"v".to_vec()),
+                }],
+                0,
+                std::iter::empty(),
+            )
+            .await
+            .expect("synthetic genesis");
+        let counts = backend.take();
+
+        assert!(counts.decoded_rows > 0, "{counts:?}");
+        assert!(counts.directory_references > 0, "{counts:?}");
+        assert!(counts.streaming_builder_inputs > 0, "{counts:?}");
+        assert!(
+            counts
+                .phases
+                .values()
+                .any(|phase| phase.decoded_rows > 0 && phase.streaming_builder_inputs > 0)
+        );
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1572,7 +1980,8 @@ async fn lazy_transaction_costs(
         measure_allocations(store.begin_control_txn(TxnOptions::default())).await;
     let mut txn = txn.unwrap();
     let begin = backend.take();
-    assert_eq!(begin.head_attempts, 1);
+    // Pinning authenticates the unchanged HEAD metadata before and after bytes.
+    assert_eq!(begin.head_attempts, 2);
     assert_eq!(begin.get_attempts + begin.range_get_attempts, 2);
     for class in ["data", "transaction", "directory"] {
         assert!(!begin.object_reads.contains_key(class));

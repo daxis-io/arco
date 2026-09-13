@@ -1,6 +1,9 @@
-//! Request-local authenticated access. Full replay remains the commit boundary.
+//! Request-local authenticated access. Authority 7 replays at commit; authority 8 uses bounded proofs.
+#[cfg(feature = "test-utils")]
+use super::TxnOptions;
 #[cfg(any(test, feature = "test-utils"))]
 use super::build_scan_page;
+use super::cost;
 use super::hash_tag;
 use super::{
     ArcoStateTxn, BTreeMap, BTreeSet, BlockScanBudget, BlockScanCursor, Bytes, CatalogError,
@@ -14,18 +17,105 @@ use super::{
     key_bounds_overlap_prefix, precondition_failed, state_reference_key_bounds,
     state_segment_reference, stored_row_value, validation_failed,
 };
-#[cfg(feature = "test-utils")]
-use super::{TxnOptions, cost};
 use crate::state_store::{ScanContinuation, ScanContinuationOrigin};
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_ENTRIES: usize = 1_000_000;
 const ENTRY_BYTES: usize = 96;
 
+/// One transaction's authenticated old-block and predicate-boundary inventory.
+#[derive(Clone, Debug, Default)]
+pub(super) struct BoundedSelection {
+    inner: std::sync::Arc<std::sync::Mutex<BoundedSelectionState>>,
+}
+
+#[derive(Debug, Default)]
+struct BoundedSelectionState {
+    digests: BTreeSet<[u8; 32]>,
+    exhausted: bool,
+}
+
+impl BoundedSelection {
+    fn exhausted() -> CatalogError {
+        CatalogError::MaintenanceBackpressure {
+            message: "bounded operation exceeds 16 selected blocks including predicate boundaries"
+                .into(),
+        }
+    }
+
+    pub(super) fn select(&self, leaf: &super::directory::Leaf) -> Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| invariant_violation("bounded selection lock poisoned"))?;
+        if state.exhausted {
+            return Err(Self::exhausted());
+        }
+        if state.digests.contains(&leaf.digest) {
+            return Ok(());
+        }
+        cost::bounded_work(cost::BoundedWork {
+            selected_blocks: 1,
+            ..Default::default()
+        });
+        if state.digests.len() == 16 {
+            state.exhausted = true;
+            return Err(Self::exhausted());
+        }
+        state.digests.insert(leaf.digest);
+        drop(state);
+        Ok(())
+    }
+
+    pub(super) fn check(&self) -> Result<()> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| invariant_violation("bounded selection lock poisoned"))?;
+        if state.exhausted {
+            Err(Self::exhausted())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_selection_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_selection_is_unique_shared_and_sticky_after_exhaustion() {
+        let selection = BoundedSelection::default();
+        let cloned = selection.clone();
+        let leaf = |id: u8| super::super::directory::Leaf {
+            first: vec![id],
+            last: vec![id],
+            rows: 1,
+            bytes: 1,
+            digest: [id; 32],
+        };
+        for id in 0..16 {
+            assert!(selection.select(&leaf(id)).is_ok());
+            assert!(cloned.select(&leaf(id)).is_ok());
+        }
+        assert!(matches!(
+            cloned.select(&leaf(16)),
+            Err(CatalogError::MaintenanceBackpressure { .. })
+        ));
+        assert!(
+            selection.check().is_err(),
+            "an ignored predicate capacity failure must remain exhausted"
+        );
+        assert!(selection.select(&leaf(0)).is_err());
+    }
+}
+
 /// A pin contains authenticated metadata, never a partially populated replay.
 #[derive(Debug)]
 pub(super) enum TransactionBase {
     Genesis,
+    Bounded(Box<super::bounded::Base>),
     Manifest {
         manifest: Box<ControlMvpManifest>,
         digest: String,
@@ -38,23 +128,29 @@ pub(super) enum TransactionBase {
 impl TransactionBase {
     pub(super) fn manifest(&self) -> Option<&ControlMvpManifest> {
         match self {
-            Self::Genesis => None,
+            Self::Genesis | Self::Bounded(_) => None,
             Self::Manifest { manifest, .. } => Some(manifest),
         }
     }
     pub(super) fn logical_sequence(&self) -> u64 {
-        self.manifest()
-            .map_or(0, |manifest| manifest.logical_sequence)
+        match self {
+            Self::Bounded(base) => base.logical_sequence(),
+            _ => self
+                .manifest()
+                .map_or(0, |manifest| manifest.logical_sequence),
+        }
     }
     pub(super) const fn writer_epoch(&self) -> u64 {
         match self {
             Self::Genesis => 0,
+            Self::Bounded(base) => base.writer_epoch(),
             Self::Manifest { writer_epoch, .. } => *writer_epoch,
         }
     }
     pub(super) const fn reclamation_generation(&self) -> u64 {
         match self {
             Self::Genesis => 0,
+            Self::Bounded(base) => base.reclamation_generation(),
             Self::Manifest {
                 reclamation_generation,
                 ..
@@ -64,12 +160,14 @@ impl TransactionBase {
     pub(super) fn pointer_version(&self) -> Option<&str> {
         match self {
             Self::Genesis => None,
+            Self::Bounded(base) => base.pointer_version(),
             Self::Manifest { head_version, .. } => Some(head_version),
         }
     }
     fn token(&self, store: &ControlMvpStateStore) -> Option<StateToken> {
         match self {
             Self::Genesis => None,
+            Self::Bounded(base) => base.token(store),
             Self::Manifest {
                 manifest, digest, ..
             } => Some(
@@ -97,6 +195,11 @@ impl TransactionBase {
     }
 
     pub(super) async fn materialize(&self, store: &ControlMvpStateStore) -> Result<ControlMvpBase> {
+        if matches!(self, Self::Bounded(_)) {
+            return Err(CatalogError::UnsupportedAuthorityFormat {
+                message: "authority-8 cannot materialize format-7 state".into(),
+            });
+        }
         let (state, history_anchor, base_states, tx_refs) = match self.manifest() {
             None => (
                 ReplayState::empty(&store.scope),
@@ -118,7 +221,7 @@ impl TransactionBase {
         Ok(ControlMvpBase {
             history_anchor,
             manifest_checksum_sha256: match self {
-                Self::Genesis => None,
+                Self::Genesis | Self::Bounded(_) => None,
                 Self::Manifest { digest, .. } => Some(digest.clone()),
             },
             reclamation_generation: self.reclamation_generation(),
@@ -135,15 +238,21 @@ impl TransactionBase {
 
 impl ControlMvpStateStore {
     pub(super) async fn pin_transaction_base(&self) -> Result<TransactionBase> {
-        let Some(meta) = self.storage.head(&self.paths.current_pointer()).await? else {
+        if self.authority_format == 8 {
+            return Ok(TransactionBase::Bounded(Box::new(
+                Box::pin(self.pin_bounded_base())
+                    .await?
+                    .with_transaction_selection(),
+            )));
+        }
+        let Some((pointer, head_version, _)) = self.load_pinned_pointer().await? else {
             return Ok(TransactionBase::Genesis);
         };
-        let pointer = self.load_pointer().await?;
         let manifest = self.load_manifest_for_pointer(&pointer).await?;
         Ok(TransactionBase::Manifest {
             manifest: Box::new(manifest),
             digest: pointer.manifest_checksum_sha256,
-            head_version: meta.version,
+            head_version,
             writer_epoch: pointer.writer_epoch,
             reclamation_generation: pointer.reclamation_generation,
         })
@@ -163,6 +272,14 @@ impl ControlMvpStateStore {
     #[must_use]
     pub fn take_test_phase_work() -> BTreeMap<&'static str, [u64; 36]> {
         cost::take()
+    }
+
+    /// Drains bounded-operation counters partitioned by the same poll phases.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn take_test_bounded_work() -> BTreeMap<&'static str, super::BoundedWork> {
+        cost::take_bounded_work()
     }
 
     /// Test-only pre-Gate-4 eager transaction reference. Begin reconstructs the
@@ -442,6 +559,7 @@ fn hash_version(hasher: &mut Sha256, key: &[u8], value: &StoredValue) {
 /// A resolved stream keeps at most one block per L1/L0 input. Tombstones remain
 /// in this stream; public filtering and overlay application happen above it.
 pub(super) struct ResolvedRows {
+    bounded: std::collections::VecDeque<(Vec<u8>, StoredValue)>,
     cursors: Vec<BlockScanCursor>,
     prefix: Vec<u8>,
     after: Option<Vec<u8>>,
@@ -484,6 +602,7 @@ impl ResolvedRows {
             }
         }
         Ok(Self {
+            bounded: std::collections::VecDeque::default(),
             cursors,
             prefix: prefix.to_vec(),
             after: after.map(<[u8]>::to_vec),
@@ -505,12 +624,18 @@ impl ResolvedRows {
         Ok(true)
     }
     pub(super) fn key(&self) -> Option<&[u8]> {
+        if let Some((key, _)) = self.bounded.front() {
+            return Some(key);
+        }
         self.cursors
             .iter()
             .filter_map(|c| c.rows.front().map(|r| r.key.as_slice()))
             .min()
     }
     pub(super) fn take(&mut self, key: &[u8]) -> Option<StoredValue> {
+        if self.bounded.front().is_some_and(|(first, _)| first == key) {
+            return self.bounded.pop_front().map(|(_, value)| value);
+        }
         let mut row = None;
         for cursor in &mut self.cursors {
             if cursor.rows.front().is_some_and(|row| row.key == key) {
@@ -520,11 +645,11 @@ impl ResolvedRows {
         row.map(stored_row_value)
     }
     pub(super) fn may_have_more(&self) -> bool {
-        self.cursors.iter().any(BlockScanCursor::may_have_more)
+        !self.bounded.is_empty() || self.cursors.iter().any(BlockScanCursor::may_have_more)
     }
 }
 
-fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(super) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(byte) = end.pop() {
         if byte != u8::MAX {
@@ -536,6 +661,59 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 impl ControlMvpTxn {
+    pub(super) async fn validate_bounded_preconditions(&self) -> Result<()> {
+        let TransactionBase::Bounded(base) = &self.base else {
+            return Err(super::unsupported("bounded validation on V1 authority"));
+        };
+        // Assertions validate at staging and record each immutable input here.
+        // Reauthenticate those exact inputs before artifacts and conditional publication.
+        for (key, expected) in &self.reads.points {
+            if point_witness(base.get(&self.store, key).await?.as_ref()) != *expected {
+                return Err(precondition_failed("authenticated bounded point changed"));
+            }
+        }
+        for ((start, end), (expected, present)) in &self.reads.ranges {
+            let rows = base.range(&self.store, start, Some(end)).await?;
+            let mut hasher = Sha256::new();
+            hash_bytes(&mut hasher, start);
+            hash_bytes(&mut hasher, end);
+            for (key, value) in &rows {
+                hash_version(&mut hasher, key, value);
+            }
+            if digest_u64(hasher) != *expected || rows.is_empty() == *present {
+                return Err(precondition_failed("authenticated bounded range changed"));
+            }
+        }
+        for scan in &self.reads.scans {
+            let end = prefix_end(&scan.prefix);
+            let mut hasher = Sha256::new();
+            for (key, value) in base
+                .range(
+                    &self.store,
+                    scan.after.as_deref().unwrap_or(&scan.prefix),
+                    end.as_deref(),
+                )
+                .await?
+            {
+                if scan
+                    .after
+                    .as_deref()
+                    .is_none_or(|after| key.as_slice() > after)
+                    && scan
+                        .through
+                        .as_deref()
+                        .is_none_or(|through| key.as_slice() <= through)
+                {
+                    hash_version(&mut hasher, &key, &value);
+                }
+            }
+            if digest_u64(hasher) != scan.witness {
+                return Err(precondition_failed("authenticated bounded scan changed"));
+            }
+        }
+        Ok(())
+    }
+
     async fn base_value(&mut self, key: &[u8]) -> Result<Option<StoredValue>> {
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(base) = &self.eager_base {
@@ -543,6 +721,10 @@ impl ControlMvpTxn {
         }
         if let Some(value) = self.reads.values.get(key) {
             return Ok(value.clone());
+        }
+        if let TransactionBase::Bounded(base) = &self.base {
+            let value = base.get(&self.store, key).await?;
+            return self.reads.point(key, value);
         }
         let value = match self.base.manifest() {
             None => None,
@@ -567,6 +749,9 @@ impl ControlMvpTxn {
                 .find(|r| r.record_id == id)
                 .cloned());
         }
+        if let TransactionBase::Bounded(base) = &self.base {
+            return base.active(&self.store, id).await;
+        }
         match self.base.manifest() {
             None => Ok(None),
             Some(manifest) => self.store.outbox_record_from_manifest(manifest, id).await,
@@ -579,6 +764,7 @@ impl ControlMvpTxn {
                 .iter()
                 .any(|intent| intent.intent_id == id)
             || self.outbox_trim.iter().any(|trim| trim.record_id == id)
+            || self.bounded_trims.iter().any(|trim| trim.record_id == id)
             || self.base_outbox_record(id).await?.is_some()
         {
             return Err(CatalogError::AlreadyExists {
@@ -649,6 +835,20 @@ impl ControlMvpTxn {
         let cache_key = (range.start().to_vec(), range.end().to_vec());
         if let Some(result) = self.reads.ranges.get(&cache_key) {
             return Ok(*result);
+        }
+        if let TransactionBase::Bounded(base) = &self.base {
+            let rows = base
+                .range(&self.store, range.start(), Some(range.end()))
+                .await?;
+            let mut hasher = Sha256::new();
+            hash_bytes(&mut hasher, range.start());
+            hash_bytes(&mut hasher, range.end());
+            for (key, value) in &rows {
+                hash_version(&mut hasher, key, value);
+            }
+            let result = (digest_u64(hasher), !rows.is_empty());
+            self.memo_range(cache_key, result)?;
+            return Ok(result);
         }
         let mut hasher = Sha256::new();
         hash_bytes(&mut hasher, range.start());
@@ -749,14 +949,34 @@ impl ControlMvpTxn {
             }
         }
         let after = request.effective_start_after();
-        let mut stream = ResolvedRows::new(
-            &self.store,
-            self.base.manifest(),
-            request.prefix(),
-            after,
-            None,
-        )
-        .await?;
+        let mut stream = if let TransactionBase::Bounded(base) = &self.base {
+            let end = prefix_end(request.prefix());
+            let rows = base
+                .range(
+                    &self.store,
+                    after.unwrap_or_else(|| request.prefix()),
+                    end.as_deref(),
+                )
+                .await?;
+            ResolvedRows {
+                bounded: rows
+                    .into_iter()
+                    .filter(|(key, _)| after.is_none_or(|a| key.as_slice() > a))
+                    .collect(),
+                cursors: Vec::new(),
+                prefix: request.prefix().to_vec(),
+                after: after.map(<[u8]>::to_vec),
+            }
+        } else {
+            ResolvedRows::new(
+                &self.store,
+                self.base.manifest(),
+                request.prefix(),
+                after,
+                None,
+            )
+            .await?
+        };
         let lower = after.map_or_else(
             || std::ops::Bound::Included(request.prefix().to_vec()),
             |after| std::ops::Bound::Excluded(after.to_vec()),

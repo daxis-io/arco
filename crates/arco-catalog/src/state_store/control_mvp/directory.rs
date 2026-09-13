@@ -14,6 +14,8 @@ use arco_core::{ScopedAuthorityStore, ScopedStorage};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+pub(super) mod update;
+
 const PAGE_MAGIC: &[u8; 8] = b"ARCODIR1";
 const ROOT_MAGIC: &[u8; 8] = b"ARCOROT1";
 const FANOUT: usize = 128;
@@ -25,6 +27,20 @@ const NODE_BYTES: usize = 245;
 const ROOT_BYTES: usize = 40 + NODE_BYTES;
 const OBJECT_LIMIT: usize = 4096;
 const PAGE_PROBE_LIMIT: usize = 4 * 1024 * 1024;
+const KEY_CACHE_ENTRIES: usize = 1024;
+const KEY_CACHE_PAYLOAD_BYTES: usize = 128 * 1024;
+const _: () = assert!(
+    KEY_CACHE_ENTRIES * size_of::<CachedKey>()
+        + size_of::<Vec<CachedKey>>()
+        + KEY_CACHE_PAYLOAD_BYTES
+        <= 256 * 1024
+);
+
+struct CachedKey {
+    scope: [u8; 32],
+    digest: [u8; 32],
+    bytes: Box<[u8]>,
+}
 const _: () = assert!(DEPTH * PAGE_PROBE_LIMIT + 2 * (MAX_BLOCK_BYTES + 1) <= MAX_SEGMENT_BYTES);
 const _: () = assert!(DEPTH * (FANOUT * 2 + 1) + 2 <= OBJECT_LIMIT);
 
@@ -61,6 +77,16 @@ pub struct Root {
     node: Node,
 }
 impl Root {
+    /// Number of directory pages on a path from this root to a leaf descriptor.
+    pub const fn depth(&self) -> u8 {
+        self.node.depth
+    }
+
+    /// Logical row count committed by the root's directory summary.
+    pub const fn row_count(&self) -> u64 {
+        self.node.rows
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(ROOT_BYTES);
         out.extend_from_slice(ROOT_MAGIC);
@@ -103,6 +129,9 @@ pub struct ReadBudget {
     byte_limit: usize,
     pub objects: usize,
     pub bytes: usize,
+    // Authenticated immutable fence bytes live only for this bounded read operation.
+    cached_keys: Vec<CachedKey>,
+    cached_key_bytes: usize,
 }
 impl Default for ReadBudget {
     fn default() -> Self {
@@ -111,6 +140,8 @@ impl Default for ReadBudget {
             byte_limit: MAX_SEGMENT_BYTES,
             objects: 0,
             bytes: 0,
+            cached_keys: Vec::new(),
+            cached_key_bytes: 0,
         }
     }
 }
@@ -126,6 +157,8 @@ impl ReadBudget {
             byte_limit: bytes,
             objects: 0,
             bytes: 0,
+            cached_keys: Vec::new(),
+            cached_key_bytes: 0,
         })
     }
     fn charge(&mut self, bytes: usize) -> Result<()> {
@@ -154,6 +187,14 @@ impl Directory {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
+        #[cfg(feature = "test-utils")]
+        super::record_sha256_work(
+            b"arco.directory.scope.v1\0".len()
+                + [scope.tenant_id(), scope.workspace_id(), scope.domain()]
+                    .iter()
+                    .map(|part| 8 + part.len())
+                    .sum::<usize>(),
+        );
         let prefix = format!("control/directory/v1/domains/{}", scope.domain());
         ScopedStorage::validate_path(&prefix)?;
         Ok(Self {
@@ -169,6 +210,19 @@ impl Directory {
             last: None,
             failed: false,
         }
+    }
+    pub(in super::super) async fn empty_root(&self) -> Result<Root> {
+        Ok(Root {
+            scope: self.scope,
+            node: self.write_page(1, &[]).await?,
+        })
+    }
+    /// Computes the canonical empty reference without persisting a page.
+    pub(in super::super) fn empty_root_reference(&self) -> Result<Root> {
+        Ok(Root {
+            scope: self.scope,
+            node: self.page_node(1, &[])?.0,
+        })
     }
     /// Structural parsing only; the enclosing authority must authenticate these bytes.
     pub fn decode_root(&self, bytes: &[u8]) -> Result<Root> {
@@ -192,6 +246,10 @@ impl Directory {
         })
     }
     fn digest(&self, kind: &[u8], bytes: &[u8]) -> [u8; 32] {
+        #[cfg(feature = "test-utils")]
+        super::record_sha256_work(
+            b"arco.directory.object.v1\0".len() + 8 + kind.len() + 32 + 8 + bytes.len(),
+        );
         let mut hash = Sha256::new();
         hash.update(b"arco.directory.object.v1\0");
         hash.update((kind.len() as u64).to_le_bytes());
@@ -204,7 +262,7 @@ impl Directory {
     fn path(&self, kind: &str, digest: &[u8; 32]) -> String {
         format!("{}/{kind}/{}", self.prefix, hex::encode(digest))
     }
-    async fn write_key(&self, bytes: &[u8]) -> Result<KeyRef> {
+    fn key_ref(&self, bytes: &[u8]) -> Result<KeyRef> {
         let digest = self.digest(b"keys", bytes);
         if bytes.len() > MAX_BLOCK_BYTES {
             return Err(validation_failed("directory fence exceeds limit"));
@@ -215,14 +273,6 @@ impl Directory {
                 .get_mut(..bytes.len())
                 .ok_or_else(|| invariant_violation("inline fence length"))?;
             prefix.copy_from_slice(bytes);
-        } else {
-            put_immutable_matching(
-                &self.storage,
-                &self.path("keys", &digest),
-                Bytes::copy_from_slice(bytes),
-                "directory key collision",
-            )
-            .await?;
         }
         Ok(KeyRef {
             inline,
@@ -230,6 +280,19 @@ impl Directory {
             bytes: u32::try_from(bytes.len())
                 .map_err(|_| capacity("directory object length overflow"))?,
         })
+    }
+    async fn write_key(&self, bytes: &[u8]) -> Result<KeyRef> {
+        let reference = self.key_ref(bytes)?;
+        if bytes.len() > INLINE_KEY_BYTES {
+            put_immutable_matching(
+                &self.storage,
+                &self.path("keys", &reference.digest),
+                Bytes::copy_from_slice(bytes),
+                "directory key collision",
+            )
+            .await?;
+        }
+        Ok(reference)
     }
     async fn read_object(
         &self,
@@ -267,10 +330,45 @@ impl Directory {
             }
             return Ok(Bytes::copy_from_slice(bytes));
         }
-        self.read_object("keys", &key.digest, key.bytes as usize, budget)
-            .await
+        let slot = budget
+            .cached_keys
+            .partition_point(|cached| (cached.scope, cached.digest) < (self.scope, key.digest));
+        if let Some(cached) = budget
+            .cached_keys
+            .get(slot)
+            .filter(|cached| cached.scope == self.scope && cached.digest == key.digest)
+        {
+            if cached.bytes.len() != key.bytes as usize {
+                return Err(invariant_violation(
+                    "cached directory fence length mismatch",
+                ));
+            }
+            return Ok(Bytes::copy_from_slice(&cached.bytes));
+        }
+        let bytes = self
+            .read_object("keys", &key.digest, key.bytes as usize, budget)
+            .await?;
+        if budget.cached_keys.len() < KEY_CACHE_ENTRIES
+            && bytes.len() <= KEY_CACHE_PAYLOAD_BYTES.saturating_sub(budget.cached_key_bytes)
+        {
+            if budget.cached_keys.capacity() == 0 {
+                budget.cached_keys = Vec::with_capacity(KEY_CACHE_ENTRIES);
+            }
+            // Copy exactly the authenticated payload; do not retain a backend's larger buffer.
+            let retained = bytes.to_vec().into_boxed_slice();
+            budget.cached_key_bytes += retained.len();
+            budget.cached_keys.insert(
+                slot,
+                CachedKey {
+                    scope: self.scope,
+                    digest: key.digest,
+                    bytes: retained,
+                },
+            );
+        }
+        Ok(bytes)
     }
-    async fn write_page(&self, depth: u8, children: &[Node]) -> Result<Node> {
+    fn page_node(&self, depth: u8, children: &[Node]) -> Result<(Node, Vec<u8>)> {
         if depth == 0 || depth as usize > DEPTH || children.len() > FANOUT {
             return Err(capacity("directory page fanout or depth exceeded"));
         }
@@ -315,9 +413,13 @@ impl Directory {
             last: children.last().map_or(empty, |n| n.last),
             digest,
         };
+        Ok((node, bytes))
+    }
+    async fn write_page(&self, depth: u8, children: &[Node]) -> Result<Node> {
+        let (node, bytes) = self.page_node(depth, children)?;
         put_immutable_matching(
             &self.storage,
-            &self.path("pages", &digest),
+            &self.path("pages", &node.digest),
             bytes.into(),
             "directory page collision",
         )
@@ -383,6 +485,41 @@ impl Directory {
         Ok(selected)
     }
     /// Finds a candidate block, without claiming the key exists inside that block.
+    /// Returns the predecessor leaf by its first endpoint, or the first leaf.
+    pub(in super::super) async fn floor_leaf(
+        &self,
+        root: &Root,
+        key: &[u8],
+        budget: &mut ReadBudget,
+    ) -> Result<Option<Leaf>> {
+        if root.scope != self.scope || key.len() > MAX_BLOCK_BYTES || root.node.depth == 0 {
+            return Err(validation_failed("invalid directory floor scope or key"));
+        }
+        validate_node(&root.node, true)?;
+        let mut node = root.node;
+        while node.depth > 0 {
+            let children = self.read_page(node, b"", None, None, budget).await?;
+            let Some(first) = children.first() else {
+                return Ok(None);
+            };
+            let mut selected = *first;
+            for child in children {
+                if self.read_key(child.first, budget).await?.as_ref() > key {
+                    break;
+                }
+                selected = child;
+            }
+            node = selected;
+        }
+        Ok(Some(Leaf {
+            first: self.read_key(node.first, budget).await?.to_vec(),
+            last: self.read_key(node.last, budget).await?.to_vec(),
+            rows: node.rows,
+            bytes: node.bytes,
+            digest: node.digest,
+        }))
+    }
+
     pub async fn lookup(
         &self,
         root: &Root,
@@ -486,6 +623,11 @@ impl Directory {
 
 impl Builder {
     pub async fn push(&mut self, leaf: Leaf) -> Result<()> {
+        #[cfg(feature = "test-utils")]
+        super::cost::bounded_work(super::cost::BoundedWork {
+            streaming_builder_inputs: 1,
+            ..Default::default()
+        });
         if self.failed {
             return Err(invariant_violation("directory builder requires restart"));
         }
@@ -636,6 +778,11 @@ fn page_probe_bytes(children: &[Node]) -> Result<usize> {
     Ok(total)
 }
 fn encode_node(out: &mut Vec<u8>, node: &Node) {
+    #[cfg(feature = "test-utils")]
+    super::cost::bounded_work(super::cost::BoundedWork {
+        directory_references: 1,
+        ..Default::default()
+    });
     out.push(node.depth);
     out.extend_from_slice(&node.bytes.to_le_bytes());
     out.extend_from_slice(&node.rows.to_le_bytes());
@@ -656,6 +803,11 @@ fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N]> {
     Ok(value)
 }
 fn decode_node(input: &mut &[u8]) -> Result<Node> {
+    #[cfg(feature = "test-utils")]
+    super::cost::bounded_work(super::cost::BoundedWork {
+        directory_references: 1,
+        ..Default::default()
+    });
     Ok(Node {
         depth: take::<1>(input)?[0],
         bytes: u32::from_le_bytes(take(input)?),

@@ -26,7 +26,8 @@ use crate::state_store::projection_outbox_acks::{
 };
 use crate::state_store::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, ProjectionIntentV1,
-    ScanContinuation, ScanContinuationKey, ScanRequest, StateScope, StateToken, TxnOptions,
+    ProjectionIntentV2, ScanContinuation, ScanContinuationKey, ScanRequest, StateScope, StateToken,
+    TxnOptions,
 };
 use crate::tier1_snapshot;
 use crate::write_options::WriteOptions;
@@ -63,6 +64,16 @@ pub trait CatalogProjectionNotifier: Send + Sync {
     /// Returns an enqueue or local scheduling error. The caller records and
     /// ignores it because the authority mutation is already committed.
     fn notify(&self, intent: &ProjectionIntentV1) -> Result<()>;
+}
+
+/// Non-blocking wake-up seam for one synthetic authority-8 projection intent.
+pub trait CatalogProjectionNotifierV2: Send + Sync {
+    /// Best-effort notification for one durably committed V2 intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an enqueue or local scheduling error after the authority commit.
+    fn notify(&self, intent: &ProjectionIntentV2) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -392,6 +403,30 @@ struct CatalogAuditRecordV1 {
     logical_sequence: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IdempotencyReceiptV2 {
+    version: u32,
+    operation_family: String,
+    request_digest: String,
+    response: MutationResponseV1,
+    logical_commit_id: String,
+    logical_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogAuditRecordV2 {
+    version: u32,
+    operation_id: String,
+    operation_family: String,
+    request_digest: String,
+    actor: String,
+    occurred_at_ms: i64,
+    logical_commit_id: String,
+    logical_sequence: u64,
+}
+
 #[derive(Debug, Clone)]
 struct FrozenMutation {
     operation_id: String,
@@ -402,6 +437,233 @@ struct FrozenMutation {
     receipt_key: Vec<u8>,
     request_id: Option<String>,
     command: FrozenCommand,
+}
+
+/// A fully frozen synthetic authority-8 catalog mutation for cost fixtures.
+///
+/// This is deliberately test-only: production callers continue to use the
+/// public catalog methods, which construct their command at request time.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone)]
+pub struct PreparedBoundedCatalogMutation(FrozenMutation);
+
+#[cfg(any(test, feature = "test-utils"))]
+impl PreparedBoundedCatalogMutation {
+    /// Returns the fixed logical operation ID recorded by the fixture.
+    #[must_use]
+    pub fn operation_id(&self) -> &str {
+        &self.0.operation_id
+    }
+
+    /// Returns the fixed logical request digest recorded by the fixture.
+    #[must_use]
+    pub fn request_digest(&self) -> &str {
+        &self.0.digest
+    }
+
+    /// Returns the fixed command timestamp recorded by the fixture.
+    #[must_use]
+    pub const fn occurred_at_ms(&self) -> i64 {
+        self.0.occurred_at_ms
+    }
+}
+
+/// Test-only catalog command shape whose IDs and request bytes are fixed before
+/// a bounded cost request starts.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone)]
+pub enum BoundedCatalogTestCommand {
+    /// Creates one catalog with the supplied stable object ID.
+    CreateCatalog {
+        /// Stable catalog object ID.
+        id: String,
+        /// Catalog name.
+        name: String,
+    },
+    /// Creates one schema with the supplied stable object ID.
+    CreateSchema {
+        /// Stable schema object ID.
+        id: String,
+        /// Parent catalog name.
+        catalog: String,
+        /// Schema name.
+        name: String,
+    },
+    /// Registers one single-column table with supplied stable IDs.
+    RegisterTable {
+        /// Stable table object ID.
+        id: String,
+        /// Stable single-column object ID.
+        column_id: String,
+        /// Parent catalog name.
+        catalog: String,
+        /// Parent schema name.
+        schema: String,
+        /// Frozen table request.
+        request: RegisterTableInSchemaRequest,
+    },
+    /// Patches one existing catalog.
+    PatchCatalog {
+        /// Existing catalog name.
+        name: String,
+        /// Frozen catalog patch.
+        patch: CatalogPatch,
+    },
+    /// Renames one existing table.
+    RenameTable {
+        /// Parent catalog name.
+        catalog: String,
+        /// Parent schema name.
+        schema: String,
+        /// Existing table name.
+        name: String,
+        /// Replacement table name.
+        new_name: String,
+    },
+    /// Drops one existing table.
+    DropTable {
+        /// Parent catalog name.
+        catalog: String,
+        /// Parent schema name.
+        schema: String,
+        /// Existing table name.
+        name: String,
+    },
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl BoundedCatalogTestCommand {
+    fn family(&self) -> &'static str {
+        match self {
+            Self::CreateCatalog { .. } => "create_catalog",
+            Self::CreateSchema { .. } => "create_schema",
+            Self::RegisterTable { .. } => "register_table",
+            Self::PatchCatalog { .. } => "patch_catalog",
+            Self::RenameTable { .. } => "rename_table",
+            Self::DropTable { .. } => "drop_table",
+        }
+    }
+
+    fn into_frozen(self) -> FrozenCommand {
+        match self {
+            Self::CreateCatalog { id, name } => FrozenCommand::CreateCatalog {
+                id,
+                name,
+                description: None,
+                properties: None,
+                storage_root: None,
+            },
+            Self::CreateSchema { id, catalog, name } => FrozenCommand::CreateSchema {
+                id,
+                catalog,
+                name,
+                description: None,
+                properties: None,
+                storage_root: None,
+            },
+            Self::RegisterTable {
+                id,
+                column_id,
+                catalog,
+                schema,
+                request,
+            } => FrozenCommand::RegisterTable {
+                id,
+                column_ids: vec![column_id],
+                catalog,
+                schema,
+                request,
+            },
+            Self::PatchCatalog { name, patch } => FrozenCommand::PatchCatalog { name, patch },
+            Self::RenameTable {
+                catalog,
+                schema,
+                name,
+                new_name,
+            } => FrozenCommand::RenameTable {
+                catalog,
+                schema,
+                name,
+                new_name,
+            },
+            Self::DropTable {
+                catalog,
+                schema,
+                name,
+            } => FrozenCommand::DropTable {
+                catalog,
+                schema,
+                name,
+            },
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ControlCatalogAuthority {
+    /// Prepares an exact synthetic authority-8 command before cost measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors from the ordinary catalog command freezer, or
+    /// rejects an authority without an injected V2 notifier.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the freezer consumes the request options into immutable command identity"
+    )]
+    pub fn prepare_synthetic_bounded_command(
+        &self,
+        command: BoundedCatalogTestCommand,
+        options: WriteOptions,
+    ) -> Result<PreparedBoundedCatalogMutation> {
+        if self.projection_notifier_v2.is_none() {
+            return Err(CatalogError::UnsupportedAuthorityFormat {
+                message: "prepared V2 catalog command requires synthetic bounded authority".into(),
+            });
+        }
+        let family = command.family();
+        Ok(PreparedBoundedCatalogMutation(freeze_mutation(
+            family,
+            &command.clone().into_frozen(),
+            options,
+        )?))
+    }
+
+    /// Executes one previously prepared synthetic authority-8 catalog command.
+    ///
+    /// # Errors
+    ///
+    /// Returns the normal catalog execution and bounded-publication errors.
+    pub async fn execute_prepared_synthetic_bounded_command(
+        &self,
+        command: PreparedBoundedCatalogMutation,
+    ) -> Result<()> {
+        self.execute_v2(command.0).await.map(|_| ())
+    }
+
+    /// Replaces the synthetic authority's empty read cache for one cost mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns cache-capacity validation errors.
+    pub fn with_synthetic_bounded_read_cache(
+        mut self,
+        config: Option<crate::state_store::ControlMvpReadCacheConfig>,
+    ) -> Result<Self> {
+        self.store = match config {
+            Some(config) => self.store.with_read_cache_config(config)?,
+            None => self.store.without_read_cache(),
+        };
+        Ok(self)
+    }
+
+    /// Returns the synthetic authority's independent cache ownership snapshot.
+    #[must_use]
+    pub fn synthetic_bounded_read_cache_statistics(
+        &self,
+    ) -> Option<crate::state_store::ControlMvpReadCacheStatistics> {
+        self.store.read_cache().map(|cache| cache.statistics())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -471,6 +733,7 @@ pub struct ControlCatalogAuthority {
     store: ControlMvpStateStore,
     continuation_key: ScanContinuationKey,
     projection_notifier: Arc<dyn CatalogProjectionNotifier>,
+    projection_notifier_v2: Option<Arc<dyn CatalogProjectionNotifierV2>>,
 }
 
 /// Restart-safe anti-entropy worker for catalog Parquet projections.
@@ -724,6 +987,37 @@ impl ControlCatalogAuthority {
             store: ControlMvpStateStore::new(storage, scope)?,
             continuation_key,
             projection_notifier,
+            projection_notifier_v2: None,
+        })
+    }
+
+    /// Creates the explicit synthetic authority-8 catalog path.
+    ///
+    /// Production construction remains authority 7; callers must inject the
+    /// V2 notifier because V1 notifiers cannot consume V2 envelopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns scope, synthetic-state-store, or continuation-key validation errors.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_synthetic_bounded(
+        storage: ScopedStorage,
+        scope: StateScope,
+        projection_notifier_v2: Arc<dyn CatalogProjectionNotifierV2>,
+    ) -> Result<Self> {
+        if scope.domain() != "catalog" {
+            return Err(CatalogError::Validation {
+                message: "control catalog authority requires the catalog state domain".to_string(),
+            });
+        }
+        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier {
+            storage: storage.clone(),
+        });
+        Ok(Self {
+            store: ControlMvpStateStore::new_synthetic_bounded(storage, scope)?,
+            continuation_key: ScanContinuationKey::generate()?,
+            projection_notifier,
+            projection_notifier_v2: Some(projection_notifier_v2),
         })
     }
 
@@ -2286,6 +2580,66 @@ async fn load_receipt(txn: &mut ControlMvpTxn, key: &[u8]) -> Result<Option<Idem
         .transpose()
 }
 
+async fn load_receipt_v2(
+    txn: &mut ControlMvpTxn,
+    key: &[u8],
+) -> Result<Option<IdempotencyReceiptV2>> {
+    txn.get(key)
+        .await?
+        .map(|value| decode_json(value.bytes(), "bounded catalog idempotency receipt"))
+        .transpose()
+}
+
+fn commit_record_bytes_v2(
+    frozen: &FrozenMutation,
+    response: &MutationResponseV1,
+    logical_commit_id: &str,
+    logical_sequence: u64,
+) -> Result<(Bytes, Bytes)> {
+    let receipt = IdempotencyReceiptV2 {
+        version: 2,
+        operation_family: frozen.family.into(),
+        request_digest: frozen.digest.clone(),
+        response: response.clone(),
+        logical_commit_id: logical_commit_id.into(),
+        logical_sequence,
+    };
+    let audit = CatalogAuditRecordV2 {
+        version: 2,
+        operation_id: frozen.operation_id.clone(),
+        operation_family: frozen.family.into(),
+        request_digest: frozen.digest.clone(),
+        actor: frozen.actor.clone(),
+        occurred_at_ms: frozen.occurred_at_ms,
+        logical_commit_id: logical_commit_id.into(),
+        logical_sequence,
+    };
+    Ok((
+        encode_json(&receipt, "receipt")?,
+        encode_json(&audit, "audit")?,
+    ))
+}
+
+async fn stage_commit_records_v2(
+    txn: &mut ControlMvpTxn,
+    frozen: &FrozenMutation,
+    response: &MutationResponseV1,
+    logical_commit_id: &str,
+    logical_sequence: u64,
+) -> Result<()> {
+    let (receipt, audit) =
+        commit_record_bytes_v2(frozen, response, logical_commit_id, logical_sequence)?;
+    txn.put(&frozen.receipt_key, receipt).await?;
+    txn.put(&audit_key(&frozen.operation_id), audit.clone())
+        .await?;
+    txn.stage_projection_intent_v2(
+        frozen.operation_id.clone(),
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        audit,
+    )
+    .await
+}
+
 async fn stage_commit_records(
     txn: &mut ControlMvpTxn,
     frozen: &FrozenMutation,
@@ -2330,6 +2684,7 @@ async fn stage_commit_records(
 async fn apply_command(
     txn: &mut ControlMvpTxn,
     command: &FrozenCommand,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     match command {
         FrozenCommand::CreateCatalog {
@@ -2346,11 +2701,12 @@ async fn apply_command(
                 description.clone(),
                 properties.clone(),
                 storage_root.clone(),
+                occurred_at_ms,
             )
             .await
         }
         FrozenCommand::PatchCatalog { name, patch } => {
-            patch_catalog(txn, name, patch.clone()).await
+            patch_catalog(txn, name, patch.clone(), occurred_at_ms).await
         }
         FrozenCommand::DeleteCatalog { name, force } => delete_catalog(txn, name, *force).await,
         FrozenCommand::CreateSchema {
@@ -2369,6 +2725,7 @@ async fn apply_command(
                 description.clone(),
                 properties.clone(),
                 storage_root.clone(),
+                occurred_at_ms,
             )
             .await
         }
@@ -2376,7 +2733,7 @@ async fn apply_command(
             catalog,
             name,
             patch,
-        } => patch_schema(txn, catalog, name, patch.clone()).await,
+        } => patch_schema(txn, catalog, name, patch.clone(), occurred_at_ms).await,
         FrozenCommand::DeleteSchema {
             catalog,
             name,
@@ -2388,19 +2745,30 @@ async fn apply_command(
             catalog,
             schema,
             request,
-        } => register_table(txn, id, column_ids, catalog, schema, request.clone()).await,
+        } => {
+            register_table(
+                txn,
+                id,
+                column_ids,
+                catalog,
+                schema,
+                request.clone(),
+                occurred_at_ms,
+            )
+            .await
+        }
         FrozenCommand::UpdateTable {
             catalog,
             schema,
             name,
             patch,
-        } => update_table(txn, catalog, schema, name, patch.clone()).await,
+        } => update_table(txn, catalog, schema, name, patch.clone(), occurred_at_ms).await,
         FrozenCommand::RenameTable {
             catalog,
             schema,
             name,
             new_name,
-        } => rename_table(txn, catalog, schema, name, new_name).await,
+        } => rename_table(txn, catalog, schema, name, new_name, occurred_at_ms).await,
         FrozenCommand::DropTable {
             catalog,
             schema,
@@ -2416,11 +2784,11 @@ async fn create_catalog(
     description: Option<String>,
     properties: Option<BTreeMap<String, String>>,
     storage_root: Option<String>,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     validate_name(name, "catalog")?;
     let index_key = name_index_key(CATALOG_KIND, None, name);
     assert_name_available(txn, &index_key, "catalog", name).await?;
-    let now = Utc::now().timestamp_millis();
     let record = CatalogRecordV1 {
         version: RECORD_VERSION,
         id: id.to_string(),
@@ -2428,8 +2796,8 @@ async fn create_catalog(
         description,
         properties,
         storage_root,
-        created_at: now,
-        updated_at: now,
+        created_at: occurred_at_ms,
+        updated_at: occurred_at_ms,
     };
     txn.put(
         &object_key(CATALOG_KIND, id),
@@ -2445,6 +2813,7 @@ async fn patch_catalog(
     txn: &mut ControlMvpTxn,
     name: &str,
     patch: CatalogPatch,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     let (old_index, mut record) = resolve_catalog(txn, name).await?;
     let next_name = patch
@@ -2479,7 +2848,7 @@ async fn patch_catalog(
     if let Some(storage_root) = patch.storage_root {
         record.storage_root = storage_root;
     }
-    record.updated_at = Utc::now().timestamp_millis();
+    record.updated_at = occurred_at_ms;
     txn.put(
         &object_key(CATALOG_KIND, &record.id),
         encode_json(&record, "catalog object")?,
@@ -2517,6 +2886,10 @@ async fn delete_catalog(
     Ok(MutationResponseV1::Deleted)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the frozen command fields remain explicit at the shared interpreter boundary"
+)]
 async fn create_schema(
     txn: &mut ControlMvpTxn,
     id: &str,
@@ -2525,12 +2898,12 @@ async fn create_schema(
     description: Option<String>,
     properties: Option<BTreeMap<String, String>>,
     storage_root: Option<String>,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     validate_name(name, "schema")?;
     let (_, catalog_record) = resolve_catalog(txn, catalog).await?;
     let index_key = name_index_key(SCHEMA_KIND, Some(&catalog_record.id), name);
     assert_name_available(txn, &index_key, "schema", name).await?;
-    let now = Utc::now().timestamp_millis();
     let record = SchemaRecordV1 {
         version: RECORD_VERSION,
         id: id.to_string(),
@@ -2539,8 +2912,8 @@ async fn create_schema(
         description,
         properties,
         storage_root,
-        created_at: now,
-        updated_at: now,
+        created_at: occurred_at_ms,
+        updated_at: occurred_at_ms,
     };
     txn.put(
         &object_key(SCHEMA_KIND, id),
@@ -2557,6 +2930,7 @@ async fn patch_schema(
     catalog: &str,
     name: &str,
     patch: SchemaPatch,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     let (_, catalog_record) = resolve_catalog(txn, catalog).await?;
     let (old_index, mut record) = resolve_schema(txn, &catalog_record.id, name).await?;
@@ -2582,7 +2956,7 @@ async fn patch_schema(
     if let Some(storage_root) = patch.storage_root {
         record.storage_root = storage_root;
     }
-    record.updated_at = Utc::now().timestamp_millis();
+    record.updated_at = occurred_at_ms;
     txn.put(
         &object_key(SCHEMA_KIND, &record.id),
         encode_json(&record, "schema object")?,
@@ -2612,6 +2986,7 @@ async fn register_table(
     catalog: &str,
     schema: &str,
     mut request: RegisterTableInSchemaRequest,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     validate_name(&request.name, "table")?;
     validate_columns(&request.columns, column_ids)?;
@@ -2620,7 +2995,6 @@ async fn register_table(
     let (_, schema_record) = resolve_schema(txn, &catalog_record.id, schema).await?;
     let index_key = name_index_key(TABLE_KIND, Some(&schema_record.id), &request.name);
     assert_name_available(txn, &index_key, "table", &request.name).await?;
-    let now = Utc::now().timestamp_millis();
     let record = TableRecordV1 {
         version: RECORD_VERSION,
         id: id.to_string(),
@@ -2631,8 +3005,8 @@ async fn register_table(
         format: request.format,
         table_type: request.table_type,
         properties: request.properties,
-        created_at: now,
-        updated_at: now,
+        created_at: occurred_at_ms,
+        updated_at: occurred_at_ms,
     };
     txn.put(
         &object_key(TABLE_KIND, id),
@@ -2667,6 +3041,7 @@ async fn update_table(
     schema: &str,
     name: &str,
     patch: TablePatch,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     let (_, catalog_record) = resolve_catalog(txn, catalog).await?;
     let (_, schema_record) = resolve_schema(txn, &catalog_record.id, schema).await?;
@@ -2684,7 +3059,7 @@ async fn update_table(
             .transpose()
             .map_err(CatalogError::from)?;
     }
-    record.updated_at = Utc::now().timestamp_millis();
+    record.updated_at = occurred_at_ms;
     txn.put(
         &object_key(TABLE_KIND, &record.id),
         encode_json(&record, "table object")?,
@@ -2699,6 +3074,7 @@ async fn rename_table(
     schema: &str,
     name: &str,
     new_name: &str,
+    occurred_at_ms: i64,
 ) -> Result<MutationResponseV1> {
     validate_name(new_name, "table")?;
     let (_, catalog_record) = resolve_catalog(txn, catalog).await?;
@@ -2711,7 +3087,7 @@ async fn rename_table(
         txn.put(&next_index, Bytes::copy_from_slice(record.id.as_bytes()))
             .await?;
         record.name = new_name.to_string();
-        record.updated_at = Utc::now().timestamp_millis();
+        record.updated_at = occurred_at_ms;
         txn.put(
             &object_key(TABLE_KIND, &record.id),
             encode_json(&record, "table object")?,
@@ -3076,6 +3452,14 @@ fn encode_scan_page_token(
 }
 
 fn iceberg_namespace_query_binding(parent_name: Option<&str>, separator: &str) -> Vec<u8> {
+    #[cfg(feature = "test-utils")]
+    crate::state_store::control_mvp::record_sha256_work(
+        b"arco/iceberg/namespace-list/v1\0".len()
+            + (usize::BITS / 8) as usize
+            + separator.len()
+            + 1
+            + parent_name.map_or(0, |name| (usize::BITS / 8) as usize + name.len()),
+    );
     let mut digest = Sha256::new();
     digest.update(b"arco/iceberg/namespace-list/v1\0");
     digest.update(separator.len().to_be_bytes());
@@ -3230,6 +3614,8 @@ fn serialization_error(error: &serde_json::Error) -> CatalogError {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    crate::state_store::control_mvp::record_sha256_work(bytes.len());
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -3253,6 +3639,27 @@ impl ControlCatalogAuthority {
     ) -> Result<Catalog> {
         self.create_catalog_with_metadata(name, description, None, None, opts)
             .await
+    }
+
+    /// Creates a catalog through the explicit synthetic authority-8 route.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless this authority was created with a V2 notifier,
+    /// or when the catalog mutation cannot commit.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn create_catalog_v2(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        opts: WriteOptions,
+    ) -> Result<Catalog> {
+        if self.projection_notifier_v2.is_none() {
+            return Err(CatalogError::UnsupportedAuthorityFormat {
+                message: "V2 catalog create requires synthetic bounded authority".to_string(),
+            });
+        }
+        self.create_catalog(name, description, opts).await
     }
 
     /// Creates a catalog including authoritative UC metadata.
@@ -3512,6 +3919,9 @@ impl ControlCatalogAuthority {
     }
 
     async fn execute(&self, frozen: FrozenMutation) -> Result<MutationResponseV1> {
+        if self.projection_notifier_v2.is_some() {
+            return self.execute_v2(frozen).await;
+        }
         let started = Instant::now();
         let mut attempt = 0_u32;
         loop {
@@ -3531,7 +3941,8 @@ impl ControlCatalogAuthority {
                 return Ok(receipt.response);
             }
 
-            let response = apply_command(&mut txn, &frozen.command).await?;
+            let response =
+                apply_command(&mut txn, &frozen.command, Utc::now().timestamp_millis()).await?;
             let predicted = txn.predicted_state_token()?;
             stage_commit_records(&mut txn, &frozen, &response, &predicted).await?;
             match txn.commit().await {
@@ -3561,6 +3972,80 @@ impl ControlCatalogAuthority {
                     return Err(CatalogError::CasFailed {
                         message:
                             "control catalog conflict retry budget exhausted after 1.5 seconds"
+                                .to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn execute_v2(&self, frozen: FrozenMutation) -> Result<MutationResponseV1> {
+        let projection_notifier = self.projection_notifier_v2.as_ref().ok_or_else(|| {
+            CatalogError::InvariantViolation {
+                message: "synthetic bounded catalog authority has no V2 notifier".to_string(),
+            }
+        })?;
+        let started = Instant::now();
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let mut options = TxnOptions::default().with_operation_id(frozen.operation_id.clone());
+            if let Some(request_id) = &frozen.request_id {
+                options = options.with_request_id(request_id);
+            }
+            let mut txn = self.store.begin_control_txn(options).await?;
+            txn.set_logical_operation(&frozen.operation_id, frozen.family, &frozen.digest)?;
+            if let Some(receipt) = load_receipt_v2(&mut txn, &frozen.receipt_key).await? {
+                if receipt.operation_family != frozen.family
+                    || receipt.request_digest != frozen.digest
+                {
+                    return Err(idempotency_conflict());
+                }
+                return Ok(receipt.response);
+            }
+
+            let response = apply_command(&mut txn, &frozen.command, frozen.occurred_at_ms).await?;
+            let logical_commit_id = txn.logical_commit_id()?;
+            let predicted = txn.predicted_state_token()?;
+            stage_commit_records_v2(
+                &mut txn,
+                &frozen,
+                &response,
+                &logical_commit_id,
+                predicted.logical_sequence(),
+            )
+            .await?;
+            match Box::pin(txn.commit_v2()).await {
+                Ok(outcome) => {
+                    if outcome.token().logical_sequence() != predicted.logical_sequence()
+                        || outcome.logical_commit_id() != logical_commit_id
+                    {
+                        return Err(CatalogError::InvariantViolation {
+                            message: "bounded catalog commit changed its logical identity"
+                                .to_string(),
+                        });
+                    }
+                    for intent in outcome.projection_intents() {
+                        if let Err(error) = projection_notifier.notify(intent) {
+                            warn!(
+                                intent_id = intent.intent_id(),
+                                projection_kind = intent.projection_kind(),
+                                error = %error,
+                                "bounded catalog projection notification failed after authority commit; durable anti-entropy will retry"
+                            );
+                        }
+                    }
+                    return Ok(response);
+                }
+                Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
+                    let jitter = 5_u64 + u64::from(attempt % 11);
+                    sleep(Duration::from_millis(jitter)).await;
+                }
+                Err(CatalogError::CasFailed { .. }) => {
+                    return Err(CatalogError::CasFailed {
+                        message:
+                            "bounded catalog conflict retry budget exhausted after 1.5 seconds"
                                 .to_string(),
                     });
                 }
@@ -3604,5 +4089,607 @@ pub(crate) fn capacity_fixture_record(
             audit_key(&record.operation_id),
             encode_json(&record, "capacity audit")?.to_vec(),
         ))
+    }
+}
+
+/// Receipt and audit `(key, value)` pairs for explicit synthetic genesis.
+#[cfg(any(test, feature = "test-utils"))]
+pub type BoundedCapacityV2RecordPair = ((Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>));
+
+/// Returns one deterministic authority-8 receipt/audit pair using the production
+/// catalog record encoders.
+///
+/// The two tuples are `(key, value)` pairs in receipt then audit order. They are
+/// fixture input for explicit synthetic genesis only, rather than evidence of a
+/// catalog command or a substitute for normal authority-8 publication.
+///
+/// # Errors
+/// Returns validation errors for zero ordinals or record encoding failures.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn bounded_capacity_v2_record_pair(ordinal: u64) -> Result<BoundedCapacityV2RecordPair> {
+    if ordinal == 0 {
+        return Err(CatalogError::Validation {
+            message: "bounded capacity fixture ordinal must be positive".to_string(),
+        });
+    }
+    let digest = format!("{ordinal:064x}");
+    let operation_id = format!("op-{ordinal:032x}");
+    let frozen = FrozenMutation {
+        operation_id: operation_id.clone(),
+        family: "delete_catalog",
+        digest: digest.clone(),
+        actor: "capacity-fixture".into(),
+        occurred_at_ms: 0,
+        receipt_key: receipt_key("delete_catalog", &digest),
+        request_id: None,
+        command: FrozenCommand::DeleteCatalog {
+            name: "capacity".into(),
+            force: false,
+        },
+    };
+    let (receipt, audit) =
+        commit_record_bytes_v2(&frozen, &MutationResponseV1::Deleted, &digest, ordinal)?;
+    Ok((
+        (frozen.receipt_key, receipt.to_vec()),
+        (audit_key(&operation_id), audit.to_vec()),
+    ))
+}
+
+/// Returns one deterministic historical V2 intent with a production-shaped
+/// catalog audit payload for explicit synthetic genesis.
+///
+/// `origin_sequence` and `ordinal` remain caller controlled so a fixture can
+/// model retained historical incarnations, including ordinal gaps after trims.
+///
+/// # Errors
+///
+/// Returns fixture-record or V2 intent validation errors.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn bounded_capacity_v2_intent(
+    scope: StateScope,
+    origin_sequence: u64,
+    ordinal: u64,
+) -> Result<ProjectionIntentV2> {
+    let (_, (_, audit)) = bounded_capacity_v2_record_pair(origin_sequence)?;
+    ProjectionIntentV2::new(
+        format!("intent-{origin_sequence:020}-{ordinal:020}"),
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        scope,
+        origin_sequence,
+        format!("{origin_sequence:064x}"),
+        ordinal,
+        audit,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod bounded_record_tests {
+    use super::*;
+
+    #[test]
+    fn v2_receipt_and_audit_use_logical_provenance() {
+        let frozen = FrozenMutation {
+            operation_id: "op-fixed".into(),
+            family: "delete_catalog",
+            digest: "11".repeat(32),
+            actor: "api".into(),
+            occurred_at_ms: 42,
+            receipt_key: b"receipt".to_vec(),
+            request_id: None,
+            command: FrozenCommand::DeleteCatalog {
+                name: "catalog".into(),
+                force: false,
+            },
+        };
+        let identity = "22".repeat(32);
+        let records =
+            commit_record_bytes_v2(&frozen, &MutationResponseV1::Deleted, &identity, 7).unwrap();
+        let repeated =
+            commit_record_bytes_v2(&frozen, &MutationResponseV1::Deleted, &identity, 7).unwrap();
+        assert_eq!(records, repeated);
+        for bytes in [&records.0, &records.1] {
+            let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(value["version"], 2);
+            assert_eq!(value["logicalCommitId"], identity);
+            assert_eq!(value["logicalSequence"], 7);
+            assert!(value.get("authorityManifestId").is_none());
+        }
+        let receipt: serde_json::Value = serde_json::from_slice(&records.0).unwrap();
+        assert_eq!(receipt["response"], serde_json::json!({"kind":"deleted"}));
+        let audit: serde_json::Value = serde_json::from_slice(&records.1).unwrap();
+        assert_eq!(audit["occurredAtMs"], 42);
+        assert_eq!(audit["operationId"], "op-fixed");
+    }
+
+    #[test]
+    fn v2_capacity_fixture_pair_uses_production_logical_record_shape() {
+        let ((receipt_key, receipt), (audit_key, audit)) =
+            bounded_capacity_v2_record_pair(42).expect("fixture pair");
+        assert_eq!(receipt_key[0], IDEMPOTENCY_KEY_TAG);
+        assert_eq!(audit_key[0], AUDIT_KEY_TAG);
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt).expect("receipt JSON");
+        let audit: serde_json::Value = serde_json::from_slice(&audit).expect("audit JSON");
+        for value in [&receipt, &audit] {
+            assert_eq!(value["version"], 2);
+            assert_eq!(value["logicalSequence"], 42);
+            assert_eq!(value["logicalCommitId"], format!("{:064x}", 42));
+            assert!(value.get("authorityManifestId").is_none());
+        }
+        assert_eq!(audit["operationId"], "op-0000000000000000000000000000002a");
+        assert_eq!(receipt["requestDigest"], format!("{:064x}", 42));
+        assert!(bounded_capacity_v2_record_pair(0).is_err());
+    }
+
+    #[test]
+    fn v2_capacity_fixture_intent_keeps_historical_origin_and_production_audit_payload() {
+        let intent =
+            bounded_capacity_v2_intent(StateScope::new("tenant", "workspace", "catalog"), 7, 9)
+                .expect("fixture intent");
+        assert_eq!(
+            intent.intent_id(),
+            "intent-00000000000000000007-00000000000000000009"
+        );
+        assert_eq!(intent.source_logical_sequence(), 7);
+        assert_eq!(intent.logical_commit_id(), format!("{:064x}", 7));
+        assert_eq!(intent.ordinal(), 9);
+        let audit: serde_json::Value =
+            serde_json::from_slice(intent.payload()).expect("audit JSON");
+        assert_eq!(audit["version"], 2);
+        assert_eq!(audit["logicalSequence"], 7);
+        assert!(audit.get("authorityManifestId").is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod bounded_catalog_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arco_core::MemoryBackend;
+
+    #[derive(Default)]
+    struct RecordingNotifierV2 {
+        calls: AtomicUsize,
+    }
+
+    impl CatalogProjectionNotifierV2 for RecordingNotifierV2 {
+        fn notify(&self, _intent: &ProjectionIntentV2) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn table_request(name: &str) -> RegisterTableInSchemaRequest {
+        RegisterTableInSchemaRequest {
+            name: name.to_string(),
+            description: Some("initial".to_string()),
+            location: Some("s3://synthetic/orders".to_string()),
+            format: Some("delta".to_string()),
+            table_type: Some("EXTERNAL".to_string()),
+            properties: None,
+            columns: vec![ColumnDefinition {
+                name: "order_id".to_string(),
+                data_type: "BIGINT".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_bounded_create_catalog_publishes_v2_records_and_notifies_v2() {
+        let storage = ScopedStorage::new(
+            Arc::new(MemoryBackend::new()),
+            "synthetic-tenant",
+            "synthetic-workspace",
+        )
+        .unwrap();
+        let notifier = Arc::new(RecordingNotifierV2::default());
+        let authority = ControlCatalogAuthority::new_synthetic_bounded(
+            storage.clone(),
+            StateScope::new("synthetic-tenant", "synthetic-workspace", "catalog"),
+            notifier.clone(),
+        )
+        .unwrap();
+
+        let catalog = authority
+            .create_catalog(
+                "bounded",
+                Some("synthetic authority-8 catalog"),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("synthetic bounded create catalog");
+        assert_eq!(catalog.name, "bounded");
+        assert_eq!(1, notifier.calls.load(Ordering::SeqCst));
+
+        let head: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw("control/v1/domains/catalog/head/current.json")
+                .await
+                .expect("bounded HEAD"),
+        )
+        .expect("bounded HEAD JSON");
+        assert_eq!(head["format_version"], 8);
+
+        for prefix in [[IDEMPOTENCY_KEY_TAG], [AUDIT_KEY_TAG]] {
+            let page = authority
+                .store
+                .scan(ScanRequest::new(prefix).with_limits(8, 1024 * 1024, 8))
+                .await
+                .expect("bounded record scan");
+            assert_eq!(page.entries().len(), 1);
+            let record: serde_json::Value =
+                serde_json::from_slice(page.entries()[0].value().bytes()).expect("V2 record JSON");
+            assert_eq!(record["version"], 2);
+            assert_eq!(record["logicalSequence"], 1);
+            assert!(
+                record["logicalCommitId"]
+                    .as_str()
+                    .is_some_and(|id| id.len() == 64)
+            );
+            assert!(record.get("authorityManifestId").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn synthetic_bounded_catalog_preserves_small_state_idempotency_and_v2_history() {
+        let storage = ScopedStorage::new(
+            Arc::new(MemoryBackend::new()),
+            "synthetic-tenant",
+            "synthetic-workspace",
+        )
+        .unwrap();
+        let notifier = Arc::new(RecordingNotifierV2::default());
+        let authority = ControlCatalogAuthority::new_synthetic_bounded(
+            storage,
+            StateScope::new("synthetic-tenant", "synthetic-workspace", "catalog"),
+            notifier.clone(),
+        )
+        .unwrap();
+
+        let first = authority
+            .create_catalog(
+                "alpha",
+                Some("first catalog"),
+                WriteOptions::with_idempotency("alpha-request"),
+            )
+            .await
+            .expect("first synthetic catalog");
+        let replay = authority
+            .create_catalog(
+                "alpha",
+                Some("first catalog"),
+                WriteOptions::with_idempotency("alpha-request"),
+            )
+            .await
+            .expect("exact idempotency replay");
+        assert_eq!(first.id, replay.id);
+        authority
+            .create_catalog("beta", None, WriteOptions::default())
+            .await
+            .expect("second synthetic catalog");
+        assert_eq!(
+            authority
+                .list_catalogs()
+                .await
+                .expect("bounded catalog oracle")
+                .into_iter()
+                .map(|catalog| catalog.name)
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert!(matches!(
+            authority
+                .create_catalog("alpha", None, WriteOptions::default())
+                .await,
+            Err(CatalogError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            authority
+                .create_catalog(
+                    "alpha",
+                    Some("changed request"),
+                    WriteOptions::with_idempotency("alpha-request"),
+                )
+                .await,
+            Err(CatalogError::PreconditionFailed { .. })
+        ));
+        assert_eq!(2, notifier.calls.load(Ordering::SeqCst));
+
+        let page = authority
+            .store
+            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(8, 1024 * 1024, 8))
+            .await
+            .expect("bounded audit scan");
+        assert_eq!(page.entries().len(), 2);
+        let mut history = page
+            .entries()
+            .iter()
+            .map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record["logicalSequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_ne!(history[0]["logicalCommitId"], history[1]["logicalCommitId"]);
+        assert!(history.iter().all(|record| {
+            record["version"] == 2
+                && record["logicalCommitId"]
+                    .as_str()
+                    .is_some_and(|id| id.len() == 64)
+                && record.get("authorityManifestId").is_none()
+        }));
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the end-to-end authority-8 lifecycle keeps its ordered oracle assertions together"
+    )]
+    async fn synthetic_bounded_schema_table_lifecycle_preserves_ids_names_and_v2_history() {
+        #[cfg(feature = "test-utils")]
+        let _fixed_inputs = arco_core::test_inputs::FixedInputs::scoped();
+        let storage = ScopedStorage::new(
+            Arc::new(MemoryBackend::new()),
+            "synthetic-tenant",
+            "synthetic-workspace",
+        )
+        .unwrap();
+        let notifier = Arc::new(RecordingNotifierV2::default());
+        let authority = ControlCatalogAuthority::new_synthetic_bounded(
+            storage,
+            StateScope::new("synthetic-tenant", "synthetic-workspace", "catalog"),
+            notifier.clone(),
+        )
+        .unwrap();
+
+        authority
+            .create_catalog(
+                "warehouse",
+                None,
+                WriteOptions::with_idempotency("warehouse"),
+            )
+            .await
+            .expect("create catalog");
+        authority
+            .create_schema(
+                "warehouse",
+                "main",
+                None,
+                WriteOptions::with_idempotency("warehouse-main"),
+            )
+            .await
+            .expect("create schema");
+        let original = authority
+            .register_table_in_schema(
+                "warehouse",
+                "main",
+                table_request("orders"),
+                WriteOptions::with_idempotency("orders-v1"),
+            )
+            .await
+            .expect("register table");
+        let updated = authority
+            .update_table_in_schema(
+                "warehouse",
+                "main",
+                "orders",
+                TablePatch {
+                    description: Some(Some("updated".to_string())),
+                    ..TablePatch::default()
+                },
+                WriteOptions::with_idempotency("orders-update"),
+            )
+            .await
+            .expect("update table");
+        let renamed = authority
+            .rename_table(
+                "warehouse",
+                "main",
+                "orders",
+                "orders_renamed",
+                WriteOptions::with_idempotency("orders-rename"),
+            )
+            .await
+            .expect("rename table");
+        assert_eq!(original.id, updated.id);
+        assert_eq!(original.id, renamed.id);
+        assert_eq!(renamed.description.as_deref(), Some("updated"));
+        assert!(
+            authority
+                .get_table("warehouse", "main", "orders")
+                .await
+                .expect("old name lookup")
+                .is_none()
+        );
+        assert_eq!(
+            authority
+                .get_table("warehouse", "main", "orders_renamed")
+                .await
+                .expect("renamed lookup")
+                .expect("renamed table")
+                .id,
+            original.id
+        );
+
+        authority
+            .drop_table(
+                "warehouse",
+                "main",
+                "orders_renamed",
+                WriteOptions::with_idempotency("orders-drop"),
+            )
+            .await
+            .expect("drop table");
+        assert!(
+            authority
+                .get_table_by_id(&original.id)
+                .await
+                .expect("dropped ID lookup")
+                .is_none()
+        );
+        let replacement = authority
+            .register_table_in_schema(
+                "warehouse",
+                "main",
+                table_request("orders_renamed"),
+                WriteOptions::with_idempotency("orders-v2"),
+            )
+            .await
+            .expect("recreate table name after tombstone");
+        assert_ne!(replacement.id, original.id);
+        assert_eq!(
+            authority
+                .get_table("warehouse", "main", "orders_renamed")
+                .await
+                .expect("replacement name lookup")
+                .expect("replacement table")
+                .id,
+            replacement.id
+        );
+        assert_eq!(7, notifier.calls.load(Ordering::SeqCst));
+
+        let page = authority
+            .store
+            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
+            .await
+            .expect("bounded lifecycle audit scan");
+        assert_eq!(page.entries().len(), 7);
+        let mut history = page
+            .entries()
+            .iter()
+            .map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record["operationFamily"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "create_catalog",
+                "create_schema",
+                "register_table",
+                "update_table",
+                "rename_table",
+                "drop_table",
+                "register_table",
+            ]
+        );
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record["logicalSequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            (1..=7).collect::<Vec<_>>()
+        );
+        assert!(history.iter().all(|record| {
+            record["version"] == 2
+                && record["requestDigest"]
+                    .as_str()
+                    .is_some_and(|digest| digest.len() == 64)
+                && record["logicalCommitId"]
+                    .as_str()
+                    .is_some_and(|id| id.len() == 64)
+                && record.get("authorityManifestId").is_none()
+        }));
+
+        let receipts = authority
+            .store
+            .scan(ScanRequest::new([IDEMPOTENCY_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
+            .await
+            .expect("bounded lifecycle receipt scan");
+        assert_eq!(receipts.entries().len(), history.len());
+        let mut receipt_history = receipts
+            .entries()
+            .iter()
+            .map(|entry| {
+                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
+            })
+            .map(|record| {
+                (
+                    record["operationFamily"].as_str().unwrap().to_string(),
+                    record["requestDigest"].as_str().unwrap().to_string(),
+                    record["logicalCommitId"].as_str().unwrap().to_string(),
+                    record["logicalSequence"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut audit_history = history
+            .iter()
+            .map(|record| {
+                (
+                    record["operationFamily"].as_str().unwrap().to_string(),
+                    record["requestDigest"].as_str().unwrap().to_string(),
+                    record["logicalCommitId"].as_str().unwrap().to_string(),
+                    record["logicalSequence"].as_u64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        receipt_history.sort();
+        audit_history.sort();
+        assert_eq!(receipt_history, audit_history);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn catalog_sha256_helper_is_included_in_authentication_work() {
+        let _ = ControlMvpStateStore::take_test_authentication_work();
+        assert_eq!(
+            sha256_hex(b"catalog-cost"),
+            "339af18fd670608f07d5e4534b487f3851d40d0f0f73faea895c364d3aed7cd4"
+        );
+        assert_eq!(
+            ControlMvpStateStore::take_test_authentication_work(),
+            (
+                1,
+                u64::try_from(b"catalog-cost".len()).expect("literal length")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_v2_command_uses_its_frozen_timestamp_for_catalog_rows() {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "frozen-time", "fixture")
+            .expect("storage");
+        let authority = ControlCatalogAuthority::new_synthetic_bounded(
+            storage,
+            StateScope::new("frozen-time", "fixture", "catalog"),
+            Arc::new(RecordingNotifierV2::default()),
+        )
+        .expect("authority");
+        let mut command = authority
+            .prepare_synthetic_bounded_command(
+                BoundedCatalogTestCommand::CreateCatalog {
+                    id: "01900000-0001-7001-8000-000000000001".to_string(),
+                    name: "frozen-time".to_string(),
+                },
+                WriteOptions::with_idempotency("frozen-time"),
+            )
+            .expect("prepare command");
+        command.0.occurred_at_ms = 42;
+        authority
+            .execute_prepared_synthetic_bounded_command(command)
+            .await
+            .expect("execute command");
+        let catalog = authority
+            .get_catalog("frozen-time")
+            .await
+            .expect("catalog lookup")
+            .expect("catalog exists");
+        assert_eq!(catalog.created_at, 42);
+        assert_eq!(catalog.updated_at, 42);
     }
 }

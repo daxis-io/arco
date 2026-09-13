@@ -4,6 +4,11 @@ Status: architecture follow-up and local feasibility complete. Production capaci
 remediation is not implemented. Gate 7 remains nonpassing; no provider run or pilot
 is implied by these results. No cloud commands were run during this follow-up.
 
+September 13 update: [Step 2 synthetic authority-8 bounded commits](2026-09-13-state-store-bounded-commits.md)
+now has complete local mutation/scaling evidence. The observations below describe
+the earlier source; production authority 7 and durable large restore remain outside
+that Step 2 implementation.
+
 ## Outcome
 
 The current restore scanner cannot admit the pilot's minimum 2,419,200 retained

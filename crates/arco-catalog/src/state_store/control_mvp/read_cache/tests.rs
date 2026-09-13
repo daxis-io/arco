@@ -341,6 +341,8 @@ async fn eight_distinct_loads_and_256_participants_are_hard_limits() {
 struct VersionBackend {
     inner: MemoryBackend,
     mode: AtomicUsize,
+    pointer_mode: AtomicUsize,
+    pointer_heads: AtomicUsize,
     heads: AtomicUsize,
     directory_reads: AtomicUsize,
     directory_gets: AtomicUsize,
@@ -390,6 +392,9 @@ impl StorageBackend for VersionBackend {
             })
     }
     async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> arco_core::Result<Bytes> {
+        if path.ends_with("/head/current.json") && self.pointer_mode.load(Ordering::Relaxed) == 4 {
+            return Err(arco_core::Error::NotFound(path.into()));
+        }
         if path.contains("/indexes/") {
             self.directory_reads.fetch_add(1, Ordering::Relaxed);
         }
@@ -410,6 +415,17 @@ impl StorageBackend for VersionBackend {
     }
     async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::storage::ObjectMeta>> {
         let mut meta = self.measured_backend(self.inner.head(path)).await?;
+        if path.ends_with("/head/current.json") {
+            let observation = self.pointer_heads.fetch_add(1, Ordering::Relaxed);
+            if let Some(meta) = &mut meta {
+                match self.pointer_mode.load(Ordering::Relaxed) {
+                    1 => meta.version.clear(),
+                    2 => meta.size += 1,
+                    3 => meta.version = format!("changing-{observation}"),
+                    _ => (),
+                }
+            }
+        }
         if path.contains("/indexes/") {
             let observation = self.heads.fetch_add(1, Ordering::Relaxed);
             let mode = self.mode.load(Ordering::Relaxed);
@@ -475,6 +491,124 @@ fn version_store() -> (Arc<VersionBackend>, ControlMvpStateStore) {
     )
     .unwrap();
     (backend, store)
+}
+
+#[tokio::test]
+async fn bounded_physical_read_cancellation_releases_cache_ownership_and_rechecks_versions() {
+    use futures::poll;
+    for config in [
+        None,
+        Some(ControlMvpReadCacheConfig::default()),
+        Some(ControlMvpReadCacheConfig {
+            metadata_bytes: MIB,
+            decoded_bytes: 4 * MIB,
+        }),
+    ] {
+        let backend = Arc::new(VersionBackend::default());
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation("cache-cancel", "test", &"ab".repeat(32))
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"value")).await.unwrap();
+        let token = txn.commit_v2().await.unwrap().token().clone();
+        let store = match config {
+            None => store.without_read_cache(),
+            Some(config) => store.with_read_cache_config(config).unwrap(),
+        };
+        let cache = store.read_cache();
+        let reader = store.read_at(token).await.unwrap();
+        backend.pause.store(true, Ordering::Relaxed);
+        let mut read = Box::pin(reader.get(b"key"));
+        assert!(poll!(read.as_mut()).is_pending());
+        if let Some(cache) = &cache {
+            assert_eq!(cache.statistics().active_loads, 1);
+            assert!(cache.statistics().metadata.reserved_bytes > 0);
+        }
+        drop(read);
+        if let Some(cache) = &cache {
+            let stats = cache.statistics();
+            assert_eq!(stats.active_loads, 0);
+            assert_eq!(stats.participants, 0);
+            assert_eq!(stats.metadata.reserved_bytes, 0);
+            assert_eq!(stats.decoded.reserved_bytes, 0);
+        }
+        backend.pause.store(false, Ordering::Relaxed);
+        backend.release.notify_waiters();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        // The warm index and decoded block cannot hide a changed immutable version.
+        backend.heads.store(0, Ordering::Relaxed);
+        backend.mode.store(4, Ordering::Relaxed);
+        assert!(reader.get(b"key").await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn selected_head_get_absence_is_not_genesis() {
+    let (backend, store) = version_store();
+    assert!(store.clone().at_current_writer_epoch().await.is_ok());
+    seed(&store).await;
+    backend.pointer_mode.store(4, Ordering::Relaxed);
+    let adopted = store.clone().at_current_writer_epoch().await;
+    let pinned = store.begin_control_txn(TxnOptions::default()).await;
+    assert!(matches!(
+        adopted,
+        Err(CatalogError::InvariantViolation { .. }
+            | CatalogError::AmbiguousAuthorityOutcome { .. })
+    ));
+    assert!(matches!(
+        pinned,
+        Err(CatalogError::InvariantViolation { .. }
+            | CatalogError::AmbiguousAuthorityOutcome { .. })
+    ));
+}
+
+#[tokio::test]
+async fn transaction_pin_rejects_empty_head_version() {
+    let (backend, store) = version_store();
+    seed(&store).await;
+    backend.pointer_mode.store(1, Ordering::Relaxed);
+    assert!(
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn transaction_pin_rejects_head_size_mismatch() {
+    let (backend, store) = version_store();
+    seed(&store).await;
+    backend.pointer_mode.store(2, Ordering::Relaxed);
+    assert!(
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn transaction_pin_does_not_accept_unstable_head_version() {
+    let (backend, store) = version_store();
+    seed(&store).await;
+    backend.pointer_mode.store(3, Ordering::Relaxed);
+    assert!(
+        store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

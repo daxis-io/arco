@@ -328,10 +328,11 @@ class DispatchPayload:
         )
 
 
-def _select_task_token(payload_token: str | None, fallback_token: str) -> str:
+def _select_task_token(payload_token: str | None) -> str:
     if payload_token and payload_token.strip():
         return payload_token
-    return fallback_token
+    msg = "dispatch task token is required"
+    raise ValueError(msg)
 
 
 def _secret_value(secret: Any) -> str:
@@ -478,9 +479,6 @@ class DispatchWorker:
     ) -> None:
         self.config = config
         self.worker_id = worker_id or f"{socket.gethostname()}:{os.getpid()}"
-        self._fallback_task_token = (
-            config.task_token.get_secret_value() or config.api_key.get_secret_value() or "debug"
-        )
         self._client = ArcoFlowApiClient(config)
         self._assets: dict[str, Any] = {}
         self._partitioned_assets: set[str] = set()
@@ -593,7 +591,7 @@ class DispatchWorker:
                 self._recent_dispatch_ids.popitem(last=False)
 
     def _run_dispatch(self, payload: WorkerDispatchEnvelope) -> DispatchOutcome:
-        task_token = _select_task_token(payload.task_token, self._fallback_task_token)
+        task_token = _select_task_token(payload.task_token)
         started_at = _now_iso()
         try:
             self._client.task_started(

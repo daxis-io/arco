@@ -755,7 +755,7 @@ impl Server {
         let metrics_handler = if state.config.posture.is_public() {
             get(|| async { StatusCode::NOT_FOUND })
         } else {
-            get(crate::metrics::serve_metrics)
+            get(|| async { crate::metrics::serve_metrics() })
         };
 
         let mut router = Router::new()

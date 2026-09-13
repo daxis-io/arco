@@ -30,4 +30,5 @@ pub mod support;
 pub use openapi::{UnityCatalogApiDoc, openapi, openapi_json};
 pub use permissions::{CompiledPermissionSource, MetastorePermissionSource};
 pub use router::unity_catalog_router;
+pub use routes::delta::config::SUPPORTED_PROTOCOL_VERSIONS as SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS;
 pub use state::{UnityCatalogConfig, UnityCatalogState};

@@ -7,7 +7,9 @@ repo-local implementation status, use the [control-plane scope scorecard](./cont
 
 ## Decision
 
-Arco should model `metastore_id` as a first-class logical scope.
+Arco models `metastore_id` as a first-class logical scope. ADR-044 assigns
+principal identity to a separate tenant-owned authority; metastore ownership
+covers privileges and securable objects.
 
 The metastore is the governed catalog authority: it owns catalogs, schemas,
 tables, views, volumes, grants, storage governance, credential vending policy,
@@ -29,12 +31,17 @@ The target model is:
 
 ```text
 tenant
-  -> metastore
+  -> identity authority
+      -> principals and lifecycle
+      -> groups and membership revisions
+      -> external authentication bindings
+  -> metastore authority
       -> governed catalog state
       -> stable object IDs
-      -> grants and compiled permissions
+      -> grants, ownership, and compiled permissions
       -> storage governance and credential scope
-  -> workspace
+      -> authoritative workspace bindings
+  -> workspace authority
       -> execution state
       -> request context
       -> orchestration state
@@ -46,6 +53,7 @@ tenant
 | Term | Meaning |
 |---|---|
 | Tenant | Top-level isolation boundary for an organization or deployment customer. |
+| Identity authority | Tenant-owned principals, lifecycle, groups, membership revisions, and external identity bindings. |
 | Metastore | Governed catalog authority within a tenant. It owns object identity, grants, storage governance, and catalog projections. |
 | Workspace | Compute, API, and orchestration context. A workspace can access a metastore only through an explicit binding. |
 | Workspace binding | Authoritative relationship that permits a workspace to use a metastore or a specific metastore-owned object. |
@@ -81,11 +89,17 @@ workspace isolation for execution state.
 
 ## Scope Ownership
 
+Tenant-identity-scoped state:
+
+- users, service principals, workloads, and principal lifecycle
+- groups and membership revisions
+- verified external authentication bindings
+
 Metastore-scoped state:
 
 - catalogs, schemas, tables, table formats, columns, constraints, and views
 - volumes, functions, registered models, and model versions
-- principals and group-membership snapshots used for metastore authorization
+- compiled authorization inputs referencing named identity-state and metastore-state tokens; principal or membership snapshots are derived compatibility data, not identity authority
 - grants, ownership, inherited permissions, and compiled authorization views
 - storage credentials, external locations, managed roots, and governed paths
 - credential vending policy, TTL clamps, deny reasons, and audit records
@@ -98,7 +112,7 @@ Workspace-scoped state:
 - orchestration runs, tasks, sensors, schedules, backfills, and dispatch outbox
 - runtime request context, workload identity, and request IDs
 - workspace-local caches and temporary execution state
-- workspace binding records when the binding object is optimized for workspace lookup
+- derived workspace-binding lookup indexes; authoritative binding records belong to the metastore
 - workspace-local observability that does not define catalog authority
 
 Table commit coordination for managed Delta tables is metastore/table scoped,
@@ -112,6 +126,19 @@ Current code uses `ScopedStorage` with paths shaped as:
 ```text
 tenant={tenant}/workspace={workspace}/...
 ```
+
+The typed tenant identity prefix is:
+
+```text
+tenant={tenant}/identity/
+```
+
+Identity storage and its event envelope are not enabled by the prefix type.
+The versioned scope migration must precede identity use of `control/v1`.
+Metastore-scoped storage can already construct a prefix while retaining a
+separate request workspace; it is not yet a supported `control/v1` root.
+The current kernel accepts only workspace physical roots. The first ADR-043
+pilot uses `metastore_id = workspace_id` and preserves that workspace layout.
 
 The target catalog authority should be able to use paths shaped as:
 
@@ -205,11 +232,14 @@ Binding evaluation should deny closed when:
 
 For a request from `workspace=bi` reading `sales.curated.orders`:
 
-1. Authenticate the principal and resolve group membership.
+1. Authenticate the tenant principal and resolve active lifecycle and group
+   membership at a named identity-state cut.
 2. Resolve the workspace's metastore binding.
 3. Resolve `sales.curated.orders` in the bound metastore.
 4. Read the metastore's published catalog snapshot or object-native head.
-5. Authorize against compiled grants and ownership using stable object IDs.
+5. Authorize against compiled grants and ownership using stable object IDs,
+   validating both identity-state and metastore-state tokens and current
+   lifecycle/freshness requirements.
 6. Apply storage governance and credential scope.
 7. Return metadata, scan planning data, or scoped credentials.
 
@@ -224,6 +254,10 @@ only after fenced pointer publication.
 
 Workspace context is still recorded with each mutation for audit and policy
 evaluation, but it is not the durability scope for shared catalog authority.
+`matches_durable_root` checks only those ownership dimensions. A domain service
+must separately validate principal privileges and workspace bindings before
+acquiring the writer capability. Tenant identity uses a separate identity
+mutation family; the generic metastore ledger cannot write identity state.
 
 Successful visible mutations must satisfy Arco's existing consistency model:
 readers see the old complete snapshot or the new complete snapshot, never a
@@ -233,9 +267,14 @@ half-published set.
 
 Credential vending must combine three decisions:
 
-1. Principal authorization on the object or path.
+1. Active tenant identity and principal authorization on the object or path.
 2. Workspace binding to the metastore or governed storage object.
 3. Provider-specific scope and TTL limits.
+
+Both identity and metastore/storage cuts must be revalidated before minting;
+a stale compiled permission or concurrent disable requires refresh or denial.
+Cross-root validation does not revoke credentials already issued by a provider;
+revocation and TTL behavior require separate qualification.
 
 The minted credential scope must be no broader than the authorized object/path
 and no broader than the workspace binding permits. Deny decisions must be
@@ -276,10 +315,22 @@ Use a compatibility-first migration:
 10. Retire the workspace-as-metastore alias only after migration tooling and
     rollback procedures exist.
 
+## Identity and Scope Migration
+
+ADR-044 resolves principal ownership at the tenant level. Its required contracts
+cover token freshness, global disable, tombstones and retention-qualified purge,
+ownership recovery, explicit bootstrap principals, credential vending, and
+legacy-principal deduplication. These remain implementation requirements.
+
+The dedicated **Versioned AuthorityScope in StateScope and control/v1** follow-up
+must migrate the persisted authority identity before enabling non-workspace
+state roots. Equal textual IDs in identity, metastore, and workspace families
+must remain distinct throughout tokens, continuations, restore references, and
+cache identity. Existing workspace records keep their explicit compatibility
+meaning; no tenant or metastore ID is substituted into a workspace field.
+
 ## Open Questions
 
-- Should principals be tenant-scoped globally or metastore-scoped with tenant
-  identity federation as an input?
 - Should one workspace bind to multiple metastores in the first public release,
   or should that be a later expansion?
 - Are managed roots always metastore-scoped, or can they be workspace-local

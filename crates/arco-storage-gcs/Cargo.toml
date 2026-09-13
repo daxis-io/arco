@@ -1,0 +1,27 @@
+[package]
+name = "arco-storage-gcs"
+description = "Google Cloud Storage adapter for Arco storage contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arco-core = { path = "../arco-core", default-features = false }
+arco-storage-object-store = { path = "../arco-storage-object-store" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+object_store = { workspace = true, features = ["gcp"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+ulid = { workspace = true }

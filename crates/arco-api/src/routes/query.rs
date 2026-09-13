@@ -26,7 +26,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{ObjectName, Statement as SqlStatement, visit_relations};
 
-use arco_catalog::{CatalogError, CatalogReader};
+use arco_catalog::{CatalogAuthorityKind, CatalogError, CatalogReader};
 use arco_core::CatalogDomain;
 
 use crate::context::RequestContext;
@@ -138,12 +138,16 @@ pub(crate) async fn query(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let reader = CatalogReader::new(storage.clone());
+    let catalog_authority_kind = state
+        .catalog_authority_bindings()
+        .resolve(&ctx.tenant, &ctx.workspace);
 
     let session = SessionContext::new();
     let registered = register_snapshot_tables(
         &session,
         &reader,
         &storage,
+        catalog_authority_kind,
         &registration_targets.snapshot_tables,
     )
     .await?
@@ -151,6 +155,7 @@ pub(crate) async fn query(
             &session,
             &reader,
             &storage,
+            catalog_authority_kind,
             &registration_targets.system_tables,
         )
         .await?;
@@ -296,10 +301,13 @@ async fn register_snapshot_tables(
     session: &SessionContext,
     reader: &CatalogReader,
     storage: &arco_core::ScopedStorage,
+    catalog_authority_kind: CatalogAuthorityKind,
     requested_tables: &HashMap<String, HashSet<String>>,
 ) -> Result<usize, ApiError> {
     let mut registered = 0;
-    if let Some(catalog_tables) = requested_tables.get("catalog") {
+    if catalog_authority_kind == CatalogAuthorityKind::Legacy
+        && let Some(catalog_tables) = requested_tables.get("catalog")
+    {
         registered += register_domain_tables(
             session,
             reader,

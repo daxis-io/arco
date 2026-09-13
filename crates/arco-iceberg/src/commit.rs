@@ -795,7 +795,10 @@ fn build_takeover_metadata_location(
     ))
 }
 
-fn apply_updates(metadata: &mut TableMetadata, updates: &[TableUpdate]) -> IcebergResult<()> {
+pub(crate) fn apply_updates(
+    metadata: &mut TableMetadata,
+    updates: &[TableUpdate],
+) -> IcebergResult<()> {
     for update in updates {
         apply_update(metadata, update)?;
     }
@@ -900,6 +903,16 @@ fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergRe
             snapshot_id,
             ..
         } => {
+            let exists = metadata
+                .snapshots
+                .iter()
+                .any(|snapshot| snapshot.snapshot_id == *snapshot_id);
+            if !exists {
+                return Err(IcebergError::BadRequest {
+                    message: format!("Snapshot {snapshot_id} does not exist"),
+                    error_type: "BadRequestException",
+                });
+            }
             let ref_type = match ref_type {
                 UpdateSnapshotRefType::Branch => "branch",
                 UpdateSnapshotRefType::Tag => "tag",

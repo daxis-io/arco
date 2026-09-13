@@ -36,6 +36,7 @@ use crate::support::documented_operations;
         crate::routes::delta_commits::post_delta_preview_commits,
         crate::routes::credentials::post_temporary_table_credentials,
         crate::routes::credentials::post_temporary_path_credentials,
+        crate::routes::delta::config::get_config,
     ),
     components(
         schemas(

@@ -1,0 +1,1556 @@
+{
+  "format_version": 1,
+  "profile": {
+    "setup_commits": 256,
+    "samples": 200
+  },
+  "backend_kind": "MemoryBackend",
+  "request_accounting": "StorageBackend API attempts; no network transport or retries",
+  "allocation_accounting": "Rust allocator calls during future polls; excludes spawned work",
+  "cache_accounting": "disabled; no cache hits",
+  "provider_qualification": "not_run",
+  "operations": [
+    {
+      "phase": "ambiguous_commit_reconciliation",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 11,
+            "returned_bytes": 32470,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 11,
+            "returned_bytes": 11520,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 7159,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 479,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 10,
+            "returned_bytes": 13828,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2883": 10,
+          "data:0:3651": 1,
+          "directory:0:1040": 2,
+          "directory:0:1050": 8,
+          "directory:0:1051": 1,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1346": 1,
+          "transaction:0:1388": 9
+        },
+        "logical_storage_calls": 39,
+        "get_attempts": 0,
+        "range_get_attempts": 34,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 65456,
+        "write_attempt_bytes": 13496,
+        "immutable_write_attempt_bytes": 13017
+      },
+      "logical_payload_bytes": 30,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 39,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 65456,
+        "denominator": 30
+      },
+      "write_amplification": {
+        "numerator": 13496,
+        "denominator": 30
+      },
+      "allocations": {
+        "count": 5092,
+        "bytes": 610071
+      },
+      "latency_p50_micros": 10157,
+      "latency_p99_micros": 10157
+    },
+    {
+      "phase": "begin",
+      "samples": 456,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 455,
+            "returned_bytes": 2635006,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 455,
+            "returned_bytes": 216661,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "manifest:0:1048577": 455,
+          "other:0:65537": 455
+        },
+        "logical_storage_calls": 1366,
+        "get_attempts": 0,
+        "range_get_attempts": 910,
+        "head_attempts": 456,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 2851667,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 1366,
+        "denominator": 456
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 132222,
+        "bytes": 18907603
+      },
+      "latency_p50_micros": 792,
+      "latency_p99_micros": 1369
+    },
+    {
+      "phase": "checkpoint",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 2,
+            "returned_bytes": 8068,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 2,
+            "returned_bytes": 2102,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 2293,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 2,
+            "ranges": 1,
+            "returned_bytes": 815,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:4035": 2,
+          "directory:0:1052": 2,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1
+        },
+        "logical_storage_calls": 16,
+        "get_attempts": 2,
+        "range_get_attempts": 6,
+        "head_attempts": 2,
+        "put_attempts": 6,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 13278,
+        "write_attempt_bytes": 2837,
+        "immutable_write_attempt_bytes": 2178
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 16,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 1367,
+        "bytes": 138800
+      },
+      "latency_p50_micros": 2436,
+      "latency_p99_micros": 2436
+    },
+    {
+      "phase": "commit",
+      "samples": 200,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 1681,
+            "returned_bytes": 5008226,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 1681,
+            "returned_bytes": 1763582,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 200,
+            "returned_bytes": 1150942,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 1468,
+            "returned_bytes": 2028262,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2883": 1468,
+          "data:0:3651": 213,
+          "directory:0:1050": 1468,
+          "directory:0:1051": 213,
+          "manifest:0:1048577": 200,
+          "transaction:0:1346": 187,
+          "transaction:0:1388": 1281
+        },
+        "logical_storage_calls": 6030,
+        "get_attempts": 0,
+        "range_get_attempts": 5030,
+        "head_attempts": 0,
+        "put_attempts": 1000,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 200,
+        "precondition_failures": 0,
+        "read_bytes": 9951012,
+        "write_attempt_bytes": 2417356,
+        "immutable_write_attempt_bytes": 2321556
+      },
+      "logical_payload_bytes": 6000,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 6030,
+        "denominator": 200
+      },
+      "read_amplification": {
+        "numerator": 9951012,
+        "denominator": 6000
+      },
+      "write_amplification": {
+        "numerator": 2417356,
+        "denominator": 6000
+      },
+      "allocations": {
+        "count": 815042,
+        "bytes": 103901635
+      },
+      "latency_p50_micros": 7825,
+      "latency_p99_micros": 14140
+    },
+    {
+      "phase": "contention_loser",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 9,
+            "returned_bytes": 26706,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 9,
+            "returned_bytes": 9442,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 6079,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 479,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 8,
+            "returned_bytes": 11054,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2883": 8,
+          "data:0:3651": 1,
+          "directory:0:1050": 8,
+          "directory:0:1051": 1,
+          "manifest:0:1048577": 1,
+          "other:0:65537": 1,
+          "transaction:0:1346": 1,
+          "transaction:0:1388": 7
+        },
+        "logical_storage_calls": 33,
+        "get_attempts": 0,
+        "range_get_attempts": 28,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 1,
+        "read_bytes": 53760,
+        "write_attempt_bytes": 12406,
+        "immutable_write_attempt_bytes": 11927
+      },
+      "logical_payload_bytes": 22,
+      "abandoned_immutable_bytes": 11927,
+      "discarded_candidates": 1,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 33,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 53760,
+        "denominator": 22
+      },
+      "write_amplification": {
+        "numerator": 12406,
+        "denominator": 22
+      },
+      "allocations": {
+        "count": 4320,
+        "bytes": 529478
+      },
+      "latency_p50_micros": 8797,
+      "latency_p99_micros": 8797
+    },
+    {
+      "phase": "contention_winner",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 9,
+            "returned_bytes": 26706,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 9,
+            "returned_bytes": 9442,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 6079,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 8,
+            "returned_bytes": 11054,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2883": 8,
+          "data:0:3651": 1,
+          "directory:0:1050": 8,
+          "directory:0:1051": 1,
+          "manifest:0:1048577": 1,
+          "transaction:0:1346": 1,
+          "transaction:0:1388": 7
+        },
+        "logical_storage_calls": 32,
+        "get_attempts": 0,
+        "range_get_attempts": 27,
+        "head_attempts": 0,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 53281,
+        "write_attempt_bytes": 12406,
+        "immutable_write_attempt_bytes": 11927
+      },
+      "logical_payload_bytes": 23,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 32,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 53281,
+        "denominator": 23
+      },
+      "write_amplification": {
+        "numerator": 12406,
+        "denominator": 23
+      },
+      "allocations": {
+        "count": 4301,
+        "bytes": 528621
+      },
+      "latency_p50_micros": 8912,
+      "latency_p99_micros": 8912
+    },
+    {
+      "phase": "expected_backpressure",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 31,
+            "returned_bytes": 53630,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 31,
+            "returned_bytes": 27364,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 18522,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 31,
+            "returned_bytes": 42738,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:1731": 31,
+          "directory:0:883": 9,
+          "directory:0:884": 22,
+          "manifest:0:1048577": 1,
+          "transaction:0:1235": 1,
+          "transaction:0:1383": 8,
+          "transaction:0:1385": 22
+        },
+        "logical_storage_calls": 94,
+        "get_attempts": 0,
+        "range_get_attempts": 94,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 142254,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 94,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 9352,
+        "bytes": 1116542
+      },
+      "latency_p50_micros": 17495,
+      "latency_p99_micros": 17495
+    },
+    {
+      "phase": "full_command_retry",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 11,
+            "returned_bytes": 32470,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 19,
+            "returned_bytes": 19912,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 2,
+            "returned_bytes": 13238,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 479,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 18,
+            "returned_bytes": 24882,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2882": 1,
+          "data:0:2883": 9,
+          "data:0:3651": 1,
+          "directory:0:1040": 2,
+          "directory:0:1050": 16,
+          "directory:0:1051": 1,
+          "manifest:0:1048577": 2,
+          "other:0:65537": 1,
+          "transaction:0:1346": 2,
+          "transaction:0:1388": 16
+        },
+        "logical_storage_calls": 57,
+        "get_attempts": 0,
+        "range_get_attempts": 51,
+        "head_attempts": 1,
+        "put_attempts": 5,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 1,
+        "precondition_failures": 0,
+        "read_bytes": 90981,
+        "write_attempt_bytes": 12946,
+        "immutable_write_attempt_bytes": 12467
+      },
+      "logical_payload_bytes": 24,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 57,
+        "denominator": 1
+      },
+      "read_amplification": {
+        "numerator": 90981,
+        "denominator": 24
+      },
+      "write_amplification": {
+        "numerator": 12946,
+        "denominator": 24
+      },
+      "allocations": {
+        "count": 6227,
+        "bytes": 720495
+      },
+      "latency_p50_micros": 12499,
+      "latency_p99_micros": 12499
+    },
+    {
+      "phase": "gc",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 3257,
+            "returned_bytes": 19855306,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 32,
+            "ranges": 15,
+            "returned_bytes": 21674,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 25894,
+            "returned_bytes": 35761518,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "manifest:0:1048577": 3257,
+          "other:0:1048577": 7,
+          "other:0:65537": 8,
+          "transaction:0:1236": 112,
+          "transaction:0:1344": 672,
+          "transaction:0:1346": 2262,
+          "transaction:0:1384": 644,
+          "transaction:0:1386": 4599,
+          "transaction:0:1387": 90,
+          "transaction:0:1388": 17515
+        },
+        "logical_storage_calls": 29328,
+        "get_attempts": 32,
+        "range_get_attempts": 29166,
+        "head_attempts": 34,
+        "put_attempts": 49,
+        "list_attempts": 0,
+        "list_page_attempts": 46,
+        "delete_attempts": 1,
+        "head_cas_attempts": 1,
+        "precondition_failures": 8,
+        "read_bytes": 55638498,
+        "write_attempt_bytes": 10373,
+        "immutable_write_attempt_bytes": 1448
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 29328,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 2869791,
+        "bytes": 422886473
+      },
+      "latency_p50_micros": 5653772,
+      "latency_p99_micros": 5653772
+    },
+    {
+      "phase": "maintenance",
+      "samples": 29,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 492,
+            "returned_bytes": 1433688,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 492,
+            "returned_bytes": 515177,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 29,
+            "returned_bytes": 316719,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 29,
+            "returned_bytes": 13885,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 464,
+            "returned_bytes": 642023,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:1731": 5,
+          "data:0:2883": 459,
+          "data:0:3651": 28,
+          "directory:0:1040": 2,
+          "directory:0:1048": 9,
+          "directory:0:1049": 90,
+          "directory:0:1050": 364,
+          "directory:0:1051": 22,
+          "directory:0:885": 5,
+          "manifest:0:1048577": 29,
+          "other:0:65537": 29,
+          "transaction:0:1236": 1,
+          "transaction:0:1344": 6,
+          "transaction:0:1346": 22,
+          "transaction:0:1384": 8,
+          "transaction:0:1386": 84,
+          "transaction:0:1387": 5,
+          "transaction:0:1388": 338
+        },
+        "logical_storage_calls": 1651,
+        "get_attempts": 0,
+        "range_get_attempts": 1506,
+        "head_attempts": 29,
+        "put_attempts": 116,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 29,
+        "precondition_failures": 0,
+        "read_bytes": 2921492,
+        "write_attempt_bytes": 215866,
+        "immutable_write_attempt_bytes": 203199
+      },
+      "logical_payload_bytes": 13864,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 1651,
+        "denominator": 29
+      },
+      "read_amplification": {
+        "numerator": 2921492,
+        "denominator": 13864
+      },
+      "write_amplification": {
+        "numerator": 215866,
+        "denominator": 13864
+      },
+      "allocations": {
+        "count": 209081,
+        "bytes": 25015348
+      },
+      "latency_p50_micros": 14106,
+      "latency_p99_micros": 14426
+    },
+    {
+      "phase": "maintenance_fill_commit",
+      "samples": 5,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 70,
+            "returned_bytes": 194060,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 70,
+            "returned_bytes": 71685,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 5,
+            "returned_bytes": 43895,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 65,
+            "returned_bytes": 89935,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:1731": 10,
+          "data:0:2883": 55,
+          "data:0:3651": 5,
+          "directory:0:1040": 10,
+          "directory:0:1050": 45,
+          "directory:0:1051": 5,
+          "directory:0:885": 10,
+          "manifest:0:1048577": 5,
+          "transaction:0:1346": 5,
+          "transaction:0:1387": 10,
+          "transaction:0:1388": 50
+        },
+        "logical_storage_calls": 235,
+        "get_attempts": 0,
+        "range_get_attempts": 210,
+        "head_attempts": 0,
+        "put_attempts": 25,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 5,
+        "precondition_failures": 0,
+        "read_bytes": 399575,
+        "write_attempt_bytes": 69534,
+        "immutable_write_attempt_bytes": 67139
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 235,
+        "denominator": 5
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 29990,
+        "bytes": 3665339
+      },
+      "latency_p50_micros": 11934,
+      "latency_p99_micros": 13540
+    },
+    {
+      "phase": "point_read",
+      "samples": 3200,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 4800,
+            "returned_bytes": 16291200,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 28800,
+            "returned_bytes": 30214400,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 3200,
+            "returned_bytes": 19452800,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 3200,
+            "returned_bytes": 1532800,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 25600,
+            "returned_bytes": 35372800,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2882": 1600,
+          "data:0:3650": 3200,
+          "directory:0:1050": 25600,
+          "directory:0:1051": 3200,
+          "manifest:0:1048577": 3200,
+          "other:0:65537": 3200,
+          "transaction:0:1346": 3200,
+          "transaction:0:1388": 22400
+        },
+        "logical_storage_calls": 68800,
+        "get_attempts": 0,
+        "range_get_attempts": 65600,
+        "head_attempts": 3200,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 102864000,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 38400,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 68800,
+        "denominator": 3200
+      },
+      "read_amplification": {
+        "numerator": 102864000,
+        "denominator": 38400
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 38400
+      },
+      "allocations": {
+        "count": 4979200,
+        "bytes": 484681600
+      },
+      "latency_p50_micros": 2906,
+      "latency_p99_micros": 3233
+    },
+    {
+      "phase": "recovery",
+      "samples": 1,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 4,
+            "returned_bytes": 16136,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 4,
+            "returned_bytes": 4204,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 5,
+            "returned_bytes": 11465,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 2,
+            "returned_bytes": 874,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:4034": 4,
+          "directory:0:1052": 4,
+          "manifest:0:1048577": 5,
+          "other:0:65537": 2
+        },
+        "logical_storage_calls": 17,
+        "get_attempts": 0,
+        "range_get_attempts": 15,
+        "head_attempts": 2,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 32679,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 0,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 17,
+        "denominator": 1
+      },
+      "read_amplification": null,
+      "write_amplification": null,
+      "allocations": {
+        "count": 1753,
+        "bytes": 205918
+      },
+      "latency_p50_micros": 2623,
+      "latency_p99_micros": 2623
+    },
+    {
+      "phase": "retained_validation",
+      "samples": 912,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 16148,
+            "returned_bytes": 49241896,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 33892,
+            "returned_bytes": 35548424,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 912,
+            "returned_bytes": 5765268,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 30372,
+            "returned_bytes": 41953988,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2882": 12628,
+          "data:0:3650": 3520,
+          "directory:0:1048": 528,
+          "directory:0:1049": 5980,
+          "directory:0:1050": 24632,
+          "directory:0:1051": 2752,
+          "manifest:0:1048577": 912,
+          "transaction:0:1236": 68,
+          "transaction:0:1344": 768,
+          "transaction:0:1346": 2752,
+          "transaction:0:1384": 460,
+          "transaction:0:1386": 5212,
+          "transaction:0:1388": 21112
+        },
+        "logical_storage_calls": 81324,
+        "get_attempts": 0,
+        "range_get_attempts": 81324,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 132509576,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 427040,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 81324,
+        "denominator": 912
+      },
+      "read_amplification": {
+        "numerator": 132509576,
+        "denominator": 427040
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 427040
+      },
+      "allocations": {
+        "count": 6649910,
+        "bytes": 717580076
+      },
+      "latency_p50_micros": 11275,
+      "latency_p99_micros": 23274
+    },
+    {
+      "phase": "scan",
+      "samples": 200,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 3000,
+            "returned_bytes": 9260400,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 7200,
+            "returned_bytes": 7553600,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 800,
+            "returned_bytes": 4863200,
+            "failures": 0
+          },
+          "other": {
+            "full_reads": 0,
+            "ranges": 200,
+            "returned_bytes": 95800,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 6400,
+            "returned_bytes": 8843200,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2882": 2200,
+          "data:0:3650": 800,
+          "directory:0:1050": 6400,
+          "directory:0:1051": 800,
+          "manifest:0:1048577": 800,
+          "other:0:65537": 200,
+          "transaction:0:1346": 800,
+          "transaction:0:1388": 5600
+        },
+        "logical_storage_calls": 17800,
+        "get_attempts": 0,
+        "range_get_attempts": 17600,
+        "head_attempts": 200,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 30616200,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 96000,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 17800,
+        "denominator": 200
+      },
+      "read_amplification": {
+        "numerator": 30616200,
+        "denominator": 96000
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 96000
+      },
+      "allocations": {
+        "count": 1472400,
+        "bytes": 168437600
+      },
+      "latency_p50_micros": 13123,
+      "latency_p99_micros": 13726
+    },
+    {
+      "phase": "setup_commit",
+      "samples": 256,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {
+          "data": {
+            "full_reads": 0,
+            "ranges": 2175,
+            "returned_bytes": 6464190,
+            "failures": 0
+          },
+          "directory": {
+            "full_reads": 0,
+            "ranges": 2175,
+            "returned_bytes": 2280867,
+            "failures": 0
+          },
+          "manifest": {
+            "full_reads": 0,
+            "ranges": 255,
+            "returned_bytes": 1484064,
+            "failures": 0
+          },
+          "transaction": {
+            "full_reads": 0,
+            "ranges": 1920,
+            "returned_bytes": 2649648,
+            "failures": 0
+          }
+        },
+        "requested_ranges": {
+          "data:0:2883": 1920,
+          "data:0:3651": 255,
+          "directory:0:1048": 99,
+          "directory:0:1049": 663,
+          "directory:0:1050": 1260,
+          "directory:0:1051": 153,
+          "manifest:0:1048577": 255,
+          "transaction:0:1236": 15,
+          "transaction:0:1344": 90,
+          "transaction:0:1346": 135,
+          "transaction:0:1384": 84,
+          "transaction:0:1386": 573,
+          "transaction:0:1388": 1023
+        },
+        "logical_storage_calls": 7805,
+        "get_attempts": 0,
+        "range_get_attempts": 6525,
+        "head_attempts": 0,
+        "put_attempts": 1280,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 256,
+        "precondition_failures": 0,
+        "read_bytes": 12878769,
+        "write_attempt_bytes": 3106954,
+        "immutable_write_attempt_bytes": 2984438
+      },
+      "logical_payload_bytes": 7570,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 7805,
+        "denominator": 256
+      },
+      "read_amplification": {
+        "numerator": 12878769,
+        "denominator": 7570
+      },
+      "write_amplification": {
+        "numerator": 3106954,
+        "denominator": 7570
+      },
+      "allocations": {
+        "count": 1050669,
+        "bytes": 133638020
+      },
+      "latency_p50_micros": 7955,
+      "latency_p99_micros": 14246
+    },
+    {
+      "phase": "stage_write",
+      "samples": 456,
+      "backend": {
+        "phases": {},
+        "replayed_rows": 0,
+        "full_checksum_calls": 0,
+        "full_checksum_bytes": 0,
+        "digest_validation_hash_calls": 0,
+        "digest_validation_hash_bytes": 0,
+        "witness_hash_calls": 0,
+        "witness_hash_bytes": 0,
+        "sha256_helper_calls": 0,
+        "sha256_helper_bytes": 0,
+        "canonical_root_hash_calls": 0,
+        "canonical_root_hash_bytes": 0,
+        "rendered_state_validation_calls": 0,
+        "rendered_state_validation_bytes": 0,
+        "rendered_transaction_validation_calls": 0,
+        "rendered_transaction_validation_bytes": 0,
+        "object_reads": {},
+        "requested_ranges": {},
+        "logical_storage_calls": 0,
+        "get_attempts": 0,
+        "range_get_attempts": 0,
+        "head_attempts": 0,
+        "put_attempts": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "delete_attempts": 0,
+        "head_cas_attempts": 0,
+        "precondition_failures": 0,
+        "read_bytes": 0,
+        "write_attempt_bytes": 0,
+        "immutable_write_attempt_bytes": 0
+      },
+      "logical_payload_bytes": 13570,
+      "abandoned_immutable_bytes": 0,
+      "discarded_candidates": 0,
+      "reused_candidates": 0,
+      "requests_per_operation": {
+        "numerator": 0,
+        "denominator": 456
+      },
+      "read_amplification": {
+        "numerator": 0,
+        "denominator": 13570
+      },
+      "write_amplification": {
+        "numerator": 0,
+        "denominator": 13570
+      },
+      "allocations": {
+        "count": 912,
+        "bytes": 296400
+      },
+      "latency_p50_micros": 2,
+      "latency_p99_micros": 3
+    }
+  ],
+  "validated_historical_tokens": 456,
+  "expected_backpressure_observed": true
+}

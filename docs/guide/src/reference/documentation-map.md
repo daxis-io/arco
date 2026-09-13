@@ -19,6 +19,8 @@ source of truth quickly.
   - `docs/guide/src/concepts/orchestration.md`
 - Control-plane scope scorecard:
   - `docs/guide/src/reference/control-plane-scope.md`
+- Canonical first-metastore authority and hard-cut boundary:
+  - `docs/guide/src/reference/catalog-authority-hard-cut.md`
 - Production target architecture:
   - `docs/guide/src/reference/object-native-catalog-architecture.md`
 - Metastore and workspace scope architecture:

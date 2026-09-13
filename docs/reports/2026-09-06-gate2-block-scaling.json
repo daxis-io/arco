@@ -1,0 +1,5235 @@
+{
+  "allocation_bound": "pinned point cumulative allocations <= 12 * returned metadata and selected data bytes + 128 KiB; eager begin measured separately",
+  "authentication": "thread-local SHA-256 helper input bytes/calls; excludes Bloom probe hashing",
+  "backend": "MemoryBackend API calls, not provider traffic",
+  "exceptional_cases": [
+    {
+      "blocks": 2,
+      "case": "oversized_row",
+      "commit": {
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 0,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 317362,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 5,
+        "object_reads": {},
+        "precondition_failures": 0,
+        "put_attempts": 5,
+        "range_get_attempts": 0,
+        "read_bytes": 0,
+        "requested_ranges": {},
+        "sha256_helper_bytes": 1557880,
+        "sha256_helper_calls": 9,
+        "write_attempt_bytes": 317827
+      },
+      "commit_allocations": {
+        "bytes": 6581949,
+        "count": 498
+      },
+      "directory_bytes": 1520,
+      "point": {
+        "delete_attempts": 0,
+        "get_attempts": 1,
+        "head_attempts": 0,
+        "head_cas_attempts": 0,
+        "immutable_write_attempt_bytes": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 3,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 310018
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 1520
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 1,
+            "ranges": 0,
+            "returned_bytes": 960
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 0,
+        "range_get_attempts": 2,
+        "read_bytes": 312498,
+        "requested_ranges": {
+          "data:0:310018": 1,
+          "directory:0:1521": 1
+        },
+        "sha256_helper_bytes": 623327,
+        "sha256_helper_calls": 5,
+        "write_attempt_bytes": 0
+      },
+      "point_allocations": {
+        "bytes": 1253109,
+        "count": 253
+      }
+    },
+    {
+      "blocks": 164,
+      "case": "disabled_filter",
+      "commit": {
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 0,
+        "head_cas_attempts": 1,
+        "immutable_write_attempt_bytes": 8208979,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 5,
+        "object_reads": {},
+        "precondition_failures": 0,
+        "put_attempts": 5,
+        "range_get_attempts": 0,
+        "read_bytes": 0,
+        "requested_ranges": {},
+        "sha256_helper_bytes": 30410299,
+        "sha256_helper_calls": 171,
+        "write_attempt_bytes": 8209444
+      },
+      "commit_allocations": {
+        "bytes": 176378411,
+        "count": 359486
+      },
+      "directory_bytes": 58507,
+      "point": {
+        "delete_attempts": 0,
+        "get_attempts": 1,
+        "head_attempts": 0,
+        "head_cas_attempts": 0,
+        "immutable_write_attempt_bytes": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 3,
+        "object_reads": {
+          "data": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 49730
+          },
+          "directory": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 1,
+            "returned_bytes": 58507
+          },
+          "transaction": {
+            "failures": 0,
+            "full_reads": 1,
+            "ranges": 0,
+            "returned_bytes": 962
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 0,
+        "range_get_attempts": 2,
+        "read_bytes": 109199,
+        "requested_ranges": {
+          "data:0:49730": 1,
+          "directory:0:58508": 1
+        },
+        "sha256_helper_bytes": 159742,
+        "sha256_helper_calls": 5,
+        "write_attempt_bytes": 0
+      },
+      "point_allocations": {
+        "bytes": 280143,
+        "count": 2362
+      }
+    },
+    {
+      "allocations": {
+        "bytes": 28090,
+        "count": 175
+      },
+      "case": "projection_source_resolution",
+      "manifests": 3,
+      "reads": {
+        "delete_attempts": 0,
+        "get_attempts": 0,
+        "head_attempts": 0,
+        "head_cas_attempts": 0,
+        "immutable_write_attempt_bytes": 0,
+        "list_attempts": 0,
+        "list_page_attempts": 0,
+        "logical_storage_calls": 3,
+        "object_reads": {
+          "manifest": {
+            "failures": 0,
+            "full_reads": 0,
+            "ranges": 3,
+            "returned_bytes": 4251
+          }
+        },
+        "precondition_failures": 0,
+        "put_attempts": 0,
+        "range_get_attempts": 3,
+        "read_bytes": 4251,
+        "requested_ranges": {
+          "manifest:0:1048577": 3
+        },
+        "sha256_helper_bytes": 9591,
+        "sha256_helper_calls": 10,
+        "write_attempt_bytes": 0
+      }
+    }
+  ],
+  "samples": [
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 264091,
+          "count": 2279
+        },
+        "eager_begin": {
+          "bytes": 52402540,
+          "count": 40652
+        },
+        "pinned_point": {
+          "bytes": 255767,
+          "count": 2205
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 158,
+      "encoded_data_bytes": 4901436,
+      "index_bytes": 66028,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 66028
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 66028,
+          "requested_ranges": {
+            "directory:0:66029": 1
+          },
+          "sha256_helper_bytes": 66028,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 230,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 193,
+              "returned_bytes": 5990146
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 37,
+              "returned_bytes": 2443036
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 230,
+          "read_bytes": 8433182,
+          "requested_ranges": {
+            "data:0:31106": 1,
+            "data:1026498:1057604": 1,
+            "data:1057604:1088710": 2,
+            "data:1088710:1119816": 1,
+            "data:1119816:1150922": 1,
+            "data:1150922:1182028": 1,
+            "data:1182028:1213134": 1,
+            "data:1213134:1244240": 2,
+            "data:1244240:1275346": 1,
+            "data:124424:155530": 2,
+            "data:1275346:1306452": 1,
+            "data:1306452:1337558": 1,
+            "data:1337558:1368664": 2,
+            "data:1368664:1399770": 1,
+            "data:1399770:1430876": 1,
+            "data:1430876:1461982": 1,
+            "data:1461982:1493088": 2,
+            "data:1493088:1524194": 1,
+            "data:1524194:1555300": 1,
+            "data:1555300:1586406": 1,
+            "data:155530:186636": 1,
+            "data:1586406:1617512": 1,
+            "data:1617512:1648618": 2,
+            "data:1648618:1679724": 1,
+            "data:1679724:1710830": 1,
+            "data:1710830:1741936": 1,
+            "data:1741936:1773042": 2,
+            "data:1773042:1804148": 1,
+            "data:1804148:1835254": 1,
+            "data:1835254:1866360": 1,
+            "data:1866360:1897466": 2,
+            "data:186636:217742": 1,
+            "data:1897466:1928572": 1,
+            "data:1928572:1959678": 1,
+            "data:1959678:1990784": 1,
+            "data:1990784:2021890": 1,
+            "data:2021890:2052996": 2,
+            "data:2052996:2084102": 1,
+            "data:2084102:2115208": 1,
+            "data:2115208:2146314": 1,
+            "data:2146314:2177420": 2,
+            "data:2177420:2208526": 1,
+            "data:217742:248848": 1,
+            "data:2208526:2239632": 1,
+            "data:2239632:2270738": 1,
+            "data:2270738:2301844": 2,
+            "data:2301844:2332950": 1,
+            "data:2332950:2364056": 1,
+            "data:2364056:2395162": 1,
+            "data:2395162:2426268": 1,
+            "data:2426268:2457374": 2,
+            "data:2457374:2488480": 1,
+            "data:2488480:2519586": 1,
+            "data:248848:279954": 2,
+            "data:2519586:2550692": 1,
+            "data:2550692:2581798": 2,
+            "data:2581798:2612904": 1,
+            "data:2612904:2644010": 1,
+            "data:2644010:2675116": 1,
+            "data:2675116:2706222": 2,
+            "data:2706222:2737328": 1,
+            "data:2737328:2768434": 1,
+            "data:2768434:2799540": 1,
+            "data:2799540:2830646": 1,
+            "data:279954:311060": 1,
+            "data:2830646:2861752": 2,
+            "data:2861752:2892858": 1,
+            "data:2892858:2923964": 1,
+            "data:2923964:2955070": 1,
+            "data:2955070:2986176": 2,
+            "data:2986176:3017282": 1,
+            "data:3017282:3048388": 1,
+            "data:3048388:3079494": 1,
+            "data:3079494:3110600": 2,
+            "data:3110600:3141706": 1,
+            "data:311060:342166": 1,
+            "data:31106:62212": 1,
+            "data:3141706:3172812": 1,
+            "data:3172812:3203918": 1,
+            "data:3203918:3235024": 1,
+            "data:3235024:3266130": 2,
+            "data:3266130:3297236": 1,
+            "data:3297236:3328342": 1,
+            "data:3328342:3359448": 1,
+            "data:3359448:3390554": 2,
+            "data:3390554:3421660": 1,
+            "data:3421660:3452766": 1,
+            "data:342166:373272": 1,
+            "data:3452766:3483872": 1,
+            "data:3483872:3514978": 1,
+            "data:3514978:3546084": 1,
+            "data:3546084:3577190": 1,
+            "data:3577190:3608296": 1,
+            "data:3608296:3639402": 1,
+            "data:3639402:3670508": 2,
+            "data:3670508:3701614": 1,
+            "data:3701614:3732720": 1,
+            "data:3732720:3763826": 1,
+            "data:373272:404378": 1,
+            "data:3763826:3794932": 2,
+            "data:3794932:3826038": 1,
+            "data:3826038:3857144": 1,
+            "data:3857144:3888250": 1,
+            "data:3888250:3919356": 1,
+            "data:3919356:3950462": 2,
+            "data:3950462:3981568": 1,
+            "data:3981568:4012674": 1,
+            "data:4012674:4043780": 1,
+            "data:4043780:4074886": 2,
+            "data:404378:435484": 2,
+            "data:4074886:4105992": 1,
+            "data:4105992:4137098": 1,
+            "data:4137098:4168204": 1,
+            "data:4168204:4199310": 2,
+            "data:4199310:4230416": 1,
+            "data:4230416:4261522": 1,
+            "data:4261522:4292628": 1,
+            "data:4292628:4323734": 1,
+            "data:4323734:4354840": 2,
+            "data:4354840:4385946": 1,
+            "data:435484:466590": 1,
+            "data:4385946:4417052": 1,
+            "data:4417052:4448158": 1,
+            "data:4448158:4479264": 2,
+            "data:4479264:4510370": 1,
+            "data:4510370:4541476": 1,
+            "data:4541476:4572582": 1,
+            "data:4572582:4603688": 2,
+            "data:4603688:4634794": 1,
+            "data:4634794:4665900": 1,
+            "data:4665900:4697006": 1,
+            "data:466590:497696": 1,
+            "data:4697006:4728112": 1,
+            "data:4728112:4759218": 2,
+            "data:4759218:4790324": 1,
+            "data:4790324:4821430": 1,
+            "data:4821430:4852536": 1,
+            "data:4852536:4883642": 2,
+            "data:4883642:4901436": 1,
+            "data:497696:528802": 1,
+            "data:528802:559908": 2,
+            "data:559908:591014": 1,
+            "data:591014:622120": 1,
+            "data:622120:653226": 1,
+            "data:62212:93318": 1,
+            "data:653226:684332": 2,
+            "data:684332:715438": 1,
+            "data:715438:746544": 1,
+            "data:746544:777650": 1,
+            "data:777650:808756": 1,
+            "data:808756:839862": 2,
+            "data:839862:870968": 1,
+            "data:870968:902074": 1,
+            "data:902074:933180": 1,
+            "data:933180:964286": 2,
+            "data:93318:124424": 1,
+            "data:964286:995392": 1,
+            "data:995392:1026498": 1,
+            "directory:0:66029": 37
+          },
+          "sha256_helper_bytes": 14423328,
+          "sha256_helper_calls": 423,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31106
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 66028
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 99029,
+          "requested_ranges": {
+            "data:2426268:2457374": 1,
+            "directory:0:66029": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 131027,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4901436
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 66028
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4969359,
+          "requested_ranges": {
+            "data:0:4901437": 1,
+            "directory:0:66029": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 32860124,
+          "sha256_helper_calls": 324,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31106
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 66028
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 97134,
+          "requested_ranges": {
+            "data:2426268:2457374": 1,
+            "directory:0:66029": 1
+          },
+          "sha256_helper_bytes": 128240,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 32768
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 259779,
+          "count": 1341
+        },
+        "eager_begin": {
+          "bytes": 51124476,
+          "count": 28443
+        },
+        "pinned_point": {
+          "bytes": 251455,
+          "count": 1267
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 75,
+      "encoded_data_bytes": 4677270,
+      "index_bytes": 37143,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 37143,
+          "requested_ranges": {
+            "directory:0:37144": 1
+          },
+          "sha256_helper_bytes": 37143,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 148,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 111,
+              "returned_bytes": 6937566
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 37,
+              "returned_bytes": 1374291
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 148,
+          "read_bytes": 8311857,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:1004576:1067362": 2,
+            "data:1067362:1130148": 1,
+            "data:1130148:1192934": 2,
+            "data:1192934:1255720": 1,
+            "data:1255720:1318506": 2,
+            "data:125572:188358": 2,
+            "data:1318506:1381292": 1,
+            "data:1381292:1444078": 2,
+            "data:1444078:1506864": 1,
+            "data:1506864:1569650": 2,
+            "data:1569650:1632436": 1,
+            "data:1632436:1695222": 2,
+            "data:1695222:1758008": 1,
+            "data:1758008:1820794": 2,
+            "data:1820794:1883580": 1,
+            "data:1883580:1946366": 2,
+            "data:188358:251144": 1,
+            "data:1946366:2009152": 1,
+            "data:2009152:2071938": 2,
+            "data:2071938:2134724": 1,
+            "data:2134724:2197510": 2,
+            "data:2197510:2260296": 1,
+            "data:2260296:2323082": 2,
+            "data:2323082:2385868": 1,
+            "data:2385868:2448654": 1,
+            "data:2448654:2511440": 2,
+            "data:2511440:2574226": 1,
+            "data:251144:313930": 2,
+            "data:2574226:2637012": 2,
+            "data:2637012:2699798": 1,
+            "data:2699798:2762584": 2,
+            "data:2762584:2825370": 1,
+            "data:2825370:2888156": 2,
+            "data:2888156:2950942": 1,
+            "data:2950942:3013728": 2,
+            "data:3013728:3076514": 1,
+            "data:3076514:3139300": 2,
+            "data:3139300:3202086": 1,
+            "data:313930:376716": 1,
+            "data:3202086:3264872": 2,
+            "data:3264872:3327658": 1,
+            "data:3327658:3390444": 2,
+            "data:3390444:3453230": 1,
+            "data:3453230:3516016": 2,
+            "data:3516016:3578802": 1,
+            "data:3578802:3641588": 2,
+            "data:3641588:3704374": 1,
+            "data:3704374:3767160": 2,
+            "data:3767160:3829946": 1,
+            "data:376716:439502": 2,
+            "data:3829946:3892732": 2,
+            "data:3892732:3955518": 1,
+            "data:3955518:4018304": 2,
+            "data:4018304:4081090": 1,
+            "data:4081090:4143876": 2,
+            "data:4143876:4206662": 1,
+            "data:4206662:4269448": 2,
+            "data:4269448:4332234": 1,
+            "data:4332234:4395020": 2,
+            "data:4395020:4457806": 1,
+            "data:439502:502288": 1,
+            "data:4457806:4520592": 2,
+            "data:4520592:4583378": 1,
+            "data:4583378:4646164": 2,
+            "data:4646164:4677270": 1,
+            "data:502288:565074": 2,
+            "data:565074:627860": 1,
+            "data:627860:690646": 2,
+            "data:62786:125572": 1,
+            "data:690646:753432": 1,
+            "data:753432:816218": 2,
+            "data:816218:879004": 1,
+            "data:879004:941790": 2,
+            "data:941790:1004576": 1,
+            "directory:0:37144": 37
+          },
+          "sha256_helper_bytes": 15249423,
+          "sha256_helper_calls": 259,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 101824,
+          "requested_ranges": {
+            "data:2323082:2385868": 1,
+            "directory:0:37144": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 165502,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4677270
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4716308,
+          "requested_ranges": {
+            "data:0:4677271": 1,
+            "directory:0:37144": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 31905690,
+          "sha256_helper_calls": 158,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 99929,
+          "requested_ranges": {
+            "data:2323082:2385868": 1,
+            "directory:0:37144": 1
+          },
+          "sha256_helper_bytes": 162715,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 358779,
+          "count": 985
+        },
+        "eager_begin": {
+          "bytes": 50547468,
+          "count": 22702
+        },
+        "pinned_point": {
+          "bytes": 350455,
+          "count": 911
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 36,
+      "encoded_data_bytes": 4587720,
+      "index_bytes": 23644,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 23644
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 23644,
+          "requested_ranges": {
+            "directory:0:23645": 1
+          },
+          "sha256_helper_bytes": 23644,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 109,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 72,
+              "returned_bytes": 9175440
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 37,
+              "returned_bytes": 874828
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 109,
+          "read_bytes": 10050268,
+          "requested_ranges": {
+            "data:0:127682": 2,
+            "data:1021456:1149138": 2,
+            "data:1149138:1276820": 2,
+            "data:1276820:1404502": 2,
+            "data:127682:255364": 2,
+            "data:1404502:1532184": 2,
+            "data:1532184:1659866": 2,
+            "data:1659866:1787548": 2,
+            "data:1787548:1915230": 2,
+            "data:1915230:2042912": 2,
+            "data:2042912:2170594": 2,
+            "data:2170594:2298276": 2,
+            "data:2298276:2425958": 2,
+            "data:2425958:2553640": 2,
+            "data:2553640:2681322": 2,
+            "data:255364:383046": 2,
+            "data:2681322:2809004": 2,
+            "data:2809004:2936686": 2,
+            "data:2936686:3064368": 2,
+            "data:3064368:3192050": 2,
+            "data:3192050:3319732": 2,
+            "data:3319732:3447414": 2,
+            "data:3447414:3575096": 2,
+            "data:3575096:3702778": 2,
+            "data:3702778:3830460": 2,
+            "data:3830460:3958142": 2,
+            "data:383046:510728": 2,
+            "data:3958142:4085824": 2,
+            "data:4085824:4213506": 2,
+            "data:4213506:4341188": 2,
+            "data:4341188:4468870": 2,
+            "data:4468870:4587720": 2,
+            "data:510728:638410": 2,
+            "data:638410:766092": 2,
+            "data:766092:893774": 2,
+            "data:893774:1021456": 2,
+            "directory:0:23645": 37
+          },
+          "sha256_helper_bytes": 19225708,
+          "sha256_helper_calls": 181,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 127682
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 23644
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 153221,
+          "requested_ranges": {
+            "data:2170594:2298276": 1,
+            "directory:0:23645": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 281795,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4587720
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 23644
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4613259,
+          "requested_ranges": {
+            "data:0:4587721": 1,
+            "directory:0:23645": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 31520492,
+          "sha256_helper_calls": 80,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 127682
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 23644
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 151326,
+          "requested_ranges": {
+            "data:2170594:2298276": 1,
+            "directory:0:23645": 1
+          },
+          "sha256_helper_bytes": 279008,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 131072
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 605403,
+          "count": 1000
+        },
+        "eager_begin": {
+          "bytes": 50258252,
+          "count": 20048
+        },
+        "pinned_point": {
+          "bytes": 597079,
+          "count": 926
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 18,
+      "encoded_data_bytes": 4537892,
+      "index_bytes": 17342,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 17342
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 17342,
+          "requested_ranges": {
+            "directory:0:17343": 1
+          },
+          "sha256_helper_bytes": 17342,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 91,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 54,
+              "returned_bytes": 13613676
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 37,
+              "returned_bytes": 641654
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 91,
+          "read_bytes": 14255330,
+          "requested_ranges": {
+            "data:0:255874": 3,
+            "data:1023496:1279370": 3,
+            "data:1279370:1535244": 3,
+            "data:1535244:1791118": 3,
+            "data:1791118:2046992": 3,
+            "data:2046992:2302866": 3,
+            "data:2302866:2558740": 3,
+            "data:2558740:2814614": 3,
+            "data:255874:511748": 3,
+            "data:2814614:3070488": 3,
+            "data:3070488:3326362": 3,
+            "data:3326362:3582236": 3,
+            "data:3582236:3838110": 3,
+            "data:3838110:4093984": 3,
+            "data:4093984:4349858": 3,
+            "data:4349858:4537892": 3,
+            "data:511748:767622": 3,
+            "data:767622:1023496": 3,
+            "directory:0:17343": 37
+          },
+          "sha256_helper_bytes": 27869006,
+          "sha256_helper_calls": 145,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 255874
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 17342
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 275111,
+          "requested_ranges": {
+            "data:2046992:2302866": 1,
+            "directory:0:17343": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 531877,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4537892
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 17342
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4557129,
+          "requested_ranges": {
+            "data:0:4537893": 1,
+            "directory:0:17343": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 31308576,
+          "sha256_helper_calls": 44,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 255874
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 17342
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 273216,
+          "requested_ranges": {
+            "data:2046992:2302866": 1,
+            "directory:0:17343": 1
+          },
+          "sha256_helper_bytes": 529090,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 262144
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 152461,
+          "count": 425
+        },
+        "eager_begin": {
+          "bytes": 764423,
+          "count": 651
+        },
+        "pinned_point": {
+          "bytes": 144137,
+          "count": 351
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 1,
+      "encoded_data_bytes": 62786,
+      "index_bytes": 1277,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1277
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1277,
+          "requested_ranges": {
+            "directory:0:1278": 1
+          },
+          "sha256_helper_bytes": 1277,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1277
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 64063,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:1278": 1
+          },
+          "sha256_helper_bytes": 126849,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1277
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1468
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 65955,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:1278": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 129630,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1277
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1468
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 65955,
+          "requested_ranges": {
+            "data:0:62787": 1,
+            "directory:0:1278": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 432693,
+          "sha256_helper_calls": 10,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1277
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 64063,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:1278": 1
+          },
+          "sha256_helper_bytes": 126849,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1468
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1468,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2781,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 1,
+      "rows": 55,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 155601,
+          "count": 469
+        },
+        "eager_begin": {
+          "bytes": 3022249,
+          "count": 1793
+        },
+        "pinned_point": {
+          "bytes": 147277,
+          "count": 395
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 4,
+      "encoded_data_bytes": 251144,
+      "index_bytes": 2724,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 2724
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 2724,
+          "requested_ranges": {
+            "directory:0:2725": 1
+          },
+          "sha256_helper_bytes": 2724,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 7,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 5,
+              "returned_bytes": 313930
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 5448
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 7,
+          "read_bytes": 319378,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:62786:125572": 1,
+            "directory:0:2725": 2
+          },
+          "sha256_helper_bytes": 633308,
+          "sha256_helper_calls": 12,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 2724
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 67403,
+          "requested_ranges": {
+            "data:125572:188358": 1,
+            "directory:0:2725": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 131079,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 251144
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 2724
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 255761,
+          "requested_ranges": {
+            "data:0:251145": 1,
+            "directory:0:2725": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 1717516,
+          "sha256_helper_calls": 16,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 2724
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 65510,
+          "requested_ranges": {
+            "data:125572:188358": 1,
+            "directory:0:2725": 1
+          },
+          "sha256_helper_bytes": 128296,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1469,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2783,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 2,
+      "rows": 220,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 171459,
+          "count": 623
+        },
+        "eager_begin": {
+          "bytes": 12063472,
+          "count": 6336
+        },
+        "pinned_point": {
+          "bytes": 163135,
+          "count": 549
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 16,
+      "encoded_data_bytes": 1004576,
+      "index_bytes": 8515,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 8515
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 8515,
+          "requested_ranges": {
+            "directory:0:8516": 1
+          },
+          "sha256_helper_bytes": 8515,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 31,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 23,
+              "returned_bytes": 1444078
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 8,
+              "returned_bytes": 68120
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 31,
+          "read_bytes": 1512198,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:313930": 2,
+            "data:313930:376716": 1,
+            "data:376716:439502": 2,
+            "data:439502:502288": 1,
+            "data:502288:565074": 2,
+            "data:565074:627860": 1,
+            "data:627860:690646": 2,
+            "data:62786:125572": 1,
+            "data:690646:753432": 1,
+            "data:753432:816218": 2,
+            "data:816218:879004": 1,
+            "data:879004:941790": 2,
+            "data:941790:1004576": 1,
+            "directory:0:8516": 8
+          },
+          "sha256_helper_bytes": 2956276,
+          "sha256_helper_calls": 54,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 8515
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1470
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 73195,
+          "requested_ranges": {
+            "data:502288:565074": 1,
+            "directory:0:8516": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 136872,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1004576
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 8515
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1470
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 1014985,
+          "requested_ranges": {
+            "data:0:1004577": 1,
+            "directory:0:8516": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 6856808,
+          "sha256_helper_calls": 40,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 8515
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 71301,
+          "requested_ranges": {
+            "data:502288:565074": 1,
+            "directory:0:8516": 1
+          },
+          "sha256_helper_bytes": 134087,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1470
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1470,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2785,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 8,
+      "rows": 880,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 234891,
+          "count": 1209
+        },
+        "eager_begin": {
+          "bytes": 48224132,
+          "count": 24419
+        },
+        "pinned_point": {
+          "bytes": 226567,
+          "count": 1135
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 64,
+      "encoded_data_bytes": 4018304,
+      "index_bytes": 31864,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31864
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 31864,
+          "requested_ranges": {
+            "directory:0:31865": 1
+          },
+          "sha256_helper_bytes": 31864,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 127,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 95,
+              "returned_bytes": 5964670
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 1019648
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 127,
+          "read_bytes": 6984318,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:1004576:1067362": 2,
+            "data:1067362:1130148": 1,
+            "data:1130148:1192934": 2,
+            "data:1192934:1255720": 1,
+            "data:1255720:1318506": 2,
+            "data:125572:188358": 2,
+            "data:1318506:1381292": 1,
+            "data:1381292:1444078": 2,
+            "data:1444078:1506864": 1,
+            "data:1506864:1569650": 2,
+            "data:1569650:1632436": 1,
+            "data:1632436:1695222": 2,
+            "data:1695222:1758008": 1,
+            "data:1758008:1820794": 2,
+            "data:1820794:1883580": 1,
+            "data:1883580:1946366": 2,
+            "data:188358:251144": 1,
+            "data:1946366:2009152": 1,
+            "data:2009152:2071938": 2,
+            "data:2071938:2134724": 1,
+            "data:2134724:2197510": 2,
+            "data:2197510:2260296": 1,
+            "data:2260296:2323082": 2,
+            "data:2323082:2385868": 1,
+            "data:2385868:2448654": 1,
+            "data:2448654:2511440": 2,
+            "data:2511440:2574226": 1,
+            "data:251144:313930": 2,
+            "data:2574226:2637012": 2,
+            "data:2637012:2699798": 1,
+            "data:2699798:2762584": 2,
+            "data:2762584:2825370": 1,
+            "data:2825370:2888156": 2,
+            "data:2888156:2950942": 1,
+            "data:2950942:3013728": 2,
+            "data:3013728:3076514": 1,
+            "data:3076514:3139300": 2,
+            "data:3139300:3202086": 1,
+            "data:313930:376716": 1,
+            "data:3202086:3264872": 2,
+            "data:3264872:3327658": 1,
+            "data:3327658:3390444": 2,
+            "data:3390444:3453230": 1,
+            "data:3453230:3516016": 2,
+            "data:3516016:3578802": 1,
+            "data:3578802:3641588": 2,
+            "data:3641588:3704374": 1,
+            "data:3704374:3767160": 2,
+            "data:3767160:3829946": 1,
+            "data:376716:439502": 2,
+            "data:3829946:3892732": 2,
+            "data:3892732:3955518": 1,
+            "data:3955518:4018304": 2,
+            "data:439502:502288": 1,
+            "data:502288:565074": 2,
+            "data:565074:627860": 1,
+            "data:627860:690646": 2,
+            "data:62786:125572": 1,
+            "data:690646:753432": 1,
+            "data:753432:816218": 2,
+            "data:816218:879004": 1,
+            "data:879004:941790": 2,
+            "data:941790:1004576": 1,
+            "directory:0:31865": 32
+          },
+          "sha256_helper_bytes": 12948988,
+          "sha256_helper_calls": 222,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31864
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 96545,
+          "requested_ranges": {
+            "data:2009152:2071938": 1,
+            "directory:0:31865": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 160223,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4018304
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31864
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4052063,
+          "requested_ranges": {
+            "data:0:4018305": 1,
+            "directory:0:31865": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 27414340,
+          "sha256_helper_calls": 136,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 31864
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 94650,
+          "requested_ranges": {
+            "data:2009152:2071938": 1,
+            "directory:0:31865": 1
+          },
+          "sha256_helper_bytes": 157436,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 32,
+      "rows": 3520,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 259779,
+          "count": 1341
+        },
+        "eager_begin": {
+          "bytes": 51124476,
+          "count": 28443
+        },
+        "pinned_point": {
+          "bytes": 251455,
+          "count": 1267
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 75,
+      "encoded_data_bytes": 4677270,
+      "index_bytes": 37143,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 37143,
+          "requested_ranges": {
+            "directory:0:37144": 1
+          },
+          "sha256_helper_bytes": 37143,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 148,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 111,
+              "returned_bytes": 6937566
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 37,
+              "returned_bytes": 1374291
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 148,
+          "read_bytes": 8311857,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:1004576:1067362": 2,
+            "data:1067362:1130148": 1,
+            "data:1130148:1192934": 2,
+            "data:1192934:1255720": 1,
+            "data:1255720:1318506": 2,
+            "data:125572:188358": 2,
+            "data:1318506:1381292": 1,
+            "data:1381292:1444078": 2,
+            "data:1444078:1506864": 1,
+            "data:1506864:1569650": 2,
+            "data:1569650:1632436": 1,
+            "data:1632436:1695222": 2,
+            "data:1695222:1758008": 1,
+            "data:1758008:1820794": 2,
+            "data:1820794:1883580": 1,
+            "data:1883580:1946366": 2,
+            "data:188358:251144": 1,
+            "data:1946366:2009152": 1,
+            "data:2009152:2071938": 2,
+            "data:2071938:2134724": 1,
+            "data:2134724:2197510": 2,
+            "data:2197510:2260296": 1,
+            "data:2260296:2323082": 2,
+            "data:2323082:2385868": 1,
+            "data:2385868:2448654": 1,
+            "data:2448654:2511440": 2,
+            "data:2511440:2574226": 1,
+            "data:251144:313930": 2,
+            "data:2574226:2637012": 2,
+            "data:2637012:2699798": 1,
+            "data:2699798:2762584": 2,
+            "data:2762584:2825370": 1,
+            "data:2825370:2888156": 2,
+            "data:2888156:2950942": 1,
+            "data:2950942:3013728": 2,
+            "data:3013728:3076514": 1,
+            "data:3076514:3139300": 2,
+            "data:3139300:3202086": 1,
+            "data:313930:376716": 1,
+            "data:3202086:3264872": 2,
+            "data:3264872:3327658": 1,
+            "data:3327658:3390444": 2,
+            "data:3390444:3453230": 1,
+            "data:3453230:3516016": 2,
+            "data:3516016:3578802": 1,
+            "data:3578802:3641588": 2,
+            "data:3641588:3704374": 1,
+            "data:3704374:3767160": 2,
+            "data:3767160:3829946": 1,
+            "data:376716:439502": 2,
+            "data:3829946:3892732": 2,
+            "data:3892732:3955518": 1,
+            "data:3955518:4018304": 2,
+            "data:4018304:4081090": 1,
+            "data:4081090:4143876": 2,
+            "data:4143876:4206662": 1,
+            "data:4206662:4269448": 2,
+            "data:4269448:4332234": 1,
+            "data:4332234:4395020": 2,
+            "data:4395020:4457806": 1,
+            "data:439502:502288": 1,
+            "data:4457806:4520592": 2,
+            "data:4520592:4583378": 1,
+            "data:4583378:4646164": 2,
+            "data:4646164:4677270": 1,
+            "data:502288:565074": 2,
+            "data:565074:627860": 1,
+            "data:627860:690646": 2,
+            "data:62786:125572": 1,
+            "data:690646:753432": 1,
+            "data:753432:816218": 2,
+            "data:816218:879004": 1,
+            "data:879004:941790": 2,
+            "data:941790:1004576": 1,
+            "directory:0:37144": 37
+          },
+          "sha256_helper_bytes": 15249423,
+          "sha256_helper_calls": 259,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 101824,
+          "requested_ranges": {
+            "data:2323082:2385868": 1,
+            "directory:0:37144": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 165502,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 4677270
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 4716308,
+          "requested_ranges": {
+            "data:0:4677271": 1,
+            "directory:0:37144": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 31905690,
+          "sha256_helper_calls": 158,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 37143
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 99929,
+          "requested_ranges": {
+            "data:2323082:2385868": 1,
+            "directory:0:37144": 1
+          },
+          "sha256_helper_bytes": 162715,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1471
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1471,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2787,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 182990,
+          "count": 657
+        },
+        "eager_begin": {
+          "bytes": 51143636,
+          "count": 29213
+        },
+        "pinned_point": {
+          "bytes": 169115,
+          "count": 549
+        },
+        "reader_open": {
+          "bytes": 15305,
+          "count": 124
+        }
+      },
+      "blocks": 76,
+      "encoded_data_bytes": 4680344,
+      "index_bytes": 39835,
+      "l0_suffix": 0,
+      "l1_segments": 4,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9919
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 9919,
+          "requested_ranges": {
+            "directory:0:9920": 1
+          },
+          "sha256_helper_bytes": 9919,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 151,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 111,
+              "returned_bytes": 6786462
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 40,
+              "returned_bytes": 398350
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 151,
+          "read_bytes": 7184812,
+          "requested_ranges": {
+            "data:0:62786": 4,
+            "data:1004576:1067362": 8,
+            "data:1067362:1130148": 4,
+            "data:1130148:1170086": 8,
+            "data:125572:188358": 5,
+            "data:188358:251144": 7,
+            "data:251144:313930": 5,
+            "data:313930:376716": 6,
+            "data:376716:439502": 6,
+            "data:439502:502288": 6,
+            "data:502288:565074": 6,
+            "data:565074:627860": 5,
+            "data:627860:690646": 7,
+            "data:62786:125572": 7,
+            "data:690646:753432": 5,
+            "data:753432:816218": 7,
+            "data:816218:879004": 4,
+            "data:879004:941790": 7,
+            "data:941790:1004576": 4,
+            "directory:0:9920": 10,
+            "directory:0:9973": 30
+          },
+          "sha256_helper_bytes": 13971274,
+          "sha256_helper_calls": 262,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9972
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3108
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 76290,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:9973": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 141605,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 11,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 4,
+              "returned_bytes": 4680344
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 4,
+              "returned_bytes": 39835
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3108
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 9,
+          "read_bytes": 4723711,
+          "requested_ranges": {
+            "data:0:1170087": 4,
+            "directory:0:9920": 1,
+            "directory:0:9973": 3,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 31926644,
+          "sha256_helper_calls": 172,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9972
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 72758,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:9973": 1
+          },
+          "sha256_helper_bytes": 135544,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3108
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 3108,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 6061,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 198770,
+          "count": 732
+        },
+        "eager_begin": {
+          "bytes": 51231180,
+          "count": 31986
+        },
+        "pinned_point": {
+          "bytes": 150731,
+          "count": 485
+        },
+        "reader_open": {
+          "bytes": 51109,
+          "count": 336
+        }
+      },
+      "blocks": 80,
+      "encoded_data_bytes": 4691104,
+      "index_bytes": 50905,
+      "l0_suffix": 0,
+      "l1_segments": 16,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3159
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 3159,
+          "requested_ranges": {
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 3159,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 168,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 116,
+              "returned_bytes": 6847720
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 52,
+              "returned_bytes": 165446
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 168,
+          "read_bytes": 7013166,
+          "requested_ranges": {
+            "data:0:62786": 24,
+            "data:125572:188358": 24,
+            "data:188358:251144": 24,
+            "data:251144:293194": 21,
+            "data:62786:125572": 23,
+            "directory:0:3160": 3,
+            "directory:0:3176": 6,
+            "directory:0:3177": 4,
+            "directory:0:3186": 39
+          },
+          "sha256_helper_bytes": 13860886,
+          "sha256_helper_calls": 284,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3185
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9644
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 76039,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:3186": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 147890,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 35,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 16,
+              "returned_bytes": 4691104
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 16,
+              "returned_bytes": 50905
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9644
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 33,
+          "read_bytes": 4752077,
+          "requested_ranges": {
+            "data:0:293195": 16,
+            "directory:0:3160": 1,
+            "directory:0:3176": 2,
+            "directory:0:3177": 1,
+            "directory:0:3186": 12,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 32004897,
+          "sha256_helper_calls": 228,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3185
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 65971,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:3186": 1
+          },
+          "sha256_helper_bytes": 128757,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9644
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 9644,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 19133,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 336114,
+          "count": 1525
+        },
+        "eager_begin": {
+          "bytes": 52150116,
+          "count": 46964
+        },
+        "pinned_point": {
+          "bytes": 151939,
+          "count": 739
+        },
+        "reader_open": {
+          "bytes": 193349,
+          "count": 1170
+        }
+      },
+      "blocks": 128,
+      "encoded_data_bytes": 4821248,
+      "index_bytes": 106161,
+      "l0_suffix": 0,
+      "l1_segments": 64,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1639
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1639,
+          "requested_ranges": {
+            "directory:0:1640": 1
+          },
+          "sha256_helper_bytes": 1639,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 264,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 164,
+              "returned_bytes": 6880584
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 100,
+              "returned_bytes": 165887
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 264,
+          "read_bytes": 7046471,
+          "requested_ranges": {
+            "data:0:62786": 96,
+            "data:62786:75332": 68,
+            "directory:0:1640": 1,
+            "directory:0:1656": 2,
+            "directory:0:1657": 20,
+            "directory:0:1660": 2,
+            "directory:0:1661": 75
+          },
+          "sha256_helper_bytes": 13927055,
+          "sha256_helper_calls": 428,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1660
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 35740
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 100610,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:1661": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 198557,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 131,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 64,
+              "returned_bytes": 4821248
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 64,
+              "returned_bytes": 106161
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 35740
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 129,
+          "read_bytes": 4963573,
+          "requested_ranges": {
+            "data:0:75333": 64,
+            "directory:0:1640": 1,
+            "directory:0:1656": 1,
+            "directory:0:1657": 13,
+            "directory:0:1660": 1,
+            "directory:0:1661": 48,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 32688177,
+          "sha256_helper_calls": 516,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1660
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 64446,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "directory:0:1661": 1
+          },
+          "sha256_helper_bytes": 127232,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 35740
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 35740,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 71325,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 37,
+      "rows": 4096,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 157219,
+          "count": 481
+        },
+        "eager_begin": {
+          "bytes": 3208388,
+          "count": 2098
+        },
+        "pinned_point": {
+          "bytes": 148895,
+          "count": 407
+        },
+        "reader_open": {
+          "bytes": 9418,
+          "count": 72
+        }
+      },
+      "blocks": 5,
+      "encoded_data_bytes": 293194,
+      "index_bytes": 3159,
+      "l0_suffix": 0,
+      "l1_segments": 1,
+      "operations": {
+        "bloom_negative": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3159
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 3159,
+          "requested_ranges": {
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 3159,
+          "sha256_helper_calls": 1,
+          "write_attempt_bytes": 0
+        },
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 10,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 7,
+              "returned_bytes": 398030
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 3,
+              "returned_bytes": 9477
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 10,
+          "read_bytes": 407507,
+          "requested_ranges": {
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:293194": 2,
+            "data:62786:125572": 1,
+            "directory:0:3160": 3
+          },
+          "sha256_helper_bytes": 805537,
+          "sha256_helper_calls": 17,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3159
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 67838,
+          "requested_ranges": {
+            "data:125572:188358": 1,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 131514,
+          "sha256_helper_calls": 5,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 293194
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3159
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 424
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 3,
+          "read_bytes": 298246,
+          "requested_ranges": {
+            "data:0:293195": 1,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2001894,
+          "sha256_helper_calls": 18,
+          "write_attempt_bytes": 0
+        },
+        "outside_bounds": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 0,
+          "object_reads": {},
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 0,
+          "read_bytes": 0,
+          "requested_ranges": {},
+          "sha256_helper_bytes": 0,
+          "sha256_helper_calls": 0,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 2,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 62786
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3159
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 2,
+          "read_bytes": 65945,
+          "requested_ranges": {
+            "data:125572:188358": 1,
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 128731,
+          "sha256_helper_calls": 3,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1469
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1469,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2783,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 3,
+      "rows": 256,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 185060,
+          "count": 727
+        },
+        "eager_begin": {
+          "bytes": 3238947,
+          "count": 2399
+        },
+        "pinned_point": {
+          "bytes": 176094,
+          "count": 650
+        },
+        "reader_open": {
+          "bytes": 10018,
+          "count": 75
+        }
+      },
+      "blocks": 5,
+      "encoded_data_bytes": 293194,
+      "index_bytes": 3159,
+      "l0_suffix": 1,
+      "l1_segments": 1,
+      "operations": {
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 3,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 18,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 405714
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 6,
+              "returned_bytes": 13005
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 3,
+              "ranges": 0,
+              "returned_bytes": 3198
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 15,
+          "read_bytes": 421917,
+          "requested_ranges": {
+            "data:0:3842": 2,
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:293194": 2,
+            "data:62786:125572": 1,
+            "directory:0:1177": 3,
+            "directory:0:3160": 3
+          },
+          "sha256_helper_bytes": 830382,
+          "sha256_helper_calls": 30,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 2,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 8,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 66628
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 4335
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1724
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 1066
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 5,
+          "read_bytes": 74219,
+          "requested_ranges": {
+            "data:0:3842": 1,
+            "data:125572:188358": 1,
+            "directory:0:1177": 1,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 142867,
+          "sha256_helper_calls": 10,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 2,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 8,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 297036
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 4335
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1724
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 1066
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 5,
+          "read_bytes": 304627,
+          "requested_ranges": {
+            "data:0:293195": 1,
+            "data:0:3843": 1,
+            "directory:0:1177": 1,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2022108,
+          "sha256_helper_calls": 26,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 1,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 5,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 66628
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 2,
+              "returned_bytes": 4335
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 1066
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 4,
+          "read_bytes": 72029,
+          "requested_ranges": {
+            "data:0:3842": 1,
+            "data:125572:188358": 1,
+            "directory:0:1177": 1,
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 139574,
+          "sha256_helper_calls": 8,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 1724
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 1724,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 3293,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 3,
+      "rows": 256,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 381797,
+          "count": 2445
+        },
+        "eager_begin": {
+          "bytes": 3454710,
+          "count": 4495
+        },
+        "pinned_point": {
+          "bytes": 366781,
+          "count": 2351
+        },
+        "reader_open": {
+          "bytes": 16060,
+          "count": 91
+        }
+      },
+      "blocks": 5,
+      "encoded_data_bytes": 293194,
+      "index_bytes": 3159,
+      "l0_suffix": 8,
+      "l1_segments": 1,
+      "operations": {
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 24,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 74,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 23,
+              "returned_bytes": 459502
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 27,
+              "returned_bytes": 37701
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 24,
+              "ranges": 0,
+              "returned_bytes": 26466
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 50,
+          "read_bytes": 523669,
+          "requested_ranges": {
+            "data:0:3842": 16,
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:293194": 2,
+            "data:62786:125572": 1,
+            "directory:0:1177": 24,
+            "directory:0:3160": 3
+          },
+          "sha256_helper_bytes": 1006061,
+          "sha256_helper_calls": 121,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 9,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 29,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 93522
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 12567
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3558
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 8,
+              "ranges": 0,
+              "returned_bytes": 8822
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 19,
+          "read_bytes": 118935,
+          "requested_ranges": {
+            "data:0:3842": 8,
+            "data:125572:188358": 1,
+            "directory:0:1177": 8,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 223024,
+          "sha256_helper_calls": 45,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 9,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 29,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 323930
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 12567
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3558
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 8,
+              "ranges": 0,
+              "returned_bytes": 8822
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 19,
+          "read_bytes": 349343,
+          "requested_ranges": {
+            "data:0:293195": 1,
+            "data:0:3843": 8,
+            "directory:0:1177": 8,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2164286,
+          "sha256_helper_calls": 82,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 8,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 26,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 93522
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 9,
+              "returned_bytes": 12567
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 8,
+              "ranges": 0,
+              "returned_bytes": 8822
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 18,
+          "read_bytes": 114911,
+          "requested_ranges": {
+            "data:0:3842": 8,
+            "data:125572:188358": 1,
+            "directory:0:1177": 8,
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 216063,
+          "sha256_helper_calls": 43,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 3558
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 3558,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 6961,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 3,
+      "rows": 256,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 610808,
+          "count": 4412
+        },
+        "eager_begin": {
+          "bytes": 3705465,
+          "count": 6894
+        },
+        "pinned_point": {
+          "bytes": 584709,
+          "count": 4295
+        },
+        "reader_open": {
+          "bytes": 27143,
+          "count": 114
+        }
+      },
+      "blocks": 5,
+      "encoded_data_bytes": 293194,
+      "index_bytes": 3159,
+      "l0_suffix": 16,
+      "l1_segments": 1,
+      "operations": {
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 48,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 138,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 39,
+              "returned_bytes": 520974
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 51,
+              "returned_bytes": 65925
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 48,
+              "ranges": 0,
+              "returned_bytes": 53058
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 90,
+          "read_bytes": 639957,
+          "requested_ranges": {
+            "data:0:3842": 32,
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:293194": 2,
+            "data:62786:125572": 1,
+            "directory:0:1177": 48,
+            "directory:0:3160": 3
+          },
+          "sha256_helper_bytes": 1206837,
+          "sha256_helper_calls": 225,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 17,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 53,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 124258
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 21975
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 6136
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 16,
+              "ranges": 0,
+              "returned_bytes": 17686
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 35,
+          "read_bytes": 170521,
+          "requested_ranges": {
+            "data:0:3842": 16,
+            "data:125572:188358": 1,
+            "directory:0:1177": 16,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 315596,
+          "sha256_helper_calls": 85,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 17,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 53,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 354666
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 21975
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 6136
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 16,
+              "ranges": 0,
+              "returned_bytes": 17686
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 35,
+          "read_bytes": 400929,
+          "requested_ranges": {
+            "data:0:293195": 1,
+            "data:0:3843": 16,
+            "directory:0:1177": 16,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2327738,
+          "sha256_helper_calls": 146,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 16,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 50,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 124258
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 17,
+              "returned_bytes": 21975
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 16,
+              "ranges": 0,
+              "returned_bytes": 17686
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 34,
+          "read_bytes": 163919,
+          "requested_ranges": {
+            "data:0:3842": 16,
+            "data:125572:188358": 1,
+            "directory:0:1177": 16,
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 303479,
+          "sha256_helper_calls": 83,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 6136
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 6136,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 12117,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 3,
+      "rows": 256,
+      "target_bytes": 65536
+    },
+    {
+      "allocations": {
+        "current_point": {
+          "bytes": 1040719,
+          "count": 8089
+        },
+        "eager_begin": {
+          "bytes": 4176146,
+          "count": 11381
+        },
+        "pinned_point": {
+          "bytes": 993324,
+          "count": 7940
+        },
+        "reader_open": {
+          "bytes": 48439,
+          "count": 146
+        }
+      },
+      "blocks": 5,
+      "encoded_data_bytes": 293194,
+      "index_bytes": 3159,
+      "l0_suffix": 31,
+      "l1_segments": 1,
+      "operations": {
+        "complete_scan": {
+          "delete_attempts": 0,
+          "get_attempts": 93,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 258,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 69,
+              "returned_bytes": 636234
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 96,
+              "returned_bytes": 118845
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 93,
+              "ranges": 0,
+              "returned_bytes": 102918
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 165,
+          "read_bytes": 857997,
+          "requested_ranges": {
+            "data:0:3842": 62,
+            "data:0:62786": 1,
+            "data:125572:188358": 2,
+            "data:188358:251144": 1,
+            "data:251144:293194": 2,
+            "data:62786:125572": 1,
+            "directory:0:1177": 93,
+            "directory:0:3160": 3
+          },
+          "sha256_helper_bytes": 1583292,
+          "sha256_helper_calls": 420,
+          "write_attempt_bytes": 0
+        },
+        "current_point": {
+          "delete_attempts": 0,
+          "get_attempts": 32,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 98,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 181888
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 39615
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9976
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 31,
+              "ranges": 0,
+              "returned_bytes": 34306
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 65,
+          "read_bytes": 266251,
+          "requested_ranges": {
+            "data:0:3842": 31,
+            "data:125572:188358": 1,
+            "directory:0:1177": 31,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 487181,
+          "sha256_helper_calls": 160,
+          "write_attempt_bytes": 0
+        },
+        "eager_begin": {
+          "delete_attempts": 0,
+          "get_attempts": 32,
+          "head_attempts": 1,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 98,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 412296
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 39615
+            },
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9976
+            },
+            "other": {
+              "failures": 0,
+              "full_reads": 1,
+              "ranges": 0,
+              "returned_bytes": 466
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 31,
+              "ranges": 0,
+              "returned_bytes": 34306
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 65,
+          "read_bytes": 496659,
+          "requested_ranges": {
+            "data:0:293195": 1,
+            "data:0:3843": 31,
+            "directory:0:1177": 31,
+            "directory:0:3160": 1,
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 2632223,
+          "sha256_helper_calls": 266,
+          "write_attempt_bytes": 0
+        },
+        "pinned_point": {
+          "delete_attempts": 0,
+          "get_attempts": 31,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 95,
+          "object_reads": {
+            "data": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 181888
+            },
+            "directory": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 32,
+              "returned_bytes": 39615
+            },
+            "transaction": {
+              "failures": 0,
+              "full_reads": 31,
+              "ranges": 0,
+              "returned_bytes": 34306
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 64,
+          "read_bytes": 255809,
+          "requested_ranges": {
+            "data:0:3842": 31,
+            "data:125572:188358": 1,
+            "directory:0:1177": 31,
+            "directory:0:3160": 1
+          },
+          "sha256_helper_bytes": 467384,
+          "sha256_helper_calls": 158,
+          "write_attempt_bytes": 0
+        },
+        "reader_open": {
+          "delete_attempts": 0,
+          "get_attempts": 0,
+          "head_attempts": 0,
+          "head_cas_attempts": 0,
+          "immutable_write_attempt_bytes": 0,
+          "list_attempts": 0,
+          "list_page_attempts": 0,
+          "logical_storage_calls": 1,
+          "object_reads": {
+            "manifest": {
+              "failures": 0,
+              "full_reads": 0,
+              "ranges": 1,
+              "returned_bytes": 9976
+            }
+          },
+          "precondition_failures": 0,
+          "put_attempts": 0,
+          "range_get_attempts": 1,
+          "read_bytes": 9976,
+          "requested_ranges": {
+            "manifest:0:1048577": 1
+          },
+          "sha256_helper_bytes": 19797,
+          "sha256_helper_calls": 2,
+          "write_attempt_bytes": 0
+        }
+      },
+      "pages": 3,
+      "rows": 256,
+      "target_bytes": 65536
+    }
+  ]
+}

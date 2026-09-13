@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 
-use crate::commit::{prune_snapshot_log_after_snapshot_removal, validate_requirements};
+use crate::commit::{apply_updates, validate_requirements};
 use crate::error::{IcebergError, IcebergResult};
 use crate::governance::TableLocationGovernance;
 use crate::idempotency::IdempotencyMarker;
@@ -24,12 +24,8 @@ use crate::transactions::{
     TransactionCasResult, TransactionRecord, TransactionStatus, TransactionStore,
     TransactionStoreImpl, TransactionTableEntry,
 };
-use crate::types::commit::{
-    CommitTableRequest, SnapshotRefType as UpdateSnapshotRefType, TableUpdate,
-};
-use crate::types::{
-    MetadataLogEntry, ObjectVersion, SnapshotLogEntry, SnapshotRefMetadata, TableMetadata,
-};
+use crate::types::commit::{CommitTableRequest, TableUpdate};
+use crate::types::{MetadataLogEntry, ObjectVersion, TableMetadata};
 
 /// Error from multi-table transaction commit.
 #[derive(Debug)]
@@ -729,168 +725,6 @@ fn build_metadata_location(
 ) -> String {
     let base = table_location.trim_end_matches('/');
     format!("{base}/metadata/{sequence_number:05}-{tx_id}-{table_uuid}.metadata.json")
-}
-
-fn apply_updates(metadata: &mut TableMetadata, updates: &[TableUpdate]) -> IcebergResult<()> {
-    for update in updates {
-        apply_update(metadata, update)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn apply_update(metadata: &mut TableMetadata, update: &TableUpdate) -> IcebergResult<()> {
-    use crate::types::TableUuid;
-    use std::collections::HashSet;
-
-    match update {
-        TableUpdate::AssignUuid { uuid } => {
-            metadata.table_uuid = TableUuid::new(*uuid);
-        }
-        TableUpdate::UpgradeFormatVersion { format_version } => {
-            if *format_version < metadata.format_version {
-                return Err(IcebergError::BadRequest {
-                    message: "format-version cannot be downgraded".to_string(),
-                    error_type: "BadRequestException",
-                });
-            }
-            metadata.format_version = *format_version;
-        }
-        TableUpdate::AddSchema {
-            schema,
-            last_column_id,
-        } => {
-            metadata.schemas.push(schema.clone());
-            let max_field_id = schema.fields.iter().map(|f| f.id).max();
-            if let Some(max_field_id) = max_field_id {
-                if max_field_id > metadata.last_column_id {
-                    metadata.last_column_id = max_field_id;
-                }
-            }
-            if let Some(last_column_id) = last_column_id {
-                if *last_column_id < metadata.last_column_id {
-                    return Err(IcebergError::BadRequest {
-                        message: "last-column-id cannot move backwards".to_string(),
-                        error_type: "BadRequestException",
-                    });
-                }
-                metadata.last_column_id = *last_column_id;
-            }
-        }
-        TableUpdate::SetCurrentSchema { schema_id } => {
-            let exists = metadata.schemas.iter().any(|s| s.schema_id == *schema_id);
-            if !exists {
-                return Err(IcebergError::BadRequest {
-                    message: format!("Schema {schema_id} does not exist"),
-                    error_type: "BadRequestException",
-                });
-            }
-            metadata.current_schema_id = *schema_id;
-        }
-        TableUpdate::AddPartitionSpec { spec } => {
-            let max_field_id = spec.fields.iter().map(|f| f.field_id).max();
-            if let Some(max_field_id) = max_field_id {
-                if max_field_id > metadata.last_partition_id {
-                    metadata.last_partition_id = max_field_id;
-                }
-            }
-            metadata.partition_specs.push(spec.clone());
-        }
-        TableUpdate::SetDefaultSpec { spec_id } => {
-            let exists = metadata
-                .partition_specs
-                .iter()
-                .any(|s| s.spec_id == *spec_id);
-            if !exists {
-                return Err(IcebergError::BadRequest {
-                    message: format!("Partition spec {spec_id} does not exist"),
-                    error_type: "BadRequestException",
-                });
-            }
-            metadata.default_spec_id = *spec_id;
-        }
-        TableUpdate::AddSortOrder { sort_order } => {
-            metadata.sort_orders.push(sort_order.clone());
-        }
-        TableUpdate::SetDefaultSortOrder { sort_order_id } => {
-            let exists = metadata
-                .sort_orders
-                .iter()
-                .any(|o| o.order_id == *sort_order_id);
-            if !exists {
-                return Err(IcebergError::BadRequest {
-                    message: format!("Sort order {sort_order_id} does not exist"),
-                    error_type: "BadRequestException",
-                });
-            }
-            metadata.default_sort_order_id = *sort_order_id;
-        }
-        TableUpdate::AddSnapshot { snapshot } => {
-            metadata.last_sequence_number =
-                metadata.last_sequence_number.max(snapshot.sequence_number);
-            metadata.snapshots.push(snapshot.clone());
-        }
-        TableUpdate::SetSnapshotRef {
-            ref_name,
-            ref_type,
-            snapshot_id,
-            ..
-        } => {
-            let ref_type_str = match ref_type {
-                UpdateSnapshotRefType::Branch => "branch",
-                UpdateSnapshotRefType::Tag => "tag",
-            };
-            metadata.refs.insert(
-                ref_name.clone(),
-                SnapshotRefMetadata {
-                    snapshot_id: *snapshot_id,
-                    ref_type: ref_type_str.to_string(),
-                },
-            );
-            if ref_name == "main" {
-                metadata.current_snapshot_id = Some(*snapshot_id);
-                metadata.snapshot_log.push(SnapshotLogEntry {
-                    snapshot_id: *snapshot_id,
-                    timestamp_ms: Utc::now().timestamp_millis(),
-                });
-            }
-        }
-        TableUpdate::RemoveSnapshotRef { ref_name } => {
-            metadata.refs.remove(ref_name);
-            if ref_name == "main" {
-                metadata.current_snapshot_id = None;
-            }
-        }
-        TableUpdate::RemoveSnapshots { snapshot_ids } => {
-            let ids: HashSet<i64> = snapshot_ids.iter().copied().collect();
-            metadata.snapshots.retain(|s| !ids.contains(&s.snapshot_id));
-            prune_snapshot_log_after_snapshot_removal(metadata);
-            metadata.refs.retain(|_, r| !ids.contains(&r.snapshot_id));
-            if metadata
-                .current_snapshot_id
-                .is_some_and(|id| ids.contains(&id))
-            {
-                metadata.current_snapshot_id = None;
-            }
-        }
-        TableUpdate::SetLocation { .. } => {
-            return Err(IcebergError::BadRequest {
-                message: "SetLocation is not permitted".to_string(),
-                error_type: "BadRequestException",
-            });
-        }
-        TableUpdate::SetProperties { updates } => {
-            for (key, value) in updates {
-                metadata.properties.insert(key.clone(), value.clone());
-            }
-        }
-        TableUpdate::RemoveProperties { removals } => {
-            for key in removals {
-                metadata.properties.remove(key);
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Collects the property map a commit request asks to set.

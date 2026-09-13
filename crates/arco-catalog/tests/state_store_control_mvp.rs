@@ -15,17 +15,19 @@
 
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, CatalogError, CheckpointOptions,
-    ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
-    ControlMvpRestoreParticipant, ControlMvpStateStore, KeyRange, PersistedAuthorityAdapter,
-    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
-    RestoreAttemptIdentity, RestoreParticipantInspection, StateRestoreParticipant, StateScope,
-    TxnOptions,
+    ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
+    ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpStateStore, KeyRange,
+    PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
+    PersistedRestoreParticipantPlan, RestoreAttemptIdentity, RestoreParticipantInspection,
+    ScanRequest, StateRestoreParticipant, StateScope, TxnOptions,
 };
 use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
@@ -47,8 +49,33 @@ fn storage() -> (Arc<MemoryBackend>, ScopedStorage) {
     (backend, storage)
 }
 
+fn path_has_extension(path: &str, extension: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+}
+
 fn store(storage: ScopedStorage) -> ControlMvpStateStore {
     ControlMvpStateStore::new(storage, scope()).expect("control MVP store")
+}
+
+#[test]
+fn legacy_state_scope_rejects_metastore_physical_roots() {
+    let backend = Arc::new(MemoryBackend::new());
+    for workspace in ["notebooks", "lakehouse"] {
+        let request = arco_core::ControlPlaneScope::new("acme", workspace, "lakehouse")
+            .expect("request scope");
+        let metastore = ScopedStorage::new_metastore_scoped(backend.clone(), &request)
+            .expect("metastore storage");
+        let state_scope = StateScope::new("acme", workspace, "catalog");
+        assert!(
+            ControlMvpStateStore::new(metastore, state_scope.clone()).is_err(),
+            "legacy StateScope must not alias a metastore root"
+        );
+        let workspace_storage =
+            ScopedStorage::new(backend.clone(), "acme", workspace).expect("workspace storage");
+        assert!(ControlMvpStateStore::new(workspace_storage, state_scope).is_ok());
+    }
 }
 
 #[test]
@@ -391,6 +418,7 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
             "stale-outbox",
             Bytes::from_static(b"stale"),
         ))
+        .await
         .expect("stage outbox record");
     let stale_tx_id = stale_txn.tx_id().to_string();
     let stale_manifest_id = stale_txn.candidate_manifest_id().to_string();
@@ -408,6 +436,7 @@ async fn cas_loss_leaves_old_state_and_old_outbox_visible_only() {
             "winning-outbox",
             Bytes::from_static(b"winner"),
         ))
+        .await
         .expect("stage outbox record");
     let winning_token = winning_txn.commit().await.expect("commit winner");
 
@@ -469,6 +498,7 @@ async fn unreachable_manifest_artifacts_are_invisible_without_pointer_reachabili
             "hidden-outbox",
             Bytes::from_static(b"hidden"),
         ))
+        .await
         .expect("stage outbox record");
 
     let mut winning_txn = store
@@ -486,7 +516,10 @@ async fn unreachable_manifest_artifacts_are_invisible_without_pointer_reachabili
         Err(CatalogError::CasFailed { .. })
     ));
 
-    let retained = store.read_at(token).await.expect("read retained manifest");
+    let retained = store
+        .read_at(token.into_state_token())
+        .await
+        .expect("read retained manifest");
     assert_eq!(
         Some(Bytes::from_static(b"winner")),
         retained
@@ -539,7 +572,7 @@ async fn read_at_state_token_resolves_retained_manifest_state() {
         .expect("commit second transaction");
 
     let first_reader = store
-        .read_at(first_token)
+        .read_at(first_token.into_state_token())
         .await
         .expect("open first retained reader");
 
@@ -585,7 +618,10 @@ async fn manifest_reachable_replay_folds_expected_kv_state() {
         .expect("stage delete");
     let token = second_txn.commit().await.expect("commit second");
 
-    let reader = store.read_at(token).await.expect("read retained state");
+    let reader = store
+        .read_at(token.into_state_token())
+        .await
+        .expect("read retained state");
     assert_eq!(
         None,
         reader
@@ -600,10 +636,11 @@ async fn manifest_reachable_replay_folds_expected_kv_state() {
             Some(1)
         )],
         reader
-            .scan_prefix(b"catalog/")
+            .scan(ScanRequest::new(b"catalog/"))
             .await
             .expect("scan folded state")
-            .into_iter()
+            .entries()
+            .iter()
             .map(|pair| {
                 (
                     pair.key().to_vec(),
@@ -629,6 +666,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "first",
             Bytes::from_static(b"payload-1"),
         ))
+        .await
         .expect("stage outbox record");
     let first_token = first_txn.commit().await.expect("commit first");
 
@@ -641,6 +679,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "stale",
             Bytes::from_static(b"payload-stale"),
         ))
+        .await
         .expect("stage outbox record");
 
     let mut winning_txn = store
@@ -652,6 +691,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             "second",
             Bytes::from_static(b"payload-2"),
         ))
+        .await
         .expect("stage outbox record");
     let second_token = winning_txn.commit().await.expect("commit second");
     assert!(matches!(
@@ -666,7 +706,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             1,
         )],
         store
-            .projection_outbox_at(first_token)
+            .projection_outbox_at(first_token.into_state_token())
             .await
             .expect("first outbox")
     );
@@ -684,7 +724,7 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             ),
         ],
         store
-            .projection_outbox_at(second_token)
+            .projection_outbox_at(second_token.into_state_token())
             .await
             .expect("second outbox")
     );
@@ -705,6 +745,75 @@ async fn projection_outbox_records_are_visible_only_after_manifest_is_visible() 
             .current_projection_outbox()
             .await
             .expect("current outbox")
+    );
+}
+
+#[tokio::test]
+async fn l1_anchor_preserves_projection_outbox_replay_order() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(1));
+
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin first transaction");
+    first
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "z-old",
+            Bytes::from_static(b"older"),
+        ))
+        .await
+        .expect("stage older record");
+    first
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "a-new",
+            Bytes::from_static(b"newer"),
+        ))
+        .await
+        .expect("stage newer record");
+    let first_token = first.commit().await.expect("commit first transaction");
+
+    assert_eq!(
+        vec!["z-old", "a-new"],
+        store
+            .projection_outbox_at(first_token.clone().into_state_token())
+            .await
+            .expect("read first anchored outbox")
+            .iter()
+            .map(ControlMvpProjectionOutboxRecord::record_id)
+            .collect::<Vec<_>>()
+    );
+
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::default())
+        .await
+        .expect("checkpoint first anchored state");
+    store
+        .read_checkpoint(checkpoint)
+        .await
+        .expect("open checkpoint whose checksum includes the ordered outbox");
+
+    let mut successor = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin successor");
+    successor
+        .put(b"catalog/default", Bytes::from_static(b"v2"))
+        .await
+        .expect("stage successor write");
+    successor.commit().await.expect("commit successor");
+
+    assert_eq!(
+        vec!["z-old", "a-new"],
+        store
+            .current_projection_outbox()
+            .await
+            .expect("read successor outbox")
+            .iter()
+            .map(ControlMvpProjectionOutboxRecord::record_id)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -739,7 +848,7 @@ async fn checksum_or_corrupt_artifact_failure_fails_closed() {
         .await
         .expect("corrupt manifest checksum");
 
-    let error = match store.read_at(token).await {
+    let error = match store.read_at(token.into_state_token()).await {
         Err(error) => error,
         Ok(_) => panic!("checksum mismatch must fail closed"),
     };
@@ -795,11 +904,80 @@ async fn manifest_transaction_checksum_mismatch_fails_closed() {
 
     rewrite_object_pretty(&storage, &paths.tx_object(&tx_id)).await;
 
-    let error = match store.read_at(token).await {
-        Err(error) => error,
-        Ok(_) => panic!("manifest transaction checksum mismatch must fail closed"),
-    };
+    let reader = store
+        .read_at(token.into_state_token())
+        .await
+        .expect("root metadata opens without reading transaction objects");
+    let error = reader
+        .get(b"catalog/default")
+        .await
+        .expect_err("selected transaction checksum mismatch must fail closed");
     assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+}
+
+#[tokio::test]
+async fn checksum_coherent_terminal_logical_sequence_is_typed_not_a_panic() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(1));
+    let paths = ControlMvpPaths::new("catalog");
+
+    commit_value(&store, b"catalog/default", "v1").await;
+    commit_value(&store, b"catalog/default", "v2").await;
+    let token = store
+        .current_state_token()
+        .await
+        .expect("current state token");
+    let manifest_path = paths.manifest_object(token.authority_manifest_id());
+    let manifest = storage
+        .get_raw(&manifest_path)
+        .await
+        .expect("current manifest");
+    let terminal_manifest = reseal_envelope(&manifest, |payload| {
+        let terminal = payload.replacen(
+            "\"logical_sequence\":1",
+            &format!("\"logical_sequence\":{}", u64::MAX),
+            1,
+        );
+        assert_ne!(
+            payload, terminal,
+            "manifest must carry the sequence-one base"
+        );
+        terminal
+    });
+    let manifest_checksum = hex::encode(sha2::Sha256::digest(&terminal_manifest));
+    storage
+        .put_raw(&manifest_path, terminal_manifest, WritePrecondition::None)
+        .await
+        .expect("write checksum-coherent terminal manifest");
+
+    let pointer_path = paths.current_pointer();
+    let pointer = storage
+        .get_raw(&pointer_path)
+        .await
+        .expect("current pointer");
+    let mut pointer: Value = serde_json::from_slice(&pointer).expect("pointer json");
+    pointer["manifest_checksum_sha256"] = Value::String(manifest_checksum);
+    storage
+        .put_raw(
+            &pointer_path,
+            Bytes::from(serde_json::to_vec(&pointer).expect("pointer bytes")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("bind pointer to terminal manifest");
+
+    let task = tokio::spawn(async move { store.get(b"catalog/default").await });
+    let result = task
+        .await
+        .expect("terminal sequence must return a typed error, not panic");
+    let error = result.expect_err("terminal sequence must fail closed");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
+    assert!(
+        error.to_string().contains("logical sequence overflow"),
+        "unexpected terminal-sequence error: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -891,18 +1069,20 @@ async fn checkpoint_reads_open_the_retained_manifest_reader() {
     // authority manifest asserts, so compare it against a token-pinned read of
     // that manifest rather than against one key.
     let manifest_reader = store
-        .read_at(checkpointed_token.clone())
+        .read_at(checkpointed_token.clone().into_state_token())
         .await
         .expect("token-pinned read of the checkpointed manifest");
     assert_eq!(
         manifest_reader
-            .scan_prefix(b"")
+            .scan(ScanRequest::new(b""))
             .await
-            .expect("manifest state"),
+            .expect("manifest state")
+            .entries(),
         checkpoint_reader
-            .scan_prefix(b"")
+            .scan(ScanRequest::new(b""))
             .await
-            .expect("checkpoint state"),
+            .expect("checkpoint state")
+            .entries(),
         "the checkpoint reader must serve exactly the manifest-named state"
     );
 
@@ -910,19 +1090,15 @@ async fn checkpoint_reads_open_the_retained_manifest_reader() {
     // substituting its bytes fails closed instead of serving another state.
     let paths = ControlMvpPaths::new("catalog");
     let checkpoint_path = paths.checkpoint_object(checkpoint.checkpoint_id());
-    let state_id = envelope_payload(&storage, &checkpoint_path).await["state"]["state_id"]
+    let state_id = envelope_payload(&storage, &checkpoint_path).await["states"][0]["state_id"]
         .as_str()
         .expect("checkpoint state id")
         .to_string();
     let snapshot_path = paths.state_object(&state_id);
-    let snapshot = storage
-        .get_raw(&snapshot_path)
-        .await
-        .expect("checkpoint snapshot");
     storage
         .put_raw(
             &snapshot_path,
-            reseal_envelope(&snapshot, |payload| payload.replace("[118,49]", "[118,50]")),
+            Bytes::from_static(b"not-an-arrow-segment"),
             WritePrecondition::None,
         )
         .await
@@ -957,7 +1133,10 @@ async fn request_time_correctness_paths_do_not_call_object_store_listing() {
         Some(Bytes::from_static(b"v1")),
         store.get(b"catalog/default").await.expect("current read")
     );
-    let retained = store.read_at(token).await.expect("retained reader");
+    let retained = store
+        .read_at(token.into_state_token())
+        .await
+        .expect("retained reader");
     assert_eq!(
         Some(Bytes::from_static(b"v1")),
         retained
@@ -1010,7 +1189,6 @@ async fn request_time_correctness_paths_do_not_call_object_store_listing() {
             .expect("apply restore without listing"),
         RestoreParticipantInspection::Visible { .. }
     ));
-
     assert_eq!(0, backend.list_calls());
 }
 
@@ -1168,11 +1346,12 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        2,
+        6,
         plan.version(),
         "planning writes the current plan version"
     );
     assert!(!plan.is_legacy_version());
+    assert_eq!(Some(32_u64), downgraded_checkpoint_interval(&serialized));
 
     // R6: a round trip of the version this revision writes proves only that
     // the writer and reader agree with themselves. Recovery has to read plans
@@ -1184,6 +1363,11 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("plan object")
         .remove("observed_writer_epoch");
     assert_eq!(Some(Value::from(0_u64)), removed);
+    let removed_interval = downgraded
+        .as_object_mut()
+        .expect("plan object")
+        .remove("checkpoint_interval");
+    assert_eq!(Some(Value::from(32_u64)), removed_interval);
     downgraded["version"] = Value::from(1_u64);
     let migrated: PersistedRestoreParticipantPlan =
         serde_json::from_value(downgraded.clone()).expect("v1 plans must remain decodable");
@@ -1202,9 +1386,9 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     // The current version, in contrast, still requires the field: an absent
     // observation must never be silently read as an observation of epoch 0.
     let mut truncated = downgraded;
-    truncated["version"] = Value::from(2_u64);
+    truncated["version"] = Value::from(4_u64);
     let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(truncated)
-        .expect_err("a v2 plan without observed_writer_epoch must fail closed");
+        .expect_err("a v4 plan without observed_writer_epoch must fail closed");
     assert!(
         error.to_string().contains("observed_writer_epoch"),
         "unexpected error: {error}"
@@ -1217,13 +1401,116 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     );
 }
 
+fn downgraded_checkpoint_interval(serialized: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(serialized)
+        .expect("restore plan JSON")
+        .get("checkpoint_interval")
+        .and_then(Value::as_u64)
+}
+
+#[tokio::test]
+async fn restore_plan_replay_anchor_interval_survives_store_reconstruction() {
+    let (_backend, storage) = storage();
+    let planning_store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("planning store")
+        .with_checkpoint_interval(interval(1));
+    let source = retained_v1_and_current_v2(&planning_store).await;
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000042", 1, "catalog")
+        .expect("identity");
+    let plan = ControlMvpRestoreParticipant::new(planning_store)
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan with interval one");
+    assert_eq!(
+        Some(1_u64),
+        downgraded_checkpoint_interval(
+            &serde_json::to_string(&plan).expect("serialized restore plan")
+        )
+    );
+
+    let reconstructed = ControlMvpStateStore::new(storage, scope())
+        .expect("reconstructed store")
+        .with_checkpoint_interval(interval(32));
+    let adapter = ControlMvpRestoreParticipant::new(reconstructed);
+    assert!(matches!(
+        adapter.inspect_restore(&plan).await.expect("inspect plan"),
+        RestoreParticipantInspection::Ready
+    ));
+    assert!(matches!(
+        adapter
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("apply plan"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    assert!(matches!(
+        adapter
+            .inspect_restore(&plan)
+            .await
+            .expect("idempotent reinspection"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+}
+
+#[tokio::test]
+async fn noncanonical_restore_authority_is_a_typed_hard_cut_error() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    for (label, retired) in [
+        ("retired manifest path", {
+            let mut retired = serde_json::to_value(&source).expect("source JSON");
+            retired["manifest_path"] = Value::String(format!(
+                "state-store/catalog/manifests/{}.json",
+                source.manifest_id()
+            ));
+            retired
+        }),
+        ("nested checkpoint path", {
+            let mut retired = serde_json::to_value(&source).expect("source JSON");
+            let checkpoint_name = source
+                .checkpoint_path()
+                .expect("checkpoint source")
+                .rsplit('/')
+                .next()
+                .expect("checkpoint file");
+            retired["checkpoint_path"] = Value::String(format!(
+                "control/v1/domains/catalog/checkpoints/nested/{checkpoint_name}"
+            ));
+            retired
+        }),
+    ] {
+        let retired = serde_json::from_value(retired).expect("retired reference shape");
+        let result = ControlMvpRestoreParticipant::new(store.clone())
+            .plan_restore(
+                &retired,
+                &RestoreAttemptIdentity::new("rst_00000000000000000000000043", 1, "catalog")
+                    .expect("identity"),
+                Utc::now(),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("{label} must not be migrated implicitly");
+        };
+        assert!(
+            format!("{error:?}").starts_with("UnsupportedAuthorityFormat"),
+            "unexpected {label} error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("control/v1 hard cut"));
+        assert!(message.contains("old layouts are not migrated"));
+        assert!(message.contains("retained control/v1 authority source"));
+    }
+}
+
 /// R6: literal, hand-maintained versioned plan fixtures.
 ///
 /// These files are authored by hand and must never be regenerated with the
 /// current serializers: a fixture produced by today's code proves only that
 /// today's code agrees with itself. `v1_pre_observed_writer_epoch.json` is the
-/// shape an older revision durably wrote, and `v2_current.json` is the shape
-/// this revision writes. Together they pin the exact accepted/rejected
+/// shape an older revision durably wrote, and `v2_current.json` is the last
+/// shape written before the `control/v1/` layout cutover. Together they pin the
+/// exact accepted/rejected
 /// compatibility policy the recovery path depends on.
 #[test]
 fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
@@ -1255,8 +1542,8 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
         "the versions must differ only by observed_writer_epoch"
     );
 
-    // ACCEPTED: version 1 decodes by explicit migration and stays marked
-    // legacy; version 2 decodes normally.
+    // ACCEPTED: both retired versions decode and stay marked legacy so the
+    // recovery driver can supersede them without dereferencing old paths.
     let PersistedRestoreParticipantPlan::ControlMvp(migrated) =
         serde_json::from_str(v1).expect("v1 fixture must not fail deserialization");
     assert_eq!(1, migrated.version());
@@ -1269,7 +1556,7 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     let PersistedRestoreParticipantPlan::ControlMvp(current) =
         serde_json::from_str(v2).expect("v2 fixture must decode");
     assert_eq!(2, current.version());
-    assert!(!current.is_legacy_version());
+    assert!(current.is_legacy_version());
     assert_eq!(
         migrated.transaction_sha256(),
         current.transaction_sha256(),
@@ -1297,6 +1584,41 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     assert!(
         error.to_string().contains("observed_writer_epoch"),
         "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn literal_old_layout_restore_plans_are_superseded_without_writes() {
+    let (backend, storage) = storage();
+    let adapter = ControlMvpRestoreParticipant::new(store(storage));
+    let before = backend.list("").await.expect("inventory before").len();
+
+    for fixture in [
+        include_str!("fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"),
+        include_str!("fixtures/control_mvp_restore_plans/v2_current.json"),
+    ] {
+        let plan: PersistedRestoreParticipantPlan =
+            serde_json::from_str(fixture).expect("decode old-layout plan fixture");
+        assert!(matches!(
+            adapter
+                .inspect_restore(&plan)
+                .await
+                .expect("inspect old-layout plan"),
+            RestoreParticipantInspection::Superseded
+        ));
+        assert!(matches!(
+            adapter
+                .apply_restore(&plan, Utc::now())
+                .await
+                .expect("apply old-layout plan"),
+            RestoreParticipantInspection::Superseded
+        ));
+    }
+
+    assert_eq!(
+        before,
+        backend.list("").await.expect("inventory after").len(),
+        "recognizing an old-layout plan must not write authority artifacts"
     );
 }
 
@@ -1339,6 +1661,9 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     let mut wire = serde_json::to_value(&plan).expect("plan json");
     let object = wire.as_object_mut().expect("plan object");
     object.remove("observed_writer_epoch");
+    object.remove("observed_reclamation_generation");
+    object.remove("checkpoint_interval");
+    object.remove("transaction_ref");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
@@ -1527,6 +1852,214 @@ async fn restore_recovery_reconciles_pointer_write_then_transport_error() {
             .expect("reconciled apply"),
         RestoreParticipantInspection::Visible { .. }
     ));
+    assert!(backend.fault_fired(), "the restore pointer fault must fire");
+}
+
+#[tokio::test]
+async fn restore_write_and_readback_failures_are_typed_ambiguous() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(PointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store);
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000044", 1, "catalog")
+        .expect("identity");
+    let plan = adapter
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan");
+    backend.arm_with_failed_readback();
+
+    let error = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect_err("failed reconciliation cannot prove the landed restore outcome");
+    let CatalogError::AmbiguousAuthorityOutcome { message } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(message.contains("injected transport error after pointer write"));
+    assert!(message.contains("injected reconciliation pointer read error"));
+    assert!(backend.fault_fired(), "the restore pointer fault must fire");
+    assert!(
+        backend.read_fault_fired(),
+        "the reconciliation read fault must fire"
+    );
+    assert!(matches!(
+        adapter
+            .inspect_restore(&plan)
+            .await
+            .expect("later inspection"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+}
+
+#[tokio::test]
+async fn commit_reconciles_pointer_write_then_transport_error() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(PointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(b"catalog/default", Bytes::from_static(b"committed"))
+        .await
+        .expect("stage write");
+    backend.arm();
+
+    let outcome = txn
+        .commit()
+        .await
+        .expect("exact pointer bytes reconcile the ambiguous response");
+    assert!(
+        backend.fault_fired(),
+        "the pointer fault must actually fire"
+    );
+
+    assert_eq!(1, outcome.state_token().logical_sequence());
+    assert_eq!(
+        Some(Bytes::from_static(b"committed")),
+        store.get(b"catalog/default").await.expect("visible value")
+    );
+}
+
+#[tokio::test]
+async fn landed_commit_followed_by_successor_recovers_from_visible_lineage() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(GatedPointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    let mut candidate = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin candidate");
+    candidate
+        .put(b"catalog/default", Bytes::from_static(b"candidate"))
+        .await
+        .expect("stage candidate");
+    backend.arm();
+    let candidate_commit = tokio::spawn(async move { candidate.commit().await });
+    backend.wait_until_landed().await;
+
+    let mut successor = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin successor from landed candidate");
+    successor
+        .put(b"catalog/default", Bytes::from_static(b"successor"))
+        .await
+        .expect("stage successor");
+    successor.commit().await.expect("commit successor");
+    backend.release_response();
+
+    let outcome = candidate_commit
+        .await
+        .expect("candidate task")
+        .expect("candidate transaction remains proven in visible lineage");
+    assert_eq!(1, outcome.logical_sequence());
+    assert!(backend.fault_fired(), "the gated pointer fault must fire");
+    assert_eq!(
+        Some(Bytes::from_static(b"successor")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("visible successor")
+    );
+}
+
+#[tokio::test]
+async fn landed_commit_with_unrelated_visible_head_is_typed_ambiguous() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(GatedPointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage.clone());
+    let mut candidate = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin candidate");
+    candidate
+        .put(b"catalog/default", Bytes::from_static(b"candidate"))
+        .await
+        .expect("stage candidate");
+    let mut foreign = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin foreign fork");
+    foreign
+        .put(b"catalog/default", Bytes::from_static(b"foreign"))
+        .await
+        .expect("stage foreign fork");
+    let foreign_manifest_id = foreign.candidate_manifest_id().to_string();
+
+    backend.arm();
+    let candidate_commit = tokio::spawn(async move { candidate.commit().await });
+    backend.wait_until_landed().await;
+    assert!(matches!(
+        foreign.commit().await,
+        Err(CatalogError::CasFailed { .. })
+    ));
+
+    let paths = store.paths();
+    let foreign_manifest = storage
+        .get_raw(&paths.manifest_object(&foreign_manifest_id))
+        .await
+        .expect("foreign immutable manifest");
+    let pointer_path = paths.current_pointer();
+    let mut foreign_pointer: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&pointer_path)
+            .await
+            .expect("landed candidate pointer"),
+    )
+    .expect("pointer JSON");
+    foreign_pointer["manifest_id"] = Value::String(foreign_manifest_id);
+    foreign_pointer["manifest_checksum_sha256"] =
+        Value::String(hex::encode(sha2::Sha256::digest(&foreign_manifest)));
+    storage
+        .put_raw(
+            &pointer_path,
+            Bytes::from(serde_json::to_vec(&foreign_pointer).expect("foreign pointer bytes")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("install unrelated visible head");
+    backend.release_response();
+
+    let error = candidate_commit
+        .await
+        .expect("candidate task")
+        .expect_err("unrelated visible lineage cannot prove the landed candidate");
+    assert!(
+        format!("{error:?}").starts_with("AmbiguousAuthorityOutcome"),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("injected transport error after gated pointer write"),
+        "ambiguous outcome must preserve the original storage failure"
+    );
+    assert!(backend.fault_fired(), "the gated pointer fault must fire");
+}
+
+#[tokio::test]
+async fn landed_writer_claim_with_lost_response_adopts_exact_claimed_epoch() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(PointerWriteThenErrorBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store = store(storage);
+    commit_value(&store, b"catalog/default", "v1").await;
+    backend.arm();
+
+    let claimed = store
+        .claim_writer_authority()
+        .await
+        .expect("exact claimed pointer bytes prove the epoch claim landed");
+
+    assert_eq!(1, claimed.writer_epoch());
+    assert!(backend.fault_fired(), "the claim pointer fault must fire");
 }
 
 #[tokio::test]
@@ -1574,7 +2107,7 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
 
     for (field, replacement) in [
         ("record_type", Value::String("other_plan".to_string())),
-        ("version", Value::from(3_u64)),
+        ("version", Value::from(99_u64)),
     ] {
         let mut value = serde_json::to_value(&plan).expect("plan json");
         value[field] = replacement;
@@ -1595,6 +2128,10 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
         .as_object_mut()
         .expect("plan object")
         .remove("observed_writer_epoch");
+    value
+        .as_object_mut()
+        .expect("plan object")
+        .remove("checkpoint_interval");
     let legacy: PersistedRestoreParticipantPlan =
         serde_json::from_value(value).expect("legacy plan remains decodable");
     assert_eq!(
@@ -1691,12 +2228,23 @@ impl StorageBackend for ScriptedFailBackend {
 #[tokio::test]
 async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
     let backend = Arc::new(ScriptedFailBackend::new(
         inner,
-        &["/txlog/tx-restore-", "/manifests/", "/current.pointer.json"],
+        &[
+            "/transactions/tx-restore-",
+            "/segments/l0/tx-restore-",
+            "/indexes/tx-restore-",
+            "/segments/l1/state-",
+            "/indexes/state-",
+            "/manifests/",
+            &current_pointer,
+        ],
     ));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
-    let store = store(storage.clone());
+    let store = ControlMvpStateStore::new(storage.clone(), scope())
+        .expect("store")
+        .with_checkpoint_interval(interval(1));
     let source = retained_v1_and_current_v2(&store).await;
     let adapter = ControlMvpRestoreParticipant::new(store.clone());
     let plan = adapter
@@ -1710,6 +2258,15 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
         .expect("plan restore");
     let PersistedRestoreParticipantPlan::ControlMvp(control_plan) = &plan;
     let transaction_path = control_plan.transaction_path().to_string();
+    let l0_path = store
+        .paths()
+        .l0_segment_object(control_plan.transaction_id());
+    let index_path = store.paths().segment_index(control_plan.transaction_id());
+    let state_id = control_plan
+        .candidate_manifest_id()
+        .replace("manifest-", "state-");
+    let l1_path = store.paths().state_object(&state_id);
+    let l1_index_path = store.paths().segment_index(&state_id);
     let manifest_path = control_plan.candidate_manifest_path().to_string();
     let pre_restore_token = store
         .current_state_token()
@@ -1722,19 +2279,48 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
         control_plan.identity().domain()
     );
 
-    // Immutable prefix each attempt must find on entry: attempt 0 is
-    // interrupted writing the transaction, attempt 1 writes it and is
-    // interrupted writing the manifest, attempt 2 writes that and is
-    // interrupted at the pointer CAS.
-    let expected_prefix = [(false, false), (false, false), (true, false)];
+    // Immutable prefix each attempt must find on entry. The script interrupts
+    // every artifact write in publication order, including the Arrow segment
+    // and its index, before finally interrupting the pointer CAS.
+    let expected_prefix = [
+        (false, false, false, false),
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, true, false, false),
+        (true, true, true, false),
+        (true, true, true, false),
+        (true, true, true, false),
+    ];
     backend.arm();
-    for (attempt, (transaction_present, manifest_present)) in
+    for (attempt, (transaction_present, l0_present, index_present, manifest_present)) in
         expected_prefix.into_iter().enumerate()
     {
         assert_eq!(
             transaction_present,
             storage.get_raw(&transaction_path).await.is_ok(),
             "attempt {attempt}: unexpected restore transaction presence before the attempt"
+        );
+        assert_eq!(
+            l0_present,
+            storage.get_raw(&l0_path).await.is_ok(),
+            "attempt {attempt}: unexpected restore L0 presence before the attempt"
+        );
+        assert_eq!(
+            index_present,
+            storage.get_raw(&index_path).await.is_ok(),
+            "attempt {attempt}: unexpected restore index presence before the attempt"
+        );
+        let expected_l1 = attempt >= 5;
+        let expected_l1_index = attempt >= 6;
+        assert_eq!(
+            expected_l1,
+            storage.get_raw(&l1_path).await.is_ok(),
+            "attempt {attempt}: unexpected restore L1 presence before the attempt"
+        );
+        assert_eq!(
+            expected_l1_index,
+            storage.get_raw(&l1_index_path).await.is_ok(),
+            "attempt {attempt}: unexpected restore L1 index presence before the attempt"
         );
         assert_eq!(
             manifest_present,
@@ -1770,20 +2356,24 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
             "attempt {attempt}: an interrupted restore must not become visible"
         );
     }
-    assert_eq!(3, backend.faults_injected(), "the whole script must fire");
+    assert_eq!(7, backend.faults_injected(), "the whole script must fire");
     assert!(
         storage.get_raw(&transaction_path).await.is_ok()
+            && storage.get_raw(&l0_path).await.is_ok()
+            && storage.get_raw(&index_path).await.is_ok()
+            && storage.get_raw(&l1_path).await.is_ok()
+            && storage.get_raw(&l1_index_path).await.is_ok()
             && storage.get_raw(&manifest_path).await.is_ok(),
-        "the interrupted pointer CAS must leave both immutable objects durable"
+        "the interrupted pointer CAS must leave every immutable object durable"
     );
 
-    // Fourth attempt: nothing is left to fail, so the restore becomes visible.
+    // Eighth attempt: nothing is left to fail, so the restore becomes visible.
     let inspection = adapter
         .apply_restore(&plan, Utc::now())
         .await
-        .expect("the fourth attempt completes");
+        .expect("the eighth attempt completes");
     let RestoreParticipantInspection::Visible { token, evidence } = inspection else {
-        panic!("the fourth attempt must publish one visible restore");
+        panic!("the eighth attempt must publish one visible restore");
     };
     assert_eq!(
         control_plan.result_logical_sequence(),
@@ -1841,7 +2431,8 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
 
 #[tokio::test]
 async fn restore_apply_resumes_transaction_and_manifest_crash_points() {
-    for needle in ["/manifests/", "/current.pointer.json"] {
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
+    for needle in ["/manifests/", current_pointer.as_str()] {
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let backend = Arc::new(FailOncePathBackend::new(inner, needle));
         let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
@@ -1863,6 +2454,7 @@ async fn restore_apply_resumes_transaction_and_manifest_crash_points() {
             adapter.apply_restore(&plan, Utc::now()).await.is_err(),
             "injected crash at {needle} must interrupt the first apply"
         );
+        assert!(backend.fault_fired(), "the armed restore fault must fire");
         assert_eq!(
             2,
             store
@@ -2288,12 +2880,26 @@ async fn restore_immutable_object_conflicts_never_publish_pointer() {
 struct PointerWriteThenErrorBackend {
     inner: Arc<dyn StorageBackend>,
     armed: AtomicBool,
+    fired: AtomicBool,
+    fail_next_pointer_read: AtomicBool,
+    read_fault_fired: AtomicBool,
+    current_pointer: String,
+}
+
+struct GatedPointerWriteThenErrorBackend {
+    inner: Arc<dyn StorageBackend>,
+    armed: AtomicBool,
+    fired: AtomicBool,
+    current_pointer: String,
+    landed: Notify,
+    release: Notify,
 }
 
 struct FailOncePathBackend {
     inner: Arc<dyn StorageBackend>,
     needle: String,
     armed: AtomicBool,
+    fired: AtomicBool,
 }
 
 impl FailOncePathBackend {
@@ -2302,11 +2908,17 @@ impl FailOncePathBackend {
             inner,
             needle: needle.to_string(),
             armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
         }
     }
 
     fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
     }
 }
 
@@ -2327,6 +2939,7 @@ impl StorageBackend for FailOncePathBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         if path.contains(&self.needle) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
             return Err(arco_core::Error::storage("injected restore crash point"));
         }
         self.inner.put(path, data, precondition).await
@@ -2352,6 +2965,7 @@ impl StorageBackend for FailOncePathBackend {
 struct UnstablePointerHeadBackend {
     inner: Arc<dyn StorageBackend>,
     counter: AtomicUsize,
+    current_pointer: String,
 }
 
 impl UnstablePointerHeadBackend {
@@ -2359,6 +2973,7 @@ impl UnstablePointerHeadBackend {
         Self {
             inner,
             counter: AtomicUsize::new(0),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
         }
     }
 }
@@ -2392,7 +3007,7 @@ impl StorageBackend for UnstablePointerHeadBackend {
 
     async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
         let mut meta = self.inner.head(path).await?;
-        if path.ends_with("/current.pointer.json")
+        if path.ends_with(&self.current_pointer)
             && let Some(meta) = &mut meta
         {
             meta.version = format!("unstable-{}", self.counter.fetch_add(1, Ordering::SeqCst));
@@ -2410,16 +3025,129 @@ impl PointerWriteThenErrorBackend {
         Self {
             inner,
             armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            fail_next_pointer_read: AtomicBool::new(false),
+            read_fault_fired: AtomicBool::new(false),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
         }
     }
 
     fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
+        self.fail_next_pointer_read.store(false, Ordering::SeqCst);
+        self.read_fault_fired.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn arm_with_failed_readback(&self) {
+        self.arm();
+        self.fail_next_pointer_read.store(true, Ordering::SeqCst);
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    fn read_fault_fired(&self) -> bool {
+        self.read_fault_fired.load(Ordering::SeqCst)
+    }
+}
+
+impl GatedPointerWriteThenErrorBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
+            landed: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_landed(&self) {
+        while !self.fired.load(Ordering::SeqCst) {
+            self.landed.notified().await;
+        }
+    }
+
+    fn release_response(&self) {
+        self.release.notify_one();
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait]
 impl StorageBackend for PointerWriteThenErrorBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        if path.ends_with(&self.current_pointer)
+            && self.fired.load(Ordering::SeqCst)
+            && self.fail_next_pointer_read.swap(false, Ordering::SeqCst)
+        {
+            self.read_fault_fired.store(true, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(
+                "injected reconciliation pointer read error",
+            ));
+        }
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        if path.ends_with(&self.current_pointer)
+            && self.fired.load(Ordering::SeqCst)
+            && self.fail_next_pointer_read.swap(false, Ordering::SeqCst)
+        {
+            self.read_fault_fired.store(true, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(
+                "injected reconciliation pointer read error",
+            ));
+        }
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        let result = self.inner.put(path, data, precondition).await?;
+        if path.ends_with(&self.current_pointer) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
+            return Err(arco_core::Error::storage(
+                "injected transport error after pointer write",
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GatedPointerWriteThenErrorBackend {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
         self.inner.get(path).await
     }
@@ -2435,9 +3163,12 @@ impl StorageBackend for PointerWriteThenErrorBackend {
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
         let result = self.inner.put(path, data, precondition).await?;
-        if path.ends_with("/current.pointer.json") && self.armed.swap(false, Ordering::SeqCst) {
+        if path.ends_with(&self.current_pointer) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
+            self.landed.notify_waiters();
+            self.release.notified().await;
             return Err(arco_core::Error::storage(
-                "injected transport error after pointer write",
+                "injected transport error after gated pointer write",
             ));
         }
         Ok(result)
@@ -2463,6 +3194,9 @@ impl StorageBackend for PointerWriteThenErrorBackend {
 struct CountingGetBackend {
     inner: Arc<dyn StorageBackend>,
     get_calls: AtomicUsize,
+    pause_at: AtomicUsize,
+    paused: Notify,
+    get_paths: Mutex<Vec<String>>,
 }
 
 impl CountingGetBackend {
@@ -2470,6 +3204,18 @@ impl CountingGetBackend {
         Self {
             inner,
             get_calls: AtomicUsize::new(0),
+            pause_at: AtomicUsize::new(0),
+            paused: Notify::new(),
+            get_paths: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn pause_if_armed(&self) {
+        if self.pause_at.load(Ordering::SeqCst) != 0
+            && self.get_calls() == self.pause_at.load(Ordering::SeqCst)
+        {
+            self.paused.notify_one();
+            std::future::pending::<()>().await;
         }
     }
 
@@ -2479,6 +3225,11 @@ impl CountingGetBackend {
 
     fn reset(&self) {
         self.get_calls.store(0, Ordering::SeqCst);
+        self.get_paths.lock().expect("get paths lock").clear();
+    }
+
+    fn get_paths(&self) -> Vec<String> {
+        self.get_paths.lock().expect("get paths lock").clone()
     }
 }
 
@@ -2486,10 +3237,21 @@ impl CountingGetBackend {
 impl StorageBackend for CountingGetBackend {
     async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
         self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.get_paths
+            .lock()
+            .expect("get paths lock")
+            .push(path.to_string());
+        self.pause_if_armed().await;
         self.inner.get(path).await
     }
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.get_paths
+            .lock()
+            .expect("range paths lock")
+            .push(path.to_string());
+        self.pause_if_armed().await;
         self.inner.get_range(path, range).await
     }
 
@@ -2517,6 +3279,186 @@ impl StorageBackend for CountingGetBackend {
     async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
         self.inner.signed_url(path, expiry).await
     }
+}
+
+#[tokio::test]
+async fn unrelated_point_read_uses_indexes_without_fetching_arrow_segments() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+
+    backend.reset();
+    assert_eq!(None, store.get(b"unrelated/key").await.expect("point read"));
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "point read must consult checksummed segment indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated point read fetched Arrow data despite disjoint indexes: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_prefix_scan_uses_indexes_without_fetching_arrow_segments() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+
+    backend.reset();
+    let page = store
+        .scan(ScanRequest::new(b"unrelated/"))
+        .await
+        .expect("prefix scan");
+    assert!(page.entries().is_empty());
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "prefix scan must consult checksummed segment indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated prefix scan fetched Arrow data despite disjoint indexes: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_token_pinned_read_stays_lazy_and_index_pruned() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage =
+        ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+    let store = ControlMvpStateStore::new(storage, scope())
+        .expect("control MVP store")
+        .with_checkpoint_interval(interval(2));
+
+    for (key, value) in [
+        (&b"catalog/a"[..], "a"),
+        (&b"catalog/b"[..], "b"),
+        (&b"catalog/c"[..], "c"),
+        (&b"catalog/d"[..], "d"),
+    ] {
+        commit_value(&store, key, value).await;
+    }
+    let token = store.current_state_token().await.expect("current token");
+
+    backend.reset();
+    let reader = store.read_at(token).await.expect("open retained reader");
+    assert_eq!(
+        None,
+        reader
+            .get(b"unrelated/key")
+            .await
+            .expect("token-pinned point read")
+    );
+    let paths = backend.get_paths();
+    assert!(
+        paths.iter().any(|path| path_has_extension(path, "idx")),
+        "token-pinned read must consult checksummed indexes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|path| !path_has_extension(path, "arrow")),
+        "unrelated token-pinned read eagerly fetched Arrow data: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn control_scan_continuations_pin_authority_and_reject_prefix_or_scope_reuse() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    for key in [b"catalog/a", b"catalog/b", b"catalog/c"] {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin seed transaction");
+        txn.put(key, Bytes::copy_from_slice(key))
+            .await
+            .expect("stage seed key");
+        txn.commit().await.expect("commit seed key");
+    }
+
+    let first = store
+        .scan(ScanRequest::new(b"catalog/").with_limits(1, 1024, 64))
+        .await
+        .expect("first page");
+    assert_eq!(b"catalog/a", first.entries()[0].key());
+    let observed = first.observed_token().expect("observed authority").clone();
+    let continuation = first.continuation().expect("first continuation").clone();
+
+    let mut advance = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin head advance");
+    advance
+        .put(b"catalog/d", Bytes::from_static(b"catalog/d"))
+        .await
+        .expect("stage head advance");
+    advance.commit().await.expect("commit head advance");
+
+    let wrong_prefix = store
+        .scan(ScanRequest::new(b"other/").with_token(continuation.clone()))
+        .await
+        .expect_err("continuation prefix mismatch must fail closed");
+    assert!(matches!(wrong_prefix, CatalogError::Validation { .. }));
+
+    let foreign_storage =
+        ScopedStorage::new(backend, "tenant", "other-workspace").expect("foreign storage");
+    let foreign = ControlMvpStateStore::new(
+        foreign_storage,
+        StateScope::new("tenant", "other-workspace", "catalog"),
+    )
+    .expect("foreign store");
+    let wrong_scope = foreign
+        .scan(ScanRequest::new(b"catalog/").with_token(continuation.clone()))
+        .await
+        .expect_err("continuation scope mismatch must fail closed");
+    assert!(matches!(wrong_scope, CatalogError::Validation { .. }));
+
+    let second = store
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(1, 1024, 64)
+                .with_token(continuation),
+        )
+        .await
+        .expect("second retained page");
+    assert_eq!(Some(&observed), second.observed_token());
+    assert_eq!(b"catalog/b", second.entries()[0].key());
+    let third = store
+        .scan(
+            ScanRequest::new(b"catalog/")
+                .with_limits(1, 1024, 64)
+                .with_token(second.continuation().expect("second continuation").clone()),
+        )
+        .await
+        .expect("third retained page");
+    assert_eq!(Some(&observed), third.observed_token());
+    assert_eq!(b"catalog/c", third.entries()[0].key());
+    assert!(third.continuation().is_none());
 }
 
 fn interval(value: u64) -> NonZeroU64 {
@@ -2599,8 +3541,8 @@ async fn replay_after_anchor_is_bounded_independent_of_history_length() {
             .expect("checkpoint value")
     );
     assert!(
-        backend.get_calls() <= 3,
-        "checkpoint reads must load only the checkpoint, authority manifest, and snapshot"
+        backend.get_calls() <= 4,
+        "checkpoint reads must load only the checkpoint, authority manifest, Arrow segment, and index"
     );
 }
 
@@ -2629,12 +3571,15 @@ async fn manifest_suffix_and_size_stay_bounded_by_checkpoint_interval() {
             tx_refs <= 4,
             "manifest suffix {tx_refs} exceeded the checkpoint interval at commit {index}"
         );
-        if manifest_json["payload"]["anchor_state"].is_object() {
+        if manifest_json["payload"]["anchor_states"]
+            .as_array()
+            .is_some_and(|states| !states.is_empty())
+        {
             boundary_manifest_sizes.push(manifest_bytes.len());
         }
     }
 
-    // The genesis boundary carries no base_state reference, so steady-state
+    // The genesis boundary carries no base_states references, so steady-state
     // size comparison starts at the second boundary.
     let steady_state = &boundary_manifest_sizes[1..];
     let first_boundary = steady_state
@@ -2649,6 +3594,174 @@ async fn manifest_suffix_and_size_stay_bounded_by_checkpoint_interval() {
     assert!(
         last_boundary <= first_boundary + 64,
         "boundary manifest size must not grow with history: first {first_boundary}, last {last_boundary}"
+    );
+}
+
+#[tokio::test]
+async fn default_layout_emits_intent_at_sixteen_and_worker_preserves_logical_sequence() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    for sequence in 1..=16_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            format!("catalog/key-{sequence:02}").as_bytes(),
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let source = store.current_state_token().await.expect("source token");
+    assert_eq!(16, source.logical_sequence());
+
+    let worker = ControlMvpMaintenanceWorker::new(storage, scope()).expect("maintenance worker");
+    let pending = worker
+        .pending_intent()
+        .await
+        .expect("pending maintenance intent")
+        .expect("intent at sixteen L0 segments");
+    assert_eq!(source.scope(), pending.source_scope());
+    assert_eq!(source.logical_sequence(), pending.source_logical_sequence());
+    assert_eq!(
+        source.authority_manifest_id(),
+        pending.source_authority_manifest_id()
+    );
+
+    let maintenance = worker
+        .consolidate_pending()
+        .await
+        .expect("consolidate pending suffix")
+        .expect("selected maintenance layout");
+    assert_eq!(&source, maintenance.source_token());
+    assert_eq!(
+        source.logical_sequence(),
+        maintenance.selected_token().logical_sequence()
+    );
+    assert_ne!(
+        source.authority_manifest_id(),
+        maintenance.selected_token().authority_manifest_id()
+    );
+    assert_eq!(1, maintenance.layout_generation());
+    assert_eq!(
+        maintenance.selected_token(),
+        &store.current_state_token().await.expect("selected token")
+    );
+    assert!(
+        worker
+            .pending_intent()
+            .await
+            .expect("post-maintenance intent")
+            .is_none()
+    );
+    for sequence in 1..=16_u64 {
+        assert_eq!(
+            Some(Bytes::from(sequence.to_be_bytes().to_vec())),
+            store
+                .get(format!("catalog/key-{sequence:02}").as_bytes())
+                .await
+                .expect("read consolidated key")
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_layout_fails_closed_before_thirty_second_l0_candidate_publication() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    for sequence in 1..=31_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            b"catalog/hot-key",
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let head_before = store.current_state_token().await.expect("head before");
+    let artifacts_before = backend
+        .list("")
+        .await
+        .expect("artifacts before")
+        .into_iter()
+        .map(|object| object.path)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut blocked = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin blocked transaction");
+    blocked
+        .put(b"catalog/hot-key", Bytes::from_static(b"blocked"))
+        .await
+        .expect("stage blocked write");
+    let error = blocked
+        .commit()
+        .await
+        .expect_err("the thirty-second reachable L0 must apply backpressure");
+    assert!(matches!(
+        error,
+        CatalogError::MaintenanceBackpressure { .. }
+    ));
+    assert_eq!(
+        head_before,
+        store.current_state_token().await.expect("head after")
+    );
+    assert_eq!(
+        artifacts_before,
+        backend
+            .list("")
+            .await
+            .expect("artifacts after")
+            .into_iter()
+            .map(|object| object.path)
+            .collect(),
+        "known maintenance backpressure must precede candidate artifact publication"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_maintenance_workers_select_only_one_equivalent_layout() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    for sequence in 1..=16_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin logical transaction");
+        txn.put(
+            b"catalog/hot-key",
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage logical write");
+        txn.commit().await.expect("commit logical write");
+    }
+    let source = store.current_state_token().await.expect("source token");
+    let worker_a = ControlMvpMaintenanceWorker::new(storage.clone(), scope()).expect("worker a");
+    let worker_b = ControlMvpMaintenanceWorker::new(storage, scope()).expect("worker b");
+    let (result_a, result_b) = tokio::join!(
+        worker_a.consolidate_pending(),
+        worker_b.consolidate_pending()
+    );
+    let result_a = result_a.expect("worker a result");
+    let result_b = result_b.expect("worker b result");
+    assert_eq!(
+        1,
+        usize::from(result_a.is_some()) + usize::from(result_b.is_some()),
+        "exact head CAS must select exactly one physical layout"
+    );
+    let current = store.current_state_token().await.expect("current token");
+    assert_eq!(source.logical_sequence(), current.logical_sequence());
+    assert_ne!(
+        source.authority_manifest_id(),
+        current.authority_manifest_id()
     );
 }
 
@@ -2730,7 +3843,7 @@ async fn stale_writer_epoch_cannot_publish_and_fenced_state_survives() {
 #[tokio::test]
 async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(FailOncePathBackend::new(inner, "/states/"));
+    let backend = Arc::new(FailOncePathBackend::new(inner, "/segments/l1/"));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
     let store = ControlMvpStateStore::new(storage.clone(), scope())
         .expect("control MVP store")
@@ -2750,6 +3863,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
         txn.commit().await.is_err(),
         "injected snapshot crash must interrupt the boundary commit"
     );
+    assert!(backend.fault_fired(), "the armed snapshot fault must fire");
 
     assert_eq!(
         Some(Bytes::from_static(b"v1")),
@@ -2823,6 +3937,10 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
             .is_err(),
         "injected snapshot crash must interrupt the explicit checkpoint"
     );
+    assert!(
+        backend.fault_fired(),
+        "the armed checkpoint snapshot fault must fire"
+    );
     assert_eq!(
         pointer_before,
         storage
@@ -2880,7 +3998,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
             .expect("checkpoint manifest checksum"),
         "the checkpoint must be bound to its authority manifest by checksum"
     );
-    let snapshot_id = checkpoint_payload["state"]["state_id"]
+    let snapshot_id = checkpoint_payload["states"][0]["state_id"]
         .as_str()
         .expect("checkpoint state id")
         .to_string();
@@ -2890,7 +4008,7 @@ async fn boundary_commit_crash_before_snapshot_registration_is_recoverable() {
         .expect("checkpointed snapshot");
     assert_eq!(
         hex::encode(sha2::Sha256::digest(&snapshot_bytes)),
-        checkpoint_payload["state"]["checksum_sha256"]
+        checkpoint_payload["states"][0]["checksum_sha256"]
             .as_str()
             .expect("checkpoint snapshot checksum"),
         "the checkpoint must be bound to its snapshot by checksum"
@@ -2982,30 +4100,18 @@ async fn corrupt_state_snapshot_objects_fail_closed() {
         .await
         .expect("anchor snapshot exists");
 
-    rewrite_object_pretty(&storage, &snapshot_path).await;
-    let error = store
-        .get(b"catalog/default")
-        .await
-        .expect_err("byte-rewritten snapshot must fail closed");
-    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
-
-    let mut tampered: Value = serde_json::from_slice(&original).expect("snapshot json");
-    tampered["payload"]["entries"][0]["value"] = Value::Array(vec![Value::from(0_u64)]);
-    let payload_bytes =
-        serde_json::to_vec(&tampered["payload"]).expect("tampered snapshot payload");
-    tampered["checksum_sha256"] = Value::String(hex::encode(sha2::Sha256::digest(&payload_bytes)));
     storage
         .put_raw(
             &snapshot_path,
-            Bytes::from(serde_json::to_vec(&tampered).expect("tampered snapshot")),
+            Bytes::from_static(b"not-an-arrow-segment"),
             WritePrecondition::None,
         )
         .await
-        .expect("write tampered snapshot");
+        .expect("replace snapshot with corrupt Arrow bytes");
     let error = store
         .get(b"catalog/default")
         .await
-        .expect_err("value-tampered snapshot must fail closed");
+        .expect_err("corrupt Arrow snapshot must fail closed");
     assert!(matches!(error, CatalogError::InvariantViolation { .. }));
 
     storage
@@ -3047,7 +4153,8 @@ fn reseal_envelope(bytes: &[u8], mutate: impl FnOnce(&str) -> String) -> Bytes {
     let payload = mutate(&text[start..text.len() - 1]);
     let checksum = hex::encode(sha2::Sha256::digest(payload.as_bytes()));
     Bytes::from(format!(
-        "{{\"artifact_type\":{},\"checksum_sha256\":\"{checksum}\",\"payload\":{payload}}}",
+        "{{\"format_version\":{},\"artifact_type\":{},\"checksum_sha256\":\"{checksum}\",\"payload\":{payload}}}",
+        value["format_version"],
         serde_json::to_string(artifact_type).expect("artifact type json"),
     ))
 }
@@ -3110,10 +4217,15 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
         .get_raw(&orphan_path)
         .await
         .expect("orphan snapshot object exists");
-    let orphan_payload = envelope_payload(&storage, &orphan_path).await;
+    let orphan_index_bytes = storage
+        .get_raw(&paths.segment_index(&orphan_state_id))
+        .await
+        .expect("orphan snapshot index exists");
+    let orphan_index: Value =
+        serde_json::from_slice(&orphan_index_bytes).expect("orphan index json");
     assert_eq!(
         winning_token.logical_sequence(),
-        orphan_payload["logical_sequence"]
+        orphan_index["logicalSequence"]
             .as_u64()
             .expect("orphan sequence"),
         "the orphan must sit at the same logical sequence as the winner"
@@ -3128,7 +4240,8 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
         .get_raw(&checkpoint_path)
         .await
         .expect("checkpoint object");
-    let winning_state_id = envelope_payload(&storage, &checkpoint_path).await["state"]["state_id"]
+    let checkpoint_payload = envelope_payload(&storage, &checkpoint_path).await;
+    let winning_state_id = checkpoint_payload["states"][0]["state_id"]
         .as_str()
         .expect("winning state id")
         .to_string();
@@ -3138,6 +4251,15 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
     // authority manifest, and every checksum in the chain is valid for the
     // bytes it covers.
     let orphan_checksum = hex::encode(sha2::Sha256::digest(&orphan_bytes));
+    let orphan_index_checksum = hex::encode(sha2::Sha256::digest(&orphan_index_bytes));
+    let winning_checksum = checkpoint_payload["states"][0]["checksum_sha256"]
+        .as_str()
+        .expect("winning segment checksum")
+        .to_string();
+    let winning_index_checksum = checkpoint_payload["states"][0]["index_checksum_sha256"]
+        .as_str()
+        .expect("winning segment index checksum")
+        .to_string();
     let tampered = reseal_envelope(&checkpoint_bytes, |payload| {
         payload
             .replace(
@@ -3145,8 +4267,12 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
                 &format!("\"state_id\":\"{orphan_state_id}\""),
             )
             .replace(
-                &envelope_payload_state_checksum(payload),
+                &format!("\"checksum_sha256\":\"{winning_checksum}\""),
                 &format!("\"checksum_sha256\":\"{orphan_checksum}\""),
+            )
+            .replace(
+                &format!("\"index_checksum_sha256\":\"{winning_index_checksum}\""),
+                &format!("\"index_checksum_sha256\":\"{orphan_index_checksum}\""),
             )
     });
     storage
@@ -3165,26 +4291,15 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
     );
     assert!(
         matches!(&error, CatalogError::InvariantViolation { message }
-            if message.contains("not the state named by its authority manifest")),
+            if message.contains("witness")),
         "unexpected error: {error:?}"
     );
 
-    // Persisted-reference resolution must fail closed on the same ground: the
-    // reference is minted from the substituted bytes, so its own digests match.
-    let reference = store
+    let error = store
         .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
         .await
-        .expect("the substitution is coherent enough to mint a reference");
-    let error = store
-        .resolve_persisted_reference(&reference)
-        .await
-        .err()
-        .expect("resolving a substituted checkpoint reference must fail closed");
-    assert!(
-        matches!(&error, CatalogError::InvariantViolation { message }
-            if message.contains("not the state named by its authority manifest")),
-        "unexpected error: {error:?}"
-    );
+        .expect_err("a historical token cannot mint a reference to coherently substituted bytes");
+    assert!(matches!(error, CatalogError::InvariantViolation { .. }));
 
     // Restoring the original checkpoint bytes serves the winning fork again.
     storage
@@ -3203,24 +4318,6 @@ async fn a_checkpoint_referencing_an_orphan_fork_snapshot_fails_closed() {
             .expect("checkpoint value")
     );
     assert!(!backend.list("").await.expect("inventory").is_empty());
-}
-
-/// Returns the exact `"checksum_sha256":"…"` fragment inside a checkpoint
-/// payload's `state` reference, which is the only one that follows `state_id`.
-fn envelope_payload_state_checksum(payload: &str) -> String {
-    let marker = "\"state\":{";
-    let start = payload.find(marker).expect("checkpoint state reference") + marker.len();
-    let rest = &payload[start..];
-    let checksum_start = rest
-        .find("\"checksum_sha256\":\"")
-        .expect("state reference checksum");
-    let checksum_end = rest[checksum_start + "\"checksum_sha256\":\"".len()..]
-        .find('"')
-        .expect("state reference checksum end")
-        + checksum_start
-        + "\"checksum_sha256\":\"".len()
-        + 1;
-    rest[checksum_start..checksum_end].to_string()
 }
 
 /// R4: only the CAS-protected claim advances the published epoch. An
@@ -3489,12 +4586,14 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
         "record-r",
         Bytes::from_static(b"payload-a"),
     ))
+    .await
     .expect("first staging");
     let error = txn
         .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
             "record-r",
             Bytes::from_static(b"payload-dup"),
         ))
+        .await
         .expect_err("duplicate staging within a transaction must fail");
     assert!(
         matches!(error, CatalogError::AlreadyExists { .. }),
@@ -3514,6 +4613,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"loser"),
         ))
+        .await
         .expect("loser stages a fresh id against its base");
     let mut concurrent_winner = store
         .begin_control_txn(TxnOptions::default())
@@ -3524,6 +4624,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"winner"),
         ))
+        .await
         .expect("winner stages the same id concurrently");
     concurrent_winner
         .commit()
@@ -3542,6 +4643,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-s",
             Bytes::from_static(b"retry"),
         ))
+        .await
         .expect_err("retry against the winning state must reject the duplicate id");
     assert!(
         matches!(&error, CatalogError::AlreadyExists { entity, name }
@@ -3572,6 +4674,7 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             ControlMvpOutboxTrimTarget::new("record-r", 1),
             ControlMvpOutboxTrimTarget::new("record-s", 2),
         ])
+        .await
         .expect("trim stays functional");
     trim_txn.commit().await.expect("commit trim");
     assert!(
@@ -3592,8 +4695,181 @@ async fn duplicate_projection_outbox_ids_fail_at_stage_time_and_domain_stays_tri
             "record-r",
             Bytes::from_static(b"payload-b"),
         ))
+        .await
         .expect("trimmed id is stageable again");
     restage.commit().await.expect("commit restage");
+}
+
+#[tokio::test]
+async fn transaction_request_ids_are_validated_before_control_transaction_begin() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let oversized = "é".repeat(129);
+    for invalid in [
+        String::new(),
+        "   ".to_string(),
+        ".".to_string(),
+        "..".to_string(),
+        "request/child".to_string(),
+        "request\\child".to_string(),
+        "request\u{0000}child".to_string(),
+        oversized,
+    ] {
+        let result = store
+            .begin_control_txn(TxnOptions::default().with_request_id(invalid.clone()))
+            .await;
+        assert!(
+            matches!(result, Err(CatalogError::Validation { .. })),
+            "invalid request id {invalid:?} was accepted"
+        );
+    }
+
+    for valid in [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "01JDPG7Y3ZQ7N8M9K2T4V6W8XA",
+    ] {
+        assert!(
+            store
+                .begin_control_txn(TxnOptions::default().with_request_id(valid))
+                .await
+                .is_ok(),
+            "representative request id {valid:?} must be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn projection_intent_collisions_and_invalid_fields_fail_during_staging() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+
+    let mut intent_first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin intent-first transaction");
+    intent_first
+        .stage_projection_intent("shared-a", "catalog", Bytes::from_static(b"payload"))
+        .await
+        .expect("stage first intent");
+    assert!(matches!(
+        intent_first
+            .stage_projection_intent("shared-a", "catalog", Bytes::from_static(b"duplicate"))
+            .await,
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        intent_first
+            .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+                "shared-a",
+                Bytes::from_static(b"record")
+            ))
+            .await,
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+
+    let mut record_first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin record-first transaction");
+    record_first
+        .stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+            "shared-b",
+            Bytes::from_static(b"record"),
+        ))
+        .await
+        .expect("stage record");
+    assert!(matches!(
+        record_first
+            .stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload"))
+            .await,
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+    record_first.commit().await.expect("commit retained record");
+
+    let mut retained_collision = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin retained collision transaction");
+    assert!(matches!(
+        retained_collision
+            .stage_projection_intent("shared-b", "catalog", Bytes::from_static(b"payload"))
+            .await,
+        Err(CatalogError::AlreadyExists { .. })
+    ));
+
+    for (intent_id, projection_kind, payload) in [
+        ("bad/id", "catalog", Bytes::from_static(b"payload")),
+        ("valid-id", " ", Bytes::from_static(b"payload")),
+        ("valid-id", "catalog", Bytes::new()),
+    ] {
+        let mut invalid = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin invalid-intent transaction");
+        assert!(matches!(
+            invalid
+                .stage_projection_intent(intent_id, projection_kind, payload)
+                .await,
+            Err(CatalogError::Validation { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn oversized_projection_intent_aggregate_fails_before_candidate_publication() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin oversized-intent transaction");
+    txn.stage_projection_intent(
+        "oversized-intent",
+        "catalog",
+        Bytes::from(vec![b'x'; 4 * 1024 * 1024]),
+    )
+    .await
+    .expect("staging validates semantic fields before aggregate encoding");
+
+    assert!(matches!(
+        txn.commit().await,
+        Err(CatalogError::MaintenanceBackpressure { .. })
+    ));
+    let published = backend
+        .list("tenant=tenant/workspace=workspace/control/v1/")
+        .await
+        .expect("list test artifacts");
+    assert!(
+        published.is_empty(),
+        "oversized intent published candidate artifacts: {published:?}"
+    );
+}
+
+#[tokio::test]
+async fn oversized_mutable_head_fails_closed_before_json_decode() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    commit_value(&store, b"catalog/default", "v1").await;
+    storage
+        .put_raw(
+            &ControlMvpPaths::new("catalog").current_pointer(),
+            Bytes::from(vec![b' '; 64 * 1024 + 1]),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("replace head with oversized bytes");
+
+    let error = store
+        .get(b"catalog/default")
+        .await
+        .expect_err("oversized head must fail closed");
+    match error {
+        CatalogError::InvariantViolation { message } => {
+            assert!(message.contains("head"));
+            assert!(message.contains("65536"));
+        }
+        other => panic!("expected invariant violation, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3693,7 +4969,8 @@ async fn genuinely_superseded_restore_stays_superseded_across_anchor_boundaries(
 #[tokio::test]
 async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recoverable() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let backend = Arc::new(FailOncePathBackend::new(inner, "/current.pointer.json"));
+    let current_pointer = ControlMvpPaths::new("catalog").current_pointer();
+    let backend = Arc::new(FailOncePathBackend::new(inner, &current_pointer));
     let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
     let store = ControlMvpStateStore::new(storage.clone(), scope())
         .expect("control MVP store")
@@ -3717,6 +4994,7 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
         txn.commit().await.is_err(),
         "injected pointer crash must interrupt the boundary commit"
     );
+    assert!(backend.fault_fired(), "the armed pointer fault must fire");
 
     let torn_state_id = torn_manifest_id.replace("manifest-", "state-");
     storage
@@ -3767,7 +5045,7 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
                 .authority_manifest_id()
                 .replace("manifest-", "state-")
         ),
-        manifest_json["payload"]["anchor_state"]["state_id"],
+        manifest_json["payload"]["anchor_states"][0]["state_id"],
         "the recovered boundary must anchor its own snapshot, not the orphan"
     );
     storage
@@ -3797,5 +5075,176 @@ async fn boundary_commit_crash_after_anchor_snapshot_before_pointer_cas_is_recov
             .as_array()
             .is_some_and(|refs| refs.len() <= 2),
         "replay suffix must stay bounded by the checkpoint interval"
+    );
+}
+
+#[tokio::test]
+async fn gate4_begin_is_metadata_only_and_points_are_memoized() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scope");
+    let store = store(storage);
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("genesis");
+    assert_eq!(backend.get_calls(), 0);
+    first
+        .put(b"a", Bytes::from_static(b"value"))
+        .await
+        .expect("put");
+    first.commit().await.expect("commit");
+    backend.reset();
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    assert_eq!(
+        backend.get_calls(),
+        2,
+        "begin reads only pointer and manifest: {:?}",
+        backend.get_paths()
+    );
+    backend.reset();
+    assert_eq!(
+        tx.get(b"a").await.expect("get").expect("present").bytes(),
+        b"value".as_slice()
+    );
+    assert!(
+        backend.get_calls() > 0,
+        "cold point must authenticate selected evidence"
+    );
+    backend.reset();
+    tx.get(b"a").await.expect("memoized get");
+    assert_eq!(backend.get_calls(), 0);
+    Box::new(tx).rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+async fn gate4_genesis_cursors_are_local_and_dynamic() {
+    let (_, storage) = storage();
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    for key in [b"".as_slice(), b"b", b"d"] {
+        tx.put(key, Bytes::new()).await.expect("put");
+    }
+    let first = tx
+        .scan(ScanRequest::new(b"").with_limits(1, 128, 64))
+        .await
+        .expect("genesis scan");
+    assert!(first.observed_token().is_none());
+    assert_eq!(first.entries()[0].key(), b"");
+    let cursor = first.continuation().expect("local cursor").clone();
+    let mut other = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("other");
+    assert!(
+        other
+            .scan(ScanRequest::new(b"").with_token(cursor.clone()))
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .scan(ScanRequest::new(b"").with_token(cursor.clone()))
+            .await
+            .is_err()
+    );
+    tx.delete(b"b").await.expect("delete");
+    tx.put(b"c", Bytes::from_static(b"new"))
+        .await
+        .expect("insert");
+    let page = tx
+        .scan(ScanRequest::new(b"").with_token(cursor))
+        .await
+        .expect("continue");
+    assert_eq!(
+        page.entries()
+            .iter()
+            .map(arco_catalog::KvPair::key)
+            .collect::<Vec<_>>(),
+        vec![b"c".as_slice(), b"d"]
+    );
+}
+
+#[tokio::test]
+async fn gate4_failed_multi_trim_stages_nothing() {
+    let (_, storage) = storage();
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new("a", Bytes::new()))
+        .await
+        .expect("stage");
+    tx.commit().await.expect("commit");
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    assert!(
+        tx.trim_projection_outbox([
+            ControlMvpOutboxTrimTarget::new("a", 1),
+            ControlMvpOutboxTrimTarget::new("missing", 1),
+        ])
+        .await
+        .is_err()
+    );
+    tx.commit().await.expect("commit empty batch");
+    assert_eq!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn gate4_cancelled_multi_trim_stages_nothing() {
+    let backend = Arc::new(CountingGetBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scope");
+    let store = store(storage);
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    for id in ["a", "b"] {
+        tx.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(id, Bytes::new()))
+            .await
+            .expect("stage");
+    }
+    tx.commit().await.expect("commit");
+    let mut tx = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    backend.reset();
+    backend.pause_at.store(4, Ordering::SeqCst);
+    {
+        let batch = tx.trim_projection_outbox([
+            ControlMvpOutboxTrimTarget::new("a", 1),
+            ControlMvpOutboxTrimTarget::new("b", 1),
+        ]);
+        tokio::pin!(batch);
+        tokio::select! {
+            result = &mut batch => panic!("batch completed before cancellation: {result:?}"),
+            () = backend.paused.notified() => {},
+        }
+    }
+    backend.pause_at.store(0, Ordering::SeqCst);
+    tx.commit().await.expect("commit after cancellation");
+    assert_eq!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox")
+            .len(),
+        2
     );
 }

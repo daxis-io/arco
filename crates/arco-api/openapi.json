@@ -11,7 +11,7 @@
       "name": "Apache-2.0",
       "identifier": "Apache-2.0"
     },
-    "version": "0.2.1"
+    "version": "0.3.0"
   },
   "paths": {
     "/api/v1/browser/urls": {
@@ -6253,7 +6253,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Paths to mint URLs for (must be in manifest allowlist)."
+            "description": "Paths to mint URLs for (must be in manifest allowlist).\nAt most 25 paths may be submitted; duplicates yield one URL."
           },
           "ttl_seconds": {
             "type": [

@@ -33,7 +33,7 @@ use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use datafusion::sql::sqlparser::ast::{ObjectName, visit_relations};
 
-use arco_catalog::{CatalogReader, Table};
+use arco_catalog::{CatalogAuthority, Table};
 
 use super::query::QueryRequest;
 
@@ -129,10 +129,10 @@ pub(crate) async fn query_data(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage.clone());
+    let authority = crate::routes::catalog_authority::resolve_read(&state, &ctx)?;
 
     let session = SessionContext::new();
-    register_referenced_tables(&session, &ctx, &reader, &storage, &referenced_tables).await?;
+    register_referenced_tables(&session, &ctx, &authority, &storage, &referenced_tables).await?;
 
     let df = session
         .sql(sql)
@@ -247,7 +247,7 @@ fn extract_referenced_tables(sql: &str) -> Result<Vec<QualifiedTableRef>, ApiErr
 async fn register_referenced_tables(
     session: &SessionContext,
     ctx: &RequestContext,
-    reader: &CatalogReader,
+    authority: &CatalogAuthority,
     storage: &arco_core::ScopedStorage,
     referenced_tables: &[QualifiedTableRef],
 ) -> Result<usize, ApiError> {
@@ -288,8 +288,8 @@ async fn register_referenced_tables(
         };
 
         if !schema_tables.contains_key(&schema_key) {
-            let tables = reader
-                .list_tables_in_schema(&table_ref.catalog, &table_ref.schema)
+            let tables = authority
+                .list_tables(&table_ref.catalog, &table_ref.schema)
                 .await
                 .map_err(ApiError::from)?;
             schema_tables.insert(schema_key.clone(), tables);

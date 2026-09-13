@@ -15,9 +15,6 @@ use arco_core::Error as CoreError;
 /// API result type.
 pub type ApiResult<T> = Result<T, ApiError>;
 
-/// Fixed client-visible message for errors whose detail is internal state.
-const PUBLIC_INTERNAL_ERROR_MESSAGE: &str = "Internal server error";
-
 /// Standard JSON error response body.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +166,41 @@ impl ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
     }
 
+    /// Rejects table-format commit coordination for the `control/v1` pilot.
+    #[must_use]
+    pub fn catalog_table_commit_disabled() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CATALOG_AUTHORITY_TABLE_COMMIT_DISABLED",
+            "Table-format commits are not enabled for the control/v1 catalog-DDL pilot",
+        )
+        .with_retry_after(5)
+    }
+
+    /// Rejects the legacy control-plane catalog transaction protocol for a
+    /// root whose catalog authority is `control/v1`.
+    #[must_use]
+    pub fn legacy_catalog_transaction_disabled() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CATALOG_AUTHORITY_LEGACY_TRANSACTION_DISABLED",
+            "The legacy catalog transaction protocol cannot write a control/v1 authority root",
+        )
+        .with_retry_after(5)
+    }
+
+    /// Refuses a catalog snapshot-projection surface when no projection for
+    /// the selected `control/v1` authority has been materialized yet.
+    #[must_use]
+    pub fn catalog_projection_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CATALOG_AUTHORITY_PROJECTION_UNAVAILABLE",
+            "The asynchronous catalog projection is not available for this control/v1 root",
+        )
+        .with_retry_after(5)
+    }
+
     /// Returns an unprocessable entity error response.
     pub fn unprocessable_entity(code: &'static str, message: impl Into<String>) -> Self {
         Self::new_with_error(
@@ -300,8 +332,42 @@ impl From<CatalogError> for ApiError {
                 Self::not_found(format!("{entity} not found: {name}"))
             }
             CatalogError::PreconditionFailed { message } => Self::precondition_failed(message),
-            CatalogError::CasFailed { message } | CatalogError::StaleWriterEpoch { message } => {
-                Self::conflict(message)
+            CatalogError::CasFailed { message } => Self::conflict(message),
+            CatalogError::StaleWriterEpoch { message } => {
+                tracing::warn!(internal_error = %message, "catalog authority fencing failure");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_FENCED",
+                    "Catalog authority fencing check failed",
+                )
+                .with_retry_after(1)
+            }
+            CatalogError::AmbiguousAuthorityOutcome { message } => {
+                tracing::warn!(internal_error = %message, "ambiguous catalog authority outcome");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_UNKNOWN_OUTCOME",
+                    "Catalog mutation outcome is not yet known",
+                )
+                .with_retry_after(1)
+            }
+            CatalogError::MaintenanceBackpressure { message } => {
+                tracing::warn!(internal_error = %message, "catalog authority maintenance backpressure");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_MAINTENANCE_BACKPRESSURE",
+                    "Catalog authority maintenance is catching up",
+                )
+                .with_retry_after(5)
+            }
+            CatalogError::UnsupportedAuthorityFormat { message } => {
+                tracing::warn!(internal_error = %message, "unsupported catalog authority format");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_UNSUPPORTED_FORMAT",
+                    "Catalog authority format is not supported by this server",
+                )
+                .with_retry_after(5)
             }
             CatalogError::RequestFailed {
                 http_status,
@@ -311,17 +377,34 @@ impl From<CatalogError> for ApiError {
             // detail (object paths, ledger event IDs, object versions, raw
             // provider errors). Correlate them in logs; expose only the stable
             // `INTERNAL` code and a fixed message.
-            CatalogError::Storage { message }
-            | CatalogError::Serialization { message }
+            CatalogError::Storage { message } => {
+                tracing::warn!(internal_error = %message, "redacted catalog storage error");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_UNAVAILABLE",
+                    "Catalog authority is temporarily unavailable",
+                )
+                .with_retry_after(1)
+            }
+            CatalogError::Serialization { message }
             | CatalogError::Parquet { message }
             | CatalogError::InvariantViolation { message } => {
-                tracing::warn!(internal_error = %message, "redacted internal catalog error");
-                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+                tracing::warn!(internal_error = %message, "redacted corrupt catalog authority state");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_CORRUPT",
+                    "Catalog authority state failed integrity validation",
+                )
             }
             CatalogError::UnsupportedOperation { message } => Self::not_acceptable(message),
             error => {
-                tracing::warn!(internal_error = %error, "redacted unknown catalog error");
-                Self::internal(PUBLIC_INTERNAL_ERROR_MESSAGE)
+                tracing::warn!(internal_error = %error, "redacted unknown catalog authority error");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "CATALOG_AUTHORITY_UNAVAILABLE",
+                    "Catalog authority is temporarily unavailable",
+                )
+                .with_retry_after(1)
             }
         }
     }

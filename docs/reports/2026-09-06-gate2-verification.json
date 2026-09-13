@@ -1,0 +1,135 @@
+{
+  "cwd": "/Users/ethanurbanski/arco/.worktrees/state-store-vnext",
+  "base_commit": "0235eb6c1552c5c87fe3a7638e10022889462b35",
+  "environment": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0"
+  },
+  "log_directory": "/private/tmp/arco-gate2-verification-20260906-112425",
+  "commands": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--test",
+        "state_store_reclamation_schedules",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 87.53957414627075
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--lib",
+        "--tests",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 96.70081305503845
+    },
+    {
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--lib",
+        "--tests",
+        "--benches",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 0.536952018737793
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--bench",
+        "control_mvp_gate",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 23.17782497406006
+    },
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 1.2678966522216797
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.05489802360534668
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-catalog",
+        "--features",
+        "test-utils",
+        "--test",
+        "control_cost_smoke",
+        "authenticated_block_scaling_acceptance",
+        "--locked",
+        "--",
+        "--ignored"
+      ],
+      "exit_code": 0,
+      "seconds": 210.55423402786255
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "arco-core",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 2.5170071125030518
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "-p",
+        "arco-api",
+        "--all-targets",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 0.4017939567565918
+    }
+  ]
+}

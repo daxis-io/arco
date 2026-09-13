@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use arco_catalog::SyncCompactor;
+use arco_catalog::{CatalogAuthorityBindings, SyncCompactor};
 use arco_core::ScopedStorage;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
@@ -114,6 +114,8 @@ pub struct IcebergState {
     pub compactor_factory: Option<Arc<dyn SyncCompactorFactory>>,
     /// Optional audit emitter for security event logging.
     pub audit_emitter: Option<AuditEmitter>,
+    /// Exact-root catalog authority bindings; unlisted roots remain legacy.
+    pub catalog_authority_bindings: Arc<CatalogAuthorityBindings>,
 }
 
 impl IcebergState {
@@ -126,6 +128,7 @@ impl IcebergState {
             credential_provider: None,
             compactor_factory: None,
             audit_emitter: None,
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -138,6 +141,7 @@ impl IcebergState {
             credential_provider: None,
             compactor_factory: None,
             audit_emitter: None,
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -159,6 +163,16 @@ impl IcebergState {
     #[must_use]
     pub fn with_audit_emitter(mut self, emitter: AuditEmitter) -> Self {
         self.audit_emitter = Some(emitter);
+        self
+    }
+
+    /// Installs validated exact-root catalog authority bindings.
+    #[must_use]
+    pub fn with_catalog_authority_bindings(
+        mut self,
+        bindings: Arc<CatalogAuthorityBindings>,
+    ) -> Self {
+        self.catalog_authority_bindings = bindings;
         self
     }
 

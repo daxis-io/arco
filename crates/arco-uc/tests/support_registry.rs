@@ -134,6 +134,7 @@ fn mounted_uc_routes_have_support_registry_metadata() {
         ("POST", "/temporary-path-credentials"),
         ("GET", "/delta/preview/commits"),
         ("POST", "/delta/preview/commits"),
+        ("GET", "/delta/v1/config"),
     ];
 
     for (method, path) in mounted_routes {
@@ -174,8 +175,26 @@ fn every_pinned_uc_operation_has_explicit_registry_classification() {
     );
 }
 
+#[test]
+fn delta_fixture_is_pinned() {
+    let yaml = include_str!("fixtures/unitycatalog-delta-openapi.yaml");
+    assert!(
+        !(yaml.contains("PLACEHOLDER") || yaml.contains("REPLACE_ME")),
+        "unitycatalog-delta-openapi.yaml is a placeholder; pin a real upstream api/delta.yaml and record the commit hash"
+    );
+}
+
 fn pinned_uc_operations() -> BTreeSet<(String, String)> {
-    let yaml = include_str!("fixtures/unitycatalog-openapi.yaml");
+    [
+        include_str!("fixtures/unitycatalog-openapi.yaml"),
+        include_str!("fixtures/unitycatalog-delta-openapi.yaml"),
+    ]
+    .into_iter()
+    .flat_map(pinned_operations_from_fixture)
+    .collect()
+}
+
+fn pinned_operations_from_fixture(yaml: &str) -> BTreeSet<(String, String)> {
     let parsed_yaml: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse UC fixture");
     let parsed_json = serde_json::to_value(parsed_yaml).expect("fixture as json");
     let paths = parsed_json

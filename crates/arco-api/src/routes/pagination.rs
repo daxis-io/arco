@@ -1,9 +1,11 @@
 //! Shared cursor pagination for catalog-style list endpoints.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::error::ApiError;
+use arco_catalog::CatalogListRequest;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
@@ -57,6 +59,14 @@ fn parse_limit(limit: Option<usize>) -> Result<usize, ApiError> {
         ))),
         value => Ok(value),
     }
+}
+
+pub(super) fn catalog_list_request(query: &ListPageQuery) -> Result<CatalogListRequest, ApiError> {
+    let request = CatalogListRequest::new(parse_limit(query.limit)?).map_err(ApiError::from)?;
+    Ok(query
+        .cursor
+        .as_ref()
+        .map_or(request.clone(), |cursor| request.with_page_token(cursor)))
 }
 
 fn encode_cursor(key: &str) -> Result<String, ApiError> {

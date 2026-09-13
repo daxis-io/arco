@@ -33,6 +33,7 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
         .merge(routes::external_locations::routes())
         .merge(routes::credentials::routes())
         .merge(routes::delta_commits::routes())
+        .merge(routes::delta::config::routes())
         .fallback(not_found)
         .layer(middleware::from_fn(context_middleware))
         .layer(TraceLayer::new_for_http());

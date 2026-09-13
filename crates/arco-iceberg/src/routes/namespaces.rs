@@ -10,23 +10,24 @@
 //! - `DELETE /v1/{prefix}/namespaces/{namespace}` - Delete namespace
 //! - `POST /v1/{prefix}/namespaces/{namespace}/properties` - Update properties
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
+use std::collections::HashMap;
 use tracing::instrument;
 
+use arco_catalog::SchemaPatch;
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogReader, CatalogWriter};
 
 use crate::context::IcebergRequestContext;
 use crate::error::{IcebergError, IcebergResult};
-use crate::routes::utils::{ensure_prefix, join_namespace, paginate, parse_namespace};
+use crate::routes::authority;
+use crate::routes::utils::{
+    catalog_list_request, ensure_prefix, join_namespace, paginate, parse_namespace,
+};
 use crate::state::{IcebergConfig, IcebergState};
 use crate::types::{
     CreateNamespaceRequest, CreateNamespaceResponse, GetNamespaceResponse, ListNamespacesQuery,
@@ -99,16 +100,7 @@ async fn list_namespaces(
 ) -> IcebergResult<Json<ListNamespacesResponse>> {
     ensure_prefix(&path.prefix, &state.config)?;
     let separator = state.config.namespace_separator_decoded();
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
-
-    let all_namespaces: Vec<NamespaceIdent> = reader
-        .list_namespaces()
-        .await
-        .map_err(IcebergError::from)?
-        .into_iter()
-        .map(|ns| parse_namespace(&ns.name, &separator))
-        .collect::<IcebergResult<Vec<_>>>()?;
+    let catalog = authority::read(&state, &ctx)?;
 
     let parent_filter = query
         .parent
@@ -116,39 +108,94 @@ async fn list_namespaces(
         .filter(|p| !p.is_empty())
         .map(|p| parse_namespace(p, &separator))
         .transpose()?;
-
-    let mut namespaces: Vec<NamespaceIdent> = if let Some(ref parent_ident) = parent_filter {
-        let parent_name = join_namespace(parent_ident, &separator)?;
-        let parent_exists = reader
-            .get_namespace(&parent_name)
+    let parent_name = parent_filter
+        .as_deref()
+        .map(|parent| join_namespace(parent, &separator))
+        .transpose()?;
+    if !authority::is_control_v1(&state, &ctx)
+        && let Some(parent_name) = parent_name.as_deref()
+    {
+        let parent_exists = catalog
+            .get_native_namespace(parent_name)
             .await
             .map_err(IcebergError::from)?
             .is_some();
 
         if !parent_exists {
-            return Err(IcebergError::namespace_not_found(&parent_name));
+            return Err(IcebergError::namespace_not_found(parent_name));
         }
+    }
 
-        all_namespaces
-            .into_iter()
-            .filter(|ident| {
-                ident.len() == parent_ident.len() + 1 && ident.starts_with(parent_ident)
-            })
-            .collect()
+    let (namespaces, next) = if authority::is_control_v1(&state, &ctx) {
+        list_control_namespaces_page(
+            &catalog,
+            &separator,
+            parent_filter.as_deref(),
+            parent_name.as_deref(),
+            query.page_token,
+            query.page_size,
+        )
+        .await?
     } else {
-        all_namespaces
+        let mut namespaces = catalog
+            .list_native_namespaces()
+            .await
+            .map_err(IcebergError::from)?
             .into_iter()
-            .filter(|ident| ident.len() == 1)
-            .collect()
+            .map(|schema| parse_namespace(&schema.name, &separator))
+            .collect::<IcebergResult<Vec<_>>>()?
+            .into_iter()
+            .filter(|ident| namespace_matches_parent(ident, parent_filter.as_deref()))
+            .collect::<Vec<_>>();
+        namespaces.sort();
+        paginate(namespaces, query.page_token, query.page_size)?
     };
 
-    namespaces.sort();
-    let (page, next) = paginate(namespaces, query.page_token, query.page_size)?;
-
     Ok(Json(ListNamespacesResponse {
-        namespaces: page,
+        namespaces,
         next_page_token: next,
     }))
+}
+
+async fn list_control_namespaces_page(
+    catalog: &arco_catalog::CatalogAuthority,
+    separator: &str,
+    parent: Option<&[String]>,
+    parent_name: Option<&str>,
+    mut page_token: Option<String>,
+    page_size: Option<u32>,
+) -> IcebergResult<(Vec<NamespaceIdent>, Option<String>)> {
+    let page_limit = catalog_list_request(None, page_size)?.max_results();
+    let mut namespaces = Vec::with_capacity(page_limit);
+    loop {
+        let remaining = page_limit.saturating_sub(namespaces.len());
+        let mut request =
+            arco_catalog::CatalogListRequest::new(remaining).map_err(IcebergError::from)?;
+        if let Some(token) = page_token.take() {
+            request = request.with_page_token(token);
+        }
+        let page = catalog
+            .list_iceberg_namespaces_page(parent_name, separator, request)
+            .await
+            .map_err(IcebergError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        for schema in page.into_items() {
+            let ident = parse_namespace(&schema.name, separator)?;
+            if namespace_matches_parent(&ident, parent) {
+                namespaces.push(ident);
+            }
+        }
+        if namespaces.len() == page_limit || next.is_none() {
+            return Ok((namespaces, next));
+        }
+        page_token = next;
+    }
+}
+
+fn namespace_matches_parent(ident: &[String], parent: Option<&[String]>) -> bool {
+    parent.map_or(ident.len() == 1, |parent| {
+        ident.len() == parent.len() + 1 && ident.starts_with(parent)
+    })
 }
 
 /// Create namespace.
@@ -187,11 +234,7 @@ pub(crate) async fn create_namespace(
     let namespace_name = join_namespace(&req.namespace, &separator)?;
     let description = req.properties.get("comment").cloned();
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(IcebergError::from)?;
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -201,19 +244,10 @@ pub(crate) async fn create_namespace(
         options = options.with_idempotency_key(key);
     }
 
-    writer
-        .create_namespace(&namespace_name, description.as_deref(), options)
+    let ns = catalog
+        .create_native_namespace(&namespace_name, description.as_deref(), options)
         .await
         .map_err(IcebergError::from)?;
-
-    let reader = CatalogReader::new(storage);
-    let ns = reader
-        .get_namespace(&namespace_name)
-        .await
-        .map_err(IcebergError::from)?
-        .ok_or_else(|| IcebergError::Internal {
-            message: "Namespace created but not found".to_string(),
-        })?;
 
     let mut properties = HashMap::from([("arco.id".to_string(), ns.id)]);
     if let Some(desc) = ns.description {
@@ -257,11 +291,10 @@ async fn get_namespace(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let catalog = authority::read(&state, &ctx)?;
 
-    let ns = reader
-        .get_namespace(&namespace_name)
+    let ns = catalog
+        .get_native_namespace(&namespace_name)
         .await
         .map_err(IcebergError::from)?
         .ok_or_else(|| IcebergError::namespace_not_found(&namespace_name))?;
@@ -305,11 +338,10 @@ async fn head_namespace(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let catalog = authority::read(&state, &ctx)?;
 
-    let exists = reader
-        .get_namespace(&namespace_name)
+    let exists = catalog
+        .get_native_namespace(&namespace_name)
         .await
         .map_err(IcebergError::from)?
         .is_some();
@@ -364,9 +396,7 @@ pub(crate) async fn delete_namespace(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -376,8 +406,8 @@ pub(crate) async fn delete_namespace(
         options = options.with_idempotency_key(key);
     }
 
-    writer
-        .delete_namespace(&namespace_name, options)
+    catalog
+        .delete_native_namespace(&namespace_name, options)
         .await
         .map_err(IcebergError::from)?;
 
@@ -436,11 +466,10 @@ pub(crate) async fn update_namespace_properties(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let ns = reader
-        .get_namespace(&namespace_name)
+    let ns = catalog
+        .get_native_namespace(&namespace_name)
         .await
         .map_err(IcebergError::from)?
         .ok_or_else(|| IcebergError::namespace_not_found(&namespace_name))?;
@@ -489,16 +518,22 @@ pub(crate) async fn update_namespace_properties(
             current_comment
         };
 
-        let compactor = state.create_compactor(&storage)?;
-        let writer = CatalogWriter::new(storage).with_sync_compactor(compactor);
+        let catalog = authority::write(&state, &ctx).await?;
         let mut opts = WriteOptions::default()
             .with_actor(format!("iceberg-api:{}", ctx.tenant))
             .with_request_id(&ctx.request_id);
         if let Some(ref key) = ctx.idempotency_key {
             opts = opts.with_idempotency_key(key);
         }
-        writer
-            .update_namespace(&namespace_name, new_description, opts)
+        catalog
+            .patch_native_namespace(
+                &namespace_name,
+                SchemaPatch {
+                    description: Some(new_description.map(ToOwned::to_owned)),
+                    ..SchemaPatch::default()
+                },
+                opts,
+            )
             .await
             .map_err(IcebergError::from)?;
     }

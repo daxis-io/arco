@@ -88,8 +88,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, ControlMvpOutboxTrimTarget,
-    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, StateToken, TxnOptions,
-    control_mvp_outbox_event_id,
+    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, MAX_SCAN_PAGE_ROWS, StateScope,
+    StateToken, TxnOptions, control_mvp_outbox_event_id, scan_all_entries_bounded,
 };
 use crate::error::{CatalogError, Result};
 
@@ -106,12 +106,95 @@ pub const PROJECTION_OUTBOX_TRIM_BINDING_KEY: &[u8] = b"projection-outbox/trim-c
 const FIRST_BINDING_INCARNATION: u64 = 1;
 
 const BINDING_REGISTRATION_ATTEMPTS: usize = 4;
+const STATUS_CAS_ATTEMPTS: usize = 8;
 
 /// Acknowledgement key namespace. Version 2 keys carry the binding incarnation
 /// and the immutable event id; version 1 keys (record-id-only) live under a
 /// different prefix, so they are never scanned, decoded, or matched by this
 /// revision and cannot authorize a skip or a trim.
 const ACK_KEY_NAMESPACE: &[u8] = b"projection-outbox-acks/ack/v2/";
+const STATUS_KEY_NAMESPACE: &[u8] = b"projection-outbox-acks/status/v1/";
+const QUARANTINE_KEY_NAMESPACE: &[u8] = b"projection-outbox-acks/quarantine/v1/";
+
+/// Durable status for one materialized projection family.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionMaterializationStatus {
+    version: u32,
+    projection_kind: String,
+    applied_authority_sequence: Option<u64>,
+    observed_authority_sequence: Option<u64>,
+    last_attempt_at_ms: i64,
+    last_success_at_ms: Option<i64>,
+    artifact_manifest_path: Option<String>,
+    failure_state: Option<String>,
+}
+
+impl ProjectionMaterializationStatus {
+    /// Returns the latest authority sequence with a published artifact.
+    #[must_use]
+    pub const fn applied_authority_sequence(&self) -> Option<u64> {
+        self.applied_authority_sequence
+    }
+
+    /// Returns the latest authority sequence attempted by the materializer.
+    #[must_use]
+    pub const fn observed_authority_sequence(&self) -> Option<u64> {
+        self.observed_authority_sequence
+    }
+
+    /// Returns the last successful materialization timestamp.
+    #[must_use]
+    pub const fn last_success_at_ms(&self) -> Option<i64> {
+        self.last_success_at_ms
+    }
+
+    /// Returns the redacted stable failure state.
+    #[must_use]
+    pub fn failure_state(&self) -> Option<&str> {
+        self.failure_state.as_deref()
+    }
+
+    /// Returns the immutable manifest for the latest applied artifact.
+    #[must_use]
+    pub fn artifact_manifest_path(&self) -> Option<&str> {
+        self.artifact_manifest_path.as_deref()
+    }
+}
+
+/// Durable terminal disposition for one malformed projection event.
+///
+/// Quarantine is distinct from acknowledgement: it lets an ordered drain
+/// continue to later valid events, while backlog and projection watermarks
+/// continue to report that this exact event was never materialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionTerminalDisposition {
+    version: u32,
+    projection_kind: String,
+    source_sequence: u64,
+    source_record_id: String,
+    failure_code: String,
+    quarantined_at_ms: i64,
+}
+
+impl ProjectionTerminalDisposition {
+    /// Returns the source sequence of the quarantined event.
+    #[must_use]
+    pub const fn source_sequence(&self) -> u64 {
+        self.source_sequence
+    }
+
+    /// Returns the exact source record identifier.
+    #[must_use]
+    pub fn source_record_id(&self) -> &str {
+        &self.source_record_id
+    }
+
+    /// Returns the redacted stable terminal failure code.
+    #[must_use]
+    pub fn failure_code(&self) -> &str {
+        &self.failure_code
+    }
+}
 
 /// Internal/operator-only writer for projection outbox acknowledgements.
 #[derive(Clone)]
@@ -165,6 +248,234 @@ impl ProjectionOutboxAckWriter {
         }
     }
 
+    /// Reads durable materialization status for one projection family.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or corrupt-record errors.
+    pub async fn projection_status(
+        &self,
+        projection_kind: &str,
+    ) -> Result<Option<ProjectionMaterializationStatus>> {
+        validate_status_identity(projection_kind, "projection kind")?;
+        self.store
+            .get(&projection_status_key(projection_kind))
+            .await?
+            .map(|bytes| decode_projection_status(&bytes, projection_kind))
+            .transpose()
+    }
+
+    /// Records a successfully published materialization before its outbox
+    /// event may be acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, storage, or CAS errors.
+    pub async fn record_projection_success(
+        &self,
+        projection_kind: &str,
+        authority_sequence: u64,
+        artifact_manifest_path: &str,
+        at_ms: i64,
+    ) -> Result<()> {
+        validate_status_identity(projection_kind, "projection kind")?;
+        ScopedStorage::validate_path(artifact_manifest_path)?;
+        if authority_sequence == 0 || at_ms < 0 {
+            return Err(validation_failed(
+                "projection success requires a positive sequence and timestamp",
+            ));
+        }
+        self.write_projection_status(ProjectionMaterializationStatus {
+            version: 1,
+            projection_kind: projection_kind.to_string(),
+            applied_authority_sequence: Some(authority_sequence),
+            observed_authority_sequence: Some(authority_sequence),
+            last_attempt_at_ms: at_ms,
+            last_success_at_ms: Some(at_ms),
+            artifact_manifest_path: Some(artifact_manifest_path.to_string()),
+            failure_state: None,
+        })
+        .await
+    }
+
+    /// Records a redacted retryable or terminal materialization failure while
+    /// retaining the last successfully applied artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, storage, or CAS errors.
+    pub async fn record_projection_failure(
+        &self,
+        projection_kind: &str,
+        observed_authority_sequence: u64,
+        failure_code: &str,
+        retryable: bool,
+        at_ms: i64,
+    ) -> Result<()> {
+        validate_status_identity(projection_kind, "projection kind")?;
+        validate_failure_code(failure_code)?;
+        if observed_authority_sequence == 0 || at_ms < 0 {
+            return Err(validation_failed(
+                "projection failure requires a positive sequence and timestamp",
+            ));
+        }
+        let state = if retryable { "retryable" } else { "terminal" };
+        self.write_projection_status(ProjectionMaterializationStatus {
+            version: 1,
+            projection_kind: projection_kind.to_string(),
+            applied_authority_sequence: None,
+            observed_authority_sequence: Some(observed_authority_sequence),
+            last_attempt_at_ms: at_ms,
+            last_success_at_ms: None,
+            artifact_manifest_path: None,
+            failure_state: Some(format!("{state}:{failure_code}")),
+        })
+        .await
+    }
+
+    /// Durably quarantines one malformed event and records terminal status in
+    /// the same ack-root transaction.
+    ///
+    /// The operation is idempotent for the exact projection kind, source
+    /// sequence, record id, and failure code. A quarantine is intentionally
+    /// not an acknowledgement, so it cannot advance the materialized
+    /// projection watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, storage, serialization, or CAS errors.
+    pub async fn record_projection_quarantine(
+        &self,
+        projection_kind: &str,
+        source_sequence: u64,
+        source_record_id: &str,
+        failure_code: &str,
+        at_ms: i64,
+    ) -> Result<()> {
+        validate_status_identity(projection_kind, "projection kind")?;
+        validate_failure_code(failure_code)?;
+        if source_sequence == 0
+            || at_ms < 0
+            || source_record_id.is_empty()
+            || source_record_id.len() > 512
+        {
+            return Err(validation_failed(
+                "projection quarantine requires a positive sequence, bounded record id, and timestamp",
+            ));
+        }
+        let disposition = ProjectionTerminalDisposition {
+            version: 1,
+            projection_kind: projection_kind.to_string(),
+            source_sequence,
+            source_record_id: source_record_id.to_string(),
+            failure_code: failure_code.to_string(),
+            quarantined_at_ms: at_ms,
+        };
+        let key = projection_quarantine_key(projection_kind, source_sequence);
+        let proposed_status = ProjectionMaterializationStatus {
+            version: 1,
+            projection_kind: projection_kind.to_string(),
+            applied_authority_sequence: None,
+            observed_authority_sequence: Some(source_sequence),
+            last_attempt_at_ms: at_ms,
+            last_success_at_ms: None,
+            artifact_manifest_path: None,
+            failure_state: Some(format!("terminal:{failure_code}")),
+        };
+        let disposition_bytes =
+            serde_json::to_vec(&disposition)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    serialization_failed(format!("projection quarantine encode: {error}"))
+                })?;
+        let status_key = projection_status_key(projection_kind);
+        for attempt in 0..STATUS_CAS_ATTEMPTS {
+            let mut txn = self
+                .writer_store()
+                .await?
+                .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
+                .await?;
+            if let Some(existing) = txn.get(&key).await? {
+                validate_matching_quarantine(existing.bytes(), &disposition)?;
+                return Ok(());
+            }
+            let previous = txn
+                .get(&status_key)
+                .await?
+                .map(|value| decode_projection_status(value.bytes(), projection_kind))
+                .transpose()?;
+            let status = merge_projection_status(previous.as_ref(), proposed_status.clone())?;
+            let status_bytes = serde_json::to_vec(&status)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    serialization_failed(format!("projection status encode: {error}"))
+                })?;
+            txn.assert_absent(&key).await?;
+            txn.put(&key, disposition_bytes.clone()).await?;
+            txn.put(&status_key, status_bytes).await?;
+            match txn.commit().await {
+                Ok(_) => return Ok(()),
+                Err(CatalogError::CasFailed { .. }) if attempt + 1 < STATUS_CAS_ATTEMPTS => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CatalogError::CasFailed {
+            message: "projection quarantine status CAS retry budget exhausted".to_string(),
+        })
+    }
+
+    /// Reads one exact durable terminal disposition.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, storage, or corrupt-record errors.
+    pub async fn projection_quarantine(
+        &self,
+        projection_kind: &str,
+        source_sequence: u64,
+    ) -> Result<Option<ProjectionTerminalDisposition>> {
+        validate_status_identity(projection_kind, "projection kind")?;
+        self.store
+            .get(&projection_quarantine_key(projection_kind, source_sequence))
+            .await?
+            .map(|bytes| decode_projection_quarantine(&bytes, projection_kind, source_sequence))
+            .transpose()
+    }
+
+    async fn write_projection_status(&self, status: ProjectionMaterializationStatus) -> Result<()> {
+        let key = projection_status_key(&status.projection_kind);
+        for attempt in 0..STATUS_CAS_ATTEMPTS {
+            let mut txn = self
+                .writer_store()
+                .await?
+                .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
+                .await?;
+            let previous = txn
+                .get(&key)
+                .await?
+                .map(|value| decode_projection_status(value.bytes(), &status.projection_kind))
+                .transpose()?;
+            let merged = merge_projection_status(previous.as_ref(), status.clone())?;
+            if previous.as_ref() == Some(&merged) {
+                return Ok(());
+            }
+            let bytes = serde_json::to_vec(&merged)
+                .map(Bytes::from)
+                .map_err(|error| {
+                    serialization_failed(format!("projection status encode: {error}"))
+                })?;
+            txn.put(&key, bytes).await?;
+            match txn.commit().await {
+                Ok(_) => return Ok(()),
+                Err(CatalogError::CasFailed { .. }) if attempt + 1 < STATUS_CAS_ATTEMPTS => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(CatalogError::CasFailed {
+            message: "projection status CAS retry budget exhausted".to_string(),
+        })
+    }
+
     /// Durably acknowledges one consumed outbox event.
     ///
     /// Idempotent per delivery identity `(consumer_id, binding_incarnation,
@@ -194,7 +505,10 @@ impl ProjectionOutboxAckWriter {
         txn.assert_absent(&key).await?;
         txn.put(&key, encode_ack_record(&record)?).await?;
         match txn.commit().await {
-            Ok(token) => Ok(ProjectionOutboxAckReceipt { token, record }),
+            Ok(outcome) => Ok(ProjectionOutboxAckReceipt {
+                token: outcome.into_state_token(),
+                record,
+            }),
             Err(CatalogError::CasFailed { .. }) => {
                 self.existing_receipt_for(&key, &record).await?.map_or_else(
                     || {
@@ -277,7 +591,10 @@ impl ProjectionOutboxAckWriter {
     pub async fn latest_projected_sequence(&self, consumer_id: &str) -> Result<Option<u64>> {
         let prefix = consumer_prefix(consumer_id);
         let mut latest = None;
-        for entry in self.store.scan_prefix(&prefix).await? {
+        for entry in
+            scan_all_entries_bounded(&self.store, &prefix, MAX_SCAN_PAGE_ROWS, 64 * 1024 * 1024)
+                .await?
+        {
             let record = decode_ack_record(entry.value().bytes())?;
             if latest.is_none_or(|current| record.source_sequence > current) {
                 latest = Some(record.source_sequence);
@@ -369,7 +686,9 @@ impl ProjectionOutboxAckWriter {
             })?,
         )
         .await?;
-        txn.commit().await.map(Some)
+        txn.commit()
+            .await
+            .map(|outcome| Some(outcome.into_state_token()))
     }
 
     /// Returns the event ids this consumer has acknowledged **within one
@@ -389,7 +708,10 @@ impl ProjectionOutboxAckWriter {
     ) -> Result<BTreeSet<String>> {
         let prefix = incarnation_prefix(consumer_id, binding_incarnation);
         let mut events = BTreeSet::new();
-        for entry in self.store.scan_prefix(&prefix).await? {
+        for entry in
+            scan_all_entries_bounded(&self.store, &prefix, MAX_SCAN_PAGE_ROWS, 64 * 1024 * 1024)
+                .await?
+        {
             let record = decode_ack_record(entry.value().bytes())?;
             if record.consumer_id != consumer_id
                 || record.binding_incarnation != binding_incarnation
@@ -694,9 +1016,22 @@ pub struct ProjectionOutboxAckWatermarkLag {
 /// Processes one outbox record during a drain pass.
 #[async_trait]
 pub trait ProjectionOutboxHandler: Send + Sync {
-    /// Processes a record; an error aborts the drain before acknowledgement,
-    /// so the record remains pending.
-    async fn process(&self, record: &ControlMvpProjectionOutboxRecord) -> Result<()>;
+    /// Processes a record. Retryable errors abort before acknowledgement;
+    /// durable terminal quarantine permits later records to proceed but leaves
+    /// the quarantined record pending and outside the projection watermark.
+    async fn process(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+    ) -> Result<ProjectionOutboxProcessDisposition>;
+}
+
+/// Truthful result of handling one projection event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionOutboxProcessDisposition {
+    /// The event was materialized and may be acknowledged.
+    Materialized,
+    /// A durable terminal disposition was recorded; do not acknowledge it.
+    Quarantined,
 }
 
 /// Drain-only handler that performs no projection work.
@@ -709,8 +1044,11 @@ pub struct AckOnlyProjectionHandler;
 
 #[async_trait]
 impl ProjectionOutboxHandler for AckOnlyProjectionHandler {
-    async fn process(&self, _record: &ControlMvpProjectionOutboxRecord) -> Result<()> {
-        Ok(())
+    async fn process(
+        &self,
+        _record: &ControlMvpProjectionOutboxRecord,
+    ) -> Result<ProjectionOutboxProcessDisposition> {
+        Ok(ProjectionOutboxProcessDisposition::Materialized)
     }
 }
 
@@ -734,6 +1072,10 @@ pub struct ProjectionOutboxDrainReport {
     pub drained_record_ids: Vec<String>,
     /// Immutable event ids processed and acknowledged by this pass.
     pub drained_event_ids: Vec<String>,
+    /// Record ids carrying durable terminal dispositions but no acknowledgement.
+    pub quarantined_record_ids: Vec<String>,
+    /// Immutable event ids carrying durable terminal dispositions.
+    pub quarantined_event_ids: Vec<String>,
     /// Records skipped because this tenure already acknowledged them.
     pub already_acknowledged: usize,
     /// Watermark after the pass.
@@ -1050,7 +1392,7 @@ impl ProjectionOutboxWorker {
             encode_binding(&self.consumer_id, incarnation)?,
         )
         .await?;
-        let token = txn.commit().await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(ProjectionOutboxRebindReport {
             previous_consumer: previous
                 .as_ref()
@@ -1116,6 +1458,35 @@ impl ProjectionOutboxWorker {
         handler: &dyn ProjectionOutboxHandler,
     ) -> Result<ProjectionOutboxDrainReport> {
         let incarnation = self.ensure_binding().await?;
+        self.drain_at_incarnation(handler, incarnation).await
+    }
+
+    /// Drains a statically assigned consumer without mutating the source root.
+    ///
+    /// The catalog projection owns one compile-time consumer identity and
+    /// stores acknowledgements in the separate ack domain. It must not install
+    /// generic trim-binding metadata in catalog authority, because doing so
+    /// would advance the logical catalog sequence without a catalog mutation.
+    /// Callers of this crate-private path must enforce that fixed identity and
+    /// must not expose generic rebind or source-domain trim operations.
+    pub(crate) async fn drain_fixed_consumer(
+        &self,
+        handler: &dyn ProjectionOutboxHandler,
+    ) -> Result<ProjectionOutboxDrainReport> {
+        if self.consumer_binding().await?.is_some() {
+            return Err(invariant_violation(
+                "fixed projection consumer cannot use a source root with generic binding metadata",
+            ));
+        }
+        self.drain_at_incarnation(handler, FIRST_BINDING_INCARNATION)
+            .await
+    }
+
+    async fn drain_at_incarnation(
+        &self,
+        handler: &dyn ProjectionOutboxHandler,
+        incarnation: u64,
+    ) -> Result<ProjectionOutboxDrainReport> {
         let outbox = self.source.current_projection_outbox().await?;
         let acked = self
             .acks
@@ -1123,6 +1494,8 @@ impl ProjectionOutboxWorker {
             .await?;
         let mut drained_record_ids = Vec::new();
         let mut drained_event_ids = Vec::new();
+        let mut quarantined_record_ids = Vec::new();
+        let mut quarantined_event_ids = Vec::new();
         let mut already_acknowledged = 0usize;
         for record in &outbox {
             let event_id = Self::event_id_of(record)?;
@@ -1131,7 +1504,12 @@ impl ProjectionOutboxWorker {
                 continue;
             }
             let origin_sequence = Self::origin_sequence_of(record)?;
-            handler.process(record).await?;
+            let disposition = handler.process(record).await?;
+            if disposition == ProjectionOutboxProcessDisposition::Quarantined {
+                quarantined_record_ids.push(record.record_id().to_string());
+                quarantined_event_ids.push(event_id);
+                continue;
+            }
             self.acks
                 .acknowledge(&ProjectionOutboxDeliveryId::new(
                     self.consumer_id.clone(),
@@ -1146,6 +1524,8 @@ impl ProjectionOutboxWorker {
         Ok(ProjectionOutboxDrainReport {
             drained_record_ids,
             drained_event_ids,
+            quarantined_record_ids,
+            quarantined_event_ids,
             already_acknowledged,
             latest_projected_sequence: self
                 .acks
@@ -1269,8 +1649,9 @@ impl ProjectionOutboxWorker {
                 .await?;
             }
         }
-        txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))?;
-        let token = txn.commit().await?;
+        txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))
+            .await?;
+        let token = txn.commit().await?.into_state_token();
         Ok(ProjectionOutboxTrimReport {
             trimmed_record_ids,
             trimmed_event_ids,
@@ -1331,6 +1712,160 @@ impl ProjectionOutboxWorker {
             Err(error) => Err(error),
         }
     }
+}
+
+fn projection_status_key(projection_kind: &str) -> Vec<u8> {
+    let mut key = STATUS_KEY_NAMESPACE.to_vec();
+    push_length_prefixed(&mut key, projection_kind.as_bytes());
+    key
+}
+
+fn projection_quarantine_key(projection_kind: &str, source_sequence: u64) -> Vec<u8> {
+    let mut key = QUARANTINE_KEY_NAMESPACE.to_vec();
+    push_length_prefixed(&mut key, projection_kind.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(format!("{source_sequence:020}").as_bytes());
+    key
+}
+
+fn decode_projection_quarantine(
+    bytes: &Bytes,
+    expected_kind: &str,
+    expected_sequence: u64,
+) -> Result<ProjectionTerminalDisposition> {
+    let disposition: ProjectionTerminalDisposition = serde_json::from_slice(bytes)
+        .map_err(|error| serialization_failed(format!("projection quarantine decode: {error}")))?;
+    if disposition.version != 1
+        || disposition.projection_kind != expected_kind
+        || disposition.source_sequence != expected_sequence
+    {
+        return Err(invariant_violation(
+            "projection quarantine identity or version is invalid",
+        ));
+    }
+    Ok(disposition)
+}
+
+fn validate_matching_quarantine(
+    bytes: &Bytes,
+    expected: &ProjectionTerminalDisposition,
+) -> Result<()> {
+    let existing =
+        decode_projection_quarantine(bytes, &expected.projection_kind, expected.source_sequence)?;
+    if existing.source_record_id != expected.source_record_id
+        || existing.failure_code != expected.failure_code
+    {
+        return Err(invariant_violation(
+            "projection quarantine key resolves to a different terminal disposition",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_projection_status(
+    bytes: &Bytes,
+    expected_kind: &str,
+) -> Result<ProjectionMaterializationStatus> {
+    let status: ProjectionMaterializationStatus = serde_json::from_slice(bytes)
+        .map_err(|error| serialization_failed(format!("projection status decode: {error}")))?;
+    if status.version != 1 || status.projection_kind != expected_kind {
+        return Err(invariant_violation(
+            "projection status identity or version is invalid",
+        ));
+    }
+    Ok(status)
+}
+
+fn merge_projection_status(
+    current: Option<&ProjectionMaterializationStatus>,
+    proposed: ProjectionMaterializationStatus,
+) -> Result<ProjectionMaterializationStatus> {
+    let Some(current) = current else {
+        return Ok(proposed);
+    };
+    if current.projection_kind != proposed.projection_kind {
+        return Err(invariant_violation(
+            "cannot merge projection status across projection kinds",
+        ));
+    }
+
+    let current_applied = current.applied_authority_sequence.unwrap_or(0);
+    let proposed_applied = proposed.applied_authority_sequence.unwrap_or(0);
+    if current_applied != 0
+        && current_applied == proposed_applied
+        && current.artifact_manifest_path.is_some()
+        && proposed.artifact_manifest_path.is_some()
+        && current.artifact_manifest_path != proposed.artifact_manifest_path
+    {
+        return Err(invariant_violation(
+            "one projection sequence resolves to conflicting artifact manifests",
+        ));
+    }
+    let proposed_advances_applied = proposed_applied > current_applied;
+    let applied_authority_sequence = current
+        .applied_authority_sequence
+        .max(proposed.applied_authority_sequence);
+    let artifact_manifest_path = if proposed_advances_applied {
+        proposed.artifact_manifest_path.clone()
+    } else {
+        current.artifact_manifest_path.clone()
+    };
+    let last_success_at_ms = current.last_success_at_ms.max(proposed.last_success_at_ms);
+
+    let current_observed = current.observed_authority_sequence.unwrap_or(0);
+    let proposed_observed = proposed.observed_authority_sequence.unwrap_or(0);
+    let observed_authority_sequence = current
+        .observed_authority_sequence
+        .max(proposed.observed_authority_sequence);
+    let merged_applied = applied_authority_sequence.unwrap_or(0);
+    let failure_state = if proposed.failure_state.is_none() && proposed_applied >= current_observed
+    {
+        None
+    } else if proposed.failure_state.is_some()
+        && proposed_observed > current_observed
+        && proposed_observed > merged_applied
+    {
+        proposed.failure_state.clone()
+    } else {
+        current.failure_state.clone()
+    };
+
+    Ok(ProjectionMaterializationStatus {
+        version: 1,
+        projection_kind: current.projection_kind.clone(),
+        applied_authority_sequence,
+        observed_authority_sequence,
+        last_attempt_at_ms: current.last_attempt_at_ms.max(proposed.last_attempt_at_ms),
+        last_success_at_ms,
+        artifact_manifest_path,
+        failure_state,
+    })
+}
+
+fn validate_status_identity(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(validation_failed(format!("invalid {label}")));
+    }
+    Ok(())
+}
+
+fn validate_failure_code(code: &str) -> Result<()> {
+    if code.is_empty()
+        || code.len() > 96
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(validation_failed(
+            "projection failure code must be a stable redacted identifier",
+        ));
+    }
+    Ok(())
 }
 
 fn consumer_prefix(consumer_id: &str) -> Vec<u8> {
@@ -1457,7 +1992,7 @@ mod tests {
     };
 
     const SOURCE_DOMAIN: &str = "phase5-source";
-    const SOURCE_POINTER: &str = "/control-mvp/phase5-source/current.pointer.json";
+    const SOURCE_POINTER: &str = "/control/v1/domains/phase5-source/head/current.json";
 
     fn ack_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PROJECTION_OUTBOX_ACK_DOMAIN)
@@ -1481,6 +2016,156 @@ mod tests {
 
     fn writer(storage: ScopedStorage) -> ProjectionOutboxAckWriter {
         ProjectionOutboxAckWriter::new(storage, ack_scope()).expect("ack writer")
+    }
+
+    #[tokio::test]
+    async fn projection_status_persists_success_and_redacted_failure_across_restart() {
+        let storage = storage();
+        let writer = ProjectionOutboxAckWriter::new(storage.clone(), ack_scope()).expect("writer");
+        writer
+            .record_projection_success(
+                "catalog-parquet-v1",
+                7,
+                "control/v1/projections/catalog-parquet/0007/manifest.json",
+                1_000,
+            )
+            .await
+            .expect("record success");
+
+        let restarted = ProjectionOutboxAckWriter::new(storage, ack_scope()).expect("restart");
+        let success = restarted
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("read status")
+            .expect("status");
+        assert_eq!(Some(7), success.applied_authority_sequence());
+        assert_eq!(Some(1_000), success.last_success_at_ms());
+        assert_eq!(None, success.failure_state());
+
+        restarted
+            .record_projection_failure(
+                "catalog-parquet-v1",
+                8,
+                "CATALOG_PROJECTION_FAILED",
+                true,
+                2_000,
+            )
+            .await
+            .expect("record failure");
+        let failure = restarted
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("read failure")
+            .expect("status");
+        assert_eq!(Some(7), failure.applied_authority_sequence());
+        assert_eq!(Some(1_000), failure.last_success_at_ms());
+        assert_eq!(Some(8), failure.observed_authority_sequence());
+        assert_eq!(
+            Some("retryable:CATALOG_PROJECTION_FAILED"),
+            failure.failure_state()
+        );
+
+        restarted
+            .record_projection_failure(
+                "catalog-parquet-v1",
+                9,
+                "INVALID_PROJECTION_INTENT",
+                false,
+                3_000,
+            )
+            .await
+            .expect("record terminal failure");
+        let terminal = restarted
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("read terminal failure")
+            .expect("status");
+        assert_eq!(Some(7), terminal.applied_authority_sequence());
+        assert_eq!(Some(9), terminal.observed_authority_sequence());
+        assert_eq!(
+            Some("terminal:INVALID_PROJECTION_INTENT"),
+            terminal.failure_state()
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_status_is_monotonic_across_stale_and_concurrent_updates() {
+        let storage = storage();
+        let writer = writer(storage.clone());
+        let stale = writer.clone();
+        let newer = writer.clone();
+        let (success, failure) = tokio::join!(
+            newer.record_projection_success(
+                "catalog-parquet-v1",
+                2,
+                "control/v1/projections/catalog-parquet/0002/manifest.json",
+                2_000,
+            ),
+            stale.record_projection_failure(
+                "catalog-parquet-v1",
+                1,
+                "CATALOG_PROJECTION_FAILED",
+                true,
+                1_000,
+            )
+        );
+        success.expect("concurrent newer success");
+        failure.expect("concurrent stale failure retries its CAS");
+
+        writer
+            .record_projection_quarantine(
+                "catalog-parquet-v1",
+                1,
+                "stale-record",
+                "INVALID_PROJECTION_INTENT",
+                3_000,
+            )
+            .await
+            .expect("stale quarantine is durable without regressing status");
+        let status = writer
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("status")
+            .expect("status exists");
+        assert_eq!(Some(2), status.applied_authority_sequence());
+        assert_eq!(Some(2), status.observed_authority_sequence());
+        assert_eq!(Some(2_000), status.last_success_at_ms());
+        assert_eq!(None, status.failure_state());
+        assert_eq!(
+            Some("control/v1/projections/catalog-parquet/0002/manifest.json"),
+            status.artifact_manifest_path()
+        );
+
+        writer
+            .record_projection_failure(
+                "catalog-parquet-v1",
+                3,
+                "CATALOG_PROJECTION_FAILED",
+                true,
+                4_000,
+            )
+            .await
+            .expect("newer failure");
+        writer
+            .record_projection_success(
+                "catalog-parquet-v1",
+                2,
+                "control/v1/projections/catalog-parquet/0002/manifest.json",
+                5_000,
+            )
+            .await
+            .expect("late duplicate success");
+        let status = writer
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("status")
+            .expect("status exists");
+        assert_eq!(Some(2), status.applied_authority_sequence());
+        assert_eq!(Some(3), status.observed_authority_sequence());
+        assert_eq!(
+            Some("retryable:CATALOG_PROJECTION_FAILED"),
+            status.failure_state()
+        );
     }
 
     fn delivery(record_id: &str, source_sequence: u64) -> ProjectionOutboxDeliveryId {
@@ -1539,8 +2224,12 @@ mod tests {
             record_id.to_string(),
             Bytes::from_static(payload),
         ))
+        .await
         .expect("stage outbox record");
-        txn.commit().await.expect("commit source record")
+        txn.commit()
+            .await
+            .expect("commit source record")
+            .into_state_token()
     }
 
     async fn current_outbox(storage: &ScopedStorage) -> Vec<ControlMvpProjectionOutboxRecord> {
@@ -1576,12 +2265,15 @@ mod tests {
 
     #[async_trait]
     impl ProjectionOutboxHandler for RecordingProjectionHandler {
-        async fn process(&self, record: &ControlMvpProjectionOutboxRecord) -> Result<()> {
+        async fn process(
+            &self,
+            record: &ControlMvpProjectionOutboxRecord,
+        ) -> Result<ProjectionOutboxProcessDisposition> {
             self.payloads
                 .lock()
                 .expect("recording handler lock")
                 .push(record.payload().clone());
-            Ok(())
+            Ok(ProjectionOutboxProcessDisposition::Materialized)
         }
     }
 
@@ -2170,7 +2862,8 @@ mod tests {
             .expect("begin");
 
         assert_precondition_failed(
-            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-unknown", 1)]),
+            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-unknown", 1)])
+                .await,
             "not present in current state",
         );
     }
@@ -2313,7 +3006,8 @@ mod tests {
             .await
             .expect_err("injected crash after ack retirement must interrupt the trim");
         assert!(
-            matches!(error, CatalogError::Storage { .. }),
+            matches!(&error, CatalogError::AmbiguousAuthorityOutcome { message }
+                if message.contains("injected trim crash point")),
             "unexpected error: {error:?}"
         );
 
@@ -2481,7 +3175,8 @@ mod tests {
         assert_precondition_failed(
             txn.trim_projection_outbox(
                 captured.iter().map(ProjectionOutboxDeliveryId::trim_target),
-            ),
+            )
+            .await,
             "a different incarnation of the same record id",
         );
 
@@ -2511,7 +3206,8 @@ mod tests {
             .expect("begin");
 
         assert_precondition_failed(
-            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-1", 99)]),
+            txn.trim_projection_outbox(vec![ControlMvpOutboxTrimTarget::new("record-1", 99)])
+                .await,
             "a different incarnation of the same record id",
         );
     }
@@ -2939,6 +3635,7 @@ mod tests {
             "record-2",
             Bytes::from_static(b"{}"),
         ))
+        .await
         .expect("stage record-2");
         txn.commit().await.expect("commit record-2");
         let report = worker
@@ -2957,6 +3654,7 @@ mod tests {
             "record-3",
             Bytes::from_static(b"{}"),
         ))
+        .await
         .expect("stage record-3");
         txn.commit().await.expect("commit record-3");
         let pinned = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")

@@ -12,7 +12,8 @@ use chrono::{Duration, Utc};
 
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CatalogError, CheckpointOptions,
-    ControlMvpStateStore, CurrentStateStore, PersistedAuthorityAdapter, StateScope, TxnOptions,
+    ControlMvpStateStore, CurrentStateStore, PersistedAuthorityAdapter, ScanRequest, StateScope,
+    TxnOptions,
 };
 use arco_core::{MemoryBackend, ScopedStorage};
 
@@ -57,7 +58,7 @@ async fn current_state_store_rejects_capability_only_reader_operations() {
     let store = CurrentStateStore::new();
 
     assert_unsupported(store.get(b"catalog/default").await, "get");
-    assert_unsupported(store.scan_prefix(b"catalog/").await, "scan_prefix");
+    assert_unsupported(store.scan(ScanRequest::new(b"catalog/")).await, "scan");
 }
 
 #[tokio::test]

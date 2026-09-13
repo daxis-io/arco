@@ -209,49 +209,67 @@ A wedged workspace shows `"state": "IN_FLIGHT"` with an `operation_kind`, `opera
 gsutil cat "gs://$BUCKET/tenant=$TENANT/workspace=$WORKSPACE/locks/workspace-retention-gc.lock.json" | jq
 ```
 
-An expired or absent lease whose `holderId` matches the epoch's `holder_id` confirms the holder is
-gone rather than slow.
+An expired or absent lease means the recorded holder no longer owns coordination. It does not
+prove that the process stopped or that previously issued remote storage requests have finished.
 
 ### Recovery
 
-- **`catalog_gc` and `catalog_repair` records recover themselves.** These operations only delete
-  objects that already cleared the fail-closed protection set, so a partially applied pass leaves no
-  half-written state. Once such a record has been in flight for longer than 600 seconds, the next
-  operation that acquires the retention lease adopts and settles it automatically — holding the
-  single-holder lease is the proof that the recorded holder no longer does. The adoption is logged
-  at WARN with `metric = arco_retention_epoch_recovered_total` and the discarded holder identity.
-  Expect enforce-mode automation to clear the wedge within roughly two of its retry intervals; no
-  operator action is required.
+- **Only `control_gc` records recover automatically.** Control authority GC fences the
+  reclamation generation and revalidates exact object versions before deletion. Later retained
+  roots cannot revive those candidates, even if a DELETE completes late. After 600 seconds,
+  a new retention lease holder can adopt the epoch. Adoption emits
+  `metric = arco_retention_epoch_recovered_total` with the discarded holder identity.
+  The new discriminator is fail closed for older readers: rolling back after writing even
+  an idle `control_gc` record requires operational coordination. Old `catalog_gc` records
+  are not automatically reinterpreted as the new operation kind.
 
-- **Publication records (`workspace_snapshot_*`, `workspace_export_*`, `workspace_restore_apply`)
+- **Legacy `catalog_gc` and `catalog_repair` records require operator recovery.** These
+  objects have no generation fence. A delayed DELETE can otherwise remove an object after
+  a new retained reference acknowledges it. Resolve every issued DELETE at the backend and
+  reconcile the affected retained closures before clearing the epoch. Old `catalog_gc` records
+  are treated conservatively even if the former caller might have been control authority GC.
+
+- **Publication records (`catalog_checkpoint_publish`, `workspace_snapshot_*`, `workspace_export_*`, `workspace_restore_apply`)
   require an explicit operator decision.** These can leave a partially published retained root, so
   they are never adopted automatically. First confirm the holder is dead (the lease check above,
-  plus the owning service's process/pod state), assess the partial publication, then force the
-  settlement, which emits the same loud audit record with your reason attached:
+  plus the owning service's process/pod state). Resolve every remote publication mutation:
+  each request must complete or be definitively cancelled at the backend, and the resulting
+  retained-root state must be reconciled. A missing readback, timeout, process death, or lease
+  expiry is insufficient evidence; a delayed PUT may still arrive. Only then force the settlement,
+  which emits the same loud audit record with your reason attached:
 
   ```rust
   // arco_catalog::recover_stale_retention_epoch
   let recovered = arco_catalog::recover_stale_retention_epoch(
       &storage,
-      "holder confirmed dead during incident <id>",
+      "holder dead; all remote mutations resolved during incident <id>",
   )
   .await?;
   ```
 
-  The call acquires the retention lease itself, so it cannot settle a record whose holder is still
-  running — a live holder makes the lease acquisition fail, which is the intended fail-closed
-  outcome. A non-empty single-line reason is mandatory and is recorded in the audit event.
+  The call acquires the retention lease itself, so a current lease owner prevents settlement.
+  A former owner may still have remote requests pending; the operator must establish their terminal
+  outcomes before calling recovery. A non-empty single-line reason is mandatory and is recorded
+  in the audit event.
 
 After recovery, re-run the dry-run reconcile commands above and confirm the epoch record reads
 `"state": "IDLE"` before returning repair automation to `enforce`.
+
+Control GC protects complete required-object closures in existing active snapshot/export
+records. New publication and retries reserve `control/v1/` for manifest/checkpoint objects
+bound to validated control authority references. Providers must keep independent projection,
+archive, and compatibility artifacts outside that namespace. Existing records with other
+control objects retain GC protection until release or expiry, but publication/retry rejects
+the unsupported paths.
 
 ### Related behavior
 
 A repair pass that cannot delete one individual object counts it in `failed_count`, logs it with
 `metric = arco_reconciler_repair_delete_failed_total`, and continues with the remaining candidates;
-it does not abandon the pass and does not leave the epoch in flight. Persistent non-zero
-`failed_count` therefore indicates an object-level problem (permissions, retention hold) rather
-than a wedged workspace.
+settlement then returns an error and leaves the durable epoch `IN_FLIGHT`. The internal
+failure counts do not turn an ambiguous DELETE into a terminal outcome. Repair, GC, and
+publication remain excluded until operator recovery meets the prerequisites above. A repair
+with no eligible deletions may return a read-only no-op without clearing that epoch.
 
 ## Production Cutover Sequence
 

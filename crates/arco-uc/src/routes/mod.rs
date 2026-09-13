@@ -3,6 +3,7 @@
 pub mod catalogs;
 pub mod common;
 pub mod credentials;
+pub mod delta;
 pub mod delta_commits;
 pub mod external_locations;
 pub mod openapi;

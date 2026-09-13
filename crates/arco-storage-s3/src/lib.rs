@@ -20,6 +20,8 @@ use object_store::signer::Signer as ObjectStoreSigner;
 #[derive(Debug, Clone)]
 pub struct S3StorageBackend {
     inner: ObjectStoreBackend,
+    #[cfg(feature = "qualification")]
+    qualification_listing: Option<ObjectStoreBackend>,
 }
 
 impl S3StorageBackend {
@@ -39,10 +41,70 @@ impl S3StorageBackend {
             configured_s3_builder(&bucket),
             &bucket,
         )?;
+        Ok(Self::from_clients(&bucket, s3, conditional_s3))
+    }
+
+    /// Creates a qualification adapter with bounded request time and ordinary retries.
+    ///
+    /// Conditional writes remain single-attempt. The production constructor is unchanged.
+    /// # Errors
+    /// Returns an error for invalid bucket/client configuration.
+    #[cfg(feature = "qualification")]
+    pub fn for_qualification(bucket: &str, listing_proxy: &str) -> Result<Self> {
+        let bucket = normalize_bucket(bucket)?;
+        let options = object_store::ClientOptions::new()
+            .with_no_redirects()
+            .with_timeout(Duration::from_secs(30))
+            .with_allow_http(std::env::var("AWS_ALLOW_HTTP").is_ok_and(|s| s == "true"));
+        let builder = || {
+            configured_s3_builder(&bucket)
+                .with_client_options(options.clone())
+                .with_retry(object_store::RetryConfig {
+                    max_retries: 1,
+                    ..Default::default()
+                })
+        };
+        let (s3, conditional_s3) = build_s3_clients(builder(), builder(), &bucket)?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+        let listing = configured_s3_builder(&bucket)
+            .with_client_options(
+                options
+                    .with_http1_only()
+                    .with_pool_max_idle_per_host(0)
+                    .with_default_headers(headers)
+                    .with_proxy_url(listing_proxy)
+                    .with_proxy_excludes("169.254.169.254"),
+            )
+            .with_retry(object_store::RetryConfig {
+                max_retries: 1,
+                ..Default::default()
+            })
+            .build()
+            .map_err(|error| {
+                Error::storage_with_source("failed to configure bounded listing", error)
+            })?;
+        let listing_conditional_store: Arc<DynObjectStore> = conditional_s3.clone();
+        let mut backend = Self::from_clients(&bucket, s3, conditional_s3);
+        let listing: Arc<DynObjectStore> = Arc::new(listing);
+        backend.qualification_listing = Some(
+            ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
+                listing,
+                listing_conditional_store,
+                None,
+            ),
+        );
+        Ok(backend)
+    }
+
+    fn from_clients(bucket: &str, s3: Arc<AmazonS3>, conditional_s3: Arc<AmazonS3>) -> Self {
         let store: Arc<DynObjectStore> = s3.clone();
         let conditional_write_store: Arc<DynObjectStore> = conditional_s3;
         let signer: Arc<dyn ObjectStoreSigner> = s3;
-        let inner = if supports_ordered_listing(&bucket) {
+        let inner = if supports_ordered_listing(bucket) {
             ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
                 store,
                 conditional_write_store,
@@ -55,7 +117,11 @@ impl S3StorageBackend {
                 Some(signer),
             )
         };
-        Ok(Self { inner })
+        Self {
+            inner,
+            #[cfg(feature = "qualification")]
+            qualification_listing: None,
+        }
     }
 
     /// Returns whether this S3 bucket supports bounded lexicographic listing.
@@ -139,6 +205,10 @@ impl StorageBackend for S3StorageBackend {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+        #[cfg(feature = "qualification")]
+        if let Some(listing) = &self.qualification_listing {
+            return listing.list(prefix).await;
+        }
         self.inner.list(prefix).await
     }
 
@@ -148,6 +218,10 @@ impl StorageBackend for S3StorageBackend {
         start_after: Option<&str>,
         limit: usize,
     ) -> Result<ListPage> {
+        #[cfg(feature = "qualification")]
+        if let Some(listing) = &self.qualification_listing {
+            return listing.list_page(prefix, start_after, limit).await;
+        }
         self.inner.list_page(prefix, start_after, limit).await
     }
 

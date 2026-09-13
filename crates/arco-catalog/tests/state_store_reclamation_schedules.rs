@@ -3,6 +3,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 #![allow(clippy::too_many_lines, clippy::unused_async)]
 
+#[path = "../benches/support/durable_maintenance.rs"]
+mod durable_maintenance;
+
 use arco_catalog::retention_coordination::{
     RETENTION_MUTATION_EPOCH_PATH, recover_stale_retention_epoch,
 };
@@ -105,12 +108,50 @@ async fn guard<T>(future: impl Future<Output = T>) -> T {
         .expect("schedule deadlock")
 }
 
+/// Unbuffered live evidence survives cancellation or process termination.
+#[derive(Debug, Default)]
+struct EventTrace {
+    events: Vec<String>,
+    live: Option<std::fs::File>,
+}
+impl EventTrace {
+    fn push(&mut self, event: String) {
+        if let Some(file) = &mut self.live {
+            use std::io::Write as _;
+            writeln!(file, "{event}").unwrap();
+        }
+        self.events.push(event);
+    }
+    fn attach(&mut self, path: &std::path::Path, identity: &str) {
+        self.live = Some(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap(),
+        );
+        self.push(identity.to_owned());
+        self.live.as_ref().unwrap().sync_all().unwrap();
+    }
+}
+impl std::ops::Deref for EventTrace {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.events
+    }
+}
+impl std::ops::DerefMut for EventTrace {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.events
+    }
+}
+
 #[derive(Debug)]
 struct Backend {
     inner: Arc<MemoryBackend>,
     armed: Mutex<Option<Arc<Schedule>>>,
     denied: Arc<Mutex<Option<String>>>,
-    trace: Arc<Mutex<Vec<String>>>,
+    trace: Arc<Mutex<EventTrace>>,
     now: Arc<Mutex<DateTime<Utc>>>,
     timestamps: Arc<Mutex<BTreeMap<String, DateTime<Utc>>>>,
     authorized_deletes: Arc<Mutex<BTreeSet<String>>>,
@@ -121,13 +162,17 @@ impl Backend {
             inner: Arc::new(MemoryBackend::new()),
             armed: Mutex::new(None),
             denied: Arc::new(Mutex::new(None)),
-            trace: Arc::new(Mutex::new(Vec::new())),
+            trace: Arc::new(Mutex::new(EventTrace::default())),
             now: Arc::new(Mutex::new(Utc::now())),
             timestamps: Arc::new(Mutex::new(BTreeMap::new())),
             authorized_deletes: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
     fn arm(&self, needle: String, skip: usize, fault: Fault) -> Arc<Schedule> {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(format!("ARM {needle} skip={skip} fault={fault:?}"));
         let schedule = Schedule::new(needle, skip, fault);
         *self.armed.lock().unwrap() = Some(schedule.clone());
         schedule
@@ -355,6 +400,17 @@ impl StorageBackend for Backend {
                 schedule.respond.acquire().await.unwrap().forget();
             }
             if let Some(tx) = tx {
+                let result = if matches!(schedule.fault, Fault::LostResponse) {
+                    Err(arco_core::Error::storage(
+                        "remote DELETE applied; response lost",
+                    ))
+                } else {
+                    result
+                };
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(format!("RESPONSE DELETE {path} {result:?}"));
                 tx.send(result).ok();
             }
             schedule.finished.notify_one();
@@ -1095,7 +1151,7 @@ fn next_random(state: &mut u64) -> u64 {
 }
 // Keep operation generation and oracle updates together for schedule review.
 #[allow(clippy::cognitive_complexity)]
-async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
+async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
     let mut f = Fixture::new().await;
     let orphan = f.store.paths().tx_object("model-orphan");
     f.storage
@@ -1123,14 +1179,16 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
     }];
     let mut checkpoints: Vec<CheckpointOracle> = Vec::new();
     let mut roots: Vec<RootOracle> = Vec::new();
-    let mut counts = [0_u32; 12];
-    for step in 0..64 {
+    let families = if durable { 18 } else { 12 };
+    let mut counts = vec![0_u32; families];
+    let mut job = None;
+    for step in 0..if durable { 128 } else { 64 } {
         // Each seed exercises every operation family once, then a fixed PRNG
         // drives ordering. The oracle never calls the collector's planner.
-        let op = if step < 12 {
+        let op = if step < families {
             step
         } else {
-            usize::try_from(next_random(&mut random) % 12).unwrap()
+            usize::try_from(next_random(&mut random) % families as u64).unwrap()
         };
         *counts.get_mut(op).unwrap() += 1;
         trace.lock().unwrap().push(format!(
@@ -1140,7 +1198,16 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
         match op {
             0..=2 => {
                 // Maintenance runs before the existing L0 backpressure limit.
-                f.worker.consolidate_pending().await.unwrap();
+                durable_maintenance::consolidate_pending(
+                    &arco_catalog::DurableMaintenanceWorker::new(
+                        f.storage.clone(),
+                        StateScope::new("tenant", "workspace", "catalog"),
+                        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
                 let mut txn = f
                     .store
                     .begin_control_txn(TxnOptions::default())
@@ -1312,7 +1379,16 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                 *f.backend.now.lock().unwrap() = now;
             }
             9 => {
-                f.worker.consolidate_pending().await.unwrap();
+                durable_maintenance::consolidate_pending(
+                    &arco_catalog::DurableMaintenanceWorker::new(
+                        f.storage.clone(),
+                        StateScope::new("tenant", "workspace", "catalog"),
+                        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
             }
             10 => {
                 let mut cursor = None;
@@ -1336,6 +1412,67 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
                     )
                     .unwrap(),
                 );
+            }
+            12..=15 | 17 => {
+                durable_model_step(&f, &mut job, now, op, trace).await;
+            }
+            16 => {
+                use arco_catalog::{
+                    ControlMvpRestoreParticipant, RestoreAttemptIdentity,
+                    StateRestoreParticipant as _,
+                };
+                #[derive(serde::Serialize)]
+                struct Notice<'a> {
+                    restore_id: &'a str,
+                    participant_attempt: u64,
+                    domain: &'a str,
+                    source_logical_sequence: u64,
+                    result_logical_sequence: u64,
+                }
+                let checkpoint = f
+                    .store
+                    .checkpoint(CheckpointOptions::default())
+                    .await
+                    .unwrap();
+                let reference = f
+                    .store
+                    .persist_checkpoint_reference(&checkpoint, now + chrono::Duration::days(1))
+                    .await
+                    .unwrap();
+                let restore_id = format!(
+                    "rst_{}",
+                    ulid::Ulid::from(u128::from(seed) * 1000 + step as u128)
+                );
+                let identity = RestoreAttemptIdentity::new(&restore_id, 1, "catalog").unwrap();
+                let participant = ControlMvpRestoreParticipant::new(f.store.as_ref().clone());
+                let plan = participant
+                    .plan_restore(&reference, &identity, now)
+                    .await
+                    .unwrap();
+                participant.apply_restore(&plan, now).await.unwrap();
+                let request = format!("restore:{restore_id}:1:catalog");
+                let notice = Bytes::from(
+                    serde_json::to_vec(&Notice {
+                        restore_id: &restore_id,
+                        participant_attempt: 1,
+                        domain: "catalog",
+                        source_logical_sequence: logical.sequence,
+                        result_logical_sequence: logical.sequence + 1,
+                    })
+                    .unwrap(),
+                );
+                logical.commit_with_request(
+                    Vec::new(),
+                    vec![(request.clone(), notice)],
+                    Vec::new(),
+                    Some(&request),
+                );
+                tokens.push(TokenOracle {
+                    logical: logical.clone(),
+                    token: f.store.current_state_token().await.unwrap(),
+                    contents: contents.clone(),
+                    until: now + chrono::Duration::days(30),
+                });
             }
             _ => unreachable!(),
         }
@@ -1449,11 +1586,126 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>) {
     );
 }
 
+async fn durable_model_step(
+    f: &Fixture,
+    job: &mut Option<(arco_catalog::MaintenanceJobId, DateTime<Utc>)>,
+    now: DateTime<Utc>,
+    op: usize,
+    trace: &Mutex<Vec<String>>,
+) {
+    use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
+    let worker = DurableMaintenanceWorker::new(
+        f.storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+        DurableAuthorityBinding::new([31; 32]),
+    )
+    .unwrap()
+    .with_test_segment_sizing(2, 8 * 1024)
+    .unwrap();
+    if job.is_none() {
+        let before = f.backend.trace.lock().unwrap().len();
+        let plan = match worker.test_prepare_forced_at(now).await {
+            Ok(Some(plan)) => plan,
+            Err(error @ arco_catalog::CatalogError::MaintenanceBackpressure { .. }) => {
+                assert!(
+                    !f.backend
+                        .trace
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .skip(before)
+                        .any(|entry| entry.starts_with("ISSUE PUT")),
+                    "capacity rejection wrote an artifact"
+                );
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(format!("admission rejected before PUT: {error:?}"));
+                return;
+            }
+            result => panic!(
+                "unexpected durable admission: {}",
+                result
+                    .err()
+                    .map_or_else(|| "no source".into(), |error| error.to_string())
+            ),
+        };
+        let id = plan.job_id().clone();
+        trace
+            .lock()
+            .unwrap()
+            .push(format!("prepared job={}", id.as_str()));
+        worker.start_at(&plan, now).await.unwrap();
+        *job = Some((id, now));
+    }
+    let (id, created_at) = job.as_ref().unwrap();
+    let created_at = *created_at;
+    let operation = async {
+        let progress = worker.resume_at(id, now).await?;
+        trace.lock().unwrap().push(format!("job={} status={:?} completed={}", id.as_str(), progress.status, progress.completed));
+        if op == 15 && matches!(progress.status, MaintenanceStatus::Active | MaintenanceStatus::ReadyToPublish) {
+            worker.abandon_at(id, now).await?;
+            return Ok(true);
+        }
+        if op == 17 {
+            trace.lock().unwrap().push("INJECT LostResponse on selected.json; immutable work remains selected only after exact reconciliation".into());
+            f.backend.arm("/selected.json".into(), 0, Fault::LostResponse);
+        }
+        match progress.status {
+            MaintenanceStatus::Active => { worker.advance_at(id, now).await?; Ok(false) }
+            MaintenanceStatus::ReadyToPublish | MaintenanceStatus::Publishing => Ok(worker.publish_at(id, now).await?.is_some()),
+            MaintenanceStatus::Published | MaintenanceStatus::Abandoned | MaintenanceStatus::Superseded => Ok(true),
+            _ => panic!("unexpected durable model state: {:?}", progress.status),
+        }
+    }.await;
+    *f.backend.armed.lock().unwrap() = None;
+    trace
+        .lock()
+        .unwrap()
+        .extend(std::mem::take(&mut f.backend.trace.lock().unwrap().events));
+    match operation {
+        Ok(true) => *job = None,
+        Ok(false) => {}
+        Err(arco_catalog::CatalogError::PreconditionFailed { .. }) => {
+            // Expiry, a restore, competing maintenance or a GC generation consumes
+            // reuse. Abandon while executable; expired protection retains its fixed deadline.
+            let _ = worker.abandon_at(id, now).await;
+            *job = None;
+        }
+        Err(error @ arco_catalog::CatalogError::NotFound { .. }) => {
+            assert!(
+                now >= created_at + chrono::Duration::days(8),
+                "live maintenance evidence disappeared: {error:?}"
+            );
+            trace.lock().unwrap().push(format!(
+                "expired job correctly returned missing evidence after reclamation: {error:?}"
+            ));
+            *job = None;
+        }
+        Err(error) => panic!("durable model error: {error:?}"),
+    }
+}
+
+#[tokio::test]
+async fn durable_maintenance_model_32_seeds_of_128_operations() {
+    for seed in 1..=32 {
+        let trace = Mutex::new(Vec::new());
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, true)))
+            .catch_unwind()
+            .await;
+        assert!(
+            result.is_ok(),
+            "durable model failed seed={seed}\n{}",
+            trace.lock().unwrap().join("\n")
+        );
+    }
+}
+
 #[tokio::test]
 async fn independent_reclamation_model_32_seeds_of_64_operations() {
     for seed in 1..=32 {
         let trace = Mutex::new(Vec::new());
-        let result = std::panic::AssertUnwindSafe(run_model(seed, &trace))
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, false)))
             .catch_unwind()
             .await;
         assert!(
@@ -1693,3 +1945,243 @@ async fn independent_oracle_covers_empty_and_nonempty_restore_history() {
         assert_eq!(store.get(b"gone").await.unwrap(), None);
     }
 }
+
+#[tokio::test]
+async fn future_clock_activation_epoch_repairs_after_expiry() {
+    use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker};
+    let f = Fixture::new().await;
+    let worker = DurableMaintenanceWorker::new(
+        f.storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+        DurableAuthorityBinding::new([33; 32]),
+    )
+    .unwrap();
+    let created = f.start + chrono::Duration::hours(48);
+    let plan = worker
+        .test_prepare_forced_at(created)
+        .await
+        .unwrap()
+        .unwrap();
+    let id = plan.job_id();
+    assert!(worker.start_at(&plan, f.start).await.is_err());
+    let schedule = f.backend.arm(
+        RETENTION_MUTATION_EPOCH_PATH.to_owned(),
+        0,
+        Fault::PauseAfter,
+    );
+    let mut invocation = Box::pin(worker.start_at(&plan, created));
+    tokio::select! {
+        result = &mut invocation => panic!("activation did not pause: {result:?}"),
+        () = schedule.issued() => {}
+    }
+    drop(invocation);
+    schedule.finish().await;
+    assert_eq!(f.epoch().await, "IN_FLIGHT");
+    f.backend.expire_lease(&f.storage).await;
+    let epoch: serde_json::Value = serde_json::from_slice(
+        &f.storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let prefix = format!(
+        "{}/maintenance/{}",
+        f.store.paths().base_prefix(),
+        id.as_str()
+    );
+    let descriptor_path = format!("{prefix}/descriptor.json");
+    let descriptor = f.storage.get_raw(&descriptor_path).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&descriptor).unwrap();
+    let pin_id = format!("pin_{}", value.get("nonce").unwrap().as_str().unwrap());
+    let pin_path = retention_pin_revision_path(&pin_id, 1).unwrap();
+    assert!(f.storage.head_raw(&pin_path).await.unwrap().is_none());
+    let expired = created + chrono::Duration::hours(25);
+    worker.recover_activation_at(id, expired).await.unwrap();
+    assert_eq!(f.epoch().await, "IDLE");
+    let repaired: serde_json::Value = serde_json::from_slice(
+        &f.storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(epoch.get("started_at"), repaired.get("started_at"));
+    let started: DateTime<Utc> =
+        serde_json::from_value(epoch.get("started_at").unwrap().clone()).unwrap();
+    assert!(started >= created && started < created + chrono::Duration::hours(24));
+    let expected_pin = RetentionPinRevision::new(
+        &pin_id,
+        1,
+        arco_catalog::workspace_snapshot::RetentionTarget::Maintenance(format!(
+            "catalog/{}",
+            id.as_str()
+        )),
+        created,
+        created + chrono::Duration::days(8),
+        None,
+    )
+    .unwrap();
+    let expected_pin = Bytes::from(encode_retention_pin_revision(&expected_pin).unwrap());
+    assert_eq!(f.storage.get_raw(&pin_path).await.unwrap(), expected_pin);
+    worker.recover_activation_at(id, expired).await.unwrap();
+    assert_eq!(f.storage.get_raw(&pin_path).await.unwrap(), expected_pin);
+    assert_eq!(
+        f.storage.get_raw(&descriptor_path).await.unwrap(),
+        descriptor
+    );
+    assert!(worker.resume_at(id, expired).await.is_err());
+    assert!(worker.advance_at(id, expired).await.is_err());
+}
+
+#[tokio::test]
+async fn durable_maintenance_remote_faults_at_every_write_class() {
+    use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
+    for stage in ["start", "advance", "publish"] {
+        let boundaries: &[(&str, usize)] = match stage {
+            "start" => &[
+                ("/descriptor.json", 0),
+                ("/plans/", 0),
+                (RETENTION_MUTATION_EPOCH_PATH, 0),
+                ("retention/pins/", 0),
+                ("retention/pins/", 1),
+                ("/maintenance-revisions-placeholder/", 0),
+                ("/selected.json", 0),
+                (RETENTION_MUTATION_EPOCH_PATH, 1),
+            ],
+            "advance" => &[
+                ("/segments/l1/maintenance-", 0),
+                ("/indexes/maintenance-", 0),
+                ("/maintenance-revisions-placeholder/", 0),
+                ("/selected.json", 0),
+            ],
+            "publish" => &[
+                ("/attempts/", 0),
+                ("/maintenance-revisions-placeholder/", 0),
+                ("/selected.json", 0),
+                ("/manifests/maintenance-", 0),
+                ("/head/current.json", 0),
+            ],
+            _ => unreachable!(),
+        };
+        for (boundary, skip) in boundaries {
+            for fault in [
+                Fault::LostResponse,
+                Fault::DelayedError,
+                Fault::PauseBefore,
+                Fault::PauseAfter,
+                Fault::Unreadable,
+            ] {
+                let f = Fixture::new().await;
+                let scope = StateScope::new("tenant", "workspace", "catalog");
+                let binding = DurableAuthorityBinding::new([32; 32]);
+                let worker =
+                    DurableMaintenanceWorker::new(f.storage.clone(), scope.clone(), binding)
+                        .unwrap();
+                let plan = worker
+                    .test_prepare_forced_at(f.start)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let id = plan.job_id().clone();
+                if stage != "start" {
+                    worker.start_at(&plan, f.start).await.unwrap();
+                }
+                if stage == "publish" {
+                    assert_eq!(
+                        worker.advance_at(&id, f.start).await.unwrap().status,
+                        MaintenanceStatus::ReadyToPublish
+                    );
+                }
+                let boundary = if *boundary == "/maintenance-revisions-placeholder/" {
+                    format!("/maintenance/{}/revisions/", id.as_str())
+                } else {
+                    (*boundary).to_owned()
+                };
+                f.backend.trace.lock().unwrap().clear();
+                let schedule = f.backend.arm(boundary.clone(), *skip, fault);
+                let operation = async {
+                    match stage {
+                        "start" => worker.start_at(&plan, f.start).await.map(|_| ()),
+                        "advance" => worker.advance_at(&id, f.start).await.map(|_| ()),
+                        "publish" => worker.publish_at(&id, f.start).await.map(|_| ()),
+                        _ => unreachable!(),
+                    }
+                };
+                let mut invocation = Box::pin(operation);
+                if matches!(fault, Fault::PauseBefore | Fault::PauseAfter) {
+                    tokio::select! { result = &mut invocation => panic!("{stage} {boundary} {fault:?} did not pause: {result:?}"), () = schedule.issued() => {} }
+                    drop(invocation);
+                } else {
+                    let result = invocation.await;
+                    if matches!(fault, Fault::DelayedError | Fault::Unreadable) {
+                        assert!(
+                            result.is_err(),
+                            "{stage} {boundary} {fault:?}: uncertainty was hidden"
+                        );
+                    }
+                }
+                assert!(
+                    f.backend
+                        .trace
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|entry| entry.starts_with("ISSUE PUT ")
+                            && entry.contains("/head/current.json"))
+                        .count()
+                        <= 1
+                );
+                schedule.finish().await;
+                *f.backend.denied.lock().unwrap() = None;
+                f.backend.expire_lease(&f.storage).await;
+                let restarted =
+                    DurableMaintenanceWorker::new(f.storage.clone(), scope, binding).unwrap();
+                if stage == "start" {
+                    // The known preparation also allows a live caller to complete
+                    // a descriptor/page prefix that never acquired root protection.
+                    restarted
+                        .start_at(&plan, f.start)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{stage} {boundary} {fault:?}: {error:?}\n{:?}",
+                                f.backend.trace.lock().unwrap()
+                            )
+                        });
+                }
+                let progress = restarted.resume_at(&id, f.start).await.unwrap();
+                if progress.status == MaintenanceStatus::Active {
+                    restarted.advance_at(&id, f.start).await.unwrap();
+                }
+                assert!(restarted.publish_at(&id, f.start).await.unwrap().is_some());
+                assert_eq!(
+                    f.store.get(b"key").await.unwrap(),
+                    Some(Bytes::from_static(b"value"))
+                );
+                let mut oracle = LogicalOracle::new();
+                oracle.commit(
+                    vec![(b"key".to_vec(), Some(Bytes::from_static(b"value")))],
+                    Vec::new(),
+                    Vec::new(),
+                );
+                oracle
+                    .assert_manifest(
+                        &f.storage,
+                        f.store
+                            .current_state_token()
+                            .await
+                            .unwrap()
+                            .authority_manifest_id(),
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+#[path = "support/gate7_model.rs"]
+mod gate7_model;
+
+#[path = "support/gate7_schedules.rs"]
+mod gate7_schedules;

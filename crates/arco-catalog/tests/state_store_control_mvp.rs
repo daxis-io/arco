@@ -13,6 +13,9 @@
     reason = "the contract suite keeps crash sequences and direct JSON fixture assertions explicit"
 )]
 
+#[path = "../benches/support/durable_maintenance.rs"]
+mod durable_maintenance;
+
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::Path;
@@ -3195,6 +3198,7 @@ struct CountingGetBackend {
     inner: Arc<dyn StorageBackend>,
     get_calls: AtomicUsize,
     pause_at: AtomicUsize,
+    pause_reads: AtomicUsize,
     paused: Notify,
     get_paths: Mutex<Vec<String>>,
 }
@@ -3205,6 +3209,7 @@ impl CountingGetBackend {
             inner,
             get_calls: AtomicUsize::new(0),
             pause_at: AtomicUsize::new(0),
+            pause_reads: AtomicUsize::new(0),
             paused: Notify::new(),
             get_paths: Mutex::new(Vec::new()),
         }
@@ -3212,7 +3217,8 @@ impl CountingGetBackend {
 
     async fn pause_if_armed(&self) {
         if self.pause_at.load(Ordering::SeqCst) != 0
-            && self.get_calls() == self.pause_at.load(Ordering::SeqCst)
+            && self.pause_reads.fetch_add(1, Ordering::SeqCst) + 1
+                == self.pause_at.load(Ordering::SeqCst)
         {
             self.paused.notify_one();
             std::future::pending::<()>().await;
@@ -3225,6 +3231,7 @@ impl CountingGetBackend {
 
     fn reset(&self) {
         self.get_calls.store(0, Ordering::SeqCst);
+        self.pause_reads.store(0, Ordering::SeqCst);
         self.get_paths.lock().expect("get paths lock").clear();
     }
 
@@ -3273,6 +3280,7 @@ impl StorageBackend for CountingGetBackend {
     }
 
     async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.pause_if_armed().await;
         self.inner.head(path).await
     }
 
@@ -3617,7 +3625,8 @@ async fn default_layout_emits_intent_at_sixteen_and_worker_preserves_logical_seq
     let source = store.current_state_token().await.expect("source token");
     assert_eq!(16, source.logical_sequence());
 
-    let worker = ControlMvpMaintenanceWorker::new(storage, scope()).expect("maintenance worker");
+    let worker =
+        ControlMvpMaintenanceWorker::new(storage.clone(), scope()).expect("maintenance worker");
     let pending = worker
         .pending_intent()
         .await
@@ -3630,8 +3639,13 @@ async fn default_layout_emits_intent_at_sixteen_and_worker_preserves_logical_seq
         pending.source_authority_manifest_id()
     );
 
-    let maintenance = worker
-        .consolidate_pending()
+    let durable = arco_catalog::DurableMaintenanceWorker::new(
+        storage,
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+    )
+    .unwrap();
+    let maintenance = durable_maintenance::consolidate_pending(&durable)
         .await
         .expect("consolidate pending suffix")
         .expect("selected maintenance layout");
@@ -3744,11 +3758,21 @@ async fn concurrent_maintenance_workers_select_only_one_equivalent_layout() {
         txn.commit().await.expect("commit logical write");
     }
     let source = store.current_state_token().await.expect("source token");
-    let worker_a = ControlMvpMaintenanceWorker::new(storage.clone(), scope()).expect("worker a");
-    let worker_b = ControlMvpMaintenanceWorker::new(storage, scope()).expect("worker b");
+    let worker_a = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+    )
+    .expect("worker a");
+    let worker_b = arco_catalog::DurableMaintenanceWorker::new(
+        storage,
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([17; 32]),
+    )
+    .expect("worker b");
     let (result_a, result_b) = tokio::join!(
-        worker_a.consolidate_pending(),
-        worker_b.consolidate_pending()
+        durable_maintenance::consolidate_pending(&worker_a),
+        durable_maintenance::consolidate_pending(&worker_b)
     );
     let result_a = result_a.expect("worker a result");
     let result_b = result_b.expect("worker b result");

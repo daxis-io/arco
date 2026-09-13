@@ -703,6 +703,17 @@ impl GarbageCollector {
                     let bytes = self.storage.get_raw(&export_path).await?;
                     exports.push(decode_export_manifest(&bytes)?);
                 }
+                RetentionTarget::Maintenance(id) => {
+                    // Generic GC only deletes legacy catalog namespaces. Validate
+                    // each complete control closure, then discard it before the next
+                    // job. Control GC separately streams these roots over its page.
+                    crate::state_store::control_mvp::maintenance::retention_root(
+                        &self.storage,
+                        id,
+                        selected,
+                    )
+                    .await?;
+                }
             }
         }
 
@@ -1251,6 +1262,99 @@ mod tests {
         assert_eq!(r1.ledger_events_deleted, 4);
         assert_eq!(r1.old_snapshots_deleted, 1);
         assert_eq!(r1.errors.len(), 2);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn many_maintenance_jobs_discard_closures_and_last_corruption_prevents_all_deletes() {
+        use crate::{
+            ControlMvpStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, TxnOptions,
+        };
+        let backend = Arc::new(RecordingBackend::new(false));
+        let storage = ScopedStorage::new(backend.clone(), "acme", "many-jobs").unwrap();
+        crate::Tier1Writer::new(storage.clone())
+            .initialize()
+            .await
+            .unwrap();
+        let old_path = seed_old_and_current_catalog_snapshots(&storage).await;
+        let scope = StateScope::new("acme", "many-jobs", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+        for _ in 0..16 {
+            store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+        let worker = DurableMaintenanceWorker::new(
+            storage.clone(),
+            scope,
+            DurableAuthorityBinding::new([9; 32]),
+        )
+        .unwrap();
+        let collector = GarbageCollector::new(
+            storage.clone(),
+            RetentionPolicy {
+                keep_snapshots: 0,
+                delay_hours: 0,
+                ledger_retention_hours: 0,
+                max_age_days: 0,
+            },
+        );
+        let mut last_descriptor = String::new();
+        for _ in 0..24 {
+            let now = Utc::now();
+            let plan = worker.prepare_at(now).await.unwrap().unwrap();
+            worker.start_at(&plan, now).await.unwrap();
+            last_descriptor = format!(
+                "control/v1/domains/catalog/maintenance/{}/descriptor.json",
+                plan.job_id().as_str()
+            );
+        }
+        let protection = collector.load_protection_set(Utc::now()).await.unwrap();
+        assert!(
+            !protection.protects_object(&last_descriptor),
+            "generic catalog GC must discard control-store closures"
+        );
+        // Corrupt the final target after every earlier target has validated.
+        let selectors = storage.list_meta("retention/pins/").await.unwrap();
+        let last = selectors
+            .iter()
+            .filter(|o| o.path.as_str().ends_with("/latest.json"))
+            .max_by_key(|o| o.path.as_str())
+            .unwrap();
+        let pin_id = last
+            .path
+            .as_str()
+            .strip_prefix("retention/pins/")
+            .unwrap()
+            .strip_suffix("/latest.json")
+            .unwrap();
+        let pin = load_selected_retention_pin(&storage, pin_id).await.unwrap();
+        let root = crate::state_store::control_mvp::maintenance::retention_root(
+            &storage,
+            pin.latest_revision().unwrap().target().id(),
+            &pin,
+        )
+        .await
+        .unwrap();
+        let descriptor = format!(
+            "{}descriptor.json",
+            root.protected_prefixes.first().unwrap()
+        );
+        storage
+            .put_raw(
+                &descriptor,
+                Bytes::from_static(b"corrupt"),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        assert!(collector.collect().await.is_err());
+        assert_eq!(backend.delete_calls.load(Ordering::SeqCst), 0);
+        assert!(storage.head_raw(&old_path).await.unwrap().is_some());
     }
 
     #[tokio::test]

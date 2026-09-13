@@ -8,6 +8,8 @@
 
 **Related documents:**
 
+- [Gate 5 maintenance qualification](../reports/2026-09-09-gate5-maintenance-qualification.md)
+
 - [Olympia-Inspired Arco Strategy](2026-06-20-olympia-inspired-arco-strategy.md)
 - [Arco Tier-1 Control Store Strategy](2026-06-25-arco-tier1-control-store-strategy.md)
 
@@ -117,7 +119,7 @@ and segment-backpressure limits. Removing synchronous Parquet publication from
 the success path does not promise unlimited writes while internal maintenance
 is stalled.
 
-The [state-store vNext roadmap](../reports/2026-09-04-state-store-vnext-progress.md#remaining-work-and-qualification-boundaries)
+The [state-store vNext qualification report](../reports/2026-09-09-gate5-maintenance-qualification.md)
 separates the implementation gates. The [Gate 2 block format contract](state-store-block-format-v1.md)
 specifies authenticated root witnesses, bounded directories, independent IPC
 blocks and selective readers; its [local evidence](../reports/2026-09-06-gate2-closeout.md)
@@ -129,6 +131,46 @@ Gates 2 and 3 adapt the existing eager transaction and maintenance paths. Gate 4
 introduces lazy transactions; Gate 5 makes maintenance incremental, durable and
 resumable. Gates 6 and 7 cover caches and provider qualification. None of these
 local implementation gates authorizes migration or production cutover.
+
+The [Gate 6 contract](2026-09-09-state-store-vnext-gate-6.md) adds process-local
+ownership of authenticated directories, unhydrated transaction metadata, decoded
+blocks and complete-segment certificates. Each shared handle retains its backend
+and typed scope identity. Default capacities are 32 MiB for metadata and 128 MiB
+for decoded rows, including reservations and nonresident leases. FIFO eviction,
+record limits, eight active loads and bounded shared-future participation keep
+cache-owned work within the configured budgets. Zero capacity disables caches;
+nonzero metadata capacity must fund handle administration and retained identity.
+
+Every substitution requires an independent fresh HEAD matching the admitted
+version and size. Admission brackets existing authentication with two agreeing
+HEAD observations. A complete-segment certificate can only follow full raw-byte
+validation, rebuilt directory equality and validation of every block; selective
+hits cannot mint one. Durable maintenance uses its independently supplied authority
+binding as an additional cache namespace. Manifests, retention evidence, maintenance
+control records and reconciliation remain uncached. Logical replay, context-dependent
+hydration, history/state checksums, writer fencing and publication CAS remain
+mandatory. Local cache qualification is separate from Gate 7 provider evidence. The
+[dated Gate 6 qualification report](../reports/2026-09-10-gate6-read-cache-qualification.md)
+records corrected local acceptance, historical unaffected CI-derived lanes,
+independent audit findings, and preserved failures. Cold point/scan qualification
+uses 200 fresh observations per operation within each of five runs, with retained
+raw durations and independently checked percentiles; the earlier singleton p99
+claim is superseded. The external closeout binds the final
+audit disposition and recovery seal to the final source manifest.
+
+The Gate 5 candidate binds durable jobs to an independently configured authority
+and an externally supplied descriptor digest. Immutable plans and receipt chains
+support one-shard advances and completed-output reuse across compatible descendants.
+Execution expires 24 hours after creation; retention ends after eight days. Recovery
+requires fresh time admission under retention coordination unless authenticated
+prior submission permits exact repair with the original bytes and deadlines.
+New activation epochs record the admitted effective clock, preserving recoverability
+for supplied logical clocks without allowing stale time to bypass wall-clock expiry.
+Publication validates full current-state equivalence before one fenced HEAD CAS.
+Generic catalog GC validates and discards one maintenance closure at a time;
+dedicated control GC streams protection over its bounded candidate page. The
+[qualification report](../reports/2026-09-09-gate5-maintenance-qualification.md) records
+the retained bounds, passing local verification and independent audit.
 
 ---
 
@@ -722,3 +764,14 @@ one product contract layer:
 ```
 
 This gives Arco the production-grade mutation model from the Tier-1 control-store strategy and the crisp file-native product semantics from the Olympia-inspired strategy, without locking the team into maintaining two permanent Tier-1 write paths.
+
+### Gate 7 qualification prerequisite
+
+The [Gate 7 execution contract](2026-09-10-state-store-vnext-gate-7.md) freezes
+additional restore/outbox/failure models, integrated S3 evidence and a dedicated-host
+604,800-second pilot. [Local qualification status](../reports/2026-09-10-gate7-state-store-qualification.md)
+records a confirmed capacity blocker: the selected pilot retains at least 2,419,200
+receipt/audit rows, exceeding restore's unchanged one-million-row aggregate bound.
+This requires architectural follow-up; it does not authorize raising limits, dropping
+records or rotating roots. Local evidence, remote CI, real S3 and pilot completion
+remain separate states. No deployment or cutover is implied.

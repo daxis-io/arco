@@ -33,6 +33,26 @@ pub(super) struct RewriteEquivalence {
     pub source_physical_root: String,
     pub logical_sequence: u64,
     pub state_checksum_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_source: Option<RenderSource>,
+}
+
+/// Flat render-cut evidence survives expiry of maintenance descriptors and does
+/// not recursively embed prior rewrites. Original ownership plus the retained
+/// suffix independently reconstructs the publish source's physical commitment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenderSource {
+    pub manifest_id: String,
+    pub manifest_sha256: String,
+    pub logical_sequence: u64,
+    pub history_anchor: HistoryAnchor,
+    pub history_root: String,
+    pub physical_root: String,
+    pub state_checksum_sha256: String,
+    pub base_states: Vec<ControlMvpStateRef>,
+    pub anchor_states: Vec<ControlMvpStateRef>,
+    pub tx_refs: Vec<super::ControlMvpTxRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,10 +105,10 @@ impl Canonical {
         if !valid_raw_digest(value) {
             return Err(invariant_violation("invalid canonical digest"));
         }
-        self.0.extend_from_slice(
-            &hex::decode(value)
-                .map_err(|error| segment_serialization_error("canonical digest", error))?,
-        );
+        let mut decoded = [0; 32];
+        hex::decode_to_slice(value, &mut decoded)
+            .map_err(|error| segment_serialization_error("canonical digest", error))?;
+        self.0.extend_from_slice(&decoded);
         Ok(())
     }
     fn finish(self) -> String {
@@ -218,25 +238,25 @@ pub(super) fn validate_state_refs(states: &[ControlMvpStateRef]) -> Result<Optio
 pub(super) fn valid_immutable_id(value: &str) -> bool {
     !value.trim().is_empty()
         && !matches!(value, "." | "..")
-        && !value.contains(['/', '\\', '%'])
-        && !value.chars().any(char::is_control)
+        && if value.is_ascii() {
+            !value
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, 0..=31 | 127 | b'/' | b'\\' | b'%'))
+        } else {
+            !value.contains(['/', '\\', '%']) && !value.chars().any(char::is_control)
+        }
 }
 
 impl ControlMvpManifest {
     pub(super) fn physical_digest(&self) -> Result<String> {
-        let mut out = Canonical::new(b"arco/control-v1/manifest-layout", &self.scope);
-        encode_states(&mut out, 1, &self.base_states)?;
-        encode_states(&mut out, 2, &self.anchor_states)?;
-        out.u8(3);
-        out.u64(self.tx_refs.len() as u64);
-        for reference in &self.tx_refs {
-            out.bytes(reference.tx_id.as_bytes());
-            out.u64(reference.sequence);
-            out.u64(reference.size_bytes);
-            out.u32(CONTROL_MVP_FORMAT_VERSION);
-            out.digest(&reference.checksum_sha256)?;
-        }
-        Ok(out.finish())
+        physical_digest(
+            &self.scope,
+            &self.base_states,
+            &self.anchor_states,
+            &self.tx_refs,
+            &[],
+        )
     }
 
     pub(super) fn successor_history_anchor(&self) -> HistoryAnchor {
@@ -282,9 +302,7 @@ impl ControlMvpManifest {
             return Err(invariant_violation("manifest integrity root mismatch"));
         }
         if let Some(evidence) = &self.equivalence {
-            if evidence.encoding_version != 1
-                || !self.tx_refs.is_empty()
-                || self.base_manifest_id.as_deref() != Some(&evidence.source_manifest_id)
+            if self.base_manifest_id.as_deref() != Some(&evidence.source_manifest_id)
                 || self.parent_manifest_sha256.as_deref() != Some(&evidence.source_manifest_sha256)
                 || evidence.source_history_root != self.history_root
                 || evidence.logical_sequence != self.logical_sequence
@@ -294,9 +312,121 @@ impl ControlMvpManifest {
             {
                 return Err(invariant_violation("invalid rewrite equivalence evidence"));
             }
+            match (evidence.encoding_version, &evidence.render_source) {
+                (1, None) if self.tx_refs.is_empty() => {}
+                (2, Some(render)) => render.validate(self, evidence)?,
+                _ => {
+                    return Err(invariant_violation(
+                        "unsupported rewrite equivalence variant",
+                    ));
+                }
+            }
         } else if self.tx_refs.is_empty() {
             return Err(invariant_violation(
                 "materialized maintenance lacks equivalence evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn physical_digest(
+    scope: &ControlMvpScopeDoc,
+    states: &[ControlMvpStateRef],
+    anchors: &[ControlMvpStateRef],
+    transactions: &[super::ControlMvpTxRef],
+    suffix: &[super::ControlMvpTxRef],
+) -> Result<String> {
+    let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope);
+    encode_states(&mut out, 1, states)?;
+    encode_states(&mut out, 2, anchors)?;
+    out.u8(3);
+    out.u64((transactions.len() + suffix.len()) as u64);
+    for reference in transactions.iter().chain(suffix) {
+        out.bytes(reference.tx_id.as_bytes());
+        out.u64(reference.sequence);
+        out.u64(reference.size_bytes);
+        out.u32(CONTROL_MVP_FORMAT_VERSION);
+        out.digest(&reference.checksum_sha256)?;
+    }
+    Ok(out.finish())
+}
+
+impl RenderSource {
+    fn validate(
+        &self,
+        candidate: &ControlMvpManifest,
+        evidence: &RewriteEquivalence,
+    ) -> Result<()> {
+        if !valid_immutable_id(&self.manifest_id)
+            || !valid_raw_digest(&self.manifest_sha256)
+            || !valid_raw_digest(&self.state_checksum_sha256)
+            || !valid_raw_digest(&self.history_root)
+            || !valid_raw_digest(&self.history_anchor.root)
+            || self.logical_sequence != candidate.history_anchor.sequence
+            || self.history_root != candidate.history_anchor.root
+            || self.history_anchor.sequence
+                != self.base_states.first().map_or(0, |s| s.logical_sequence)
+            || (self.history_anchor.sequence == 0
+                && self.history_anchor != genesis(&candidate.scope))
+            || (!candidate.tx_refs.is_empty() && !self.anchor_states.is_empty())
+            || self
+                .anchor_states
+                .iter()
+                .any(|s| s.logical_sequence != self.logical_sequence)
+            || physical_digest(
+                &candidate.scope,
+                &self.base_states,
+                &self.anchor_states,
+                &self.tx_refs,
+                &[],
+            )? != self.physical_root
+        {
+            return Err(invariant_violation("invalid rewrite render cut"));
+        }
+        let mut sequence = self.history_anchor.sequence;
+        let mut history = &self.history_anchor.root;
+        let mut ids = BTreeSet::new();
+        for tx in self.tx_refs.iter().chain(&candidate.tx_refs) {
+            sequence = sequence
+                .checked_add(1)
+                .ok_or_else(|| invariant_violation("rewrite sequence overflow"))?;
+            if tx.sequence != sequence
+                || tx.history.preceding_root != *history
+                || !valid_immutable_id(&tx.tx_id)
+                || !ids.insert(&tx.tx_id)
+                || tx.size_bytes == 0
+                || tx.size_bytes > MAX_TRANSACTION_JSON_BYTES as u64
+            {
+                return Err(invariant_violation("invalid rewrite source history prefix"));
+            }
+            tx.history.validate(&candidate.scope, sequence)?;
+            history = &tx.history.resulting_root;
+            if sequence == self.logical_sequence && history != &self.history_root {
+                return Err(invariant_violation("rewrite render history mismatch"));
+            }
+        }
+        if self
+            .tx_refs
+            .last()
+            .map_or(self.history_anchor.sequence, |tx| tx.sequence)
+            != self.logical_sequence
+            || sequence != candidate.logical_sequence
+            || history != &candidate.history_root
+            || physical_digest(
+                &candidate.scope,
+                &self.base_states,
+                &self.anchor_states,
+                &self.tx_refs,
+                &candidate.tx_refs,
+            )? != evidence.source_physical_root
+            || (candidate.tx_refs.is_empty()
+                && (self.manifest_id != evidence.source_manifest_id
+                    || self.manifest_sha256 != evidence.source_manifest_sha256
+                    || self.state_checksum_sha256 != evidence.state_checksum_sha256))
+        {
+            return Err(invariant_violation(
+                "rewrite publish source differs from render prefix and retained suffix",
             ));
         }
         Ok(())

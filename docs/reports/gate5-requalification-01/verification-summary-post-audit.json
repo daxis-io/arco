@@ -1,0 +1,210 @@
+{
+  "source_manifest_sha256": "2a3c4e9c32ab02f616810c0bb07d448ac1d34dccd45570a37be601f6fd9d537e",
+  "post_audit_required_lanes": [
+    "catalog-03",
+    "clippy-03",
+    "benchmark-default-03",
+    "fmt-03",
+    "diff-check-03",
+    "scaling-03",
+    "resume-03",
+    "core-03",
+    "api-check-03",
+    "lifecycle-03",
+    "catalog-default-lib-03",
+    "workspace-clippy-03",
+    "default-cost-smoke-03",
+    "workspace-docs-03",
+    "workspace-doctests-03",
+    "workspace-default-check-03",
+    "catalog-all-features-lib-03",
+    "workspace-check-03"
+  ],
+  "post_audit_passed": 18,
+  "post_audit_failed": 0,
+  "post_audit_exact_source": true,
+  "counts": {
+    "catalog-03": {
+      "passed": 908,
+      "failed": 0,
+      "ignored": 9
+    },
+    "clippy-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "benchmark-default-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "fmt-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "diff-check-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "scaling-03": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "resume-03": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "core-03": {
+      "passed": 302,
+      "failed": 0,
+      "ignored": 6
+    },
+    "api-check-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "lifecycle-03": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "catalog-default-lib-03": {
+      "passed": 435,
+      "failed": 0,
+      "ignored": 0
+    },
+    "workspace-clippy-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "default-cost-smoke-03": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    "workspace-docs-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "workspace-doctests-03": {
+      "passed": 37,
+      "failed": 0,
+      "ignored": 19
+    },
+    "workspace-default-check-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "catalog-all-features-lib-03": {
+      "passed": 468,
+      "failed": 0,
+      "ignored": 0
+    },
+    "workspace-check-03": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "all_recorded_runs": 97,
+  "preserved_failures": [
+    "catalog-02",
+    "clock-lint-01",
+    "effective-clock-red-01",
+    "future-creation-red-01",
+    "gc-closure-red-01",
+    "lifetime-red-01",
+    "lint-stabilization-01",
+    "lint-stabilization-02",
+    "lock-expiry-red-01",
+    "phases-red-01",
+    "prior-submission-red-01",
+    "production-api-red-01",
+    "python-hermetic-01"
+  ],
+  "initial_qualification": {
+    "mandatory_lanes": [
+      "reclamation-01",
+      "catalog-01",
+      "clippy-01",
+      "benchmark-default-01",
+      "fmt-01",
+      "diff-check-01",
+      "scaling-01",
+      "resume-01",
+      "core-01",
+      "api-check-01",
+      "lifecycle-01",
+      "xtask-doctor-01",
+      "xtask-adr-check-01",
+      "xtask-verify-integrity-01",
+      "xtask-engine-boundary-check-01",
+      "xtask-parity-matrix-check-01",
+      "xtask-repo-hygiene-check-01",
+      "xtask-proto-breaking-check-01",
+      "catalog-default-lib-01",
+      "workspace-check-01",
+      "api-full-check-01",
+      "api-crypto-check-01",
+      "workspace-clippy-01",
+      "workspace-tests-01",
+      "default-cost-smoke-01",
+      "vendored-thrift-01",
+      "delta-replay-01",
+      "api-tests-01",
+      "api-tokens-01",
+      "api-parity-01",
+      "flow-default-build-01",
+      "flow-default-lib-01",
+      "flow-legacy-build-01",
+      "flow-legacy-lib-01",
+      "flow-rebuild-01",
+      "flow-dispatch-01",
+      "flow-parity-m1-01",
+      "flow-parity-m2-01",
+      "flow-parity-m3-01",
+      "flow-tests-01",
+      "flow-legacy-integration-01",
+      "deterministic-uat-01",
+      "workspace-docs-01",
+      "workspace-doctests-01",
+      "workspace-default-check-01",
+      "dependency-policy-candidate-01",
+      "dependency-policy-base-01",
+      "dependency-advisories-01",
+      "buf-lint-01",
+      "proto-base-breaking-01",
+      "mdbook-01",
+      "python-hermetic-02",
+      "advisory-policy-tests-01",
+      "advisory-exceptions-01"
+    ],
+    "mandatory_passed": 54,
+    "mandatory_failed": 0,
+    "mandatory_candidate_exact_source": true,
+    "total_lanes": 72,
+    "preserved_failed_lanes": [
+      "gc-closure-red-01",
+      "lifetime-red-01",
+      "lint-stabilization-01",
+      "lint-stabilization-02",
+      "lock-expiry-red-01",
+      "phases-red-01",
+      "prior-submission-red-01",
+      "production-api-red-01",
+      "python-hermetic-01"
+    ],
+    "source_sha256": "bc4b27b29eab0ec33e0bc13adcb3d0403a8acc5ad5c470037a5f30814dd6875b",
+    "counts_overlap": true
+  },
+  "scope": "The initial 54-lane qualification remains pinned to bc4b27. Eighteen affected lanes are repeated on final source. Unchanged downstream/runtime/policy evidence is scoped in post-audit-verification-scope.md. Counts overlap; do not sum them as unique tests."
+}

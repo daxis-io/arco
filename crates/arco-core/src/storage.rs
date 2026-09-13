@@ -344,7 +344,7 @@ impl StorageBackend for MemoryBackend {
             StoredObject {
                 data,
                 version: new_version,
-                last_modified: Utc::now(),
+                last_modified: crate::wall_clock(),
             },
         );
         drop(objects);

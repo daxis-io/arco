@@ -705,6 +705,8 @@ impl WorkspaceSnapshotService {
         self
     }
 
+    // The instance clock is only compiled with test-utils.
+    #[cfg_attr(not(feature = "test-utils"), allow(clippy::unused_self))]
     fn now(&self) -> DateTime<Utc> {
         #[cfg(feature = "test-utils")]
         if let Some(clock) = &self.clock {
@@ -2197,6 +2199,8 @@ fn validate_operation_retention(
 }
 
 fn prefixed_sha256(bytes: &[u8]) -> String {
+    #[cfg(feature = "test-utils")]
+    crate::state_store::control_mvp::cost::record_retention_hash(bytes.len());
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))

@@ -22,6 +22,24 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
 
+arco-catalog = { path = "../arco-catalog", default-features = false, optional = true }
+serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+ulid = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 ulid = { workspace = true }
+
+[features]
+qualification = ["dep:arco-catalog", "dep:serde_json", "dep:serde", "dep:sha2", "dep:futures", "dep:http", "dep:chrono", "dep:tokio", "dep:ulid"]
+
+[[bin]]
+name = "arco-state-store-qualification"
+path = "src/bin/qualification.rs"
+required-features = ["qualification"]

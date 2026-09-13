@@ -26,7 +26,6 @@ new wire format nor conversion is implemented in this follow-up.
 ## Exact source and scope
 
 - Worktree: `/Users/ethanurbanski/arco/.worktrees/state-store-vnext-gate7-capacity-20260912-01`.
-- Branch: `codex/state-store-vnext-gate7-capacity-20260912-01`.
 - Git base: `92fd19f11a547ece5004ac94cad83a3527471812`.
 - Reconstructed Gate 7 checkpoint 05: 1,096 files, manifest SHA-256
   `079a7b5251ad06d34c90aa9cff12c54975ef2dab300a9ded31843a0474824924`.

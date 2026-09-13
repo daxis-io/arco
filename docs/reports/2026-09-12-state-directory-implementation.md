@@ -98,8 +98,7 @@ Existing authority algorithms and the separate runtime-cache handoff remain unto
 
 ## Source and recovery
 
-Worktree: `/Users/ethanurbanski/arco/.worktrees/state-store-directory-20260912-01`. Branch:
-`codex/state-store-directory-20260912-01`. Git base:
+Worktree: `/Users/ethanurbanski/arco/.worktrees/state-store-directory-20260912-01`. Git base:
 `92fd19f11a547ece5004ac94cad83a3527471812`. Input candidate manifest:
 `11af6ae7f7649040bf4796da52729f01fb744000db3145cfdbe673ce2951f98b`.
 

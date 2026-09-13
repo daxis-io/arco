@@ -20,8 +20,8 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use tracing::instrument;
 
+use arco_catalog::RegisterTableInSchemaRequest;
 use arco_catalog::write_options::WriteOptions;
-use arco_catalog::{CatalogReader, CatalogWriter};
 
 use crate::audit::{
     REASON_COMMIT_CACHED_FAILURE, REASON_COMMIT_CAS_CONFLICT, REASON_COMMIT_IN_PROGRESS,
@@ -41,16 +41,17 @@ use crate::idempotency::canonical_request_hash;
 use crate::paths::resolve_metadata_path;
 use crate::pointer::{IcebergTablePointer, UpdateSource, resolve_effective_metadata_location};
 use crate::pointer_store::IcebergPointerStore;
+use crate::routes::authority;
 use crate::routes::utils::{
-    commit_idempotency_key, ensure_prefix, is_iceberg_table, join_namespace, paginate,
-    parse_namespace,
+    catalog_list_request, commit_idempotency_key, ensure_prefix, is_iceberg_table, join_namespace,
+    paginate, parse_namespace,
 };
 use crate::state::{CredentialRequest, IcebergState, TableInfo};
 use crate::transactions::TransactionStoreImpl;
 use crate::types::{
     AccessDelegation, CommitTableRequest, CommitTableResponse, CreateTableRequest,
     CredentialsQuery, DropTableQuery, ListTablesQuery, ListTablesResponse, LoadTableQuery,
-    LoadTableResponse, RegisterTableRequest, ReportMetricsRequest, SnapshotsFilter,
+    LoadTableResponse, NamespaceIdent, RegisterTableRequest, ReportMetricsRequest, SnapshotsFilter,
     TableCredentialsResponse, TableIdent, TableMetadata,
 };
 
@@ -128,25 +129,68 @@ async fn list_tables(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let mut tables: Vec<TableIdent> = reader
-        .list_tables(&namespace_name)
-        .await
-        .map_err(IcebergError::from)?
-        .into_iter()
-        .filter(|table| is_iceberg_table(table.format.as_deref()))
-        .map(|table| TableIdent::new(namespace_ident.clone(), table.name))
-        .collect();
-
-    tables.sort_by(|a, b| a.name.cmp(&b.name));
-    let (page, next) = paginate(tables, query.page_token, query.page_size)?;
+    let (tables, next) = if authority::is_control_v1(&state, &ctx) {
+        list_control_tables_page(
+            &catalog,
+            &namespace_name,
+            &namespace_ident,
+            query.page_token,
+            query.page_size,
+        )
+        .await?
+    } else {
+        let mut tables = catalog
+            .list_native_tables(&namespace_name)
+            .await
+            .map_err(IcebergError::from)?
+            .into_iter()
+            .filter(|table| is_iceberg_table(table.format.as_deref()))
+            .map(|table| TableIdent::new(namespace_ident.clone(), table.name))
+            .collect::<Vec<_>>();
+        tables.sort_by(|left, right| left.name.cmp(&right.name));
+        paginate(tables, query.page_token, query.page_size)?
+    };
 
     Ok(Json(ListTablesResponse {
-        identifiers: page,
+        identifiers: tables,
         next_page_token: next,
     }))
+}
+
+async fn list_control_tables_page(
+    catalog: &arco_catalog::CatalogAuthority,
+    namespace_name: &str,
+    namespace_ident: &NamespaceIdent,
+    mut page_token: Option<String>,
+    page_size: Option<u32>,
+) -> IcebergResult<(Vec<TableIdent>, Option<String>)> {
+    let page_limit = catalog_list_request(None, page_size)?.max_results();
+    let mut tables = Vec::with_capacity(page_limit);
+    loop {
+        let remaining = page_limit.saturating_sub(tables.len());
+        let mut request =
+            arco_catalog::CatalogListRequest::new(remaining).map_err(IcebergError::from)?;
+        if let Some(token) = page_token.take() {
+            request = request.with_page_token(token);
+        }
+        let page = catalog
+            .list_native_tables_page(namespace_name, request)
+            .await
+            .map_err(IcebergError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        tables.extend(
+            page.into_items()
+                .into_iter()
+                .filter(|table| is_iceberg_table(table.format.as_deref()))
+                .map(|table| TableIdent::new(namespace_ident.clone(), table.name)),
+        );
+        if tables.len() == page_limit || next.is_none() {
+            return Ok((tables, next));
+        }
+        page_token = next;
+    }
 }
 
 /// Create table.
@@ -197,10 +241,7 @@ async fn create_table(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(IcebergError::from)?;
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -249,14 +290,16 @@ async fn create_table(
         });
     }
 
-    let table = writer
-        .register_table(
-            arco_catalog::RegisterTableRequest {
-                namespace: namespace_name.clone(),
+    let table = catalog
+        .register_native_table(
+            &namespace_name,
+            RegisterTableInSchemaRequest {
                 name: req.name.clone(),
                 description: None,
                 location: Some(table_location.clone()),
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties: Some(req.properties.clone().into_iter().collect()),
                 columns: vec![],
             },
             options,
@@ -306,8 +349,8 @@ async fn create_table(
         )
         .await
     {
-        if let Err(rollback_err) = writer
-            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+        if let Err(rollback_err) = catalog
+            .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
             .await
         {
             tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after metadata write failure");
@@ -336,8 +379,8 @@ async fn create_table(
             if let Err(rollback_err) = storage.delete(&metadata_storage_path).await {
                 tracing::warn!(error = %rollback_err, path = %metadata_storage_path, "Failed to rollback metadata file after pointer write failure");
             }
-            if let Err(rollback_err) = writer
-                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            if let Err(rollback_err) = catalog
+                .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
                 .await
             {
                 tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer write failure");
@@ -354,8 +397,8 @@ async fn create_table(
             if let Err(rollback_err) = storage.delete(&metadata_storage_path).await {
                 tracing::warn!(error = %rollback_err, path = %metadata_storage_path, "Failed to rollback metadata file after pointer conflict");
             }
-            if let Err(rollback_err) = writer
-                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            if let Err(rollback_err) = catalog
+                .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
                 .await
             {
                 tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer conflict");
@@ -434,10 +477,10 @@ async fn load_table(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let table = reader
-        .get_table(&namespace_name, &path.table)
+    let table = catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
@@ -597,10 +640,10 @@ async fn head_table(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let table = reader
-        .get_table(&namespace_name, &path.table)
+    let table = catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()));
@@ -665,6 +708,7 @@ async fn commit_table(
     Json(request_value): Json<serde_json::Value>,
 ) -> IcebergResult<Response> {
     ensure_prefix(&path.prefix, &state.config)?;
+    authority::reject_table_commit_for_control_v1(&state, &ctx)?;
 
     if !state.config.allow_write {
         return Err(IcebergError::BadRequest {
@@ -710,10 +754,10 @@ async fn commit_table(
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage.clone());
+    let catalog = authority::read(&state, &ctx)?;
 
-    let table = reader
-        .get_table(&namespace_name, &path.table)
+    let table = catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
@@ -874,16 +918,15 @@ async fn drop_table(
 
     let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
 
-    let reader = CatalogReader::new(storage.clone());
-    let table = reader
-        .get_table(&namespace_name, &path.table)
+    let catalog = authority::read(&state, &ctx)?;
+    let table = catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
         .ok_or_else(|| IcebergError::table_not_found(&namespace_name, &path.table))?;
 
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -893,8 +936,8 @@ async fn drop_table(
         options = options.with_idempotency_key(key);
     }
 
-    writer
-        .drop_table(&namespace_name, &path.table, options)
+    catalog
+        .drop_native_table(&namespace_name, &path.table, options)
         .await
         .map_err(IcebergError::from)?;
 
@@ -962,11 +1005,10 @@ async fn get_credentials(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let catalog = authority::read(&state, &ctx)?;
 
-    let table = reader
-        .get_table(&namespace_name, &path.table)
+    let table = catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
@@ -1038,11 +1080,10 @@ async fn report_metrics(
     let namespace_ident = parse_namespace(&path.namespace, &separator)?;
     let namespace_name = join_namespace(&namespace_ident, &separator)?;
 
-    let storage = ctx.scoped_storage(Arc::clone(&state.storage))?;
-    let reader = CatalogReader::new(storage);
+    let catalog = authority::read(&state, &ctx)?;
 
-    reader
-        .get_table(&namespace_name, &path.table)
+    catalog
+        .get_native_table(&namespace_name, &path.table)
         .await
         .map_err(IcebergError::from)?
         .filter(|table| is_iceberg_table(table.format.as_deref()))
@@ -1118,9 +1159,9 @@ async fn register_table(
             error_type: "BadRequestException",
         })?;
 
-    let reader = CatalogReader::new(storage.clone());
-    let existing = reader
-        .get_table(&namespace_name, &req.name)
+    let catalog = authority::read(&state, &ctx)?;
+    let existing = catalog
+        .get_native_table(&namespace_name, &req.name)
         .await
         .map_err(IcebergError::from)?;
 
@@ -1150,10 +1191,7 @@ async fn register_table(
             }
         })?;
 
-    let compactor = state.create_compactor(&storage)?;
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(IcebergError::from)?;
+    let catalog = authority::write(&state, &ctx).await?;
 
     let mut options = WriteOptions::default()
         .with_actor(format!("iceberg-api:{}", ctx.tenant))
@@ -1164,20 +1202,22 @@ async fn register_table(
     }
 
     if existing.is_some() && req.overwrite {
-        writer
-            .drop_table(&namespace_name, &req.name, options.clone())
+        catalog
+            .drop_native_table(&namespace_name, &req.name, options.clone())
             .await
             .map_err(IcebergError::from)?;
     }
 
-    let table = writer
-        .register_table(
-            arco_catalog::RegisterTableRequest {
-                namespace: namespace_name.clone(),
+    let table = catalog
+        .register_native_table(
+            &namespace_name,
+            RegisterTableInSchemaRequest {
                 name: req.name.clone(),
                 description: None,
                 location: Some(metadata.location.clone()),
                 format: Some("iceberg".to_string()),
+                table_type: None,
+                properties: Some(metadata.properties.clone().into_iter().collect()),
                 columns: vec![],
             },
             options,
@@ -1210,8 +1250,8 @@ async fn register_table(
         )
         .await
     {
-        if let Err(rollback_err) = writer
-            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+        if let Err(rollback_err) = catalog
+            .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
             .await
         {
             tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after metadata write failure in register");
@@ -1240,8 +1280,8 @@ async fn register_table(
             if let Err(rollback_err) = storage.delete(&new_metadata_storage_path).await {
                 tracing::warn!(error = %rollback_err, path = %new_metadata_storage_path, "Failed to rollback metadata file after pointer write failure in register");
             }
-            if let Err(rollback_err) = writer
-                .drop_table(&namespace_name, &req.name, WriteOptions::default())
+            if let Err(rollback_err) = catalog
+                .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
                 .await
             {
                 tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer write failure in register");
@@ -1259,8 +1299,8 @@ async fn register_table(
         if let Err(rollback_err) = storage.delete(&new_metadata_storage_path).await {
             tracing::warn!(error = %rollback_err, path = %new_metadata_storage_path, "Failed to rollback metadata file after pointer conflict in register");
         }
-        if let Err(rollback_err) = writer
-            .drop_table(&namespace_name, &req.name, WriteOptions::default())
+        if let Err(rollback_err) = catalog
+            .drop_native_table(&namespace_name, &req.name, WriteOptions::default())
             .await
         {
             tracing::warn!(error = %rollback_err, "Failed to rollback catalog entry after pointer conflict in register");
@@ -1380,9 +1420,11 @@ async fn maybe_vended_credentials(
 mod tests {
     use super::*;
     use crate::state::IcebergConfig;
-    use arco_catalog::CatalogWriter;
     use arco_catalog::Tier1Compactor;
     use arco_catalog::write_options::WriteOptions;
+    use arco_catalog::{
+        CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogReader, CatalogWriter,
+    };
     use arco_core::ScopedStorage;
     use arco_core::storage::{
         MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -1494,6 +1536,15 @@ mod tests {
         };
         IcebergState::with_config(storage, config)
             .with_compactor_factory(Arc::new(crate::state::Tier1CompactorFactory))
+    }
+
+    fn build_control_v1_state_with_write_enabled() -> IcebergState {
+        let bindings = CatalogAuthorityBindings::new([CatalogAuthorityBinding::control_v1(
+            "acme",
+            "analytics",
+        )])
+        .expect("exact binding");
+        build_state_with_write_enabled().with_catalog_authority_bindings(Arc::new(bindings))
     }
 
     async fn seed_table(state: &IcebergState, namespace: &str, table: &str) -> String {
@@ -1924,6 +1975,32 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn control_v1_root_rejects_table_metadata_commit_before_catalog_lookup() {
+        let response = app(build_control_v1_state_with_write_enabled())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/arco/namespaces/sales/tables/orders")
+                    .header("X-Tenant-Id", "acme")
+                    .header("X-Workspace-Id", "analytics")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("Retry-After").unwrap(), "5");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body_text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(body_text.contains("catalog_authority_table_commit_disabled"));
+        assert!(!body_text.contains("StateToken"));
     }
 
     async fn seed_namespace_only(state: &IcebergState, namespace: &str) {

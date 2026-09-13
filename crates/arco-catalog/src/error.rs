@@ -78,6 +78,30 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// A conditional authority write may have landed, but visible durable
+    /// state cannot prove either commitment or non-commitment.
+    #[error("ambiguous authority outcome: {message}")]
+    AmbiguousAuthorityOutcome {
+        /// Reconciliation context including the original storage failure.
+        message: String,
+    },
+
+    /// A mandatory bounded-replay anchor cannot fit the supported immutable
+    /// segment format, so publication must stop before writing candidates.
+    #[error("maintenance backpressure: {message}")]
+    MaintenanceBackpressure {
+        /// Capacity limit that requires offline consolidation or retention work.
+        message: String,
+    },
+
+    /// Restore recovery encountered authority from a retired/noncanonical
+    /// durable layout that this kernel deliberately does not migrate.
+    #[error("unsupported authority format: {message}")]
+    UnsupportedAuthorityFormat {
+        /// Hard-cut diagnosis and operator recovery direction.
+        message: String,
+    },
+
     /// Replayed terminal request failure with a preserved HTTP status code.
     #[error("{message}")]
     RequestFailed {
@@ -126,7 +150,10 @@ impl CatalogError {
             Self::Storage { .. }
             | Self::Serialization { .. }
             | Self::Parquet { .. }
-            | Self::InvariantViolation { .. } => None,
+            | Self::InvariantViolation { .. }
+            | Self::AmbiguousAuthorityOutcome { .. }
+            | Self::MaintenanceBackpressure { .. }
+            | Self::UnsupportedAuthorityFormat { .. } => None,
         }
     }
 }

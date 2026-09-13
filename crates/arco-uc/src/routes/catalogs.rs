@@ -5,8 +5,8 @@
 
 #![allow(clippy::option_option)]
 
+use arco_catalog::CatalogError;
 use arco_catalog::writer::CatalogPatch;
-use arco_catalog::{CatalogError, CatalogReader};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Extension, Path, Query, State};
@@ -119,25 +119,6 @@ fn catalog_info(catalog: arco_catalog::writer::Catalog) -> CatalogInfo {
     }
 }
 
-fn paginate_catalogs(
-    catalogs: &[CatalogInfo],
-    pagination: &preview::Pagination,
-) -> (Vec<CatalogInfo>, Option<String>) {
-    let start = pagination.start();
-    if start >= catalogs.len() {
-        return (Vec::new(), None);
-    }
-
-    let end = start.saturating_add(pagination.limit()).min(catalogs.len());
-    let next_page_token = (end < catalogs.len()).then(|| end.to_string());
-    (
-        catalogs
-            .get(start..end)
-            .map_or_else(Vec::new, ToOwned::to_owned),
-        next_page_token,
-    )
-}
-
 fn validate_storage_root(value: Option<String>) -> UnityCatalogResult<Option<String>> {
     value
         .map(|storage_root| preview::require_non_empty_string(Some(storage_root), "storage_root"))
@@ -210,36 +191,46 @@ pub(crate) async fn get_catalogs(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
-        page_token = ?query.page_token,
+        page_token_present = query.page_token.is_some(),
         max_results = ?query.max_results,
         "unity catalog list catalogs from authoritative catalog state"
     );
 
-    let pagination = preview::parse_pagination(
-        query.page_token.as_deref(),
+    if !common::uses_control_v1_catalog_authority(&state, &ctx) {
+        preview::validate_legacy_page_token(query.page_token.as_deref())?;
+    }
+
+    let pagination = preview::catalog_list_request(
+        query.page_token,
         query.max_results,
         preview::DEFAULT_PAGE_SIZE,
         1000,
     )?;
 
-    let mut catalogs = match common::authoritative_catalog_reader(&state, &ctx).await? {
-        Some(reader) => reader
-            .list_catalogs()
-            .await
-            .map_err(common::map_catalog_error)?
-            .into_iter()
-            .map(catalog_info)
-            .collect::<Vec<_>>(),
-        None => Vec::new(),
-    };
-    catalogs.sort_by(|left, right| left.name.cmp(&right.name));
-    let (catalogs, next_page_token) = paginate_catalogs(&catalogs, &pagination);
+    let (catalogs, next_page_token) =
+        match common::authoritative_catalog_reader(&state, &ctx).await? {
+            Some(reader) => {
+                let page = reader
+                    .list_catalogs_page(pagination)
+                    .await
+                    .map_err(common::map_catalog_error)?;
+                let next = page.next_page_token().map(str::to_string);
+                (
+                    page.into_items()
+                        .into_iter()
+                        .map(catalog_info)
+                        .collect::<Vec<_>>(),
+                    next,
+                )
+            }
+            None => (Vec::new(), None),
+        };
     tracing::debug!(
         tenant = %ctx.tenant,
         workspace = %ctx.workspace,
         request_id = %ctx.request_id,
         catalogs = catalogs.len(),
-        next_page_token = ?next_page_token,
+        next_page_token_present = next_page_token.is_some(),
         "unity catalog listed catalogs from authoritative catalog state"
     );
 
@@ -287,8 +278,8 @@ pub(crate) async fn post_catalogs(
         "unity catalog create catalog on authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let catalog = writer
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let catalog = authority
         .create_catalog_with_metadata(
             &name,
             payload.comment.as_deref(),
@@ -397,8 +388,8 @@ pub(crate) async fn update_catalog(
         "unity catalog update catalog on authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
-    let catalog = writer
+    let authority = common::catalog_authority(&state, &ctx).await?;
+    let catalog = authority
         .patch_catalog(
             &name,
             CatalogPatch {
@@ -452,10 +443,9 @@ pub(crate) async fn delete_catalog(
         "unity catalog delete catalog from authoritative catalog state"
     );
 
-    let writer = common::initialized_catalog_writer(&state, &ctx).await?;
+    let authority = common::catalog_authority(&state, &ctx).await?;
     if !force {
-        let reader = CatalogReader::new(writer.storage().clone());
-        let schemas = reader
+        let schemas = authority
             .list_schemas(&name)
             .await
             .map_err(common::map_catalog_error)?;
@@ -466,7 +456,7 @@ pub(crate) async fn delete_catalog(
         }
     }
 
-    writer
+    authority
         .delete_catalog(&name, force, common::writer_options(&ctx))
         .await
         .map_err(map_delete_catalog_error)?;

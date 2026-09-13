@@ -144,6 +144,8 @@ jobs:
           sudo mkdir -p /mnt/target
           sudo chown -R "$(id -u):$(id -g)" /mnt/target
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
+      - name: Control state operation-cost smoke (no latency thresholds)
+        run: cargo test -p arco-catalog --test control_cost_smoke --locked
       - name: Test vendored thrift protocol guards
         run: |
           tmpdir="$(mktemp -d)"

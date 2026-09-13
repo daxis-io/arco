@@ -13,7 +13,6 @@ use serde::Serialize;
 
 use arco_core::ScopedStorage;
 use arco_core::observability::{LogFormat, init_logging};
-use arco_core::storage::{ObjectStoreBackend, StorageBackend};
 use arco_flow::error::{Error, Result};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::compactor::FoldState;
@@ -30,6 +29,7 @@ use arco_flow::orchestration::events::{
     OrchestrationEvent, OrchestrationEventData, TaskOutcome, TimerType as EventTimerType,
 };
 use arco_flow::orchestration::flow_service::append_events_and_compact;
+use arco_storage::from_bucket;
 
 const DEFAULT_WORKER_QUEUE: &str = "default-queue";
 
@@ -390,8 +390,7 @@ async fn main() -> Result<()> {
     let port = resolve_port()?;
     let orch_compactor_url = optional_env("ARCO_FLOW_COMPACTOR_URL");
 
-    let backend = ObjectStoreBackend::from_bucket(&bucket)?;
-    let backend: Arc<dyn StorageBackend> = Arc::new(backend);
+    let backend = from_bucket(&bucket)?;
     let storage = ScopedStorage::new(backend, tenant_id.clone(), workspace_id.clone())?;
 
     let state = AppState {

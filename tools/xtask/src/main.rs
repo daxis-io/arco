@@ -7,7 +7,6 @@ use std::env;
 use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -21,8 +20,8 @@ use arco_catalog::manifest::{
     CatalogDomainManifest, DomainManifestPointer, ExecutionsManifest, LineageManifest,
     RootManifest, SearchManifest, SnapshotInfo,
 };
-use arco_core::storage::ObjectStoreBackend;
 use arco_core::{CatalogDomain, CatalogPaths, Error as CoreError, ScopedStorage};
+use arco_storage::from_bucket;
 
 /// Expected tool versions (should match CI)
 mod versions {
@@ -86,6 +85,8 @@ enum Commands {
     ParityMatrixCheck,
     /// Generate endpoint inventory from vendored Unity Catalog OSS OpenAPI fixture
     UcOpenapiInventory,
+    /// Generate endpoint inventory from vendored Unity Catalog Delta OpenAPI fixture
+    UcDeltaOpenapiInventory,
 }
 
 fn main() -> Result<()> {
@@ -102,6 +103,7 @@ fn main() -> Result<()> {
         Commands::ProtoBreakingCheck => run_proto_breaking_check(),
         Commands::ParityMatrixCheck => run_parity_matrix_check(),
         Commands::UcOpenapiInventory => run_uc_openapi_inventory(),
+        Commands::UcDeltaOpenapiInventory => run_uc_delta_openapi_inventory(),
         Commands::EngineBoundaryCheck => run_engine_boundary_check(),
         Commands::FlowBoundaryCheck => run_flow_boundary_check(),
         Commands::VerifyIntegrity {
@@ -115,33 +117,35 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_uc_openapi_inventory() -> Result<()> {
+fn generate_openapi_inventory(
+    spec_path: &Path,
+    output_path: &Path,
+    doc_title: &str,
+    source_ref: &str,
+) -> Result<()> {
     type OperationEntry = (String, String, Option<String>, Option<String>);
     type OperationsByTag = HashMap<String, Vec<OperationEntry>>;
 
-    let spec_path = Path::new("crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml");
-    let output_path = Path::new("docs/guide/src/reference/unity-catalog-openapi-inventory.md");
-
     let yaml = std::fs::read_to_string(spec_path)
-        .with_context(|| format!("read UC OpenAPI fixture at {}", spec_path.display()))?;
+        .with_context(|| format!("read OpenAPI fixture at {}", spec_path.display()))?;
     if yaml.contains("PLACEHOLDER") || yaml.contains("REPLACE_ME") {
         anyhow::bail!(
-            "UC OpenAPI fixture is a placeholder; replace {} with a pinned upstream api/all.yaml and record the commit hash in the header",
+            "OpenAPI fixture at {} is a placeholder; replace it with a pinned upstream {source_ref} and record the commit hash in the header",
             spec_path.display()
         );
     }
 
     let spec_yaml: serde_yaml::Value =
-        serde_yaml::from_str(&yaml).context("parse UC OpenAPI fixture YAML")?;
+        serde_yaml::from_str(&yaml).context("parse OpenAPI fixture YAML")?;
     let spec: serde_json::Value =
-        serde_json::to_value(spec_yaml).context("convert UC OpenAPI spec to JSON")?;
+        serde_json::to_value(spec_yaml).context("convert OpenAPI spec to JSON")?;
     let spec_sha256 = format!("{:x}", Sha256::digest(yaml.as_bytes()));
 
     let title = spec
         .get("info")
         .and_then(|info| info.get("title"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Unity Catalog OSS OpenAPI");
+        .unwrap_or("Unity Catalog OpenAPI");
     let version = spec
         .get("info")
         .and_then(|info| info.get("version"))
@@ -163,7 +167,7 @@ fn run_uc_openapi_inventory() -> Result<()> {
     let spec_paths = spec
         .get("paths")
         .and_then(serde_json::Value::as_object)
-        .context("UC OpenAPI spec missing `paths` object")?;
+        .context("OpenAPI spec missing `paths` object")?;
 
     let mut by_tag: OperationsByTag = HashMap::new();
 
@@ -226,7 +230,7 @@ fn run_uc_openapi_inventory() -> Result<()> {
     let manual_block = read_manual_block(output_path)?;
 
     let mut md = String::new();
-    md.push_str("# Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)\n\n");
+    md.push_str(&format!("# {doc_title}\n\n"));
     md.push_str(&format!("**Spec SHA256:** `{spec_sha256}`  \n"));
     md.push_str(&format!("**Spec fixture:** `{}`  \n", spec_path.display()));
     md.push_str(&format!("**Spec title:** {title}  \n"));
@@ -269,10 +273,28 @@ fn run_uc_openapi_inventory() -> Result<()> {
         .with_context(|| format!("write inventory markdown to {}", output_path.display()))?;
 
     println!(
-        "Wrote UC OpenAPI endpoint inventory to {}",
+        "Wrote OpenAPI endpoint inventory to {}",
         output_path.display()
     );
     Ok(())
+}
+
+fn run_uc_openapi_inventory() -> Result<()> {
+    generate_openapi_inventory(
+        Path::new("crates/arco-uc/tests/fixtures/unitycatalog-openapi.yaml"),
+        Path::new("docs/guide/src/reference/unity-catalog-openapi-inventory.md"),
+        "Unity Catalog OSS OpenAPI Endpoint Inventory (Pinned)",
+        "api/all.yaml",
+    )
+}
+
+fn run_uc_delta_openapi_inventory() -> Result<()> {
+    generate_openapi_inventory(
+        Path::new("crates/arco-uc/tests/fixtures/unitycatalog-delta-openapi.yaml"),
+        Path::new("docs/guide/src/reference/unity-catalog-delta-openapi-inventory.md"),
+        "Unity Catalog Delta OpenAPI Endpoint Inventory (Pinned)",
+        "api/delta.yaml",
+    )
 }
 
 fn is_http_method(key: &str) -> bool {
@@ -2040,9 +2062,9 @@ fn run_workspace_integrity(
     println!("  Scope: tenant={tenant}, workspace={workspace}");
     println!("  Bucket: {bucket}");
 
-    let backend = ObjectStoreBackend::from_bucket(&bucket)
+    let backend = from_bucket(&bucket)
         .with_context(|| format!("Failed to configure storage backend for '{bucket}'"))?;
-    let storage = ScopedStorage::new(Arc::new(backend), tenant, workspace)
+    let storage = ScopedStorage::new(backend, tenant, workspace)
         .context("Failed to create scoped storage")?;
 
     let runtime = Runtime::new().context("Failed to create tokio runtime")?;

@@ -1,93 +1,75 @@
 # Control-Plane Scope
 
-This page is the repo-local scorecard for Arco's control-plane scope.
+This scorecard separates architecture, repository implementation, local
+evidence, private provider qualification, production route wiring, and actual
+authority. A check in one column never implies a check in a later column.
 
-Use it to answer a narrow question:
+Reconciled against `origin/main@febdff55590cec7429e94b02ddb08f49b1bfae96`
+on 2026-09-01. The only change after the original report baseline
+`1979f0bc401c074637ea7496df7ea936c1dff900` is the UC Delta API configuration
+groundwork in PR #410; it does not change the authority assessment.
 
-> What is authoritative in the current repo, what is only partial, and what is still planned?
+Candidate implementation columns below include the uncommitted 2026-09-02
+working tree. They are local evidence only; the private qualification,
+authoritative, cutover, and soak columns deliberately remain negative.
 
-Status meanings:
+Legend:
 
-- `Implemented`: authoritative path exists in code, has tests, and is exercised by CI
-- `Partial`: some real implementation exists, but the scope is narrower than the intended framing or parallel non-authoritative paths still exist
-- `Planned`: documented intent, parity scaffolding, or placeholder behavior only
+- **Yes**: evidence exists at exactly this layer.
+- **Partial**: a real but narrower implementation exists.
+- **No**: the layer has not been crossed.
+- **N/A**: the layer does not apply to that row.
 
-Implementation claims on this page should satisfy the evidence policy in `docs/guide/src/reference/evidence-policy.md`.
+Implementation claims must follow the [evidence policy](./evidence-policy.md).
+Private qualification means machine-recorded provider evidence bound to a
+public Git SHA; repository tests and ignored credentialed tests do not qualify.
 
-## Scorecard
+## Authority-transition scorecard
 
-| Area | Status | Current authoritative path | Notes |
-|---|---|---|---|
-| Catalog DDL: catalogs, schemas, tables, columns | `Implemented` | `CatalogWriter` -> ledger append -> sync compaction -> immutable manifest snapshot -> pointer CAS | See `crates/arco-catalog/src/writer.rs` and `crates/arco-catalog/src/tier1_compactor.rs` |
-| Lineage domain | `Implemented` | Lineage ledger/events -> lineage snapshot -> pointer CAS | Separate manifest/lock domain from catalog DDL |
-| Search index | `Implemented` | Derived from current catalog state, then published via immutable snapshot + pointer CAS | Serving/index state is derived, not authoritative |
-| Orchestration transactions | `Implemented` | Orchestration events -> compaction -> immutable manifest snapshot -> pointer CAS | See `proto/arco/controlplane/v1/transactions.proto` |
-| Root transactions for pinned `catalog` + `orchestration` reads | `Implemented` | Root tx record + immutable super-manifest | Cross-domain pinning exists, but it is scoped |
-| Metastore/governance protobuf surface | `Partial` | Durable `arco.catalog.v1` metastore messages plus root transaction mutation envelope | Wire contract exists in `proto/arco/catalog/v1/metastore.proto`; additive changes must pass `cargo xtask proto-breaking-check` |
-| Metastore replay/projection kernel | `Partial` | `crates/arco-catalog/src/metastore/` folds initial native metastore events and builds allowlisted `metastore_objects.parquet` rows | This is a narrow kernel with schema watermarking and redaction tests; native writer parity and system-table exposure remain pending. Some UC governance adapters now have partial route behavior over scoped metastore and storage-governance state |
-| Table-format catalog contract | `Implemented` | `TableFormat` accepts Delta Lake, Iceberg, and plain Parquet; new table registration defaults to Delta | Legacy rows without persisted format metadata still read as Parquet; Iceberg and Parquet support do not imply full governance parity yet |
-| Delta commit coordination | `Implemented` | Coordinator state + CAS/idempotency flow | Table-scoped control-plane subsystem |
-| UC native parity for catalogs/schemas/tables | `Implemented` | UC catalog/schema/table routes use `CatalogWriter`/`CatalogReader` over the authoritative catalog ledger and manifest-published snapshots; `arco_uc::support` labels these operations `implemented` and exports their OpenAPI support metadata | Catalog/schema PATCH now authoritatively persists `comment`, `new_name`, `properties`, and `storage_root`; table create/get/list round-trips authoritative `table_type` and `properties`. Route-wide compiled-grant enforcement remains separate governance work |
-| Broader "catalog as control-plane ledger" framing | `Partial` | Real today for catalog DDL, lineage/search publication, orchestration transactions, delta coordination, the initial metastore replay/projection kernel, and selected route-level UC governance adapters | Broader governance domains are not yet production-backed through native writer APIs, route-wide enforcement, or system tables |
-| Grants / RBAC | `Partial` | `GET /permissions/{securable_type}/{full_name}` reads injected compiled assignments; contract and initial replay/projection kernel types also exist | `PATCH /permissions`, writer-backed grant mutation/persistence, grant-option enforcement, grant mutation audit, and native grants store parity remain planned or known-unsupported |
-| Permissions/authz state | `Partial` | UC-compatible partial adapters can consume injected compiled permissions and deny closed when required projections are unavailable | This is not yet a manifest-published grants projection or full route-wide authorization enforcement path |
-| Storage credentials | `Partial` | Arco-native `/storage-credentials` create/list/get uses scoped metastore ledger state and storage-governance validation | Pinned UC `/credentials` routes are known-unsupported; provider credential material/secret integration, update/delete, service credentials, and system-table exposure remain planned |
-| Service credentials | `Planned` | None | Roadmap object family; no authoritative contract or route behavior |
-| External service connections | `Planned` | None | Roadmap object family; no authoritative contract or route behavior |
-| External locations | `Partial` | `/external-locations` create/list/get uses scoped metastore ledger mutation/replay plus storage-governance path validation | Update/delete, broader binding lifecycle, native governance writer parity, and system-table exposure remain planned |
-| Managed storage roots | `Planned` | None | Required for governed path ownership, but not yet authoritative state |
-| Views | `Planned` | None | Views are a planned securable object family; query expansion/execution is out of current scope |
-| Volumes | `Planned` | Metastore proto contracts exist; no authoritative catalog writer/projection or API enforcement path | UC inventory has route shapes, but Arco-native state is not implemented |
-| Functions | `Planned` | Metastore proto contracts exist; no authoritative catalog writer/projection or API enforcement path | Metadata object family only; execution is out of scope |
-| Models / model versions | `Planned` | Metastore proto contracts exist; no authoritative catalog writer/projection or API enforcement path | Model artifact ownership and credential vending are planned |
-| Shares / providers / recipients | `Planned` | None | Roadmap compatibility surface; no current authoritative state |
-| Policies, masking, classifications, governance rules | `Planned` | `GovernanceAttachment` proto contract exists; no authoritative catalog writer/projection or policy enforcement path | Not yet modeled as authoritative runtime state |
-| Glossary terms / data products / business domains | `Planned` | None | Product taxonomy and metadata domains are design-level only |
-| Ownership / tags as authoritative control-plane state | `Planned` | Data types and metastore attachment contracts exist, but not authoritative transaction-managed state | Do not describe these as implemented governance control-plane objects |
-| Temporary credential vending | `Partial` | Table/path credential routes use compiled authorization plus published storage-governance state | Volume/model credentials, provider token material, revocation metadata, and full UC parity remain planned or known-unsupported |
-| Access audit | `Planned` | Tracing/audit hooks exist, but no authoritative catalog access-audit projection | System tables for access audit remain deferred |
-| Storage/system tables beyond initial catalog lineage orchestration surface | `Planned` | None | `system.access.*`, `system.storage.*`, and extended catalog object-family tables are not registered until projections exist |
-| State-store seam + current adapter (Phase 1A) | `Partial` | None; current Tier-1 ledger append -> sync compaction remains sole authority | `ArcoStateReader`/`ArcoStateStore`/`ArcoStateTxn`/`StateToken` seam types exist and are CI-tested (`crates/arco-catalog/src/state_store.rs`); the `CurrentStateStore` adapter intentionally exposes capability discovery only and delegates no production reads or writes |
-| Deterministic state model (Phase 3A) | `Partial` | None | `ModelStateStore` reference backend with point/range/predicate preconditions and replay determinism proven in CI (`crates/arco-catalog/src/state_store/model.rs`); reference model only, zero production callers |
-| Object-store control-store MVP (Phase 3B) | `Partial` | None | `ControlMvpStateStore` txlog + manifest + pointer-CAS prototype (`crates/arco-catalog/src/state_store/control_mvp.rs`); prototype-approved only, not accepted production architecture; replay is unbounded from genesis (#334) and publish has no writer-epoch fencing; zero production callers |
-| Prototype promotion gate (Phase 3C) | `Partial` | None | Advisory evaluator exists and is CI-tested (`crates/arco-catalog/src/state_store/promotion_gate.rs`) but has never run with real measurements; no control-MVP benchmark or recorded evidence packet exists; the control store is NOT promoted |
-| Shadow replay importer (Phase 4A) | `Partial` | None | `state_store/shadow_replay.rs` imports Tier-1 catalog state into an isolated `catalog-shadow` domain; covers 3 of 9 mandated comparison domains; importer has zero non-test callers, so no deployed shadow store is ever populated |
-| Internal comparison reads (Phase 4B) | `Partial` | None | `state_store/comparison_reads.rs` behind `ARCO_CATALOG_SHADOW_COMPARE_READS`; one internal read path (catalog inventory descriptor) compares current vs shadow, diagnostics only; inert while the 4A importer never runs |
-| Projection-outbox-acks writable domain (Phase 5) | `Partial` | None | First control-store writable domain (`state_store/projection_outbox_acks.rs`), idempotent acks + token-pinned reads at unit level; crate-private with zero non-test callers and not wired to the real arco-flow outbox |
-| Storage-governance metadata domains (Phase 6) | `Partial` | None | `path_governance_metadata.rs`, `external_location_metadata.rs`, `workspace_binding_metadata.rs` with ancestor/descendant predicate model and deny-closed readiness helpers, CI-tested; no authority moved; credential vending does not read these domains; the revocation-freshness budget required before any grants migration is undefined |
-| Workspace snapshots + export manifest (Phase 7A) | `Partial` | None | `workspace_snapshot.rs` snapshot/export contracts, GC ProtectionSet, and `system.catalog.snapshots` exact-schema projection, all CI-tested; pins can only reference control-MVP checkpoints, so no production authority is pinnable yet; no producer writes `snapshots.parquet` |
-| Workspace snapshot service (Phase 7B) | `Partial` | None | `workspace_snapshot_service.rs` Create/Get/Export with DistributedLock + retention-mutation-epoch coordination and read-only restore preflight, CI-tested; constructed by zero production code (no route or binary) |
-| Roll-forward restore (Phase 7C) | `Partial` | None | `workspace_restore.rs` deterministic plan/inspect/apply with crash-resume and REPAIR_REQUIRED journal tests; only the control-MVP `StateRestoreParticipant` exists; catalog/orchestration domains have no typed restore operation |
-| Durable transaction handles (Phase 7D) | `Partial` | None | Full OPEN..REPAIR_REQUIRED lifecycle state machine with 94 unit tests (`arco-api/src/control_plane_transactions/handles.rs`); deliberately transport-less (`#![cfg_attr(not(test), allow(dead_code))]`), unreachable in production builds; the legacy-handle identity guard IS live in the production `claim_idempotency` path |
+| Area | Accepted design | Implemented | Locally verified | Privately provider-qualified | Route-wired | Authoritative |
+|---|---|---|---|---|---|---|
+| Legacy catalog DDL (`CatalogWriter` -> ledger -> synchronous compaction -> Parquet manifest) | Yes, as the ADR-018 legacy path | Yes | Yes | Not recorded here | Yes through the shared adapter for every unbound root | Yes for every uncut root |
+| `ArcoStateStore` traits and `StateToken` contract | Yes (ADR-043) | Yes | Yes | N/A | Yes for an exact configured control root | No deployed authority |
+| Deterministic model store | Yes as a reference oracle | Yes | Yes | N/A | No | No |
+| `control/v1` object-store kernel | Yes (ADR-043) | Yes: v4 ordered L1 shards, bounded replay, checksum-bound Arrow/indexes, fencing, ambiguity reconciliation, restore | Yes | No | Yes, default-disabled for one exact root | No |
+| Bounded JSON envelopes and index-pruned paginated reads | Yes | Yes: 64 KiB head, 1/4 MiB envelopes, 4 MiB pages, authenticated-encrypted authority-pinned continuations, pinned and query-bound parent lookup, shared L0/L1 physical-read accounting, 64-segment budget, and unchanged native legacy keyset cursors | Yes for deterministic and control-kernel contracts | No | Yes through control authority reads | No |
+| Asynchronous L1 maintenance and conservative active GC | Yes | Yes: durable intent at 16 L0s, typed backpressure at 32, separate exact-CAS consolidation/GC capabilities, retention epochs and conservative marking | Yes for deterministic maintenance, recovery, retention, and deletion contracts | No | Worker APIs exist; no deployed scheduler | No |
+| Durable projection intents and acknowledgement root | Yes | Partial: intents, fixed consumer, real-Parquet materializer, separate ack root, exact terminal quarantine, monotonic durable redacted status, fail-open process-local notification, and fail-closed projection reads; provider queue delivery and always-on deployed scheduling absent | Yes for artifact-before-ack, retry/terminal recovery, poison-then-valid anti-entropy progress, concurrent status updates, sequence isolation, and status routing | No | Immediate local wake and operator drain exist; no deployed scheduler | No |
+| Shared native/UC/Iceberg `CatalogAuthority` | Yes | Yes | Yes, including cross-protocol reads and DDL | No | Yes, selected by exact binding | No deployed control root |
+| Exact per-root legacy/control binding | Yes | Yes: one validated tenant/workspace pair, no wildcard form, legacy default | Yes | No | Yes through server/native/UC/Iceberg state | No deployed control root |
+| S3 adapter | Yes, first qualification target | Yes | Yes for deterministic adapter contracts | No successful private gate recorded | Selectable by storage composition, not catalog authority | No catalog root |
+| GCS adapter | Yes as a future independent target | Yes | Yes for deterministic adapter contracts | No | Selectable by storage composition, not catalog authority | No catalog root |
+| Azure adapter | Yes as a future independent target | Yes | Yes for deterministic adapter contracts | No | Selectable by storage composition, not catalog authority | No catalog root |
+| Synthetic S3 catalog-DDL pilot | Yes | No | No | No | No | No |
 
-## Current Thesis, Narrowly Stated
+## Product-surface scorecard
 
-The repo proves this statement today:
+| Area | Accepted design | Implemented | Locally verified | Privately provider-qualified | Route-wired | Authoritative |
+|---|---|---|---|---|---|---|
+| Catalog/schema/table DDL and columns-at-registration | Yes | Yes on legacy and control authorities | Yes, including name/index/cascade/idempotency invariants and cross-protocol reads | Not recorded here | Native, UC, and Iceberg through one adapter | Legacy only in deployed state |
+| Table-format catalog records (Delta, Iceberg, Parquet) | Yes | Yes | Yes | N/A | Yes, with protocol-specific gaps | Yes on legacy catalog authority |
+| Managed Delta commits | Deferred from pilot | Yes as a separate coordinator; control pilot rejects before side effects | Yes | Not part of this gate | Existing behavior on non-pilot roots; disabled on pilot | Separate table-scoped authority |
+| Iceberg metadata commits | Deferred from pilot | Yes on existing route; control pilot rejects before legacy access | Yes | Not part of this gate | Existing behavior on non-pilot roots; disabled on pilot | Not moved to pilot authority |
+| Catalog Parquet/system-table projections | Yes, derived only | Legacy synchronous path plus control restart-safe Parquet materializer and status contract | Yes for materialization, restart recovery, redacted failures, and status-table lag | N/A | Legacy yes; control operator drain is wired, while projection-only reads still fail closed | Derived; never authorization authority |
+| Grants/RBAC and route-wide authorization | Yes, later milestone | Partial | Partial | No | Partial | Common catalog authority exists; authorization cutover remains deferred |
+| Storage credentials and external locations | Yes, later milestone | Partial create/list/get | Partial | No | Partial | Narrow scoped metastore paths only |
+| Rich lineage observations and projections | Proposed (ADR-042), deferred | Partial legacy edge surface | Yes for existing scope | N/A | Partial | Legacy lineage domain only |
+| Planner/runtime migration | Design direction, deferred | Partial seam | Partial | N/A | Partial | Existing orchestration path remains |
+| Workspace snapshot/export/roll-forward restore | Yes | Partial deterministic machinery | Yes | No | No operator route | No production caller |
 
-> Arco is a file-native catalog and metastore for open lakehouse table formats. It has an immutable-commit control plane for catalog DDL, lineage/search materialization, orchestration transactions, and Delta coordinated commit state, with fenced head publication as the visibility boundary.
+## Current thesis
 
-It also contains an initial native metastore replay/projection kernel that
-proves stable-ID folding, projection allowlisting, schema watermarking, and
-redaction for the first generic metastore projection.
+The candidate proves a legacy file-native catalog and locally verified,
+default-disabled `control/v1` catalog route machinery. It does **not** prove a
+provider-qualified, deployed, or authoritative `control/v1` catalog root. The
+milestone becomes proven only after provider notification/deployed scheduling
+and remaining operations work, a synthetic S3 root's private gate,
+simultaneous protocol cutover, old-writer revocation, and the seven-day soak.
 
-It additionally contains the Phase 1A–7D state-store program surfaces
-(seam traits, deterministic model, object-store control-store MVP, promotion
-gate, shadow replay, comparison reads, projection-outbox-acks, storage-
-governance metadata, workspace snapshots/export/restore, durable transaction
-handles). These are landed with CI-run test suites but are deliberately
-non-authoritative: crate-private, with zero production callers, and the
-control-store prototype has not passed its Phase 3C promotion gate. Do not
-describe any of them as production control-plane authority.
+## Canonical references
 
-The repo does not yet prove this broader statement:
-
-> Every governance and metadata object in the catalog is already managed through the same authoritative immutable control-plane ledger.
-
-## Related References
-
-- [Unified execution roadmap](../../../plans/2026-06-27-arco-unified-execution-roadmap.md)
-- `docs/reports/2026-07-30-design-program-progress-audit.md`
-- `docs/reports/2026-04-20-catalog-control-plane-framing-audit.md`
-- `docs/adr/adr-018-tier1-write-path.md`
-- `docs/adr/adr-032-immutable-manifest-pointers.md`
-- `docs/adr/adr-034-fenced-head-published-control-plane-transactions.md`
+- [Catalog authority hard cut](./catalog-authority-hard-cut.md)
+- [ADR-043](../../../adr/adr-043-s3-state-token-authority.md)
+- [ADR-018 legacy path](../../../adr/adr-018-tier1-write-path.md)
+- [Evidence policy](./evidence-policy.md)
+- `docs/reports/2026-09-01-consolidated-product-architecture-roadmap-state.md`

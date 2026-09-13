@@ -4,6 +4,11 @@
 
 Proposed
 
+This proposed lineage expansion is explicitly deferred from the first
+`control/v1` metastore hard-cut milestone. The pilot retains the existing
+lineage authority and does not claim grants/RBAC, rich lineage observations, or
+lineage-projection completeness.
+
 ## Context
 
 Arco's current lineage surface is a single table-level edge store: clients POST

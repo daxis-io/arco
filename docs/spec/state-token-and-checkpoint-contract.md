@@ -89,3 +89,21 @@ compatibility tests and a later decision.
 - public exposure by API surface;
 - cache and proxy behavior for header tokens;
 - audit logging for token issuance and failed token use.
+
+
+## Nondurable control/v1 transaction pins (Gate 4)
+
+A request-local transaction pin authenticates the selected manifest and captures
+HEAD's exact version and fences. It is distinct from a durable checkpoint or
+persisted authority reference: opening a transaction does not renew retention.
+Lazy reads validate selected immutable evidence; commit reconstructs the complete
+pinned authority and revalidates all required inputs before publication.
+Missing or corrupt required evidence fails closed even after earlier successful
+memoized reads.
+
+Transaction continuations bind a fresh in-memory origin and optional base token.
+They can paginate staged genesis values without inventing a durable state token,
+and cannot be passed to public readers or encoded into the v3 continuation wire.
+They expire with their transaction. Staged changes above the exclusive boundary
+are reflected in subsequent pages, including empty pages that advance over
+resolved deletes. See the [integrity and transaction contract](../plans/state-store-integrity-format-v1.md#gate-4-transaction-access-contract).

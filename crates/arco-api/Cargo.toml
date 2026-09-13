@@ -50,6 +50,7 @@ arco-iceberg = { path = "../arco-iceberg", default-features = false }
 arco-uc = { path = "../arco-uc", default-features = false }
 arco-proto = { path = "../arco-proto" }
 arco-worker-contract = { path = "../arco-worker-contract" }
+arco-storage = { path = "../arco-storage" }
 
 # Async runtime
 tokio = { workspace = true }

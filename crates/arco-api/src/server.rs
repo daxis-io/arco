@@ -37,7 +37,7 @@ use crate::context::RequestContext;
 use crate::error::ApiError;
 use crate::grpc_transactions;
 use crate::rate_limit::{RateLimitResult, RateLimitState};
-use arco_catalog::SyncCompactor;
+use arco_catalog::{CatalogAuthorityBindings, SyncCompactor};
 use arco_core::Result;
 use arco_core::audit::AuditEmitter;
 
@@ -107,6 +107,8 @@ pub struct AppState {
     sensor_evaluator: Arc<dyn SensorEvaluator>,
     /// Audit event emitter for security decision logging.
     audit: Arc<AuditEmitter>,
+    /// Exact-root catalog authority bindings; unlisted roots remain legacy.
+    catalog_authority_bindings: Arc<CatalogAuthorityBindings>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -118,6 +120,7 @@ impl std::fmt::Debug for AppState {
             .field("sync_compactor", &self.sync_compactor.is_some())
             .field("sensor_evaluator", &"<SensorEvaluator>")
             .field("audit", &self.audit)
+            .field("catalog_authority_bindings", &"<exact-root bindings>")
             .finish()
     }
 }
@@ -173,6 +176,7 @@ impl AppState {
             sync_compactor,
             sensor_evaluator,
             audit,
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -210,6 +214,7 @@ impl AppState {
             sync_compactor,
             sensor_evaluator,
             audit: Arc::new(AuditEmitter::with_tracing()),
+            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
         }
     }
 
@@ -244,6 +249,22 @@ impl AppState {
     #[must_use]
     pub fn audit(&self) -> &AuditEmitter {
         &self.audit
+    }
+
+    /// Returns the validated exact-root catalog authority registry.
+    #[must_use]
+    pub fn catalog_authority_bindings(&self) -> Arc<CatalogAuthorityBindings> {
+        Arc::clone(&self.catalog_authority_bindings)
+    }
+
+    /// Installs validated exact-root catalog authority bindings.
+    #[must_use]
+    pub fn with_catalog_authority_bindings(
+        mut self,
+        bindings: Arc<CatalogAuthorityBindings>,
+    ) -> Self {
+        self.catalog_authority_bindings = bindings;
+        self
     }
 }
 
@@ -758,13 +779,24 @@ impl Server {
         &self.config
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "serve validates the exact-root binding configuration before constructing state; test_router treats invalid fixture configuration as a test bug"
+    )]
     fn create_state(&self) -> Arc<AppState> {
-        Arc::new(AppState::new_with_audit(
-            self.config.clone(),
-            Arc::clone(&self.storage),
-            Arc::clone(&self.sensor_evaluator),
-            self.audit_emitter.clone(),
-        ))
+        let bindings = self
+            .config
+            .catalog_authority_bindings()
+            .expect("server configuration must validate before state construction");
+        Arc::new(
+            AppState::new_with_audit(
+                self.config.clone(),
+                Arc::clone(&self.storage),
+                Arc::clone(&self.sensor_evaluator),
+                self.audit_emitter.clone(),
+            )
+            .with_catalog_authority_bindings(Arc::new(bindings)),
+        )
     }
 
     /// Creates the router with all routes and middleware.
@@ -863,7 +895,8 @@ impl Server {
             let mut iceberg_state = IcebergState::with_config(
                 Arc::clone(&state.storage),
                 state.config.iceberg.to_iceberg_config(),
-            );
+            )
+            .with_catalog_authority_bindings(state.catalog_authority_bindings());
 
             if state.config.iceberg.allow_namespace_crud || state.config.iceberg.allow_table_crud {
                 if let Some(compactor) = state.sync_compactor() {
@@ -910,6 +943,7 @@ impl Server {
             // deployed server. Wire the per-scope metastore-backed source; it
             // stays fail-closed when a scope's ledger cannot be read.
             let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+                .with_catalog_authority_bindings(state.catalog_authority_bindings())
                 .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
                     &state.storage,
                 ))));
@@ -1147,6 +1181,8 @@ impl Server {
 
     #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
+        self.config.catalog_authority_bindings()?;
+
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(
                 "debug mode requires posture=dev".to_string(),

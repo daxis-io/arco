@@ -5,7 +5,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow::array::{StringArray, TimestampMillisecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datafusion::catalog::memory::{MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::catalog_common::{CatalogProvider, SchemaProvider};
@@ -14,7 +16,14 @@ use datafusion::prelude::SessionContext;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use arco_catalog::parquet_util::{transaction_handle_schema, workspace_snapshot_schema};
-use arco_catalog::{CatalogError, CatalogReader};
+use arco_catalog::state_store::projection_outbox_acks::{
+    PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionMaterializationStatus, ProjectionOutboxAckWriter,
+    ProjectionOutboxWorker,
+};
+use arco_catalog::{
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthorityKind, CatalogError, CatalogReader,
+    StateScope,
+};
 use arco_core::{CatalogDomain, ScopedStorage};
 use arco_flow::orchestration::compactor::{
     MicroCompactor, write_backfill_chunks, write_backfills, write_catalog_run_index,
@@ -74,6 +83,8 @@ const CATALOG_SYSTEM_TABLES: &[SystemTableSpec] = &[
     },
 ];
 
+const CATALOG_PROJECTION_STATUS_TABLE: &str = "projection_status";
+
 const LINEAGE_SYSTEM_TABLES: &[SystemTableSpec] = &[SystemTableSpec {
     schema: "lineage",
     table: "edges",
@@ -103,7 +114,10 @@ const ORCHESTRATION_SYSTEM_TABLES: &[&str] = &[
 /// tenant-visible system catalog surface.
 pub(crate) fn is_allowlisted_system_table(schema: &str, table: &str) -> bool {
     match schema {
-        "catalog" => spec_table_is_allowlisted(CATALOG_SYSTEM_TABLES, table),
+        "catalog" => {
+            table == CATALOG_PROJECTION_STATUS_TABLE
+                || spec_table_is_allowlisted(CATALOG_SYSTEM_TABLES, table)
+        }
         "lineage" => spec_table_is_allowlisted(LINEAGE_SYSTEM_TABLES, table),
         ORCHESTRATION_SCHEMA => ORCHESTRATION_SYSTEM_TABLES.contains(&table),
         _ => false,
@@ -122,6 +136,7 @@ pub(crate) async fn register_system_tables(
     session: &SessionContext,
     reader: &CatalogReader,
     storage: &ScopedStorage,
+    catalog_authority_kind: CatalogAuthorityKind,
     requested_tables: &HashMap<String, HashSet<String>>,
 ) -> Result<usize, ApiError> {
     if requested_tables.is_empty() {
@@ -138,15 +153,28 @@ pub(crate) async fn register_system_tables(
 
     let mut registered = 0;
     if let Some(catalog_tables) = requested_tables.get("catalog") {
-        registered += register_domain_specs(
-            reader,
-            storage,
-            CatalogDomain::Catalog,
-            CATALOG_SYSTEM_TABLES,
-            catalog_tables,
-            &schema_providers,
-        )
-        .await?;
+        match catalog_authority_kind {
+            CatalogAuthorityKind::Legacy => {
+                registered += register_domain_specs(
+                    reader,
+                    storage,
+                    CatalogDomain::Catalog,
+                    CATALOG_SYSTEM_TABLES,
+                    catalog_tables,
+                    &schema_providers,
+                )
+                .await?;
+            }
+            CatalogAuthorityKind::ControlV1 => {
+                if catalog_tables.contains(CATALOG_PROJECTION_STATUS_TABLE) {
+                    let schema_provider = schema_providers.get("catalog").ok_or_else(|| {
+                        ApiError::internal("missing system schema provider for 'catalog'")
+                    })?;
+                    registered +=
+                        register_catalog_projection_status(schema_provider, storage).await?;
+                }
+            }
+        }
     }
     if let Some(lineage_tables) = requested_tables.get("lineage") {
         registered += register_domain_specs(
@@ -164,6 +192,88 @@ pub(crate) async fn register_system_tables(
             register_orchestration_tables(storage, orchestration_tables, &schema_providers).await?;
     }
     Ok(registered)
+}
+
+async fn register_catalog_projection_status(
+    schema_provider: &Arc<MemorySchemaProvider>,
+    storage: &ScopedStorage,
+) -> Result<usize, ApiError> {
+    let worker = ProjectionOutboxWorker::new(
+        storage.clone(),
+        CatalogDomain::Catalog.as_str(),
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    )
+    .map_err(ApiError::from)?;
+    let backlog = worker.backlog().await.map_err(ApiError::from)?;
+    let observed_head_sequence = backlog.committed_sequence;
+    let status = ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            storage.tenant_id(),
+            storage.workspace_id(),
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .map_err(ApiError::from)?
+    .projection_status(CATALOG_PARQUET_PROJECTION_CONSUMER_ID)
+    .await
+    .map_err(ApiError::from)?;
+    let applied_authority_sequence = status
+        .as_ref()
+        .and_then(ProjectionMaterializationStatus::applied_authority_sequence);
+    let last_success_at_ms = status
+        .as_ref()
+        .and_then(ProjectionMaterializationStatus::last_success_at_ms);
+    let failure_state = status.as_ref().and_then(|status| status.failure_state());
+    let lag = match (observed_head_sequence, applied_authority_sequence) {
+        (Some(head), Some(applied)) => Some(head.saturating_sub(applied)),
+        (Some(head), None) => Some(head),
+        (None, _) => None,
+    };
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("projection_kind", DataType::Utf8, false),
+        Field::new("applied_authority_sequence", DataType::UInt64, true),
+        Field::new("observed_head_sequence", DataType::UInt64, true),
+        Field::new("lag", DataType::UInt64, true),
+        Field::new(
+            "last_success_at_ms",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new("failure_state", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec![
+                CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+            ])),
+            Arc::new(UInt64Array::from(vec![applied_authority_sequence])),
+            Arc::new(UInt64Array::from(vec![observed_head_sequence])),
+            Arc::new(UInt64Array::from(vec![lag])),
+            Arc::new(TimestampMillisecondArray::from(vec![last_success_at_ms])),
+            Arc::new(StringArray::from(vec![failure_state])),
+        ],
+    )
+    .map_err(|error| {
+        ApiError::internal(format!(
+            "failed to build system.catalog.projection_status: {error}"
+        ))
+    })?;
+    let table = MemTable::try_new(schema, vec![vec![batch]]).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to register system.catalog.projection_status: {error}"
+        ))
+    })?;
+    schema_provider
+        .register_table(CATALOG_PROJECTION_STATUS_TABLE.to_string(), Arc::new(table))
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "failed to register system.catalog.projection_status: {error}"
+            ))
+        })?;
+    Ok(1)
 }
 
 fn register_system_schemas<'a>(
@@ -520,6 +630,7 @@ mod tests {
             ("catalog", "tables"),
             ("catalog", "columns"),
             ("catalog", "commits"),
+            ("catalog", "projection_status"),
             ("lineage", "edges"),
             ("orchestration", "runs"),
             ("orchestration", "tasks"),

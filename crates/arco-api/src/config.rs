@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use arco_catalog::{CatalogAuthorityBinding, CatalogAuthorityBindings};
 pub use arco_core::TaskTokenConfig;
 use arco_core::{Error, MAX_TASK_TOKEN_TTL_SECONDS, Result};
 
@@ -246,6 +248,20 @@ pub struct Config {
     #[serde(default)]
     pub unity_catalog: UnityCatalogApiConfig,
 
+    /// Optional exact synthetic metastore root bound to `control/v1`.
+    ///
+    /// Every other root remains on the legacy authority. Wildcards and lists
+    /// are deliberately unsupported for the first hard-cut pilot.
+    #[serde(default)]
+    pub catalog_control_v1_root: Option<ControlV1CatalogRootConfig>,
+
+    /// Base64-encoded 32-byte key that seals control catalog list cursors.
+    ///
+    /// Required whenever the pilot root is configured. Private deployment
+    /// tooling must supply the same secret to every replica and restart.
+    #[serde(default)]
+    pub catalog_control_v1_cursor_key: Option<ControlV1CursorKeyConfig>,
+
     /// Audit configuration for security event logging.
     #[serde(default)]
     pub audit: AuditConfig,
@@ -340,7 +356,7 @@ impl AuditConfig {
             return;
         };
 
-        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key_b64) {
+        match STANDARD.decode(key_b64) {
             Ok(key) => {
                 self.actor_hmac_key_bytes = Some(Arc::from(key));
             }
@@ -402,11 +418,52 @@ impl Default for Config {
             code_version: None,
             iceberg: IcebergApiConfig::default(),
             unity_catalog: UnityCatalogApiConfig::default(),
+            catalog_control_v1_root: None,
+            catalog_control_v1_cursor_key: None,
             audit: AuditConfig::default(),
             idempotency_stale_timeout_secs: default_idempotency_stale_timeout_secs(),
             control_store_operator_endpoints: false,
             control_store_operator_group: None,
         }
+    }
+}
+
+/// Exact synthetic tenant/workspace root selected for the `control/v1` pilot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlV1CatalogRootConfig {
+    /// Exact tenant identifier; wildcard syntax is not accepted.
+    pub tenant_id: String,
+    /// Exact workspace identifier; wildcard syntax is not accepted.
+    pub workspace_id: String,
+}
+
+/// Redacted deployment-stable key used only for sealed control list cursors.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ControlV1CursorKeyConfig(String);
+
+impl ControlV1CursorKeyConfig {
+    /// Wraps one base64-encoded key without exposing it through debug output.
+    #[must_use]
+    pub fn new(encoded: impl Into<String>) -> Self {
+        Self(encoded.into())
+    }
+
+    fn decode(&self) -> Result<[u8; 32]> {
+        let bytes = STANDARD.decode(&self.0).map_err(|_| {
+            Error::InvalidInput("ARCO_CATALOG_CONTROL_V1_CURSOR_KEY must be base64".to_string())
+        })?;
+        bytes.try_into().map_err(|_| {
+            Error::InvalidInput(
+                "ARCO_CATALOG_CONTROL_V1_CURSOR_KEY must decode to exactly 32 bytes".to_string(),
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for ControlV1CursorKeyConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ControlV1CursorKeyConfig(<redacted>)")
     }
 }
 
@@ -514,7 +571,8 @@ impl Default for UnityCatalogApiConfig {
 /// Storage configuration for the API server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Object storage bucket name (e.g., `my-bucket`, `gs://my-bucket`, `s3://my-bucket`).
+    /// Object storage bucket or Azure container name (e.g., `my-bucket`,
+    /// `gs://my-bucket`, `s3://my-bucket`, `az://my-container`).
     ///
     /// In GCS deployments this is injected via Terraform as `ARCO_STORAGE_BUCKET`.
     #[serde(default)]
@@ -569,6 +627,9 @@ impl Config {
     /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
     /// - `ARCO_UNITY_CATALOG_ENABLED`
     /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
+    /// - `ARCO_CATALOG_CONTROL_V1_TENANT_ID`
+    /// - `ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID`
+    /// - `ARCO_CATALOG_CONTROL_V1_CURSOR_KEY`
     /// - `ARCO_AUDIT_ACTOR_HMAC_KEY`
     /// - `ARCO_IDEMPOTENCY_STALE_TIMEOUT_SECS` (10-3600, default: 300)
     ///
@@ -739,6 +800,24 @@ impl Config {
             config.unity_catalog.mount_prefix = prefix;
         }
 
+        let control_tenant = env_string("ARCO_CATALOG_CONTROL_V1_TENANT_ID");
+        let control_workspace = env_string("ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID");
+        config.catalog_control_v1_root = match (control_tenant, control_workspace) {
+            (None, None) => None,
+            (Some(tenant_id), Some(workspace_id)) => Some(ControlV1CatalogRootConfig {
+                tenant_id,
+                workspace_id,
+            }),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "ARCO_CATALOG_CONTROL_V1_TENANT_ID and ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID must be set together"
+                        .to_string(),
+                ));
+            }
+        };
+        config.catalog_control_v1_cursor_key =
+            env_string("ARCO_CATALOG_CONTROL_V1_CURSOR_KEY").map(ControlV1CursorKeyConfig::new);
+
         if let Some(key) = env_string("ARCO_AUDIT_ACTOR_HMAC_KEY") {
             config.audit.actor_hmac_key = Some(key);
         }
@@ -786,6 +865,46 @@ impl Config {
             .idempotency_stale_timeout_secs
             .min(MAX_IDEMPOTENCY_STALE_TIMEOUT_SECS);
         chrono::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+    }
+
+    /// Builds the validated exact-root catalog authority registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid tenant/workspace scope. No wildcard or
+    /// prefix binding form exists.
+    pub fn catalog_authority_bindings(&self) -> Result<CatalogAuthorityBindings> {
+        match (
+            self.catalog_control_v1_root.as_ref(),
+            self.catalog_control_v1_cursor_key.as_ref(),
+        ) {
+            (None, None) => CatalogAuthorityBindings::new(std::iter::empty::<
+                CatalogAuthorityBinding,
+            >()),
+            (Some(root), Some(cursor_key)) => {
+                let key = cursor_key.decode()?;
+                CatalogAuthorityBindings::new_with_continuation_key(
+                    [CatalogAuthorityBinding::control_v1(
+                        &root.tenant_id,
+                        &root.workspace_id,
+                    )],
+                    &key,
+                )
+            }
+            (Some(_), None) => {
+                return Err(Error::InvalidInput(
+                    "ARCO_CATALOG_CONTROL_V1_CURSOR_KEY is required with the control/v1 catalog root"
+                        .to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "ARCO_CATALOG_CONTROL_V1_CURSOR_KEY requires a control/v1 catalog root"
+                        .to_string(),
+                ));
+            }
+        }
+        .map_err(|error| Error::InvalidInput(error.to_string()))
     }
 }
 
@@ -1005,6 +1124,8 @@ fn normalize_pem(pem: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use arco_catalog::CatalogAuthorityKind;
+
     use super::*;
 
     #[test]
@@ -1053,6 +1174,96 @@ mod tests {
     fn iceberg_multi_table_transactions_default_is_false() {
         let config = IcebergApiConfig::default();
         assert!(!config.allow_multi_table_transactions);
+    }
+
+    #[test]
+    fn catalog_authority_binding_defaults_to_legacy_and_matches_only_exact_control_root()
+    -> Result<()> {
+        let default_bindings = Config::default().catalog_authority_bindings()?;
+        assert_eq!(
+            default_bindings.resolve("tenant-a", "workspace-a"),
+            CatalogAuthorityKind::Legacy
+        );
+
+        let config = Config {
+            catalog_control_v1_root: Some(ControlV1CatalogRootConfig {
+                tenant_id: "pilot-tenant".to_string(),
+                workspace_id: "pilot-workspace".to_string(),
+            }),
+            catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )),
+            ..Config::default()
+        };
+        let bindings = config.catalog_authority_bindings()?;
+        assert_eq!(
+            bindings.resolve("pilot-tenant", "pilot-workspace"),
+            CatalogAuthorityKind::ControlV1
+        );
+        assert_eq!(
+            bindings.resolve("pilot-tenant", "other-workspace"),
+            CatalogAuthorityKind::Legacy
+        );
+        assert_eq!(
+            bindings.resolve("other-tenant", "pilot-workspace"),
+            CatalogAuthorityKind::Legacy
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_authority_binding_rejects_invalid_exact_root() {
+        let config = Config {
+            catalog_control_v1_root: Some(ControlV1CatalogRootConfig {
+                tenant_id: String::new(),
+                workspace_id: "pilot-workspace".to_string(),
+            }),
+            catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )),
+            ..Config::default()
+        };
+        assert!(matches!(
+            config.catalog_authority_bindings(),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn control_binding_requires_a_valid_redacted_replica_stable_cursor_key() {
+        let missing = Config {
+            catalog_control_v1_root: Some(ControlV1CatalogRootConfig {
+                tenant_id: "pilot-tenant".to_string(),
+                workspace_id: "pilot-workspace".to_string(),
+            }),
+            ..Config::default()
+        };
+        assert!(matches!(
+            missing.catalog_authority_bindings(),
+            Err(Error::InvalidInput(message)) if message.contains("CURSOR_KEY is required")
+        ));
+
+        let invalid = Config {
+            catalog_control_v1_root: missing.catalog_control_v1_root,
+            catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new("not-base64")),
+            ..Config::default()
+        };
+        assert!(matches!(
+            invalid.catalog_authority_bindings(),
+            Err(Error::InvalidInput(message)) if message.contains("must be base64")
+        ));
+
+        let dangling = Config {
+            catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )),
+            ..Config::default()
+        };
+        assert!(matches!(
+            dangling.catalog_authority_bindings(),
+            Err(Error::InvalidInput(message)) if message.contains("requires a control/v1")
+        ));
+        assert!(!format!("{dangling:?}").contains("AAAAAAAAAAAAAAAA"));
     }
 
     #[test]

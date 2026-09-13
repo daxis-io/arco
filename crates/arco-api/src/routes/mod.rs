@@ -1,6 +1,7 @@
 //! HTTP route handlers.
 
 pub mod browser;
+pub(crate) mod catalog_authority;
 pub mod catalogs;
 pub mod control_store;
 pub mod delta;
@@ -14,7 +15,6 @@ pub mod query_data;
 pub mod tables;
 pub mod tasks;
 pub mod transactions;
-pub mod uc;
 
 use std::sync::Arc;
 

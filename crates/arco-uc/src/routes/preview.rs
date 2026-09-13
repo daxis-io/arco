@@ -5,23 +5,9 @@
 //! own state handling; this module now exists only for generic request parsing.
 
 use crate::error::{UnityCatalogError, UnityCatalogResult};
+use arco_catalog::CatalogListRequest;
 
 pub const DEFAULT_PAGE_SIZE: usize = 100;
-
-pub struct Pagination {
-    start: usize,
-    limit: usize,
-}
-
-impl Pagination {
-    pub const fn start(&self) -> usize {
-        self.start
-    }
-
-    pub const fn limit(&self) -> usize {
-        self.limit
-    }
-}
 
 pub fn require_identifier(value: Option<String>, field: &str) -> UnityCatalogResult<String> {
     let Some(value) = value else {
@@ -73,27 +59,29 @@ fn validate_identifier(value: &str, field: &str) -> UnityCatalogResult<()> {
     })
 }
 
-pub fn parse_pagination(
-    page_token: Option<&str>,
+pub fn catalog_list_request(
+    page_token: Option<String>,
     max_results: Option<i32>,
     default_page_size: usize,
     max_page_size: usize,
-) -> UnityCatalogResult<Pagination> {
-    let start = parse_page_token(page_token)?;
+) -> UnityCatalogResult<CatalogListRequest> {
     let limit = parse_max_results(max_results, default_page_size, max_page_size)?;
-    Ok(Pagination { start, limit })
+    let request =
+        CatalogListRequest::new(limit).map_err(|error| UnityCatalogError::BadRequest {
+            message: error.to_string(),
+        })?;
+    Ok(page_token.map_or(request.clone(), |token| request.with_page_token(token)))
 }
 
-fn parse_page_token(page_token: Option<&str>) -> UnityCatalogResult<usize> {
-    let Some(page_token) = page_token else {
-        return Ok(0);
-    };
-
-    page_token
-        .parse::<usize>()
-        .map_err(|_err| UnityCatalogError::BadRequest {
-            message: "invalid page_token: expected non-negative integer offset".to_string(),
-        })
+pub fn validate_legacy_page_token(page_token: Option<&str>) -> UnityCatalogResult<()> {
+    if let Some(page_token) = page_token {
+        page_token
+            .parse::<usize>()
+            .map_err(|_| UnityCatalogError::BadRequest {
+                message: "invalid page_token: expected non-negative integer offset".to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 fn parse_max_results(

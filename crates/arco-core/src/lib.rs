@@ -34,6 +34,8 @@
 #![warn(clippy::pedantic)]
 
 pub mod audit;
+pub mod authority_root;
+pub mod authority_storage;
 pub mod backpressure;
 pub mod canonical_json;
 pub mod catalog_event;
@@ -68,6 +70,8 @@ pub mod tenant;
 /// use arco_core::prelude::*;
 /// ```
 pub mod prelude {
+    pub use crate::authority_root::{AuthorityRoot, AuthorityScope};
+    pub use crate::authority_storage::{AuthorityWritePrecondition, ScopedAuthorityStore};
     pub use crate::catalog_event::{CatalogEvent, CatalogEventPayload};
     pub use crate::catalog_paths::{CatalogDomain, CatalogPaths};
     pub use crate::control_plane_scope::ControlPlaneScope;
@@ -88,8 +92,7 @@ pub mod prelude {
     pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
     pub use crate::scoped_storage::{ScopedListPage, ScopedStorage};
     pub use crate::storage::{
-        ListPage, MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
-        WriteResult,
+        ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
     };
     pub use crate::storage_keys::{
         CommitKey, LedgerKey, LockKey, ManifestKey, QuarantineKey, SequenceKey, StateKey,
@@ -111,6 +114,8 @@ pub mod prelude {
 }
 
 // Re-export key types at crate root for ergonomics
+pub use authority_root::{AuthorityRoot, AuthorityScope};
+pub use authority_storage::{AuthorityWritePrecondition, ScopedAuthorityStore};
 pub use catalog_event::{CatalogEvent, CatalogEventPayload};
 pub use catalog_paths::{CatalogDomain, CatalogPaths};
 pub use control_plane_scope::ControlPlaneScope;
@@ -134,8 +139,7 @@ pub use orchestration_compaction::{
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
 pub use scoped_storage::{ScopedListPage, ScopedStorage};
 pub use storage::{
-    ListPage, MemoryBackend, ObjectMeta, ObjectStoreBackend, StorageBackend, WritePrecondition,
-    WriteResult,
+    ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
 };
 pub use sync_compact::{SyncCompactRequest, SyncCompactResponse, VisibilityStatus};
 pub use table_format::TableFormat;

@@ -11,7 +11,9 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
-use arco_api::config::{Config, CorsConfig, Posture};
+use arco_api::config::{
+    Config, ControlV1CatalogRootConfig, ControlV1CursorKeyConfig, CorsConfig, Posture,
+};
 use arco_api::server::{Server, ServerBuilder};
 
 const TEST_JWT_SECRET: &str = "test-jwt-secret";
@@ -20,6 +22,21 @@ const TEST_JWT_AUDIENCE: &str = "arco-api";
 
 fn test_router() -> axum::Router {
     ServerBuilder::new().debug(true).build().test_router()
+}
+
+fn test_router_control_v1() -> axum::Router {
+    let config = Config {
+        debug: true,
+        catalog_control_v1_root: Some(ControlV1CatalogRootConfig {
+            tenant_id: "test-tenant".to_string(),
+            workspace_id: "test-workspace".to_string(),
+        }),
+        catalog_control_v1_cursor_key: Some(ControlV1CursorKeyConfig::new(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )),
+        ..Config::default()
+    };
+    Server::new(config).test_router()
 }
 
 fn test_router_prod() -> axum::Router {
@@ -1221,6 +1238,28 @@ mod delta {
         )?;
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_v1_root_rejects_managed_delta_staging_before_storage_write() -> Result<()> {
+        let request = helpers::make_request(
+            Method::POST,
+            &format!("/api/v1/delta/tables/{}/commits/stage", Uuid::now_v7()),
+            Some(serde_json::json!({
+                "payload": "{\"commitInfo\":{\"timestamp\":1}}\n"
+            })),
+        )?;
+        let response = test_router_control_v1()
+            .oneshot(request)
+            .await
+            .map_err(|err| match err {})?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("Retry-After").unwrap(), "5");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload["code"], "CATALOG_AUTHORITY_TABLE_COMMIT_DISABLED");
+        assert!(payload.get("stateToken").is_none());
         Ok(())
     }
 

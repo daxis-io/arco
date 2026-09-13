@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use super::metadata_readiness::{self, CompiledStateStatus, ProjectionLag, TokenPinnedReadStatus};
 use super::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange, StateScope,
-    StateToken, TxnOptions,
+    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, KeyRange,
+    MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_SEGMENTS, ScanRequest, StateScope, StateToken, TxnOptions,
 };
 use crate::error::{CatalogError, Result};
 use crate::metastore::events::LifecycleState;
@@ -114,7 +114,10 @@ impl PathGovernancePendingDeclaration {
     pub(crate) async fn commit(self) -> Result<PathGovernanceMetadataReceipt> {
         let declaration = self.declaration;
         match self.txn.commit().await {
-            Ok(token) => Ok(PathGovernanceMetadataReceipt { token, declaration }),
+            Ok(outcome) => Ok(PathGovernanceMetadataReceipt {
+                token: outcome.into_state_token(),
+                declaration,
+            }),
             Err(CatalogError::CasFailed { .. }) => {
                 if self.writer.has_path_conflict(&declaration).await? {
                     Err(precondition_failed(
@@ -335,13 +338,22 @@ pub(super) async fn stage_path_governance_declaration(
             ));
         }
     }
-    if !txn.scan_prefix(&keys.descendant_prefix).await?.is_empty() {
+    if !txn
+        .scan(ScanRequest::new(&keys.descendant_prefix).with_limits(
+            1,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        ))
+        .await?
+        .entries()
+        .is_empty()
+    {
         return Err(precondition_failed(
             "descendant path governance metadata conflict",
         ));
     }
 
-    let descendant_witness = txn.range_witness(&keys.descendant_range);
+    let descendant_witness = txn.range_witness(&keys.descendant_range).await?;
     txn.assert_absent(&keys.record_key).await?;
     txn.assert_absent(&keys.exact_path_key).await?;
     for ancestor_key in &keys.ancestor_path_keys {
@@ -383,7 +395,15 @@ pub(super) async fn path_governance_declaration_conflicts(
             return Ok(true);
         }
     }
-    Ok(!store.scan_prefix(&keys.descendant_prefix).await?.is_empty())
+    Ok(!store
+        .scan(ScanRequest::new(&keys.descendant_prefix).with_limits(
+            1,
+            MAX_SCAN_PAGE_BYTES,
+            MAX_SCAN_PAGE_SEGMENTS,
+        ))
+        .await?
+        .entries()
+        .is_empty())
 }
 
 fn validate_declaration_scope(
@@ -866,12 +886,12 @@ mod tests {
         let storage = storage();
         let writer = writer(storage.clone());
         let store = ControlMvpStateStore::new(storage, metadata_scope()).expect("control store");
-        let txn = store
+        let mut txn = store
             .begin_control_txn(TxnOptions::new(Some(metadata_scope())))
             .await
             .expect("begin transaction");
         let range = descendant_conflict_range("gs://bucket/warehouse/orders/");
-        let stale_witness = txn.range_witness(&range);
+        let stale_witness = txn.range_witness(&range).await.expect("witness");
 
         writer
             .declare_path(declaration(

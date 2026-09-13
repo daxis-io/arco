@@ -467,6 +467,81 @@ const REGISTRY: &[UcOperationSupport] = &[
         "ModelVersions",
         "model version lifecycle is not authoritative yet",
     ),
+    // uc delta api
+    implemented(
+        "GET",
+        "/delta/v1/config",
+        "DeltaConfiguration",
+        "authoritative catalog ledger plus static protocol negotiation and endpoint advertisement",
+        "",
+        true,
+    ),
+    planned(
+        "POST",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables",
+        "DeltaTables",
+        "Catalog-managed table staging-table allocation is planned",
+    ),
+    planned(
+        "POST",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables",
+        "DeltaTables",
+        "Catalog-managed table creation is planned",
+    ),
+    planned(
+        "GET",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}",
+        "DeltaTables",
+        "Catalog-managed table loading is planned",
+    ),
+    planned(
+        "POST",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}",
+        "DeltaTables",
+        "Catalog-managed table update/commit flow is planned",
+    ),
+    planned(
+        "DELETE",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}",
+        "DeltaTables",
+        "Catalog-managed table deletion is planned",
+    ),
+    planned(
+        "HEAD",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}",
+        "DeltaTables",
+        "Catalog-managed table existence check is planned",
+    ),
+    planned(
+        "GET",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/credentials",
+        "DeltaTemporaryCredentials",
+        "Catalog-managed table credential vending is planned",
+    ),
+    planned(
+        "POST",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/metrics",
+        "DeltaTables",
+        "Catalog-managed table commit metrics reporting is planned",
+    ),
+    planned(
+        "GET",
+        "/delta/v1/staging-tables/{table_id}/credentials",
+        "DeltaTemporaryCredentials",
+        "Catalog-managed staging credential vending is planned",
+    ),
+    planned(
+        "POST",
+        "/delta/v1/catalogs/{catalog}/schemas/{schema}/tables/{table}/rename",
+        "DeltaTables",
+        "Catalog-managed table rename is planned",
+    ),
+    known_unsupported(
+        "GET",
+        "/delta/v1/temporary-path-credentials",
+        "DeltaTemporaryCredentials",
+        "temporary-path-credentials serves external-table creation and is not planned",
+    ),
 ];
 
 /// Returns the full UC support registry.

@@ -31,14 +31,31 @@ use arco_catalog::idempotency::{
     calculate_retry_after, canonical_request_hash, check_idempotency,
 };
 use arco_catalog::manifest::SnapshotInfo;
-use arco_catalog::{CatalogReader, CatalogWriter, Tier1Compactor};
+use arco_catalog::{CatalogAuthorityKind, CatalogReader};
 use arco_core::TableFormat;
 
 use super::tables::ColumnDefinition;
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
-use crate::routes::pagination::{ListPageQuery, page_by_key};
+use crate::routes::catalog_authority;
+use crate::routes::pagination::{ListPageQuery, catalog_list_request, page_by_key};
 use crate::server::AppState;
+
+fn authority_write_options(ctx: &RequestContext) -> arco_catalog::WriteOptions {
+    let options = arco_catalog::WriteOptions::default()
+        .with_actor(format!("api:{}", ctx.tenant))
+        .with_request_id(&ctx.request_id);
+    ctx.idempotency_key
+        .as_deref()
+        .map_or(options.clone(), |key| options.with_idempotency_key(key))
+}
+
+fn uses_control_v1(state: &AppState, ctx: &RequestContext) -> bool {
+    state
+        .catalog_authority_bindings()
+        .resolve(&ctx.tenant, &ctx.workspace)
+        == CatalogAuthorityKind::ControlV1
+}
 
 /// Request to create a catalog.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -256,6 +273,11 @@ pub(crate) async fn get_catalog_inventory(
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+
+    if uses_control_v1(&state, &ctx) {
+        return Err(ApiError::catalog_projection_unavailable());
+    }
+
     let reader = CatalogReader::new(storage);
     let descriptor = reader
         .get_catalog_snapshot_descriptor()
@@ -344,6 +366,28 @@ pub(crate) async fn create_catalog(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
+    if uses_control_v1(&state, &ctx) {
+        let catalog = catalog_authority::resolve(&state, &ctx)
+            .await?
+            .create_catalog_with_metadata(
+                &req.name,
+                req.description.as_deref(),
+                None,
+                None,
+                authority_write_options(&ctx),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let response = CatalogResponse {
+            id: catalog.id,
+            name: catalog.name,
+            description: catalog.description,
+            created_at: format_timestamp(catalog.created_at),
+            updated_at: format_timestamp(catalog.updated_at),
+        };
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
     let request_json = serde_json::json!({
         "name": &req.name,
         "description": &req.description
@@ -375,7 +419,7 @@ pub(crate) async fn create_catalog(
             entity_id,
             entity_name,
         } => {
-            let reader = CatalogReader::new(storage);
+            let reader = catalog_authority::resolve_read(&state, &ctx)?;
             let catalog = reader
                 .get_catalog(&entity_name)
                 .await
@@ -408,19 +452,14 @@ pub(crate) async fn create_catalog(
         }
     };
 
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(ApiError::from)?;
+    let authority = catalog_authority::resolve(&state, &ctx).await?;
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
 
-    let create_result = writer
-        .create_catalog(&req.name, req.description.as_deref(), options)
+    let create_result = authority
+        .create_catalog_with_metadata(&req.name, req.description.as_deref(), None, None, options)
         .await;
 
     if let (Some(marker), Some(version)) = (&marker, &marker_version) {
@@ -502,14 +541,23 @@ pub(crate) async fn list_catalogs(
         "Listing catalogs"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
-    let catalogs = reader
-        .list_catalogs()
-        .await
-        .map_err(ApiError::from)?
+    let (catalogs, next_cursor) = if reader.kind() == CatalogAuthorityKind::Legacy {
+        page_by_key(
+            reader.list_catalogs().await.map_err(ApiError::from)?,
+            &query,
+            |catalog| &catalog.name,
+        )?
+    } else {
+        let page = reader
+            .list_catalogs_page(catalog_list_request(&query)?)
+            .await
+            .map_err(ApiError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        (page.into_items(), next)
+    };
+    let catalogs = catalogs
         .into_iter()
         .map(|c| CatalogResponse {
             id: c.id,
@@ -519,7 +567,6 @@ pub(crate) async fn list_catalogs(
             updated_at: format_timestamp(c.updated_at),
         })
         .collect();
-    let (catalogs, next_cursor) = page_by_key(catalogs, &query, |catalog| &catalog.name)?;
 
     Ok(Json(ListCatalogsResponse {
         catalogs,
@@ -559,9 +606,7 @@ pub(crate) async fn get_catalog(
         "Getting catalog"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
     let catalog = reader
         .get_catalog(&name)
@@ -619,6 +664,30 @@ pub(crate) async fn create_schema(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
 
+    if uses_control_v1(&state, &ctx) {
+        let schema_record = catalog_authority::resolve(&state, &ctx)
+            .await?
+            .create_schema_with_metadata(
+                &catalog,
+                &req.name,
+                req.description.as_deref(),
+                None,
+                None,
+                authority_write_options(&ctx),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let response = SchemaResponse {
+            id: schema_record.id,
+            catalog,
+            name: schema_record.name,
+            description: schema_record.description,
+            created_at: format_timestamp(schema_record.created_at),
+            updated_at: format_timestamp(schema_record.updated_at),
+        };
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
     let request_json = serde_json::json!({
         "catalog": &catalog,
         "name": &req.name,
@@ -651,7 +720,7 @@ pub(crate) async fn create_schema(
             entity_id,
             entity_name,
         } => {
-            let reader = CatalogReader::new(storage);
+            let reader = catalog_authority::resolve_read(&state, &ctx)?;
             let schema = reader
                 .list_schemas(&catalog)
                 .await
@@ -687,19 +756,21 @@ pub(crate) async fn create_schema(
         }
     };
 
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(ApiError::from)?;
+    let authority = catalog_authority::resolve(&state, &ctx).await?;
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
         .with_request_id(&ctx.request_id);
 
-    let create_result = writer
-        .create_schema(&catalog, &req.name, req.description.as_deref(), options)
+    let create_result = authority
+        .create_schema_with_metadata(
+            &catalog,
+            &req.name,
+            req.description.as_deref(),
+            None,
+            None,
+            options,
+        )
         .await;
 
     if let (Some(marker), Some(version)) = (&marker, &marker_version) {
@@ -786,14 +857,26 @@ pub(crate) async fn list_schemas(
         "Listing schemas"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
-    let schemas = reader
-        .list_schemas(&catalog)
-        .await
-        .map_err(ApiError::from)?
+    let (schemas, next_cursor) = if reader.kind() == CatalogAuthorityKind::Legacy {
+        page_by_key(
+            reader
+                .list_schemas(&catalog)
+                .await
+                .map_err(ApiError::from)?,
+            &query,
+            |schema| &schema.name,
+        )?
+    } else {
+        let page = reader
+            .list_schemas_page(&catalog, catalog_list_request(&query)?)
+            .await
+            .map_err(ApiError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        (page.into_items(), next)
+    };
+    let schemas = schemas
         .into_iter()
         .map(|ns| SchemaResponse {
             id: ns.id,
@@ -804,7 +887,6 @@ pub(crate) async fn list_schemas(
             updated_at: format_timestamp(ns.updated_at),
         })
         .collect();
-    let (schemas, next_cursor) = page_by_key(schemas, &query, |schema| &schema.name)?;
 
     Ok(Json(ListSchemasResponse {
         schemas,
@@ -870,6 +952,54 @@ pub(crate) async fn register_table_in_schema(
         .map_err(ApiError::from)?;
     }
 
+    if uses_control_v1(&state, &ctx) {
+        let columns = req
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, column)| {
+                Ok(arco_catalog::ColumnDefinition {
+                    name: column.name,
+                    data_type: column.data_type,
+                    is_nullable: column.nullable,
+                    ordinal: i32::try_from(ordinal)
+                        .map_err(|_| ApiError::bad_request("table has too many columns"))?,
+                    description: column.description,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let table = catalog_authority::resolve(&state, &ctx)
+            .await?
+            .register_table(
+                &catalog,
+                &schema,
+                arco_catalog::RegisterTableInSchemaRequest {
+                    name: req.name,
+                    description: req.description,
+                    location: req.location,
+                    format: Some(requested_format),
+                    table_type: None,
+                    properties: None,
+                    columns,
+                },
+                authority_write_options(&ctx),
+            )
+            .await
+            .map_err(ApiError::from)?;
+        let response = SchemaTableResponse {
+            id: table.id,
+            catalog,
+            schema,
+            name: table.name,
+            description: table.description,
+            location: table.location,
+            format: effective_table_format(table.format.as_deref())?,
+            created_at: format_timestamp(table.created_at),
+            updated_at: format_timestamp(table.updated_at),
+        };
+        return Ok((StatusCode::CREATED, Json(response)));
+    }
+
     let request_json = serde_json::json!({
         "catalog": &catalog,
         "schema": &schema,
@@ -906,9 +1036,9 @@ pub(crate) async fn register_table_in_schema(
             entity_id,
             entity_name,
         } => {
-            let reader = CatalogReader::new(storage);
+            let reader = catalog_authority::resolve_read(&state, &ctx)?;
             let table = reader
-                .get_table_in_schema(&catalog, &schema, &entity_name)
+                .get_table(&catalog, &schema, &entity_name)
                 .await
                 .map_err(ApiError::from)?
                 .ok_or_else(|| ApiError::internal("Cached table not found"))?;
@@ -943,12 +1073,7 @@ pub(crate) async fn register_table_in_schema(
         }
     };
 
-    let compactor = state
-        .sync_compactor()
-        .unwrap_or_else(|| Arc::new(Tier1Compactor::new(storage.clone())));
-    let writer = CatalogWriter::new(storage.clone()).with_sync_compactor(compactor);
-
-    writer.initialize().await.map_err(ApiError::from)?;
+    let authority = catalog_authority::resolve(&state, &ctx).await?;
 
     let options = arco_catalog::write_options::WriteOptions::default()
         .with_actor(format!("api:{}", ctx.tenant))
@@ -967,8 +1092,8 @@ pub(crate) async fn register_table_in_schema(
         })
         .collect();
 
-    let create_result = writer
-        .register_table_in_schema(
+    let create_result = authority
+        .register_table(
             &catalog,
             &schema,
             arco_catalog::RegisterTableInSchemaRequest {
@@ -1073,16 +1198,27 @@ pub(crate) async fn list_tables_in_schema(
         "Listing tables in schema"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
+    let (page_tables, next_cursor) = if reader.kind() == CatalogAuthorityKind::Legacy {
+        page_by_key(
+            reader
+                .list_tables(&catalog, &schema)
+                .await
+                .map_err(ApiError::from)?,
+            &query,
+            |table| &table.name,
+        )?
+    } else {
+        let page = reader
+            .list_tables_page(&catalog, &schema, catalog_list_request(&query)?)
+            .await
+            .map_err(ApiError::from)?;
+        let next = page.next_page_token().map(str::to_string);
+        (page.into_items(), next)
+    };
     let mut tables = Vec::new();
-    for table in reader
-        .list_tables_in_schema(&catalog, &schema)
-        .await
-        .map_err(ApiError::from)?
-    {
+    for table in page_tables {
         tables.push(SchemaTableResponse {
             id: table.id,
             catalog: catalog.clone(),
@@ -1095,8 +1231,6 @@ pub(crate) async fn list_tables_in_schema(
             updated_at: format_timestamp(table.updated_at),
         });
     }
-    let (tables, next_cursor) = page_by_key(tables, &query, |table| &table.name)?;
-
     Ok(Json(ListSchemaTablesResponse {
         tables,
         next_cursor,
@@ -1139,12 +1273,10 @@ pub(crate) async fn get_table_in_schema(
         "Getting table in schema"
     );
 
-    let backend = state.storage_backend()?;
-    let storage = ctx.scoped_storage(backend)?;
-    let reader = CatalogReader::new(storage);
+    let reader = catalog_authority::resolve_read(&state, &ctx)?;
 
     let table = reader
-        .get_table_in_schema(&catalog, &schema, &name)
+        .get_table(&catalog, &schema, &name)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| {

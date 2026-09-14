@@ -181,7 +181,7 @@ impl CatalogAuthorityBinding {
 /// start cold and have independent budgets; these capacities are not an RSS bound.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogAuthorityBindings {
-    exact: BTreeMap<(String, AuthorityRoot), CatalogAuthorityKind>,
+    exact: Arc<BTreeMap<(String, AuthorityRoot), CatalogAuthorityEntry>>,
     read_cache_config: crate::ControlMvpReadCacheConfig,
     continuation_key: Option<ScanContinuationKey>,
 }
@@ -355,7 +355,7 @@ impl CatalogAuthorityBindings {
     // stays direct and cannot replace the first retained handle.
     fn reuse_read_cache(
         &self,
-        root: &(String, String),
+        root: &(String, AuthorityRoot),
         store: ControlMvpStateStore,
     ) -> ControlMvpStateStore {
         let Some(entry) = self.exact.get(root) else {
@@ -1405,10 +1405,7 @@ impl CatalogAuthority {
         bindings: &CatalogAuthorityBindings,
     ) -> Result<Self> {
         let key = bindings.control_continuation_key(&scope)?;
-        let root = (
-            scope.tenant_id().to_string(),
-            scope.workspace_id().to_string(),
-        );
+        let root = (scope.tenant_id().to_string(), scope.root().clone());
         let mut authority =
             ControlCatalogAuthority::new_with_continuation_key(storage, scope, key)?;
         authority.store = bindings.reuse_read_cache(&root, authority.store);

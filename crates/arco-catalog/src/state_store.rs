@@ -3273,7 +3273,7 @@ mod tests {
                     "workspace_id": "prod",
                     "domain": "catalog"
                 }),
-                "version",
+                "unsupported StateScope version",
             ),
             (
                 "v2 missing root_kind",
@@ -3282,7 +3282,7 @@ mod tests {
                     "tenant_id": "acme",
                     "domain": "catalog"
                 }),
-                "root_kind",
+                "requires root_kind",
             ),
             (
                 "v2 unknown root_kind",
@@ -3292,7 +3292,7 @@ mod tests {
                     "tenant_id": "acme",
                     "domain": "catalog"
                 }),
-                "table",
+                "root-kind: table",
             ),
             (
                 "v2 metastore missing metastore_id",
@@ -3302,7 +3302,7 @@ mod tests {
                     "tenant_id": "acme",
                     "domain": "catalog"
                 }),
-                "metastore_id",
+                "requires metastore_id",
             ),
             (
                 "legacy missing workspace_id",
@@ -3310,7 +3310,7 @@ mod tests {
                     "tenant_id": "acme",
                     "domain": "catalog"
                 }),
-                "workspace_id",
+                "requires workspace_id",
             ),
             (
                 "legacy unsafe workspace_id",
@@ -3319,7 +3319,7 @@ mod tests {
                     "workspace_id": "a/b",
                     "domain": "catalog"
                 }),
-                "workspace_id",
+                "nonblank path-safe component",
             ),
             (
                 "legacy carrying root_kind",
@@ -3329,7 +3329,7 @@ mod tests {
                     "workspace_id": "prod",
                     "domain": "catalog"
                 }),
-                "not carry root_kind",
+                "must not carry root_kind",
             ),
         ];
 

@@ -353,13 +353,13 @@ impl ControlMvpManifest {
 }
 
 fn physical_digest(
-    scope: &ControlMvpScopeDoc,
+    scope: &StateScope,
     states: &[ControlMvpStateRef],
     anchors: &[ControlMvpStateRef],
     transactions: &[super::ControlMvpTxRef],
     suffix: &[super::ControlMvpTxRef],
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope);
+    let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope)?;
     encode_states(&mut out, 1, states)?;
     encode_states(&mut out, 2, anchors)?;
     out.u8(3);
@@ -390,7 +390,7 @@ impl RenderSource {
             || self.history_anchor.sequence
                 != self.base_states.first().map_or(0, |s| s.logical_sequence)
             || (self.history_anchor.sequence == 0
-                && self.history_anchor != genesis(&candidate.scope))
+                && self.history_anchor != genesis(&candidate.scope)?)
             || (!candidate.tx_refs.is_empty() && !self.anchor_states.is_empty())
             || self
                 .anchor_states

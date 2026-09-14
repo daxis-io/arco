@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// The authority kind a scoped store is rooted at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum AuthorityRoot {
     /// 'tenant={t}/identity' - tenant identity authority root.

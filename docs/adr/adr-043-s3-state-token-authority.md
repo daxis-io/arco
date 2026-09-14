@@ -99,18 +99,33 @@ This ADR fixes the following invariants.
 
 ### Scope compatibility boundary
 
-The current persisted `StateScope` encodes tenant, workspace, and domain. It
-identifies the workspace-shaped pilot, not every target authority family.
-Adding an `AuthorityScope` prefix does not extend `StateToken` semantics:
-`ControlMvpStateStore` rejects metastore physical roots, and legacy scoped
-storage cannot construct tenant identity roots. Existing workspace path bytes
-and token encodings remain unchanged.
+The persisted `StateScope` is versioned. Workspace roots serialize as the legacy
+v1 shape (`tenant_id`, `workspace_id`, `domain`) with no version or root marker;
+every non-workspace root serializes as version 2 with an explicit
+`scope_version` and `root_kind`. Decoding a record without an explicit root
+marker always yields a workspace root and never relabels an ID into another
+family. Unknown scope versions or root kinds are rejected before I/O.
 
-Before enabling either target root in `control/v1`, the
+Root kind and identifiers are carried through `StateScope`, `StateToken`,
+transaction and checkpoint envelopes, manifests, projection intents,
+continuation tokens (v4), retained references, restore/GC comparisons, and
+catalog bindings. The workspace pilot's path bytes and token semantics are
+unchanged: `ControlMvpStateStore` still requires a workspace physical root, and
+legacy scoped storage cannot construct tenant identity roots.
+
+Migration is decode-only. No persisted workspace record is rewritten, so an
+existing workspace domain keeps its authority bytes and history roots, and the
+old workspace encoding fixtures continue to decode as workspace roots. New
+non-workspace roots are not enabled by this change. Rollback is safe for
+workspace data because version-2 workspace records keep the legacy top-level
+`workspace_id` and earlier readers ignore unknown fields; a rolled-back binary
+must not run concurrently with a version-2 writer.
+
+Before enabling either target root in `control/v1`, the remaining
 [versioned authority-scope follow-up](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1)
-must propagate root kind and identifiers through every persisted authority
-reference and scope comparison. Old workspace records must not be decoded as
-identity or metastore roots by relabeling an ID. The pilot's seeded root and
+must implement and qualify the identity and metastore cross-root authorization
+and lifecycle contracts. Old workspace records must never be decoded as identity
+or metastore roots by relabeling an ID. The pilot's seeded root and
 hard-cut/provider qualification requirements continue to apply.
 
 ### Layout

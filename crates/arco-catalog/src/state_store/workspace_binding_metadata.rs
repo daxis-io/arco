@@ -35,8 +35,14 @@ impl WorkspaceMetastoreBindingMetadataWriter {
         input: WorkspaceMetastoreBindingMetadataInput,
     ) -> Result<WorkspaceMetastoreBindingMetadataReceipt> {
         input.validate()?;
+        let workspace_id = self.scope.workspace_id();
+        if workspace_id.is_none() {
+            return Err(validation_failed(
+                "workspace binding state scope must be a workspace rooted authority scope",
+            ));
+        }
         let record = WorkspaceMetastoreBindingMetadataRecord::from(input);
-        if record.workspace_id() != self.scope.workspace_id() {
+        if Some(record.workspace_id()) != workspace_id {
             return Err(validation_failed(
                 "workspace binding metadata workspace_id must match state scope",
             ));

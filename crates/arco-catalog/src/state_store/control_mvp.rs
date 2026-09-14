@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use arco_core::lock::DistributedLock;
 use arco_core::storage::WriteResult;
-use arco_core::{AuthorityWritePrecondition, ScopedAuthorityStore, ScopedStorage};
+use arco_core::{AuthorityRoot, AuthorityWritePrecondition, ScopedAuthorityStore, ScopedStorage};
 use arrow::array::{
     Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, UInt8Array, UInt8Builder,
     UInt64Array, UInt64Builder,
@@ -239,9 +239,12 @@ impl ControlMvpStateStore {
     /// versioned authority-scope format; they must not alias legacy `StateScope`.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         scope.validate()?;
-        if storage.tenant_id() != scope.tenant_id()
-            || storage.scope().workspace_id() != Some(scope.workspace_id())
-        {
+        if !matches!(scope.root(), AuthorityRoot::Workspace { .. }) {
+            return Err(validation_failed(
+                "control MVP requires a workspace physical root",
+            ));
+        }
+        if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
                 "control MVP storage scope does not match StateScope",
             ));
@@ -1107,7 +1110,7 @@ impl ControlMvpStateStore {
         let rows = decode_segment_rows(bytes, index, &tx.l0_segment, &self.scope)?;
         let mut decoded = tx.clone();
         decoded.hydrate_from_segment_rows(rows)?;
-        if integrity::mutation_digest(&decoded) != tx.history.mutation_sha256 {
+        if integrity::mutation_digest(&decoded)? != tx.history.mutation_sha256 {
             return Err(invariant_violation(
                 "rendered transaction differs from expected mutation",
             ));
@@ -1476,14 +1479,14 @@ impl ControlMvpStateStore {
                 source_physical_root: manifest.physical_root.clone(),
                 state_checksum_sha256: manifest.state_checksum_sha256.clone(),
                 checkpoint_physical_root: integrity::checkpoint_physical_digest(
-                    &ControlMvpScopeDoc::from(&self.scope),
+                    &self.scope,
                     &state_refs,
                 )?,
             },
             reclamation_generation: pointer.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             checkpoint_id: checkpoint_id.clone(),
             manifest_id: pointer.manifest_id,
             logical_sequence: pointer.logical_sequence,
@@ -1910,14 +1913,14 @@ impl ControlMvpStateStore {
                 let candidate_parent = self.load_restore_source_lineage(source).await?;
                 return Ok(StableRestoreBase {
                     current: ControlMvpBase {
-                        history_anchor: integrity::genesis(&ControlMvpScopeDoc::from(&self.scope)),
+                        history_anchor: integrity::genesis(&self.scope)?,
                         reclamation_generation: 0,
                         pointer_version: None,
                         manifest_id: None,
                         manifest_checksum_sha256: None,
                         writer_epoch: 0,
                         layout_generation: 0,
-                        state: ReplayState::empty(&self.scope),
+                        state: ReplayState::empty(&self.scope)?,
                         base_states: Vec::new(),
                         tx_refs: Vec::new(),
                     },
@@ -2065,7 +2068,7 @@ impl ControlMvpStateStore {
             &prefixed_sha256(&stable.pointer_bytes),
             result_sequence,
             Some(checkpoint_interval),
-        );
+        )?;
         let suffix = format!("{suffix}-rg-{:020}", stable.current.reclamation_generation);
         let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
         let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
@@ -2089,7 +2092,7 @@ impl ControlMvpStateStore {
             history: HistoryLink::default(),
             reclamation_generation: stable.current.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             tx_id: transaction_id.clone(),
             base_manifest_id: Some(base_manifest_id.to_string()),
             sequence: result_sequence,
@@ -2171,7 +2174,7 @@ impl ControlMvpStateStore {
             reclamation_generation: stable.current.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             manifest_id: candidate_manifest_id.clone(),
             logical_sequence: result_sequence,
             base_manifest_id: Some(base_manifest_id.to_string()),
@@ -2200,7 +2203,7 @@ impl ControlMvpStateStore {
             reclamation_generation: stable.current.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             manifest_id: candidate_manifest_id.clone(),
             logical_sequence: result_sequence,
             manifest_checksum_sha256: manifest_checksum,
@@ -3500,7 +3503,7 @@ impl ControlMvpRestorePlan {
         }
         reference
             .history
-            .validate(&ControlMvpScopeDoc::from(&self.scope), reference.sequence)?;
+            .validate(&self.scope, reference.sequence)?;
         Ok(reference)
     }
     /// Returns the durable plan version.
@@ -3665,7 +3668,7 @@ impl ControlMvpRestorePlan {
             &self.observed_base_pointer_sha256,
             self.result_logical_sequence,
             Some(checkpoint_interval),
-        );
+        )?;
         let suffix = format!("{suffix}-rg-{:020}", self.observed_reclamation_generation);
         let expected_transaction_id =
             format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
@@ -3937,7 +3940,7 @@ impl ControlMvpRestoreParticipant {
             reclamation_generation: manifest.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.store.scope),
+            scope: self.store.scope.clone(),
             manifest_id: plan.candidate_manifest_id.clone(),
             logical_sequence: plan.result_logical_sequence,
             manifest_checksum_sha256: sha256_hex(&manifest_bytes),
@@ -4337,7 +4340,7 @@ impl ControlMvpTxn {
             history: HistoryLink::default(),
             reclamation_generation: base.reclamation_generation,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.store.scope),
+            scope: self.store.scope.clone(),
             tx_id: self.tx_id.clone(),
             base_manifest_id: base.manifest_id.clone(),
             sequence: next_sequence,
@@ -4427,7 +4430,7 @@ impl ControlMvpTxn {
             reclamation_generation: base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.store.scope),
+            scope: self.store.scope.clone(),
             manifest_id: self.manifest_id.clone(),
             logical_sequence: next_sequence,
             base_manifest_id: base.manifest_id,
@@ -4453,7 +4456,7 @@ impl ControlMvpTxn {
             reclamation_generation: base.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.store.scope),
+            scope: self.store.scope.clone(),
             manifest_id: self.manifest_id.clone(),
             logical_sequence: next_sequence,
             manifest_checksum_sha256: manifest_checksum,
@@ -5440,18 +5443,18 @@ impl ReplayState {
         }
         Ok(())
     }
-    fn empty(scope: &StateScope) -> Self {
-        Self {
-            history_root: integrity::genesis(&ControlMvpScopeDoc::from(scope)).root,
+    fn empty(scope: &StateScope) -> Result<Self> {
+        Ok(Self {
+            history_root: integrity::genesis(scope)?.root,
             ..Self::default()
-        }
+        })
     }
     fn apply_tx(&mut self, tx: &ControlMvpTxObject) -> Result<()> {
         #[cfg(feature = "test-utils")]
         cost::record(8, tx.writes.len() + tx.outbox.len() + tx.outbox_trim.len());
         tx.history.validate(&tx.scope, tx.sequence)?;
         if tx.history.preceding_root != self.history_root
-            || integrity::mutation_digest(tx) != tx.history.mutation_sha256
+            || integrity::mutation_digest(tx)? != tx.history.mutation_sha256
         {
             return Err(invariant_violation(
                 "replayed mutation differs from logical history",
@@ -5738,37 +5741,12 @@ struct ChecksumEnvelope<T> {
     payload: T,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ControlMvpScopeDoc {
-    tenant_id: String,
-    workspace_id: String,
-    domain: String,
-}
-
-impl ControlMvpScopeDoc {
-    fn matches_scope(&self, scope: &StateScope) -> bool {
-        self.tenant_id == scope.tenant_id()
-            && self.workspace_id == scope.workspace_id()
-            && self.domain == scope.domain()
-    }
-}
-
-impl From<&StateScope> for ControlMvpScopeDoc {
-    fn from(value: &StateScope) -> Self {
-        Self {
-            tenant_id: value.tenant_id().to_string(),
-            workspace_id: value.workspace_id().to_string(),
-            domain: value.domain().to_string(),
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct ControlMvpPointer {
     reclamation_generation: u64,
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     manifest_id: String,
     logical_sequence: u64,
     manifest_checksum_sha256: String,
@@ -5787,7 +5765,7 @@ impl ControlMvpPointer {
                 "control MVP pointer implementation mismatch",
             ));
         }
-        if !self.scope.matches_scope(scope) {
+        if &self.scope != scope {
             return Err(validation_failed("control MVP pointer scope mismatch"));
         }
         if self.writer_epoch == u64::MAX {
@@ -5843,7 +5821,7 @@ struct ControlMvpSegmentIndex {
     distinct_kv_keys: u64,
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     segment_id: String,
     level: ControlMvpSegmentLevel,
     logical_sequence: u64,
@@ -5896,7 +5874,7 @@ struct ControlMvpSegmentRow {
 struct ControlMvpStateObject {
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     state_id: String,
     logical_sequence: u64,
     entries: Vec<ReplayStateDigestEntry>,
@@ -5910,7 +5888,7 @@ impl ControlMvpStateObject {
         Self {
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(scope),
+            scope: scope.clone(),
             state_id,
             logical_sequence: state.logical_sequence,
             kv_start_ordinal: (!state.kv.is_empty()).then_some(0),
@@ -5943,7 +5921,7 @@ impl ControlMvpStateObject {
                 "control MVP state snapshot implementation mismatch",
             ));
         }
-        if !self.scope.matches_scope(scope) {
+        if &self.scope != scope {
             return Err(validation_failed(
                 "control MVP state snapshot scope mismatch",
             ));
@@ -5972,7 +5950,7 @@ struct ControlMvpManifest {
     reclamation_generation: u64,
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     manifest_id: String,
     logical_sequence: u64,
     base_manifest_id: Option<String>,
@@ -6008,7 +5986,7 @@ impl ControlMvpManifest {
                 "control MVP manifest implementation mismatch",
             ));
         }
-        if !self.scope.matches_scope(scope) {
+        if &self.scope != scope {
             return Err(validation_failed("control MVP manifest scope mismatch"));
         }
         if self.manifest_id != expected_manifest_id {
@@ -6171,7 +6149,7 @@ struct ControlMvpTxObject {
     history: HistoryLink,
     reclamation_generation: u64,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     tx_id: String,
     base_manifest_id: Option<String>,
     sequence: u64,
@@ -6222,7 +6200,7 @@ impl ControlMvpTxObject {
                 "control MVP transaction implementation mismatch",
             ));
         }
-        if !self.scope.matches_scope(scope) {
+        if &self.scope != scope {
             return Err(validation_failed("control MVP transaction scope mismatch"));
         }
         if self.tx_id != tx_ref.tx_id || self.sequence != tx_ref.sequence {
@@ -6612,7 +6590,7 @@ fn state_object_from_segment_rows(
     Ok(ControlMvpStateObject {
         format_version: CONTROL_MVP_FORMAT_VERSION,
         implementation: IMPLEMENTATION.to_string(),
-        scope: ControlMvpScopeDoc::from(scope),
+        scope: scope.clone(),
         state_id: reference.state_id.clone(),
         logical_sequence: reference.logical_sequence,
         entries,
@@ -7001,7 +6979,7 @@ fn build_segment_index(
         distinct_kv_keys: keys.len() as u64,
         format_version: SEGMENT_FORMAT_VERSION,
         implementation: IMPLEMENTATION.to_string(),
-        scope: scope.into(),
+        scope: scope.clone(),
         segment_id: segment_id.to_string(),
         level,
         logical_sequence,
@@ -7542,7 +7520,7 @@ fn validate_segment_index_identity(
 ) -> Result<()> {
     let identity_matches = index.format_version == SEGMENT_FORMAT_VERSION
         && index.implementation == IMPLEMENTATION
-        && index.scope.matches_scope(scope)
+        && &index.scope == scope
         && index.segment_id == reference.segment_id
         && index.level == reference.level
         && index.logical_sequence == reference.logical_sequence
@@ -7848,7 +7826,7 @@ struct ControlMvpCheckpoint {
     reclamation_generation: u64,
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     checkpoint_id: String,
     manifest_id: String,
     logical_sequence: u64,
@@ -7889,7 +7867,7 @@ impl ControlMvpCheckpoint {
                 "control MVP checkpoint implementation mismatch",
             ));
         }
-        if !self.scope.matches_scope(scope) {
+        if &self.scope != scope {
             return Err(validation_failed("control MVP checkpoint scope mismatch"));
         }
         if self.checkpoint_id != expected_checkpoint_id {
@@ -8272,12 +8250,11 @@ fn restore_identity_suffix(
     observed_base_pointer_sha256: &str,
     result_sequence: u64,
     checkpoint_interval: Option<u64>,
-) -> String {
+) -> Result<String> {
     let mut hasher = Sha256::new();
+    // Scope must stay first to preserve legacy workspace digests.
+    hash_scope(&mut hasher, scope)?;
     for value in [
-        scope.tenant_id(),
-        scope.workspace_id(),
-        scope.domain(),
         identity.restore_id(),
         identity.domain(),
         source.implementation(),
@@ -8299,7 +8276,7 @@ fn restore_identity_suffix(
     if let Some(checkpoint_interval) = checkpoint_interval {
         hash_u64(&mut hasher, checkpoint_interval);
     }
-    hex::encode(hasher.finalize())[..32].to_string()
+    Ok(hex::encode(hasher.finalize())[..32].to_string())
 }
 
 fn digest_u64(hasher: Sha256) -> u64 {
@@ -8334,6 +8311,31 @@ fn hash_u64(hasher: &mut Sha256, value: u64) {
     #[cfg(feature = "test-utils")]
     cost::record(11, 8);
     hasher.update(value.to_be_bytes());
+}
+
+fn hash_scope(hasher: &mut Sha256, scope: &StateScope) -> Result<()> {
+    hash_bytes(hasher, scope.tenant_id().as_bytes());
+    match scope.root() {
+        AuthorityRoot::Workspace { workspace_id } => {
+            // Workspace hash are unchanged from legacy v1 `StateScope`.
+            // Avoid adding `hash_bytes(hasher, b"root=workspace")`.
+            hash_bytes(hasher, workspace_id.as_bytes());
+        }
+        AuthorityRoot::Metastore { metastore_id } => {
+            hash_bytes(hasher, b"root=metastore");
+            hash_bytes(hasher, metastore_id.as_bytes());
+        }
+        AuthorityRoot::TenantIdentity => {
+            hash_bytes(hasher, b"root=identity");
+        }
+        _ => {
+            return Err(invariant_violation(
+                "unsupported authority root for restore identity",
+            ));
+        }
+    }
+    hash_bytes(hasher, scope.domain().as_bytes());
+    Ok(())
 }
 
 fn unsupported(operation: &str) -> CatalogError {
@@ -10969,7 +10971,7 @@ mod tests {
             history: HistoryLink::default(),
             reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&scope),
+            scope,
             tx_id: "tx-1".to_string(),
             base_manifest_id: None,
             sequence: 1,
@@ -11004,7 +11006,7 @@ mod tests {
             history: HistoryLink::default(),
             reclamation_generation: 0,
             implementation: IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&scope),
+            scope,
             tx_id: "tx-zero".to_string(),
             base_manifest_id: Some("manifest-terminal".to_string()),
             sequence: 0,
@@ -11302,6 +11304,124 @@ mod tests {
                 "compressed files must fail preflight"
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_workspace_restore_suffix(
+        scope: &StateScope,
+        identity: &RestoreAttemptIdentity,
+        source: &PersistedAuthorityReference,
+        current_base_kind: ControlMvpRestoreCurrentBaseKind,
+        base_manifest_id: &str,
+        base_pointer_version: Option<&str>,
+        observed_base_pointer_sha256: &str,
+        result_sequence: u64,
+        checkpoint_interval: Option<u64>,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        for value in [
+            scope.tenant_id(),
+            scope.workspace_id().expect("workspace scope"),
+            scope.domain(),
+            identity.restore_id(),
+            identity.domain(),
+            source.implementation(),
+            source.manifest_id(),
+            source.manifest_path(),
+            source.manifest_sha256(),
+            source.checkpoint_path().unwrap_or_default(),
+            source.checkpoint_sha256().unwrap_or_default(),
+            current_base_kind.identity_label(),
+            base_manifest_id,
+            base_pointer_version.unwrap_or_default(),
+            observed_base_pointer_sha256,
+        ] {
+            hash_bytes(&mut hasher, value.as_bytes());
+        }
+        hash_u64(&mut hasher, identity.attempt());
+        hash_u64(&mut hasher, source.logical_sequence());
+        hash_u64(&mut hasher, result_sequence);
+        if let Some(interval) = checkpoint_interval {
+            hash_u64(&mut hasher, interval);
+        }
+        hex::encode(hasher.finalize())[..32].to_string()
+    }
+
+    #[test]
+    fn restore_identity_is_root_aware_and_preserves_legacy_workspace_bytes() {
+        let workspace = StateScope::new("acme", "lakehouse", "catalog");
+        let metastore = StateScope::metastore("acme", "lakehouse", "catalog");
+        let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000042", 1, "catalog")
+            .expect("identity");
+
+        let source_for = |scope: &StateScope| {
+            PersistedAuthorityReference::new(
+                IMPLEMENTATION,
+                scope.clone(),
+                PersistedAuthorityKind::StateToken,
+                "manifest-1",
+                1,
+                "control/v1/domains/catalog/manifests/manifest-1.json",
+                format!("sha256:{}", "a".repeat(64)),
+                None,
+                None,
+                Utc::now() + ChronoDuration::hours(1),
+            )
+            .expect("source reference")
+        };
+
+        let workspace_source = source_for(&workspace);
+        let metastore_source = source_for(&metastore);
+        let observed = format!("sha256:{}", "b".repeat(64));
+
+        let workspace_suffix = restore_identity_suffix(
+            &workspace,
+            &identity,
+            &workspace_source,
+            ControlMvpRestoreCurrentBaseKind::Empty,
+            "base-manifest",
+            None,
+            &observed,
+            2,
+            Some(32),
+        )
+        .expect("workspace suffix");
+
+        let metastore_suffix = restore_identity_suffix(
+            &metastore,
+            &identity,
+            &metastore_source,
+            ControlMvpRestoreCurrentBaseKind::Empty,
+            "base-manifest",
+            None,
+            &observed,
+            2,
+            Some(32),
+        )
+        .expect("metastore suffix");
+
+        assert_ne!(
+            workspace_suffix, metastore_suffix,
+            "equal textual ids must not share a restore identity"
+        );
+
+        // Byte stability: recompute the legacy workspace algorithm independently.
+        // Scope fields first, no root discriminator, then the remaining inputs.
+        let legacy = legacy_workspace_restore_suffix(
+            &workspace,
+            &identity,
+            &workspace_source,
+            ControlMvpRestoreCurrentBaseKind::Empty,
+            "base-manifest",
+            None,
+            &observed,
+            2,
+            Some(32),
+        );
+        assert_eq!(
+            workspace_suffix, legacy,
+            "workspace restore identity must keep the legacy byte order"
+        );
     }
 }
 

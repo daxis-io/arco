@@ -627,7 +627,7 @@ impl WorkspaceDomainRegistry {
         for binding in bindings {
             binding.state_scope.validate()?;
             if binding.state_scope.tenant_id() != scope.tenant_id()
-                || binding.state_scope.workspace_id() != scope.workspace_id()
+                || binding.state_scope.workspace_id() != Some(scope.workspace_id())
             {
                 return Err(validation(
                     "workspace domain binding tenant/workspace scope mismatch",

@@ -98,20 +98,21 @@ before acquiring mutation capabilities.
 `ScopedStorage` retains the real request workspace for its existing workspace
 and metastore constructors. It has no tenant-identity constructor. Identity
 cannot enter legacy ledger, catalog, or state-store APIs by substituting the
-tenant ID for a workspace. The current `StateScope` remains workspace-shaped;
-`ControlMvpStateStore` rejects non-workspace physical roots, even when their IDs
-have the same text. There is no implicit conversion from `AuthorityScope` to
-that persisted representation.
+tenant ID for a workspace. `StateScope` now carries a typed authority root with
+a versioned encoding: workspace records keep the legacy v1 shape and every
+non-workspace root serializes as version 2. `ControlMvpStateStore` still rejects
+non-workspace physical roots, even when their IDs have the same text. There is
+no implicit conversion from `AuthorityScope` to the persisted representation.
 
-The dedicated follow-up,
-[Versioned AuthorityScope in StateScope and control/v1](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1),
-must carry root kind through tokens, transactions, checkpoints, manifests,
-projection intents, continuations, retained references, restore/GC checks, and
-catalog bindings. It must explicitly version the serialized shape, preserve or
-reject old workspace records according to a documented compatibility policy,
-and prove that equal textual IDs in different root families cannot share
-state identity. Identity CRUD and tenant-wide enforcement remain unavailable
-until their separate semantic API and these contracts are implemented.
+The representation work of the
+[Versioned AuthorityScope in StateScope and control/v1](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1)
+follow-up is implemented: root kind and identifiers flow through tokens,
+transactions, checkpoints, manifests, projection intents, continuations (v4),
+retained references, restore/GC checks, and catalog bindings; old workspace
+records decode only as workspace roots; and equal textual IDs in different root
+families cannot share state identity. Identity CRUD and tenant-wide enforcement
+remain unavailable until their separate semantic API and cross-root contracts
+are implemented.
 
 ## Consequences
 

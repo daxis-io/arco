@@ -74,7 +74,7 @@ impl ExternalLocationMetadataWriter {
             record.path_declaration_id().to_string(),
             record.location_id().to_string(),
             "EXTERNAL_LOCATION",
-            Some(self.scope.workspace_id().to_string()),
+            self.scope.workspace_id(),
             &governed_path,
             record.owner().to_string(),
         );

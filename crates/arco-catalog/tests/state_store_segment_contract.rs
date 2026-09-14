@@ -173,6 +173,8 @@ fn bloom_bits_hex(keys: &[&[u8]]) -> String {
 
 #[derive(Serialize, Deserialize)]
 struct MirrorScope {
+    scope_version: u32,
+    root_kind: String,
     tenant_id: String,
     workspace_id: String,
     domain: String,

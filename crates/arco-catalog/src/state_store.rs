@@ -3184,7 +3184,7 @@ mod tests {
             assert_eq!(
                 decoded, scope,
                 "v2 round-trip must preserve the authority root"
-            )
+            );
         }
     }
 
@@ -3337,11 +3337,7 @@ mod tests {
             let error =
                 from_value::<StateScope>(raw).expect_err(&format!("case {name} must be rejected"));
 
-            assert!(
-                error.to_string().contains(expected_fragment),
-                "case {}",
-                name
-            );
+            assert!(error.to_string().contains(expected_fragment), "case {name}");
         }
     }
 

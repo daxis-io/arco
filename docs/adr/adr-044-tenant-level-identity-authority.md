@@ -99,8 +99,9 @@ before acquiring mutation capabilities.
 and metastore constructors. It has no tenant-identity constructor. Identity
 cannot enter legacy ledger, catalog, or state-store APIs by substituting the
 tenant ID for a workspace. `StateScope` now carries a typed authority root with
-a versioned encoding: workspace records keep the legacy v1 shape and every
-non-workspace root serializes as version 2. `ControlMvpStateStore` still rejects
+a versioned encoding: every new record serializes as version 2 with an explicit
+`scope_version` and `root_kind`, while legacy records decode only as workspace
+roots. `ControlMvpStateStore` still rejects
 non-workspace physical roots, even when their IDs have the same text. There is
 no implicit conversion from `AuthorityScope` to the persisted representation.
 
@@ -121,7 +122,8 @@ are implemented.
 - Identity and metastore cuts can advance independently. No operation claims
   atomicity across them, and freshness is an enforcement requirement.
 - The first workspace-as-metastore pilot retains its existing path bytes and
-  persisted scope encoding. This decision does not relocate or promote a root.
+  canonical history roots; new records carry the version-2 scope encoding. This
+  decision does not relocate or promote a root.
 - Existing metastore principal snapshots are compatibility data or derived
   authorization inputs during migration, not the target identity authority.
 

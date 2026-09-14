@@ -99,12 +99,11 @@ This ADR fixes the following invariants.
 
 ### Scope compatibility boundary
 
-The persisted `StateScope` is versioned. Workspace roots serialize as the legacy
-v1 shape (`tenant_id`, `workspace_id`, `domain`) with no version or root marker;
-every non-workspace root serializes as version 2 with an explicit
-`scope_version` and `root_kind`. Decoding a record without an explicit root
-marker always yields a workspace root and never relabels an ID into another
-family. Unknown scope versions or root kinds are rejected before I/O.
+The persisted `StateScope` is versioned. Every new record serializes as version
+2 with an explicit `scope_version` and `root_kind` plus the root's identifiers.
+Decoding a legacy record that has no explicit version or root marker always
+yields a workspace root and never relabels an ID into another family. Unknown
+scope versions or root kinds are rejected before I/O.
 
 Root kind and identifiers are carried through `StateScope`, `StateToken`,
 transaction and checkpoint envelopes, manifests, projection intents,
@@ -114,8 +113,8 @@ unchanged: `ControlMvpStateStore` still requires a workspace physical root, and
 legacy scoped storage cannot construct tenant identity roots.
 
 Migration is decode-only. No persisted workspace record is rewritten, so an
-existing workspace domain keeps its authority bytes and history roots, and the
-old workspace encoding fixtures continue to decode as workspace roots. New
+existing workspace domain keeps its path bytes and canonical history roots, and
+the old workspace encoding fixtures continue to decode as workspace roots. New
 non-workspace roots are not enabled by this change. Rollback is safe for
 workspace data because version-2 workspace records keep the legacy top-level
 `workspace_id` and earlier readers ignore unknown fields; a rolled-back binary

@@ -105,7 +105,7 @@ fn validate_metadata_timestamp(updated_at_ms: i64) -> Result<()> {
     Ok(())
 }
 
-/// Opaque retained authority token for a future state-store scope.
+/// Opaque retained authority token for a state-store authority scope.
 ///
 /// External crates cannot mint authority tokens directly.
 ///
@@ -892,7 +892,7 @@ impl CheckpointToken {
     }
 }
 
-/// Options for opening a future state-store transaction.
+/// Options for opening a state-store transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TxnOptions {
     scope: Option<StateScope>,
@@ -963,7 +963,7 @@ impl TxnOptions {
     }
 }
 
-/// Options for creating a future retained authority checkpoint.
+/// Options for creating a retained authority checkpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckpointOptions {
     scope: Option<StateScope>,
@@ -1015,7 +1015,7 @@ impl CheckpointOptions {
     }
 }
 
-/// Value plus generation evidence observed from a future state-store backend.
+/// Value plus generation evidence observed from a state-store backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     bytes: Bytes,

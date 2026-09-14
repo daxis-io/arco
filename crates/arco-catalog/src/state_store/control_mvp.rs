@@ -235,8 +235,9 @@ impl ControlMvpStateStore {
     /// Returns validation errors when the storage scope does not match the state
     /// scope, the physical root is not a workspace, or the domain cannot be
     /// represented as a safe object path, or default cache administration cannot
-    /// fit its byte capacity. Non-workspace roots require the future
-    /// versioned authority-scope format; they must not alias legacy `StateScope`.
+    /// fit its byte capacity. Non-workspace roots remain disabled until the
+    /// metastore and identity authority APIs are implemented; they must not
+    /// alias a workspace `StateScope`.
     pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
         scope.validate()?;
         if !matches!(scope.root(), AuthorityRoot::Workspace { .. }) {

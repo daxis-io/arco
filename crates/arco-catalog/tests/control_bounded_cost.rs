@@ -357,7 +357,10 @@ struct PreparedCandidateInventory {
 
 fn require_manifest_scope(value: &serde_json::Value, scope: &StateScope) {
     assert_eq!(value["scope"]["tenant_id"], scope.tenant_id());
-    assert_eq!(value["scope"]["workspace_id"], scope.workspace_id());
+    assert_eq!(
+        value["scope"]["workspace_id"].as_str(),
+        scope.workspace_id()
+    );
     assert_eq!(value["scope"]["domain"], scope.domain());
 }
 

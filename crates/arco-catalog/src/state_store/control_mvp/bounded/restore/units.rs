@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 mod codec;
 mod decode;
+mod publication;
 
 /// Owned selection provenance only; native use still requires store/root validation.
 pub(super) struct OwnedSelectedPlan {
@@ -3184,6 +3185,842 @@ mod behavioral_tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn durable_unit_publishes_all_records_before_selecting_progress() {
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"durable unit");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let receipt = decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+            Ok(receipt(
+                expected.value(),
+                0,
+                genesis_receipt_raw_sha256(expected.value())?,
+                genesis_chain_sha256(expected.value())?,
+                zero_cursor(),
+                MergeCursor {
+                    global: GlobalCut::End,
+                    source: SideCursor::End,
+                    current: SideCursor::End,
+                },
+                CumulativeSemanticCounts::default(),
+            ))
+        })
+        .expect("receipt");
+        let progress = decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+            Ok(progress_after(
+                expected.value(),
+                receipt.value(),
+                &encode(receipt.value(), "receipt"),
+                true,
+            ))
+        })
+        .expect("progress");
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            &[],
+        )
+        .expect("assembled");
+        assert_eq!(
+            publication::publish(&mut io, &mut route, unit)
+                .await
+                .expect("published"),
+            publication::Publication::Written
+        );
+        let written = store
+            .storage
+            .head(&expected.value().receipt_path(0))
+            .await
+            .expect("receipt HEAD");
+        assert!(
+            written.is_some(),
+            "receipt must be durable before selected progress can advance"
+        );
+        let current = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("current");
+        assert_eq!(current.progress.value().next_ordinal, 1);
+        assert!(current.progress.value().terminal);
+    }
+
+    fn durable_unit_models(
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        expected: &WorkingValue<ExpectedPlan<'_>>,
+    ) -> (
+        WorkingValue<ControlMvpRestoreReceiptV1>,
+        WorkingValue<RestoreProgressV1>,
+    ) {
+        let receipt = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
+            Ok(receipt(
+                expected.value(),
+                0,
+                genesis_receipt_raw_sha256(expected.value())?,
+                genesis_chain_sha256(expected.value())?,
+                zero_cursor(),
+                MergeCursor {
+                    global: GlobalCut::End,
+                    source: SideCursor::End,
+                    current: SideCursor::End,
+                },
+                CumulativeSemanticCounts::default(),
+            ))
+        })
+        .expect("receipt");
+        let progress = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
+            Ok(progress_after(
+                expected.value(),
+                receipt.value(),
+                &encode(receipt.value(), "receipt"),
+                true,
+            ))
+        })
+        .expect("progress");
+        (receipt, progress)
+    }
+
+    #[tokio::test]
+    async fn durable_unit_publication_faults_reconcile_without_resending() {
+        for final_route in [false, true] {
+            for at in 3..=5 {
+                for after in [false, true] {
+                    for pending in [false, true] {
+                        durable_unit_fault_case(final_route, at, after, pending).await;
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep cancellation and retained target lifetimes visible through fresh recovery"
+    )]
+    async fn durable_unit_fault_case(final_route: bool, at: usize, after: bool, pending: bool) {
+        use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let (_, plan) = super::super::tests::inspection_fixture().await;
+        let store = physical::restore_io::unit_publication_test_store(at, after, pending);
+        let digest = prefixed_sha256(b"durable fault matrix");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut route = if final_route {
+            RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+        } else {
+            RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            }
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let (receipt, progress) = durable_unit_models(&mut io, &mut route, &expected);
+        let live = io.live_ownership_evidence();
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            &[],
+        )
+        .expect("assembly");
+        let target = unit.recovery_target();
+        let reads = io.reading_evidence();
+        if pending {
+            let mut future = Box::pin(publication::publish(&mut io, &mut route, unit));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+            drop(future);
+            assert_eq!(io.live_ownership_evidence(), live);
+        } else {
+            assert!(
+                publication::publish(&mut io, &mut route, unit)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(io.writing_evidence().0, (at - 2) as u64);
+        assert_eq!(
+            io.reading_evidence(),
+            reads,
+            "uncertain outcome must not auto-read"
+        );
+        assert_eq!(io.allocation_underestimates(), 0);
+        let writes = io.writing_evidence();
+        assert!(
+            publication::reconcile(&mut io, &mut route, &expected, target)
+                .await
+                .is_err()
+        );
+        assert_eq!(io.reading_evidence(), reads);
+        assert_eq!(io.writing_evidence(), writes);
+        // The fixed target survives dropping all old invocation heap owners.
+        drop((expected, selected, receipt, progress, io));
+        let mut recovery = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut recovery, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("recovery expected");
+        let observed = publication::reconcile(&mut recovery, &mut route, &expected, target)
+            .await
+            .expect("fresh read-only recovery");
+        assert_eq!(
+            observed,
+            if at == 5 && after {
+                publication::Reconciliation::Exact
+            } else {
+                publication::Reconciliation::Prior
+            }
+        );
+        assert_eq!(recovery.writing_evidence(), (0, 0));
+        assert_eq!(recovery.allocation_underestimates(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_unit_identical_writers_use_original_version_cas() {
+        let (_, plan) = super::super::tests::inspection_fixture().await;
+        let store = physical::restore_io::unit_publication_barrier_store();
+        let digest = prefixed_sha256(b"barrier contenders");
+        let expected = ExpectedPlan::from_selected(&plan, &digest).expect("expected");
+        seed_selected_read_case(&store, &expected, 14).await;
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                durable_unit_contender(&store, &plan, &digest),
+                durable_unit_contender(&store, &plan, &digest)
+            )
+        })
+        .await
+        .expect("both writers reached CAS barrier");
+        assert!(matches!(
+            (&first, &second),
+            (
+                publication::Publication::Written,
+                publication::Publication::ExactSelected
+            ) | (
+                publication::Publication::ExactSelected,
+                publication::Publication::Written
+            )
+        ));
+    }
+
+    async fn durable_unit_contender(
+        store: &super::super::super::super::ControlMvpStateStore,
+        plan: &ControlMvpRestorePlanV7,
+        digest: &str,
+    ) -> publication::Publication {
+        let mut io = RestorePhysicalIo::new(store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(plan, digest)
+        })
+        .expect("expected");
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let (receipt, progress) = durable_unit_models(&mut io, &mut route, &expected);
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            &[],
+        )
+        .expect("assembly");
+        let outcome = publication::publish(&mut io, &mut route, unit)
+            .await
+            .expect("publication");
+        assert_eq!(io.writing_evidence().0, 3);
+        assert_eq!(io.allocation_underestimates(), 0);
+        outcome
+    }
+
+    #[tokio::test]
+    async fn durable_unit_exact_bytes_stale_versions_and_read_only_recovery() {
+        for final_route in [false, true] {
+            for case in 0..7 {
+                durable_unit_observation_case(final_route, case).await;
+            }
+        }
+    }
+
+    async fn durable_unit_install_later(
+        store: &super::super::super::super::ControlMvpStateStore,
+        expected: &ExpectedPlan<'_>,
+    ) {
+        let (selector_raw, progress, receipt, ordinal) = selected_read_fixture(expected, 18);
+        for (record, raw) in [
+            (RestoreControlRecord::Progress(ordinal), progress),
+            (RestoreControlRecord::Receipt(ordinal - 1), receipt),
+        ] {
+            store
+                .storage
+                .put(
+                    &record.path(&expected.prefix),
+                    bytes::Bytes::from(raw),
+                    arco_core::AuthorityWritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("later immutable");
+        }
+        let path = expected.selector_path();
+        let meta = store
+            .storage
+            .head(&path)
+            .await
+            .expect("head")
+            .expect("selector");
+        store
+            .storage
+            .put(
+                &path,
+                bytes::Bytes::from(selector_raw),
+                arco_core::AuthorityWritePrecondition::MatchesVersion(meta.version),
+            )
+            .await
+            .expect("later selector");
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cognitive_complexity,
+        reason = "end-to-end ordered publication and fresh recovery scenario"
+    )]
+    async fn durable_unit_observation_case(final_route: bool, case: u8) {
+        use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+        use publication::{Publication, Reconciliation};
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"observation matrix");
+        let other_digest = prefixed_sha256(b"other plan");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut route = if final_route {
+            RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+        } else {
+            RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            }
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let (receipt, progress) = durable_unit_models(&mut io, &mut route, &expected);
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            &[],
+        )
+        .expect("assembly");
+        let target = unit.recovery_target();
+        if case == 1 {
+            store
+                .storage
+                .put(
+                    &expected.value().selector_path(),
+                    bytes::Bytes::copy_from_slice(selected.selector_raw.as_slice()),
+                    arco_core::AuthorityWritePrecondition::MatchesVersion(
+                        selected.selector_meta.value().version.clone(),
+                    ),
+                )
+                .await
+                .expect("same bytes new version");
+        }
+        if case == 2 {
+            durable_unit_install_later(&store, expected.value()).await;
+        }
+        if case == 4 {
+            store
+                .storage
+                .put(
+                    &expected.value().receipt_path(0),
+                    bytes::Bytes::from_static(b"wrong"),
+                    arco_core::AuthorityWritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("collision");
+        }
+        let outcome = publication::publish(&mut io, &mut route, unit).await;
+        match case {
+            1 => assert_eq!(
+                outcome.expect("stale CAS"),
+                Publication::Conflict(Reconciliation::Prior)
+            ),
+            2 => assert_eq!(
+                outcome.expect("different CAS winner"),
+                Publication::Conflict(Reconciliation::Different)
+            ),
+            4 => assert!(outcome.is_err()),
+            _ => assert_eq!(outcome.expect("written"), Publication::Written),
+        }
+        if matches!(case, 1 | 2) {
+            let reads = io.reading_evidence();
+            assert!(
+                read_selected_progress(&mut io, &mut route, &expected)
+                    .await
+                    .is_err(),
+                "non-exact CAS conflict must stop the publisher route"
+            );
+            assert_eq!(io.reading_evidence(), reads);
+        }
+        assert_eq!(io.writing_evidence().0, if case == 4 { 1 } else { 3 });
+        assert_eq!(io.allocation_underestimates(), 0);
+        if case == 0 {
+            for (path, raw) in [
+                (
+                    expected.value().receipt_path(0),
+                    encode(receipt.value(), "receipt"),
+                ),
+                (
+                    expected.value().progress_path(1),
+                    encode(progress.value(), "progress"),
+                ),
+                (
+                    expected.value().selector_path(),
+                    encode(
+                        &selector(
+                            expected.value(),
+                            progress.value(),
+                            &encode(progress.value(), "progress"),
+                        ),
+                        "selector",
+                    ),
+                ),
+            ] {
+                assert_eq!(store.storage.get(&path).await.expect("raw").as_ref(), raw);
+            }
+        }
+        if case == 3 {
+            durable_unit_install_later(&store, expected.value()).await;
+        }
+        if case == 5 {
+            let path = expected.value().progress_path(1);
+            let meta = store
+                .storage
+                .head(&path)
+                .await
+                .expect("head")
+                .expect("progress");
+            store
+                .storage
+                .put(
+                    &path,
+                    bytes::Bytes::from_static(b"{}"),
+                    arco_core::AuthorityWritePrecondition::MatchesVersion(meta.version),
+                )
+                .await
+                .expect("corruption");
+        }
+        drop((expected, selected, receipt, progress, io));
+        let mut recovery = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut recovery, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, if case == 6 { &other_digest } else { &digest })
+        })
+        .expect("expected");
+        let outcome = publication::reconcile(&mut recovery, &mut route, &expected, target).await;
+        match case {
+            1 | 4 => assert_eq!(outcome.expect("prior"), Reconciliation::Prior),
+            2 | 3 => assert_eq!(outcome.expect("different"), Reconciliation::Different),
+            5 | 6 => assert!(outcome.is_err()),
+            _ => assert_eq!(outcome.expect("exact"), Reconciliation::Exact),
+        }
+        if case == 6 {
+            assert_eq!(recovery.reading_evidence(), (0, 0, 0));
+        }
+        assert_eq!(recovery.writing_evidence(), (0, 0));
+        assert_eq!(recovery.allocation_underestimates(), 0);
+    }
+
+    async fn durable_unit_output_fixture(
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        expected: &WorkingValue<ExpectedPlan<'_>>,
+    ) -> physical::restore_io::StandardRestoreOutput {
+        let id =
+            codec::hashes::output_id(io, route, expected, 0, 0, physical::Role::Kv).expect("id");
+        let rows = decode_with_reservation(io, route, Some(64 * 1024), || {
+            Ok(vec![ControlMvpSegmentRow {
+                record_kind: SEGMENT_RECORD_KV,
+                key: b"a".to_vec(),
+                value: Some(b"value".to_vec()),
+                generation: 1,
+                tombstone: false,
+                logical_sequence: 1,
+                logical_ordinal: 0,
+                origin_sequence: None,
+            }])
+        })
+        .expect("rows");
+        physical::restore_io::write_standard_restore_output(io, route, id.value(), 1, &rows)
+            .await
+            .expect("output")
+    }
+
+    #[tokio::test]
+    async fn durable_unit_assembly_rejects_unbound_records_before_control_writes() {
+        for final_route in [false, true] {
+            for case in 0..7 {
+                durable_unit_assembly_case(final_route, case).await;
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "retain all guarded fixture products across assembly admission"
+    )]
+    async fn durable_unit_assembly_case(final_route: bool, case: u8) {
+        use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"assembly matrix");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut foreign = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut route = if final_route {
+            RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+        } else {
+            RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            }
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let output = if case >= 3 {
+            Some(durable_unit_output_fixture(&mut io, &mut route, &expected).await)
+        } else {
+            None
+        };
+        let mut foreign_workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut foreign_payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut foreign_route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut foreign_workspace,
+            payload: &mut foreign_payload,
+        };
+        let receipt = decode_with_reservation(
+            if case == 6 { &mut foreign } else { &mut io },
+            if case == 6 {
+                &mut foreign_route
+            } else {
+                &mut route
+            },
+            Some(2 * 1024 * 1024),
+            || {
+                let mut value = native_receipt_fixture(expected.value());
+                if case != 2 {
+                    value.outputs.clear();
+                    value.counts.output_blocks = 0;
+                    value.counts.output_encoded_bytes = 0;
+                }
+                if matches!(case, 0 | 4 | 5 | 6) {
+                    if let Some(output) = output.as_ref() {
+                        value.outputs.push(output_binding_witness(
+                            &store,
+                            output,
+                            &output.descriptor.value().segment.segment_id,
+                            u8::from(case == 5),
+                        ));
+                        value.counts.output_blocks = 1;
+                        value.counts.output_encoded_bytes = output.descriptor.value().block.length;
+                    }
+                }
+                if case == 1 {
+                    value.predecessor_chain_sha256 = prefixed_sha256(b"wrong chain");
+                }
+                rehash_receipt(&mut value);
+                Ok(value)
+            },
+        )
+        .expect("receipt");
+        let progress = decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+            Ok(progress_after(
+                expected.value(),
+                receipt.value(),
+                &encode(receipt.value(), "receipt"),
+                false,
+            ))
+        })
+        .expect("progress");
+        let writes = io.writing_evidence();
+        let reads = io.reading_evidence();
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            output.as_slice(),
+        );
+        assert_eq!(
+            unit.is_ok(),
+            matches!(case, 0 | 4),
+            "case={case} final={final_route}: {:?}",
+            unit.as_ref().err()
+        );
+        assert_eq!(io.writing_evidence(), writes);
+        assert_eq!(io.reading_evidence(), reads);
+        if let Ok(unit) = unit {
+            assert_eq!(
+                publication::publish(&mut io, &mut route, unit)
+                    .await
+                    .expect("publish"),
+                publication::Publication::Written
+            );
+        }
+        assert_eq!(io.allocation_underestimates(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_unit_non_genesis_continuity_and_later_selection_are_distinct() {
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"two durable units");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let mut first = None;
+        for ordinal in 0..2 {
+            let selected = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .expect("selected");
+            assert_eq!(selected.progress.value().next_ordinal, ordinal);
+            let receipt =
+                decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+                    Ok(proposed_receipt_fixture(
+                        expected.value(),
+                        selected.progress.value(),
+                        0,
+                    ))
+                })
+                .expect("receipt");
+            let progress =
+                decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+                    Ok(progress_after(
+                        expected.value(),
+                        receipt.value(),
+                        &encode(receipt.value(), "receipt"),
+                        is_end_cursor(&receipt.value().after),
+                    ))
+                })
+                .expect("progress");
+            let unit = publication::assemble(
+                &mut io,
+                &mut route,
+                &expected,
+                &selected,
+                &receipt,
+                &progress,
+                &[],
+            )
+            .expect("assembly");
+            let target = unit.recovery_target();
+            assert_eq!(
+                publication::publish(&mut io, &mut route, unit)
+                    .await
+                    .expect("publication"),
+                publication::Publication::Written
+            );
+            assert_eq!(
+                publication::reconcile(&mut io, &mut route, &expected, target)
+                    .await
+                    .expect("exact"),
+                publication::Reconciliation::Exact
+            );
+            if ordinal == 0 {
+                first = Some(target);
+            }
+        }
+        assert_eq!(
+            publication::reconcile(&mut io, &mut route, &expected, first.expect("first target"))
+                .await
+                .expect("later selection"),
+            publication::Reconciliation::Different
+        );
+        assert_eq!(io.writing_evidence().0, 6);
+        assert_eq!(io.allocation_underestimates(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_unit_preflight_preserves_no_effect_on_foreign_or_exhausted_owners() {
+        for final_route in [false, true] {
+            for case in 0..3 {
+                durable_unit_admission_case(final_route, case).await;
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep original and foreign owner lifetimes explicit in preflight matrix"
+    )]
+    async fn durable_unit_admission_case(final_route: bool, case: u8) {
+        use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"durable admission");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut foreign = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        seed_selected_read_case(&store, expected.value(), 14).await;
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("selected");
+        let (receipt, progress) = durable_unit_models(&mut io, &mut route, &expected);
+        let unit = publication::assemble(
+            &mut io,
+            &mut route,
+            &expected,
+            &selected,
+            &receipt,
+            &progress,
+            &[],
+        )
+        .expect("assembly");
+        let target = unit.recovery_target();
+        let owner = if case == 0 { &mut foreign } else { &mut io };
+        let held = if case != 0 && !final_route {
+            let remaining = 64 * 1024 * 1024 - owner.live_ownership_evidence().0;
+            Some(
+                decode_with_reservation(owner, &mut route, Some(remaining), || {
+                    Ok(vec![0_u8; remaining - 32 * 1024])
+                })
+                .expect("carry"),
+            )
+        } else {
+            None
+        };
+        let mut totals = FinalStreamTotals::new();
+        let carry = if case != 0 && final_route {
+            64 * 1024 * 1024 - owner.live_ownership_evidence().0 - 64 * 1024 + 1
+        } else {
+            0
+        };
+        let mut chunk = FinalMicrochunk::begin(&mut totals, carry, owner).expect("chunk");
+        let mut route = if final_route {
+            RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+        } else {
+            route
+        };
+        let reads = owner.reading_evidence();
+        let hashes = owner.hashing_evidence();
+        if case == 2 {
+            assert!(
+                publication::assemble(
+                    owner,
+                    &mut route,
+                    &expected,
+                    &selected,
+                    &receipt,
+                    &progress,
+                    &[]
+                )
+                .is_err()
+            );
+            drop(unit);
+        } else {
+            assert!(publication::publish(owner, &mut route, unit).await.is_err());
+        }
+        assert_eq!(owner.writing_evidence(), (0, 0));
+        assert_eq!(owner.reading_evidence(), reads);
+        assert_eq!(owner.hashing_evidence(), hashes);
+        assert_eq!(owner.allocation_underestimates(), 0);
+        drop(held);
+        assert!(
+            publication::reconcile(owner, &mut route, &expected, target)
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.reading_evidence(), reads);
+    }
 
     #[tokio::test]
     async fn output_binding_rejects_substituted_objects() {

@@ -868,6 +868,11 @@ impl<'store> RestorePhysicalIo<'store> {
     }
 
     #[cfg(test)]
+    pub(in super::super) fn writing_evidence(&self) -> (u64, u64) {
+        (self.work.write_attempts, self.work.submitted_write_bytes)
+    }
+
+    #[cfg(test)]
     pub(in super::super) fn reading_evidence(&self) -> (u64, u64, u64) {
         (
             self.work.range_reads,
@@ -2156,6 +2161,20 @@ pub(in super::super) fn selected_read_pending_store(boundary: usize) -> ControlM
 }
 
 #[cfg(test)]
+pub(in super::super) fn unit_publication_test_store(
+    at: usize,
+    after: bool,
+    pending: bool,
+) -> ControlMvpStateStore {
+    range_tests::unit_publication_test_store(at, after, pending)
+}
+
+#[cfg(test)]
+pub(in super::super) fn unit_publication_barrier_store() -> ControlMvpStateStore {
+    range_tests::unit_publication_barrier_store()
+}
+
+#[cfg(test)]
 mod range_tests {
     use super::*;
     use arco_core::{
@@ -2176,6 +2195,12 @@ mod range_tests {
         WriteOpaqueError,
         WritePending,
         WritePendingAt(usize),
+        PublicationFault {
+            at: usize,
+            after: bool,
+            pending: bool,
+        },
+        SelectorBarrier(Arc<tokio::sync::Barrier>),
         ChangedHead(usize),
         ChangedSize(usize),
         CollisionPending(usize),
@@ -2185,7 +2210,10 @@ mod range_tests {
         HeadOpaqueErrorAt(usize),
         ReadError(usize),
         Unknown,
-        Owned { capacity: usize, wrong_length: bool },
+        Owned {
+            capacity: usize,
+            wrong_length: bool,
+        },
         Pending,
     }
     #[derive(Debug)]
@@ -2230,6 +2258,8 @@ mod range_tests {
                 | Response::WriteOpaqueError
                 | Response::WritePending
                 | Response::WritePendingAt(_)
+                | Response::PublicationFault { .. }
+                | Response::SelectorBarrier(_)
                 | Response::ChangedHead(_)
                 | Response::ChangedSize(_)
                 | Response::CollisionPending(_)
@@ -2287,7 +2317,40 @@ mod range_tests {
             if matches!(self.response, Response::WritePending) {
                 return pending().await;
             }
+            if let Response::SelectorBarrier(ref barrier) = self.response {
+                if path.ends_with("/selector.json")
+                    && matches!(condition, arco_core::WritePrecondition::MatchesVersion(_))
+                {
+                    barrier.wait().await;
+                }
+            }
+            if let Response::PublicationFault {
+                at,
+                after: false,
+                pending: wait,
+            } = self.response
+            {
+                if at == ordinal {
+                    if wait {
+                        return pending().await;
+                    }
+                    return Err(arco_core::Error::storage("before publication write"));
+                }
+            }
             let mut result = self.inner.put(path, data, condition).await?;
+            if let Response::PublicationFault {
+                at,
+                after: true,
+                pending: wait,
+            } = self.response
+            {
+                if at == ordinal {
+                    if wait {
+                        return pending().await;
+                    }
+                    return Err(arco_core::Error::storage("lost publication response"));
+                }
+            }
             if let Response::WriteOwned(capacity) = self.response {
                 let version = match &mut result {
                     arco_core::WriteResult::Success { version } => version,
@@ -2350,6 +2413,28 @@ mod range_tests {
         assert!((1..=9).contains(&boundary));
         store(
             backend(Response::CollisionPending(boundary)),
+            "catalog",
+            true,
+        )
+    }
+
+    pub(super) fn unit_publication_test_store(
+        at: usize,
+        after: bool,
+        pending: bool,
+    ) -> ControlMvpStateStore {
+        store(
+            backend(Response::PublicationFault { at, after, pending }),
+            "catalog",
+            true,
+        )
+    }
+
+    pub(super) fn unit_publication_barrier_store() -> ControlMvpStateStore {
+        store(
+            backend(Response::SelectorBarrier(Arc::new(
+                tokio::sync::Barrier::new(2),
+            ))),
             "catalog",
             true,
         )

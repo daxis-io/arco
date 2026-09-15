@@ -13,7 +13,7 @@ use tracing::warn;
 use ulid::Ulid;
 use uuid::Uuid;
 
-use arco_core::{ScopedStorage, TableFormat, WritePrecondition, WriteResult};
+use arco_core::{AuthorityRoot, ScopedStorage, TableFormat, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
 use crate::idempotency::validate_uuidv7;
@@ -104,37 +104,55 @@ pub enum CatalogAuthorityKind {
     ControlV1,
 }
 
-/// Exact tenant/workspace catalog-authority binding.
+/// Exact tenant/root catalog-authority binding.
+///
+/// The durable key is `(tenant_id, root)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogAuthorityBinding {
     tenant_id: String,
-    workspace_id: String,
+    root: AuthorityRoot,
     kind: CatalogAuthorityKind,
 }
 
 impl CatalogAuthorityBinding {
-    /// Creates an exact binding to the legacy catalog authority.
+    /// Creates an exact workspace binding to the legacy catalog authority.
     #[must_use]
     pub fn legacy(tenant_id: impl Into<String>, workspace_id: impl Into<String>) -> Self {
-        Self::new(tenant_id, workspace_id, CatalogAuthorityKind::Legacy)
+        Self::workspace(tenant_id, workspace_id, CatalogAuthorityKind::Legacy)
     }
 
-    /// Creates an exact binding to the `control/v1` catalog authority.
+    /// Creates an exact workspace binding to the `control/v1` catalog authority.
     #[must_use]
     pub fn control_v1(tenant_id: impl Into<String>, workspace_id: impl Into<String>) -> Self {
-        Self::new(tenant_id, workspace_id, CatalogAuthorityKind::ControlV1)
+        Self::workspace(tenant_id, workspace_id, CatalogAuthorityKind::ControlV1)
     }
 
-    fn new(
+    /// Creates a binding for an explicit root family.
+    #[must_use]
+    pub fn new(
         tenant_id: impl Into<String>,
-        workspace_id: impl Into<String>,
+        root: AuthorityRoot,
         kind: CatalogAuthorityKind,
     ) -> Self {
         Self {
             tenant_id: tenant_id.into(),
-            workspace_id: workspace_id.into(),
+            root,
             kind,
         }
+    }
+
+    fn workspace(
+        tenant_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        kind: CatalogAuthorityKind,
+    ) -> Self {
+        Self::new(
+            tenant_id,
+            AuthorityRoot::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+            kind,
+        )
     }
 }
 
@@ -148,7 +166,7 @@ impl CatalogAuthorityBinding {
 /// start cold and have independent budgets; these capacities are not an RSS bound.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogAuthorityBindings {
-    exact: Arc<BTreeMap<(String, String), CatalogAuthorityEntry>>,
+    exact: Arc<BTreeMap<(String, AuthorityRoot), CatalogAuthorityEntry>>,
     read_cache_config: crate::ControlMvpReadCacheConfig,
     continuation_key: Option<ScanContinuationKey>,
 }
@@ -260,8 +278,8 @@ impl CatalogAuthorityBindings {
     ) -> Result<Self> {
         let mut exact = BTreeMap::new();
         for binding in bindings {
-            StateScope::new(&binding.tenant_id, &binding.workspace_id, "catalog").validate()?;
-            let key = (binding.tenant_id, binding.workspace_id);
+            validate_catalog_authority_root(&binding.tenant_id, &binding.root)?;
+            let key = (binding.tenant_id, binding.root);
             if exact
                 .insert(
                     key.clone(),
@@ -274,7 +292,7 @@ impl CatalogAuthorityBindings {
             {
                 return Err(CatalogError::Validation {
                     message: format!(
-                        "duplicate catalog authority binding for tenant={} workspace={}",
+                        "duplicate catalog authority binding for tenant={} root={:?}",
                         key.0, key.1
                     ),
                 });
@@ -309,11 +327,11 @@ impl CatalogAuthorityBindings {
         })
     }
 
-    /// Resolves one exact root, defaulting every unlisted root to legacy.
+    /// Resolves one exact root family, defaulting every unlisted root to legacy.
     #[must_use]
-    pub fn resolve(&self, tenant_id: &str, workspace_id: &str) -> CatalogAuthorityKind {
+    pub fn resolve_root(&self, tenant_id: &str, root: &AuthorityRoot) -> CatalogAuthorityKind {
         self.exact
-            .get(&(tenant_id.to_string(), workspace_id.to_string()))
+            .get(&(tenant_id.to_string(), root.clone()))
             .map_or(CatalogAuthorityKind::Legacy, |entry| entry.kind)
     }
 
@@ -322,7 +340,7 @@ impl CatalogAuthorityBindings {
     // stays direct and cannot replace the first retained handle.
     fn reuse_read_cache(
         &self,
-        root: &(String, String),
+        root: &(String, AuthorityRoot),
         store: ControlMvpStateStore,
     ) -> ControlMvpStateStore {
         let Some(entry) = self.exact.get(root) else {
@@ -367,12 +385,19 @@ impl CatalogAuthorityBindings {
             .collect()
     }
 
-    fn control_continuation_key(
-        &self,
-        tenant_id: &str,
-        workspace_id: &str,
-    ) -> Result<ScanContinuationKey> {
-        if self.resolve(tenant_id, workspace_id) != CatalogAuthorityKind::ControlV1 {
+    /// Resolves one exact workspace root, defaulting every unlisted root to legacy.
+    #[must_use]
+    pub fn resolve(&self, tenant_id: &str, workspace_id: &str) -> CatalogAuthorityKind {
+        self.resolve_root(
+            tenant_id,
+            &AuthorityRoot::Workspace {
+                workspace_id: workspace_id.to_string(),
+            },
+        )
+    }
+
+    fn control_continuation_key(&self, scope: &StateScope) -> Result<ScanContinuationKey> {
+        if self.resolve_root(scope.tenant_id(), scope.root()) != CatalogAuthorityKind::ControlV1 {
             return Err(CatalogError::Validation {
                 message: "control catalog authority requires an exact control/v1 root binding"
                     .to_string(),
@@ -384,6 +409,24 @@ impl CatalogAuthorityBindings {
                 message: "control/v1 root binding has no continuation key".to_string(),
             })
     }
+}
+
+fn validate_catalog_authority_root(tenant_id: &str, root: &AuthorityRoot) -> Result<()> {
+    let scope = match root {
+        AuthorityRoot::Workspace { workspace_id } => {
+            StateScope::new(tenant_id, workspace_id, "catalog")
+        }
+        AuthorityRoot::Metastore { metastore_id } => {
+            StateScope::metastore(tenant_id, metastore_id, "catalog")
+        }
+        _ => {
+            return Err(CatalogError::Validation {
+                message: "catalog authority bindings support only workspace and metastore roots"
+                    .to_string(),
+            });
+        }
+    };
+    scope.validate()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1346,11 +1389,8 @@ impl CatalogAuthority {
         scope: StateScope,
         bindings: &CatalogAuthorityBindings,
     ) -> Result<Self> {
-        let key = bindings.control_continuation_key(scope.tenant_id(), scope.workspace_id())?;
-        let root = (
-            scope.tenant_id().to_string(),
-            scope.workspace_id().to_string(),
-        );
+        let key = bindings.control_continuation_key(&scope)?;
+        let root = (scope.tenant_id().to_string(), scope.root().clone());
         let mut authority =
             ControlCatalogAuthority::new_with_continuation_key(storage, scope, key)?;
         authority.store = bindings.reuse_read_cache(&root, authority.store);

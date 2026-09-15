@@ -412,7 +412,7 @@ fn validate_declaration_scope(
 ) -> Result<()> {
     if declaration
         .workspace_id()
-        .is_some_and(|workspace_id| workspace_id != expected_scope.workspace_id())
+        .is_some_and(|workspace_id| Some(workspace_id) != expected_scope.workspace_id())
     {
         return Err(validation_failed(
             "path governance metadata workspace_id must match state scope",

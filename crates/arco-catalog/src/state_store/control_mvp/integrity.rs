@@ -1,10 +1,14 @@
 //! Canonical authority-format-7 integrity commitments. No storage I/O lives here.
+use arco_core::AuthorityRoot;
+
+use crate::StateScope;
+
 #[cfg(feature = "test-utils")]
 use super::record_integrity_work;
 use super::{
     BTreeSet, CONTROL_MVP_FORMAT_VERSION, ControlMvpCheckpoint, ControlMvpManifest,
-    ControlMvpScopeDoc, ControlMvpStateRef, ControlMvpTxObject, Deserialize, IMPLEMENTATION,
-    MAX_SEGMENT_BYTES, MAX_SEGMENT_INDEX_BYTES, MAX_TRANSACTION_JSON_BYTES, ReplayState, Result,
+    ControlMvpStateRef, ControlMvpTxObject, Deserialize, IMPLEMENTATION, MAX_SEGMENT_BYTES,
+    MAX_SEGMENT_INDEX_BYTES, MAX_TRANSACTION_JSON_BYTES, ReplayState, Result,
     SEGMENT_FORMAT_VERSION, Serialize, invariant_violation, segment_serialization_error,
     sha256_hex, state_reference_key_bounds, valid_raw_digest,
 };
@@ -68,16 +72,34 @@ pub(super) struct CheckpointValidation {
 struct Canonical(Vec<u8>);
 
 impl Canonical {
-    fn new(tag: &[u8], scope: &ControlMvpScopeDoc) -> Self {
+    fn new(tag: &[u8], scope: &StateScope) -> Result<Self> {
         let mut this = Self(Vec::new());
         this.bytes(tag);
         this.u32(1);
         this.bytes(IMPLEMENTATION.as_bytes());
         this.u32(CONTROL_MVP_FORMAT_VERSION);
         this.bytes(scope.tenant_id.as_bytes());
-        this.bytes(scope.workspace_id.as_bytes());
+        match scope.root() {
+            AuthorityRoot::Workspace { workspace_id } => {
+                // Workspace digests are unchanged from legacy v1 `StateScope`.
+                // Avoid adding `this.bytes(b"root=workspace")`.
+                this.bytes(workspace_id.as_bytes());
+            }
+            AuthorityRoot::Metastore { metastore_id } => {
+                this.bytes(b"root=metastore");
+                this.bytes(metastore_id.as_bytes());
+            }
+            AuthorityRoot::TenantIdentity => {
+                this.bytes(b"root=identity");
+            }
+            _ => {
+                return Err(invariant_violation(
+                    "unsupported authority root for canonical digest",
+                ));
+            }
+        }
         this.bytes(scope.domain.as_bytes());
-        this
+        Ok(this)
     }
     fn u8(&mut self, value: u8) {
         self.0.push(value);
@@ -118,28 +140,28 @@ impl Canonical {
     }
 }
 
-pub(super) fn genesis(scope: &ControlMvpScopeDoc) -> HistoryAnchor {
-    HistoryAnchor {
+pub(super) fn genesis(scope: &StateScope) -> Result<HistoryAnchor> {
+    Ok(HistoryAnchor {
         sequence: 0,
-        root: Canonical::new(b"arco/control-v1/history-genesis", scope).finish(),
-    }
+        root: Canonical::new(b"arco/control-v1/history-genesis", scope)?.finish(),
+    })
 }
 
 pub(super) fn history_step(
-    scope: &ControlMvpScopeDoc,
+    scope: &StateScope,
     preceding: &str,
     sequence: u64,
     mutation: &str,
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/history-step", scope);
+    let mut out = Canonical::new(b"arco/control-v1/history-step", scope)?;
     out.digest(preceding)?;
     out.u64(sequence);
     out.digest(mutation)?;
     Ok(out.finish())
 }
 
-pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> String {
-    let mut out = Canonical::new(b"arco/control-v1/mutation", &tx.scope);
+pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
+    let mut out = Canonical::new(b"arco/control-v1/mutation", &tx.scope)?;
     out.optional_bytes(tx.request_id.as_deref().map(str::as_bytes));
     let mut writes = tx.writes.iter().collect::<Vec<_>>();
     writes.sort_by(|a, b| a.key.cmp(&b.key));
@@ -162,19 +184,19 @@ pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> String {
         out.bytes(trim.record_id.as_bytes());
         out.u64(trim.origin_sequence);
     }
-    out.finish()
+    Ok(out.finish())
 }
 
 impl HistoryLink {
     pub(super) fn new(tx: &ControlMvpTxObject, preceding: &str) -> Result<Self> {
-        let mutation_sha256 = mutation_digest(tx);
+        let mutation_sha256 = mutation_digest(tx)?;
         Ok(Self {
             preceding_root: preceding.to_string(),
             resulting_root: history_step(&tx.scope, preceding, tx.sequence, &mutation_sha256)?,
             mutation_sha256,
         })
     }
-    pub(super) fn validate(&self, scope: &ControlMvpScopeDoc, sequence: u64) -> Result<()> {
+    pub(super) fn validate(&self, scope: &StateScope, sequence: u64) -> Result<()> {
         if history_step(scope, &self.preceding_root, sequence, &self.mutation_sha256)?
             != self.resulting_root
         {
@@ -277,7 +299,7 @@ impl ControlMvpManifest {
             .map_or(0, |state| state.logical_sequence);
         if self.history_anchor.sequence != base_sequence
             || !valid_raw_digest(&self.history_anchor.root)
-            || (base_sequence == 0 && self.history_anchor != genesis(&self.scope))
+            || (base_sequence == 0 && self.history_anchor != genesis(&self.scope)?)
         {
             return Err(invariant_violation(
                 "history anchor does not match replay base",
@@ -331,13 +353,13 @@ impl ControlMvpManifest {
 }
 
 fn physical_digest(
-    scope: &ControlMvpScopeDoc,
+    scope: &StateScope,
     states: &[ControlMvpStateRef],
     anchors: &[ControlMvpStateRef],
     transactions: &[super::ControlMvpTxRef],
     suffix: &[super::ControlMvpTxRef],
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope);
+    let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope)?;
     encode_states(&mut out, 1, states)?;
     encode_states(&mut out, 2, anchors)?;
     out.u8(3);
@@ -368,7 +390,7 @@ impl RenderSource {
             || self.history_anchor.sequence
                 != self.base_states.first().map_or(0, |s| s.logical_sequence)
             || (self.history_anchor.sequence == 0
-                && self.history_anchor != genesis(&candidate.scope))
+                && self.history_anchor != genesis(&candidate.scope)?)
             || (!candidate.tx_refs.is_empty() && !self.anchor_states.is_empty())
             || self
                 .anchor_states
@@ -434,10 +456,10 @@ impl RenderSource {
 }
 
 pub(super) fn checkpoint_physical_digest(
-    scope: &ControlMvpScopeDoc,
+    scope: &StateScope,
     states: &[ControlMvpStateRef],
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/checkpoint-layout", scope);
+    let mut out = Canonical::new(b"arco/control-v1/checkpoint-layout", scope)?;
     encode_states(&mut out, 4, states)?;
     Ok(out.finish())
 }

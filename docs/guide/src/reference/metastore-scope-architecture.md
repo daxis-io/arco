@@ -134,11 +134,11 @@ tenant={tenant}/identity/
 ```
 
 Identity storage and its event envelope are not enabled by the prefix type.
-The versioned scope migration must precede identity use of `control/v1`.
-Metastore-scoped storage can already construct a prefix while retaining a
-separate request workspace; it is not yet a supported `control/v1` root.
-The current kernel accepts only workspace physical roots. The first ADR-043
-pilot uses `metastore_id = workspace_id` and preserves that workspace layout.
+The persisted authority scope is now versioned and carries root kind, but the
+`control/v1` kernel still accepts only workspace physical roots. Metastore-scoped
+storage can already construct a prefix while retaining a separate request
+workspace; it is not yet a supported `control/v1` root. The first ADR-043 pilot
+uses `metastore_id = workspace_id` and preserves that workspace layout.
 
 The target catalog authority should be able to use paths shaped as:
 
@@ -322,12 +322,17 @@ cover token freshness, global disable, tombstones and retention-qualified purge,
 ownership recovery, explicit bootstrap principals, credential vending, and
 legacy-principal deduplication. These remain implementation requirements.
 
-The dedicated **Versioned AuthorityScope in StateScope and control/v1** follow-up
-must migrate the persisted authority identity before enabling non-workspace
-state roots. Equal textual IDs in identity, metastore, and workspace families
-must remain distinct throughout tokens, continuations, restore references, and
-cache identity. Existing workspace records keep their explicit compatibility
+The **Versioned AuthorityScope in StateScope and control/v1** follow-up's
+representation work now carries root kind and identifiers through the persisted
+authority identity, and equal textual IDs in identity, metastore, and workspace
+families remain distinct throughout tokens, continuations, restore references,
+and cache identity. Existing workspace records keep their explicit compatibility
 meaning; no tenant or metastore ID is substituted into a workspace field.
+Once a version-2 scope envelope is published, rollback requires a version-2-
+capable reader or restoration from retained pre-version-2 artifacts; older
+binaries must not read or write that root.
+Enabling non-workspace `control/v1` roots still requires the remaining identity
+and metastore cross-root contracts.
 
 ## Open Questions
 

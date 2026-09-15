@@ -4,11 +4,10 @@
 use super::{
     AuthorityWritePrecondition, CONTROL_MVP_FORMAT_VERSION, CatalogError,
     ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpManifest,
-    ControlMvpPointer, ControlMvpScopeDoc, HistoryAnchor, IMPLEMENTATION,
-    LayoutMaintenanceIntentV1, LayoutMaintenanceReason, MAX_CONTROL_JSON_BYTES,
-    MAX_HEAD_JSON_BYTES, Result, RewriteEquivalence, WriteResult, ambiguous_authority_outcome,
-    encode_envelope_limited, encode_json_limited, invariant_violation, put_immutable_matching,
-    sha256_hex,
+    ControlMvpPointer, HistoryAnchor, IMPLEMENTATION, LayoutMaintenanceIntentV1,
+    LayoutMaintenanceReason, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES, Result,
+    RewriteEquivalence, WriteResult, ambiguous_authority_outcome, encode_envelope_limited,
+    encode_json_limited, invariant_violation, put_immutable_matching, sha256_hex,
 };
 
 impl ControlMvpMaintenanceWorker {
@@ -91,7 +90,7 @@ impl ControlMvpMaintenanceWorker {
                 reclamation_generation: pointer.reclamation_generation,
                 format_version: CONTROL_MVP_FORMAT_VERSION,
                 implementation: IMPLEMENTATION.to_string(),
-                scope: ControlMvpScopeDoc::from(&self.store.scope),
+                scope: self.store.scope.clone(),
                 manifest_id: candidate_manifest_id.clone(),
                 logical_sequence: source_manifest.logical_sequence,
                 base_manifest_id: Some(source_manifest.manifest_id.clone()),
@@ -115,7 +114,7 @@ impl ControlMvpMaintenanceWorker {
                 reclamation_generation: pointer.reclamation_generation,
                 format_version: CONTROL_MVP_FORMAT_VERSION,
                 implementation: IMPLEMENTATION.to_string(),
-                scope: ControlMvpScopeDoc::from(&self.store.scope),
+                scope: self.store.scope.clone(),
                 manifest_id: candidate_manifest_id.clone(),
                 logical_sequence: source_manifest.logical_sequence,
                 manifest_checksum_sha256: sha256_hex(&manifest_bytes),

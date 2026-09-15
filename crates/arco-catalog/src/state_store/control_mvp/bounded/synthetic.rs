@@ -1,8 +1,8 @@
 //! Explicit test-only streaming authority-8 fixture construction.
 
 use super::{
-    ActiveRecord8, ArtifactRef, CatalogError, ControlMvpScopeDoc, ControlMvpSegmentRow,
-    ControlMvpStateStore, Manifest8, ManifestKind8, Result, RootBinding, directory, encode_json,
+    ActiveRecord8, ArtifactRef, CatalogError, ControlMvpSegmentRow, ControlMvpStateStore,
+    Manifest8, ManifestKind8, Result, RootBinding, StateScope, directory, encode_json,
     encode_json_limited, invariant_violation, logical_v2, persist_role_rows, physical,
     publish_manifest_candidate, put_immutable_matching, sha256_hex, valid_raw_digest,
     validate_raw_checksum, write_projection_source,
@@ -32,7 +32,7 @@ pub struct SyntheticKvEntry {
 struct SyntheticGenesisWitness8 {
     record_type: String,
     encoding_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     fixture_id: String,
     logical_sequence: u64,
     logical_history: String,
@@ -326,7 +326,7 @@ impl ControlMvpStateStore {
         let witness = SyntheticGenesisWitness8 {
             record_type: SYNTHETIC_WITNESS_RECORD_TYPE.to_owned(),
             encoding_version: SYNTHETIC_WITNESS_ENCODING,
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             fixture_id: fixture_id.to_owned(),
             logical_sequence,
             logical_history: logical_history.clone(),
@@ -363,7 +363,7 @@ impl ControlMvpStateStore {
         let manifest = Manifest8 {
             format_version: super::AUTHORITY_FORMAT,
             implementation: super::super::IMPLEMENTATION.to_owned(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             manifest_id: manifest_id.clone(),
             logical_sequence,
             logical_history,
@@ -435,7 +435,7 @@ pub(super) async fn validate_manifest_witness(
     };
     if witness.record_type != SYNTHETIC_WITNESS_RECORD_TYPE
         || witness.encoding_version != SYNTHETIC_WITNESS_ENCODING
-        || !witness.scope.matches_scope(&store.scope)
+        || witness.scope != store.scope
         || witness.fixture_id != fixture_id
         || witness.logical_sequence != manifest.logical_sequence
         || witness.logical_history != manifest.logical_history
@@ -476,8 +476,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ArtifactRef, ControlMvpScopeDoc, ControlMvpStateStore, Manifest8, ManifestKind8,
-        SYNTHETIC_ROWS_PER_PART, SYNTHETIC_WITNESS_ENCODING, SYNTHETIC_WITNESS_RECORD_TYPE,
+        ArtifactRef, ControlMvpStateStore, Manifest8, ManifestKind8, SYNTHETIC_ROWS_PER_PART,
+        SYNTHETIC_WITNESS_ENCODING, SYNTHETIC_WITNESS_RECORD_TYPE, StateScope,
         SyntheticGenesisWitness8, SyntheticKvEntry, directory, encode_json, put_immutable_matching,
         root_binding, sha256_hex, validate_manifest_witness,
     };
@@ -501,7 +501,7 @@ mod tests {
         Manifest8 {
             format_version: super::super::AUTHORITY_FORMAT,
             implementation: super::super::super::IMPLEMENTATION.to_owned(),
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             manifest_id: format!("synthetic-{fixture_id}"),
             logical_sequence: 7,
             logical_history: "ab".repeat(32),
@@ -642,7 +642,7 @@ mod tests {
         let mut witness = SyntheticGenesisWitness8 {
             record_type: SYNTHETIC_WITNESS_RECORD_TYPE.to_owned(),
             encoding_version: SYNTHETIC_WITNESS_ENCODING,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             fixture_id: fixture_id.to_owned(),
             logical_sequence: 7,
             logical_history: "ab".repeat(32),
@@ -701,7 +701,7 @@ mod tests {
         let witness = SyntheticGenesisWitness8 {
             record_type: SYNTHETIC_WITNESS_RECORD_TYPE.to_owned(),
             encoding_version: SYNTHETIC_WITNESS_ENCODING,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             fixture_id: fixture_id.to_owned(),
             logical_sequence: 7,
             logical_history: "ab".repeat(32),

@@ -4,21 +4,21 @@ use super::{
     Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
     CONTROL_MVP_FORMAT_VERSION, CatalogError, ChronoDuration, ControlMvpBlock,
     ControlMvpGcCandidate, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
-    ControlMvpMaintenanceWorker, ControlMvpManifest, ControlMvpPointer, ControlMvpScopeDoc,
-    ControlMvpSegmentIndex, ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow,
-    ControlMvpStateRef, ControlMvpStateStore, DateTime, Deserialize, Digest, DistributedLock,
-    HistoryAnchor, IMPLEMENTATION, KeyRange, MAX_BLOCK_BYTES, MAX_CONTROL_JSON_BYTES,
-    MAX_HEAD_JSON_BYTES, MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS,
-    RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
-    RenderedControlMvpStateSegment, ReplayState, Result, RetainedAuthorityRoots,
-    RetentionMutationEpoch, RewriteEquivalence, SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV,
-    SEGMENT_RECORD_OUTBOX, ScopedStorage, Serialize, Sha256, StateScope, Ulid, Utc, WriteResult,
-    ambiguous_authority_outcome, block_key_bounds, cost, decode_json, decode_json_limited,
-    decode_segment_rows, encode_envelope_limited, encode_json, encode_json_limited, encode_segment,
-    half_segment_limits, hash_bytes, hash_tag, hash_u64, integrity, invariant_violation,
-    layout_maintenance_intent_for_manifest, lazy, precondition_failed, put_immutable_matching,
-    segment_row_key_bounds_hex, sha256_hex, sort_segment_rows, state_segment_reference,
-    valid_raw_digest, validate_raw_checksum, validation_failed,
+    ControlMvpMaintenanceWorker, ControlMvpManifest, ControlMvpPointer, ControlMvpSegmentIndex,
+    ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow, ControlMvpStateRef,
+    ControlMvpStateStore, DateTime, Deserialize, Digest, DistributedLock, HistoryAnchor,
+    IMPLEMENTATION, KeyRange, MAX_BLOCK_BYTES, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES,
+    MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS, RETENTION_GC_LOCK_MAX_RETRIES,
+    RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RenderedControlMvpStateSegment, ReplayState,
+    Result, RetainedAuthorityRoots, RetentionMutationEpoch, RewriteEquivalence,
+    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, ScopedStorage, Serialize,
+    Sha256, StateScope, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds,
+    cost, decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited,
+    encode_json, encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag,
+    hash_u64, integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
+    precondition_failed, put_immutable_matching, segment_row_key_bounds_hex, sha256_hex,
+    sort_segment_rows, state_segment_reference, valid_raw_digest, validate_raw_checksum,
+    validation_failed,
 };
 
 const MAINTENANCE_VERSION: u32 = 1;
@@ -614,7 +614,7 @@ struct Descriptor {
     segment_version: u32,
     directory_version: u32,
     encoder_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     binding: DurableAuthorityBinding,
     source_id: String,
     source_digest: String,
@@ -641,7 +641,7 @@ impl Descriptor {
             || self.segment_version != SEGMENT_FORMAT_VERSION
             || self.directory_version != SEGMENT_FORMAT_VERSION
             || self.encoder_version != 1
-            || !self.scope.matches_scope(scope)
+            || &self.scope != scope
             || self.binding != binding
         {
             return Err(validation_failed(
@@ -1390,7 +1390,7 @@ impl DurableMaintenanceWorker {
                 segment_version: SEGMENT_FORMAT_VERSION,
                 directory_version: SEGMENT_FORMAT_VERSION,
                 encoder_version: 1,
-                scope: (&store.scope).into(),
+                scope: store.scope.clone(),
                 binding: self.binding,
                 source_id: source.manifest_id.clone(),
                 source_digest: pointer.manifest_checksum_sha256,
@@ -2258,7 +2258,7 @@ impl DurableMaintenanceWorker {
             reclamation_generation: pointer.reclamation_generation,
             format_version: CONTROL_MVP_FORMAT_VERSION,
             implementation: IMPLEMENTATION.into(),
-            scope: (&store.scope).into(),
+            scope: store.scope.clone(),
             manifest_id: candidate_id.clone(),
             logical_sequence: current.logical_sequence,
             manifest_checksum_sha256: candidate_digest.clone(),

@@ -605,7 +605,7 @@ impl WorkspaceRestoreJournal {
                 && (evidence.validate().is_err()
                     || evidence.participant_attempt() != participant.participant_attempt
                     || evidence.scope().tenant_id() != self.scope.tenant_id()
-                    || evidence.scope().workspace_id() != self.scope.workspace_id()
+                    || evidence.scope().workspace_id() != Some(self.scope.workspace_id())
                     || evidence.scope().domain() != participant.domain)
             {
                 return Err(validation("restore journal participant evidence mismatch"));
@@ -726,7 +726,7 @@ impl WorkspaceRestoreReadManifest {
         for participant in &self.participants {
             participant.evidence.validate()?;
             if participant.evidence.scope().tenant_id() != self.scope.tenant_id()
-                || participant.evidence.scope().workspace_id() != self.scope.workspace_id()
+                || participant.evidence.scope().workspace_id() != Some(self.scope.workspace_id())
                 || participant.evidence.scope().domain() != participant.domain
             {
                 return Err(validation(

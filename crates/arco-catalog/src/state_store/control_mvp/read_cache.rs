@@ -3,14 +3,14 @@
 #![allow(clippy::significant_drop_tightening)]
 use super::cost;
 use super::{
-    Bytes, CONTROL_MVP_FORMAT_VERSION, CatalogError, ControlMvpBlock, ControlMvpScopeDoc,
-    ControlMvpSegmentIndex, ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow,
-    ControlMvpStateStore, ControlMvpTxObject, ControlMvpTxRef, MAX_SEGMENT_BYTES,
-    MAX_SEGMENT_INDEX_BYTES, MAX_SEGMENT_ROWS, MAX_TRANSACTION_JSON_BYTES, Result,
-    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, SEGMENT_RECORD_OUTBOX_TRIM,
-    Serialize, StateScope, StateStoreBindingIdentity, decode_segment_rows, fmt, integrity,
-    invariant_violation, segment_serialization_error, valid_raw_digest,
-    validate_segment_index_identity, validation_failed,
+    Bytes, CONTROL_MVP_FORMAT_VERSION, CatalogError, ControlMvpBlock, ControlMvpSegmentIndex,
+    ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow, ControlMvpStateStore,
+    ControlMvpTxObject, ControlMvpTxRef, MAX_SEGMENT_BYTES, MAX_SEGMENT_INDEX_BYTES,
+    MAX_SEGMENT_ROWS, MAX_TRANSACTION_JSON_BYTES, Result, SEGMENT_FORMAT_VERSION,
+    SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, SEGMENT_RECORD_OUTBOX_TRIM, Serialize, StateScope,
+    StateStoreBindingIdentity, decode_segment_rows, fmt, integrity, invariant_violation,
+    segment_serialization_error, valid_raw_digest, validate_segment_index_identity,
+    validation_failed,
 };
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared, WeakShared};
@@ -237,8 +237,13 @@ fn string(s: &String) -> usize {
 fn optional(s: Option<&String>) -> usize {
     s.map_or(0, string)
 }
-fn scope_charge(s: &ControlMvpScopeDoc) -> usize {
-    string(&s.tenant_id) + string(&s.workspace_id) + string(&s.domain)
+fn scope_root_id_len(s: &StateScope) -> usize {
+    s.workspace_id()
+        .or_else(|| s.metastore_id())
+        .map_or(0, str::len)
+}
+fn scope_charge(s: &StateScope) -> usize {
+    string(&s.tenant_id) + heap(scope_root_id_len(s)) + string(&s.domain)
 }
 fn reference_charge(r: &ControlMvpSegmentRef) -> usize {
     string(&r.segment_id) + string(&r.checksum_sha256) + string(&r.index_checksum_sha256)
@@ -427,7 +432,7 @@ impl ControlMvpReadCache {
         config: ControlMvpReadCacheConfig,
     ) -> Option<Self> {
         let identity_bytes = 2 * heap(store.scope.tenant_id().len())
-            + 2 * heap(store.scope.workspace_id().len())
+            + 2 * heap(scope_root_id_len(&store.scope))
             + heap(store.scope.domain().len());
         let administration = ADMIN.saturating_add(identity_bytes);
         if config.metadata_bytes < administration || config.decoded_bytes == 0 {
@@ -876,7 +881,7 @@ impl ControlMvpStateStore {
         // copies until completion. Charge those captures as well as the final key.
         let captures = 8_usize.saturating_mul(
             heap(self.scope.tenant_id().len())
-                + heap(self.scope.workspace_id().len())
+                + heap(scope_root_id_len(&self.scope))
                 + heap(self.scope.domain().len()),
         );
         let reservation = bound
@@ -958,7 +963,7 @@ impl ControlMvpStateStore {
         }
         reference
             .history
-            .validate(&ControlMvpScopeDoc::from(&self.scope), reference.sequence)?;
+            .validate(&self.scope, reference.sequence)?;
         let path = self.paths.tx_object(&reference.tx_id);
         let Some(version) = self.cache_version(cache, &path, reference.size_bytes).await else {
             return self.load_tx_metadata_direct(reference).await;

@@ -7,14 +7,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arco_core::ScopedStorage;
 use arco_core::storage::StorageBackend;
+use arco_core::{AuthorityRoot, ScopedStorage};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CatalogError, Result};
@@ -109,7 +110,7 @@ fn validate_metadata_timestamp(updated_at_ms: i64) -> Result<()> {
     Ok(())
 }
 
-/// Opaque retained authority token for a future state-store scope.
+/// Opaque retained authority token for a state-store authority scope.
 ///
 /// External crates cannot mint authority tokens directly.
 ///
@@ -896,7 +897,7 @@ impl CheckpointToken {
     }
 }
 
-/// Options for opening a future state-store transaction.
+/// Options for opening a state-store transaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TxnOptions {
     scope: Option<StateScope>,
@@ -967,7 +968,7 @@ impl TxnOptions {
     }
 }
 
-/// Options for creating a future retained authority checkpoint.
+/// Options for creating a retained authority checkpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckpointOptions {
     scope: Option<StateScope>,
@@ -1019,7 +1020,7 @@ impl CheckpointOptions {
     }
 }
 
-/// Value plus generation evidence observed from a future state-store backend.
+/// Value plus generation evidence observed from a state-store backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionedValue {
     bytes: Bytes,
@@ -1176,11 +1177,15 @@ enum ScanContinuationOrigin {
     },
 }
 
-const SCAN_CONTINUATION_VERSION: u32 = 3;
-const SCAN_CONTINUATION_PREFIX: &str = "v3.";
-const SCAN_CONTINUATION_AAD: &[u8] = b"arco/control-v1/scan-continuation/v3";
+const SCAN_CONTINUATION_VERSION: u32 = 4;
+const SCAN_CONTINUATION_PREFIX: &str = "v4.";
+const SCAN_CONTINUATION_AAD: &[u8] = b"arco/control-v1/scan-continuation/v4";
 const SCAN_CONTINUATION_NONCE_BYTES: usize = 12;
 const MAX_SCAN_CONTINUATION_ENCODED_BYTES: usize = 16 * 1024;
+
+const SCAN_CONTINUATION_V3_VERSION: u32 = 3;
+const SCAN_CONTINUATION_V3_PREFIX: &str = "v3.";
+const SCAN_CONTINUATION_V3_AAD: &[u8] = b"arco/control-v1/scan-continuation/v3";
 
 /// Authenticated-encryption key for protocol continuations.
 ///
@@ -1230,6 +1235,20 @@ impl ScanContinuationKey {
 struct ScanContinuationEnvelope {
     manifest_sha256: String,
     version: u32,
+    scope: StateScope,
+    prefix_hex: String,
+    manifest_id: String,
+    logical_sequence: u64,
+    exclusive_last_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    query_binding_hex: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScanContinuationEnvelopeV3 {
+    manifest_sha256: String,
+    version: u32,
     tenant_id: String,
     workspace_id: String,
     domain: String,
@@ -1247,9 +1266,7 @@ impl ScanContinuation {
         let envelope = ScanContinuationEnvelope {
             manifest_sha256: observed_token.manifest_witness()?.to_string(),
             version: SCAN_CONTINUATION_VERSION,
-            tenant_id: self.scope.tenant_id().to_string(),
-            workspace_id: self.scope.workspace_id().to_string(),
-            domain: self.scope.domain().to_string(),
+            scope: self.scope.clone(),
             prefix_hex: hex::encode(&self.prefix),
             manifest_id: observed_token.authority_manifest_id().to_string(),
             logical_sequence: observed_token.logical_sequence(),
@@ -1286,98 +1303,55 @@ impl ScanContinuation {
 
     pub(crate) fn decode_opaque(value: &str, key: &ScanContinuationKey) -> Result<Self> {
         if value.starts_with("v1.") || value.starts_with("v2.") {
-            return Err(CatalogError::Validation {
-                message: "unsupported opaque scan continuation version".to_string(),
-            });
+            return Err(unsupported_scan_continuation_version());
         }
-        let encoded = value
-            .strip_prefix(SCAN_CONTINUATION_PREFIX)
-            .ok_or_else(|| CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            })?;
-        if encoded.len() > MAX_SCAN_CONTINUATION_ENCODED_BYTES {
-            return Err(CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            });
+
+        // v3 legacy cursors are workspace-rooted only
+        if value.starts_with(SCAN_CONTINUATION_V3_PREFIX) {
+            let plaintext = Self::open_sealed(
+                value,
+                SCAN_CONTINUATION_V3_PREFIX,
+                SCAN_CONTINUATION_V3_AAD,
+                key,
+            )?;
+            let envelope: ScanContinuationEnvelopeV3 =
+                serde_json::from_slice(&plaintext).map_err(|_| invalid_scan_continuation())?;
+            if envelope.version != SCAN_CONTINUATION_V3_VERSION {
+                return Err(unsupported_scan_continuation_version());
+            }
+            let scope = StateScope::new(envelope.tenant_id, envelope.workspace_id, envelope.domain);
+            return Self::from_wire(
+                scope,
+                envelope.manifest_sha256,
+                envelope.prefix_hex,
+                envelope.manifest_id,
+                envelope.logical_sequence,
+                envelope.exclusive_last_key_hex,
+                envelope.query_binding_hex,
+            );
         }
-        let mut sealed = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            })?;
-        if sealed.len() <= SCAN_CONTINUATION_NONCE_BYTES + aead::AES_256_GCM.tag_len() {
-            return Err(CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            });
+
+        // v4 carries an explicit, root-aware StateScope
+        if value.starts_with(SCAN_CONTINUATION_PREFIX) {
+            let plaintext =
+                Self::open_sealed(value, SCAN_CONTINUATION_PREFIX, SCAN_CONTINUATION_AAD, key)?;
+            let envelope: ScanContinuationEnvelope =
+                serde_json::from_slice(&plaintext).map_err(|_| invalid_scan_continuation())?;
+            if envelope.version != SCAN_CONTINUATION_VERSION {
+                return Err(unsupported_scan_continuation_version());
+            }
+            return Self::from_wire(
+                envelope.scope,
+                envelope.manifest_sha256,
+                envelope.prefix_hex,
+                envelope.manifest_id,
+                envelope.logical_sequence,
+                envelope.exclusive_last_key_hex,
+                envelope.query_binding_hex,
+            );
         }
-        let nonce_bytes: [u8; SCAN_CONTINUATION_NONCE_BYTES] = sealed
-            .get(..SCAN_CONTINUATION_NONCE_BYTES)
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or_else(|| CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            })?;
-        let plaintext = key
-            .less_safe_key()?
-            .open_in_place(
-                Nonce::assume_unique_for_key(nonce_bytes),
-                Aad::from(SCAN_CONTINUATION_AAD),
-                sealed
-                    .get_mut(SCAN_CONTINUATION_NONCE_BYTES..)
-                    .ok_or_else(|| CatalogError::Validation {
-                        message: "invalid opaque scan continuation".to_string(),
-                    })?,
-            )
-            .map_err(|_| CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            })?;
-        let envelope: ScanContinuationEnvelope =
-            serde_json::from_slice(plaintext).map_err(|_| CatalogError::Validation {
-                message: "invalid opaque scan continuation".to_string(),
-            })?;
-        if envelope.version != SCAN_CONTINUATION_VERSION {
-            return Err(CatalogError::Validation {
-                message: "unsupported opaque scan continuation version".to_string(),
-            });
-        }
-        if envelope.manifest_sha256.len() != 64
-            || !envelope
-                .manifest_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(CatalogError::Validation {
-                message: "invalid scan continuation manifest witness".to_string(),
-            });
-        }
-        let prefix = hex::decode(envelope.prefix_hex).map_err(|_| CatalogError::Validation {
-            message: "invalid opaque scan continuation prefix".to_string(),
-        })?;
-        let exclusive_last_key =
-            hex::decode(envelope.exclusive_last_key_hex).map_err(|_| CatalogError::Validation {
-                message: "invalid opaque scan continuation boundary".to_string(),
-            })?;
-        let query_binding = envelope
-            .query_binding_hex
-            .map(|binding| {
-                hex::decode(binding).map_err(|_| CatalogError::Validation {
-                    message: "invalid opaque scan continuation".to_string(),
-                })
-            })
-            .transpose()?;
-        let scope = StateScope::new(envelope.tenant_id, envelope.workspace_id, envelope.domain);
-        scope.validate()?;
-        Ok(Self {
-            origin: ScanContinuationOrigin::Authority(StateToken {
-                scope: scope.clone(),
-                logical_sequence: envelope.logical_sequence,
-                authority_manifest_id: envelope.manifest_id,
-                expected_manifest_sha256: Some(envelope.manifest_sha256),
-            }),
-            scope,
-            prefix,
-            exclusive_last_key,
-            query_binding,
-        })
+
+        Err(unsupported_scan_continuation_version())
     }
 
     pub(crate) fn observed_token(&self) -> Result<&StateToken> {
@@ -1403,6 +1377,99 @@ impl ScanContinuation {
                 message: "scan continuation query mismatch".to_string(),
             })
         }
+    }
+
+    fn open_sealed(
+        value: &str,
+        prefix: &str,
+        aad: &[u8],
+        key: &ScanContinuationKey,
+    ) -> Result<Vec<u8>> {
+        let encoded = value
+            .strip_prefix(prefix)
+            .ok_or_else(invalid_scan_continuation)?;
+        if encoded.len() > MAX_SCAN_CONTINUATION_ENCODED_BYTES {
+            return Err(invalid_scan_continuation());
+        }
+        let mut sealed = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| invalid_scan_continuation())?;
+        if sealed.len() <= SCAN_CONTINUATION_NONCE_BYTES + aead::AES_256_GCM.tag_len() {
+            return Err(invalid_scan_continuation());
+        }
+        let nonce_bytes: [u8; SCAN_CONTINUATION_NONCE_BYTES] = sealed
+            .get(..SCAN_CONTINUATION_NONCE_BYTES)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(invalid_scan_continuation)?;
+        let plaintext = key
+            .less_safe_key()?
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(aad),
+                sealed
+                    .get_mut(SCAN_CONTINUATION_NONCE_BYTES..)
+                    .ok_or_else(invalid_scan_continuation)?,
+            )
+            .map_err(|_| invalid_scan_continuation())?;
+
+        Ok(plaintext.to_vec())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_wire(
+        scope: StateScope,
+        manifest_sha256: String,
+        prefix_hex: String,
+        manifest_id: String,
+        logical_sequence: u64,
+        exclusive_last_key_hex: String,
+        query_binding_hex: Option<String>,
+    ) -> Result<Self> {
+        scope.validate()?;
+        if manifest_sha256.len() != 64
+            || !manifest_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(CatalogError::Validation {
+                message: "invalid scan continuation manifest witness".to_string(),
+            });
+        }
+        let prefix = hex::decode(prefix_hex).map_err(|_| CatalogError::Validation {
+            message: "invalid opaque scan continuation prefix".to_string(),
+        })?;
+        let exclusive_last_key =
+            hex::decode(exclusive_last_key_hex).map_err(|_| CatalogError::Validation {
+                message: "invalid opaque scan continuation boundary".to_string(),
+            })?;
+        let query_binding = query_binding_hex
+            .map(|binding| hex::decode(binding).map_err(|_| invalid_scan_continuation()))
+            .transpose()?;
+
+        Ok(Self {
+            origin: ScanContinuationOrigin::Authority(StateToken {
+                scope: scope.clone(),
+                logical_sequence,
+                authority_manifest_id: manifest_id,
+                expected_manifest_sha256: Some(manifest_sha256),
+            }),
+            scope,
+            prefix,
+            exclusive_last_key,
+            query_binding,
+        })
+    }
+}
+
+fn invalid_scan_continuation() -> CatalogError {
+    CatalogError::Validation {
+        message: "invalid opaque scan continuation".to_string(),
+    }
+}
+
+fn unsupported_scan_continuation_version() -> CatalogError {
+    CatalogError::Validation {
+        message: "unsupported opaque scan continuation version".to_string(),
     }
 }
 
@@ -1758,20 +1825,26 @@ impl KvPair {
     }
 }
 
-/// Legacy workspace authority scope addressed by state-store tokens and transactions.
+const STATE_SCOPE_FORMAT_VERSION: u32 = 2;
+
+/// Root-aware authority scope addressed by state-store tokens and transactions.
 ///
-/// This persisted shape cannot represent tenant identity or metastore root kinds.
-/// Non-workspace control stores remain disabled until a versioned scope encoding
-/// carries `AuthorityScope` throughout the token and retained-reference protocols.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// # Persisted encoding
+/// - Version 2 : always carries `scope_version`, `root_kind`, root's identifiers
+///   and `domain`.
+/// - Version 1 (read-only) : legacy workspace-shaped records and an explicit
+///   `scope_version: 1` are treated as v1. They carry only `tenant_id`,
+///   `workspace_id` and `domain`, and always decode as a workspace root.
+/// - Unknown versions or root kinds are rejected before I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateScope {
     tenant_id: String,
-    workspace_id: String,
+    root: AuthorityRoot,
     domain: String,
 }
 
 impl StateScope {
-    /// Creates an authority scope.
+    /// Creates a workspace rooted authority scope.
     #[must_use]
     pub fn new(
         tenant_id: impl Into<String>,
@@ -1780,7 +1853,35 @@ impl StateScope {
     ) -> Self {
         Self {
             tenant_id: tenant_id.into(),
-            workspace_id: workspace_id.into(),
+            root: AuthorityRoot::Workspace {
+                workspace_id: workspace_id.into(),
+            },
+            domain: domain.into(),
+        }
+    }
+
+    /// Creates a metastore rooted authority scope.
+    #[must_use]
+    pub fn metastore(
+        tenant_id: impl Into<String>,
+        metastore_id: impl Into<String>,
+        domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            root: AuthorityRoot::Metastore {
+                metastore_id: metastore_id.into(),
+            },
+            domain: domain.into(),
+        }
+    }
+
+    /// Creates a tenant identity rooted authority scope.
+    #[must_use]
+    pub fn tenant_identity(tenant_id: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self {
+            tenant_id: tenant_id.into(),
+            root: AuthorityRoot::TenantIdentity,
             domain: domain.into(),
         }
     }
@@ -1791,10 +1892,31 @@ impl StateScope {
         &self.tenant_id
     }
 
-    /// Returns the workspace identifier.
+    /// Returns the state-store root kind.
     #[must_use]
-    pub fn workspace_id(&self) -> &str {
-        &self.workspace_id
+    pub fn root(&self) -> &AuthorityRoot {
+        &self.root
+    }
+
+    /// Returns the workspace identifier only for a workspace rooted authority scope.
+    ///
+    /// Callers migrating from the pre-v2 unconditional workspace accessor must
+    /// handle `None` or match on [`Self::root`].
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&str> {
+        match &self.root {
+            AuthorityRoot::Workspace { workspace_id } => Some(workspace_id),
+            _ => None,
+        }
+    }
+
+    /// Returns the metastore identifier only for a metastore rooted authority scope.
+    #[must_use]
+    pub fn metastore_id(&self) -> Option<&str> {
+        match &self.root {
+            AuthorityRoot::Metastore { metastore_id } => Some(metastore_id),
+            _ => None,
+        }
     }
 
     /// Returns the state-store domain name.
@@ -1810,8 +1932,145 @@ impl StateScope {
     /// Returns a validation error for blank values, separators, dot segments, or controls.
     pub fn validate(&self) -> Result<()> {
         validate_scope_component(&self.tenant_id, "tenant_id")?;
-        validate_scope_component(&self.workspace_id, "workspace_id")?;
+        match &self.root {
+            AuthorityRoot::Workspace { workspace_id } => {
+                validate_scope_component(workspace_id, "workspace_id")?;
+            }
+            AuthorityRoot::Metastore { metastore_id } => {
+                validate_scope_component(metastore_id, "metastore_id")?;
+            }
+            AuthorityRoot::TenantIdentity => {}
+            _ => {
+                return Err(CatalogError::Validation {
+                    message: "unsupported authority root scope".to_string(),
+                });
+            }
+        }
         validate_scope_component(&self.domain, "domain")
+    }
+}
+
+impl Serialize for StateScope {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.root {
+            AuthorityRoot::Workspace { workspace_id } => {
+                let mut s = serializer.serialize_struct("StateScope", 5)?;
+                s.serialize_field("scope_version", &STATE_SCOPE_FORMAT_VERSION)?;
+                s.serialize_field("root_kind", "workspace")?;
+                s.serialize_field("tenant_id", &self.tenant_id)?;
+                s.serialize_field("workspace_id", workspace_id)?;
+                s.serialize_field("domain", &self.domain)?;
+                s.end()
+            }
+            AuthorityRoot::Metastore { metastore_id } => {
+                let mut s = serializer.serialize_struct("StateScope", 5)?;
+                s.serialize_field("scope_version", &STATE_SCOPE_FORMAT_VERSION)?;
+                s.serialize_field("root_kind", "metastore")?;
+                s.serialize_field("tenant_id", &self.tenant_id)?;
+                s.serialize_field("metastore_id", metastore_id)?;
+                s.serialize_field("domain", &self.domain)?;
+                s.end()
+            }
+            AuthorityRoot::TenantIdentity => {
+                let mut s = serializer.serialize_struct("StateScope", 4)?;
+                s.serialize_field("scope_version", &STATE_SCOPE_FORMAT_VERSION)?;
+                s.serialize_field("root_kind", "identity")?;
+                s.serialize_field("tenant_id", &self.tenant_id)?;
+                s.serialize_field("domain", &self.domain)?;
+                s.end()
+            }
+            _ => Err(serde::ser::Error::custom(
+                "unsupported authority root scope",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StateScope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            scope_version: Option<u32>,
+            #[serde(default)]
+            root_kind: Option<String>,
+            tenant_id: String,
+            #[serde(default)]
+            workspace_id: Option<String>,
+            #[serde(default)]
+            metastore_id: Option<String>,
+            domain: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let scope = match wire.scope_version {
+            // v1 legacy: workspace shaped only.
+            None | Some(1) => {
+                if wire.root_kind.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "legacy StateScope must not carry root_kind",
+                    ));
+                }
+                Self {
+                    tenant_id: wire.tenant_id,
+                    root: AuthorityRoot::Workspace {
+                        workspace_id: wire.workspace_id.ok_or_else(|| {
+                            serde::de::Error::custom("legacy StateScope requires workspace_id")
+                        })?,
+                    },
+                    domain: wire.domain,
+                }
+            }
+            Some(2) => match wire.root_kind.as_deref() {
+                Some("workspace") => Self {
+                    tenant_id: wire.tenant_id,
+                    root: AuthorityRoot::Workspace {
+                        workspace_id: wire.workspace_id.ok_or_else(|| {
+                            serde::de::Error::custom("workspace scope requires workspace_id")
+                        })?,
+                    },
+                    domain: wire.domain,
+                },
+                Some("metastore") => Self {
+                    tenant_id: wire.tenant_id,
+                    root: AuthorityRoot::Metastore {
+                        metastore_id: wire.metastore_id.ok_or_else(|| {
+                            serde::de::Error::custom("metastore scope requires metastore_id")
+                        })?,
+                    },
+                    domain: wire.domain,
+                },
+                Some("identity") => Self {
+                    tenant_id: wire.tenant_id,
+                    root: AuthorityRoot::TenantIdentity,
+                    domain: wire.domain,
+                },
+                Some(other) => {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported StateScope root-kind: {other}"
+                    )));
+                }
+                None => {
+                    return Err(serde::de::Error::custom(
+                        "StateScope version 2 requires root_kind",
+                    ));
+                }
+            },
+            Some(other) => {
+                return Err(serde::de::Error::custom(format!(
+                    "unsupported StateScope version: {other}"
+                )));
+            }
+        };
+
+        scope.validate().map_err(serde::de::Error::custom)?;
+        Ok(scope)
     }
 }
 
@@ -2819,6 +3078,8 @@ fn unsupported(operation: &str) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{from_value, json, to_value};
+
     use super::*;
 
     fn assert_unsupported<T>(result: Result<T>, expected: &str) {
@@ -2826,6 +3087,265 @@ mod tests {
             Err(CatalogError::UnsupportedOperation { .. }) => {}
             Err(error) => panic!("expected UnsupportedOperation for {expected}, got {error:?}"),
             Ok(_) => panic!("expected UnsupportedOperation for {expected}"),
+        }
+    }
+
+    #[test]
+    fn scope_matches_expected_authority_roots() {
+        assert!(matches!(
+            StateScope::new("acme", "prod", "catalog").root(),
+            AuthorityRoot::Workspace { .. }
+        ));
+        assert!(matches!(
+            StateScope::metastore("acme", "lakehouse", "catalog").root(),
+            AuthorityRoot::Metastore { .. }
+        ));
+        assert!(matches!(
+            StateScope::tenant_identity("acme", "catalog").root(),
+            AuthorityRoot::TenantIdentity
+        ));
+    }
+
+    #[test]
+    fn workspace_scope_v2_serializes_with_explicit_kind() {
+        let scope = StateScope::new("acme", "prod", "catalog");
+        let expected = json!({
+            "scope_version": 2,
+            "root_kind": "workspace",
+            "tenant_id": "acme",
+            "workspace_id": "prod",
+            "domain": "catalog"
+        });
+        let out = to_value(scope).expect("scope serializes");
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn metastore_scope_v2_serializes_with_explicit_kind() {
+        let scope = StateScope::metastore("acme", "lakehouse", "catalog");
+        let expected = json!({
+            "scope_version": 2,
+            "root_kind": "metastore",
+            "tenant_id": "acme",
+            "metastore_id": "lakehouse",
+            "domain": "catalog"
+        });
+        let out = to_value(scope).expect("scope serializes");
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn identity_scope_v2_serializes_with_explicit_kind() {
+        let scope = StateScope::tenant_identity("acme", "catalog");
+        let expected = json!({
+            "scope_version": 2,
+            "root_kind": "identity",
+            "tenant_id": "acme",
+            "domain": "catalog"
+        });
+        let out = to_value(scope).expect("scope serializes");
+
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn legacy_v1_decodes_as_workspace() {
+        let raw = json!({
+            "tenant_id": "acme",
+            "workspace_id": "prod",
+            "domain": "catalog"
+        });
+        let scope = from_value::<StateScope>(raw).expect("v1 scope decodes");
+
+        assert!(
+            matches!(scope.root(), AuthorityRoot::Workspace { .. }),
+            "legacy v1 must decode as a workspace root"
+        );
+    }
+
+    #[test]
+    fn explicit_v1_version_decodes_as_workspace() {
+        let raw = json!({
+            "scope_version": 1,
+            "tenant_id": "acme",
+            "workspace_id": "prod",
+            "domain": "catalog"
+        });
+        let scope = from_value::<StateScope>(raw).expect("explicit v1 decodes");
+        assert!(matches!(scope.root(), AuthorityRoot::Workspace { .. }));
+    }
+
+    #[test]
+    fn v2_scope_round_trips() {
+        let scopes = [
+            StateScope::new("acme", "prod", "catalog"),
+            StateScope::metastore("acme", "lakehouse", "catalog"),
+            StateScope::tenant_identity("acme", "catalog"),
+        ];
+
+        for scope in scopes {
+            let raw = to_value(&scope).expect("scope serializes");
+            let decoded = from_value::<StateScope>(raw).expect("v2 scope decodes");
+
+            assert_eq!(
+                decoded, scope,
+                "v2 round-trip must preserve the authority root"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_textual_ids_remain_isolated_through_serde() {
+        let wks = StateScope::new("acme", "prod", "catalog");
+        let mts = StateScope::metastore("acme", "prod", "catalog");
+        let identity = StateScope::tenant_identity("acme", "catalog");
+
+        let wks_json = to_value(&wks).expect("workspace serializes");
+        let mts_json = to_value(&mts).expect("metastore serializes");
+        let identity_json = to_value(&identity).expect("identity serializes");
+
+        assert_ne!(
+            wks_json, mts_json,
+            "workspace and metastore scopes must not encode to the same json"
+        );
+        assert_ne!(
+            wks_json, identity_json,
+            "workspace and identity scopes must not encode to the same json"
+        );
+        assert_ne!(
+            mts_json, identity_json,
+            "metastore and identity scopes must not encode to the same json"
+        );
+
+        let wks_decoded = from_value::<StateScope>(wks_json).expect("workspace decodes");
+        let mts_decoded = from_value::<StateScope>(mts_json).expect("metastore decodes");
+        let identity_decoded = from_value::<StateScope>(identity_json).expect("identity decodes");
+
+        assert_ne!(
+            wks_decoded, mts_decoded,
+            "equal textual ids must not alias across serialize/deserialize"
+        );
+        assert_ne!(
+            wks_decoded, identity_decoded,
+            "equal textual ids must not alias across serialize/deserialize"
+        );
+        assert_ne!(
+            mts_decoded, identity_decoded,
+            "equal textual ids must not alias across serialize/deserialize"
+        );
+
+        assert_eq!(wks_decoded, wks);
+        assert_eq!(mts_decoded, mts);
+        assert_eq!(identity_decoded, identity);
+    }
+
+    #[test]
+    fn equal_textual_ids_do_not_share_tokens() {
+        let workspace = StateScope::new("acme", "lakehouse", "catalog");
+        let metastore = StateScope::metastore("acme", "lakehouse", "catalog");
+
+        let workspace_token = StateToken::for_test(workspace.clone(), 1, "manifest-1");
+        let metastore_token = StateToken::for_test(metastore.clone(), 1, "manifest-1");
+        assert_ne!(
+            workspace_token, metastore_token,
+            "equal textual ids must not share a state token"
+        );
+
+        let workspace_checkpoint = CheckpointToken {
+            expected_checkpoint_sha256: None,
+            scope: workspace,
+            checkpoint_id: "checkpoint-1".to_string(),
+        };
+        let metastore_checkpoint = CheckpointToken {
+            expected_checkpoint_sha256: None,
+            scope: metastore,
+            checkpoint_id: "checkpoint-1".to_string(),
+        };
+        assert_ne!(
+            workspace_checkpoint, metastore_checkpoint,
+            "equal textual ids must not share a checkpoint token"
+        );
+    }
+
+    #[test]
+    fn unsupported_or_malformed_scope_encodings_are_rejected() {
+        let cases: [(&str, serde_json::Value, &str); 7] = [
+            (
+                "unknown version",
+                json!({
+                    "scope_version": 3,
+                    "root_kind": "workspace",
+                    "tenant_id": "acme",
+                    "workspace_id": "prod",
+                    "domain": "catalog"
+                }),
+                "unsupported StateScope version",
+            ),
+            (
+                "v2 missing root_kind",
+                json!({
+                    "scope_version": 2,
+                    "tenant_id": "acme",
+                    "domain": "catalog"
+                }),
+                "requires root_kind",
+            ),
+            (
+                "v2 unknown root_kind",
+                json!({
+                    "scope_version": 2,
+                    "root_kind": "table",
+                    "tenant_id": "acme",
+                    "domain": "catalog"
+                }),
+                "root-kind: table",
+            ),
+            (
+                "v2 metastore missing metastore_id",
+                json!({
+                    "scope_version": 2,
+                    "root_kind": "metastore",
+                    "tenant_id": "acme",
+                    "domain": "catalog"
+                }),
+                "requires metastore_id",
+            ),
+            (
+                "legacy missing workspace_id",
+                json!({
+                    "tenant_id": "acme",
+                    "domain": "catalog"
+                }),
+                "requires workspace_id",
+            ),
+            (
+                "legacy unsafe workspace_id",
+                json!({
+                    "tenant_id": "acme",
+                    "workspace_id": "a/b",
+                    "domain": "catalog"
+                }),
+                "nonblank path-safe component",
+            ),
+            (
+                "legacy carrying root_kind",
+                json!({
+                    "tenant_id": "acme",
+                    "root_kind": "workspace",
+                    "workspace_id": "prod",
+                    "domain": "catalog"
+                }),
+                "must not carry root_kind",
+            ),
+        ];
+
+        for (name, raw, expected_fragment) in cases {
+            let error =
+                from_value::<StateScope>(raw).expect_err(&format!("case {name} must be rejected"));
+
+            assert!(error.to_string().contains(expected_fragment), "case {name}");
         }
     }
 
@@ -2852,5 +3372,93 @@ mod tests {
             CurrentStateStore::new().read_checkpoint(token).await,
             "read_checkpoint",
         );
+    }
+
+    #[test]
+    fn v4_scan_continuation_round_trips() {
+        let key = ScanContinuationKey::generate().expect("key");
+        let scope = StateScope::new("acme", "prod", "catalog");
+        let token = StateToken::for_test(scope.clone(), 3, "manifest-3");
+        let continuation = ScanContinuation {
+            scope,
+            prefix: b"catalog/".to_vec(),
+            origin: ScanContinuationOrigin::Authority(token),
+            exclusive_last_key: b"catalog/a".to_vec(),
+            query_binding: None,
+        };
+
+        let encoded = continuation.encode_opaque(&key).expect("encode");
+        assert!(encoded.starts_with("v4."), "new cursors must be v4");
+
+        let decoded = ScanContinuation::decode_opaque(&encoded, &key).expect("decode");
+        assert_eq!(decoded, continuation);
+    }
+
+    #[test]
+    fn v3_scan_continuation_decodes_as_workspace_only() {
+        let key = ScanContinuationKey::generate().expect("key");
+        let envelope = ScanContinuationEnvelopeV3 {
+            manifest_sha256: "0".repeat(64),
+            version: SCAN_CONTINUATION_V3_VERSION,
+            tenant_id: "acme".to_string(),
+            workspace_id: "prod".to_string(),
+            domain: "catalog".to_string(),
+            prefix_hex: hex::encode(b"catalog/"),
+            manifest_id: "manifest-3".to_string(),
+            logical_sequence: 3,
+            exclusive_last_key_hex: hex::encode(b"catalog/a"),
+            query_binding_hex: None,
+        };
+        let mut plaintext = serde_json::to_vec(&envelope).expect("v3 envelope json");
+        let nonce = [7_u8; SCAN_CONTINUATION_NONCE_BYTES];
+        key.less_safe_key()
+            .expect("key")
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(SCAN_CONTINUATION_V3_AAD),
+                &mut plaintext,
+            )
+            .expect("seal v3 continuation");
+        let mut sealed = nonce.to_vec();
+        sealed.extend_from_slice(&plaintext);
+        let encoded = format!("v3.{}", URL_SAFE_NO_PAD.encode(sealed));
+
+        let decoded = ScanContinuation::decode_opaque(&encoded, &key).expect("decode v3");
+        let scope = decoded.observed_token().expect("authority token").scope();
+        assert!(matches!(scope.root(), AuthorityRoot::Workspace { .. }));
+        assert_eq!(scope.workspace_id(), Some("prod"));
+    }
+
+    #[test]
+    fn scan_continuation_rejects_cross_root_scope() {
+        let metastore = StateScope::metastore("acme", "lakehouse", "catalog");
+        let workspace = StateScope::new("acme", "lakehouse", "catalog");
+        let token = StateToken::for_test(metastore.clone(), 1, "manifest-1");
+        let continuation = ScanContinuation {
+            scope: metastore,
+            prefix: b"catalog/".to_vec(),
+            origin: ScanContinuationOrigin::Authority(token),
+            exclusive_last_key: b"catalog/a".to_vec(),
+            query_binding: None,
+        };
+
+        let request = ScanRequest::new(b"catalog/")
+            .with_limits(2, 1024, 64)
+            .with_token(continuation);
+        let error = request
+            .validate_for_scope(&workspace)
+            .expect_err("metastore cursor must not validate against a workspace store");
+        assert!(error.to_string().contains("scope mismatch"));
+    }
+
+    #[test]
+    fn decode_opaque_rejects_unknown_and_retired_versions() {
+        let key = ScanContinuationKey::generate().expect("key");
+        for retired in ["v1.abc", "v2.abc"] {
+            assert!(ScanContinuation::decode_opaque(retired, &key).is_err());
+        }
+        for invalid in ["garbage", "v9.abc", ""] {
+            assert!(ScanContinuation::decode_opaque(invalid, &key).is_err());
+        }
     }
 }

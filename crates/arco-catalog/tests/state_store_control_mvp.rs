@@ -77,7 +77,12 @@ fn legacy_state_scope_rejects_metastore_physical_roots() {
         );
         let workspace_storage =
             ScopedStorage::new(backend.clone(), "acme", workspace).expect("workspace storage");
-        assert!(ControlMvpStateStore::new(workspace_storage, state_scope).is_ok());
+        assert!(ControlMvpStateStore::new(workspace_storage.clone(), state_scope).is_ok());
+        let metastore_scope = StateScope::metastore("acme", workspace, "catalog");
+        assert!(
+            ControlMvpStateStore::new(workspace_storage, metastore_scope).is_err(),
+            "metastore StateScope must not alias a workspace physical root"
+        );
     }
 }
 
@@ -1565,6 +1570,17 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
         current.transaction_sha256(),
         "the migration must preserve every field version 1 did carry"
     );
+    assert!(
+        matches!(
+            migrated.source().scope().root(),
+            arco_core::AuthorityRoot::Workspace { .. }
+        ),
+        "the v1 fixture scope must decode as a workspace root"
+    );
+    assert!(matches!(
+        current.source().scope().root(),
+        arco_core::AuthorityRoot::Workspace { .. }
+    ));
 
     // REJECTED: a version 2 record missing the field it is required to carry,
     // and a version 1 record carrying the field it never wrote. Neither may be

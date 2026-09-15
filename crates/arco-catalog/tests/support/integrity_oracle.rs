@@ -376,7 +376,13 @@ fn assert_transaction_owner(tx: &serde_json::Value, owner: &serde_json::Value) {
     assert_eq!(tx["implementation"], "arco-state-control-mvp");
     assert_eq!(
         tx["scope"],
-        serde_json::json!({"tenant_id":"tenant", "workspace_id":"workspace", "domain":"catalog"})
+        serde_json::json!({
+            "scope_version": 2,
+            "root_kind": "workspace",
+            "tenant_id": "tenant",
+            "workspace_id": "workspace",
+            "domain": "catalog"
+        })
     );
     assert_eq!(tx["tx_id"], owner["tx_id"]);
     assert_eq!(tx["sequence"], owner["sequence"]);
@@ -464,7 +470,13 @@ fn decode_physical_rows(
     assert_eq!(index["implementation"], "arco-state-control-mvp");
     assert_eq!(
         index["scope"],
-        serde_json::json!({"tenant_id":"tenant", "workspace_id":"workspace", "domain":"catalog"})
+        serde_json::json!({
+            "scope_version": 2,
+            "root_kind": "workspace",
+            "tenant_id": "tenant",
+            "workspace_id": "workspace",
+            "domain": "catalog"
+        })
     );
     assert_eq!(
         index["segmentId"],

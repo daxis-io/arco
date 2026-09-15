@@ -1,6 +1,7 @@
 //! Authority-8 logical identity and projection-envelope commitments.
 
 use super::{ControlMvpWriteEntry, Result, StateScope, invariant_violation, valid_raw_digest};
+use arco_core::AuthorityRoot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,7 +54,15 @@ impl Canonical {
 
     fn scope(&mut self, scope: &StateScope) {
         self.bytes(scope.tenant_id().as_bytes());
-        self.bytes(scope.workspace_id().as_bytes());
+        match scope.root() {
+            AuthorityRoot::Workspace { workspace_id } => self.bytes(workspace_id.as_bytes()),
+            AuthorityRoot::Metastore { metastore_id } => {
+                self.bytes(b"root=metastore");
+                self.bytes(metastore_id.as_bytes());
+            }
+            AuthorityRoot::TenantIdentity => self.bytes(b"root=identity"),
+            _ => self.bytes(b"root=unsupported"),
+        }
         self.bytes(scope.domain().as_bytes());
     }
 

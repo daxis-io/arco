@@ -10,8 +10,8 @@
 //! ```
 //!
 //! Tenant identity has a typed root value but cannot be constructed through this
-//! legacy storage API. Its separate mutation API and root-aware state protocol
-//! must be implemented before identity storage is enabled.
+//! legacy storage API. Identity storage stays disabled until its separate
+//! mutation API and cross-root authorization contracts are implemented.
 //!
 //! The key=value path format provides:
 //! - Operational ergonomics (grep-friendly: `tenant=acme` is self-documenting)

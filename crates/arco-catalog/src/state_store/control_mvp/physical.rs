@@ -1,7 +1,7 @@
 //! Physical leaf interpretation for explicitly selected authority-8 roots.
 use super::{
-    ControlMvpBlock, ControlMvpScopeDoc, ControlMvpSegmentLevel, ControlMvpSegmentRef,
-    ControlMvpSegmentRow, ControlMvpStateStore, MAX_CONTROL_JSON_BYTES, Result, SEGMENT_RECORD_KV,
+    ControlMvpBlock, ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow,
+    ControlMvpStateStore, MAX_CONTROL_JSON_BYTES, Result, SEGMENT_RECORD_KV, StateScope,
     block_key_bounds, decode_json, directory, invariant_violation, read_cache,
     validate_raw_checksum,
 };
@@ -19,7 +19,7 @@ pub(super) enum Role {
 #[serde(deny_unknown_fields)]
 pub(super) struct Descriptor {
     pub encoding_version: u32,
-    pub scope: ControlMvpScopeDoc,
+    pub scope: StateScope,
     pub role: Role,
     pub segment: ControlMvpSegmentRef,
     pub segment_version: String,
@@ -46,7 +46,7 @@ impl ControlMvpStateStore {
         )?;
         let descriptor: Descriptor = decode_json(&bytes, "physical descriptor")?;
         if descriptor.encoding_version != 1
-            || !descriptor.scope.matches_scope(&self.scope)
+            || descriptor.scope != self.scope
             || descriptor.role != role
             || descriptor.segment.level != ControlMvpSegmentLevel::L1
             || descriptor.segment_version.is_empty()
@@ -167,7 +167,7 @@ mod tests {
         }
         let descriptor = Descriptor {
             encoding_version: 1,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             role: Role::Kv,
             segment: reference,
             segment_version: storage

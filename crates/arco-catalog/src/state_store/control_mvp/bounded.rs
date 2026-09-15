@@ -1,9 +1,9 @@
 //! Authority-8 bounded directory roots.
 
 use super::{
-    CatalogError, ControlMvpPointer, ControlMvpScopeDoc, ControlMvpSegmentLevel,
-    ControlMvpSegmentRow, ControlMvpStateStore, ControlMvpTxn, ControlMvpWriteEntry, Result,
-    StagedWrite, StateToken, StoredValue, TransactionBase, decode_json, directory, encode_json,
+    CatalogError, ControlMvpPointer, ControlMvpSegmentLevel, ControlMvpSegmentRow,
+    ControlMvpStateStore, ControlMvpTxn, ControlMvpWriteEntry, Result, StagedWrite, StateScope,
+    StateToken, StoredValue, TransactionBase, decode_json, directory, encode_json,
     encode_json_limited, encode_segment, invariant_violation, logical_v2, next_logical_sequence,
     physical, precondition_failed, put_immutable_matching, sha256_hex, valid_raw_digest,
     validate_raw_checksum,
@@ -75,7 +75,7 @@ struct RootBinding {
 struct Manifest8 {
     format_version: u32,
     implementation: String,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     manifest_id: String,
     logical_sequence: u64,
     logical_history: String,
@@ -111,7 +111,7 @@ struct ArtifactRef {
 #[serde(deny_unknown_fields)]
 struct Transaction8 {
     format_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     transaction_id: String,
     logical_sequence: u64,
     operation: logical_v2::Operation,
@@ -135,7 +135,7 @@ struct BoundedWrite8 {
 #[serde(deny_unknown_fields)]
 struct Transition8 {
     format_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     transaction_id: String,
     roles: Vec<RoleTransition8>,
 }
@@ -171,7 +171,7 @@ struct LeafProof8 {
 struct PreparedCandidateV1 {
     record_type: String,
     encoding_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     candidate_id: String,
     kind: ManifestKind8,
     original_head: Option<PreparedHeadV1>,
@@ -207,7 +207,7 @@ struct ActiveRecord8 {
 #[serde(deny_unknown_fields)]
 struct ProjectionSource8 {
     encoding_version: u32,
-    scope: ControlMvpScopeDoc,
+    scope: StateScope,
     logical_sequence: u64,
     logical_commit_id: String,
     kv_root_hex: String,
@@ -228,10 +228,10 @@ impl Manifest8 {
         Ok(root)
     }
 
-    fn validate(&self, scope: &super::StateScope, expected_id: &str) -> Result<()> {
+    fn validate(&self, scope: &StateScope, expected_id: &str) -> Result<()> {
         if self.format_version != AUTHORITY_FORMAT
             || self.implementation != super::IMPLEMENTATION
-            || !self.scope.matches_scope(scope)
+            || &self.scope != scope
             || self.manifest_id != expected_id
             || !super::integrity::valid_immutable_id(&self.manifest_id)
             || self.logical_sequence == 0
@@ -505,7 +505,7 @@ async fn validate_manifest_artifacts(
     let transaction: Transaction8 =
         decode_json(&transaction_bytes, "bounded manifest transaction")?;
     if transaction.format_version != AUTHORITY_FORMAT
-        || !transaction.scope.matches_scope(&store.scope)
+        || transaction.scope != store.scope
         || transaction.logical_sequence != manifest.logical_sequence
         || transaction.logical_history != manifest.logical_history
         || transaction_ref.path != store.paths.tx_object(&transaction.transaction_id)
@@ -524,7 +524,7 @@ async fn validate_manifest_artifacts(
     )?;
     let transition: Transition8 = decode_json(&transition_bytes, "bounded manifest transition")?;
     if transition.format_version != AUTHORITY_FORMAT
-        || !transition.scope.matches_scope(&store.scope)
+        || transition.scope != store.scope
         || transition.transaction_id != transaction.transaction_id
         || transition.roles.len() != 3
         || transition_ref.path
@@ -595,7 +595,7 @@ async fn validate_prepared_candidate(
 ) -> Result<(Manifest8, ControlMvpPointer)> {
     if prepared.record_type != PREPARED_CANDIDATE_RECORD_TYPE
         || prepared.encoding_version != PREPARED_CANDIDATE_ENCODING_VERSION
-        || !prepared.scope.matches_scope(&store.scope)
+        || prepared.scope != store.scope
         || prepared.candidate_id != expected_id
         || !super::integrity::valid_immutable_id(&prepared.candidate_id)
         || !valid_artifact_ref(&prepared.candidate_manifest)
@@ -799,7 +799,7 @@ async fn prepared_candidate(
     Ok(PreparedCandidateV1 {
         record_type: PREPARED_CANDIDATE_RECORD_TYPE.to_owned(),
         encoding_version: PREPARED_CANDIDATE_ENCODING_VERSION,
-        scope: ControlMvpScopeDoc::from(&store.scope),
+        scope: store.scope.clone(),
         candidate_id: manifest.manifest_id.clone(),
         kind: manifest.kind,
         original_head,
@@ -835,7 +835,7 @@ async fn publish_manifest_candidate(
         reclamation_generation: base.reclamation_generation(),
         format_version: AUTHORITY_FORMAT,
         implementation: super::IMPLEMENTATION.to_string(),
-        scope: ControlMvpScopeDoc::from(&store.scope),
+        scope: store.scope.clone(),
         manifest_id: manifest.manifest_id.clone(),
         logical_sequence: manifest.logical_sequence,
         manifest_checksum_sha256: manifest_ref.sha256.clone(),
@@ -994,11 +994,11 @@ async fn verify_candidate_transition(
 ) -> Result<Vec<ControlMvpWriteEntry>> {
     let candidate_sequence = next_logical_sequence(base.logical_sequence(), "bounded verifier")?;
     if transition.format_version != AUTHORITY_FORMAT
-        || !transition.scope.matches_scope(&store.scope)
+        || transition.scope != store.scope
         || transition.transaction_id != transaction.transaction_id
         || transition.roles.len() != 3
         || transaction.format_version != AUTHORITY_FORMAT
-        || !transaction.scope.matches_scope(&store.scope)
+        || transaction.scope != store.scope
         || transaction.logical_sequence != candidate_sequence
         || !valid_raw_digest(&transaction.logical_commit_id)
         || !valid_raw_digest(&transaction.logical_history)
@@ -1473,7 +1473,7 @@ async fn persist_role_rows(
     for block in index.blocks {
         let descriptor = physical::Descriptor {
             encoding_version: 1,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             role,
             segment: reference.clone(),
             segment_version: segment_version.clone(),
@@ -1776,7 +1776,7 @@ async fn write_projection_source(
 ) -> Result<ArtifactRef> {
     let source = ProjectionSource8 {
         encoding_version: 1,
-        scope: ControlMvpScopeDoc::from(&store.scope),
+        scope: store.scope.clone(),
         logical_sequence: sequence,
         logical_commit_id: logical_commit_id.to_owned(),
         kv_root_hex: hex::encode(kv_root.encode()),
@@ -2405,7 +2405,7 @@ async fn load_projection_source(
     validate_raw_checksum(&bytes, Some(digest), "bounded projection source checksum")?;
     let source: ProjectionSource8 = decode_json(&bytes, "bounded projection source")?;
     if source.encoding_version != 1
-        || !source.scope.matches_scope(&store.scope)
+        || source.scope != store.scope
         || source.logical_sequence == 0
         || !valid_raw_digest(&source.logical_commit_id)
         || hex::decode(&source.kv_root_hex).is_err()
@@ -2479,7 +2479,7 @@ impl ControlMvpTxn {
 pub(super) fn validate_outbox_row(
     role: physical::Role,
     row: &ControlMvpSegmentRow,
-    scope: &super::StateScope,
+    scope: &StateScope,
 ) -> Result<()> {
     if row.record_kind != super::SEGMENT_RECORD_OUTBOX
         || row.tombstone
@@ -2838,7 +2838,7 @@ impl ControlMvpStateStore {
         )?;
         let transaction = Transaction8 {
             format_version: AUTHORITY_FORMAT,
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             transaction_id: txn.tx_id.clone(),
             logical_sequence: sequence,
             operation: operation.clone(),
@@ -2902,7 +2902,7 @@ impl ControlMvpStateStore {
         .await?;
         let transition = Transition8 {
             format_version: AUTHORITY_FORMAT,
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             transaction_id: txn.tx_id.clone(),
             roles: vec![
                 role_transition(
@@ -3000,7 +3000,7 @@ impl ControlMvpStateStore {
         let manifest = Manifest8 {
             format_version: AUTHORITY_FORMAT,
             implementation: super::IMPLEMENTATION.to_string(),
-            scope: ControlMvpScopeDoc::from(&self.scope),
+            scope: self.scope.clone(),
             manifest_id: txn.manifest_id.clone(),
             logical_sequence: sequence,
             logical_history,
@@ -3175,9 +3175,9 @@ impl ControlMvpStateStore {
         };
         Ok(serde_json::json!({
             "scope": {
-                "tenantId": transaction.scope.tenant_id,
-                "workspaceId": transaction.scope.workspace_id,
-                "domain": transaction.scope.domain,
+                "tenantId": transaction.scope.tenant_id(),
+                "workspaceId": transaction.scope.workspace_id(),
+                "domain": transaction.scope.domain(),
             },
             "priorHistory": prior_history,
             "nextSeq": transaction.logical_sequence,
@@ -3467,7 +3467,7 @@ mod tests {
             .expect("candidate root");
         let mut transaction = Transaction8 {
             format_version: AUTHORITY_FORMAT,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             transaction_id: "forged-transition".to_string(),
             logical_sequence: sequence,
             operation: logical_v2::Operation {
@@ -3495,7 +3495,7 @@ mod tests {
         .expect("logical ID for forged transition");
         let transition = Transition8 {
             format_version: AUTHORITY_FORMAT,
-            scope: ControlMvpScopeDoc::from(&store.scope),
+            scope: store.scope.clone(),
             transaction_id: transaction.transaction_id.clone(),
             roles: vec![
                 role_transition(

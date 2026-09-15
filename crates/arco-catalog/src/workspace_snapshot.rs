@@ -297,7 +297,7 @@ impl DomainAuthorityReference {
         self.scope.validate()?;
         self.authority.validate()?;
         if self.authority.scope().tenant_id() != self.scope.tenant_id()
-            || self.authority.scope().workspace_id() != self.scope.workspace_id()
+            || self.authority.scope().workspace_id() != Some(self.scope.workspace_id())
             || self.authority.scope().domain() != self.domain
         {
             return Err(validation(

@@ -10,7 +10,7 @@ use super::{
 };
 use crate::error::{CatalogError, Result};
 use crate::state_store::StateScope;
-use arco_core::{ScopedAuthorityStore, ScopedStorage};
+use arco_core::{AuthorityRoot, ScopedAuthorityStore, ScopedStorage};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
@@ -174,26 +174,36 @@ impl ReadBudget {
 impl Directory {
     pub fn new(storage: ScopedStorage, scope: &StateScope) -> Result<Self> {
         scope.validate()?;
-        if storage.tenant_id() != scope.tenant_id()
-            || storage.scope().workspace_id() != Some(scope.workspace_id())
-        {
+        if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
                 "directory storage and state scopes differ",
             ));
         }
         let mut hash = Sha256::new();
         hash.update(b"arco.directory.scope.v1\0");
-        for part in [scope.tenant_id(), scope.workspace_id(), scope.domain()] {
+        let mut parts: Vec<&str> = vec![scope.tenant_id()];
+        match scope.root() {
+            AuthorityRoot::Workspace { workspace_id } => parts.push(workspace_id.as_str()),
+            AuthorityRoot::Metastore { metastore_id } => {
+                parts.push("root=metastore");
+                parts.push(metastore_id.as_str());
+            }
+            AuthorityRoot::TenantIdentity => parts.push("root=identity"),
+            _ => {
+                return Err(validation_failed(
+                    "unsupported authority root for directory scope",
+                ));
+            }
+        }
+        parts.push(scope.domain());
+        for part in &parts {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
         #[cfg(feature = "test-utils")]
         super::record_sha256_work(
             b"arco.directory.scope.v1\0".len()
-                + [scope.tenant_id(), scope.workspace_id(), scope.domain()]
-                    .iter()
-                    .map(|part| 8 + part.len())
-                    .sum::<usize>(),
+                + parts.iter().map(|part| 8 + part.len()).sum::<usize>(),
         );
         let prefix = format!("control/directory/v1/domains/{}", scope.domain());
         ScopedStorage::validate_path(&prefix)?;

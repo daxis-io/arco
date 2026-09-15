@@ -18,7 +18,7 @@ use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionOutboxAckWriter, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
     CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListRequest,
     CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
     ControlCatalogAuthority, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
@@ -26,7 +26,7 @@ use arco_catalog::{
     WriteOptions,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
-use arco_core::{MemoryBackend, ScopedStorage};
+use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -1361,4 +1361,69 @@ async fn bounded_v2_frozen_patch_reexecutes_after_competing_cas_with_same_identi
         token_before_replay,
     );
     assert_eq!(backend.attempts.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn bindings_distinguish_equal_textual_workspace_and_metastore_roots() {
+    let bindings = CatalogAuthorityBindings::new([
+        CatalogAuthorityBinding::control_v1("acme", "lakehouse"),
+        CatalogAuthorityBinding::new(
+            "acme",
+            AuthorityRoot::Metastore {
+                metastore_id: "lakehouse".to_string(),
+            },
+            CatalogAuthorityKind::ControlV1,
+        ),
+    ])
+    .expect("distinct root families");
+
+    assert_eq!(
+        CatalogAuthorityKind::ControlV1,
+        bindings.resolve_root(
+            "acme",
+            &AuthorityRoot::Workspace {
+                workspace_id: "lakehouse".to_string()
+            }
+        )
+    );
+    assert_eq!(
+        CatalogAuthorityKind::ControlV1,
+        bindings.resolve_root(
+            "acme",
+            &AuthorityRoot::Metastore {
+                metastore_id: "lakehouse".to_string()
+            }
+        )
+    );
+    assert_eq!(
+        CatalogAuthorityKind::Legacy,
+        bindings.resolve("acme", "other")
+    );
+}
+
+#[test]
+fn catalog_bindings_reject_non_catalog_roots() {
+    let error = CatalogAuthorityBindings::new([CatalogAuthorityBinding::new(
+        "acme",
+        AuthorityRoot::TenantIdentity,
+        CatalogAuthorityKind::ControlV1,
+    )])
+    .expect_err("identity is not a catalog authority root");
+    assert!(error.to_string().contains("workspace and metastore"));
+}
+
+#[tokio::test]
+async fn control_v1_bound_rejects_a_metastore_scope_without_a_metastore_binding() {
+    let bindings =
+        CatalogAuthorityBindings::new([CatalogAuthorityBinding::control_v1("acme", "lakehouse")])
+            .expect("workspace binding");
+
+    let storage =
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), "acme", "lakehouse").expect("storage");
+    let metastore_scope = StateScope::metastore("acme", "lakehouse", "catalog");
+
+    assert!(
+        CatalogAuthority::control_v1_bound(storage, metastore_scope, &bindings).is_err(),
+        "a workspace binding must not authorize a metastore root"
+    );
 }

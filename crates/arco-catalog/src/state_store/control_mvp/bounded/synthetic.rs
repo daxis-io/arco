@@ -477,9 +477,9 @@ mod tests {
 
     use super::{
         ArtifactRef, ControlMvpStateStore, Manifest8, ManifestKind8, SYNTHETIC_ROWS_PER_PART,
-        SYNTHETIC_WITNESS_ENCODING, SYNTHETIC_WITNESS_RECORD_TYPE, StateScope,
-        SyntheticGenesisWitness8, SyntheticKvEntry, directory, encode_json, put_immutable_matching,
-        root_binding, sha256_hex, validate_manifest_witness,
+        SYNTHETIC_WITNESS_ENCODING, SYNTHETIC_WITNESS_RECORD_TYPE, SyntheticGenesisWitness8,
+        SyntheticKvEntry, directory, encode_json, put_immutable_matching, root_binding, sha256_hex,
+        validate_manifest_witness,
     };
     use crate::state_store::{ArcoStateTxn, ProjectionIntentV2, StateScope, TxnOptions};
 

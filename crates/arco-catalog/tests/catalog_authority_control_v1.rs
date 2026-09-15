@@ -1363,6 +1363,60 @@ async fn bounded_v2_frozen_patch_reexecutes_after_competing_cas_with_same_identi
     assert_eq!(backend.attempts.lock().unwrap().len(), 4);
 }
 
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_v2_recovers_accepted_head_after_lost_response() {
+    let backend = LoseAcceptedCatalogHeadResponseBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let authority = ControlCatalogAuthority::new_synthetic_bounded(
+        storage.clone(),
+        scope(),
+        Arc::new(NoopProjectionNotifierV2),
+    )
+    .expect("bounded authority");
+    authority
+        .create_catalog_v2(
+            "analytics",
+            Some("before"),
+            WriteOptions::with_idempotency("seed"),
+        )
+        .await
+        .expect("seed catalog");
+    backend.arm();
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("after".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("lost-response"),
+        )
+        .await
+        .expect("accepted V2 HEAD must reconcile to committed outcome");
+    let store = ControlMvpStateStore::new_synthetic_bounded(storage, scope()).expect("store");
+    let token = store.current_state_token().await.expect("published token");
+    assert_eq!(token.logical_sequence(), 2);
+    assert_eq!(backend.attempts.lock().unwrap().len(), 2);
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("after".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("lost-response"),
+        )
+        .await
+        .expect("idempotent V2 replay");
+    assert_eq!(
+        store.current_state_token().await.expect("replay token"),
+        token
+    );
+    assert_eq!(backend.attempts.lock().unwrap().len(), 2);
+}
+
 #[test]
 fn bindings_distinguish_equal_textual_workspace_and_metastore_roots() {
     let bindings = CatalogAuthorityBindings::new([

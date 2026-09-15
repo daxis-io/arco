@@ -876,15 +876,24 @@ async fn publish_manifest_candidate(
         .map_or(AuthorityWritePrecondition::DoesNotExist, |version| {
             AuthorityWritePrecondition::MatchesVersion(version.to_string())
         });
-    match store
+    let publication = store
         .storage
         .put(&store.paths.current_pointer(), pointer_bytes, precondition)
-        .await?
-    {
-        WriteResult::Success { .. } => Ok(store
+        .await;
+    match publication {
+        Err(error) => match store.reconcile_candidate_v2(&manifest.manifest_id).await {
+            Ok(CandidateRecoveryV2::Committed(token)) => Ok(token),
+            outcome => Err(CatalogError::AmbiguousAuthorityOutcome {
+                message: format!(
+                    "bounded authority HEAD outcome for candidate {} is ambiguous ({outcome:?}); write error: {error}",
+                    manifest.manifest_id
+                ),
+            }),
+        },
+        Ok(WriteResult::Success { .. }) => Ok(store
             .token(manifest.manifest_id, manifest.logical_sequence)
             .with_manifest_witness(manifest_ref.sha256)),
-        WriteResult::PreconditionFailed { .. } => Err(CatalogError::CasFailed {
+        Ok(WriteResult::PreconditionFailed { .. }) => Err(CatalogError::CasFailed {
             message: "bounded authority HEAD changed before candidate publication".into(),
         }),
     }

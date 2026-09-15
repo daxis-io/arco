@@ -9020,7 +9020,12 @@ mod tests {
         let txn = bounded_fault_txn(&store, "before-write").await;
         let candidate = txn.candidate_manifest_id().to_owned();
         backend.fail_head_before.store(true, Ordering::SeqCst);
-        assert!(txn.commit_v2().await.is_err());
+        let error = txn.commit_v2().await.unwrap_err();
+        assert!(matches!(
+            &error,
+            CatalogError::AmbiguousAuthorityOutcome { .. }
+        ));
+        assert!(error.to_string().contains(&candidate));
         assert!(matches!(
             store.reconcile_candidate_v2(&candidate).await.unwrap(),
             CandidateRecoveryV2::Unresolved

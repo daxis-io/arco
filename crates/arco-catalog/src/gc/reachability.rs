@@ -140,58 +140,7 @@ impl SelectedRetentionPin {
         previous: &PinRevisionEvidence,
         current: &PinRevisionEvidence,
     ) -> Result<()> {
-        if current.revision.pin_id() != previous.revision.pin_id()
-            || current.revision.target() != previous.revision.target()
-            || current.revision.created_at() != previous.revision.created_at()
-        {
-            return Err(validation(
-                "retention pin successor changes immutable pin identity",
-            ));
-        }
-        let predecessor = current
-            .revision
-            .predecessor()
-            .ok_or_else(|| validation("retention pin successor is missing predecessor evidence"))?;
-        if predecessor.revision() != previous.revision.revision()
-            || predecessor.revision_path()
-                != pin_revision_path(previous.revision.pin_id(), previous.revision.revision())?
-            || predecessor.revision_sha256() != previous.raw_sha256
-        {
-            return Err(validation(
-                "retention pin predecessor evidence does not match stored bytes",
-            ));
-        }
-        if current.revision.revised_at() < previous.revision.revised_at()
-            || previous
-                .revision
-                .structural_status_at(current.revision.revised_at())?
-                != RetentionStatus::Active
-        {
-            return Err(validation(
-                "retention pin successor must transition from an active predecessor",
-            ));
-        }
-        match current.revision.released_at() {
-            Some(_) => {
-                if previous.revision.released_at().is_some()
-                    || current.revision.retained_until() != previous.revision.retained_until()
-                {
-                    return Err(validation(
-                        "retention pin release cannot alter retention or follow release",
-                    ));
-                }
-            }
-            None => {
-                if previous.revision.released_at().is_some()
-                    || current.revision.retained_until() <= previous.revision.retained_until()
-                {
-                    return Err(validation(
-                        "retention pin renewal must extend an active predecessor",
-                    ));
-                }
-            }
-        }
-        Ok(())
+        validate_pin_transition(&previous.revision, &previous.raw_sha256, &current.revision)
     }
 
     fn validate_selector_target(&self) -> Result<()> {
@@ -729,6 +678,61 @@ fn validation(message: impl Into<String>) -> CatalogError {
     CatalogError::Validation {
         message: message.into(),
     }
+}
+
+/// Validates one authenticated adjacent pair without retaining the whole chain.
+pub fn validate_pin_transition(
+    previous: &RetentionPinRevision,
+    previous_raw_sha256: &str,
+    current: &RetentionPinRevision,
+) -> Result<()> {
+    if current.pin_id() != previous.pin_id()
+        || current.target() != previous.target()
+        || current.created_at() != previous.created_at()
+    {
+        return Err(validation(
+            "retention pin successor changes immutable pin identity",
+        ));
+    }
+    let predecessor = current
+        .predecessor()
+        .ok_or_else(|| validation("retention pin successor is missing predecessor evidence"))?;
+    if predecessor.revision() != previous.revision()
+        || predecessor.revision_path() != pin_revision_path(previous.pin_id(), previous.revision())?
+        || predecessor.revision_sha256() != previous_raw_sha256
+    {
+        return Err(validation(
+            "retention pin predecessor evidence does not match stored bytes",
+        ));
+    }
+    if current.revised_at() < previous.revised_at()
+        || previous.structural_status_at(current.revised_at())? != RetentionStatus::Active
+    {
+        return Err(validation(
+            "retention pin successor must transition from an active predecessor",
+        ));
+    }
+    match current.released_at() {
+        Some(_) => {
+            if previous.released_at().is_some()
+                || current.retained_until() != previous.retained_until()
+            {
+                return Err(validation(
+                    "retention pin release cannot alter retention or follow release",
+                ));
+            }
+        }
+        None => {
+            if previous.released_at().is_some()
+                || current.retained_until() <= previous.retained_until()
+            {
+                return Err(validation(
+                    "retention pin renewal must extend an active predecessor",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

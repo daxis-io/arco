@@ -330,6 +330,92 @@ async fn persisted_authority_references_round_trip_state_tokens_and_checkpoints(
     }
 }
 
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_current_state_token_captures_a_configured_source() {
+    let (_backend, storage) = storage();
+    let store = ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope())
+        .expect("synthetic authority-8 store")
+        .with_durable_authority_binding(arco_catalog::DurableAuthorityBinding::new([8; 32]));
+    let token = store
+        .install_synthetic_genesis(
+            "authority8-retained-source",
+            1,
+            1,
+            [arco_catalog::state_store::SyntheticKvEntry {
+                key: b"catalog/default".to_vec(),
+                generation: 1,
+                value: Some(b"retained".to_vec()),
+            }],
+            0,
+            std::iter::empty(),
+        )
+        .await
+        .expect("publish authority-8 source");
+    let deadline = Utc::now() + ChronoDuration::hours(1);
+    let manifest_path =
+        ControlMvpPaths::new("catalog").manifest_object(token.authority_manifest_id());
+    let manifest = storage
+        .get_raw(&manifest_path)
+        .await
+        .expect("published authority-8 manifest");
+    let current_reference = PersistedAuthorityReference::new(
+        ControlMvpStateStore::IMPLEMENTATION,
+        scope(),
+        PersistedAuthorityKind::StateToken,
+        token.authority_manifest_id(),
+        token.logical_sequence(),
+        manifest_path,
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(&manifest))),
+        None,
+        None,
+        deadline,
+    )
+    .expect("well-formed authority-8 current reference");
+    let retained = store
+        .resolve_persisted_reference(&current_reference)
+        .await
+        .expect("resolve the authenticated authority-8 current HEAD");
+    assert_eq!(
+        Some(Bytes::from_static(b"retained")),
+        retained
+            .get(b"catalog/default")
+            .await
+            .expect("read current source")
+    );
+
+    let unconfigured = ControlMvpStateStore::new_synthetic_bounded(storage, scope())
+        .expect("unconfigured synthetic authority-8 store");
+    assert!(
+        unconfigured
+            .persist_state_reference(&token, deadline)
+            .await
+            .is_err(),
+        "authority-8 source capture requires trusted durable-location configuration"
+    );
+
+    let reference = store
+        .persist_state_reference(&token, deadline)
+        .await
+        .expect("capture authenticated authority-8 retained source");
+    assert_eq!(
+        PersistedAuthorityKind::StateToken,
+        reference.reference_kind()
+    );
+    assert_eq!(token.authority_manifest_id(), reference.manifest_id());
+    let retained = store
+        .resolve_persisted_reference(&reference)
+        .await
+        .expect("resolve current authority-8 source");
+    assert_eq!(
+        Some(Bytes::from_static(b"retained")),
+        retained
+            .get(b"catalog/default")
+            .await
+            .expect("read current source")
+    );
+}
+
 #[tokio::test]
 async fn persisted_authority_resolution_revalidates_every_stable_field() {
     let (_backend, storage) = storage();
@@ -1544,7 +1630,9 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("second plan");
 
     assert_eq!(first, second);
-    let PersistedRestoreParticipantPlan::ControlMvp(plan) = &first;
+    let PersistedRestoreParticipantPlan::ControlMvp(plan) = &first else {
+        panic!("expected legacy ControlMvp plan")
+    };
     assert_eq!(3, plan.result_logical_sequence());
     assert!(plan.observed_base_pointer_sha256().starts_with("sha256:"));
     assert!(plan.candidate_pointer_sha256().starts_with("sha256:"));
@@ -1595,7 +1683,9 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     downgraded["version"] = Value::from(1_u64);
     let migrated: PersistedRestoreParticipantPlan =
         serde_json::from_value(downgraded.clone()).expect("v1 plans must remain decodable");
-    let PersistedRestoreParticipantPlan::ControlMvp(migrated_plan) = &migrated;
+    let PersistedRestoreParticipantPlan::ControlMvp(migrated_plan) = &migrated else {
+        panic!("expected legacy ControlMvp plan")
+    };
     assert_eq!(1, migrated_plan.version());
     assert!(
         migrated_plan.is_legacy_version(),
@@ -1769,7 +1859,10 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     // ACCEPTED: both retired versions decode and stay marked legacy so the
     // recovery driver can supersede them without dereferencing old paths.
     let PersistedRestoreParticipantPlan::ControlMvp(migrated) =
-        serde_json::from_str(v1).expect("v1 fixture must not fail deserialization");
+        serde_json::from_str(v1).expect("v1 fixture must not fail deserialization")
+    else {
+        panic!("expected legacy ControlMvp plan")
+    };
     assert_eq!(1, migrated.version());
     assert!(migrated.is_legacy_version());
     assert_eq!(3, migrated.result_logical_sequence());
@@ -1778,7 +1871,10 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
         migrated.transaction_sha256()
     );
     let PersistedRestoreParticipantPlan::ControlMvp(current) =
-        serde_json::from_str(v2).expect("v2 fixture must decode");
+        serde_json::from_str(v2).expect("v2 fixture must decode")
+    else {
+        panic!("expected legacy ControlMvp plan")
+    };
     assert_eq!(2, current.version());
     assert!(current.is_legacy_version());
     assert_eq!(
@@ -2696,7 +2792,9 @@ async fn restore_apply_survives_a_sequence_of_interrupted_retries() {
         )
         .await
         .expect("plan restore");
-    let PersistedRestoreParticipantPlan::ControlMvp(control_plan) = &plan;
+    let PersistedRestoreParticipantPlan::ControlMvp(control_plan) = &plan else {
+        panic!("expected legacy ControlMvp plan")
+    };
     let transaction_path = control_plan.transaction_path().to_string();
     let l0_path = store
         .paths()
@@ -2888,7 +2986,9 @@ async fn restore_apply_resumes_transaction_and_manifest_crash_points() {
             )
             .await
             .expect("plan");
-        let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan;
+        let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+            panic!("expected legacy ControlMvp plan")
+        };
         backend.arm();
         assert!(
             adapter.apply_restore(&plan, Utc::now()).await.is_err(),
@@ -3142,7 +3242,9 @@ async fn restore_empty_current_base_extends_source_lineage_and_retries_idempoten
         )
         .await
         .expect("plan from explicit empty current base");
-    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan;
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected legacy ControlMvp plan")
+    };
     assert_eq!(
         source.logical_sequence() + 1,
         control.result_logical_sequence()
@@ -3257,7 +3359,9 @@ async fn restore_immutable_object_conflicts_never_publish_pointer() {
         )
         .await
         .expect("plan");
-    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan;
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected legacy ControlMvp plan")
+    };
     first_storage
         .put_raw(
             control.transaction_path(),
@@ -3296,7 +3400,9 @@ async fn restore_immutable_object_conflicts_never_publish_pointer() {
         )
         .await
         .expect("manifest-conflict plan");
-    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan;
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected legacy ControlMvp plan")
+    };
     storage
         .put_raw(
             control.candidate_manifest_path(),

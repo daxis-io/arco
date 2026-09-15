@@ -1,5 +1,8 @@
 //! Durable exclusion between retained-root publication and mutating GC runs.
 
+mod bounded;
+pub(crate) use bounded::{BoundedMutation, RetainedPointerSend};
+
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -7,9 +10,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use arco_core::lock::{DistributedLock, LockGuard};
-use arco_core::{RootStorage, WritePrecondition, WriteResult};
+use arco_core::{RootStorage, ScopedStorage, StorageBackend, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
 use crate::workspace_snapshot::{
@@ -87,6 +91,78 @@ enum RetentionMutationState {
     Idle,
 }
 
+const ARMED_EPOCH_LIMIT: usize = 256 * 1024;
+const RETAINED_POINTER_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RetainedPointerIntentPrecondition {
+    DoesNotExist {},
+    MatchesVersion { version: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArmedRetainedPointerIntent {
+    pub(crate) intent_type: String,
+    pub(crate) version: u32,
+    pub(crate) domain: String,
+    pub(crate) pointer_path: String,
+    pub(crate) reference_key_hex: String,
+    pub(crate) expected_pointer_json: String,
+    pub(crate) expected_pointer_raw_sha256: String,
+    pub(crate) precondition: RetainedPointerIntentPrecondition,
+}
+
+impl ArmedRetainedPointerIntent {
+    fn validate(&self) -> Result<()> {
+        if self.intent_type != "arco.retained-source.pointer-intent" || self.version != 1 {
+            return Err(validation("unsupported retained pointer intent envelope"));
+        }
+        crate::state_store::StateScope::new("tenant", "workspace", &self.domain).validate()?;
+        if self.pointer_path
+            != format!(
+                "control/v1/domains/{}/retained/v1/current.json",
+                self.domain
+            )
+        {
+            return Err(validation(
+                "retained pointer intent names a different selector",
+            ));
+        }
+        if self.reference_key_hex.len() != 64
+            || !self
+                .reference_key_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(validation(
+                "retained pointer intent has an invalid reference key",
+            ));
+        }
+        if self.expected_pointer_json.is_empty()
+            || self.expected_pointer_json.len() > RETAINED_POINTER_LIMIT
+        {
+            return Err(validation(
+                "retained pointer intent exceeds its pointer size limit",
+            ));
+        }
+        if hex::encode(Sha256::digest(self.expected_pointer_json.as_bytes()))
+            != self.expected_pointer_raw_sha256
+        {
+            return Err(validation("retained pointer intent checksum mismatch"));
+        }
+        if let RetainedPointerIntentPrecondition::MatchesVersion { version } = &self.precondition {
+            if version.is_empty() || version.len() > 4096 || version.chars().any(char::is_control) {
+                return Err(validation(
+                    "retained pointer intent requires a bounded nonempty version",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RetentionMutationEpochRecord {
     record_type: String,
@@ -98,6 +174,8 @@ struct RetentionMutationEpochRecord {
     operation_id: String,
     started_at: DateTime<Utc>,
     completed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    armed_retained_pointer: Option<ArmedRetainedPointerIntent>,
 }
 
 impl RetentionMutationEpochRecord {
@@ -117,12 +195,18 @@ impl RetentionMutationEpochRecord {
             operation_id: operation_id.into(),
             started_at: wall_clock(),
             completed_at: None,
+            armed_retained_pointer: None,
         };
         record.validate()?;
         Ok(record)
     }
 
     fn completed(&self) -> Result<Self> {
+        if self.armed_retained_pointer.is_some() {
+            return Err(validation(
+                "armed retained pointer requires exact publication reconciliation",
+            ));
+        }
         let completed_at = wall_clock().max(self.started_at);
         let record = Self {
             state: RetentionMutationState::Idle,
@@ -139,6 +223,20 @@ impl RetentionMutationEpochRecord {
         }
         if self.epoch == 0 {
             return Err(validation("retention mutation epoch must be positive"));
+        }
+        if let Some(intent) = &self.armed_retained_pointer {
+            if self.state != RetentionMutationState::InFlight
+                || !matches!(
+                    self.operation_kind,
+                    RetentionMutationKind::WorkspaceSnapshotFinalize
+                        | RetentionMutationKind::WorkspaceSnapshotRetry
+                )
+            {
+                return Err(validation(
+                    "retained pointer intent requires an in-flight snapshot epoch",
+                ));
+            }
+            intent.validate()?;
         }
         validate_identity(&self.holder_id, "holder_id")?;
         validate_identity(&self.operation_id, "operation_id")?;
@@ -175,6 +273,12 @@ pub struct RetentionMutationEpoch {
 }
 
 impl RetentionMutationEpoch {
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.record.epoch
+    }
+}
+
+impl RetentionMutationEpoch {
     /// Claims the exact durable epoch while the caller owns the distributed lock.
     ///
     /// The lock is re-proved once after the claim. From that point until
@@ -194,6 +298,23 @@ impl RetentionMutationEpoch {
     ) -> Result<Self> {
         Self::claim_inner(
             storage,
+            guard,
+            operation_kind,
+            operation_id.into(),
+            false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn claim_workspace(
+        storage: ScopedStorage,
+        guard: &mut LockGuard<ScopedStorage>,
+        operation_kind: RetentionMutationKind,
+        operation_id: impl Into<String>,
+    ) -> Result<Self> {
+        Self::claim_inner(
+            storage.into(),
             guard,
             operation_kind,
             operation_id.into(),
@@ -223,9 +344,9 @@ impl RetentionMutationEpoch {
         .await
     }
 
-    async fn claim_inner(
+    async fn claim_inner<S: StorageBackend + ?Sized>(
         storage: RootStorage,
-        guard: &mut LockGuard<RootStorage>,
+        guard: &mut LockGuard<S>,
         operation_kind: RetentionMutationKind,
         operation_id: String,
         replay_maintenance_root: bool,
@@ -471,6 +592,31 @@ impl RetentionMutationEpoch {
         operation_kind: RetentionMutationKind,
         terminal_operation_ids: &BTreeSet<String>,
     ) -> Result<bool> {
+        Self::settle_terminal_matching_inner(storage, guard, operation_kind, terminal_operation_ids)
+            .await
+    }
+
+    pub(crate) async fn settle_terminal_matching_workspace(
+        storage: ScopedStorage,
+        guard: &mut LockGuard<ScopedStorage>,
+        operation_kind: RetentionMutationKind,
+        terminal_operation_ids: &BTreeSet<String>,
+    ) -> Result<bool> {
+        Self::settle_terminal_matching_inner(
+            storage.into(),
+            guard,
+            operation_kind,
+            terminal_operation_ids,
+        )
+        .await
+    }
+
+    async fn settle_terminal_matching_inner<S: StorageBackend + ?Sized>(
+        storage: RootStorage,
+        guard: &mut LockGuard<S>,
+        operation_kind: RetentionMutationKind,
+        terminal_operation_ids: &BTreeSet<String>,
+    ) -> Result<bool> {
         if terminal_operation_ids.is_empty() {
             return Ok(false);
         }
@@ -680,7 +826,11 @@ async fn recover_stale_epoch_while_locked(
         });
     }
 
-    settle_stale_record(storage, &record, &meta.version).await?;
+    // This explicit operator override requires all remote requests to be
+    // independently terminal. Generic and automatic settlement cannot clear it.
+    let mut terminal = record.clone();
+    terminal.armed_retained_pointer = None;
+    settle_stale_record(storage, &terminal, &meta.version).await?;
     let recovered = RecoveredRetentionEpoch {
         epoch: record.epoch,
         holder_id: record.holder_id.clone(),
@@ -720,9 +870,9 @@ async fn recover_stale_epoch_while_locked(
 /// Both guards must hold: the record has been in flight for at least
 /// `STALE_RECLAMATION_EPOCH_MIN_AGE_SECS`, and the adopting caller currently
 /// owns the durable retention lease (so the recorded holder does not).
-async fn adopt_stale_reclamation_epoch(
+async fn adopt_stale_reclamation_epoch<S: StorageBackend + ?Sized>(
     storage: &RootStorage,
-    guard: &LockGuard<RootStorage>,
+    guard: &LockGuard<S>,
     previous: &RetentionMutationEpochRecord,
     observed_version: &str,
     now: DateTime<Utc>,
@@ -762,9 +912,9 @@ async fn adopt_stale_reclamation_epoch(
 ///
 /// This is the liveness key for recovery: the lease is single-holder, so a
 /// caller that owns it has proven the epoch's recorded holder does not.
-async fn holds_live_retention_lease(
+async fn holds_live_retention_lease<S: StorageBackend + ?Sized>(
     storage: &RootStorage,
-    guard: &LockGuard<RootStorage>,
+    guard: &LockGuard<S>,
 ) -> Result<bool> {
     let Some(info) = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
         .read_lock_info()
@@ -812,9 +962,13 @@ fn validate_override_reason(reason: &str) -> Result<()> {
 
 fn encode_record(record: &RetentionMutationEpochRecord) -> Result<Vec<u8>> {
     record.validate()?;
-    serde_jcs::to_vec(record).map_err(|error| CatalogError::Serialization {
+    let bytes = serde_jcs::to_vec(record).map_err(|error| CatalogError::Serialization {
         message: format!("failed to serialize retention mutation epoch: {error}"),
-    })
+    })?;
+    if record.armed_retained_pointer.is_some() && bytes.len() > ARMED_EPOCH_LIMIT {
+        return Err(validation("armed retention epoch exceeds 256 KiB"));
+    }
+    Ok(bytes)
 }
 
 fn decode_record(bytes: &[u8]) -> Result<RetentionMutationEpochRecord> {
@@ -823,6 +977,9 @@ fn decode_record(bytes: &[u8]) -> Result<RetentionMutationEpochRecord> {
             message: format!("failed to deserialize retention mutation epoch: {error}"),
         })?;
     record.validate()?;
+    if record.armed_retained_pointer.is_some() && bytes.len() > ARMED_EPOCH_LIMIT {
+        return Err(validation("armed retention epoch exceeds 256 KiB"));
+    }
     Ok(record)
 }
 
@@ -869,6 +1026,162 @@ mod tests {
 
     use super::*;
     use crate::workspace_snapshot::RETENTION_GC_LOCK_PATH;
+
+    #[test]
+    fn armed_retained_pointer_survives_decode_and_blocks_generic_settlement() {
+        let record = RetentionMutationEpochRecord::in_flight(
+            1,
+            "holder",
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            "snapshot",
+        )
+        .expect("record");
+        let plain = encode_record(&record).expect("plain record");
+        let mut value: Value = serde_json::from_slice(&plain).expect("JSON");
+        assert!(
+            value.get("armed_retained_pointer").is_none(),
+            "V1 bytes omit absent intent"
+        );
+        value["armed_retained_pointer"] = serde_json::json!({
+            "intent_type": "arco.retained-source.pointer-intent", "version": 1,
+            "domain": "catalog", "pointer_path": "control/v1/domains/catalog/retained/v1/current.json",
+            "reference_key_hex": "11".repeat(32), "expected_pointer_json": "{}",
+            "expected_pointer_raw_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "precondition": {"kind": "does_not_exist"}
+        });
+        let armed_bytes = serde_jcs::to_vec(&value).expect("armed JSON");
+        let armed = decode_record(&armed_bytes).expect("valid coordination envelope");
+        assert_eq!(
+            encode_record(&armed).expect("round trip"),
+            armed_bytes,
+            "a possibly sent pointer intent must never be silently discarded"
+        );
+        assert!(
+            armed.completed().is_err(),
+            "generic settlement must preserve armed intent"
+        );
+        assert_eq!(
+            encode_record(&decode_record(&plain).expect("V1 decode")).expect("V1 encode"),
+            plain
+        );
+        for bad in [
+            serde_json::json!({"operation_kind":"control_gc"}),
+            serde_json::json!({"armed_retained_pointer": null, "state":"IDLE", "completed_at":null}),
+        ] {
+            let mut changed = value.clone();
+            for (key, replacement) in bad.as_object().expect("patch") {
+                changed[key] = replacement.clone();
+            }
+            assert!(decode_record(&serde_jcs::to_vec(&changed).expect("bad envelope")).is_err());
+        }
+        for (field, replacement) in [
+            ("domain", Value::from("../catalog")),
+            (
+                "pointer_path",
+                Value::from("control/v1/domains/catalog/head/current.json"),
+            ),
+            ("reference_key_hex", Value::from("AA".repeat(32))),
+            ("expected_pointer_raw_sha256", Value::from("00".repeat(32))),
+            (
+                "expected_pointer_json",
+                Value::from("x".repeat(64 * 1024 + 1)),
+            ),
+            (
+                "precondition",
+                serde_json::json!({"kind":"matches_version","version":""}),
+            ),
+            (
+                "precondition",
+                serde_json::json!({"kind":"matches_version","version":"v\n"}),
+            ),
+            (
+                "precondition",
+                serde_json::json!({"kind":"does_not_exist","extra":true}),
+            ),
+        ] {
+            let mut changed = value.clone();
+            changed["armed_retained_pointer"][field] = replacement;
+            assert!(
+                decode_record(&serde_jcs::to_vec(&changed).expect("bad intent")).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_epoch_is_preserved_by_both_generic_settlement_paths() {
+        let storage = storage();
+        let mut guard = acquire(&storage).await;
+        let mut epoch = RetentionMutationEpoch::claim(
+            storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            SNAPSHOT_ID,
+        )
+        .await
+        .expect("claim");
+        epoch.record.armed_retained_pointer = Some(ArmedRetainedPointerIntent {
+            intent_type: "arco.retained-source.pointer-intent".into(),
+            version: 1,
+            domain: "catalog".into(),
+            pointer_path: "control/v1/domains/catalog/retained/v1/current.json".into(),
+            reference_key_hex: "11".repeat(32),
+            expected_pointer_json: "{}".into(),
+            expected_pointer_raw_sha256:
+                "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a".into(),
+            precondition: RetainedPointerIntentPrecondition::DoesNotExist {},
+        });
+        let armed = Bytes::from(encode_record(&epoch.record).expect("armed record"));
+        let WriteResult::Success { version } = storage
+            .put_raw(
+                RETENTION_MUTATION_EPOCH_PATH,
+                armed.clone(),
+                WritePrecondition::MatchesVersion(epoch.claimed_version.clone()),
+            )
+            .await
+            .expect("arm fixture")
+        else {
+            panic!("fixture lost epoch CAS");
+        };
+        epoch.claimed_version = version;
+        assert!(epoch.settle().await.is_err());
+        assert_eq!(
+            storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("selected"),
+            armed
+        );
+        assert!(
+            RetentionMutationEpoch::settle_terminal_matching(
+                storage.clone(),
+                &mut guard,
+                RetentionMutationKind::WorkspaceSnapshotFinalize,
+                &BTreeSet::from([SNAPSHOT_ID.to_string()])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .expect("selected"),
+            armed
+        );
+        guard.release().await.expect("release");
+        // The existing explicit operator path assumes independent proof that
+        // all remote requests are terminal; it remains the manual escape hatch.
+        let recovered =
+            recover_stale_retention_epoch(&storage, "all remote requests independently terminal")
+                .await
+                .expect("operator recovery")
+                .expect("recovered epoch");
+        assert!(recovered.operator_override);
+        let selected = read_epoch(&storage).await;
+        assert_eq!(selected["state"], "IDLE");
+        assert!(selected.get("armed_retained_pointer").is_none());
+    }
 
     const SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
@@ -1289,6 +1602,7 @@ mod tests {
             operation_id: "dead-operation".to_string(),
             started_at: Utc::now() - in_flight_for,
             completed_at: None,
+            armed_retained_pointer: None,
         };
         let result = storage
             .put_raw(

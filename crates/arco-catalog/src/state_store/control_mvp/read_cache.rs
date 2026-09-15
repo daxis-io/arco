@@ -1080,9 +1080,17 @@ pub(super) fn validate_rows(
     reference: &ControlMvpSegmentRef,
     rows: &[ControlMvpSegmentRow],
 ) -> Result<()> {
-    let l0 = reference.level == ControlMvpSegmentLevel::L0;
+    validate_rows_for_sequence(reference.level, reference.logical_sequence, rows)
+}
+
+pub(super) fn validate_rows_for_sequence(
+    level: ControlMvpSegmentLevel,
+    logical_sequence: u64,
+    rows: &[ControlMvpSegmentRow],
+) -> Result<()> {
+    let l0 = level == ControlMvpSegmentLevel::L0;
     for row in rows {
-        if row.logical_sequence != reference.logical_sequence {
+        if row.logical_sequence != logical_sequence {
             return Err(invariant_violation(if l0 {
                 "control MVP L0 row sequence does not match transaction sequence"
             } else {
@@ -1092,8 +1100,8 @@ pub(super) fn validate_rows(
         match row.record_kind {
             SEGMENT_RECORD_KV => {
                 if row.generation == 0
-                    || row.generation > reference.logical_sequence
-                    || (l0 && row.generation != reference.logical_sequence)
+                    || row.generation > logical_sequence
+                    || (l0 && row.generation != logical_sequence)
                     || row.origin_sequence.is_some()
                     || row.tombstone != row.value.is_none()
                 {
@@ -1108,7 +1116,7 @@ pub(super) fn validate_rows(
                 if l0 {
                     if row.tombstone
                         || row.generation != 0
-                        || row.origin_sequence != Some(reference.logical_sequence)
+                        || row.origin_sequence != Some(logical_sequence)
                     {
                         return Err(invariant_violation(
                             "control MVP L0 outbox row metadata is invalid",
@@ -1118,7 +1126,7 @@ pub(super) fn validate_rows(
                     let origin = row.origin_sequence.ok_or_else(|| {
                         invariant_violation("control MVP L1 outbox row is missing origin sequence")
                     })?;
-                    if row.generation != 0 || origin == 0 || origin > reference.logical_sequence {
+                    if row.generation != 0 || origin == 0 || origin > logical_sequence {
                         return Err(invariant_violation(
                             "control MVP L1 outbox row origin metadata is invalid",
                         ));

@@ -278,6 +278,211 @@ async fn transaction(store: &ControlMvpStateStore, operation: &str) -> ControlMv
 }
 
 #[tokio::test]
+async fn authority8_forged_attachment_cannot_make_an_unpublished_candidate_readable() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([8; 32]));
+    transaction(&store, "seed").await.commit_v2().await.unwrap();
+    let mut first = transaction(&store, "first-candidate").await;
+    first
+        .put(b"first", Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    let first_token = first.predicted_state_token().unwrap();
+    let mut second = transaction(&store, "second-candidate").await;
+    second
+        .put(b"second", Bytes::from_static(b"second"))
+        .await
+        .unwrap();
+    let second_token = second.predicted_state_token().unwrap();
+    let (first_result, second_result) = tokio::join!(first.commit_v2(), second.commit_v2());
+    let candidate = match (first_result.is_err(), second_result.is_err()) {
+        (true, false) => first_token,
+        (false, true) => second_token,
+        _ => panic!("exactly one candidate must lose HEAD publication"),
+    };
+    let manifest_path = store
+        .paths
+        .manifest_object(candidate.authority_manifest_id());
+    let manifest = store.retention.get_raw(&manifest_path).await.unwrap();
+    let reference = PersistedAuthorityReference::new(
+        IMPLEMENTATION,
+        store.scope.clone(),
+        PersistedAuthorityKind::StateToken,
+        candidate.authority_manifest_id(),
+        candidate.logical_sequence(),
+        manifest_path,
+        prefixed_sha256(&manifest),
+        None,
+        None,
+        Utc::now() + ChronoDuration::hours(1),
+    )
+    .unwrap();
+    let attachment_path = format!(
+        "{}/retained-authority8/{}.json",
+        store.paths.base_prefix(),
+        reference.manifest_id()
+    );
+    store
+        .retention
+        .put_raw(
+            &attachment_path,
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "record_type": "control_mvp_retained_authority8",
+                    "version": 1,
+                    "reference": reference,
+                    "binding": vec![8_u8; 32],
+                }))
+                .unwrap(),
+            ),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.resolve_persisted_reference(&reference).await.is_err(),
+        "a forged attachment must not make a detached candidate retained authority"
+    );
+}
+
+#[tokio::test]
+async fn authority8_selected_retained_source_survives_more_than_thirty_two_head_advances() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([9; 32]));
+    let mut source = transaction(&store, "retained-source").await;
+    source
+        .put(b"retained", Bytes::from_static(b"source"))
+        .await
+        .unwrap();
+    let source = source.commit_v2().await.unwrap().token().clone();
+    let reference = store
+        .persist_state_reference(&source, Utc::now() + ChronoDuration::days(1))
+        .await
+        .unwrap();
+    store
+        .install_test_retained_source(&reference)
+        .await
+        .unwrap();
+    for advance in 0..33 {
+        let mut txn = transaction(&store, &format!("advance-{advance}")).await;
+        txn.put(
+            format!("advance-{advance}").as_bytes(),
+            Bytes::from_static(b"advanced"),
+        )
+        .await
+        .unwrap();
+        txn.commit_v2().await.unwrap();
+    }
+    let reader = store.resolve_persisted_reference(&reference).await.unwrap();
+    assert_eq!(
+        reader.get(b"retained").await.unwrap(),
+        Some(Bytes::from_static(b"source"))
+    );
+}
+
+#[tokio::test]
+async fn authority8_selected_retained_source_rejects_a_covering_singleton_gap() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([10; 32]));
+    let source = transaction(&store, "retained-gap")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    let reference = store
+        .persist_state_reference(source.token(), Utc::now() + ChronoDuration::days(1))
+        .await
+        .unwrap();
+    store
+        .install_test_retained_singleton_gap(&reference)
+        .await
+        .unwrap();
+    transaction(&store, "retained-gap-advance")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    assert!(
+        store.resolve_persisted_reference(&reference).await.is_err(),
+        "a covering retained-directory leaf must not prove exact membership"
+    );
+}
+
+#[tokio::test]
+async fn authority8_selected_retained_source_rejects_a_different_configured_binding() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([11; 32]));
+    let source = transaction(&store, "retained-binding")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    let reference = store
+        .persist_state_reference(source.token(), Utc::now() + ChronoDuration::days(1))
+        .await
+        .unwrap();
+    store
+        .install_test_retained_source(&reference)
+        .await
+        .unwrap();
+    transaction(&store, "retained-binding-advance")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    let other =
+        ControlMvpStateStore::new_synthetic_bounded(store.retention.clone(), store.scope.clone())
+            .unwrap()
+            .with_durable_authority_binding(DurableAuthorityBinding::new([12; 32]));
+    assert!(other.resolve_persisted_reference(&reference).await.is_err());
+}
+
+#[tokio::test]
+async fn authority8_selected_retained_source_rejects_deadline_equality() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([13; 32]));
+    let source = transaction(&store, "retained-deadline")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    let deadline = Utc::now() + ChronoDuration::hours(1);
+    let reference = store
+        .persist_state_reference(source.token(), deadline)
+        .await
+        .unwrap();
+    store
+        .install_test_retained_source(&reference)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .resolve_persisted_reference_at(&reference, deadline)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn authority8_selected_retained_source_rejects_a_generation_jump() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([14; 32]));
+    let source = transaction(&store, "retained-generation")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    let reference = store
+        .persist_state_reference(source.token(), Utc::now() + ChronoDuration::days(1))
+        .await
+        .unwrap();
+    store
+        .install_test_retained_generation_jump(&reference)
+        .await
+        .unwrap();
+    transaction(&store, "retained-generation-advance")
+        .await
+        .commit_v2()
+        .await
+        .unwrap();
+    assert!(store.resolve_persisted_reference(&reference).await.is_err());
+}
+
+#[tokio::test]
 async fn authority8_competing_writers_preserve_point_and_empty_range_observations() {
     let store = store();
     let mut seed = transaction(&store, "seed").await;
@@ -626,4 +831,163 @@ async fn authority8_rejects_put_with_expiry_before_staging() {
         .unwrap();
     assert_eq!(after.bytes(), &Bytes::from_static(b"first"));
     assert_eq!(after.generation(), Some(1));
+}
+
+#[tokio::test]
+async fn authority8_bounded_restore_plans_the_authenticated_source_without_writes() {
+    use crate::state_store::RestorePlanningContext;
+    use crate::workspace_io_budget::{WorkspaceCaptureIo, WorkspaceIoBudget};
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([35; 32]));
+    let mut txn = transaction(&store, "restore-plan7-source").await;
+    txn.put(b"key", Bytes::from_static(b"source"))
+        .await
+        .unwrap();
+    let token = txn.commit_v2().await.unwrap().token().clone();
+    let now = Utc::now();
+    let source = store
+        .persist_state_reference(&token, now + ChronoDuration::days(2))
+        .await
+        .unwrap();
+    let identity =
+        RestoreAttemptIdentity::new(format!("rst_{}", Ulid::from(705_u128)), 1, "catalog").unwrap();
+    let inventory = |objects: Vec<arco_core::storage::ObjectMeta>| {
+        objects
+            .into_iter()
+            .map(|o| (o.path, o.version, o.size))
+            .collect::<BTreeSet<_>>()
+    };
+    let before = inventory(store.retention.backend().list("").await.unwrap());
+    let mut budget = WorkspaceIoBudget::new();
+    let mut context = RestorePlanningContext::new(
+        prefixed_sha256(b"workspace-request"),
+        now,
+        now + ChronoDuration::hours(24),
+        now,
+        WorkspaceCaptureIo::new(&store.retention, &mut budget),
+    );
+    let plan = ControlMvpRestoreParticipant::new(store.clone())
+        .plan_restore_bounded(&source, &identity, &mut context)
+        .await
+        .expect("authenticated authority-8 source must produce Plan7");
+    let wire = serde_json::to_value(&plan).unwrap();
+    assert_eq!(wire["plan_kind"], "control_mvp_v7");
+    assert_eq!(wire["version"], 7);
+    assert_eq!(wire["owner_generation"], 1);
+    assert_eq!(wire["source"], serde_json::to_value(&source).unwrap());
+    assert_eq!(wire["identity"], serde_json::to_value(&identity).unwrap());
+    let mut inspection = crate::state_store::RestoreBoundedInspectionContext::new(
+        identity.restore_id().into(),
+        identity.attempt(),
+        identity.domain().into(),
+        prefixed_sha256(&serde_jcs::to_vec(&plan).unwrap()),
+        WorkspaceCaptureIo::new(&store.retention, &mut budget),
+    );
+    assert!(matches!(
+        ControlMvpRestoreParticipant::new(store.clone())
+            .inspect_restore_bounded(&plan, &mut inspection)
+            .await
+            .expect("unstarted Plan7 must have bounded read-only inspection"),
+        RestoreParticipantInspection::Ready
+    ));
+    assert_eq!(
+        before,
+        inventory(store.retention.backend().list("").await.unwrap()),
+        "planning wrote artifacts"
+    );
+}
+
+#[tokio::test]
+async fn authority8_plan7_retries_keep_original_logical_identity_and_reject_tampering() {
+    use crate::state_store::RestorePlanningContext;
+    use crate::workspace_io_budget::{WorkspaceCaptureIo, WorkspaceIoBudget};
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([37; 32]));
+    let mut txn = transaction(&store, "plan7-source-past").await;
+    txn.put(b"key", Bytes::from_static(b"source"))
+        .await
+        .unwrap();
+    let token = txn.commit_v2().await.unwrap().token().clone();
+    let now = Utc::now();
+    let source = store
+        .persist_state_reference(&token, now + ChronoDuration::days(2))
+        .await
+        .unwrap();
+    store.install_test_retained_source(&source).await.unwrap();
+    let mut txn = transaction(&store, "plan7-current").await;
+    txn.put(b"key", Bytes::from_static(b"target"))
+        .await
+        .unwrap();
+    let current = txn.commit_v2().await.unwrap().token().clone();
+    let restore_id = format!("rst_{}", Ulid::from(707_u128));
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let mut wires = Vec::new();
+    for (attempt, elapsed) in [(1, 0), (1, 1), (2, 2)] {
+        let identity = RestoreAttemptIdentity::new(&restore_id, attempt, "catalog").unwrap();
+        let mut budget = WorkspaceIoBudget::new();
+        let mut context = RestorePlanningContext::new(
+            prefixed_sha256(b"workspace-request"),
+            now,
+            now + ChronoDuration::hours(24),
+            now + ChronoDuration::seconds(elapsed),
+            WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        );
+        let plan = adapter
+            .plan_restore_bounded(&source, &identity, &mut context)
+            .await
+            .unwrap();
+        assert!(matches!(
+            adapter.inspect_restore(&plan).await,
+            Err(CatalogError::UnsupportedOperation { .. })
+        ));
+        assert!(matches!(
+            adapter.apply_restore(&plan, now).await,
+            Err(CatalogError::UnsupportedOperation { .. })
+        ));
+        let wire = serde_json::to_value(&plan).unwrap();
+        let decoded: PersistedRestoreParticipantPlan =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded, plan);
+        assert_eq!(wire["source_logical_sequence"], source.logical_sequence());
+        assert_eq!(wire["base_logical_sequence"], current.logical_sequence());
+        assert_eq!(
+            wire["result_logical_sequence"],
+            current.logical_sequence() + 1
+        );
+        wires.push(wire);
+    }
+    let [first, retry, replacement] = wires.as_slice() else {
+        panic!("three attempts")
+    };
+    assert_eq!(
+        first, retry,
+        "live retry time must not change immutable bytes"
+    );
+    assert_eq!(first["logical_commit_id"], replacement["logical_commit_id"]);
+    assert_eq!(
+        first["restore_request_digest"],
+        replacement["restore_request_digest"]
+    );
+    assert_ne!(first["candidate_id"], replacement["candidate_id"]);
+    for (field, value) in [
+        ("owner_generation", serde_json::json!(2)),
+        ("version", serde_json::json!(6)),
+        (
+            "workspace_request_sha256",
+            serde_json::json!(prefixed_sha256(b"different-request")),
+        ),
+        ("source_kv_root_b64", serde_json::json!("YQ==")),
+        ("restore_notice_payload_b64", serde_json::json!("YQ")),
+        (
+            "logical_commit_id",
+            serde_json::json!(prefixed_sha256(b"forged-logical")),
+        ),
+        ("candidate_id", serde_json::json!("aa".repeat(32))),
+        ("unknown_field", serde_json::json!(true)),
+    ] {
+        let mut changed = first.clone();
+        changed[field] = value;
+        assert!(
+            serde_json::from_value::<PersistedRestoreParticipantPlan>(changed).is_err(),
+            "accepted changed {field}"
+        );
+    }
 }

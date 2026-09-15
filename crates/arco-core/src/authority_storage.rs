@@ -89,6 +89,18 @@ impl ScopedAuthorityStore {
         self.storage.get_range(path, range).await
     }
 
+    /// Reads a scoped authority range with the backend's ownership statement.
+    ///
+    /// # Errors
+    /// Returns path-validation, not-found, invalid-range, or backend errors.
+    pub async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<crate::storage::ClassifiedBytes> {
+        self.storage.get_range_with_ownership(path, range).await
+    }
+
     /// Reads authority-object metadata without fetching its content.
     ///
     /// # Errors
@@ -123,6 +135,55 @@ mod tests {
     use super::{AuthorityWritePrecondition, ScopedAuthorityStore};
     use crate::storage::{MemoryBackend, WriteResult};
     use crate::{RootStorage, ScopedStorage};
+
+    #[tokio::test]
+    async fn classified_memory_ranges_preserve_shared_origin_and_scope() -> crate::Result<()> {
+        use crate::storage::{BytesBackingOwnership, StorageBackend};
+        let backend = Arc::new(MemoryBackend::new());
+        let scoped = ScopedStorage::new(backend.clone(), "tenant", "workspace")?;
+        let authority = ScopedAuthorityStore::new(scoped.clone());
+        let mut data = Vec::with_capacity(4096);
+        data.extend_from_slice(b"abcdef");
+        assert!(data.capacity() > data.len());
+        authority
+            .put(
+                "payload",
+                data.into(),
+                AuthorityWritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let full = authority.get_range_with_ownership("payload", 0..99).await?;
+        let part = authority.get_range_with_ownership("payload", 1..4).await?;
+        assert_eq!(full.bytes.as_ref(), b"abcdef");
+        assert_eq!(part.bytes.as_ref(), b"bcd");
+        assert_eq!(
+            full.ownership,
+            BytesBackingOwnership::BackendOriginShared { held_len: 6 }
+        );
+        assert_eq!(
+            part.ownership,
+            BytesBackingOwnership::BackendOriginShared { held_len: 3 }
+        );
+        let through_trait =
+            StorageBackend::get_range_with_ownership(&scoped, "payload", 2..3).await?;
+        assert_eq!(
+            through_trait.ownership,
+            BytesBackingOwnership::BackendOriginShared { held_len: 1 }
+        );
+        assert!(
+            authority
+                .get_range_with_ownership("../payload", 0..1)
+                .await
+                .is_err()
+        );
+        scoped.delete("payload").await?;
+        assert_eq!(
+            part.bytes.as_ref(),
+            b"bcd",
+            "deletion does not release a held handle"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn exposes_only_scoped_reads_heads_and_conditional_writes() {

@@ -145,7 +145,8 @@ pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarVal
 pub use root_storage::RootStorage;
 pub use scoped_storage::{ScopedListPage, ScopedStorage};
 pub use storage::{
-    ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+    BytesBackingOwnership, ClassifiedBytes, ListPage, MemoryBackend, ObjectMeta, StorageBackend,
+    WritePrecondition, WriteResult,
 };
 pub use sync_compact::{SyncCompactRequest, SyncCompactResponse, VisibilityStatus};
 pub use table_format::TableFormat;

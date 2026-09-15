@@ -2,6 +2,7 @@
 
 use super::{ControlMvpWriteEntry, Result, StateScope, invariant_violation, valid_raw_digest};
 use arco_core::AuthorityRoot;
+use chrono::{SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -9,7 +10,7 @@ const ENCODING_VERSION: u32 = 2;
 
 struct Canonical {
     hasher: Sha256,
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     input_bytes: usize,
 }
 
@@ -17,7 +18,7 @@ impl Canonical {
     fn new(tag: &[u8], scope: &StateScope) -> Self {
         let mut out = Self {
             hasher: Sha256::new(),
-            #[cfg(feature = "test-utils")]
+            #[cfg(any(test, feature = "test-utils"))]
             input_bytes: 0,
         };
         out.bytes(tag);
@@ -29,7 +30,7 @@ impl Canonical {
     fn update(&mut self, bytes: impl AsRef<[u8]>) {
         let bytes = bytes.as_ref();
         self.hasher.update(bytes);
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         {
             self.input_bytes = self.input_bytes.saturating_add(bytes.len());
         }
@@ -76,7 +77,7 @@ impl Canonical {
     }
 
     fn finish(self) -> String {
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         super::record_sha256_work(self.input_bytes);
         hex::encode(self.hasher.finalize())
     }
@@ -243,6 +244,280 @@ impl<'de> Deserialize<'de> for ProjectionIntentV2 {
         };
         intent.validate().map_err(serde::de::Error::custom)?;
         Ok(intent)
+    }
+}
+
+const RESTORE_REQUEST_VERSION: u32 = 1;
+const RESTORE_HISTORY_VERSION: u32 = 1;
+const RESTORE_FAMILY: &str = "workspace-restore-v2";
+
+/// Private mode tag for the frozen workspace-restore logical codec.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RestoreMode {
+    Present,
+    Absent,
+}
+
+impl RestoreMode {
+    const fn byte(self) -> u8 {
+        match self {
+            Self::Present => 0,
+            Self::Absent => 1,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// Stable, private restore request inputs and authenticated output base.
+pub(super) struct RestoreRequest {
+    scope: StateScope,
+    mode: RestoreMode,
+    source_sequence: u64,
+    source_history: String,
+    base_sequence: u64,
+    prior_history: String,
+    restore_id: String,
+    seconds: i64,
+    nanoseconds: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreNoticePayload<'a> {
+    restore_id: &'a str,
+    mode: &'a str,
+    source_logical_sequence: u64,
+    source_logical_history: &'a str,
+    result_logical_sequence: u64,
+    requested_at: &'a str,
+}
+
+/// Streaming restore-history encoder. One invalid pushed tuple poisons it.
+pub(super) struct RestoreHistory {
+    out: Canonical,
+    scope: StateScope,
+    sequence: u64,
+    logical_commit_id: String,
+    declared_mutations: u64,
+    accepted_mutations: u64,
+    previous_key: Option<Vec<u8>>,
+    notice: ProjectionIntentV2,
+    poisoned: bool,
+}
+
+impl RestoreRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        scope: &StateScope,
+        mode: RestoreMode,
+        source_sequence: u64,
+        source_history: &str,
+        base_sequence: u64,
+        prior_history: &str,
+        restore_id: &str,
+        seconds: i64,
+        nanoseconds: u32,
+    ) -> Result<Self> {
+        scope.validate()?;
+        validate_sequence(source_sequence, "restore source logical sequence")?;
+        validate_digest(source_history, "restore source logical history")?;
+        validate_sequence(base_sequence, "restore logical base sequence")?;
+        validate_digest(prior_history, "restore prior logical history")?;
+        // This existing path helper validates the exact `rst_` + canonical
+        // uppercase ULID contract before it formats a request-derived path.
+        let _ = crate::workspace_restore::restore_request_path(restore_id)?;
+        if nanoseconds >= 1_000_000_000 {
+            return Err(invariant_violation("invalid restore timestamp nanoseconds"));
+        }
+        if mode == RestoreMode::Absent
+            && (base_sequence != source_sequence || prior_history != source_history)
+        {
+            return Err(invariant_violation(
+                "absent restore base differs from authenticated source",
+            ));
+        }
+        base_sequence
+            .checked_add(1)
+            .ok_or_else(|| invariant_violation("restore result sequence overflows"))?;
+        Ok(Self {
+            scope: scope.clone(),
+            mode,
+            source_sequence,
+            source_history: source_history.to_owned(),
+            base_sequence,
+            prior_history: prior_history.to_owned(),
+            restore_id: restore_id.to_owned(),
+            seconds,
+            nanoseconds,
+        })
+    }
+
+    pub(super) fn request_digest(&self) -> Result<String> {
+        let mut out = Canonical::new(b"arco/control-v2/restore-request", &self.scope);
+        out.u32(RESTORE_REQUEST_VERSION);
+        out.u8(self.mode.byte());
+        out.u64(self.source_sequence);
+        out.digest(&self.source_history)?;
+        out.bytes(self.restore_id.as_bytes());
+        out.update(self.seconds.to_be_bytes());
+        out.u32(self.nanoseconds);
+        Ok(out.finish())
+    }
+
+    pub(super) fn operation(&self) -> Result<Operation> {
+        Ok(Operation {
+            operation_id: self.restore_id.clone(),
+            family: RESTORE_FAMILY.to_owned(),
+            request_digest: self.request_digest()?,
+        })
+    }
+
+    pub(super) fn result_sequence(&self) -> u64 {
+        // Constructor checked the addition before preserving base_sequence.
+        self.base_sequence + 1
+    }
+
+    pub(super) fn prior_history(&self) -> &str {
+        &self.prior_history
+    }
+
+    fn requested_at_utc9(&self) -> Result<String> {
+        let instant = Utc
+            .timestamp_opt(self.seconds, self.nanoseconds)
+            .single()
+            .ok_or_else(|| invariant_violation("invalid restore UTC timestamp"))?;
+        Ok(instant.to_rfc3339_opts(SecondsFormat::Nanos, true))
+    }
+
+    pub(super) fn notice(&self, logical_commit_id: &str) -> Result<ProjectionIntentV2> {
+        validate_digest(logical_commit_id, "restore logical commit ID")?;
+        let requested_at = self.requested_at_utc9()?;
+        let payload = serde_json::to_vec(&RestoreNoticePayload {
+            restore_id: &self.restore_id,
+            mode: self.mode.name(),
+            source_logical_sequence: self.source_sequence,
+            source_logical_history: &self.source_history,
+            result_logical_sequence: self.result_sequence(),
+            requested_at: &requested_at,
+        })
+        .map_err(|error| {
+            invariant_violation(format!("restore notice serialization failed: {error}"))
+        })?;
+        ProjectionIntentV2::new(
+            format!("restore-{}", self.restore_id),
+            RESTORE_FAMILY,
+            self.scope.clone(),
+            self.result_sequence(),
+            logical_commit_id,
+            0,
+            payload,
+        )
+    }
+
+    pub(super) fn history(
+        &self,
+        logical_commit_id: &str,
+        declared_mutations: u64,
+    ) -> Result<RestoreHistory> {
+        RestoreHistory::new(
+            &self.scope,
+            &self.prior_history,
+            self.result_sequence(),
+            logical_commit_id,
+            declared_mutations,
+            self.notice(logical_commit_id)?,
+        )
+    }
+}
+
+impl RestoreHistory {
+    fn new(
+        scope: &StateScope,
+        prior_history: &str,
+        sequence: u64,
+        logical_commit_id: &str,
+        declared_mutations: u64,
+        notice: ProjectionIntentV2,
+    ) -> Result<Self> {
+        scope.validate()?;
+        validate_digest(prior_history, "restore prior logical history")?;
+        validate_sequence(sequence, "restore history sequence")?;
+        validate_digest(logical_commit_id, "restore logical commit ID")?;
+        let mut out = Canonical::new(b"arco/control-v2/restore-history", scope);
+        out.u32(RESTORE_HISTORY_VERSION);
+        out.digest(prior_history)?;
+        out.u64(sequence);
+        out.digest(logical_commit_id)?;
+        out.u64(declared_mutations);
+        Ok(Self {
+            out,
+            scope: scope.clone(),
+            sequence,
+            logical_commit_id: logical_commit_id.to_owned(),
+            declared_mutations,
+            accepted_mutations: 0,
+            previous_key: None,
+            notice,
+            poisoned: false,
+        })
+    }
+
+    pub(super) fn push(&mut self, key: &[u8], generation: u64, value: Option<&[u8]>) -> Result<()> {
+        if self.poisoned {
+            return Err(invariant_violation("restore history stream is poisoned"));
+        }
+        if self.accepted_mutations == self.declared_mutations {
+            self.poisoned = true;
+            return Err(invariant_violation(
+                "restore history mutation count exceeds declaration",
+            ));
+        }
+        if self
+            .previous_key
+            .as_deref()
+            .is_some_and(|previous| previous >= key)
+        {
+            self.poisoned = true;
+            return Err(invariant_violation(
+                "restore history keys are not strictly ordered",
+            ));
+        }
+        if generation != self.sequence {
+            self.poisoned = true;
+            return Err(invariant_violation(
+                "restore history write generation differs from result sequence",
+            ));
+        }
+        encode_write_tuple(&mut self.out, key, generation, value);
+        self.previous_key = Some(key.to_vec());
+        self.accepted_mutations += 1;
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> Result<(String, ProjectionIntentV2)> {
+        if self.poisoned {
+            return Err(invariant_violation("restore history stream is poisoned"));
+        }
+        if self.accepted_mutations != self.declared_mutations {
+            return Err(invariant_violation(
+                "restore history accepted mutation count differs from declaration",
+            ));
+        }
+        encode_additions(
+            &mut self.out,
+            std::slice::from_ref(&self.notice),
+            &self.scope,
+            self.sequence,
+            &self.logical_commit_id,
+        )?;
+        encode_trims(&mut self.out, &[], self.sequence)?;
+        Ok((self.out.finish(), self.notice))
     }
 }
 
@@ -582,6 +857,147 @@ mod tests {
             value: value.map(ToOwned::to_owned),
             expires_at_ms: None,
         }
+    }
+
+    fn restore_request(mode: RestoreMode) -> RestoreRequest {
+        let (base_sequence, prior_history, restore_id) = match mode {
+            RestoreMode::Present => (11, "22".repeat(32), "rst_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            RestoreMode::Absent => (7, "11".repeat(32), "rst_01ARZ3NDEKTSV4RRFFQ69G5FAW"),
+        };
+        RestoreRequest::new(
+            &scope(),
+            mode,
+            7,
+            &"11".repeat(32),
+            base_sequence,
+            &prior_history,
+            restore_id,
+            1_704_164_645,
+            123_456_789,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn restore_request_matches_frozen_present_vector() {
+        let scope = scope();
+        let request = restore_request(RestoreMode::Present);
+        assert_eq!(
+            request.request_digest().unwrap(),
+            "5ca2eaa9002b26c172d91e1ef4a50bbff29ec6c73fd41fd0765032ac92b4e117"
+        );
+        assert_eq!(request.result_sequence(), 12);
+        let operation = request.operation().unwrap();
+        let commit = commit_id(
+            &scope,
+            request.prior_history(),
+            request.result_sequence(),
+            &operation,
+        )
+        .unwrap();
+        assert_eq!(
+            commit,
+            "8d493be3d5f0e7ebedab8a393c9ae74cd6f7cc14a09aa2489159090d2c92b9ba"
+        );
+        let mut history = request.history(&commit, 2).unwrap();
+        history.push(b"\0k", 12, Some(&[0xff, 0])).unwrap();
+        history.push(b"gone", 12, None).unwrap();
+        let (history, notice) = history.finish().unwrap();
+        assert_eq!(
+            std::str::from_utf8(notice.payload()).unwrap(),
+            "{\"restoreId\":\"rst_01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"mode\":\"present\",\"sourceLogicalSequence\":7,\"sourceLogicalHistory\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"resultLogicalSequence\":12,\"requestedAt\":\"2024-01-02T03:04:05.123456789Z\"}"
+        );
+        assert_eq!(
+            history,
+            "e2b1640790b1dfbd54ef7fd5a66ef6f3b38924530931324923d19dd3c2f0c324"
+        );
+    }
+
+    #[test]
+    fn restore_absent_matches_frozen_vector_and_history_rejects_retry_after_invalid_tuple() {
+        let scope = scope();
+        let request = restore_request(RestoreMode::Absent);
+        assert_eq!(
+            request.request_digest().unwrap(),
+            "97b4a7504ddd16ad12aca79bc08d174592f1920078505b1e7716a649d1099991"
+        );
+        let commit = commit_id(
+            &scope,
+            request.prior_history(),
+            request.result_sequence(),
+            &request.operation().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            commit,
+            "7f462773006e779269fcb22df167e9199e2b2db8c299600a5626d87fc69284ce"
+        );
+        let mut history = request.history(&commit, 1).unwrap();
+        history.push(&[0x80], 8, Some(&[0, 0xff])).unwrap();
+        let (history, _notice) = history.finish().unwrap();
+        assert_eq!(
+            history,
+            "44445ac1dbdebf4227735d7fcdae2e9370fc3cf9cd73775ef05e252ee9b75cc4"
+        );
+
+        let mut poisoned = request.history(&commit, 1).unwrap();
+        assert!(poisoned.push(b"a", 7, Some(b"invalid")).is_err());
+        assert!(
+            poisoned
+                .push(b"b", 8, Some(b"valid-after-invalid"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn restore_timestamp_is_exact_utc9_and_invalid_request_inputs_fail() {
+        let request = restore_request(RestoreMode::Present);
+        assert_eq!(
+            request.requested_at_utc9().unwrap(),
+            "2024-01-02T03:04:05.123456789Z"
+        );
+        assert!(
+            RestoreRequest::new(
+                &scope(),
+                RestoreMode::Present,
+                7,
+                &"11".repeat(32),
+                11,
+                &"22".repeat(32),
+                "restore-01900000-0000-7000-8000-000000000001",
+                0,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            RestoreRequest::new(
+                &scope(),
+                RestoreMode::Present,
+                7,
+                &"11".repeat(32),
+                11,
+                &"22".repeat(32),
+                "rst_01arz3ndektsv4rrffq69g5fav",
+                0,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            RestoreRequest::new(
+                &scope(),
+                RestoreMode::Present,
+                7,
+                &"11".repeat(32),
+                11,
+                &"22".repeat(32),
+                "rst_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                0,
+                1_000_000_000,
+            )
+            .is_err()
+        );
     }
 
     #[test]

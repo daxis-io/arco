@@ -664,10 +664,14 @@ async fn exact_half_open_boundaries_and_fail_only_budget() {
     assert!(page.next.is_some());
 }
 
+#[derive(Default)]
 struct PutFaultBackend {
     inner: MemoryBackend,
     lost: std::sync::atomic::AtomicBool,
     puts: std::sync::atomic::AtomicUsize,
+    ranges: std::sync::atomic::AtomicUsize,
+    version_bytes: std::sync::atomic::AtomicUsize,
+    oversized_version: std::sync::atomic::AtomicBool,
     gate: Option<tokio::sync::Barrier>,
 }
 #[async_trait]
@@ -676,6 +680,8 @@ impl arco_core::storage::StorageBackend for PutFaultBackend {
         self.inner.get(path).await
     }
     async fn get_range(&self, path: &str, range: std::ops::Range<u64>) -> arco_core::Result<Bytes> {
+        self.ranges
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.get_range(path, range).await
     }
     async fn put(
@@ -691,7 +697,16 @@ impl arco_core::storage::StorageBackend for PutFaultBackend {
                 gate.wait().await;
             }
         }
-        let result = self.inner.put(path, bytes, condition).await?;
+        let mut result = self.inner.put(path, bytes, condition).await?;
+        let version = match &mut result {
+            WriteResult::Success { version } => version,
+            WriteResult::PreconditionFailed { current_version } => current_version,
+        };
+        if self.oversized_version.load(SeqCst) {
+            version.reserve_exact(40 * 1024 * 1024);
+        }
+        self.version_bytes
+            .fetch_add(size_of::<WriteResult>() + version.capacity(), SeqCst);
         if self.lost.swap(false, SeqCst) {
             return Err(arco_core::Error::storage(
                 "injected lost directory PUT response after persistence",
@@ -725,6 +740,9 @@ async fn rebuild_reconciles_lost_put_and_competing_identical_writers() {
             lost: std::sync::atomic::AtomicBool::new(lost),
             puts: std::sync::atomic::AtomicUsize::new(0),
             gate: (!lost).then(|| tokio::sync::Barrier::new(2)),
+            ranges: std::sync::atomic::AtomicUsize::new(0),
+            version_bytes: std::sync::atomic::AtomicUsize::new(0),
+            oversized_version: std::sync::atomic::AtomicBool::new(false),
         });
         let dir = Directory::new(
             ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
@@ -1076,4 +1094,195 @@ async fn external_fence_reuse_respects_entry_and_payload_admission_limits() {
         total_budget.objects, 4,
         "aggregate overflow falls back to reading"
     );
+}
+
+#[tokio::test]
+async fn retained_role_rejects_cross_role_roots_pages_and_updates_in_both_directions() {
+    let storage =
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let ordinary = Directory::new(storage.clone(), &scope).unwrap();
+    let retained = Directory::retained_reference(storage, &scope).unwrap();
+    let ordinary_root = build(&ordinary, 1).await;
+    let retained_root = build(&retained, 1).await;
+    for (target, own, foreign, foreign_root) in [
+        (&ordinary, &ordinary_root, &retained, &retained_root),
+        (&retained, &retained_root, &ordinary, &ordinary_root),
+    ] {
+        assert!(target.decode_root(&foreign_root.encode()).is_err());
+        assert!(
+            target
+                .lookup(foreign_root, &leaf(0).first, &mut ReadBudget::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            target
+                .update(foreign_root, &[], &mut ReadBudget::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            target
+                .verify_update(own, foreign_root, &[], &mut ReadBudget::default())
+                .await
+                .is_err()
+        );
+        assert!(
+            target
+                .verify_update(foreign_root, own, &[], &mut ReadBudget::default())
+                .await
+                .is_err()
+        );
+        // Replacing the root scope alone cannot make a foreign page authentic,
+        // even when its bytes exist at the target role's expected path.
+        let bytes = foreign
+            .storage
+            .get(&foreign.path("pages", &foreign_root.node.digest))
+            .await
+            .unwrap();
+        target
+            .storage
+            .put(
+                &target.path("pages", &foreign_root.node.digest),
+                bytes,
+                AuthorityWritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let forged = Root {
+            scope: target.scope,
+            node: foreign_root.node,
+        };
+        assert!(
+            target
+                .lookup(&forged, &leaf(0).first, &mut ReadBudget::default())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_directory_workspace_admission_precedes_reads_and_updates() {
+    use crate::workspace_io_budget::{OPERATIONS, WorkspaceIoBudget};
+    use std::sync::atomic::Ordering::SeqCst;
+    let backend = Arc::new(PutFaultBackend::default());
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let dir =
+        Directory::retained_reference(storage, &StateScope::new("tenant", "workspace", "catalog"))
+            .unwrap();
+    let old = dir.empty_root().await.unwrap();
+    let edit = update::Edit {
+        old: None,
+        new: vec![Leaf {
+            first: vec![1; 32],
+            last: vec![1; 32],
+            rows: 1,
+            bytes: 1,
+            digest: [1; 32],
+        }],
+    };
+    for mutation in [false, true] {
+        backend.puts.store(0, SeqCst);
+        backend.ranges.store(0, SeqCst);
+        let mut workspace = WorkspaceIoBudget::new();
+        workspace.charge_operations(OPERATIONS).unwrap();
+        let mut budget = ReadBudget::with_workspace(&mut workspace);
+        let result = if mutation {
+            dir.update(&old, std::slice::from_ref(&edit), &mut budget)
+                .await
+                .map(|_| ())
+        } else {
+            dir.lookup(&old, &[1; 32], &mut budget).await.map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(CatalogError::MaintenanceBackpressure { .. })
+        ));
+        assert_eq!(backend.puts.load(SeqCst), 0);
+        assert_eq!(backend.ranges.load(SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn retained_directory_workspace_charges_update_collision_and_verifier_io() {
+    use crate::workspace_io_budget::WorkspaceIoBudget;
+    use std::sync::atomic::Ordering::SeqCst;
+    let backend = Arc::new(PutFaultBackend::default());
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let dir =
+        Directory::retained_reference(storage, &StateScope::new("tenant", "workspace", "catalog"))
+            .unwrap();
+    let old = dir.empty_root().await.unwrap();
+    let edits = [update::Edit {
+        old: None,
+        new: vec![Leaf {
+            first: vec![1; 32],
+            last: vec![1; 32],
+            rows: 1,
+            bytes: 1,
+            digest: [1; 32],
+        }],
+    }];
+    let mut previous_root = None;
+    for collision in [false, true] {
+        backend.puts.store(0, SeqCst);
+        backend.ranges.store(0, SeqCst);
+        backend.version_bytes.store(0, SeqCst);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut budget = ReadBudget::with_workspace(&mut workspace);
+        let new = dir.update(&old, &edits, &mut budget).await.unwrap();
+        let before_verification = backend.ranges.load(SeqCst);
+        dir.verify_update(&old, &new, &edits, &mut budget)
+            .await
+            .unwrap();
+        assert!(backend.ranges.load(SeqCst) > before_verification);
+        drop(budget);
+        let accounting = workspace.test_accounting();
+        assert_eq!(
+            accounting.1,
+            backend.puts.load(SeqCst) + backend.ranges.load(SeqCst)
+        );
+        assert_eq!(accounting.3, backend.version_bytes.load(SeqCst));
+        assert!(accounting.0 > accounting.3);
+        if collision {
+            assert_eq!(Some(&new), previous_root.as_ref());
+        }
+        previous_root = Some(new);
+    }
+}
+
+#[tokio::test]
+async fn retained_directory_workspace_rejects_oversized_put_metadata() {
+    use crate::workspace_io_budget::{METADATA_BYTES, WorkspaceIoBudget};
+    use std::sync::atomic::Ordering::SeqCst;
+    let backend = Arc::new(PutFaultBackend::default());
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let dir =
+        Directory::retained_reference(storage, &StateScope::new("tenant", "workspace", "catalog"))
+            .unwrap();
+    let old = dir.empty_root().await.unwrap();
+    backend.oversized_version.store(true, SeqCst);
+    let edits = [update::Edit {
+        old: None,
+        new: vec![Leaf {
+            first: vec![1; 32],
+            last: vec![1; 32],
+            rows: 1,
+            bytes: 1,
+            digest: [1; 32],
+        }],
+    }];
+    let mut workspace = WorkspaceIoBudget::new();
+    assert!(
+        dir.update(
+            &old,
+            &edits,
+            &mut ReadBudget::with_workspace(&mut workspace)
+        )
+        .await
+        .is_err()
+    );
+    assert!(workspace.test_accounting().0 > METADATA_BYTES);
 }

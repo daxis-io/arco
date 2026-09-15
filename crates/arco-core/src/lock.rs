@@ -37,7 +37,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::publish::{FencingToken, PermitIssuer};
-use crate::storage::{StorageBackend, WritePrecondition, WriteResult};
+use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+
+/// Borrowed metadata returned by bounded lock I/O.
+#[derive(Debug, Clone, Copy)]
+pub enum LockResponseMetadata<'a> {
+    /// Metadata returned by a HEAD call.
+    Head(&'a ObjectMeta),
+    /// Metadata returned by a conditional PUT, including a failed precondition.
+    Write(&'a WriteResult),
+}
+
+type MetadataObserver<'a> = dyn FnMut(LockResponseMetadata<'_>) -> Result<()> + Send + 'a;
 
 /// Default lock TTL (30 seconds).
 pub const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(30);
@@ -120,6 +131,7 @@ pub struct DistributedLock<S: StorageBackend + ?Sized> {
     storage: Arc<S>,
     lock_path: String,
     holder_id: String,
+    bounded_records: bool,
 }
 
 // Manual Clone implementation to avoid requiring S: Clone
@@ -130,6 +142,7 @@ impl<S: StorageBackend + ?Sized> Clone for DistributedLock<S> {
             storage: Arc::clone(&self.storage),
             lock_path: self.lock_path.clone(),
             holder_id: self.holder_id.clone(),
+            bounded_records: self.bounded_records,
         }
     }
 }
@@ -144,7 +157,18 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
             storage,
             lock_path: lock_path.into(),
             holder_id: crate::fresh_nonce().to_string(),
+            bounded_records: false,
         }
+    }
+
+    /// Restricts lock records to 64 KiB and uses length-plus-one range probes.
+    ///
+    /// Returned guards require explicit release. Dropping a guard leaves expiry
+    /// to its TTL, avoiding background I/O outside the caller's request budget.
+    #[must_use]
+    pub fn with_bounded_records(mut self) -> Self {
+        self.bounded_records = true;
+        self
     }
 
     /// Returns the holder ID for this lock instance.
@@ -173,11 +197,31 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
         max_retries: u32,
         operation: Option<String>,
     ) -> Result<LockGuard<S>> {
+        self.acquire_inner(ttl, max_retries, operation, None).await
+    }
+
+    async fn acquire_inner(
+        &self,
+        ttl: Duration,
+        max_retries: u32,
+        operation: Option<String>,
+        mut observer: Option<&mut MetadataObserver<'_>>,
+    ) -> Result<LockGuard<S>> {
+        // Reject caller payloads before retry clones or JSON escaping allocate.
+        // The encoded check below still enforces the complete record ceiling.
+        if self.bounded_records {
+            if let Some(operation) = &operation {
+                check_lock_record_size(true, operation.len().max(1))?;
+            }
+        }
         let mut attempts = 0;
         let mut backoff = BACKOFF_BASE;
 
         loop {
-            match self.try_acquire(ttl, operation.clone()).await {
+            match self
+                .try_acquire(ttl, operation.clone(), &mut observer)
+                .await
+            {
                 Ok(guard) => return Ok(guard),
                 Err(LockError::AlreadyHeld(holder)) => {
                     attempts += 1;
@@ -198,11 +242,36 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
         }
     }
 
+    /// Acquires a bounded-record lock, charging returned HEAD and PUT metadata before its next I/O.
+    ///
+    /// The caller admits operation and range ceilings before calling. The
+    /// observer charges actual metadata ownership and may stop acquisition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unbounded lock, observer rejection, or acquisition failure.
+    pub async fn acquire_with_operation_observing_metadata(
+        &self,
+        ttl: Duration,
+        max_retries: u32,
+        operation: Option<String>,
+        observer: &mut MetadataObserver<'_>,
+    ) -> Result<LockGuard<S>> {
+        if !self.bounded_records {
+            return Err(Error::InvalidInput(
+                "metadata observation requires bounded lock records".into(),
+            ));
+        }
+        self.acquire_inner(ttl, max_retries, operation, Some(observer))
+            .await
+    }
+
     /// Attempts to acquire the lock once (no retries).
     async fn try_acquire(
         &self,
         ttl: Duration,
         operation: Option<String>,
+        observer: &mut Option<&mut MetadataObserver<'_>>,
     ) -> std::result::Result<LockGuard<S>, LockError> {
         // First, try to create lock with DoesNotExist precondition
         // New locks start with sequence_number = 1
@@ -215,12 +284,17 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
             })
         })?);
 
-        match self
+        check_lock_record_size(self.bounded_records, lock_bytes.len())
+            .map_err(LockError::Storage)?;
+        let result = self
             .storage
             .put(&self.lock_path, lock_bytes, WritePrecondition::DoesNotExist)
             .await
-            .map_err(LockError::Storage)?
-        {
+            .map_err(LockError::Storage)?;
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(LockResponseMetadata::Write(&result)).map_err(LockError::Storage)?;
+        }
+        match result {
             WriteResult::Success { version } => {
                 return Ok(LockGuard {
                     storage: self.storage.clone(),
@@ -229,6 +303,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                     version,
                     fencing_token: FencingToken::new(1),
                     released: false,
+                    bounded_records: self.bounded_records,
                 });
             }
             WriteResult::PreconditionFailed { .. } => {
@@ -253,6 +328,9 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
             return Err(LockError::AlreadyHeld("race".into()));
         };
 
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(LockResponseMetadata::Head(&meta)).map_err(LockError::Storage)?;
+        }
         let existing = self.read_lock().await.map_err(LockError::Storage)?;
 
         match existing {
@@ -270,9 +348,11 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                         })
                     })?);
 
+                check_lock_record_size(self.bounded_records, new_lock_bytes.len())
+                    .map_err(LockError::Storage)?;
                 // This ensures atomicity: if another writer took over after our HEAD,
                 // the CAS will fail and we'll retry.
-                match self
+                let result = self
                     .storage
                     .put(
                         &self.lock_path,
@@ -280,8 +360,11 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                         WritePrecondition::MatchesVersion(meta.version),
                     )
                     .await
-                    .map_err(LockError::Storage)?
-                {
+                    .map_err(LockError::Storage)?;
+                if let Some(observer) = observer.as_deref_mut() {
+                    observer(LockResponseMetadata::Write(&result)).map_err(LockError::Storage)?;
+                }
+                match result {
                     WriteResult::Success { version } => Ok(LockGuard {
                         storage: self.storage.clone(),
                         lock_path: self.lock_path.clone(),
@@ -289,6 +372,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                         version,
                         fencing_token: FencingToken::new(new_sequence),
                         released: false,
+                        bounded_records: self.bounded_records,
                     }),
                     WriteResult::PreconditionFailed { .. } => {
                         // Someone else took it or lock changed - retry
@@ -309,7 +393,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
 
     /// Reads the current lock info, if any.
     async fn read_lock(&self) -> Result<Option<LockInfo>> {
-        match self.storage.get(&self.lock_path).await {
+        match read_lock_bytes(self.storage.as_ref(), &self.lock_path, self.bounded_records).await {
             Ok(data) => {
                 let info: LockInfo =
                     serde_json::from_slice(&data).map_err(|e| Error::Internal {
@@ -362,6 +446,7 @@ impl<S: StorageBackend + ?Sized> DistributedLock<S> {
                 })?,
             );
 
+        check_lock_record_size(self.bounded_records, broken_bytes.len())?;
         match self
             .storage
             .put(
@@ -426,6 +511,7 @@ pub struct LockGuard<S: StorageBackend + ?Sized> {
     /// Fencing token from lock acquisition (for distributed fencing).
     fencing_token: FencingToken,
     released: bool,
+    bounded_records: bool,
 }
 
 impl<S: StorageBackend + ?Sized> LockGuard<S> {
@@ -469,7 +555,24 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     ///
     /// Returns an error if the lock could not be released.
     pub async fn release(mut self) -> Result<()> {
-        self.do_release().await
+        self.do_release(None).await
+    }
+
+    /// Releases a bounded lock while charging returned PUT metadata.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unbounded guard, observer rejection, or release failure.
+    pub async fn release_observing_metadata(
+        mut self,
+        observer: &mut MetadataObserver<'_>,
+    ) -> Result<()> {
+        if !self.bounded_records {
+            return Err(Error::InvalidInput(
+                "metadata observation requires bounded lock records".into(),
+            ));
+        }
+        self.do_release(Some(observer)).await
     }
 
     /// Internal release implementation.
@@ -477,7 +580,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     /// Uses CAS to write an expired lock record instead of unconditional delete.
     /// This prevents deleting a new holder's lock if takeover happened between
     /// our ownership check and the release operation.
-    async fn do_release(&mut self) -> Result<()> {
+    async fn do_release(&mut self, observer: Option<&mut MetadataObserver<'_>>) -> Result<()> {
         if self.released {
             return Ok(());
         }
@@ -502,6 +605,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                         }
                     })?);
 
+                check_lock_record_size(self.bounded_records, expired_bytes.len())?;
                 // CAS write with our version - if another holder took over,
                 // this fails and we leave their lock intact.
                 //
@@ -511,7 +615,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                 //
                 // On PreconditionFailed: Another holder took over - don't touch
                 // their lock. This is expected in takeover scenarios.
-                let _ = self
+                let result = self
                     .storage
                     .put(
                         &self.lock_path,
@@ -519,6 +623,9 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                         WritePrecondition::MatchesVersion(self.version.clone()),
                     )
                     .await?;
+                if let Some(observer) = observer {
+                    observer(LockResponseMetadata::Write(&result))?;
+                }
             }
         }
 
@@ -528,7 +635,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
 
     /// Reads the current lock info.
     async fn read_lock(&self) -> Result<Option<LockInfo>> {
-        match self.storage.get(&self.lock_path).await {
+        match read_lock_bytes(self.storage.as_ref(), &self.lock_path, self.bounded_records).await {
             Ok(data) => {
                 let info: LockInfo =
                     serde_json::from_slice(&data).map_err(|e| Error::Internal {
@@ -541,6 +648,24 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
         }
     }
 
+    /// Renews a bounded-record lock, charging returned HEAD and PUT metadata before further I/O.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unbounded guard, observer rejection, or a lost lease.
+    pub async fn extend_observing_metadata(
+        &mut self,
+        additional_ttl: Duration,
+        observer: &mut MetadataObserver<'_>,
+    ) -> Result<()> {
+        if !self.bounded_records {
+            return Err(Error::InvalidInput(
+                "metadata observation requires bounded lock records".into(),
+            ));
+        }
+        self.extend_inner(additional_ttl, Some(observer)).await
+    }
+
     /// Extends the lock TTL.
     ///
     /// This is useful for long-running operations that need to hold
@@ -550,6 +675,14 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
     ///
     /// Returns an error if the lock is no longer held by this guard.
     pub async fn extend(&mut self, additional_ttl: Duration) -> Result<()> {
+        self.extend_inner(additional_ttl, None).await
+    }
+
+    async fn extend_inner(
+        &mut self,
+        additional_ttl: Duration,
+        mut observer: Option<&mut MetadataObserver<'_>>,
+    ) -> Result<()> {
         // Read the version first, then the contents, and bind the renewal to
         // that earlier version with CAS. Reading the contents first would let a
         // stale holder overwrite a newer owner if takeover happened before HEAD.
@@ -558,6 +691,9 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
             .head(&self.lock_path)
             .await?
             .ok_or_else(|| Error::NotFound(self.lock_path.clone()))?;
+        if let Some(observer) = observer.as_deref_mut() {
+            observer(LockResponseMetadata::Head(&meta))?;
+        }
         let info = self
             .read_lock()
             .await?
@@ -581,15 +717,19 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
                 message: format!("serialize lock: {e}"),
             })?);
 
-        match self
+        check_lock_record_size(self.bounded_records, lock_bytes.len())?;
+        let result = self
             .storage
             .put(
                 &self.lock_path,
                 lock_bytes,
                 WritePrecondition::MatchesVersion(meta.version),
             )
-            .await?
-        {
+            .await?;
+        if let Some(observer) = observer {
+            observer(LockResponseMetadata::Write(&result))?;
+        }
+        match result {
             WriteResult::Success { version } => {
                 self.version = version;
                 Ok(())
@@ -603,7 +743,7 @@ impl<S: StorageBackend + ?Sized> LockGuard<S> {
 
 impl<S: StorageBackend + ?Sized> Drop for LockGuard<S> {
     fn drop(&mut self) {
-        if !self.released {
+        if !self.released && !self.bounded_records {
             // Best-effort async release in destructor.
             // In practice, prefer calling release() explicitly.
             //
@@ -655,6 +795,30 @@ impl<S: StorageBackend + ?Sized> Drop for LockGuard<S> {
     }
 }
 
+const BOUNDED_LOCK_RECORD_BYTES: usize = 64 * 1024;
+
+fn check_lock_record_size(bounded: bool, size: usize) -> Result<()> {
+    if bounded && (size == 0 || size > BOUNDED_LOCK_RECORD_BYTES) {
+        return Err(Error::InvalidInput("lock record exceeds 64 KiB".into()));
+    }
+    Ok(())
+}
+
+async fn read_lock_bytes<S: StorageBackend + ?Sized>(
+    storage: &S,
+    path: &str,
+    bounded: bool,
+) -> Result<Bytes> {
+    let bytes = if bounded {
+        let probe_end = BOUNDED_LOCK_RECORD_BYTES as u64 + 1;
+        storage.get_range(path, 0..probe_end).await?
+    } else {
+        storage.get(path).await?
+    };
+    check_lock_record_size(bounded, bytes.len())?;
+    Ok(bytes)
+}
+
 /// Internal lock acquisition errors.
 enum LockError {
     AlreadyHeld(String),
@@ -694,11 +858,13 @@ mod tests {
 
     use tokio::sync::Notify;
 
-    use crate::storage::{MemoryBackend, ObjectMeta};
+    use crate::storage::MemoryBackend;
 
     #[derive(Debug, Default)]
     struct PauseAfterGetBackend {
         inner: MemoryBackend,
+        unbounded_gets: std::sync::atomic::AtomicUsize,
+        ranges: Mutex<Vec<Range<u64>>>,
         pause_path: Mutex<Option<String>>,
         get_reached: Notify,
         resume_get: Notify,
@@ -721,6 +887,8 @@ mod tests {
     #[async_trait::async_trait]
     impl StorageBackend for PauseAfterGetBackend {
         async fn get(&self, path: &str) -> Result<Bytes> {
+            self.unbounded_gets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let bytes = self.inner.get(path).await?;
             let should_pause = {
                 let mut pause_path = self.pause_path.lock().expect("pause path");
@@ -739,6 +907,7 @@ mod tests {
         }
 
         async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+            self.ranges.lock().expect("ranges").push(range.clone());
             self.inner.get_range(path, range).await
         }
 
@@ -766,6 +935,164 @@ mod tests {
         async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
             self.inner.signed_url(path, expiry).await
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_lock_head_admission_stops_before_range_or_cas() {
+        let backend = Arc::new(PauseAfterGetBackend::default());
+        let lock = DistributedLock::new(backend.clone(), "observed.lock").with_bounded_records();
+        let expired = LockInfo::new("previous", Duration::ZERO, 1);
+        backend
+            .inner
+            .put(
+                "observed.lock",
+                Bytes::from(serde_json::to_vec(&expired).expect("expired")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("fixture");
+        let mut heads = 0;
+        let denied = lock
+            .acquire_with_operation_observing_metadata(
+                Duration::from_secs(30),
+                5,
+                None,
+                &mut |metadata| {
+                    if matches!(metadata, LockResponseMetadata::Write(_)) {
+                        return Ok(());
+                    }
+                    heads += 1;
+                    Err(Error::InvalidInput("metadata budget exhausted".into()))
+                },
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(Error::InvalidInput(_))),
+            "HEAD admission must stop acquisition"
+        );
+        assert_eq!(heads, 1);
+        assert!(backend.ranges.lock().expect("ranges").is_empty());
+        let mut guard = lock
+            .acquire_with_operation_observing_metadata(
+                Duration::from_secs(30),
+                5,
+                None,
+                &mut |metadata| {
+                    if matches!(metadata, LockResponseMetadata::Write(_)) {
+                        return Ok(());
+                    }
+                    heads += 1;
+                    Ok(())
+                },
+            )
+            .await
+            .expect("admitted acquire");
+        assert_eq!(heads, 2);
+        let before = backend.ranges.lock().expect("ranges").len();
+        assert!(
+            guard
+                .extend_observing_metadata(Duration::from_secs(30), &mut |metadata| {
+                    if matches!(metadata, LockResponseMetadata::Write(_)) {
+                        return Ok(());
+                    }
+                    heads += 1;
+                    Err(Error::InvalidInput("metadata budget exhausted".into()))
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(heads, 3);
+        assert_eq!(backend.ranges.lock().expect("ranges").len(), before);
+        guard
+            .extend_observing_metadata(Duration::from_secs(30), &mut |metadata| {
+                if matches!(metadata, LockResponseMetadata::Write(_)) {
+                    return Ok(());
+                }
+                heads += 1;
+                Ok(())
+            })
+            .await
+            .expect("admitted renewal");
+        assert_eq!(heads, 4);
+        guard.release().await.expect("release");
+        let fresh = DistributedLock::new(backend, "fresh.lock").with_bounded_records();
+        let guard = fresh
+            .acquire_with_operation_observing_metadata(
+                Duration::from_secs(30),
+                5,
+                None,
+                &mut |metadata| {
+                    if matches!(metadata, LockResponseMetadata::Write(_)) {
+                        return Ok(());
+                    }
+                    panic!("uncontended acquisition performs no HEAD");
+                },
+            )
+            .await
+            .expect("fresh acquire");
+        guard.release().await.expect("fresh release");
+    }
+
+    #[tokio::test]
+    async fn bounded_lock_records_cover_takeover_renewal_release_and_drop() {
+        use std::sync::atomic::Ordering;
+        let backend = Arc::new(PauseAfterGetBackend::default());
+        let lock = DistributedLock::new(backend.clone(), "bounded.lock").with_bounded_records();
+        let mut guard = lock
+            .acquire(Duration::from_secs(30), 5)
+            .await
+            .expect("first acquire");
+        guard.extend(Duration::from_secs(30)).await.expect("renew");
+        guard.release().await.expect("release");
+        let guard = lock
+            .acquire(Duration::from_secs(30), 5)
+            .await
+            .expect("takeover expired record");
+        assert_eq!(
+            backend.unbounded_gets.load(Ordering::Relaxed),
+            0,
+            "bounded lock must never read a whole object"
+        );
+        assert_eq!(
+            backend.ranges.lock().expect("ranges").as_slice(),
+            &[0..65537, 0..65537, 0..65537]
+        );
+        let before = backend.ranges.lock().expect("ranges").len();
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            backend.ranges.lock().expect("ranges").len(),
+            before,
+            "dropped bounded guards expire by TTL without unaccounted background I/O"
+        );
+        assert_eq!(backend.unbounded_gets.load(Ordering::Relaxed), 0);
+        let mut oversized = LockInfo::new("old", Duration::ZERO, 1);
+        oversized.operation = Some("x".repeat(65536));
+        backend
+            .inner
+            .put(
+                "oversized.lock",
+                Bytes::from(serde_json::to_vec(&oversized).expect("oversized JSON")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("fixture");
+        assert!(
+            DistributedLock::new(backend.clone(), "oversized.lock")
+                .with_bounded_records()
+                .acquire(Duration::from_secs(30), 5)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.unbounded_gets.load(Ordering::Relaxed), 0);
+        assert!(
+            backend
+                .ranges
+                .lock()
+                .expect("ranges")
+                .iter()
+                .all(|range| range == &(0..65537))
+        );
     }
 
     #[tokio::test]

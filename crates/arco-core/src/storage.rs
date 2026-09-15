@@ -103,6 +103,39 @@ impl ListPage {
     }
 }
 
+/// Backing ownership reported by the adapter that produced a range response.
+///
+/// This is a trusted adapter contract, not an inference from the visible length.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BytesBackingOwnership {
+    /// The adapter cannot establish the backing's ownership or capacity.
+    Unknown,
+    /// A shared handle originating in backend storage, even after object deletion.
+    BackendOriginShared {
+        /// Visible span held by this response; not its backing capacity.
+        held_len: usize,
+    },
+    /// The adapter allocated the backing for this request.
+    NewRequestOwned {
+        /// Capacity observed at the backing allocation site.
+        actual_capacity: usize,
+    },
+    /// The adapter copied bytes into a backing allocated for this request.
+    CopiedRequestOwned {
+        /// Capacity observed at the copy's allocation site.
+        actual_capacity: usize,
+    },
+}
+
+/// A range response paired with its adapter's backing-ownership statement.
+#[derive(Debug)]
+pub struct ClassifiedBytes {
+    /// The exact returned range.
+    pub bytes: Bytes,
+    /// The ownership statement for this response's backing.
+    pub ownership: BytesBackingOwnership,
+}
+
 /// Storage backend trait for object storage.
 ///
 /// All storage backends (GCS, S3, memory) implement this trait.
@@ -120,6 +153,23 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Returns `Error::InvalidInput` if end < start.
     /// Clamps end to object length if end > length.
     async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes>;
+
+    /// Reads a range with an explicit backing-ownership statement.
+    ///
+    /// Existing adapters preserve their range behavior and report unknown
+    /// ownership. A bounded consumer must reject unknown ownership before use.
+    /// Adapters reporting owned capacity must observe it at the allocation site;
+    /// the returned length alone does not establish that capacity.
+    async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<ClassifiedBytes> {
+        Ok(ClassifiedBytes {
+            bytes: self.get_range(path, range).await?,
+            ownership: BytesBackingOwnership::Unknown,
+        })
+    }
 
     /// Writes with optional precondition.
     ///
@@ -268,6 +318,21 @@ impl MemoryBackend {
 
 #[async_trait]
 impl StorageBackend for MemoryBackend {
+    async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<ClassifiedBytes> {
+        let bytes = self.get_range(path, range).await?;
+        // get_range slices a clone of the stored inventory, without copying.
+        Ok(ClassifiedBytes {
+            ownership: BytesBackingOwnership::BackendOriginShared {
+                held_len: bytes.len(),
+            },
+            bytes,
+        })
+    }
+
     async fn get(&self, path: &str) -> Result<Bytes> {
         let objects = self.objects.read().map_err(|_| Error::Internal {
             message: "lock poisoned".into(),
@@ -438,6 +503,77 @@ impl StorageBackend for MemoryBackend {
 #[allow(clippy::manual_let_else, clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
+
+    struct UnclassifiedBackend {
+        inner: MemoryBackend,
+        range_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StorageBackend for UnclassifiedBackend {
+        async fn get(&self, path: &str) -> Result<Bytes> {
+            self.inner.get(path).await
+        }
+
+        async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+            self.range_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_range(path, range).await
+        }
+
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            condition: WritePrecondition,
+        ) -> Result<WriteResult> {
+            self.inner.put(path, data, condition).await
+        }
+
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.inner.delete(path).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+
+        async fn signed_url(&self, path: &str, expiry: Duration) -> Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn classified_range_default_never_infers_adapter_ownership() -> Result<()> {
+        let backend = Arc::new(UnclassifiedBackend {
+            inner: MemoryBackend::new(),
+            range_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let scoped = crate::ScopedStorage::new(backend.clone(), "tenant", "workspace")?;
+        scoped
+            .put_raw(
+                "value",
+                Bytes::from_static(b"abc"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?;
+        let authority = crate::ScopedAuthorityStore::new(scoped);
+        let result = authority.get_range_with_ownership("value", 1..9).await?;
+        assert_eq!(result.bytes.as_ref(), b"bc");
+        assert_eq!(result.ownership, BytesBackingOwnership::Unknown);
+        assert_eq!(backend.range_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            authority
+                .get_range_with_ownership("../value", 0..1)
+                .await
+                .is_err()
+        );
+        assert_eq!(backend.range_calls.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
 
     async fn run_precondition_conformance<B: StorageBackend>(
         backend: &B,

@@ -5,7 +5,7 @@ use super::{
     ControlMvpStateStore, ControlMvpTxn, ControlMvpWriteEntry, Result, StagedWrite, StateScope,
     StateToken, StoredValue, TransactionBase, decode_json, directory, encode_json,
     encode_json_limited, encode_segment, invariant_violation, logical_v2, next_logical_sequence,
-    physical, precondition_failed, put_immutable_matching, sha256_hex, valid_raw_digest,
+    physical, precondition_failed, put_immutable_matching, retained, sha256_hex, valid_raw_digest,
     validate_raw_checksum,
 };
 use arco_core::{AuthorityWritePrecondition, WriteResult};
@@ -13,6 +13,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+pub(super) mod restore;
 mod synthetic;
 #[cfg(feature = "test-utils")]
 pub use synthetic::SyntheticKvEntry;
@@ -483,8 +484,41 @@ async fn validate_manifest_artifacts(
     manifest: &Manifest8,
     roots: (&directory::Root, &directory::Root, &directory::Root),
 ) -> Result<()> {
+    validate_manifest_artifacts_with_budget(store, manifest, roots, None).await
+}
+
+async fn bounded_json(
+    store: &ControlMvpStateStore,
+    budget: Option<&mut retained::ReadBudget<'_>>,
+    path: &str,
+    limit: usize,
+    context: &str,
+) -> Result<Bytes> {
+    if let Some(budget) = budget {
+        retained::read_bounded_json(store, budget, path, limit, context).await
+    } else {
+        store.get_json(path, limit).await
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the manifest and its authenticated artifacts are one validation boundary"
+)]
+async fn validate_manifest_artifacts_with_budget(
+    store: &ControlMvpStateStore,
+    manifest: &Manifest8,
+    roots: (&directory::Root, &directory::Root, &directory::Root),
+    mut budget: Option<&mut retained::ReadBudget<'_>>,
+) -> Result<()> {
     if manifest.kind == ManifestKind8::SyntheticGenesis {
-        return synthetic::validate_manifest_witness(store, manifest, roots).await;
+        return synthetic::validate_manifest_witness_with_budget(
+            store,
+            manifest,
+            roots,
+            budget.as_deref_mut(),
+        )
+        .await;
     }
     let transaction_ref = manifest
         .transaction
@@ -494,9 +528,14 @@ async fn validate_manifest_artifacts(
         .transition
         .as_ref()
         .ok_or_else(|| invariant_violation("transaction manifest has no transition reference"))?;
-    let transaction_bytes = store
-        .get_json(&transaction_ref.path, super::MAX_TRANSACTION_JSON_BYTES)
-        .await?;
+    let transaction_bytes = bounded_json(
+        store,
+        budget.as_deref_mut(),
+        &transaction_ref.path,
+        super::MAX_TRANSACTION_JSON_BYTES,
+        "bounded manifest transaction",
+    )
+    .await?;
     validate_raw_checksum(
         &transaction_bytes,
         Some(&transaction_ref.sha256),
@@ -514,9 +553,14 @@ async fn validate_manifest_artifacts(
             "bounded manifest transaction differs from manifest",
         ));
     }
-    let transition_bytes = store
-        .get_json(&transition_ref.path, super::MAX_CONTROL_JSON_BYTES)
-        .await?;
+    let transition_bytes = bounded_json(
+        store,
+        budget.as_deref_mut(),
+        &transition_ref.path,
+        super::MAX_CONTROL_JSON_BYTES,
+        "bounded manifest transition",
+    )
+    .await?;
     validate_raw_checksum(
         &transition_bytes,
         Some(&transition_ref.sha256),
@@ -559,7 +603,8 @@ async fn validate_manifest_artifacts(
     ) {
         (None, true) => {}
         (Some(source), false) => {
-            let resolved = load_projection_source(store, &source.sha256).await?;
+            let resolved =
+                load_projection_source_with_budget(store, &source.sha256, budget).await?;
             if source.path
                 != format!(
                     "{}/projection-sources/{}.json",
@@ -1001,6 +1046,7 @@ async fn verify_candidate_transition(
     transaction: &Transaction8,
     transition: &Transition8,
     work: &mut BoundedCommitWork,
+    mut retained_budget: Option<&mut retained::ReadBudget<'_>>,
 ) -> Result<Vec<ControlMvpWriteEntry>> {
     let candidate_sequence = next_logical_sequence(base.logical_sequence(), "bounded verifier")?;
     if transition.format_version != AUTHORITY_FORMAT
@@ -1034,7 +1080,6 @@ async fn verify_candidate_transition(
         ));
     }
     let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
-    let mut budget = directory::ReadBudget::default();
     let expected = [
         (physical::Role::Kv, &base.kv_root, candidate_kv),
         (
@@ -1083,13 +1128,27 @@ async fn verify_candidate_transition(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        directory
-            .verify_update(old_root, new_root, &edits, &mut budget)
-            .await?;
+        if let Some(retained_budget) = retained_budget.as_deref_mut() {
+            let mut budget = directory::ReadBudget::with_retained(retained_budget);
+            directory
+                .verify_update(old_root, new_root, &edits, &mut budget)
+                .await?;
+        } else {
+            let mut budget = directory::ReadBudget::default();
+            directory
+                .verify_update(old_root, new_root, &edits, &mut budget)
+                .await?;
+        }
         for edit in edits {
             if let Some(old) = edit.old {
                 base.selection().select(&old)?;
-                let rows = store.resolve_physical_block(role, &old).await?;
+                let rows = if let Some(retained_budget) = retained_budget.as_deref_mut() {
+                    store
+                        .resolve_physical_block_bounded(role, &old, retained_budget)
+                        .await?
+                } else {
+                    store.resolve_physical_block(role, &old).await?
+                };
                 super::cost::bounded_work(super::cost::BoundedWork {
                     transition_proof_rows: rows.len() as u64,
                     ..Default::default()
@@ -1109,7 +1168,13 @@ async fn verify_candidate_transition(
             }
             for new in edit.new {
                 work.verify_rewrite(new.digest)?;
-                let rows = store.resolve_physical_block(role, &new).await?;
+                let rows = if let Some(retained_budget) = retained_budget.as_deref_mut() {
+                    store
+                        .resolve_physical_block_bounded(role, &new, retained_budget)
+                        .await?
+                } else {
+                    store.resolve_physical_block(role, &new).await?
+                };
                 super::cost::bounded_work(super::cost::BoundedWork {
                     transition_proof_rows: rows.len() as u64,
                     ..Default::default()
@@ -1143,6 +1208,7 @@ async fn verify_candidate_transition(
         &active_new,
         &delivery_old,
         &delivery_new,
+        retained_budget,
     )
     .await?;
     if logical_v2::history(
@@ -1255,7 +1321,8 @@ fn verify_kv_mutation(
 
 #[allow(
     clippy::too_many_lines,
-    reason = "both outbox indexes are cross-validated in one proof"
+    clippy::too_many_arguments,
+    reason = "both outbox indexes share the same proof and optional retained admission"
 )]
 async fn verify_outbox_mutation(
     store: &ControlMvpStateStore,
@@ -1265,6 +1332,7 @@ async fn verify_outbox_mutation(
     active_new: &BTreeMap<Vec<u8>, ControlMvpSegmentRow>,
     delivery_old: &BTreeMap<Vec<u8>, ControlMvpSegmentRow>,
     delivery_new: &BTreeMap<Vec<u8>, ControlMvpSegmentRow>,
+    mut budget: Option<&mut retained::ReadBudget<'_>>,
 ) -> Result<()> {
     let additions = transaction
         .additions
@@ -1314,7 +1382,12 @@ async fn verify_outbox_mutation(
                 "bounded V2 active addition differs from its envelope",
             ));
         }
-        let source = load_projection_source(store, &outer.source_descriptor_sha256).await?;
+        let source = load_projection_source_with_budget(
+            store,
+            &outer.source_descriptor_sha256,
+            budget.as_deref_mut(),
+        )
+        .await?;
         if source.logical_sequence != transaction.logical_sequence
             || source.logical_commit_id != transaction.logical_commit_id
             || source.kv_root_hex != hex::encode(candidate_kv.encode())
@@ -1954,6 +2027,120 @@ impl Base {
             .map_or_else(|| "", |manifest| manifest.logical_history.as_str())
     }
 
+    /// The exact predecessor witness of an already authenticated manifest.
+    pub(super) fn parent_token(&self, store: &ControlMvpStateStore) -> Result<Option<StateToken>> {
+        let Some(manifest) = &self.manifest else {
+            return Ok(None);
+        };
+        let (Some(id), Some(digest)) = (
+            &manifest.parent_manifest_id,
+            &manifest.parent_manifest_sha256,
+        ) else {
+            return Ok(None);
+        };
+        let sequence = manifest
+            .logical_sequence
+            .checked_sub(1)
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| invariant_violation("bounded parent sequence underflows"))?;
+        Ok(Some(
+            store
+                .token(id.clone(), sequence)
+                .with_manifest_witness(digest.clone()),
+        ))
+    }
+
+    /// Verifies the complete authenticated edge from `parent` to this child.
+    ///
+    /// A parent digest is necessary but does not prove that the child was the
+    /// next logical mutation of that parent.  Retained retry authentication
+    /// uses this path so checksum-consistent corrupt child artifacts cannot
+    /// re-authorize an older source.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the child manifest, frozen artifacts, roots, and parent fences are one proof"
+    )]
+    pub(super) async fn verify_parent_transition(
+        &self,
+        store: &ControlMvpStateStore,
+        parent: &Self,
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<()> {
+        let child = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| invariant_violation("bounded transition child manifest is absent"))?;
+        let parent_manifest = parent
+            .manifest
+            .as_ref()
+            .ok_or_else(|| invariant_violation("bounded transition parent manifest is absent"))?;
+        let parent_digest = parent
+            .manifest_digest
+            .as_deref()
+            .ok_or_else(|| invariant_violation("bounded transition parent digest is absent"))?;
+        if child.parent_manifest_id.as_deref() != Some(parent_manifest.manifest_id.as_str())
+            || child.parent_manifest_sha256.as_deref() != Some(parent_digest)
+            || child.writer_epoch < parent_manifest.writer_epoch
+            || child.reclamation_generation < parent_manifest.reclamation_generation
+        {
+            return Err(invariant_violation(
+                "bounded retained child parent identity or fences differ",
+            ));
+        }
+        let transaction_ref = child.transaction.as_ref().ok_or_else(|| {
+            invariant_violation("bounded retained transition child has no transaction")
+        })?;
+        let transaction_bytes = retained::read_bounded_json(
+            store,
+            budget,
+            &transaction_ref.path,
+            super::MAX_TRANSACTION_JSON_BYTES,
+            "bounded retained transition transaction",
+        )
+        .await?;
+        validate_raw_checksum(
+            &transaction_bytes,
+            Some(&transaction_ref.sha256),
+            "bounded retained transition transaction checksum",
+        )?;
+        let transaction: Transaction8 = decode_json(
+            &transaction_bytes,
+            "bounded retained transition transaction",
+        )?;
+        let transition_ref = child.transition.as_ref().ok_or_else(|| {
+            invariant_violation("bounded retained transition child has no transition")
+        })?;
+        let transition_bytes = retained::read_bounded_json(
+            store,
+            budget,
+            &transition_ref.path,
+            super::MAX_CONTROL_JSON_BYTES,
+            "bounded retained transition proof",
+        )
+        .await?;
+        validate_raw_checksum(
+            &transition_bytes,
+            Some(&transition_ref.sha256),
+            "bounded retained transition proof checksum",
+        )?;
+        let transition: Transition8 =
+            decode_json(&transition_bytes, "bounded retained transition proof")?;
+        let mut work = BoundedCommitWork::default();
+        verify_candidate_transition(
+            store,
+            parent,
+            &self.kv_root,
+            &self.active_id_root,
+            &self.delivery_order_root,
+            &transaction,
+            &transition,
+            &mut work,
+            Some(budget),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub(super) fn token(&self, store: &ControlMvpStateStore) -> Option<StateToken> {
         self.manifest
             .as_ref()
@@ -2416,6 +2603,14 @@ async fn load_projection_source(
     store: &ControlMvpStateStore,
     digest: &str,
 ) -> Result<ProjectionSource8> {
+    load_projection_source_with_budget(store, digest, None).await
+}
+
+async fn load_projection_source_with_budget(
+    store: &ControlMvpStateStore,
+    digest: &str,
+    budget: Option<&mut retained::ReadBudget<'_>>,
+) -> Result<ProjectionSource8> {
     if !valid_raw_digest(digest) {
         return Err(invariant_violation("projection source digest is invalid"));
     }
@@ -2423,7 +2618,14 @@ async fn load_projection_source(
         "{}/projection-sources/{digest}.json",
         store.paths.base_prefix()
     );
-    let bytes = store.get_json(&path, super::MAX_CONTROL_JSON_BYTES).await?;
+    let bytes = bounded_json(
+        store,
+        budget,
+        &path,
+        super::MAX_CONTROL_JSON_BYTES,
+        "bounded projection source",
+    )
+    .await?;
     validate_raw_checksum(&bytes, Some(digest), "bounded projection source checksum")?;
     let source: ProjectionSource8 = decode_json(&bytes, "bounded projection source")?;
     if source.encoding_version != 1
@@ -2991,6 +3193,7 @@ impl ControlMvpStateStore {
             &transaction,
             &transition,
             &mut work,
+            None,
         )
         .await?;
         let transition_path = format!(
@@ -3064,41 +3267,117 @@ impl ControlMvpStateStore {
     }
 
     pub(super) async fn read_bounded_token(&self, token: &StateToken) -> Result<Base> {
-        if token.scope() != &self.scope {
-            return Err(invariant_violation(
-                "bounded retained token scope does not match control MVP store",
-            ));
-        }
         let manifest_bytes = self
             .get_json(
                 &self.paths.manifest_object(token.authority_manifest_id()),
                 super::MAX_CONTROL_JSON_BYTES,
             )
             .await?;
+        self.bounded_base_from_manifest(token, &manifest_bytes, None, None)
+            .await
+    }
+
+    /// Opens a retained source from manifest bytes authenticated by its selected
+    /// retained-reference proof. Ordinary token readers retain their existing
+    /// fetch-and-validate path above.
+    pub(super) async fn read_bounded_token_from_manifest(
+        &self,
+        token: &StateToken,
+        manifest_bytes: &[u8],
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<Base> {
+        self.bounded_base_from_manifest(token, manifest_bytes, Some(budget), None)
+            .await
+    }
+
+    /// Opens a retained source that is also the currently selected authority-8
+    /// HEAD, preserving the authenticated pointer fences without refetching its
+    /// manifest.
+    pub(super) async fn read_bounded_current_from_manifest(
+        &self,
+        token: &StateToken,
+        manifest_bytes: &[u8],
+        pointer: &ControlMvpPointer,
+        pointer_version: String,
+        pointer_bytes: Bytes,
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<Base> {
+        self.bounded_base_from_manifest(
+            token,
+            manifest_bytes,
+            Some(budget),
+            Some((pointer, pointer_version, pointer_bytes)),
+        )
+        .await
+    }
+
+    async fn bounded_base_from_manifest(
+        &self,
+        token: &StateToken,
+        manifest_bytes: &[u8],
+        budget: Option<&mut retained::ReadBudget<'_>>,
+        current: Option<(&ControlMvpPointer, String, Bytes)>,
+    ) -> Result<Base> {
+        if token.scope() != &self.scope {
+            return Err(invariant_violation(
+                "bounded retained token scope does not match control MVP store",
+            ));
+        }
         let digest = token.manifest_witness()?.to_string();
         validate_raw_checksum(
-            &manifest_bytes,
+            manifest_bytes,
             Some(&digest),
             "bounded retained manifest checksum",
         )?;
-        let manifest: Manifest8 = decode_json(&manifest_bytes, "bounded retained manifest")?;
+        let manifest: Manifest8 = decode_json(manifest_bytes, "bounded retained manifest")?;
         manifest.validate(&self.scope, token.authority_manifest_id())?;
         if manifest.logical_sequence != token.logical_sequence() {
             return Err(invariant_violation(
                 "bounded retained token sequence differs from manifest",
             ));
         }
+        if let Some((pointer, _, _)) = &current
+            && (pointer.manifest_id != token.authority_manifest_id()
+                || pointer.logical_sequence != token.logical_sequence()
+                || pointer.manifest_checksum_sha256 != digest
+                || pointer.writer_epoch < manifest.writer_epoch
+                || pointer.reclamation_generation < manifest.reclamation_generation)
+        {
+            return Err(invariant_violation(
+                "bounded HEAD fences or source differ from retained manifest",
+            ));
+        }
         let directory = directory::Directory::new(self.retention.clone(), &self.scope)?;
         let roots = decode_roots(&directory, &manifest)?;
-        validate_manifest_artifacts(self, &manifest, (&roots.0, &roots.1, &roots.2)).await?;
-        let writer_epoch = manifest.writer_epoch;
-        let reclamation_generation = manifest.reclamation_generation;
+        validate_manifest_artifacts_with_budget(
+            self,
+            &manifest,
+            (&roots.0, &roots.1, &roots.2),
+            budget,
+        )
+        .await?;
+        let (pointer_version, pointer_bytes, writer_epoch, reclamation_generation) =
+            if let Some((pointer, version, bytes)) = current {
+                (
+                    Some(version),
+                    Some(bytes.to_vec()),
+                    pointer.writer_epoch,
+                    pointer.reclamation_generation,
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    manifest.writer_epoch,
+                    manifest.reclamation_generation,
+                )
+            };
         base_from_manifest(
             &directory,
             manifest,
             digest,
-            None,
-            None,
+            pointer_version,
+            pointer_bytes,
             writer_epoch,
             reclamation_generation,
         )
@@ -3205,6 +3484,7 @@ impl ControlMvpStateStore {
             &transaction,
             &transition,
             &mut work,
+            None,
         )
         .await?;
         let prior_history = if parent.logical_sequence() == 0 {
@@ -3355,6 +3635,84 @@ mod tests {
 
     use super::*;
     use crate::state_store::{ArcoStateTxn, StateScope, TxnOptions};
+
+    #[tokio::test]
+    async fn retained_outbox_proof_cannot_read_projection_source_after_budget_exhaustion() {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("transaction");
+        txn.set_logical_operation("projection-budget", "test", &"ac".repeat(32))
+            .expect("identity");
+        txn.stage_projection_intent_v2("projection-budget", "test", Bytes::from_static(b"payload"))
+            .await
+            .expect("intent");
+        store.commit_bounded(txn).await.expect("published child");
+        let base = store.pin_bounded_base().await.expect("base");
+        let manifest = base.manifest.as_ref().expect("manifest");
+        let tx_ref = manifest.transaction.as_ref().expect("transaction");
+        let transaction: Transaction8 = decode_json(
+            &store
+                .get_json(&tx_ref.path, super::super::MAX_TRANSACTION_JSON_BYTES)
+                .await
+                .expect("tx"),
+            "test transaction",
+        )
+        .expect("decode");
+        let (active, delivery) = outbox_mutations(
+            &transaction.additions,
+            &[],
+            transaction.logical_sequence,
+            manifest.projection_source.as_ref(),
+        )
+        .expect("rows");
+        let active: BTreeMap<_, _> = active
+            .into_iter()
+            .filter_map(|(key, row)| row.map(|row| (key, row)))
+            .collect();
+        let delivery: BTreeMap<_, _> = delivery
+            .into_iter()
+            .filter_map(|(key, row)| row.map(|row| (key, row)))
+            .collect();
+        for outer in [false, true] {
+            let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+            workspace
+                .charge_operations(4096)
+                .expect("exhaust outer admission");
+            let mut budget = if outer {
+                retained::ReadBudget::with_workspace(&mut workspace)
+            } else {
+                retained::ReadBudget::new()
+            };
+            if !outer {
+                for _ in 0..4096 {
+                    budget.operation().expect("exhaust retained admission");
+                }
+            }
+            let result = verify_outbox_mutation(
+                &store,
+                &base.kv_root,
+                &transaction,
+                &BTreeMap::new(),
+                &active,
+                &BTreeMap::new(),
+                &delivery,
+                Some(&mut budget),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(CatalogError::MaintenanceBackpressure { .. })),
+                "projection-source validation escaped exhausted admission (outer={outer})"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn bounded_empty_base_reads_missing_key() {
@@ -3575,6 +3933,7 @@ mod tests {
                 &transaction,
                 &transition,
                 &mut work,
+                None,
             )
             .await
             .is_err()
@@ -3598,6 +3957,7 @@ mod tests {
                 &transaction,
                 &transition,
                 &mut work,
+                None,
             )
             .await
             .is_err()

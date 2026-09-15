@@ -80,6 +80,21 @@ fn scoped_list_boundary(prefix: &str) -> String {
 }
 
 impl ScopedStorage {
+    /// Reads a scope-relative range with the backend's ownership statement.
+    ///
+    /// # Errors
+    /// Returns path-validation, not-found, invalid-range, or backend errors.
+    pub async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<crate::storage::ClassifiedBytes> {
+        Self::validate_path(path)?;
+        self.backend
+            .get_range_with_ownership(&self.scoped_path(path), range)
+            .await
+    }
+
     /// Creates workspace-scoped storage.
     ///
     /// # Errors
@@ -741,6 +756,14 @@ impl std::fmt::Display for ScopedPath {
 // Allow scoped storage to satisfy StorageBackend for components that expect it.
 #[async_trait]
 impl StorageBackend for ScopedStorage {
+    async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<crate::storage::ClassifiedBytes> {
+        Self::get_range_with_ownership(self, path, range).await
+    }
+
     async fn get(&self, path: &str) -> Result<Bytes> {
         self.get_raw(path).await
     }

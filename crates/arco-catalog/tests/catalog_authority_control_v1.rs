@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "test-utils")]
+use arco_catalog::catalog_authority::{BoundedCatalogTestCommand, CatalogProjectionNotifierV2};
 use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionOutboxAckWriter, ProjectionOutboxWorker,
 };
@@ -46,6 +48,20 @@ struct LoseAcceptedCatalogHeadResponseBackend {
 struct RecordingProjectionNotifier {
     calls: AtomicUsize,
     fail: AtomicBool,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Default)]
+struct NoopProjectionNotifierV2;
+
+#[cfg(feature = "test-utils")]
+impl CatalogProjectionNotifierV2 for NoopProjectionNotifierV2 {
+    fn notify(
+        &self,
+        _: &arco_catalog::state_store::ProjectionIntentV2,
+    ) -> arco_catalog::Result<()> {
+        Ok(())
+    }
 }
 
 impl CatalogProjectionNotifier for RecordingProjectionNotifier {
@@ -1251,6 +1267,154 @@ async fn gate4_cas_loss_reexecutes_decisions_and_regenerates_receipt_response_an
         .await
         .unwrap();
     assert_eq!(receipts.entries().len(), 3);
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_v2_frozen_patch_reexecutes_after_competing_cas_with_same_identity() {
+    let backend = LoseAcceptedCatalogHeadResponseBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let authority = ControlCatalogAuthority::new_synthetic_bounded(
+        storage.clone(),
+        scope(),
+        Arc::new(NoopProjectionNotifierV2),
+    )
+    .expect("bounded authority");
+    authority
+        .create_catalog_v2(
+            "analytics",
+            Some("before"),
+            WriteOptions::with_idempotency("seed"),
+        )
+        .await
+        .expect("seed catalog");
+    let command = authority
+        .prepare_synthetic_bounded_command(
+            BoundedCatalogTestCommand::PatchCatalog {
+                name: "analytics".to_string(),
+                patch: CatalogPatch {
+                    properties: Some(Some(std::collections::BTreeMap::from([(
+                        "pending-property".to_string(),
+                        "value".to_string(),
+                    )]))),
+                    ..CatalogPatch::default()
+                },
+            },
+            WriteOptions::with_idempotency("bounded-pending").with_request_id("bounded-request"),
+        )
+        .expect("freeze command before CAS");
+    let operation_id = command.operation_id().to_string();
+    let request_digest = command.request_digest().to_string();
+    let occurred_at_ms = command.occurred_at_ms();
+    backend.gate_next.store(true, Ordering::SeqCst);
+    let pending = authority.execute_prepared_synthetic_bounded_command(command.clone());
+    tokio::pin!(pending);
+    tokio::select! {
+        result = &mut pending => panic!("bounded command finished before the CAS gate: {result:?}"),
+        () = backend.paused.notified() => {},
+    }
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("concurrent".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("bounded-concurrent"),
+        )
+        .await
+        .expect("competing V2 patch");
+    backend.resume.notify_one();
+    pending.await.expect("frozen bounded retry");
+    let store = ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope())
+        .expect("bounded store");
+    let published = store
+        .export_published_logical_v2_current()
+        .await
+        .expect("published frozen logical operation");
+    assert_eq!(published["operation"]["operationId"], operation_id);
+    assert_eq!(published["operation"]["requestDigest"], request_digest);
+    let catalog = authority
+        .get_catalog("analytics")
+        .await
+        .expect("catalog lookup")
+        .expect("catalog exists");
+    assert_eq!(catalog.description.as_deref(), Some("concurrent"));
+    assert_eq!(
+        catalog.properties.as_ref().unwrap()["pending-property"],
+        "value"
+    );
+    assert_eq!(catalog.updated_at, occurred_at_ms);
+    let token_before_replay = store.current_state_token().await.expect("published token");
+    authority
+        .execute_prepared_synthetic_bounded_command(command)
+        .await
+        .expect("exact frozen replay");
+    assert!(!operation_id.is_empty());
+    assert_eq!(request_digest.len(), 64);
+    assert_eq!(
+        store
+            .current_state_token()
+            .await
+            .expect("token after exact replay"),
+        token_before_replay,
+    );
+    assert_eq!(backend.attempts.lock().unwrap().len(), 4);
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_v2_recovers_accepted_head_after_lost_response() {
+    let backend = LoseAcceptedCatalogHeadResponseBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let authority = ControlCatalogAuthority::new_synthetic_bounded(
+        storage.clone(),
+        scope(),
+        Arc::new(NoopProjectionNotifierV2),
+    )
+    .expect("bounded authority");
+    authority
+        .create_catalog_v2(
+            "analytics",
+            Some("before"),
+            WriteOptions::with_idempotency("seed"),
+        )
+        .await
+        .expect("seed catalog");
+    backend.arm();
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("after".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("lost-response"),
+        )
+        .await
+        .expect("accepted V2 HEAD must reconcile to committed outcome");
+    let store = ControlMvpStateStore::new_synthetic_bounded(storage, scope()).expect("store");
+    let token = store.current_state_token().await.expect("published token");
+    assert_eq!(token.logical_sequence(), 2);
+    assert_eq!(backend.attempts.lock().unwrap().len(), 2);
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("after".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("lost-response"),
+        )
+        .await
+        .expect("idempotent V2 replay");
+    assert_eq!(
+        store.current_state_token().await.expect("replay token"),
+        token
+    );
+    assert_eq!(backend.attempts.lock().unwrap().len(), 2);
 }
 
 #[test]

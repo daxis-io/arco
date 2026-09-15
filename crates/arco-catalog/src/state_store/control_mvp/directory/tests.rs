@@ -10,14 +10,14 @@ use arco_core::storage::WriteResult;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-fn directory(domain: &str) -> Directory {
+pub(super) fn directory(domain: &str) -> Directory {
     Directory::new(
         ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap(),
         &StateScope::new("tenant", "workspace", domain),
     )
     .unwrap()
 }
-fn leaf(n: u64) -> Leaf {
+pub(super) fn leaf(n: u64) -> Leaf {
     Leaf {
         first: (n * 4).to_be_bytes().to_vec(),
         last: (n * 4 + 1).to_be_bytes().to_vec(),
@@ -26,7 +26,7 @@ fn leaf(n: u64) -> Leaf {
         digest: Sha256::digest(n.to_be_bytes()).into(),
     }
 }
-async fn build(dir: &Directory, count: u64) -> Root {
+pub(super) async fn build(dir: &Directory, count: u64) -> Root {
     let mut writer = dir.builder();
     for n in 0..count {
         writer.push(leaf(n)).await.unwrap();
@@ -933,5 +933,144 @@ async fn inline_fences_have_one_canonical_encoding_at_all_boundaries() {
         dir.lookup(&forged, b"", &mut ReadBudget::default())
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn floor_leaf_authenticates_the_predecessor_of_an_insertion_gap() {
+    let dir = directory("catalog");
+    let mut first = leaf(0);
+    first.first = b"a".to_vec();
+    first.last = b"b".to_vec();
+    let mut last = leaf(1);
+    last.first = b"y".to_vec();
+    last.last = b"z".to_vec();
+    let mut builder = dir.builder();
+    builder.push(first.clone()).await.unwrap();
+    builder.push(last).await.unwrap();
+    let root = builder.finish().await.unwrap();
+    assert_eq!(
+        dir.floor_leaf(&root, b"m", &mut ReadBudget::default())
+            .await
+            .unwrap(),
+        Some(first)
+    );
+}
+
+#[tokio::test]
+async fn authenticated_external_fence_is_reused_within_one_read_budget() {
+    let dir = directory("fence-reuse");
+    let key = vec![b'a'; 83];
+    let reference = dir.write_key(&key).await.unwrap();
+    let mut budget = ReadBudget::new(1, key.len() + 1).unwrap();
+    assert_eq!(dir.read_key(reference, &mut budget).await.unwrap(), key);
+    assert_eq!(dir.read_key(reference, &mut budget).await.unwrap(), key);
+    assert_eq!(budget.objects, 1);
+    let other = directory("different-fence-scope");
+    assert!(other.read_key(reference, &mut budget).await.is_err());
+}
+
+#[tokio::test]
+async fn fresh_budget_rejects_corrupt_unselected_external_sibling() {
+    let dir = directory("fence-sibling");
+    let mut builder = dir.builder();
+    let mut final_key = Vec::new();
+    for number in 0_u64..128 {
+        let mut key = vec![b'k'; 80];
+        key.extend_from_slice(&number.to_be_bytes());
+        final_key = key.clone();
+        builder
+            .push(Leaf {
+                first: key.clone(),
+                last: key,
+                rows: 1,
+                bytes: 100,
+                digest: Sha256::digest(number.to_be_bytes()).into(),
+            })
+            .await
+            .unwrap();
+    }
+    let root = builder.finish().await.unwrap();
+    let mut first_key = vec![b'k'; 80];
+    first_key.extend_from_slice(&0_u64.to_be_bytes());
+    assert!(
+        dir.lookup(&root, &first_key, &mut ReadBudget::default())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let reference = dir.key_ref(&final_key).unwrap();
+    let path = dir.path("keys", &reference.digest);
+    let version = dir.storage.head(&path).await.unwrap().unwrap().version;
+    dir.storage
+        .put(
+            &path,
+            Bytes::from(vec![b'x'; final_key.len()]),
+            AuthorityWritePrecondition::MatchesVersion(version),
+        )
+        .await
+        .unwrap();
+    assert!(
+        dir.lookup(&root, &first_key, &mut ReadBudget::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn external_fence_reuse_respects_entry_and_payload_admission_limits() {
+    let dir = directory("fence-admission");
+    let mut budget = ReadBudget::default();
+    let mut references = Vec::new();
+    for number in 0_u64..1025 {
+        let mut key = vec![b'k'; 80];
+        key.extend_from_slice(&number.to_be_bytes());
+        let reference = dir.write_key(&key).await.unwrap();
+        assert_eq!(dir.read_key(reference, &mut budget).await.unwrap(), key);
+        references.push(reference);
+    }
+    assert_eq!(budget.objects, 1025);
+    dir.read_key(*references.first().unwrap(), &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(budget.objects, 1025);
+    dir.read_key(*references.last().unwrap(), &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(budget.objects, 1026);
+    let large = vec![b'z'; 129 * 1024];
+    let reference = dir.write_key(&large).await.unwrap();
+    let mut large_budget = ReadBudget::default();
+    assert_eq!(
+        dir.read_key(reference, &mut large_budget).await.unwrap(),
+        large
+    );
+    assert_eq!(
+        dir.read_key(reference, &mut large_budget).await.unwrap(),
+        large
+    );
+    assert_eq!(large_budget.objects, 2);
+
+    let mut total_budget = ReadBudget::default();
+    let mut total_references = Vec::new();
+    for key in [vec![b'a'; 64 * 1024], vec![b'b'; 64 * 1024], vec![b'c'; 65]] {
+        let reference = dir.write_key(&key).await.unwrap();
+        dir.read_key(reference, &mut total_budget).await.unwrap();
+        total_references.push(reference);
+    }
+    assert_eq!(total_budget.objects, 3);
+    for reference in total_references.iter().take(2) {
+        dir.read_key(*reference, &mut total_budget).await.unwrap();
+    }
+    assert_eq!(
+        total_budget.objects, 3,
+        "exact aggregate payload remains reusable"
+    );
+    dir.read_key(*total_references.last().unwrap(), &mut total_budget)
+        .await
+        .unwrap();
+    assert_eq!(
+        total_budget.objects, 4,
+        "aggregate overflow falls back to reading"
     );
 }

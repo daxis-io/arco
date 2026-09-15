@@ -1063,7 +1063,7 @@ fn segment_path(store: &ControlMvpStateStore, reference: &ControlMvpSegmentRef) 
         ControlMvpSegmentLevel::L1 => store.paths.state_object(&reference.segment_id),
     }
 }
-fn validate_owner(reference: &ControlMvpSegmentRef) -> Result<()> {
+pub(super) fn validate_owner(reference: &ControlMvpSegmentRef) -> Result<()> {
     if !integrity::valid_immutable_id(&reference.segment_id)
         || reference.segment_size_bytes == 0
         || reference.segment_size_bytes > MAX_SEGMENT_BYTES as u64
@@ -1076,7 +1076,10 @@ fn validate_owner(reference: &ControlMvpSegmentRef) -> Result<()> {
     }
     Ok(())
 }
-fn validate_rows(reference: &ControlMvpSegmentRef, rows: &[ControlMvpSegmentRow]) -> Result<()> {
+pub(super) fn validate_rows(
+    reference: &ControlMvpSegmentRef,
+    rows: &[ControlMvpSegmentRow],
+) -> Result<()> {
     let l0 = reference.level == ControlMvpSegmentLevel::L0;
     for row in rows {
         if row.logical_sequence != reference.logical_sequence {

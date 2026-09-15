@@ -18,7 +18,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{
     Arc, RwLock,
@@ -246,7 +246,7 @@ fn next_start_after(objects: &[ObjectMeta], limit: usize) -> Option<String> {
 /// Uses numeric versions internally (stored as strings) to simulate GCS-like behavior.
 #[derive(Debug, Default)]
 pub struct MemoryBackend {
-    objects: Arc<RwLock<HashMap<String, StoredObject>>>,
+    objects: Arc<RwLock<BTreeMap<String, StoredObject>>>,
     next_version: Arc<AtomicI64>,
 }
 

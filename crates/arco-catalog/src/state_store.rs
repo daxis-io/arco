@@ -38,14 +38,19 @@ pub mod shadow_replay;
 )]
 pub(crate) mod workspace_binding_metadata;
 
+#[cfg(feature = "test-utils")]
+pub use control_mvp::BoundedWork;
+#[cfg(feature = "test-utils")]
+pub use control_mvp::SyntheticKvEntry;
+pub use control_mvp::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
 pub use control_mvp::{
-    ControlMvpGcCandidate, ControlMvpGcOutcome, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
-    ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
-    ControlMvpProjectionOutboxRecord, ControlMvpReadCache, ControlMvpReadCacheConfig,
-    ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics, ControlMvpRestoreParticipant,
-    ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding,
-    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress, MaintenanceStatus,
-    PreparedMaintenance, control_mvp_outbox_event_id,
+    CommitOutcomeV2, ControlMvpGcCandidate, ControlMvpGcOutcome, ControlMvpGcPlan,
+    ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget,
+    ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpReadCache,
+    ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
+    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
+    MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

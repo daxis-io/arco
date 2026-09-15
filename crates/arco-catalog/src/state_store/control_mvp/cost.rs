@@ -9,10 +9,51 @@ use std::{
 thread_local! {
     static PHASE: Cell<&'static str> = const { Cell::new("request") };
     static WORK: RefCell<BTreeMap<&'static str,[u64;36]>> = const { RefCell::new(BTreeMap::new()) };
+    static BOUNDED_WORK: RefCell<BTreeMap<&'static str, BoundedWork>> = const { RefCell::new(BTreeMap::new()) };
 }
 pub(super) struct PhaseGuard {
     #[cfg(feature = "test-utils")]
     prior: &'static str,
+}
+
+/// Work that the authority-8 bounded path must report independently of the
+/// historical fixed phase slots.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct BoundedWork {
+    /// Arrow rows presented to a decoder, including a rejected malformed batch.
+    pub decoded_rows: u64,
+    /// Rows semantically checked by transition proofs.
+    pub transition_proof_rows: u64,
+    /// Unique physical blocks selected by one bounded operation.
+    pub selected_blocks: u64,
+    /// Physical blocks rewritten by one bounded operation.
+    pub rewritten_blocks: u64,
+    /// Directory child references decoded or encoded, including failed decodes.
+    pub directory_references: u64,
+    /// Inputs presented to the streaming directory builder, including rejections.
+    pub streaming_builder_inputs: u64,
+}
+
+/// Records authority-8 bounded work without consuming historical slot space.
+pub(super) fn bounded_work(work: BoundedWork) {
+    #[cfg(feature = "test-utils")]
+    BOUNDED_WORK.with(|all| {
+        let mut all = all.borrow_mut();
+        let total = all.entry(current()).or_default();
+        total.decoded_rows += work.decoded_rows;
+        total.transition_proof_rows += work.transition_proof_rows;
+        total.selected_blocks += work.selected_blocks;
+        total.rewritten_blocks += work.rewritten_blocks;
+        total.directory_references += work.directory_references;
+        total.streaming_builder_inputs += work.streaming_builder_inputs;
+    });
+    #[cfg(not(feature = "test-utils"))]
+    let _ = work;
+}
+
+#[cfg(feature = "test-utils")]
+pub(super) fn take_bounded_work() -> BTreeMap<&'static str, BoundedWork> {
+    BOUNDED_WORK.with(|work| std::mem::take(&mut *work.borrow_mut()))
 }
 impl PhaseGuard {
     pub(super) fn enter(phase: &'static str) -> Self {
@@ -116,6 +157,47 @@ pub(super) fn now() -> chrono::DateTime<chrono::Utc> {
     #[cfg(not(feature = "test-utils"))]
     {
         chrono::Utc::now()
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+#[allow(clippy::indexing_slicing)] // Fixed key created by the assertion's preceding record.
+mod tests {
+    use super::{BoundedWork, bounded_work, take, take_bounded_work};
+
+    #[test]
+    fn bounded_work_is_reported_without_changing_historical_phase_slots() {
+        take();
+        take_bounded_work();
+        bounded_work(BoundedWork {
+            decoded_rows: 2,
+            transition_proof_rows: 3,
+            selected_blocks: 4,
+            rewritten_blocks: 5,
+            directory_references: 6,
+            streaming_builder_inputs: 7,
+        });
+        bounded_work(BoundedWork {
+            decoded_rows: 20,
+            transition_proof_rows: 30,
+            selected_blocks: 40,
+            rewritten_blocks: 50,
+            directory_references: 60,
+            streaming_builder_inputs: 70,
+        });
+
+        assert!(take().is_empty());
+        assert_eq!(
+            take_bounded_work()["request"],
+            BoundedWork {
+                decoded_rows: 22,
+                transition_proof_rows: 33,
+                selected_blocks: 44,
+                rewritten_blocks: 55,
+                directory_references: 66,
+                streaming_builder_inputs: 77,
+            }
+        );
     }
 }
 #[inline]

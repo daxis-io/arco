@@ -1935,6 +1935,133 @@ fn validate_output(output: &OutputWitness, expected_id: &str) -> Result<(Vec<u8>
     Ok((first, last, output.block.length))
 }
 
+fn validate_persisted_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    expected: &WorkingValue<ExpectedPlan<'_>>,
+    ordinal: u64,
+    witness: &WorkingValue<OutputWitness>,
+    output: &physical::restore_io::StandardRestoreOutput,
+) -> Result<WorkingValue<()>> {
+    let same_owner = expected.is_owned_by(io)
+        && witness.is_owned_by(io)
+        && output.descriptor.is_owned_by(io)
+        && output.bytes.is_owned_by(io);
+    let store = io.store();
+    let result = (|| {
+        let reservation = decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !same_owner || usize::BITS != 64 {
+                return Err(invariant_violation("output binding ownership differs"));
+            }
+            let bytes = output_binding_string_bytes(witness.value(), output.descriptor.value())
+                .filter(|bytes| *bytes <= UNIT_RECORD_BYTES)
+                .ok_or_else(|| invariant_violation("output binding exceeds string admission"))?;
+            physical::restore_io::directory_scope_reservation(store)?
+                .checked_add(64 * 1024)
+                .and_then(|fixed| bytes.checked_mul(4)?.checked_add(fixed))
+                .ok_or_else(|| invariant_violation("output binding reservation overflow"))
+        })?;
+        let bytes = *reservation.value();
+        drop(reservation);
+        let id = codec::hashes::output_id(
+            io,
+            route,
+            expected,
+            ordinal,
+            witness.value().part,
+            physical::Role::Kv,
+        )?;
+        let raw_hash = codec::hashes::raw_encoded(io, route, &output.bytes)?;
+        decode_with_reservation(io, route, Some(bytes), || {
+            validate_persisted_output_fields(
+                store,
+                witness.value(),
+                output,
+                id.value(),
+                raw_hash.value(),
+            )
+        })
+    })();
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+fn validate_persisted_output_fields(
+    store: &super::super::super::ControlMvpStateStore,
+    value: &OutputWitness,
+    output: &physical::restore_io::StandardRestoreOutput,
+    id: &str,
+    raw_hash: &str,
+) -> Result<()> {
+    let descriptor = output.descriptor.value();
+    let block = &descriptor.block;
+    let (first, last, _) = validate_output(value, id)?;
+    let actual_bounds = super::super::super::block_key_bounds(block)?;
+    let descriptor_hash = format!("sha256:{}", hex::encode(output.digest));
+    if descriptor.encoding_version != 1
+        || !descriptor.scope.matches_scope(&store.scope)
+        || descriptor.role != physical::Role::Kv
+        || descriptor.segment.level != ControlMvpSegmentLevel::L1
+        || descriptor.segment.segment_id != id
+        || descriptor.segment_version.is_empty()
+        || descriptor.index_version.is_empty()
+        || block.record_kind != Some(SEGMENT_RECORD_KV)
+        || block.offset != 0
+        || block.length != descriptor.segment.segment_size_bytes
+        || raw_hash != descriptor_hash
+        || value.descriptor.sha256 != descriptor_hash
+        || value.descriptor.byte_size != output.bytes.value().len() as u64
+        || value.descriptor.path
+            != format!(
+                "{}/physical/descriptors/{}.json",
+                store.paths.base_prefix(),
+                hex::encode(output.digest)
+            )
+        || value.index.path != store.paths.segment_index(id)
+        || value.index.byte_size != descriptor.segment.index_size_bytes
+        || value.index.sha256.strip_prefix("sha256:")
+            != Some(descriptor.segment.index_checksum_sha256.as_str())
+        || value.directory_leaf.digest != descriptor_hash
+        || value.directory_leaf.rows != block.row_count
+        || u64::from(value.directory_leaf.bytes) != block.length
+        || actual_bounds.as_ref() != Some(&(first, last))
+        || value.block.offset != block.offset
+        || value.block.length != block.length
+        || value.block.rows != block.row_count
+        || value.block.sha256.strip_prefix("sha256:") != Some(block.checksum_sha256.as_str())
+        || value.block.min_key_b64url != value.directory_leaf.first_key_b64url
+        || value.block.max_key_b64url != value.directory_leaf.last_key_b64url
+    {
+        return Err(invariant_violation(
+            "receipt output differs from persisted artifacts",
+        ));
+    }
+    Ok(())
+}
+
+fn output_binding_string_bytes(w: &OutputWitness, d: &physical::Descriptor) -> Option<usize> {
+    [
+        &w.output_id,
+        &w.directory_leaf.first_key_b64url,
+        &w.directory_leaf.last_key_b64url,
+        &w.directory_leaf.digest,
+        &w.descriptor.path,
+        &w.descriptor.sha256,
+        &w.index.path,
+        &w.index.sha256,
+        &w.block.sha256,
+        &w.block.min_key_b64url,
+        &w.block.max_key_b64url,
+    ]
+    .into_iter()
+    .map(String::len)
+    .chain(d.block.min_key_hex.as_ref().map(String::len))
+    .chain(d.block.max_key_hex.as_ref().map(String::len))
+    .try_fold(0_usize, usize::checked_add)
+}
+
 fn strictly_ordered_inputs(expected_root: &str, inputs: &[InputWitness]) -> Result<(u64, u64)> {
     let mut previous_last = None;
     let mut bytes = 0_u64;
@@ -3057,6 +3184,256 @@ mod behavioral_tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing)]
 
     use super::*;
+
+    #[tokio::test]
+    async fn output_binding_rejects_substituted_objects() {
+        let mut accepted = Vec::new();
+        for case in 0..3 {
+            accepted.push(output_binding_case(false, case).await);
+        }
+        assert_eq!(
+            accepted,
+            vec![true, false, false],
+            "shape validation cannot bind a witness to persisted output"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_binding_preserves_sparse_part_ids() {
+        let mut accepted = Vec::new();
+        for final_route in [false, true] {
+            for case in [28, 29] {
+                accepted.push(output_binding_case(final_route, case).await);
+            }
+        }
+        assert_eq!(
+            accepted,
+            vec![true; 4],
+            "part is a u32 identity, not the output list length"
+        );
+    }
+
+    fn output_binding_witness(
+        store: &super::super::super::super::ControlMvpStateStore,
+        output: &physical::restore_io::StandardRestoreOutput,
+        id: &str,
+        case: u8,
+    ) -> OutputWitness {
+        let d = output.descriptor.value();
+        let mut value = OutputWitness {
+            role: physical::Role::Kv,
+            output_id: id.into(),
+            part: 0,
+            directory_leaf: OutputDirectoryLeafWitness {
+                first_key_b64url: "YQ".into(),
+                last_key_b64url: "YQ".into(),
+                rows: 1,
+                bytes: u32::try_from(d.block.length).expect("length"),
+                digest: prefixed_sha256(output.bytes.value()),
+            },
+            descriptor: ImmutableObjectWitness {
+                path: format!(
+                    "{}/physical/descriptors/{}.json",
+                    store.paths.base_prefix(),
+                    hex::encode(output.digest)
+                ),
+                byte_size: output.bytes.value().len() as u64,
+                sha256: prefixed_sha256(output.bytes.value()),
+            },
+            index: ImmutableObjectWitness {
+                path: store.paths.segment_index(id),
+                byte_size: d.segment.index_size_bytes,
+                sha256: format!("sha256:{}", d.segment.index_checksum_sha256),
+            },
+            block: BlockWitness {
+                offset: 0,
+                length: d.block.length,
+                sha256: format!("sha256:{}", d.block.checksum_sha256),
+                rows: 1,
+                min_key_b64url: "YQ".into(),
+                max_key_b64url: "YQ".into(),
+            },
+        };
+        match case {
+            1 => value.index.path.push_str("wrong"),
+            2 => value.descriptor.path.push_str("wrong"),
+            3 => value.index.byte_size += 1,
+            4 => value.index.sha256 = prefixed_sha256(b"wrong"),
+            5 => value.descriptor.byte_size += 1,
+            6 => value.descriptor.sha256 = prefixed_sha256(b"wrong"),
+            7 => value.directory_leaf.digest = prefixed_sha256(b"wrong"),
+            8 => value.directory_leaf.rows += 1,
+            9 => value.directory_leaf.bytes += 1,
+            10 => value.directory_leaf.first_key_b64url = "YA".into(),
+            11 => value.directory_leaf.last_key_b64url = "Yg".into(),
+            12 => value.block.offset += 1,
+            13 => value.block.length += 1,
+            14 => value.block.sha256 = prefixed_sha256(b"wrong"),
+            15 => value.block.rows += 1,
+            16 => value.block.min_key_b64url = "YA".into(),
+            17 => value.block.max_key_b64url = "Yg".into(),
+            18 => value.role = physical::Role::ActiveId,
+            19 => value.output_id = "f".repeat(64),
+            20 => value.part = 1,
+            27 => value.index.path = "x".repeat(UNIT_RECORD_BYTES),
+            28 => value.part = 32,
+            29 => value.part = u32::MAX,
+            _ => {}
+        }
+        value
+    }
+
+    #[tokio::test]
+    async fn output_binding_matrix_has_exact_physical_fields() {
+        for final_route in [false, true] {
+            for case in 0..30 {
+                assert_eq!(
+                    output_binding_case(final_route, case).await,
+                    matches!(case, 0 | 28 | 29),
+                    "case={case} final={final_route}"
+                );
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep output, model and route ownership lifetimes visible through the matrix"
+    )]
+    async fn output_binding_case(final_route: bool, case: u8) -> bool {
+        use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"output binding");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut foreign = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("expected");
+        let id = codec::hashes::output_id(
+            &mut io,
+            &mut route,
+            &expected,
+            0,
+            match case {
+                28 => 32,
+                29 => u32::MAX,
+                _ => 0,
+            },
+            physical::Role::Kv,
+        )
+        .expect("id");
+        let rows = decode_with_reservation(
+            if case == 23 { &mut foreign } else { &mut io },
+            &mut route,
+            Some(64 * 1024),
+            || {
+                Ok(vec![ControlMvpSegmentRow {
+                    record_kind: SEGMENT_RECORD_KV,
+                    key: b"a".to_vec(),
+                    value: Some(b"value".to_vec()),
+                    generation: 1,
+                    tombstone: false,
+                    logical_sequence: 1,
+                    logical_ordinal: 0,
+                    origin_sequence: None,
+                }])
+            },
+        )
+        .expect("rows");
+        let mut output = physical::restore_io::write_standard_restore_output(
+            if case == 23 { &mut foreign } else { &mut io },
+            &mut route,
+            id.value(),
+            1,
+            &rows,
+        )
+        .await
+        .expect("persisted output");
+        let witness = decode_with_reservation(
+            if case == 21 { &mut foreign } else { &mut io },
+            &mut route,
+            Some(8 * 1024 * 1024),
+            || Ok(output_binding_witness(&store, &output, id.value(), case)),
+        )
+        .expect("witness");
+        let other = decode_with_reservation(&mut foreign, &mut route, Some(64 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .expect("foreign expected");
+        if case == 25 {
+            output.digest = [0; 32];
+        }
+        if case == 26 {
+            output.bytes = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+                Ok(bytes::Bytes::from_static(b"wrong"))
+            })
+            .expect("wrong bytes");
+        }
+        let held = if case == 24 && !final_route {
+            let remaining = 64 * 1024 * 1024 - io.live_ownership_evidence().0;
+            Some(
+                decode_with_reservation(&mut io, &mut route, Some(remaining), || {
+                    Ok(vec![0_u8; remaining - 32 * 1024])
+                })
+                .expect("carry"),
+            )
+        } else {
+            None
+        };
+        let mut totals = FinalStreamTotals::new();
+        let carry = if case == 24 && final_route {
+            64 * 1024 * 1024 - io.live_ownership_evidence().0 - 64 * 1024 + 1
+        } else {
+            0
+        };
+        let mut chunk = FinalMicrochunk::begin(&mut totals, carry, &io).expect("chunk");
+        let mut route = if final_route {
+            RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+        } else {
+            route
+        };
+        let reads = io.reading_evidence();
+        let hashes = io.hashing_evidence();
+        let live = io.allocation_evidence().1;
+        let checked = validate_persisted_output(
+            &mut io,
+            &mut route,
+            if case == 22 { &other } else { &expected },
+            0,
+            &witness,
+            &output,
+        );
+        let accepted = checked.is_ok();
+        drop(checked);
+        assert_eq!(io.reading_evidence(), reads);
+        assert_eq!(io.allocation_underestimates(), 0);
+        if accepted {
+            assert_eq!(io.allocation_evidence().1, live);
+        } else {
+            assert!(io.allocation_evidence().1 <= live + 64 * 1024);
+        }
+        if matches!(case, 21..=24 | 27) {
+            assert_eq!(io.hashing_evidence(), hashes);
+        }
+        drop(held);
+        if !accepted {
+            let hashes = io.hashing_evidence();
+            assert!(
+                validate_persisted_output(&mut io, &mut route, &expected, 0, &witness, &output)
+                    .is_err()
+            );
+            assert_eq!(io.hashing_evidence(), hashes);
+            assert_eq!(io.reading_evidence(), reads);
+        }
+        accepted
+    }
 
     #[tokio::test]
     async fn proposed_transition_rejects_disconnected_records() {

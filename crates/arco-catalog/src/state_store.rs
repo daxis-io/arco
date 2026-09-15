@@ -1894,6 +1894,9 @@ impl StateScope {
     }
 
     /// Returns the workspace identifier only for a workspace rooted authority scope.
+    ///
+    /// Callers migrating from the pre-v2 unconditional workspace accessor must
+    /// handle `None` or match on [`Self::root`].
     #[must_use]
     pub fn workspace_id(&self) -> Option<&str> {
         match &self.root {

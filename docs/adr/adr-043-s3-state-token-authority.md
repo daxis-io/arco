@@ -113,12 +113,16 @@ unchanged: `ControlMvpStateStore` still requires a workspace physical root, and
 legacy scoped storage cannot construct tenant identity roots.
 
 Migration is decode-only. No persisted workspace record is rewritten, so an
-existing workspace domain keeps its path bytes and canonical history roots, and
-the old workspace encoding fixtures continue to decode as workspace roots. New
-non-workspace roots are not enabled by this change. Rollback is safe for
-workspace data because version-2 workspace records keep the legacy top-level
-`workspace_id` and earlier readers ignore unknown fields; a rolled-back binary
-must not run concurrently with a version-2 writer.
+existing workspace domain keeps its path bytes and canonical history roots.
+Checksummed legacy manifests, transactions, and checkpoints verify the exact
+stored payload bytes before decoding and continue to decode as workspace roots.
+New non-workspace roots are not enabled by this change.
+
+Rollback has a hard write boundary. Once any version-2 scope envelope is
+published, an older binary must not read or write that root because its checksum
+verifier cannot reproduce the new payload bytes. Recovery after that boundary is
+roll-forward with a version-2-capable reader or restoration from retained
+pre-version-2 artifacts.
 
 Before enabling either target root in `control/v1`, the remaining
 [versioned authority-scope follow-up](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1)

@@ -101,6 +101,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flatbuffers::VerifierOptions;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -8056,7 +8057,17 @@ where
     }
     let checksum = sha256_hex(&payload_bytes);
     if checksum != envelope.checksum_sha256 {
-        return Err(invariant_violation(format!("{context} checksum mismatch")));
+        // Compatible wire migrations can change reserialized bytes. Fall back
+        // to verifying the exact stored payload before rejecting the envelope.
+        let raw_envelope: ChecksumEnvelope<&RawValue> = decode_json(bytes, context)?;
+        #[cfg(feature = "test-utils")]
+        {
+            cost::record(13, 1);
+            cost::record(14, raw_envelope.payload.get().len());
+        }
+        if sha256_hex(raw_envelope.payload.get().as_bytes()) != envelope.checksum_sha256 {
+            return Err(invariant_violation(format!("{context} checksum mismatch")));
+        }
     }
     Ok(envelope.payload)
 }
@@ -8134,9 +8145,9 @@ fn encode_json_vec<T: Serialize>(value: &T, context: &str) -> Result<Vec<u8>> {
     })
 }
 
-fn decode_json<T>(bytes: &[u8], context: &str) -> Result<T>
+fn decode_json<'de, T>(bytes: &'de [u8], context: &str) -> Result<T>
 where
-    T: for<'de> Deserialize<'de>,
+    T: Deserialize<'de>,
 {
     #[cfg(feature = "test-utils")]
     if matches!(
@@ -8153,9 +8164,9 @@ where
     })
 }
 
-fn decode_json_limited<T>(bytes: &[u8], max_bytes: usize, context: &str) -> Result<T>
+fn decode_json_limited<'de, T>(bytes: &'de [u8], max_bytes: usize, context: &str) -> Result<T>
 where
-    T: for<'de> Deserialize<'de>,
+    T: Deserialize<'de>,
 {
     validate_persisted_json_size(bytes, max_bytes, context)?;
     decode_json(bytes, context)

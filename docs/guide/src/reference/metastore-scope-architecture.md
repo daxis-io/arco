@@ -328,6 +328,9 @@ authority identity, and equal textual IDs in identity, metastore, and workspace
 families remain distinct throughout tokens, continuations, restore references,
 and cache identity. Existing workspace records keep their explicit compatibility
 meaning; no tenant or metastore ID is substituted into a workspace field.
+Once a version-2 scope envelope is published, rollback requires a version-2-
+capable reader or restoration from retained pre-version-2 artifacts; older
+binaries must not read or write that root.
 Enabling non-workspace `control/v1` roots still requires the remaining identity
 and metastore cross-root contracts.
 

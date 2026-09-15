@@ -1257,7 +1257,13 @@ async fn gate4_cas_loss_reexecutes_decisions_and_regenerates_receipt_response_an
 fn bindings_distinguish_equal_textual_workspace_and_metastore_roots() {
     let bindings = CatalogAuthorityBindings::new([
         CatalogAuthorityBinding::control_v1("acme", "lakehouse"),
-        CatalogAuthorityBinding::control_v1_metastore("acme", "lakehouse"),
+        CatalogAuthorityBinding::new(
+            "acme",
+            AuthorityRoot::Metastore {
+                metastore_id: "lakehouse".to_string(),
+            },
+            CatalogAuthorityKind::ControlV1,
+        ),
     ])
     .expect("distinct root families");
 

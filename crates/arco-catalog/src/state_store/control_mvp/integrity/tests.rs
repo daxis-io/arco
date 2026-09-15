@@ -297,6 +297,45 @@ fn control_mvp_envelope_accepts_legacy_workspace_scope() {
 }
 
 #[test]
+fn checksummed_legacy_workspace_envelopes_remain_readable() {
+    let manifest: ControlMvpManifest = decode_envelope_limited(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/control_mvp_authority_v7/legacy_workspace_manifest.json"
+        )),
+        "control-mvp-manifest",
+        MAX_CONTROL_JSON_BYTES,
+        "legacy manifest fixture",
+    )
+    .expect("legacy workspace manifest");
+    let transaction: ControlMvpTxObject = decode_envelope_limited(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/control_mvp_authority_v7/legacy_workspace_transaction.json"
+        )),
+        "control-mvp-tx",
+        MAX_TRANSACTION_JSON_BYTES,
+        "legacy transaction fixture",
+    )
+    .expect("legacy workspace transaction");
+    let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/control_mvp_authority_v7/legacy_workspace_checkpoint.json"
+        )),
+        "control-mvp-checkpoint",
+        MAX_CONTROL_JSON_BYTES,
+        "legacy checkpoint fixture",
+    )
+    .expect("legacy workspace checkpoint");
+
+    for scope in [&manifest.scope, &transaction.scope, &checkpoint.scope] {
+        assert!(matches!(scope.root(), AuthorityRoot::Workspace { .. }));
+        assert_eq!(scope.workspace_id(), Some("workspace"));
+    }
+}
+
+#[test]
 fn control_mvp_envelope_scope_is_versioned_and_round_trips() {
     let scope = StateScope::new("acme", "prod", "catalog");
     let pointer = ControlMvpPointer {

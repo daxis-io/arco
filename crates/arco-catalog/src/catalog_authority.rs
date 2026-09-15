@@ -127,21 +127,6 @@ impl CatalogAuthorityBinding {
         Self::workspace(tenant_id, workspace_id, CatalogAuthorityKind::ControlV1)
     }
 
-    /// Creates an exact `control/v1` binding for a metastore root.
-    #[must_use]
-    pub fn control_v1_metastore(
-        tenant_id: impl Into<String>,
-        metastore_id: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            tenant_id,
-            AuthorityRoot::Metastore {
-                metastore_id: metastore_id.into(),
-            },
-            CatalogAuthorityKind::ControlV1,
-        )
-    }
-
     /// Creates a binding for an explicit root family.
     #[must_use]
     pub fn new(

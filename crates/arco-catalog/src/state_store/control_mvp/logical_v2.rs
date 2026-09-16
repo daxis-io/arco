@@ -10,16 +10,14 @@ const ENCODING_VERSION: u32 = 2;
 
 struct Canonical {
     hasher: Sha256,
-    #[cfg(any(test, feature = "test-utils"))]
-    input_bytes: usize,
 }
 
 impl Canonical {
     fn new(tag: &[u8], scope: &StateScope) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        super::record_sha256_work(0);
         let mut out = Self {
             hasher: Sha256::new(),
-            #[cfg(any(test, feature = "test-utils"))]
-            input_bytes: 0,
         };
         out.bytes(tag);
         out.u32(ENCODING_VERSION);
@@ -31,9 +29,7 @@ impl Canonical {
         let bytes = bytes.as_ref();
         self.hasher.update(bytes);
         #[cfg(any(test, feature = "test-utils"))]
-        {
-            self.input_bytes = self.input_bytes.saturating_add(bytes.len());
-        }
+        super::record_sha256_update(bytes.len());
     }
 
     fn u8(&mut self, value: u8) {
@@ -77,8 +73,6 @@ impl Canonical {
     }
 
     fn finish(self) -> String {
-        #[cfg(any(test, feature = "test-utils"))]
-        super::record_sha256_work(self.input_bytes);
         hex::encode(self.hasher.finalize())
     }
 }
@@ -306,7 +300,7 @@ pub(super) struct RestoreHistory {
     logical_commit_id: String,
     declared_mutations: u64,
     accepted_mutations: u64,
-    previous_key: Option<Vec<u8>>,
+    previous_key: Vec<u8>,
     notice: ProjectionIntentV2,
     poisoned: bool,
 }
@@ -462,7 +456,7 @@ impl RestoreHistory {
             logical_commit_id: logical_commit_id.to_owned(),
             declared_mutations,
             accepted_mutations: 0,
-            previous_key: None,
+            previous_key: Vec::with_capacity(super::MAX_BLOCK_BYTES),
             notice,
             poisoned: false,
         })
@@ -478,11 +472,13 @@ impl RestoreHistory {
                 "restore history mutation count exceeds declaration",
             ));
         }
-        if self
-            .previous_key
-            .as_deref()
-            .is_some_and(|previous| previous >= key)
-        {
+        if key.len() > super::MAX_BLOCK_BYTES {
+            self.poisoned = true;
+            return Err(invariant_violation(
+                "restore history key exceeds directory ceiling",
+            ));
+        }
+        if self.accepted_mutations > 0 && self.previous_key.as_slice() >= key {
             self.poisoned = true;
             return Err(invariant_violation(
                 "restore history keys are not strictly ordered",
@@ -495,7 +491,8 @@ impl RestoreHistory {
             ));
         }
         encode_write_tuple(&mut self.out, key, generation, value);
-        self.previous_key = Some(key.to_vec());
+        self.previous_key.clear();
+        self.previous_key.extend_from_slice(key);
         self.accepted_mutations += 1;
         Ok(())
     }
@@ -1298,5 +1295,81 @@ mod tests {
             usize::try_from(allocations.bytes_max).unwrap() < payload.len() / 8,
             "large V2 payload was copied into a hash preimage: {allocations:?}"
         );
+    }
+    #[test]
+    fn restore_history_accounts_partial_hash_before_finish_or_drop() {
+        let request = restore_request(RestoreMode::Present);
+        let mut history = request.history(&"a".repeat(64), 2).unwrap();
+        let capture = super::super::cost::NativeCapture::begin();
+        history.push(b"a", 12, Some(b"value")).unwrap();
+        let partial = capture.finish();
+        assert_eq!(
+            partial.slots[0], 0,
+            "continuation does not begin another hash"
+        );
+        assert_eq!(
+            partial.slots[1], 31,
+            "exact key, generation and opaque value bytes charged now"
+        );
+        let capture = super::super::cost::NativeCapture::begin();
+        assert!(history.push(b"a", 12, None).is_err());
+        drop(history);
+        let rejected = capture.finish();
+        assert_eq!(
+            &rejected.slots[..2],
+            &[0, 0],
+            "failed ordering and drop neither omit nor repeat accepted hash work"
+        );
+    }
+
+    #[test]
+    fn restore_history_reuses_admitted_previous_key_allocation() {
+        let request = restore_request(RestoreMode::Present);
+        let mut history = request.history(&"a".repeat(64), 2).unwrap();
+        history
+            .push(&vec![b'a'; 48 * 1024], 12, Some(b"first"))
+            .unwrap();
+        let capture = super::super::cost::NativeCapture::begin();
+        let allocation = allocation_counter::measure(|| {
+            history.push(b"b", 12, None).unwrap();
+        });
+        let _ = capture.finish();
+        assert_eq!(
+            allocation.bytes_total, 0,
+            "accepted mutation reuses retained key capacity"
+        );
+        history.finish().unwrap();
+    }
+
+    #[test]
+    fn restore_history_empty_and_maximum_keys_preserve_ordering_and_poisoning() {
+        let request = restore_request(RestoreMode::Present);
+        let commit = "a".repeat(64);
+        let mut history = request.history(&commit, 2).unwrap();
+        history.push(b"", 12, None).unwrap();
+        history.push(b"a", 12, None).unwrap();
+        history.finish().unwrap();
+        let mut history = request.history(&commit, 2).unwrap();
+        history.push(b"", 12, None).unwrap();
+        assert!(history.push(b"", 12, None).is_err());
+        assert!(history.finish().is_err());
+        let mut history = request.history(&commit, 2).unwrap();
+        let first = vec![b'a'; super::super::MAX_BLOCK_BYTES];
+        let last = vec![b'b'; super::super::MAX_BLOCK_BYTES];
+        let capture = super::super::cost::NativeCapture::begin();
+        let allocations = allocation_counter::measure(|| {
+            history.push(&first, 12, None).unwrap();
+            history.push(&last, 12, None).unwrap();
+        });
+        let work = capture.finish();
+        assert_eq!(allocations.bytes_total, 0);
+        assert_eq!(work.slots[1], 2 * (17 + first.len() as u64));
+        history.finish().unwrap();
+        let mut history = request.history(&commit, 1).unwrap();
+        let invalid = vec![b'c'; super::super::MAX_BLOCK_BYTES + 1];
+        let capture = super::super::cost::NativeCapture::begin();
+        assert!(history.push(&invalid, 12, None).is_err());
+        assert!(history.finish().is_err());
+        assert_eq!(&capture.finish().slots[..2], &[0, 0]);
     }
 }

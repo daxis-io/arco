@@ -10010,6 +10010,19 @@ pub(crate) fn record_sha256_work(bytes: usize) {
     }
 }
 
+/// Account bytes when a streaming hash consumes them, including unfinished streams.
+#[cfg(any(test, feature = "test-utils"))]
+fn record_sha256_update(bytes: usize) {
+    cost::record(1, bytes);
+    #[cfg(feature = "test-utils")]
+    if !cost::native_capture_active() {
+        TEST_SHA256_WORK.with(|work| {
+            let (calls, total) = work.get();
+            work.set((calls, total + bytes as u64));
+        });
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     #[cfg(any(test, feature = "test-utils"))]
     record_sha256_work(bytes.len());

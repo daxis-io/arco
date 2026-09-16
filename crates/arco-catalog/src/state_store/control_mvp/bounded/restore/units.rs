@@ -1820,7 +1820,7 @@ fn validate_singleton_transition(before: &SingletonState, after: &SingletonState
                 key_b64url: before_key,
                 source: before_source,
                 current: before_current,
-                phase: SingletonPhase::CompareSource,
+                phase: before_phase @ SingletonPhase::CompareSource,
             },
             SingletonState::Pending {
                 key_b64url: after_key,
@@ -1834,7 +1834,7 @@ fn validate_singleton_transition(before: &SingletonState, after: &SingletonState
                 key_b64url: before_key,
                 source: before_source,
                 current: before_current,
-                phase: SingletonPhase::CompareCurrent,
+                phase: before_phase @ SingletonPhase::CompareCurrent,
             },
             SingletonState::Pending {
                 key_b64url: after_key,
@@ -1845,7 +1845,10 @@ fn validate_singleton_transition(before: &SingletonState, after: &SingletonState
         ) => {
             if before_key == after_key
                 && before_source == after_source
-                && before_current == after_current
+                // The first comparison may add the not-yet-observed current row.
+                // Every already observed witness remains immutable.
+                && (before_current == after_current
+                    || (*before_phase == SingletonPhase::CompareSource && before_current.is_none()))
             {
                 Ok(())
             } else {
@@ -8365,6 +8368,71 @@ mod behavioral_tests {
             current: None,
             phase,
         }
+    }
+
+    #[test]
+    fn singleton_comparison_accumulates_only_the_unobserved_current_witness() {
+        let before = audit_pending("YQ", SingletonPhase::CompareSource);
+        let mut after = audit_pending("YQ", SingletonPhase::CompareCurrent);
+        if let SingletonState::Pending { current, .. } = &mut after {
+            *current = Some(Box::new(audit_singleton_value("YQ")));
+        }
+        assert!(
+            validate_singleton_transition(&before, &after).is_ok(),
+            "separate bounded reads must be able to retain the second value witness"
+        );
+        for mutation in 0..6 {
+            let mut changed = after.clone();
+            if let SingletonState::Pending {
+                key_b64url,
+                source,
+                current,
+                phase,
+            } = &mut changed
+            {
+                match mutation {
+                    0 => *key_b64url = "Yg".into(),
+                    1 => source.as_mut().unwrap().generation += 1,
+                    2 => *source = None,
+                    3 => *phase = SingletonPhase::Emit,
+                    4 => *phase = SingletonPhase::CompareSource,
+                    5 => {
+                        *source = None;
+                        *current = None;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                validate_singleton_transition(&before, &changed).is_err(),
+                "mutation={mutation}"
+            );
+        }
+        let mut observed = after.clone();
+        if let SingletonState::Pending { phase, .. } = &mut observed {
+            *phase = SingletonPhase::CompareSource;
+        }
+        for remove in [false, true] {
+            let mut changed = after.clone();
+            if let SingletonState::Pending { current, .. } = &mut changed {
+                if remove {
+                    *current = None;
+                } else {
+                    current.as_mut().unwrap().generation += 1;
+                }
+            }
+            assert!(validate_singleton_transition(&observed, &changed).is_err());
+        }
+        let mut emit = after.clone();
+        if let SingletonState::Pending { phase, .. } = &mut emit {
+            *phase = SingletonPhase::Emit;
+        }
+        assert!(validate_singleton_transition(&after, &emit).is_ok());
+        let absent = audit_pending("YQ", SingletonPhase::CompareCurrent);
+        assert!(
+            validate_singleton_transition(&absent, &emit).is_err(),
+            "current cannot appear after comparison"
+        );
     }
 
     fn audit_after(key_b64url: &str) -> MergeCursor {

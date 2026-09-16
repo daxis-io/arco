@@ -313,3 +313,285 @@ pub(in super::super) async fn dense_eight_level_path(directory: &Directory) -> R
         node: selected.expect("eight path pages"),
     }
 }
+
+/// Opaque frontier for the charged native final builder.
+pub(in super::super) struct NativeBuilder {
+    directory: Directory,
+    levels: [Vec<Node>; DEPTH],
+    last: Vec<u8>,
+    has_last: bool,
+    failed: bool,
+}
+
+impl NativeBuilder {
+    pub(in super::super) fn reservation() -> Result<usize> {
+        if size_of::<Node>() > 256 {
+            return Err(super::capacity("unqualified directory builder node layout"));
+        }
+        Ok(DEPTH * FANOUT * size_of::<Node>() + MAX_BLOCK_BYTES)
+    }
+
+    pub(in super::super) fn new(directory: Directory) -> Self {
+        Self {
+            directory,
+            levels: std::array::from_fn(|_| Vec::with_capacity(FANOUT)),
+            last: Vec::with_capacity(MAX_BLOCK_BYTES),
+            has_last: false,
+            failed: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn seed_depth_frontier(
+        &mut self,
+        all_levels: bool,
+    ) -> Result<super::Builder> {
+        // Simulated authenticated summaries only, not 128^8 executed leaf writes.
+        let mut legacy = self.directory.builder();
+        for level in 0..DEPTH {
+            if !all_levels && level != DEPTH - 1 {
+                continue;
+            }
+            for index in 0..FANOUT {
+                let ordinal = (DEPTH - 1 - level) * FANOUT + index;
+                let key = u64::try_from(ordinal)
+                    .map_err(|_| super::capacity("fixture ordinal"))?
+                    .to_be_bytes();
+                let reference = self.directory.key_ref(&key)?;
+                let node = Node {
+                    depth: u8::try_from(level).map_err(|_| super::capacity("fixture depth"))?,
+                    bytes: 100,
+                    rows: 1,
+                    first: reference,
+                    last: reference,
+                    digest: [7; 32],
+                };
+                self.levels
+                    .get_mut(level)
+                    .ok_or_else(|| super::capacity("fixture level"))?
+                    .push(node);
+                legacy
+                    .levels
+                    .get_mut(level)
+                    .ok_or_else(|| super::capacity("fixture level"))?
+                    .push(node);
+            }
+        }
+        Ok(legacy)
+    }
+
+    pub(in super::super) async fn push(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        leaf: &Leaf,
+    ) -> Result<()> {
+        let checked =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                #[cfg(any(test, feature = "test-utils"))]
+                super::super::cost::bounded_work(super::super::cost::BoundedWork {
+                    streaming_builder_inputs: 1,
+                    ..Default::default()
+                });
+                if self.failed {
+                    return Err(invariant_violation(
+                        "native directory builder requires restart",
+                    ));
+                }
+                if leaf.first.len() > MAX_BLOCK_BYTES
+                    || leaf.last.len() > MAX_BLOCK_BYTES
+                    || leaf.first > leaf.last
+                    || leaf.rows == 0
+                    || leaf.bytes == 0
+                    || leaf.bytes as usize > super::MAX_SEGMENT_BYTES
+                    || (leaf.rows > 1 && leaf.bytes as usize > MAX_BLOCK_BYTES)
+                    || (self.has_last && self.last >= leaf.first)
+                {
+                    return Err(super::validation_failed(
+                        "invalid or unordered directory leaf",
+                    ));
+                }
+                self.failed = true;
+                Ok(())
+            })?;
+        drop(checked);
+        let first = self.write_key(io, route, &leaf.first).await?;
+        let last = self.write_key(io, route, &leaf.last).await?;
+        self.push_node(
+            io,
+            route,
+            Node {
+                depth: 0,
+                first,
+                last,
+                rows: leaf.rows,
+                bytes: leaf.bytes,
+                digest: leaf.digest,
+            },
+        )
+        .await?;
+        let completed =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                self.last.clear();
+                self.last.extend_from_slice(&leaf.last);
+                self.has_last = true;
+                self.failed = false;
+                Ok(())
+            })?;
+        drop(completed);
+        Ok(())
+    }
+
+    async fn write_key(
+        &self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        bytes: &[u8],
+    ) -> Result<KeyRef> {
+        let key =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                self.directory.key_ref(bytes)
+            })?;
+        if bytes.len() > INLINE_KEY_BYTES {
+            super::super::physical::restore_io::write_directory_output(
+                io,
+                route,
+                true,
+                &key.value().digest,
+                bytes,
+            )
+            .await?;
+        }
+        Ok(*key.value())
+    }
+
+    async fn push_node(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        mut node: Node,
+    ) -> Result<()> {
+        loop {
+            let level = usize::from(node.depth);
+            let flush =
+                decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                    let added =
+                        page_probe_bytes(std::slice::from_ref(&node))? - super::HEADER_BYTES - 1;
+                    let page = self
+                        .levels
+                        .get_mut(level)
+                        .ok_or_else(|| super::capacity("directory depth exceeded"))?;
+                    if !page.is_empty()
+                        && (page.len() == FANOUT
+                            || page_probe_bytes(page)? + added > PAGE_PROBE_LIMIT)
+                    {
+                        Ok(true)
+                    } else {
+                        page.push(node);
+                        Ok(false)
+                    }
+                })?;
+            if !*flush.value() {
+                return Ok(());
+            }
+            drop(flush);
+            let page = self
+                .levels
+                .get(level)
+                .ok_or_else(|| invariant_violation("builder level disappeared"))?;
+            let parent = self.write_page(io, route, node.depth + 1, page).await?;
+            let changed =
+                decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                    let page = self
+                        .levels
+                        .get_mut(level)
+                        .ok_or_else(|| invariant_violation("builder level disappeared"))?;
+                    page.clear();
+                    page.push(node);
+                    Ok(())
+                })?;
+            drop(changed);
+            node = parent;
+        }
+    }
+
+    pub(in super::super) async fn finish(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> Result<WorkingValue<Root>> {
+        let ready =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                if self.failed {
+                    return Err(invariant_violation(
+                        "native directory builder requires restart",
+                    ));
+                }
+                self.failed = true;
+                Ok(())
+            })?;
+        drop(ready);
+        let node = loop {
+            let Some(level) = self.levels.iter().position(|page| !page.is_empty()) else {
+                break self.write_page(io, route, 1, &[]).await?;
+            };
+            let page = self
+                .levels
+                .get(level)
+                .ok_or_else(|| invariant_violation("builder level disappeared"))?;
+            if level > 0 && page.len() == 1 && self.levels.iter().skip(level + 1).all(Vec::is_empty)
+            {
+                break *page
+                    .first()
+                    .ok_or_else(|| invariant_violation("builder root disappeared"))?;
+            }
+            let depth =
+                u8::try_from(level + 1).map_err(|_| super::capacity("directory depth overflow"))?;
+            let parent = self.write_page(io, route, depth, page).await?;
+            let cleared =
+                decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                    self.levels
+                        .get_mut(level)
+                        .ok_or_else(|| invariant_violation("builder level disappeared"))?
+                        .clear();
+                    Ok(())
+                })?;
+            drop(cleared);
+            if usize::from(parent.depth) == DEPTH {
+                break parent;
+            }
+            self.push_node(io, route, parent).await?;
+        };
+        decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+            Ok(Root {
+                scope: self.directory.scope,
+                node,
+            })
+        })
+    }
+
+    async fn write_page(
+        &self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        depth: u8,
+        children: &[Node],
+    ) -> Result<Node> {
+        use super::super::physical::restore_io::{encode_with_reservation, write_directory_output};
+        let encoded = encode_with_reservation(
+            io,
+            route,
+            DIRECTORY_FIXED_ALLOCATION_BYTES + super::PAGE_LIMIT,
+            || self.directory.page_node(depth, children),
+        )?;
+        write_directory_output(
+            io,
+            route,
+            false,
+            &encoded.value().0.digest,
+            &encoded.value().1,
+        )
+        .await?;
+        Ok(encoded.value().0)
+    }
+}

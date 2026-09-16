@@ -5979,6 +5979,125 @@ impl<T> Drop for WorkingValue<T> {
     fn drop(&mut self) {}
 }
 
+pub(in super::super) fn new_directory_builder(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+) -> CatalogResult<WorkingValue<super::super::directory::restore::NativeBuilder>> {
+    use super::super::directory::{Directory, restore::NativeBuilder};
+    let store = io.store;
+    let reservation = directory_scope_reservation(store)?
+        .checked_add(NativeBuilder::reservation()?)
+        .ok_or_else(|| physical_backpressure("native builder reservation overflow"))?;
+    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    decode_with_reservation(io, route, Some(reservation), || {
+        if store.authority_format != 8 || !final_stream {
+            return Err(physical_backpressure(
+                "native builder requires final authority-8 stream",
+            ));
+        }
+        Ok(NativeBuilder::new(Directory::new(
+            store.retention.clone(),
+            &store.scope,
+        )?))
+    })
+}
+
+impl WorkingValue<super::super::directory::restore::NativeBuilder> {
+    pub(in super::super) async fn push_directory_leaf(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        leaf: &WorkingValue<super::super::directory::Leaf>,
+    ) -> CatalogResult<()> {
+        let owned = self.is_owned_by(io) && leaf.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        let admitted =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                if !owned || !final_stream {
+                    return Err(physical_backpressure(
+                        "native builder owner or phase differs",
+                    ));
+                }
+                Ok(())
+            })?;
+        drop(admitted);
+        self.value.push(io, route, leaf.value()).await
+    }
+
+    pub(in super::super) async fn finish_directory(
+        mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> CatalogResult<WorkingValue<super::super::directory::Root>> {
+        let owned = self.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        let admitted =
+            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                if !owned || !final_stream {
+                    return Err(physical_backpressure(
+                        "native builder owner or phase differs",
+                    ));
+                }
+                Ok(())
+            })?;
+        drop(admitted);
+        self.value.finish(io, route).await
+    }
+}
+
+/// Closed directory namespace only; all bodies originate in admitted builder codecs.
+pub(in super::super) async fn write_directory_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    key: bool,
+    digest: &[u8; 32],
+    raw: &[u8],
+) -> CatalogResult<()> {
+    let store = io.store;
+    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    let declared = encode_with_reservation(io, route, directory_scope_reservation(store)?, || {
+        if !final_stream {
+            return Err(physical_backpressure(
+                "native directory output requires final stream",
+            ));
+        }
+        DeclaredPhysicalRange::new(
+            store,
+            PhysicalObject::Directory {
+                key,
+                digest,
+                length: raw.len(),
+            },
+            true,
+        )
+    })?;
+    let bytes = encode_directory_output(io, route, raw)?;
+    put_restore_output(io, route, declared.value(), &bytes).await?;
+    Ok(())
+}
+
+#[allow(
+    clippy::redundant_clone,
+    reason = "promote exact-capacity Bytes backing inside the measured allocation guard"
+)]
+fn encode_directory_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    raw: &[u8],
+) -> CatalogResult<WorkingValue<Bytes>> {
+    encode_with_reservation(
+        io,
+        route,
+        raw.len()
+            .checked_add(DIRECTORY_FIXED_ALLOCATION_BYTES)
+            .ok_or_else(|| physical_backpressure("directory encoding reservation overflow"))?,
+        || {
+            let bytes = Bytes::copy_from_slice(raw);
+            Ok(bytes.clone())
+        },
+    )
+}
+
 // Frozen native-directory contract; includes the fixed cost-counter nodes,
 // scope clones, path formatting and fixed validation errors, but no I/O response.
 pub(in super::super) const DIRECTORY_FIXED_ALLOCATION_BYTES: usize = 16 * 1024;
@@ -9310,6 +9429,592 @@ mod native_descriptor_tests {
 mod native_directory_tests {
     use super::super::directory::{Directory, Leaf, restore};
     use super::*;
+
+    #[tokio::test]
+    async fn native_builder_empty_root_matches_legacy_and_releases_frontier() {
+        let (store, _) = native_counter_fixture().await;
+        let directory = Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let expected = directory.builder().finish().await.expect("legacy empty");
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let builder = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor chunk");
+            new_directory_builder(
+                &mut io,
+                &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+            )
+            .expect("admitted native builder")
+        };
+        let root = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("finish chunk");
+            builder
+                .finish_directory(
+                    &mut io,
+                    &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                )
+                .await
+                .expect("native empty root")
+        };
+        assert_eq!(root.value(), &expected);
+        assert_eq!(io.writing_evidence().0, 1);
+        drop(root);
+        assert!(io.ledger.lock().expect("ledger").report().passing());
+    }
+
+    #[tokio::test]
+    async fn native_builder_output_first_share_is_already_invoiced() {
+        let (store, _) = native_counter_fixture().await;
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let bytes = encode_directory_output(
+            &mut io,
+            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+            b"directory body",
+        )
+        .expect("encoded");
+        let promotion = allocation_counter::measure(|| {
+            let clone = bytes.value().clone();
+            std::hint::black_box(&clone);
+        });
+        assert_eq!(
+            promotion.bytes_total, 0,
+            "first PUT clone must allocate nothing outside encoder"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keep exact object parity and cross-chunk ownership evidence in one scenario"
+    )]
+    async fn native_builder_stream_matches_legacy_across_page_boundaries() {
+        for collision in [false, true] {
+            for (count, key_length) in [
+                (1, 0),
+                (127, 8),
+                (128, 64),
+                (129, 65),
+                (513, 8),
+                (16_385, 8),
+                (1_025, 65),
+                (33, 131_072),
+                (2, 262_144),
+            ] {
+                let (store, _) = native_counter_fixture().await;
+                let directory =
+                    Directory::new(store.retention.clone(), &store.scope).expect("directory");
+                let leaf = |index: u64| {
+                    let mut key = vec![0; key_length];
+                    if !key.is_empty() {
+                        key[..8].copy_from_slice(&index.to_be_bytes());
+                    }
+                    Leaf {
+                        first: key.clone(),
+                        last: key,
+                        rows: 1,
+                        bytes: 100,
+                        digest: [7; 32],
+                    }
+                };
+                let mut legacy = directory.builder();
+                for index in 0..count {
+                    legacy.push(leaf(index)).await.expect("legacy push");
+                }
+                let expected = legacy.finish().await.expect("legacy root");
+                let (fresh, _) = range_tests::window_pending_store();
+                let native_store = if collision { &store } else { &fresh };
+                let mut io = RestorePhysicalIo::new(
+                    native_store,
+                    FINAL_MICROCHUNK_BYTES,
+                    FINAL_MICROCHUNK_BYTES,
+                );
+                let mut totals = FinalStreamTotals::new();
+                let mut builder = {
+                    let mut chunk =
+                        FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor");
+                    new_directory_builder(
+                        &mut io,
+                        &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                    )
+                    .expect("builder")
+                };
+                let retained = io
+                    .ledger
+                    .lock()
+                    .expect("ledger")
+                    .report()
+                    .working_live_bytes;
+                assert!(retained >= 256 * 1024);
+                for index in 0..count {
+                    let mut chunk =
+                        FinalMicrochunk::begin(&mut totals, 0, &io).expect("push chunk");
+                    let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                    let input = decode_with_reservation(
+                        &mut io,
+                        &mut route,
+                        Some(16 * 1024 + 2 * key_length),
+                        || Ok(leaf(index)),
+                    )
+                    .expect("leaf");
+                    builder
+                        .push_directory_leaf(&mut io, &mut route, &input)
+                        .await
+                        .expect("native push");
+                    drop(input);
+                    assert_eq!(
+                        io.ledger
+                            .lock()
+                            .expect("ledger")
+                            .report()
+                            .working_live_bytes,
+                        retained
+                    );
+                }
+                let root = {
+                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("finish");
+                    builder
+                        .finish_directory(
+                            &mut io,
+                            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                        )
+                        .await
+                        .expect("native root")
+                };
+                assert_eq!(
+                    root.value(),
+                    &expected,
+                    "count={count} key_length={key_length}"
+                );
+                assert_eq!(io.work.native.bounded.streaming_builder_inputs, count);
+                assert!(io.writing_evidence().0 > 0);
+                drop(root);
+                assert!(io.ledger.lock().expect("ledger").report().passing());
+                if count == 1_025 && collision {
+                    assert!(totals.total_operations > 4096);
+                }
+                let expected_paths = store
+                    .retention
+                    .list("control/directory/v1")
+                    .await
+                    .expect("oracle inventory");
+                let actual_paths = native_store
+                    .retention
+                    .list("control/directory/v1")
+                    .await
+                    .expect("native inventory");
+                let expected_paths: std::collections::BTreeSet<_> = expected_paths
+                    .iter()
+                    .map(arco_core::scoped_storage::ScopedPath::as_str)
+                    .collect();
+                let actual_paths: std::collections::BTreeSet<_> = actual_paths
+                    .iter()
+                    .map(arco_core::scoped_storage::ScopedPath::as_str)
+                    .collect();
+                assert_eq!(actual_paths, expected_paths);
+                for path in expected_paths {
+                    assert_eq!(
+                        store.retention.get_raw(path).await.expect("oracle bytes"),
+                        native_store
+                            .retention
+                            .get_raw(path)
+                            .await
+                            .expect("native bytes")
+                    );
+                }
+                println!(
+                    "builder fixture leaves={count} key_bytes={key_length} collision={collision} operations={} peak_chunk_owned={} retained_frontier={retained}",
+                    totals.total_operations, totals.peak_chunk_owned_upper_bound_bytes
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_constructor_admission_is_exact_and_phase_closed() {
+        use super::super::super::directory::restore::NativeBuilder;
+        let (store, _) = native_counter_fixture().await;
+        let reservation = directory_scope_reservation(&store).expect("scope")
+            + NativeBuilder::reservation().expect("frontier");
+        for limit in [0, reservation - 1, reservation] {
+            let mut io = RestorePhysicalIo::new(&store, limit, FINAL_MICROCHUNK_BYTES);
+            let ledger = io.ledger.clone();
+            let mut totals = FinalStreamTotals::new();
+            {
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let result = new_directory_builder(
+                    &mut io,
+                    &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                );
+                assert_eq!(result.is_ok(), limit == reservation);
+                assert_eq!(io.reading_evidence(), (0, 0, 0));
+                assert_eq!(io.writing_evidence(), (0, 0));
+                if result.is_ok() {
+                    let retained = ledger.lock().expect("ledger").report().working_live_bytes;
+                    assert!(retained >= NativeBuilder::reservation().expect("frontier"));
+                    assert!(retained <= reservation);
+                }
+                drop(result);
+            }
+            drop(io);
+            let report = ledger.lock().expect("ledger").report();
+            assert_eq!(report.owned_live_upper_bound(), 0);
+            assert_eq!(report.working_underestimates, 0);
+        }
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        assert!(
+            new_directory_builder(
+                &mut io,
+                &mut RestorePhysicalRoute::OrdinaryUnit {
+                    workspace: &mut workspace,
+                    payload: &mut payload
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(io.writing_evidence(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn native_builder_rejects_bad_leaves_before_output() {
+        for mutation in 0..7 {
+            let (store, _) = native_counter_fixture().await;
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut totals = FinalStreamTotals::new();
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+            let input = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                let mut leaf = Leaf {
+                    first: b"a".to_vec(),
+                    last: b"b".to_vec(),
+                    rows: 1,
+                    bytes: 100,
+                    digest: [7; 32],
+                };
+                match mutation {
+                    0 => leaf.first = b"z".to_vec(),
+                    1 => leaf.rows = 0,
+                    2 => leaf.bytes = 0,
+                    3 => leaf.bytes = 64 * 1024 * 1024 + 1,
+                    4 => {
+                        leaf.rows = 2;
+                        leaf.bytes = 256 * 1024 + 1;
+                    }
+                    5 => leaf.last = vec![255; 256 * 1024 + 1],
+                    _ => {}
+                }
+                Ok(leaf)
+            })
+            .expect("input");
+            if mutation == 6 {
+                builder
+                    .push_directory_leaf(&mut io, &mut route, &input)
+                    .await
+                    .expect("first leaf");
+            }
+            assert!(
+                builder
+                    .push_directory_leaf(&mut io, &mut route, &input)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(io.writing_evidence(), (0, 0));
+            assert!(io.stopped);
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_cancellation_at_each_immutable_boundary_stops_retry() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::{Context, Poll, Waker};
+        for collision in [false, true] {
+            for boundary in 1..=if collision { 8 } else { 2 } {
+                let (store, remaining) = range_tests::window_pending_store();
+                let directory =
+                    Directory::new(store.retention.clone(), &store.scope).expect("directory");
+                let fixture = Leaf {
+                    first: vec![1; 65],
+                    last: vec![2; 65],
+                    rows: 1,
+                    bytes: 100,
+                    digest: [7; 32],
+                };
+                if collision {
+                    let mut legacy = directory.builder();
+                    legacy.push(fixture.clone()).await.expect("seed collision");
+                    legacy.finish().await.expect("legacy root");
+                }
+                let mut io =
+                    RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+                let ledger = io.ledger.clone();
+                let mut totals = FinalStreamTotals::new();
+                {
+                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                    let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                    let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                    let input =
+                        decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
+                            Ok(fixture.clone())
+                        })
+                        .expect("input");
+                    remaining.store(boundary, Ordering::SeqCst);
+                    let mut future =
+                        Box::pin(builder.push_directory_leaf(&mut io, &mut route, &input));
+                    assert!(matches!(
+                        future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Pending
+                    ));
+                    drop(future);
+                    assert!(io.stopped);
+                    let before = (io.reading_evidence(), io.writing_evidence());
+                    assert!(
+                        builder
+                            .push_directory_leaf(&mut io, &mut route, &input)
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!((io.reading_evidence(), io.writing_evidence()), before);
+                    assert!(
+                        ledger.lock().expect("ledger").report().working_live_bytes >= 256 * 1024
+                    );
+                }
+                drop(io);
+                let report = ledger.lock().expect("ledger").report();
+                assert_eq!(report.owned_live_upper_bound(), 0);
+                assert_eq!(report.backend_origin_shared_live_bytes, 0);
+                assert_eq!(report.working_underestimates, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_empty_finish_faults_release_frontier() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        for after in [false, true] {
+            for pending in [false, true] {
+                let store = range_tests::unit_publication_test_store(1, after, pending);
+                let mut io =
+                    RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+                let ledger = io.ledger.clone();
+                let mut totals = FinalStreamTotals::new();
+                {
+                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                    let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                    let builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                    let mut future = Box::pin(builder.finish_directory(&mut io, &mut route));
+                    let result = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    match result {
+                        Poll::Pending => assert!(pending),
+                        Poll::Ready(result) => {
+                            assert!(!pending);
+                            assert!(result.is_err());
+                        }
+                    }
+                    drop(future);
+                    assert!(io.stopped);
+                    assert_eq!(io.writing_evidence().0, 1);
+                }
+                drop(io);
+                let report = ledger.lock().expect("ledger").report();
+                assert_eq!(report.owned_live_upper_bound(), 0);
+                assert_eq!(report.working_underestimates, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_push_and_finish_reject_foreign_owner_or_phase() {
+        for operation in 0..4 {
+            let (store, _) = native_counter_fixture().await;
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut foreign =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut totals = FinalStreamTotals::new();
+            let (mut builder, input) = {
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                let input = decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
+                    Ok(Leaf {
+                        first: vec![1],
+                        last: vec![2],
+                        rows: 1,
+                        bytes: 100,
+                        digest: [7; 32],
+                    })
+                })
+                .expect("input");
+                (builder, input)
+            };
+            let target = if operation < 2 { &mut foreign } else { &mut io };
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, target).expect("attempt");
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = if operation < 2 {
+                RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+            } else {
+                RestorePhysicalRoute::OrdinaryUnit {
+                    workspace: &mut workspace,
+                    payload: &mut payload,
+                }
+            };
+            if operation % 2 == 0 {
+                assert!(
+                    builder
+                        .push_directory_leaf(target, &mut route, &input)
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(builder.finish_directory(target, &mut route).await.is_err());
+            }
+            assert_eq!(target.reading_evidence(), (0, 0, 0));
+            assert_eq!(target.writing_evidence(), (0, 0));
+            assert!(target.stopped);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_depth_eight_and_overflow_match_simulated_legacy_frontiers() {
+        for overflow in [false, true] {
+            let (store, _) = native_counter_fixture().await;
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut totals = FinalStreamTotals::new();
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+            let mut oracle =
+                decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                    builder.value.seed_depth_frontier(overflow)
+                })
+                .expect("simulated frontier");
+            if overflow {
+                let leaf = decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
+                    Ok(Leaf {
+                        first: 1024_u64.to_be_bytes().to_vec(),
+                        last: 1024_u64.to_be_bytes().to_vec(),
+                        rows: 1,
+                        bytes: 100,
+                        digest: [7; 32],
+                    })
+                })
+                .expect("last leaf");
+                assert!(oracle.value.push(leaf.value().clone()).await.is_err());
+                assert!(
+                    builder
+                        .push_directory_leaf(&mut io, &mut route, &leaf)
+                        .await
+                        .is_err()
+                );
+                assert!(io.stopped);
+            } else {
+                // Legacy finish consumes its owned model, so construct its independent fixture outside the native ledger.
+                drop(oracle);
+                let directory =
+                    Directory::new(store.retention.clone(), &store.scope).expect("directory");
+                let mut fixture = restore::NativeBuilder::new(directory);
+                let expected = fixture
+                    .seed_depth_frontier(false)
+                    .expect("oracle")
+                    .finish()
+                    .await
+                    .expect("depth eight oracle");
+                let root = builder
+                    .finish_directory(&mut io, &mut route)
+                    .await
+                    .expect("depth eight native");
+                assert_eq!(root.value().depth(), 8);
+                assert_eq!(root.value(), &expected);
+                drop(root);
+                assert!(io.ledger.lock().expect("ledger").report().passing());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_builder_corrupt_key_or_page_collision_fails_closed() {
+        for key in [false, true] {
+            for wrong_size in [false, true] {
+                let (store, _) = range_tests::window_pending_store();
+                let directory =
+                    Directory::new(store.retention.clone(), &store.scope).expect("directory");
+                let fixture = Leaf {
+                    first: vec![1; 65],
+                    last: vec![2; 65],
+                    rows: 1,
+                    bytes: 100,
+                    digest: [7; 32],
+                };
+                let mut legacy = directory.builder();
+                if key {
+                    legacy.push(fixture.clone()).await.expect("seed keys");
+                }
+                legacy.finish().await.expect("seed page");
+                let paths = store
+                    .retention
+                    .list(if key {
+                        "control/directory/v1/domains/catalog/keys"
+                    } else {
+                        "control/directory/v1/domains/catalog/pages"
+                    })
+                    .await
+                    .expect("fixture paths");
+                let path = paths.first().expect("object").as_str();
+                let mut bytes = store
+                    .retention
+                    .get_raw(path)
+                    .await
+                    .expect("fixture body")
+                    .to_vec();
+                if wrong_size {
+                    bytes.pop();
+                } else {
+                    bytes[0] ^= 1;
+                }
+                store
+                    .retention
+                    .put_raw(path, Bytes::from(bytes), arco_core::WritePrecondition::None)
+                    .await
+                    .expect("corrupt fixture");
+                let mut io =
+                    RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+                let mut totals = FinalStreamTotals::new();
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                if key {
+                    let input =
+                        decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
+                            Ok(fixture.clone())
+                        })
+                        .expect("input");
+                    assert!(
+                        builder
+                            .push_directory_leaf(&mut io, &mut route, &input)
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    assert!(builder.finish_directory(&mut io, &mut route).await.is_err());
+                }
+                assert!(io.stopped);
+                assert_eq!(io.allocation_underestimates(), 0);
+            }
+        }
+    }
 
     async fn native_counter_fixture() -> (ControlMvpStateStore, Vec<u8>) {
         let (fixture, _, _) = super::super::tests::fixture().await;

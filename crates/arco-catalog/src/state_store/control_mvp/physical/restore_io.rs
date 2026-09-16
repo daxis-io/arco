@@ -484,6 +484,72 @@ impl RestoreControlRecord {
     }
 }
 
+/// Read-only fixed identities needed by native driver admission.
+#[derive(Clone, Copy)]
+pub(in super::super) enum RestoreGateRecord<'a> {
+    Head,
+    Manifest(&'a str),
+    Prepared(&'a str),
+}
+
+pub(in super::super) async fn read_restore_gate_record(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    record: RestoreGateRecord<'_>,
+) -> CatalogResult<Option<(AccountedBytes, AccountedMeta)>> {
+    let result = async {
+        let store = io.store();
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        let cap = match record {
+            RestoreGateRecord::Head => super::super::MAX_HEAD_JSON_BYTES,
+            RestoreGateRecord::Manifest(_) => MAX_CONTROL_JSON_BYTES,
+            RestoreGateRecord::Prepared(_) => 1024 * 1024,
+        };
+        let declared =
+            decode_with_reservation(io, route, Some(directory_scope_reservation(store)?), || {
+                if final_stream {
+                    return Err(physical_backpressure(
+                        "restore gate records require the control ledger",
+                    ));
+                }
+                let path = match record {
+                    RestoreGateRecord::Head => store.paths.current_pointer(),
+                    RestoreGateRecord::Manifest(id) => {
+                        if !super::super::integrity::valid_immutable_id(id) {
+                            return Err(physical_backpressure("invalid restore gate manifest ID"));
+                        }
+                        store.paths.manifest_object(id)
+                    }
+                    RestoreGateRecord::Prepared(candidate) => {
+                        if !valid_raw_digest(candidate) {
+                            return Err(physical_backpressure("invalid restore gate candidate ID"));
+                        }
+                        format!(
+                            "{}/restore/v7/{candidate}/prepared.json",
+                            store.paths.base_prefix()
+                        )
+                    }
+                };
+                Ok(DeclaredPhysicalRange {
+                    scope: store.scope.clone(),
+                    final_stream,
+                    payload: false,
+                    path,
+                    range: 0..(cap + 1) as u64,
+                    reservation_bytes: cap + 1,
+                    min_response_bytes: 1,
+                    max_response_bytes: cap,
+                })
+            })?;
+        read_stable_restore_metadata(io, route, declared, cap).await
+    }
+    .await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
 pub(in super::super) async fn read_restore_control_record(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
@@ -494,7 +560,12 @@ pub(in super::super) async fn read_restore_control_record(
         let store = io.store();
         let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
         let reservation = directory_scope_reservation(store)?;
-        let mut declared = decode_with_reservation(io, route, Some(reservation), || {
+        let declared = decode_with_reservation(io, route, Some(reservation), || {
+            if final_stream {
+                return Err(physical_backpressure(
+                    "restore control records require the control ledger",
+                ));
+            }
             if !valid_raw_digest(candidate) {
                 return Err(physical_backpressure("invalid restore control candidate"));
             }
@@ -510,48 +581,55 @@ pub(in super::super) async fn read_restore_control_record(
                 max_response_bytes: FINAL_RECEIPT_BYTES,
             })
         })?;
-        let Some(before) = head_optional_declared_physical(io, route, declared.value()).await?
-        else {
-            return Ok(None);
-        };
-        let length =
-            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
-                let length = usize::try_from(before.value.size)
-                    .map_err(|_| physical_backpressure("restore control record size overflow"))?;
-                admitted_physical_length(length, FINAL_RECEIPT_BYTES)?;
-                if before.value.version.is_empty() {
-                    return Err(physical_backpressure(
-                        "restore control record version is empty",
-                    ));
-                }
-                Ok(length)
-            })?;
-        declared.value.range.end = (*length.value() + 1) as u64;
-        declared.value.reservation_bytes = *length.value() + 1;
-        declared.value.min_response_bytes = *length.value();
-        declared.value.max_response_bytes = *length.value();
-        drop(length);
-        let bytes = read_declared_physical_range(io, route, declared.value()).await?;
-        let after = head_declared_physical(io, route, declared.value()).await?;
-        let checked =
-            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
-                if after.value.size != before.value.size
-                    || after.value.version != before.value.version
-                {
-                    return Err(physical_backpressure(
-                        "restore control record changed during read",
-                    ));
-                }
-                Ok(())
-            })?;
-        drop(checked);
-        Ok(Some((bytes, after)))
+        read_stable_restore_metadata(io, route, declared, FINAL_RECEIPT_BYTES).await
     }
     .await;
     if result.is_err() {
         io.stop(route);
     }
     result
+}
+
+async fn read_stable_restore_metadata(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    mut declared: WorkingValue<DeclaredPhysicalRange>,
+    cap: usize,
+) -> CatalogResult<Option<(AccountedBytes, AccountedMeta)>> {
+    let Some(before) = head_optional_declared_physical(io, route, declared.value()).await? else {
+        return Ok(None);
+    };
+    let length =
+        decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+            let length = usize::try_from(before.value.size)
+                .map_err(|_| physical_backpressure("restore control record size overflow"))?;
+            admitted_physical_length(length, cap)?;
+            if before.value.version.is_empty() {
+                return Err(physical_backpressure(
+                    "restore control record version is empty",
+                ));
+            }
+            Ok(length)
+        })?;
+    declared.value.range.end = (*length.value() + 1) as u64;
+    declared.value.reservation_bytes = *length.value() + 1;
+    declared.value.min_response_bytes = *length.value();
+    declared.value.max_response_bytes = *length.value();
+    drop(length);
+    let bytes = read_declared_physical_range(io, route, declared.value()).await?;
+    let after = head_declared_physical(io, route, declared.value()).await?;
+    let checked =
+        decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+            if after.value.size != before.value.size || after.value.version != before.value.version
+            {
+                return Err(physical_backpressure(
+                    "restore control record changed during read",
+                ));
+            }
+            Ok(())
+        })?;
+    drop(checked);
+    Ok(Some((bytes, after)))
 }
 
 pub(in super::super) async fn write_restore_control_record(
@@ -574,6 +652,11 @@ pub(in super::super) async fn write_restore_control_record(
             Some(reservation.unwrap_or(DIRECTORY_FIXED_ALLOCATION_BYTES)),
             true,
             || {
+                if final_stream {
+                    return Err(physical_backpressure(
+                        "restore control writes require the control ledger",
+                    ));
+                }
                 if reservation.is_none() {
                     return Err(physical_backpressure(
                         "restore control reservation overflow",
@@ -895,12 +978,26 @@ impl<'store> RestorePhysicalIo<'store> {
     }
 
     #[cfg(test)]
+    pub(in super::super) fn peak_owned_evidence(&self) -> usize {
+        self.ledger
+            .lock()
+            .expect("ledger")
+            .report
+            .request_owned_peak_bytes
+    }
+
+    #[cfg(test)]
     pub(in super::super) fn allocation_underestimates(&self) -> u64 {
         self.ledger
             .lock()
             .expect("ledger")
             .report
             .working_underestimates
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn decoding_operations(&self) -> u64 {
+        self.work.decode_operations
     }
 
     #[cfg(test)]
@@ -2161,6 +2258,12 @@ pub(in super::super) fn selected_read_pending_store(boundary: usize) -> ControlM
 }
 
 #[cfg(test)]
+pub(in super::super) fn window_pending_store()
+-> (ControlMvpStateStore, Arc<std::sync::atomic::AtomicUsize>) {
+    range_tests::window_pending_store()
+}
+
+#[cfg(test)]
 pub(in super::super) fn unit_publication_test_store(
     at: usize,
     after: bool,
@@ -2190,6 +2293,7 @@ mod range_tests {
 
     enum Response {
         Shared,
+        WindowPending(Arc<AtomicUsize>),
         WriteOwned(usize),
         WriteError(usize),
         WriteOpaqueError,
@@ -2232,6 +2336,17 @@ mod range_tests {
         puts: AtomicUsize,
         response: Response,
     }
+    impl Backend {
+        async fn window_boundary(&self) {
+            if let Response::WindowPending(remaining) = &self.response {
+                if remaining.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    == Ok(1)
+                {
+                    pending::<()>().await;
+                }
+            }
+        }
+    }
     #[async_trait::async_trait]
     impl StorageBackend for Backend {
         async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
@@ -2245,6 +2360,7 @@ mod range_tests {
             path: &str,
             range: Range<u64>,
         ) -> arco_core::Result<ClassifiedBytes> {
+            self.window_boundary().await;
             let ordinal = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if matches!(self.response, Response::CollisionPending(at) if at % 3 == 2 && ordinal == at / 3 + 1)
             {
@@ -2253,6 +2369,7 @@ mod range_tests {
             match self.response {
                 Response::Pending => pending().await,
                 Response::Shared
+                | Response::WindowPending(_)
                 | Response::WriteOwned(_)
                 | Response::WriteError(_)
                 | Response::WriteOpaqueError
@@ -2299,6 +2416,7 @@ mod range_tests {
             data: Bytes,
             condition: arco_core::WritePrecondition,
         ) -> arco_core::Result<arco_core::WriteResult> {
+            self.window_boundary().await;
             let ordinal = self.puts.fetch_add(1, Ordering::SeqCst) + 1;
             if matches!(self.response, Response::WritePendingAt(at) if at == ordinal) {
                 return pending().await;
@@ -2365,6 +2483,7 @@ mod range_tests {
             Ok(result)
         }
         async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.window_boundary().await;
             let ordinal = self.heads.fetch_add(1, Ordering::SeqCst) + 1;
             if matches!(self.response, Response::HeadErrorAt(at) if ordinal == at) {
                 let mut message = String::with_capacity(512 * 1024);
@@ -2409,12 +2528,207 @@ mod range_tests {
             self.inner.signed_url(path, duration).await
         }
     }
+    #[tokio::test]
+    async fn restore_control_records_cannot_borrow_the_final_stream_ledger() {
+        let candidate = "ab".repeat(32);
+        for write in [false, true] {
+            for record in [
+                RestoreControlRecord::Selector,
+                RestoreControlRecord::Progress(0),
+                RestoreControlRecord::Receipt(0),
+            ] {
+                let store = store(backend(Response::Shared), "catalog", true);
+                let mut io =
+                    RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+                let mut totals = FinalStreamTotals::new();
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let rejected = if write {
+                    let raw = encode_with_reservation(&mut io, &mut route, 64 * 1024, || {
+                        Ok(Bytes::from_static(b"{}"))
+                    })
+                    .expect("raw");
+                    write_restore_control_record(
+                        &mut io, &mut route, &candidate, record, &raw, None,
+                    )
+                    .await
+                    .is_err()
+                } else {
+                    read_restore_control_record(&mut io, &mut route, &candidate, record)
+                        .await
+                        .is_err()
+                };
+                assert!(
+                    rejected,
+                    "generic control record cannot become terminal stream work"
+                );
+                assert_eq!(io.reading_evidence(), (0, 0, 0));
+                assert_eq!(io.writing_evidence(), (0, 0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_gate_records_reject_final_stream_before_io() {
+        let candidate = "ab".repeat(32);
+        for record in [
+            RestoreGateRecord::Head,
+            RestoreGateRecord::Manifest(&candidate),
+            RestoreGateRecord::Prepared(&candidate),
+        ] {
+            let store = store(backend(Response::Shared), "catalog", true);
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut totals = FinalStreamTotals::new();
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            assert!(
+                read_restore_gate_record(&mut io, &mut route, record)
+                    .await
+                    .is_err(),
+                "control cannot use stream ledger"
+            );
+            assert_eq!(io.reading_evidence(), (0, 0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_gate_records_use_scoped_stable_accounted_reads() {
+        let candidate = "ab".repeat(32);
+        let b = backend(Response::Shared);
+        let store = store(b, "catalog", true);
+        for (record, path) in [
+            (RestoreGateRecord::Head, store.paths.current_pointer()),
+            (
+                RestoreGateRecord::Manifest(&candidate),
+                store.paths.manifest_object(&candidate),
+            ),
+            (
+                RestoreGateRecord::Prepared(&candidate),
+                format!(
+                    "{}/restore/v7/{candidate}/prepared.json",
+                    store.paths.base_prefix()
+                ),
+            ),
+        ] {
+            store
+                .retention
+                .put_raw(
+                    &path,
+                    Bytes::from_static(b"authenticated bytes"),
+                    arco_core::WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("fixture");
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let (raw, metadata) = read_restore_gate_record(&mut io, &mut route, record)
+                .await
+                .expect("gate read")
+                .expect("present");
+            assert_eq!(raw.as_slice(), b"authenticated bytes");
+            assert!(!metadata.value().version.is_empty());
+            assert_eq!(io.reading_evidence(), (1, 2, 19));
+            assert_eq!(io.writing_evidence().0, 0);
+            assert_eq!(io.allocation_underestimates(), 0);
+            drop((raw, metadata));
+            assert_eq!(io.live_ownership_evidence(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_gate_records_reject_changed_sizes_versions_and_invalid_paths() {
+        for response in [
+            Response::ChangedHead(2),
+            Response::ChangedSize(2),
+            Response::HeadErrorAt(1),
+        ] {
+            let b = backend(response);
+            let store = store(b.clone(), "catalog", true);
+            store
+                .retention
+                .put_raw(
+                    &store.paths.current_pointer(),
+                    Bytes::from_static(b"{}"),
+                    arco_core::WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("fixture");
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            assert!(
+                read_restore_gate_record(&mut io, &mut route, RestoreGateRecord::Head)
+                    .await
+                    .is_err()
+            );
+            let counts = (
+                b.calls.load(Ordering::SeqCst),
+                b.heads.load(Ordering::SeqCst),
+            );
+            assert!(
+                read_restore_gate_record(&mut io, &mut route, RestoreGateRecord::Head)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                counts,
+                (
+                    b.calls.load(Ordering::SeqCst),
+                    b.heads.load(Ordering::SeqCst)
+                )
+            );
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+        for record in [
+            RestoreGateRecord::Manifest("../other"),
+            RestoreGateRecord::Prepared("../other"),
+        ] {
+            let store = store(backend(Response::Shared), "catalog", true);
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 0);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            assert!(
+                read_restore_gate_record(&mut io, &mut route, record)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(io.reading_evidence(), (0, 0, 0));
+            assert_eq!(io.writing_evidence().0, 0);
+        }
+    }
+
     pub(super) fn selected_read_pending_store(boundary: usize) -> ControlMvpStateStore {
         assert!((1..=9).contains(&boundary));
         store(
             backend(Response::CollisionPending(boundary)),
             "catalog",
             true,
+        )
+    }
+
+    pub(super) fn window_pending_store() -> (ControlMvpStateStore, Arc<AtomicUsize>) {
+        let remaining = Arc::new(AtomicUsize::new(0));
+        (
+            store(
+                backend(Response::WindowPending(remaining.clone())),
+                "catalog",
+                true,
+            ),
+            remaining,
         )
     }
 
@@ -2518,7 +2832,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_records_pin_all_typed_addresses_on_both_routes() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for (record, suffix) in [
                 (RestoreControlRecord::Selector, "selector.json"),
                 (
@@ -2571,7 +2886,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_writer_uses_immutable_replay_and_explicit_selector_conflicts() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for record in [
                 RestoreControlRecord::Selector,
                 RestoreControlRecord::Progress(4),
@@ -2638,7 +2954,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_writer_selector_cas_keeps_the_exact_winner() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             let backend = backend(Response::Shared);
             let store = store(backend.clone(), "catalog", true);
             let mut io =
@@ -2725,7 +3042,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_writer_failures_retain_diagnostics_and_stop_before_recovery() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for response in [
                 Response::WriteError(512 * 1024),
                 Response::WriteOpaqueError,
@@ -2797,7 +3115,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_writer_cancellation_keeps_version_and_bytes_owners_until_drop() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             let backend = backend(Response::WritePendingAt(2));
             let store = store(backend.clone(), "catalog", true);
             let mut io =
@@ -2885,6 +3204,11 @@ mod range_tests {
             assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
             assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
             drop((first, bytes, expected));
+            assert!(
+                ledger.lock().expect("ledger").report().working_live_bytes > 0,
+                "stopped-call diagnostic retained"
+            );
+            drop(io);
             assert!(ledger.lock().expect("ledger").report().passing());
         }
     }
@@ -3004,7 +3328,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_writer_immutable_mismatch_is_terminal() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for record in [
                 RestoreControlRecord::Progress(1),
                 RestoreControlRecord::Receipt(0),
@@ -3095,7 +3420,8 @@ mod range_tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Keep both routes and their failure ownership assertions together.
     async fn restore_control_record_faults_stop_before_later_io() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for response in [
                 Response::ChangedHead(1),
                 Response::ChangedHead(2),
@@ -3208,7 +3534,8 @@ mod range_tests {
 
     #[tokio::test]
     async fn restore_control_record_cancellation_releases_owners_at_each_boundary() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for boundary in 1..=3 {
                 let backend = backend(Response::CollisionPending(boundary));
                 let store = store(backend.clone(), "catalog", true);
@@ -3535,9 +3862,31 @@ mod range_tests {
     }
 
     #[tokio::test]
+    async fn standard_output_cannot_write_through_final_stream() {
+        let store = store(backend(Response::Shared), "catalog", true);
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let rows = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+            Ok(owned_encode_tests::rows(3, 8, 128, Some(1)))
+        })
+        .expect("rows");
+        assert!(
+            write_standard_restore_output(&mut io, &mut route, &"77".repeat(32), 1, &rows)
+                .await
+                .is_err()
+        );
+        assert_eq!(io.writing_evidence(), (0, 0));
+        assert_eq!(io.reading_evidence(), (0, 0, 0));
+        assert_eq!(io.encoding_evidence(), (0, 0));
+    }
+
+    #[tokio::test]
     async fn restore_output_pipeline_publishes_readable_products_with_three_writes_and_exact_replay()
      {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             let backend = backend(Response::Shared);
             let store = store(backend.clone(), "catalog", true);
             let mut io =
@@ -3634,7 +3983,8 @@ mod range_tests {
         reason = "each output PUT cancellation is followed by exact restart reconciliation on both routes"
     )]
     async fn restore_output_pipeline_cancellation_at_each_put_restarts_with_exact_products() {
-        for final_stream in [false, true] {
+        {
+            let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
             for cancelled_put in 1..=3 {
                 let backend = backend(Response::WritePendingAt(cancelled_put));
                 let store = store(backend.clone(), "catalog", true);
@@ -5780,6 +6130,65 @@ mod unit_hash_tests {
     }
 }
 
+// A refused decoder did not underestimate its working reservation. Its known
+// new static diagnostic still needs an owner, including after admission stops.
+#[cfg(any(test, feature = "test-utils"))]
+fn retain_rejected_diagnostic(
+    ledger: &Arc<Mutex<RestoreOwnershipLedger>>,
+    owner: &mut Option<WorkingMemory>,
+    work: &mut RestoreReadWork,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    encoding: bool,
+    error: CatalogError,
+) -> CatalogError {
+    let bytes = catalog_error_string_capacity(&error).unwrap_or(usize::MAX);
+    let allocated = if encoding {
+        &mut work.encoded_owned_allocation_bytes
+    } else {
+        &mut work.decoded_owned_allocation_bytes
+    };
+    let next = allocated.checked_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    *allocated = next.unwrap_or(u64::MAX);
+    let mut guard = match ledger.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.report.poisoned_ledger = true;
+            guard
+        }
+    };
+    let report = &mut guard.report;
+    let working = report.working_live_bytes.checked_add(bytes);
+    let total_live = working.and_then(|n| n.checked_add(report.request_owned_live_bytes));
+    report.counter_overflow |= next.is_none() || working.is_none() || total_live.is_none();
+    report.working_live_bytes = working.unwrap_or(usize::MAX);
+    report.working_peak_bytes = report.working_peak_bytes.max(report.working_live_bytes);
+    report.request_owned_peak_bytes = report
+        .request_owned_peak_bytes
+        .max(total_live.unwrap_or(usize::MAX));
+    if let Some(owner) = owner {
+        let sum = owner.bytes.checked_add(bytes);
+        report.counter_overflow |= sum.is_none();
+        owner.bytes = sum.unwrap_or(usize::MAX);
+    } else {
+        *owner = Some(WorkingMemory {
+            ledger: ledger.clone(),
+            bytes,
+        });
+    }
+    let live = total_live.unwrap_or(usize::MAX);
+    drop(guard);
+    if let RestorePhysicalRoute::FinalMicrochunk(chunk) = route {
+        chunk.record_allocated_owned(bytes);
+        let live = live.saturating_add(chunk.external_owned_carry_bytes);
+        chunk.totals.peak_request_owned_live_bytes =
+            chunk.totals.peak_request_owned_live_bytes.max(live);
+        chunk.totals.peak_chunk_owned_upper_bound_bytes =
+            chunk.totals.peak_chunk_owned_upper_bound_bytes.max(live);
+    }
+    error
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::too_many_lines)]
 fn allocate_with_reservation<T>(
@@ -5792,8 +6201,14 @@ fn allocate_with_reservation<T>(
     if io.stopped || io.store.authority_format != 8 {
         io.stopped = true;
         route.stop();
-        return Err(physical_backpressure(
-            "restore decoder authority is unavailable",
+        let error = physical_backpressure("restore decoder authority is unavailable");
+        return Err(retain_rejected_diagnostic(
+            &io.ledger,
+            &mut io.failed_allocation,
+            &mut io.work,
+            route,
+            encoding,
+            error,
         ));
     }
     let mut attempt = RestoreReadAttempt::new(&mut io.stopped, route);
@@ -5834,10 +6249,18 @@ fn allocate_with_reservation<T>(
         )
         .map_err(ownership_failure)?;
         drop(ledger);
-        return Err(physical_backpressure(
-            "restore decoder reservation exceeds remaining admission",
+        let error =
+            physical_backpressure("restore decoder reservation exceeds remaining admission");
+        return Err(retain_rejected_diagnostic(
+            &io.ledger,
+            &mut io.failed_allocation,
+            &mut io.work,
+            attempt.route,
+            encoding,
+            error,
         ));
     }
+
     let mut working =
         reserve_working_memory(io.ledger.clone(), admitted).map_err(ownership_failure)?;
     let (operations, allocated_bytes) = if encoding {
@@ -6017,6 +6440,47 @@ pub(in super::super) struct StandardRestoreOutput {
     pub(in super::super) digest: [u8; 32],
 }
 
+/// Validate the exact standard Arrow/index encoding without any storage effect.
+/// The caller preflights every chosen partition before writing the first one.
+pub(in super::super) fn preflight_standard_restore_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    output_id: &str,
+    logical_sequence: u64,
+    rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+) -> CatalogResult<()> {
+    let owned = rows.is_owned_by(io);
+    let result = (|| {
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !owned || !valid_raw_digest(output_id) {
+                return Err(physical_backpressure(
+                    "restore output preflight owner or identity differs",
+                ));
+            }
+            Ok(())
+        })?);
+        let segment = encode_standard_restore_output(io, route, rows.value())?;
+        let index = build_restore_output_index(
+            io,
+            route,
+            output_id,
+            logical_sequence,
+            rows.value(),
+            segment.value(),
+        )?;
+        drop(encode_restore_output_metadata(
+            io,
+            route,
+            RestoreOutputMetadata::Index(index.value()),
+        )?);
+        Ok(())
+    })();
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
 /// The unit codec supplies its frozen `output_id`; only exact encoder products
 /// reach the private model constructors and immutable writer below.
 pub(in super::super) async fn write_standard_restore_output(
@@ -6027,11 +6491,21 @@ pub(in super::super) async fn write_standard_restore_output(
     rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
 ) -> CatalogResult<StandardRestoreOutput> {
     let result = async {
-        if !Arc::ptr_eq(&rows.working.ledger, &io.ledger) || !valid_raw_digest(output_id) {
-            return Err(physical_backpressure(
-                "restore output rows or frozen identity differ",
-            ));
-        }
+        let ordinary = matches!(route, RestorePhysicalRoute::OrdinaryUnit { .. });
+        let owned = rows.is_owned_by(io);
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
+            || {
+                if !ordinary || !owned || !valid_raw_digest(output_id) {
+                    return Err(physical_backpressure(
+                        "restore output requires ordinary owned rows and a frozen identity",
+                    ));
+                }
+                Ok(())
+            },
+        )?);
         let segment = encode_standard_restore_output(io, route, rows.value())?;
         let index = build_restore_output_index(
             io,
@@ -6378,7 +6852,8 @@ mod output_metadata_tests {
                     rows[1].logical_ordinal = 0;
                 }
             }
-            for final_stream in [false, true] {
+            {
+                let final_stream = false; // Control transport is ordinary-only; rejection has separate coverage.
                 let mut io =
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let mut totals = FinalStreamTotals::new();
@@ -6994,7 +7469,7 @@ fn encode_standard_restore_output(
     result
 }
 
-fn standard_output_reservation(
+pub(in super::super) fn standard_output_reservation(
     rows: &[super::ControlMvpSegmentRow],
 ) -> CatalogResult<(usize, usize)> {
     let capacity = || {
@@ -7566,6 +8041,37 @@ mod owned_decode_tests {
 mod decode_error_ownership_tests {
     use super::*;
 
+    #[test]
+    fn rejected_reservation_final_carry_accounts_exactly_one_diagnostic() {
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            arco_core::ScopedStorage::new(
+                Arc::new(arco_core::MemoryBackend::new()),
+                "tenant",
+                "workspace",
+            )
+            .expect("scope"),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk =
+            FinalMicrochunk::begin(&mut totals, FINAL_MICROCHUNK_BYTES, &io).expect("exact carry");
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let mut result = None;
+        let measured = allocation_counter::measure(|| {
+            result = Some(decode_with_reservation(
+                &mut io,
+                &mut route,
+                Some(1),
+                || -> CatalogResult<()> { panic!("refused closure") },
+            ));
+        });
+        assert!(result.expect("called").is_err());
+        assert_eq!(io.allocation_evidence().0, measured.bytes_total);
+        assert_eq!(io.allocation_evidence().1 as u64, measured.bytes_total);
+    }
+
     #[tokio::test]
     async fn restore_decode_zero_remaining_keeps_replacement_error_charged() {
         use arco_core::{MemoryBackend, ScopedStorage};
@@ -7875,7 +8381,10 @@ mod native_payload_tests {
             let report = io.ledger.lock().expect("ledger").report();
             assert_eq!(report.working_admission_failures, 1);
             assert_eq!(report.working_underestimates, 0);
-            assert_eq!(report.working_live_bytes, 0);
+            let Err(CatalogError::MaintenanceBackpressure { ref message }) = result else {
+                panic!("expected rejection")
+            };
+            assert_eq!(report.working_live_bytes, message.capacity());
             assert!(report.request_owned_peak_bytes <= limit * 1024 * 1024);
         }
     }
@@ -8080,12 +8589,39 @@ pub(in super::super) async fn read_restore_leaf(
     Ok((descriptor, rows))
 }
 
+/// Return the authenticated raw descriptor size for exact unit witnesses.
+pub(in super::super) async fn read_restore_leaf_sized(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    leaf: &super::directory::Leaf,
+) -> CatalogResult<(
+    WorkingValue<super::Descriptor>,
+    WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    u64,
+)> {
+    let (descriptor, bytes) = read_restore_descriptor_sized(io, route, role, leaf).await?;
+    let rows = read_restore_payload(io, route, descriptor.value()).await?;
+    Ok((descriptor, rows, bytes))
+}
+
 async fn read_restore_descriptor(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
     role: super::Role,
     leaf: &super::directory::Leaf,
 ) -> CatalogResult<WorkingValue<super::Descriptor>> {
+    Ok(read_restore_descriptor_sized(io, route, role, leaf)
+        .await?
+        .0)
+}
+
+async fn read_restore_descriptor_sized(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    leaf: &super::directory::Leaf,
+) -> CatalogResult<(WorkingValue<super::Descriptor>, u64)> {
     let store = io.store;
     let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
     let result = async {
@@ -8146,7 +8682,7 @@ async fn read_restore_descriptor(
         drop(before);
         drop(after);
         verify_restore_index(io, route, &descriptor.value).await?;
-        Ok(descriptor)
+        Ok((descriptor, length as u64))
     }
     .await;
     if result.is_err() {

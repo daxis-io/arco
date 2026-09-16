@@ -651,6 +651,22 @@ pub(in super::super) async fn plan(
     Ok(plan)
 }
 
+#[allow(
+    clippy::large_futures,
+    reason = "native bounded driver retains accounted fixed products on stack"
+)]
+pub(in super::super) async fn advance(
+    store: &ControlMvpStateStore,
+    plan: &super::super::PersistedRestoreParticipantPlan,
+    context: &mut crate::state_store::RestoreAdvanceContext<'_>,
+) -> Result<crate::state_store::RestoreParticipantAdvance> {
+    units::advance(store, plan, context).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keep exact HEAD supersession ordering and selected-progress admission together"
+)]
 pub(in super::super) async fn inspect(
     store: &ControlMvpStateStore,
     persisted: &super::super::PersistedRestoreParticipantPlan,
@@ -684,6 +700,7 @@ pub(in super::super) async fn inspect(
         store.paths.base_prefix(),
         p.candidate_id
     );
+    let selected_digest = context.plan_sha256().to_owned();
     let io = context.io().workspace_budget();
     if io
         .head(&store.retention, &format!("{prefix}/prepared.json"))
@@ -694,15 +711,10 @@ pub(in super::super) async fn inspect(
             message: "prepared Plan7 requires exact candidate reconciliation".into(),
         });
     }
-    if io
+    let has_progress = io
         .head(&store.retention, &format!("{prefix}/selector.json"))
         .await?
-        .is_some()
-    {
-        return Err(CatalogError::AmbiguousAuthorityOutcome {
-            message: "selected Plan7 progress requires authenticated unit inspection".into(),
-        });
-    }
+        .is_some();
     let Target::Present {
         current_pointer_raw_b64,
         current_pointer_version,
@@ -714,45 +726,51 @@ pub(in super::super) async fn inspect(
             message: "absent Plan7 inspection requires its synthetic fence observer".into(),
         });
     };
-    let mut budget = retained::ReadBudget::with_workspace(io);
-    let Some((pointer, version, bytes)) =
-        retained::load_current_pointer(store, &mut budget).await?
-    else {
-        return Err(CatalogError::AmbiguousAuthorityOutcome {
-            message: "present Plan7 HEAD disappeared".into(),
-        });
-    };
-    if version != *current_pointer_version || bytes.as_ref() != binary(current_pointer_raw_b64)? {
-        return Ok(RestoreParticipantInspection::Superseded);
-    }
-    let manifest_bytes = retained::read_bounded_json(
-        store,
-        &mut budget,
-        &store.paths.manifest_object(&pointer.manifest_id),
-        MAX_CONTROL_JSON_BYTES,
-        "Plan7 inspected target manifest",
-    )
-    .await?;
-    if manifest_bytes.len() as u64 != manifest.byte_size {
-        return Err(invariant_violation(
-            "Plan7 target manifest size differs from witness",
-        ));
-    }
-    let token = store
-        .token(pointer.manifest_id.clone(), pointer.logical_sequence)
-        .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
-    let base = store
-        .read_bounded_current_from_manifest(
-            &token,
-            &manifest_bytes,
-            &pointer,
-            version.clone(),
-            bytes.clone(),
+    {
+        let mut budget = retained::ReadBudget::with_workspace(io);
+        let Some((pointer, version, bytes)) =
+            retained::load_current_pointer(store, &mut budget).await?
+        else {
+            return Err(CatalogError::AmbiguousAuthorityOutcome {
+                message: "present Plan7 HEAD disappeared".into(),
+            });
+        };
+        if version != *current_pointer_version || bytes.as_ref() != binary(current_pointer_raw_b64)?
+        {
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
+        let manifest_bytes = retained::read_bounded_json(
+            store,
             &mut budget,
+            &store.paths.manifest_object(&pointer.manifest_id),
+            MAX_CONTROL_JSON_BYTES,
+            "Plan7 inspected target manifest",
         )
         .await?;
-    plan.verify_inspected_manifest_roots(store, &base, &mut budget)
-        .await?;
+        if manifest_bytes.len() as u64 != manifest.byte_size {
+            return Err(invariant_violation(
+                "Plan7 target manifest size differs from witness",
+            ));
+        }
+        let token = store
+            .token(pointer.manifest_id.clone(), pointer.logical_sequence)
+            .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
+        let base = store
+            .read_bounded_current_from_manifest(
+                &token,
+                &manifest_bytes,
+                &pointer,
+                version.clone(),
+                bytes.clone(),
+                &mut budget,
+            )
+            .await?;
+        plan.verify_inspected_manifest_roots(store, &base, &mut budget)
+            .await?;
+    }
+    if has_progress {
+        units::inspect_progress(store, plan, &selected_digest, io).await?;
+    }
     Ok(RestoreParticipantInspection::Ready)
 }
 

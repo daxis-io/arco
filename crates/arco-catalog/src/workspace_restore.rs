@@ -904,6 +904,7 @@ struct RestoreAdvanceFence<'a> {
     reason = "native bounded advance integration remains disabled"
 )]
 pub(crate) struct RestoreUnitSelection<'a> {
+    observed_now: DateTime<Utc>,
     plan: &'a PersistedRestoreParticipantPlan,
     plan_sha256: &'a str,
     budget: &'a mut WorkspaceIoBudget,
@@ -914,6 +915,9 @@ pub(crate) struct RestoreUnitSelection<'a> {
     reason = "native bounded advance integration remains disabled"
 )]
 impl RestoreUnitSelection<'_> {
+    pub(crate) const fn observed_now(&self) -> DateTime<Utc> {
+        self.observed_now
+    }
     pub(crate) fn parts(
         &mut self,
     ) -> (
@@ -959,6 +963,7 @@ impl RestoreAdvanceContext<'_> {
             ));
         }
         Ok(RestoreUnitSelection {
+            observed_now: fence.service.now(),
             plan: &fence.participant.plan,
             plan_sha256: &fence.participant.plan_sha256,
             budget: fence.budget,
@@ -4831,6 +4836,7 @@ mod plan7_tests {
         Ready,
         AdvanceVisible,
         AdvanceInProgress,
+        AdvanceNativeUnit,
     }
 
     struct MixedPlan7Adapter {
@@ -4907,6 +4913,9 @@ mod plan7_tests {
             _plan: &PersistedRestoreParticipantPlan,
             _context: &mut RestoreBoundedInspectionContext<'_>,
         ) -> Result<RestoreParticipantInspection> {
+            if matches!(self.inspection, MixedAInspection::AdvanceNativeUnit) {
+                return self.inner.inspect_restore_bounded(_plan, _context).await;
+            }
             Ok(match self.inspection {
                 MixedAInspection::Visible => RestoreParticipantInspection::Visible {
                     token: self.visible_token.clone(),
@@ -4922,25 +4931,31 @@ mod plan7_tests {
                 }
                 MixedAInspection::Ready
                 | MixedAInspection::AdvanceVisible
-                | MixedAInspection::AdvanceInProgress => RestoreParticipantInspection::Ready,
+                | MixedAInspection::AdvanceInProgress
+                | MixedAInspection::AdvanceNativeUnit => RestoreParticipantInspection::Ready,
             })
         }
 
         fn supports_bounded_restore_advance(&self) -> bool {
             matches!(
                 self.inspection,
-                MixedAInspection::AdvanceVisible | MixedAInspection::AdvanceInProgress
+                MixedAInspection::AdvanceVisible
+                    | MixedAInspection::AdvanceInProgress
+                    | MixedAInspection::AdvanceNativeUnit
             )
         }
 
         async fn advance_restore(
             &self,
-            _plan: &PersistedRestoreParticipantPlan,
+            plan: &PersistedRestoreParticipantPlan,
             context: &mut RestoreAdvanceContext<'_>,
         ) -> Result<RestoreParticipantAdvance> {
             context.refence().await?;
             self.advance_calls.fetch_add(1, Ordering::SeqCst);
             match self.inspection {
+                MixedAInspection::AdvanceNativeUnit => {
+                    self.inner.advance_restore(plan, context).await
+                }
                 MixedAInspection::AdvanceVisible => Ok(RestoreParticipantAdvance::Terminal(
                     RestoreParticipantInspection::Visible {
                         token: self.visible_token.clone(),
@@ -5072,16 +5087,26 @@ mod plan7_tests {
     async fn mixed_selected_resume_fixture(
         a_inspection: MixedAInspection,
     ) -> MixedSelectedResumeFixture {
+        mixed_selected_resume_fixture_with_backend(
+            a_inspection,
+            Arc::new(arco_core::MemoryBackend::new()),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "shared fixture creates real authority-8 and format-7 source records"
+    )]
+    async fn mixed_selected_resume_fixture_with_backend(
+        a_inspection: MixedAInspection,
+        backend: Arc<dyn arco_core::StorageBackend>,
+    ) -> MixedSelectedResumeFixture {
         use crate::workspace_snapshot_service::{
             CreateWorkspaceSnapshotRequest, WorkspaceDomainBinding,
         };
 
-        let storage = ScopedStorage::new(
-            Arc::new(arco_core::MemoryBackend::new()),
-            "tenant",
-            "workspace",
-        )
-        .expect("storage");
+        let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
         let catalog_scope = StateScope::new("tenant", "workspace", "catalog");
         let catalog = Arc::new(
             ControlMvpStateStore::new_synthetic_bounded(storage.clone(), catalog_scope.clone())
@@ -5355,6 +5380,177 @@ mod plan7_tests {
         )
         .expect("attempt decode");
         (journal, attempt)
+    }
+
+    #[cfg(feature = "test-utils")]
+    struct ExpireAfterProgress {
+        inner: arco_core::MemoryBackend,
+        ordinal: u64,
+        expired: std::sync::atomic::AtomicBool,
+        late_selectors: AtomicUsize,
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[async_trait::async_trait]
+    impl arco_core::StorageBackend for ExpireAfterProgress {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn get_range_with_ownership(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<arco_core::storage::ClassifiedBytes> {
+            self.inner.get_range_with_ownership(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            condition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path.ends_with("/selector.json") && self.expired.load(Ordering::SeqCst) {
+                self.late_selectors.fetch_add(1, Ordering::SeqCst);
+            }
+            let result = self.inner.put(path, data, condition).await;
+            if path.ends_with(&format!("/progress/{:020}.json", self.ordinal)) {
+                self.expired.store(true, Ordering::SeqCst);
+            }
+            result
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, path: &str) -> arco_core::Result<Vec<arco_core::ObjectMeta>> {
+            self.inner.list(path).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(&self, path: &str, duration: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, duration).await
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn native_restore_driver_refences_after_immutable_staging() {
+        for ordinal in [0, 1] {
+            let backend = Arc::new(ExpireAfterProgress {
+                inner: arco_core::MemoryBackend::new(),
+                ordinal,
+                expired: std::sync::atomic::AtomicBool::new(false),
+                late_selectors: AtomicUsize::new(0),
+            });
+            let mut fixture = mixed_selected_resume_fixture_with_backend(
+                MixedAInspection::AdvanceNativeUnit,
+                backend.clone(),
+            )
+            .await;
+            fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+            install_mixed_selected_attempt(&fixture, false).await;
+            let now = Utc::now();
+            let deadline = fixture.request.requested_at + ChronoDuration::hours(24);
+            let clock_backend = backend.clone();
+            fixture.service.clock = Some(Arc::new(move || {
+                if clock_backend.expired.load(Ordering::SeqCst) {
+                    deadline
+                } else {
+                    now
+                }
+            }));
+            let _outcome = fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await;
+            assert!(
+                backend.expired.load(Ordering::SeqCst),
+                "reached immutable progress {ordinal}"
+            );
+            assert_eq!(
+                backend.late_selectors.load(Ordering::SeqCst),
+                0,
+                "selector after deadline, ordinal {ordinal}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_restore_driver_publishes_one_unit_without_changing_head() {
+        let fixture = mixed_selected_resume_fixture(MixedAInspection::AdvanceNativeUnit).await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        let paths = crate::state_store::control_mvp::ControlMvpPaths::new("catalog");
+        let head_before = fixture
+            .service
+            .storage
+            .get_raw(&paths.current_pointer())
+            .await
+            .expect("HEAD");
+        for call in 1..=2 {
+            let outcome = fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await
+                .expect("native unit");
+            assert_eq!(
+                outcome.status(),
+                WorkspaceRestoreStatus::Applying,
+                "call {call}"
+            );
+            assert!(outcome.read_manifest().is_none());
+            assert_eq!(fixture.plan7.advance_calls.load(Ordering::SeqCst), call);
+        }
+        let (journal, attempt) = selected_mixed_records(&fixture).await;
+        assert!(journal.participants.iter().all(|p| p.evidence.is_none()));
+        let participant = attempt
+            .participants
+            .iter()
+            .find(|p| p.domain == "catalog")
+            .expect("catalog");
+        let plan = serde_json::to_value(&participant.plan).expect("plan");
+        let candidate = plan["candidate_id"].as_str().expect("candidate");
+        let selector_path = format!(
+            "{}/restore/v7/{candidate}/selector.json",
+            paths.base_prefix()
+        );
+        let selector: Value = serde_json::from_slice(
+            &fixture
+                .service
+                .storage
+                .get_raw(&selector_path)
+                .await
+                .expect("selector"),
+        )
+        .expect("JSON");
+        let progress: Value = serde_json::from_slice(
+            &fixture
+                .service
+                .storage
+                .get_raw(selector["current_progress_path"].as_str().expect("path"))
+                .await
+                .expect("progress"),
+        )
+        .expect("JSON");
+        assert_eq!(progress["next_ordinal"], 2);
+        assert_eq!(progress["receipt_count"], 2);
+        assert_eq!(progress["terminal"], true);
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .get_raw(&paths.current_pointer())
+                .await
+                .expect("same HEAD"),
+            head_before
+        );
     }
 
     #[tokio::test]

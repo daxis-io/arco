@@ -6508,6 +6508,28 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         )))
     }
 
+    #[allow(
+        clippy::large_futures,
+        reason = "native bounded driver retains accounted fixed products on stack"
+    )]
+    async fn advance_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+        context: &mut crate::state_store::RestoreAdvanceContext<'_>,
+    ) -> Result<crate::state_store::RestoreParticipantAdvance> {
+        if context.is_bounded() {
+            if self.store.authority_format != 8 {
+                return Err(CatalogError::UnsupportedOperation {
+                    message: "bounded advance requires synthetic authority 8".into(),
+                });
+            }
+            return bounded::restore::advance(&self.store, plan, context).await;
+        }
+        self.apply_restore(plan, context.observed_now())
+            .await
+            .map(crate::state_store::RestoreParticipantAdvance::Terminal)
+    }
+
     async fn inspect_restore_bounded(
         &self,
         plan: &PersistedRestoreParticipantPlan,

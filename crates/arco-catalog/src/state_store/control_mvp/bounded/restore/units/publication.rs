@@ -157,11 +157,27 @@ pub(super) fn assemble<'a, 'p>(
     result
 }
 
+pub(super) struct StagedUnit<'a, 'p>(PreparedUnit<'a, 'p>);
+
+#[cfg(test)]
 pub(super) async fn publish(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
     unit: PreparedUnit<'_, '_>,
 ) -> Result<Publication> {
+    let staged = stage(io, route, unit).await?;
+    let result = select(io, route, staged).await;
+    if matches!(result, Ok(Publication::Conflict(_))) {
+        io.stop(route);
+    }
+    result
+}
+
+pub(super) async fn stage<'a, 'p>(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    unit: PreparedUnit<'a, 'p>,
+) -> Result<StagedUnit<'a, 'p>> {
     let same_owner = unit.expected.is_owned_by(io)
         && unit.selected.selector_meta.is_owned_by(io)
         && unit.selected.selector_raw.is_owned_by(io)
@@ -201,6 +217,23 @@ pub(super) async fn publish(
             )
             .await?,
         );
+        Ok(StagedUnit(unit))
+    }
+    .await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+pub(super) async fn select(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    staged: StagedUnit<'_, '_>,
+) -> Result<Publication> {
+    let unit = staged.0;
+    let result = async {
+        let candidate = unit.expected.value().candidate_id;
         let result = write_restore_control_record(
             io,
             route,
@@ -221,7 +254,7 @@ pub(super) async fn publish(
         if observed == Reconciliation::Exact {
             Ok(Publication::ExactSelected)
         } else {
-            io.stop(route);
+            // The native caller admits its typed conflict error before stopping.
             Ok(Publication::Conflict(observed))
         }
     }

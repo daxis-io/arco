@@ -23,7 +23,21 @@ pub(in super::super) async fn first_after(
     root: &Root,
     after: Option<&[u8]>,
 ) -> Result<WorkingValue<Option<Position>>> {
-    let result = first_after_inner(io, route, root, after).await;
+    let result = first_after_inner(io, route, root, after, false).await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+/// Inclusive endpoint lookup for authenticating a saved restore cursor.
+pub(in super::super) async fn first_at_or_after(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    root: &Root,
+    key: &[u8],
+) -> Result<WorkingValue<Option<Position>>> {
+    let result = first_after_inner(io, route, root, Some(key), true).await;
     if result.is_err() {
         io.stop(route);
     }
@@ -39,6 +53,7 @@ async fn first_after_inner(
     route: &mut RestorePhysicalRoute<'_, '_>,
     root: &Root,
     after: Option<&[u8]>,
+    inclusive: bool,
 ) -> Result<WorkingValue<Option<Position>>> {
     let store = io.store();
     let reservation = directory_scope_reservation(store)?;
@@ -92,7 +107,9 @@ async fn first_after_inner(
                     Ok(())
                 })?;
             drop(checked);
-            if selected.is_none() && after.is_none_or(|a| last.as_slice() > a) {
+            if selected.is_none()
+                && after.is_none_or(|a| last.as_slice() > a || (inclusive && last.as_slice() == a))
+            {
                 let index = u32::try_from(index)
                     .map_err(|_| invariant_violation("directory child index overflow"))?;
                 selected = Some((index, *child));

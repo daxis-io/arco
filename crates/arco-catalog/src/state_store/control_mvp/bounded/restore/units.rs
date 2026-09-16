@@ -11,9 +11,45 @@ use physical::restore_io::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+mod admission;
+mod bootstrap;
 mod codec;
 mod decode;
+mod driver;
 mod publication;
+mod window;
+pub(super) use driver::advance;
+
+// Read-only local selection authentication; Ready cannot settle an uncertain
+// workspace epoch and does not attest the unseen receipt prefix.
+pub(super) async fn inspect_progress(
+    store: &super::super::super::ControlMvpStateStore,
+    plan: &ControlMvpRestorePlanV7,
+    digest: &str,
+    workspace: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+) -> Result<()> {
+    let mut io = RestorePhysicalIo::new(store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+    let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+    let mut route = RestorePhysicalRoute::OrdinaryUnit {
+        workspace,
+        payload: &mut payload,
+    };
+    let owned = decode_with_reservation(
+        &mut io,
+        &mut route,
+        selected_plan_copy_reservation(plan),
+        || {
+            raw_digest(digest)?;
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.to_owned(),
+            })
+        },
+    )?;
+    let expected = admitted_expected_plan(&mut io, &mut route, &owned)?;
+    drop(read_selected_progress(&mut io, &mut route, &expected).await?);
+    Ok(())
+}
 
 /// Owned selection provenance only; native use still requires store/root validation.
 pub(super) struct OwnedSelectedPlan {
@@ -384,7 +420,8 @@ mod kv_merge_tests {
             FinalMicrochunk, FinalStreamTotals, write_standard_restore_output,
         };
         let store = store();
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
@@ -1607,8 +1644,8 @@ fn canonical_binary(value: &str, field: &str, nonempty: bool) -> Result<Vec<u8>>
 }
 
 fn validate_directory_leaf(leaf: &DirectoryPositionLeafWitness) -> Result<(Vec<u8>, Vec<u8>)> {
-    let first = canonical_binary(&leaf.first_b64url, "directory leaf first key", true)?;
-    let last = canonical_binary(&leaf.last_b64url, "directory leaf last key", true)?;
+    let first = canonical_binary(&leaf.first_b64url, "directory leaf first key", false)?;
+    let last = canonical_binary(&leaf.last_b64url, "directory leaf last key", false)?;
     if first > last || leaf.rows == 0 || leaf.bytes == 0 {
         return Err(invariant_violation("invalid directory leaf witness"));
     }
@@ -1617,8 +1654,8 @@ fn validate_directory_leaf(leaf: &DirectoryPositionLeafWitness) -> Result<(Vec<u
 }
 
 fn validate_block(block: &BlockWitness) -> Result<(Vec<u8>, Vec<u8>)> {
-    let min = canonical_binary(&block.min_key_b64url, "block minimum key", true)?;
-    let max = canonical_binary(&block.max_key_b64url, "block maximum key", true)?;
+    let min = canonical_binary(&block.min_key_b64url, "block minimum key", false)?;
+    let max = canonical_binary(&block.max_key_b64url, "block maximum key", false)?;
     if min > max
         || block.length == 0
         || block.rows == 0
@@ -1664,7 +1701,7 @@ fn validate_side_cursor(expected_root_b64: &str, cursor: &SideCursor) -> Result<
             key_b64url,
             position,
         } => {
-            let key = canonical_binary(key_b64url, "side cursor key", true)?;
+            let key = canonical_binary(key_b64url, "side cursor key", false)?;
             validate_position(expected_root_b64, position)?;
             let (first, last) = validate_directory_leaf(&position.leaf)?;
             if key < first || key > last {
@@ -1677,7 +1714,7 @@ fn validate_side_cursor(expected_root_b64: &str, cursor: &SideCursor) -> Result<
 
 fn validate_cursor_shape(expected: &ExpectedPlan<'_>, cursor: &MergeCursor) -> Result<()> {
     if let GlobalCut::After { key_b64url } = &cursor.global {
-        canonical_binary(key_b64url, "global cut key", true)?;
+        canonical_binary(key_b64url, "global cut key", false)?;
     }
     validate_side_cursor(expected.source_kv_root_b64, &cursor.source)?;
     validate_side_cursor(expected.base_kv_root_b64, &cursor.current)
@@ -1687,7 +1724,7 @@ fn global_key(cut: &GlobalCut) -> Result<Option<Vec<u8>>> {
     match cut {
         GlobalCut::Start | GlobalCut::End => Ok(None),
         GlobalCut::After { key_b64url } => {
-            canonical_binary(key_b64url, "global cut key", true).map(Some)
+            canonical_binary(key_b64url, "global cut key", false).map(Some)
         }
     }
 }
@@ -1707,8 +1744,8 @@ fn validate_side_advance(before: &SideCursor, after: &SideCursor) -> Result<()> 
                 key_b64url: right, ..
             },
         ) => {
-            if canonical_binary(left, "side cursor key", true)?
-                >= canonical_binary(right, "side cursor key", true)?
+            if canonical_binary(left, "side cursor key", false)?
+                >= canonical_binary(right, "side cursor key", false)?
             {
                 Err(invariant_violation(
                     "side cursor regressed or changed a retained position",
@@ -1727,7 +1764,7 @@ fn pending_key(state: &SingletonState) -> Result<Option<Vec<u8>>> {
     match state {
         SingletonState::None => Ok(None),
         SingletonState::Pending { key_b64url, .. } | SingletonState::Complete { key_b64url } => {
-            canonical_binary(key_b64url, "singleton key", true).map(Some)
+            canonical_binary(key_b64url, "singleton key", false).map(Some)
         }
     }
 }
@@ -1844,8 +1881,8 @@ fn validate_cursor_transition(
         (GlobalCut::After { .. }, GlobalCut::End) | (GlobalCut::Start, _) => {}
         (GlobalCut::End, _) => return Err(invariant_violation("global cut moved after end")),
         (GlobalCut::After { key_b64url: left }, GlobalCut::After { key_b64url: right }) => {
-            if canonical_binary(left, "global cut key", true)?
-                > canonical_binary(right, "global cut key", true)?
+            if canonical_binary(left, "global cut key", false)?
+                > canonical_binary(right, "global cut key", false)?
             {
                 return Err(invariant_violation("global cut regressed"));
             }
@@ -1914,12 +1951,12 @@ fn validate_output(output: &OutputWitness, expected_id: &str) -> Result<(Vec<u8>
     let first = canonical_binary(
         &output.directory_leaf.first_key_b64url,
         "output leaf first key",
-        true,
+        false,
     )?;
     let last = canonical_binary(
         &output.directory_leaf.last_key_b64url,
         "output leaf last key",
-        true,
+        false,
     )?;
     if first > last || output.directory_leaf.rows == 0 || output.directory_leaf.bytes == 0 {
         return Err(invariant_violation("invalid output leaf witness"));
@@ -3187,6 +3224,59 @@ mod behavioral_tests {
     use super::*;
 
     #[tokio::test]
+    #[allow(
+        clippy::large_futures,
+        reason = "exercise fixed stack product slots without an unaccounted heap box"
+    )]
+    async fn standard_window_reads_merges_and_assembles_actual_unit() {
+        let (store, plan) = super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(b"standard window");
+        let e = ExpectedPlan::from_selected(&plan, &digest).expect("expected");
+        seed_selected_read_case(&store, &e, 14).await;
+        for ordinal in 0..2 {
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+            let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                Ok(OwnedSelectedPlan {
+                    plan: plan.clone(),
+                    plan_sha256: digest.clone(),
+                })
+            })
+            .expect("owned plan");
+            let expected =
+                admitted_expected_plan(&mut io, &mut route, &owned).expect("admitted expected");
+            let selected = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .expect("selected");
+            let unit = window::prepare(&mut io, &mut route, &owned, &expected, &selected)
+                .await
+                .expect("bounded window must assemble from authenticated input");
+            assert_eq!(
+                io.writing_evidence().0,
+                if ordinal == 0 { 3 } else { 0 },
+                "assembly writes only physical products"
+            );
+            assert_eq!(
+                publication::publish(&mut io, &mut route, unit)
+                    .await
+                    .expect("publish"),
+                publication::Publication::Written
+            );
+            let next = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .expect("published progress");
+            assert_eq!(next.progress.value().next_ordinal, ordinal + 1);
+            assert_eq!(next.progress.value().terminal, ordinal == 1);
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn durable_unit_publishes_all_records_before_selecting_progress() {
         let (store, plan) = super::super::tests::inspection_fixture().await;
         let digest = prefixed_sha256(b"durable unit");
@@ -3300,7 +3390,8 @@ mod behavioral_tests {
 
     #[tokio::test]
     async fn durable_unit_publication_faults_reconcile_without_resending() {
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for at in 3..=5 {
                 for after in [false, true] {
                     for pending in [false, true] {
@@ -3482,7 +3573,8 @@ mod behavioral_tests {
 
     #[tokio::test]
     async fn durable_unit_exact_bytes_stale_versions_and_read_only_recovery() {
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for case in 0..7 {
                 durable_unit_observation_case(final_route, case).await;
             }
@@ -3721,7 +3813,8 @@ mod behavioral_tests {
 
     #[tokio::test]
     async fn durable_unit_assembly_rejects_unbound_records_before_control_writes() {
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for case in 0..7 {
                 durable_unit_assembly_case(final_route, case).await;
             }
@@ -4635,14 +4728,15 @@ mod behavioral_tests {
 
     #[tokio::test]
     async fn selected_progress_read_binds_records_and_bounds_lookups() {
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for case in 0..19 {
                 selected_read_case(final_route, case).await;
             }
         }
     }
 
-    async fn seed_selected_read_case(
+    pub(super) async fn seed_selected_read_case(
         store: &super::super::super::super::ControlMvpStateStore,
         expected: &ExpectedPlan<'_>,
         case: u8,
@@ -4784,7 +4878,8 @@ mod behavioral_tests {
         use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
         let (_fixture_store, plan) = super::super::tests::inspection_fixture().await;
         let digest = prefixed_sha256(b"cancellation model");
-        for final_route in [false, true] {
+        {
+            let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for boundary in 1..=9 {
                 let store = physical::restore_io::selected_read_pending_store(boundary);
                 let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
@@ -6135,14 +6230,21 @@ mod behavioral_tests {
                     let mut route = if final_route { RestorePhysicalRoute::FinalMicrochunk(&mut chunk) } else { RestorePhysicalRoute::OrdinaryUnit { workspace, payload: &mut payload } };
                     let result = admitted_expected_plan(&mut io, &mut route, &owned);
                     assert_eq!(result.is_ok(), !below, "final={final_route} below={below}");
+                    let mut diagnostic_bytes = match &result {
+                        Err(CatalogError::MaintenanceBackpressure { message }) => message.capacity(),
+                        Ok(_) => 0,
+                        Err(error) => panic!("unexpected {error:?}"),
+                    };
                     drop(result);
                     assert_eq!(io.native_work_evidence().bounded.directory_references, if below {0} else {6});
                     assert_eq!(io.allocation_underestimates(), 0);
                     if below {
-                        assert!(decode_with_reservation(&mut io, &mut route, Some(1), || -> Result<()> { panic!("route must remain stopped") }).is_err());
+                        let error = decode_with_reservation(&mut io, &mut route, Some(1), || -> Result<()> { panic!("route must remain stopped") }).err().expect("stopped");
+                        let CatalogError::MaintenanceBackpressure { message } = error else { panic!("unexpected stop") };
+                        diagnostic_bytes += message.capacity();
                     }
                     drop(owned);
-                    assert_eq!(io.allocation_evidence().1, 0);
+                    assert_eq!(io.allocation_evidence().1, diagnostic_bytes);
                 }
             }
         }).await;
@@ -6452,9 +6554,23 @@ mod behavioral_tests {
                     ),
                     "copy must reserve complete graph plus fixed scratch before cloning"
                 );
-                assert_eq!(io.allocation_evidence(), (0, 0), "no copy allocation");
+                let first = io.allocation_evidence();
+                assert!(first.0 > 0, "rejection diagnostic is counted");
+                assert_eq!(first.0, first.1 as u64);
+                assert_eq!(
+                    io.decoding_operations(),
+                    u64::from(limit >= 64 * 1024),
+                    "only fixed preflight may run"
+                );
                 assert!(own_selected_plan(&mut io, selection, &mut payload).is_err());
-                assert_eq!(io.allocation_evidence(), (0, 0), "sticky stop");
+                let stopped = io.allocation_evidence();
+                assert!(stopped.0 > first.0, "stopped diagnostic is counted");
+                assert_eq!(stopped.0, stopped.1 as u64);
+                assert_eq!(
+                    io.decoding_operations(),
+                    u64::from(limit >= 64 * 1024),
+                    "sticky stop"
+                );
             }
         })
         .await;
@@ -6573,7 +6689,7 @@ mod behavioral_tests {
 
     async fn codec_raw(
         io: &mut RestorePhysicalIo<'_>,
-        route: &mut RestorePhysicalRoute<'_, '_>,
+        _codec_route: &mut RestorePhysicalRoute<'_, '_>,
         raw: &[u8],
     ) -> physical::restore_io::AccountedBytes {
         let candidate = prefixed_sha256(raw)
@@ -6589,9 +6705,16 @@ mod behavioral_tests {
             )
             .await
             .expect("fixture record");
+        // Fixture transport is control work even when the codec runs in a final chunk.
+        let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut payload = physical::restore_io::UnitPayloadAdmission::new();
+        let mut control_route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
         physical::restore_io::read_restore_control_record(
             io,
-            route,
+            &mut control_route,
             &candidate,
             RestoreControlRecord::Selector,
         )
@@ -6619,13 +6742,13 @@ mod behavioral_tests {
             payload: &mut payload,
         };
         let raw = codec_raw(&mut io, &mut route, &raw).await;
-        let before = io.allocation_evidence().0;
+        let before = io.decoding_operations();
         assert!(
             codec::decode_selector(&mut io, &mut route, &raw).is_err(),
             "record parsing must require its complete reservation"
         );
         assert_eq!(
-            io.allocation_evidence().0,
+            io.decoding_operations(),
             before,
             "parser must not run on failed admission"
         );
@@ -6927,6 +7050,12 @@ mod behavioral_tests {
         for final_stream in [false, true] {
             let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
             let mut workspace = WorkspaceIoBudget::new();
+            let mut transport_workspace = WorkspaceIoBudget::new();
+            let mut transport_payload = UnitPayloadAdmission::new();
+            let mut transport = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut transport_workspace,
+                payload: &mut transport_payload,
+            };
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
             let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
@@ -7059,7 +7188,7 @@ mod behavioral_tests {
             };
             let published = write_restore_control_record(
                 &mut io,
-                &mut route,
+                &mut transport,
                 &candidate,
                 RestoreControlRecord::Receipt(0),
                 &encoded,
@@ -7069,7 +7198,7 @@ mod behavioral_tests {
             .expect("publish");
             let (raw, metadata) = read_restore_control_record(
                 &mut io,
-                &mut route,
+                &mut transport,
                 &candidate,
                 RestoreControlRecord::Receipt(0),
             )
@@ -7288,6 +7417,12 @@ mod behavioral_tests {
         for final_stream in [false, true] {
             let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
             let mut workspace = WorkspaceIoBudget::new();
+            let mut transport_workspace = WorkspaceIoBudget::new();
+            let mut transport_payload = UnitPayloadAdmission::new();
+            let mut transport = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut transport_workspace,
+                payload: &mut transport_payload,
+            };
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
             let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
@@ -7323,7 +7458,12 @@ mod behavioral_tests {
                     .trim_start_matches("sha256:")
                     .to_owned();
                     let first = write_restore_control_record(
-                        &mut io, &mut route, &candidate, $record, &encoded, None,
+                        &mut io,
+                        &mut transport,
+                        &candidate,
+                        $record,
+                        &encoded,
+                        None,
                     )
                     .await
                     .expect("publish record");
@@ -7333,7 +7473,7 @@ mod behavioral_tests {
                     let selector = matches!($record, RestoreControlRecord::Selector);
                     let second = write_restore_control_record(
                         &mut io,
-                        &mut route,
+                        &mut transport,
                         &candidate,
                         $record,
                         &encoded,
@@ -7346,7 +7486,7 @@ mod behavioral_tests {
                         selector
                     );
                     let (raw, metadata) =
-                        read_restore_control_record(&mut io, &mut route, &candidate, $record)
+                        read_restore_control_record(&mut io, &mut transport, &candidate, $record)
                             .await
                             .expect("read")
                             .expect("present");
@@ -7532,12 +7672,12 @@ mod behavioral_tests {
                 FinalMicrochunk::begin(&mut totals, if large { 0 } else { 63 * 1024 * 1024 }, &io)
                     .expect("carry");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-            let before = io.allocation_evidence().0;
+            let before = io.decoding_operations();
             assert!(matches!(
                 codec::decode_progress(&mut io, &mut route, &raw),
                 Err(CatalogError::MaintenanceBackpressure { .. })
             ));
-            assert_eq!(io.allocation_evidence().0, before);
+            assert_eq!(io.decoding_operations(), before);
         }
     }
 
@@ -7672,7 +7812,7 @@ mod behavioral_tests {
         }
     }
 
-    fn receipt(
+    pub(super) fn receipt(
         expected: &ExpectedPlan<'_>,
         ordinal: u64,
         predecessor_receipt_sha256: String,
@@ -7707,7 +7847,7 @@ mod behavioral_tests {
         receipt
     }
 
-    fn progress_after(
+    pub(super) fn progress_after(
         expected: &ExpectedPlan<'_>,
         receipt: &ControlMvpRestoreReceiptV1,
         receipt_raw: &[u8],

@@ -16,6 +16,7 @@ mod bootstrap;
 mod codec;
 mod decode;
 mod driver;
+mod prefix;
 mod publication;
 mod window;
 pub(super) use driver::advance;

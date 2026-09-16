@@ -119,7 +119,21 @@ async fn fixture(
     super::super::ControlMvpRestorePlanV7,
     String,
 ) {
-    let (store, mut plan) = super::super::super::tests::inspection_fixture().await;
+    let (store, plan) = super::super::super::tests::inspection_fixture().await;
+    fixture_on_store(store, plan, source, current, absent).await
+}
+
+async fn fixture_on_store(
+    store: ControlMvpStateStore,
+    mut plan: super::super::ControlMvpRestorePlanV7,
+    source: &[Vec<ControlMvpSegmentRow>],
+    current: &[Vec<ControlMvpSegmentRow>],
+    absent: bool,
+) -> (
+    ControlMvpStateStore,
+    super::super::ControlMvpRestorePlanV7,
+    String,
+) {
     plan.fields.source_kv_root_b64 = root(&store, "source", source).await;
     plan.fields.base_kv_root_b64 = if absent {
         plan.fields.source_kv_root_b64.clone()
@@ -209,9 +223,9 @@ async fn standard_window_large_key_metadata_is_admitted() {
 }
 
 #[tokio::test]
-async fn standard_window_multiunit_matches_independent_oracle() {
+async fn standard_window_multiunit_matches_independent_oracle_and_final_receipt_prefix() {
     for absent in [false, true] {
-        for case in 0..12 {
+        for case in 0..13 {
             let (source, current) = match case {
                 0 => (vec![], vec![]),
                 1 => (
@@ -281,6 +295,10 @@ async fn standard_window_multiunit_matches_independent_oracle() {
                     vec![vec![row(b"", Some(b"old"), 9)]],
                 ),
                 10 => (vec![], vec![vec![row(b"", None, 9)]]),
+                12 => (
+                    vec![vec![row(&vec![b'a'; 48 * 1024], Some(b"value"), 6)]],
+                    vec![],
+                ),
                 _ => (
                     vec![vec![row(b"", Some(b"same"), 6)]],
                     vec![vec![row(b"", Some(b"same"), 9)]],
@@ -431,6 +449,58 @@ async fn standard_window_multiunit_matches_independent_oracle() {
             }
             assert!(finished, "bounded fixture must finish");
             assert_eq!(actual, expected_rows, "case {case} absent {absent}");
+            // Fresh ordinary-authenticated terminal selection; one forward receipt per chunk.
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                Ok(OwnedSelectedPlan {
+                    plan: plan.clone(),
+                    plan_sha256: digest.clone(),
+                })
+            })
+            .expect("selected plan");
+            let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned)
+                .expect("expected");
+            let selected = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .expect("terminal selection");
+            assert!(selected.progress.value().terminal);
+            let mut prefix =
+                super::super::prefix::Prefix::new(&mut io, &mut route, &expected, &selected)
+                    .expect("terminal prefix");
+            let mut totals = physical::restore_io::FinalStreamTotals::new();
+            let mut count = 0;
+            loop {
+                let mut chunk = physical::restore_io::FinalMicrochunk::begin(&mut totals, 0, &io)
+                    .expect("receipt chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let Some(receipt) = prefix
+                    .next(&mut io, &mut route)
+                    .await
+                    .expect("forward receipt")
+                else {
+                    break;
+                };
+                assert_eq!(receipt.value().ordinal, count);
+                count += 1;
+            }
+            assert_eq!(count, selected.progress.value().receipt_count);
+            assert_eq!(io.allocation_underestimates(), 0);
+            println!(
+                "receipt prefix fixture case={case} absent={absent} receipts={count} reads={:?} peak={}",
+                io.reading_evidence(),
+                io.peak_owned_evidence()
+            );
+            drop(prefix);
+            drop(selected);
+            drop(expected);
+            drop(owned);
+            assert_eq!(io.live_ownership_evidence(), (0, 0));
         }
     }
 }
@@ -1143,4 +1213,363 @@ async fn standard_window_cannot_select_inputs_in_final_stream() {
     );
     assert_eq!(io.reading_evidence(), reads, "no new merge selection");
     assert_eq!(io.writing_evidence(), (0, 0));
+}
+
+#[tokio::test]
+async fn final_receipt_prefix_rejects_middle_tampering_and_ignores_orphans() {
+    for mutation in 0..14 {
+        let chunks: Vec<_> = (b'a'..=b'e')
+            .map(|key| vec![row(&[key], Some(&[key]), 6)])
+            .collect();
+        let (store, plan, digest) = fixture(&chunks, &[], false).await;
+        let fixture_expected = ExpectedPlan::from_selected(&plan, &digest).expect("fixture plan");
+        let mut finished = false;
+        for _ in 0..8 {
+            advance_once(&store, &plan, &digest).await;
+            let selector_raw = store
+                .storage
+                .get(&fixture_expected.selector_path())
+                .await
+                .expect("fixture selector");
+            let selector: super::super::RestoreProgressSelectorV1 =
+                control::decode_json(&selector_raw, "fixture selector").expect("selector");
+            let progress_raw = store
+                .storage
+                .get(&selector.current_progress_path)
+                .await
+                .expect("fixture progress");
+            let progress: RestoreProgressV1 =
+                control::decode_json(&progress_raw, "fixture progress").expect("progress");
+            if progress.terminal {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .expect("plan");
+        let expected =
+            super::super::admitted_expected_plan(&mut io, &mut route, &owned).expect("expected");
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("terminal bundle");
+        assert!(selected.progress.value().receipt_count >= 3);
+        let mut prefix =
+            super::super::prefix::Prefix::new(&mut io, &mut route, &expected, &selected)
+                .expect("prefix");
+        let ordinal = match mutation {
+            10 | 11 => 0,
+            12 => selected.progress.value().receipt_count - 1,
+            _ => 1,
+        };
+        let path = expected.value().receipt_path(ordinal);
+        if mutation == 0 {
+            store
+                .retention
+                .delete(&path)
+                .await
+                .expect("missing middle fixture");
+        } else if mutation == 1 {
+            store
+                .retention
+                .put_raw(
+                    &path,
+                    bytes::Bytes::from_static(b"not-json"),
+                    arco_core::WritePrecondition::None,
+                )
+                .await
+                .expect("malformed fixture");
+        } else if mutation == 9 {
+            let orphan_path = expected
+                .value()
+                .receipt_path(selected.progress.value().receipt_count);
+            store
+                .retention
+                .put_raw(
+                    &orphan_path,
+                    bytes::Bytes::from_static(b"unattached losing writer"),
+                    arco_core::WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("orphan fixture");
+        } else {
+            let raw = store.storage.get(&path).await.expect("middle receipt");
+            let mut receipt: ControlMvpRestoreReceiptV1 =
+                control::decode_json(&raw, "receipt").expect("fixture model");
+            match mutation {
+                2 => receipt.ordinal += 1,
+                3 => receipt.predecessor_receipt_sha256 = prefixed_sha256(b"wrong raw predecessor"),
+                4 => receipt.predecessor_chain_sha256 = prefixed_sha256(b"wrong chain predecessor"),
+                5 => receipt.before = super::super::zero_cursor(),
+                6 => {
+                    receipt.singleton_before = SingletonState::Complete {
+                        key_b64url: "YQ".into(),
+                    }
+                }
+                7 => receipt.prefix_cumulative_counts.mutations += 1,
+                10 => receipt.predecessor_receipt_sha256 = prefixed_sha256(b"wrong genesis raw"),
+                11 => receipt.predecessor_chain_sha256 = prefixed_sha256(b"wrong genesis chain"),
+                12 => receipt.counts.mutations += 1,
+                13 => {
+                    receipt.after = MergeCursor {
+                        global: GlobalCut::End,
+                        source: SideCursor::End,
+                        current: SideCursor::End,
+                    }
+                }
+                _ => receipt.source_inputs[0].root_b64 = plan.fields.base_kv_root_b64.clone(),
+            }
+            // Repair local hashes so the continuity tests cannot pass merely by detecting an old body hash.
+            receipt.receipt_body_sha256 =
+                super::super::receipt_body_sha256(&receipt).expect("repaired body");
+            receipt.chain_sha256 =
+                super::super::receipt_chain_sha256(&receipt).expect("repaired chain");
+            if matches!(mutation, 3 | 4 | 7 | 10..=13) {
+                super::super::validate_receipt_shape(expected.value(), &receipt)
+                    .expect("locally valid corrupted edge");
+            }
+            store
+                .retention
+                .put_raw(
+                    &path,
+                    super::super::jcs(&receipt)
+                        .expect("corrupt canonical receipt")
+                        .into(),
+                    arco_core::WritePrecondition::None,
+                )
+                .await
+                .expect("tampered fixture");
+        }
+        let mut totals = physical::restore_io::FinalStreamTotals::new();
+        let mut count = 0;
+        let mut failed = false;
+        loop {
+            let mut chunk =
+                physical::restore_io::FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            match prefix.next(&mut io, &mut route).await {
+                Ok(Some(receipt)) => {
+                    assert_eq!(receipt.value().ordinal, count);
+                    count += 1;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    let reads = io.reading_evidence();
+                    assert!(prefix.next(&mut io, &mut route).await.is_err());
+                    assert_eq!(
+                        io.reading_evidence(),
+                        reads,
+                        "failed prefix cannot retry I/O"
+                    );
+                    break;
+                }
+            }
+        }
+        assert_eq!(failed, mutation != 9, "mutation {mutation}");
+        if mutation == 9 {
+            assert_eq!(count, selected.progress.value().receipt_count);
+        }
+        assert_eq!(io.allocation_underestimates(), 0);
+    }
+}
+
+#[tokio::test]
+async fn final_receipt_prefix_cancellation_stops_first_and_resumed_reads() {
+    use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+    use std::sync::atomic::Ordering;
+    for resumed in [false, true] {
+        for boundary in 1..=3 {
+            let (store, remaining) = physical::restore_io::window_pending_store();
+            let store = store.with_durable_authority_binding(
+                crate::state_store::DurableAuthorityBinding::new([39; 32]),
+            );
+            let (_, plan) = super::super::super::tests::inspection_fixture().await;
+            let chunks: Vec<_> = (b'a'..=b'e')
+                .map(|key| vec![row(&[key], Some(&[key]), 6)])
+                .collect();
+            let (store, plan, digest) = fixture_on_store(store, plan, &chunks, &[], false).await;
+            let e = ExpectedPlan::from_selected(&plan, &digest).unwrap();
+            let mut terminal = false;
+            for _ in 0..8 {
+                advance_once(&store, &plan, &digest).await;
+                let raw = store.storage.get(&e.selector_path()).await.unwrap();
+                let selector: super::super::RestoreProgressSelectorV1 =
+                    control::decode_json(&raw, "fixture selector").unwrap();
+                let raw = store
+                    .storage
+                    .get(&selector.current_progress_path)
+                    .await
+                    .unwrap();
+                let progress: RestoreProgressV1 =
+                    control::decode_json(&raw, "fixture progress").unwrap();
+                if progress.terminal {
+                    assert!(progress.receipt_count >= 3);
+                    terminal = true;
+                    break;
+                }
+            }
+            assert!(terminal);
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                Ok(OwnedSelectedPlan {
+                    plan,
+                    plan_sha256: digest,
+                })
+            })
+            .unwrap();
+            let expected =
+                super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+            let selected = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .unwrap();
+            let mut prefix =
+                super::super::prefix::Prefix::new(&mut io, &mut route, &expected, &selected)
+                    .unwrap();
+            let mut totals = FinalStreamTotals::new();
+            if resumed {
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).unwrap();
+                drop(
+                    prefix
+                        .next(
+                            &mut io,
+                            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+            remaining.store(boundary, Ordering::SeqCst);
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).unwrap();
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let mut pending = Box::pin(prefix.next(&mut io, &mut route));
+            assert!(matches!(
+                futures::poll!(pending.as_mut()),
+                std::task::Poll::Pending
+            ));
+            drop(pending);
+            let reads = io.reading_evidence();
+            let error = prefix
+                .next(&mut io, &mut route)
+                .await
+                .err()
+                .expect("cancelled prefix stops");
+            assert_eq!(io.reading_evidence(), reads);
+            assert_eq!(remaining.load(Ordering::SeqCst), 0);
+            assert_eq!(io.allocation_underestimates(), 0);
+            drop(prefix);
+            drop(selected);
+            drop(expected);
+            drop(owned);
+            assert_eq!(
+                io.live_ownership_evidence(),
+                (
+                    crate::workspace_io_budget::catalog_error_string_capacity(&error)
+                        .expect("known diagnostic"),
+                    0
+                ),
+                "only the retained retry diagnostic remains after carried owners drop",
+            );
+            println!(
+                "prefix cancellation resumed={resumed} boundary={boundary} retained_diagnostic={} error={error}",
+                io.live_ownership_evidence().0
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn final_receipt_prefix_rejects_nonterminal_owner_and_phase_offers() {
+    use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+    for offer in 0..5 {
+        let (store, plan, digest) = fixture(&[], &[], false).await;
+        if offer != 0 {
+            advance_once(&store, &plan, &digest).await;
+        }
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan,
+                plan_sha256: digest,
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        let mut foreign = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let reads = io.reading_evidence();
+        if offer == 0 {
+            assert!(
+                super::super::prefix::Prefix::new(&mut io, &mut route, &expected, &selected)
+                    .is_err()
+            );
+        } else if offer == 1 {
+            assert!(
+                super::super::prefix::Prefix::new(&mut foreign, &mut route, &expected, &selected)
+                    .is_err()
+            );
+        } else if offer == 2 {
+            let mut totals = FinalStreamTotals::new();
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).unwrap();
+            assert!(
+                super::super::prefix::Prefix::new(
+                    &mut io,
+                    &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                    &expected,
+                    &selected
+                )
+                .is_err()
+            );
+        } else {
+            let mut prefix =
+                super::super::prefix::Prefix::new(&mut io, &mut route, &expected, &selected)
+                    .unwrap();
+            if offer == 3 {
+                assert!(prefix.next(&mut io, &mut route).await.is_err());
+            } else {
+                let mut totals = FinalStreamTotals::new();
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &foreign).unwrap();
+                assert!(
+                    prefix
+                        .next(
+                            &mut foreign,
+                            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(io.reading_evidence(), reads);
+        assert_eq!(foreign.reading_evidence(), (0, 0, 0));
+        assert_eq!(io.allocation_underestimates(), 0);
+        assert_eq!(foreign.allocation_underestimates(), 0);
+    }
 }

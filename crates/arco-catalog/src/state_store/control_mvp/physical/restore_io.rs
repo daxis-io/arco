@@ -590,6 +590,33 @@ pub(in super::super) async fn read_restore_control_record(
     result
 }
 
+/// One immutable ascending receipt. Only the terminal prefix reader may interpret it.
+pub(in super::super) async fn read_final_restore_receipt(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    candidate: &str,
+    ordinal: u64,
+) -> CatalogResult<Option<(AccountedBytes, AccountedMeta)>> {
+    let result = async {
+        let store = io.store();
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        let declared =
+            decode_with_reservation(io, route, Some(directory_scope_reservation(store)?), || {
+                DeclaredPhysicalRange::new(
+                    store,
+                    PhysicalObject::Receipt { candidate, ordinal },
+                    final_stream,
+                )
+            })?;
+        read_stable_restore_metadata(io, route, declared, FINAL_RECEIPT_BYTES).await
+    }
+    .await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
 async fn read_stable_restore_metadata(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
@@ -10014,6 +10041,51 @@ mod native_directory_tests {
                 assert_eq!(io.allocation_underestimates(), 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn final_receipt_transport_reads_stable_ordinal_without_opening_control_route() {
+        let (store, _) = range_tests::window_pending_store();
+        let candidate = "88".repeat(32);
+        let path = format!(
+            "{}/restore/v7/{candidate}/receipts/{:020}.json",
+            store.paths.base_prefix(),
+            0
+        );
+        store
+            .retention
+            .put_raw(
+                &path,
+                Bytes::from_static(b"{}"),
+                arco_core::WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("fixture receipt");
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("receipt chunk");
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let (raw, metadata) = read_final_restore_receipt(&mut io, &mut route, &candidate, 0)
+            .await
+            .expect("receipt transport")
+            .expect("receipt exists");
+        assert_eq!(raw.as_slice(), b"{}");
+        assert!(!metadata.value.version.is_empty());
+        assert_eq!(io.reading_evidence().0, 1);
+        assert_eq!(io.reading_evidence().1, 2);
+        drop((raw, metadata));
+        let prior = io.reading_evidence();
+        assert!(
+            read_restore_control_record(
+                &mut io,
+                &mut route,
+                &candidate,
+                RestoreControlRecord::Receipt(0)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(io.reading_evidence(), prior);
     }
 
     async fn native_counter_fixture() -> (ControlMvpStateStore, Vec<u8>) {

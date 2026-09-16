@@ -392,6 +392,23 @@ fn unit_record_decode_reservation(raw: &[u8]) -> Option<usize> {
     Some(failure.max(success))
 }
 
+// A tail clones a strict subset of one decoded receipt's strings/containers.
+// Its additional raw digest and one transient canonical path are separate terms.
+pub(super) fn receipt_tail_copy_reservation(
+    raw_bytes: usize,
+    prefix_bytes: usize,
+) -> Option<usize> {
+    if usize::BITS != 64 || raw_bytes == 0 || raw_bytes > UNIT_RECORD_BYTES {
+        return None;
+    }
+    typed_backing_bound()?;
+    raw_bytes
+        .checked_add(71)?
+        .checked_add(64 * 1024)?
+        .checked_add(prefix_bytes)?
+        .checked_add(128)
+}
+
 fn typed_backing_bound() -> Option<usize> {
     size_of::<InputWitness>()
         .checked_mul(32)?

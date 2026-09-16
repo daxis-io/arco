@@ -448,7 +448,6 @@ fn admit_response<T>(
     })
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 use crate::workspace_io_budget::catalog_error_string_capacity;
 use crate::{
     error::{CatalogError, Result as CatalogResult},
@@ -1043,6 +1042,11 @@ impl<'store> RestorePhysicalIo<'store> {
         self.store
     }
 
+    pub(in super::super) fn stop_final(&mut self, totals: &mut FinalStreamTotals) {
+        self.stopped = true;
+        totals.stop();
+    }
+
     pub(in super::super) fn stop(&mut self, route: &mut RestorePhysicalRoute<'_, '_>) {
         self.stopped = true;
         route.stop();
@@ -1164,6 +1168,7 @@ impl UnitPayloadAdmission {
 /// Monotonic evidence for the one final traversal.  Its microchunk admission
 /// is independent from, and cannot reset or borrow, `WorkspaceIoBudget`.
 pub(in super::super) struct FinalStreamTotals {
+    microchunks: u64,
     total_operations: u64,
     total_io_reservation_bytes: u64,
     total_returned_request_owned_bytes: u64,
@@ -1174,8 +1179,13 @@ pub(in super::super) struct FinalStreamTotals {
 }
 
 impl FinalStreamTotals {
+    #[cfg(test)]
+    pub(in super::super) fn microchunks(&self) -> u64 {
+        self.microchunks
+    }
     pub(in super::super) const fn new() -> Self {
         Self {
+            microchunks: 0,
             total_operations: 0,
             total_io_reservation_bytes: 0,
             total_returned_request_owned_bytes: 0,
@@ -1233,41 +1243,67 @@ pub(in super::super) struct FinalMicrochunk<'a> {
 }
 
 impl<'a> FinalMicrochunk<'a> {
+    /// Finish this physical primitive without resetting its monotonic totals.
+    pub(in super::super) fn finish(self) -> &'a mut FinalStreamTotals {
+        self.totals
+    }
+
     pub(in super::super) fn begin(
         totals: &'a mut FinalStreamTotals,
         external_owned_carry_bytes: usize,
-        io: &RestorePhysicalIo<'_>,
+        io: &mut RestorePhysicalIo<'_>,
     ) -> CatalogResult<Self> {
-        let report = checked_ownership_ledger(&io.ledger)
-            .inspect_err(|_| {
-                totals.stop();
-            })?
-            .report();
-        let starting_owned_carry_bytes = external_owned_carry_bytes
-            .checked_add(report.owned_live_upper_bound())
-            .unwrap_or(usize::MAX);
-        totals.peak_request_owned_live_bytes = totals
-            .peak_request_owned_live_bytes
-            .max(starting_owned_carry_bytes);
-        totals.peak_chunk_owned_upper_bound_bytes = totals
-            .peak_chunk_owned_upper_bound_bytes
-            .max(starting_owned_carry_bytes);
-        if totals.stopped || io.stopped || starting_owned_carry_bytes > FINAL_MICROCHUNK_BYTES {
-            totals.stop();
-            return Err(physical_backpressure(
-                "final stream stopped or carried ownership exceeds 64 MiB",
-            ));
-        }
-        Ok(Self {
+        let mut chunk = Self {
             totals,
             io_reservation_bytes: 0,
             returned_request_owned_bytes: 0,
             owned_allocation_bytes: 0,
             operations: 0,
             external_owned_carry_bytes,
-            starting_owned_carry_bytes,
+            starting_owned_carry_bytes: external_owned_carry_bytes,
             ledger: io.ledger.clone(),
-        })
+        };
+        let admitted = (|| {
+            chunk.totals.microchunks = chunk
+                .totals
+                .microchunks
+                .checked_add(1)
+                .ok_or_else(|| physical_backpressure("final microchunk count overflow"))?;
+            let report = checked_ownership_ledger(&io.ledger)?.report();
+            chunk.starting_owned_carry_bytes = external_owned_carry_bytes
+                .checked_add(report.owned_live_upper_bound())
+                .unwrap_or(usize::MAX);
+            chunk.totals.peak_request_owned_live_bytes = chunk
+                .totals
+                .peak_request_owned_live_bytes
+                .max(chunk.starting_owned_carry_bytes);
+            chunk.totals.peak_chunk_owned_upper_bound_bytes = chunk
+                .totals
+                .peak_chunk_owned_upper_bound_bytes
+                .max(chunk.starting_owned_carry_bytes);
+            if chunk.totals.stopped
+                || io.stopped
+                || chunk.starting_owned_carry_bytes > FINAL_MICROCHUNK_BYTES
+            {
+                return Err(physical_backpressure(
+                    "final stream stopped or carried ownership exceeds 64 MiB",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = admitted {
+            io.stopped = true;
+            chunk.totals.stop();
+            return Err(retain_rejected_diagnostic(
+                &io.ledger,
+                &mut io.failed_allocation,
+                &mut io.work,
+                &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                false,
+                error,
+            ));
+        }
+        Ok(chunk)
     }
 
     fn owned_upper_bound(&self) -> usize {
@@ -2568,7 +2604,7 @@ mod range_tests {
                 let mut io =
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 let rejected = if write {
                     let raw = encode_with_reservation(&mut io, &mut route, 64 * 1024, || {
@@ -2607,7 +2643,7 @@ mod range_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             assert!(
                 read_restore_gate_record(&mut io, &mut route, record)
@@ -2884,7 +2920,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -2927,7 +2963,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -2990,7 +3026,7 @@ mod range_tests {
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -3082,7 +3118,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -3151,7 +3187,7 @@ mod range_tests {
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -3258,7 +3294,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -3368,7 +3404,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -3482,7 +3518,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -3577,7 +3613,7 @@ mod range_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -3753,7 +3789,7 @@ mod range_tests {
                 let mut io =
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -3833,7 +3869,7 @@ mod range_tests {
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let ledger = io.ledger.clone();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -3893,7 +3929,7 @@ mod range_tests {
         let store = store(backend(Response::Shared), "catalog", true);
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
         let rows = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
             Ok(owned_encode_tests::rows(3, 8, 128, Some(1)))
@@ -3919,7 +3955,7 @@ mod range_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -4024,7 +4060,8 @@ mod range_tests {
                     );
                     let ledger = io.ledger.clone();
                     let mut totals = FinalStreamTotals::new();
-                    let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+                    let mut chunk =
+                        FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
                     let mut workspace = WorkspaceIoBudget::new();
                     let mut payload = UnitPayloadAdmission::new();
                     let mut route = if final_stream {
@@ -4151,7 +4188,7 @@ mod range_tests {
                 }
                 backend.puts.store(0, Ordering::SeqCst);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -4221,7 +4258,7 @@ mod range_tests {
             )
             .expect("declaration");
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -4289,7 +4326,7 @@ mod range_tests {
             )
             .expect("declaration");
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -4346,7 +4383,7 @@ mod range_tests {
             )
             .expect("declaration");
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -4433,7 +4470,7 @@ mod range_tests {
             let store = store(backend.clone(), "catalog", true);
             let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("healthy chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("healthy chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             let ledger = io.ledger.clone();
             let _ = std::panic::catch_unwind(|| {
@@ -4476,13 +4513,13 @@ mod range_tests {
     #[test]
     fn restore_final_poisoned_start_records_invalid_accounting() {
         let store = store(backend(Response::Shared), "catalog", true);
-        let io = RestorePhysicalIo::new(&store, 1024, 1024);
+        let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
         let _ = std::panic::catch_unwind(|| {
             let _guard = io.ledger.lock().expect("healthy ledger");
             panic!("inject accounting poison");
         });
         let mut totals = FinalStreamTotals::new();
-        assert!(FinalMicrochunk::begin(&mut totals, 0, &io).is_err());
+        assert!(FinalMicrochunk::begin(&mut totals, 0, &mut io).is_err());
         assert!(totals.stopped);
         assert!(
             io.ledger
@@ -4502,7 +4539,8 @@ mod range_tests {
                 let store = store(backend.clone(), "catalog", true);
                 let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("healthy chunk");
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("healthy chunk");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload_admission = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -4556,7 +4594,7 @@ mod range_tests {
         let mut totals = FinalStreamTotals::new();
         {
             let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             assert_eq!(
                 read_declared_physical_range(&mut io, &mut route, &declared)
@@ -4611,7 +4649,7 @@ mod range_tests {
         let mut totals = FinalStreamTotals::new();
         let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
         {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             assert!(
                 error(
@@ -4648,7 +4686,7 @@ mod range_tests {
             let mut totals = FinalStreamTotals::new();
             let mut io = RestorePhysicalIo::new(&store, limit, 1024);
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 assert!(
                     error(
@@ -4687,7 +4725,7 @@ mod range_tests {
         let mut io = RestorePhysicalIo::new(&store, 32, 1024);
         let mut totals = FinalStreamTotals::new();
         {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             assert!(
                 error(
@@ -4723,7 +4761,7 @@ mod range_tests {
             let pinned = if bounded { &selected } else { &foreign };
             let mut io = RestorePhysicalIo::new(pinned, 1024, 1024);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             assert!(
                 error(read_declared_physical_range(&mut io, &mut route, &declared).await)
@@ -4749,7 +4787,7 @@ mod range_tests {
             }
             let mut totals = FinalStreamTotals::new();
             let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             if is_pending {
                 let declared = payload(&store, true);
@@ -4796,7 +4834,7 @@ mod range_tests {
         let mut io = RestorePhysicalIo::new(&store, 64 * mib, 1024);
         let mut totals = FinalStreamTotals::new();
         let retained = {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("first chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("first chunk");
             read_declared_physical_range(
                 &mut io,
                 &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -4805,15 +4843,19 @@ mod range_tests {
             .await
             .expect("first response")
         };
-        assert!(FinalMicrochunk::begin(&mut totals, 50 * mib, &io).is_err());
+        let error = FinalMicrochunk::begin(&mut totals, 50 * mib, &mut io)
+            .err()
+            .expect("excess carry");
+        let diagnostic = catalog_error_string_capacity(&error).expect("diagnostic capacity");
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
             1,
             "known 70 MiB combined carry must reject before another read"
         );
         assert_eq!(totals.total_operations, 1);
-        assert_eq!(totals.peak_request_owned_live_bytes, 70 * mib);
+        assert_eq!(totals.peak_request_owned_live_bytes, 70 * mib + diagnostic);
         drop(retained);
+        assert_eq!(io.live_ownership_evidence(), (diagnostic, 0));
         assert_eq!(
             io.ledger
                 .lock()
@@ -4836,7 +4878,7 @@ mod range_tests {
             let mut io = RestorePhysicalIo::new(&store, 1024 * 1024, 1024);
             let owned;
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -4891,7 +4933,7 @@ mod range_tests {
             let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
             let mut totals = FinalStreamTotals::new();
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 if pending_head {
                     let mut future =
@@ -4933,7 +4975,7 @@ mod range_tests {
             seed(&store, &declared.path, b"payload").await;
             let mut io = RestorePhysicalIo::new(&store, 1024 * 1024, 1024);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             drop(
                 head_declared_physical(&mut io, &mut route, &declared)
@@ -5018,7 +5060,7 @@ mod range_tests {
         let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
         io.work.returned_range_bytes = u64::MAX;
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
         assert!(
             error(read_declared_physical_range(&mut io, &mut route, &payload(&store, true)).await)
@@ -5050,7 +5092,7 @@ mod range_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -5204,10 +5246,11 @@ mod final_carry_tests {
             StateScope::new("tenant", "workspace", "catalog"),
         )
         .expect("store");
-        let io = RestorePhysicalIo::new(&store, 64 * mib, 0);
+        let mut io = RestorePhysicalIo::new(&store, 64 * mib, 0);
         let mut totals = FinalStreamTotals::new();
         {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 50 * mib, &io).expect("carry fits");
+            let mut chunk =
+                FinalMicrochunk::begin(&mut totals, 50 * mib, &mut io).expect("carry fits");
             chunk.reserve_io(7).expect("first range");
             chunk
                 .charge_returned_request_owned(10 * mib, 10 * mib)
@@ -6278,7 +6321,6 @@ mod unit_hash_tests {
 
 // A refused decoder did not underestimate its working reservation. Its known
 // new static diagnostic still needs an owner, including after admission stops.
-#[cfg(any(test, feature = "test-utils"))]
 fn retain_rejected_diagnostic(
     ledger: &Arc<Mutex<RestoreOwnershipLedger>>,
     owner: &mut Option<WorkingMemory>,
@@ -7003,7 +7045,7 @@ mod output_metadata_tests {
                 let mut io =
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -7092,7 +7134,7 @@ mod output_metadata_tests {
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let ledger = io.ledger.clone();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -7235,7 +7277,7 @@ mod output_metadata_tests {
                 } else {
                     0
                 },
-                &io,
+                &mut io,
             )
             .expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
@@ -7309,7 +7351,7 @@ mod output_metadata_tests {
                 } else {
                     0
                 },
-                &io,
+                &mut io,
             )
             .expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
@@ -7455,7 +7497,8 @@ mod output_metadata_tests {
                     );
                     let ledger = io.ledger.clone();
                     let mut totals = FinalStreamTotals::new();
-                    let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("carry");
+                    let mut chunk =
+                        FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("carry");
                     let mut workspace = WorkspaceIoBudget::new();
                     let mut payload = UnitPayloadAdmission::new();
                     let mut route = if final_stream {
@@ -7544,7 +7587,7 @@ mod output_metadata_tests {
                         } else {
                             0
                         },
-                        &io,
+                        &mut io,
                     )
                     .expect("chunk");
                     let mut workspace = WorkspaceIoBudget::new();
@@ -7722,7 +7765,7 @@ mod owned_encode_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 4096, &mut io).expect("chunk");
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut route = if final_stream {
@@ -7900,7 +7943,8 @@ mod owned_encode_tests {
         let input = rows(1, 8, 211_568, None);
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, 0);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 60 * 1024 * 1024, &io).expect("carry");
+        let mut chunk =
+            FinalMicrochunk::begin(&mut totals, 60 * 1024 * 1024, &mut io).expect("carry");
         assert!(
             encode_standard_restore_output(
                 &mut io,
@@ -7915,7 +7959,7 @@ mod owned_encode_tests {
 
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, 0);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
         let first = encode_standard_restore_output(
             &mut io,
             &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -7945,7 +7989,7 @@ mod owned_encode_tests {
         let input = rows(1, 8, 128, None);
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, 0);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
         let decoded = decode_owned(
             &mut io,
             &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -8075,7 +8119,7 @@ mod owned_decode_tests {
             let mut totals = FinalStreamTotals::new();
             {
                 let mut chunk =
-                    FinalMicrochunk::begin(&mut totals, external * mib, &io).expect("chunk");
+                    FinalMicrochunk::begin(&mut totals, external * mib, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 let first = decode_owned(&mut io, &mut route, || Ok(vec![1_u8; first * mib]))
                     .expect("first decode fits");
@@ -8201,8 +8245,8 @@ mod decode_error_ownership_tests {
         .expect("store");
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk =
-            FinalMicrochunk::begin(&mut totals, FINAL_MICROCHUNK_BYTES, &io).expect("exact carry");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, FINAL_MICROCHUNK_BYTES, &mut io)
+            .expect("exact carry");
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
         let mut result = None;
         let measured = allocation_counter::measure(|| {
@@ -8378,6 +8422,18 @@ fn payload_decode_reservation(descriptor: &super::Descriptor) -> CatalogResult<u
     Ok(reserved)
 }
 
+fn declare_restore_physical(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    object: PhysicalObject<'_>,
+) -> CatalogResult<WorkingValue<DeclaredPhysicalRange>> {
+    let store = io.store;
+    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    decode_with_reservation(io, route, Some(directory_scope_reservation(store)?), || {
+        DeclaredPhysicalRange::new(store, object, final_stream)
+    })
+}
+
 async fn read_restore_payload(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
@@ -8387,28 +8443,32 @@ async fn read_restore_payload(
     // This primitive authenticates the selected payload and its two
     // version fences; it does not mint retained or readable authority.
     let store = io.store;
-    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
     let result = async {
-        if descriptor.encoding_version != 1
-            || descriptor.scope != store.scope
-            || descriptor.segment_version.is_empty()
-        {
-            return Err(super::invariant_violation(
-                "restore payload descriptor identity differs",
-            ));
-        }
-        let selected = DeclaredPhysicalRange::new(
-            store,
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if descriptor.encoding_version != 1
+                || descriptor.scope != store.scope
+                || descriptor.segment_version.is_empty()
+            {
+                return Err(super::invariant_violation(
+                    "restore payload descriptor identity differs",
+                ));
+            }
+            Ok(())
+        })?);
+        let selected = declare_restore_physical(
+            io,
+            route,
             PhysicalObject::Payload {
                 segment: &descriptor.segment,
                 block: &descriptor.block,
             },
-            final_stream,
         )?;
-        let before = head_declared_physical(io, route, &selected).await?;
-        validate_restore_payload_version(&before.value, descriptor)?;
+        let before = head_declared_physical(io, route, selected.value()).await?;
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            validate_restore_payload_version(&before.value, descriptor)
+        })?);
         drop(before);
-        let encoded = read_declared_physical_range(io, route, &selected).await?;
+        let encoded = read_declared_physical_range(io, route, selected.value()).await?;
         let reservation = payload_decode_reservation(descriptor)?;
         let rows = decode_with_reservation(io, route, Some(reservation), || {
             let rows = super::super::decode_block_rows_with_preflight(
@@ -8443,16 +8503,11 @@ async fn read_restore_payload(
         // The production decoder copies every returned key/value. The owned
         // rows remain charged while the encoded response is released.
         drop(encoded);
-        let selected = DeclaredPhysicalRange::new(
-            store,
-            PhysicalObject::Payload {
-                segment: &descriptor.segment,
-                block: &descriptor.block,
-            },
-            final_stream,
-        )?;
-        let after = head_declared_physical(io, route, &selected).await?;
-        validate_restore_payload_version(&after.value, descriptor)?;
+
+        let after = head_declared_physical(io, route, selected.value()).await?;
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            validate_restore_payload_version(&after.value, descriptor)
+        })?);
         drop(after);
         Ok(rows)
     }
@@ -8497,7 +8552,7 @@ mod native_payload_tests {
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
             let mut chunk =
-                FinalMicrochunk::begin(&mut totals, carry * 1024 * 1024, &io).expect("chunk");
+                FinalMicrochunk::begin(&mut totals, carry * 1024 * 1024, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -8512,8 +8567,8 @@ mod native_payload_tests {
                 "observed small allocations cannot replace the proven admission"
             );
             assert_eq!(
-                io.work.decode_operations, 0,
-                "reject before checksum and decoder"
+                io.work.decode_operations, 3,
+                "identity, declaration, and version guards run before decoder admission"
             );
             assert_eq!(
                 io.work.range_reads, 1,
@@ -8608,7 +8663,7 @@ mod native_payload_tests {
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let result = read_restore_payload(
                     &mut io,
                     &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -8654,7 +8709,7 @@ mod native_payload_tests {
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -8672,7 +8727,7 @@ mod native_payload_tests {
             assert_eq!(rows.value[0].value, Some(vec![42; 1024]));
             assert_eq!(io.work.range_reads, 1);
             assert_eq!(io.work.metadata_heads, 2);
-            assert_eq!(io.work.decode_operations, 1);
+            assert_eq!(io.work.decode_operations, 5);
             assert!(rows.working.bytes >= 1024);
             let report = io.ledger.lock().expect("ledger").report();
             assert_eq!(
@@ -8717,6 +8772,63 @@ fn index_decode_reservation(length: usize) -> CatalogResult<usize> {
         .checked_mul(80)
         .and_then(|variable| variable.checked_add(8 * 1024 * 1024 + 128 * 1024))
         .ok_or_else(capacity)
+}
+
+/// Physical authentication only; membership and receipt coverage remain the caller's proof.
+pub(in super::super) struct FinalDescriptor {
+    descriptor: WorkingValue<super::Descriptor>,
+    raw_bytes: u64,
+}
+
+impl FinalDescriptor {
+    pub(in super::super) fn value(&self) -> &super::Descriptor {
+        self.descriptor.value()
+    }
+
+    pub(in super::super) fn raw_bytes(&self) -> u64 {
+        self.raw_bytes
+    }
+}
+
+pub(in super::super) async fn read_final_descriptor(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    leaf: &WorkingValue<super::directory::Leaf>,
+) -> CatalogResult<FinalDescriptor> {
+    let admissible =
+        leaf.is_owned_by(io) && matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+        if !admissible {
+            return Err(physical_backpressure(
+                "final descriptor owner or phase differs",
+            ));
+        }
+        Ok(())
+    })?);
+    let (descriptor, raw_bytes) =
+        read_restore_descriptor_sized(io, route, super::Role::Kv, leaf.value()).await?;
+    Ok(FinalDescriptor {
+        descriptor,
+        raw_bytes,
+    })
+}
+
+pub(in super::super) async fn read_final_payload(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    descriptor: &FinalDescriptor,
+) -> CatalogResult<WorkingValue<Vec<super::ControlMvpSegmentRow>>> {
+    let admissible = descriptor.descriptor.is_owned_by(io)
+        && matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+        if !admissible {
+            return Err(physical_backpressure(
+                "final payload owner or phase differs",
+            ));
+        }
+        Ok(())
+    })?);
+    read_restore_payload(io, route, descriptor.value()).await
 }
 
 /// The caller authenticates membership in its pinned role root. Keep the exact
@@ -8769,34 +8881,38 @@ async fn read_restore_descriptor_sized(
     leaf: &super::directory::Leaf,
 ) -> CatalogResult<(WorkingValue<super::Descriptor>, u64)> {
     let store = io.store;
-    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
     let result = async {
-        let announced = DeclaredPhysicalRange::new(
-            store,
+        let announced = declare_restore_physical(
+            io,
+            route,
             PhysicalObject::Descriptor {
                 digest: &leaf.digest,
                 length: MAX_CONTROL_JSON_BYTES,
             },
-            final_stream,
         )?;
-        let before = head_declared_physical(io, route, &announced).await?;
-        let length = usize::try_from(before.value.size)
-            .map_err(|_| physical_backpressure("restore descriptor length overflow"))?;
-        admitted_physical_length(length, MAX_CONTROL_JSON_BYTES)?;
-        if before.value.version.is_empty() {
-            return Err(super::invariant_violation(
-                "restore descriptor version is absent",
-            ));
-        }
-        let selected = DeclaredPhysicalRange::new(
-            store,
+        let before = head_declared_physical(io, route, announced.value()).await?;
+        let length = decode_with_reservation(io, route, Some(64 * 1024), || {
+            let length = usize::try_from(before.value.size)
+                .map_err(|_| physical_backpressure("restore descriptor length overflow"))?;
+            admitted_physical_length(length, MAX_CONTROL_JSON_BYTES)?;
+            if before.value.version.is_empty() {
+                return Err(super::invariant_violation(
+                    "restore descriptor version is absent",
+                ));
+            }
+            Ok(length)
+        })?;
+        let length = *length.value();
+        drop(announced);
+        let selected = declare_restore_physical(
+            io,
+            route,
             PhysicalObject::Descriptor {
                 digest: &leaf.digest,
                 length,
             },
-            final_stream,
         )?;
-        let bytes = read_declared_physical_range(io, route, &selected).await?;
+        let bytes = read_declared_physical_range(io, route, selected.value()).await?;
         let reservation =
             descriptor_decode_reservation(length, leaf).inspect_err(|_| io.stop(route))?;
         let descriptor = decode_with_reservation(io, route, Some(reservation), || {
@@ -8811,20 +8927,17 @@ async fn read_restore_descriptor_sized(
             Ok(descriptor)
         })?;
         drop(bytes);
-        let selected = DeclaredPhysicalRange::new(
-            store,
-            PhysicalObject::Descriptor {
-                digest: &leaf.digest,
-                length,
-            },
-            final_stream,
-        )?;
-        let after = head_declared_physical(io, route, &selected).await?;
-        if after.value.size != before.value.size || after.value.version != before.value.version {
-            return Err(super::invariant_violation(
-                "restore descriptor version or size changed",
-            ));
-        }
+
+        let after = head_declared_physical(io, route, selected.value()).await?;
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if after.value.size != before.value.size || after.value.version != before.value.version
+            {
+                return Err(super::invariant_violation(
+                    "restore descriptor version or size changed",
+                ));
+            }
+            Ok(())
+        })?);
         drop(before);
         drop(after);
         verify_restore_index(io, route, &descriptor.value).await?;
@@ -8869,16 +8982,13 @@ async fn verify_restore_index(
     descriptor: &super::Descriptor,
 ) -> CatalogResult<()> {
     let store = io.store;
-    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
-    let selected = DeclaredPhysicalRange::new(
-        store,
-        PhysicalObject::Index(&descriptor.segment),
-        final_stream,
-    )?;
-    let before = head_declared_physical(io, route, &selected).await?;
-    validate_restore_index_version(&before.value, descriptor)?;
+    let selected = declare_restore_physical(io, route, PhysicalObject::Index(&descriptor.segment))?;
+    let before = head_declared_physical(io, route, selected.value()).await?;
+    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+        validate_restore_index_version(&before.value, descriptor)
+    })?);
     drop(before);
-    let bytes = read_declared_physical_range(io, route, &selected).await?;
+    let bytes = read_declared_physical_range(io, route, selected.value()).await?;
     let reservation =
         index_decode_reservation(bytes.as_slice().len()).inspect_err(|_| io.stop(route))?;
     let verified = decode_with_reservation(io, route, Some(reservation), || {
@@ -8911,13 +9021,11 @@ async fn verify_restore_index(
     })?;
     drop(verified);
     drop(bytes);
-    let selected = DeclaredPhysicalRange::new(
-        store,
-        PhysicalObject::Index(&descriptor.segment),
-        final_stream,
-    )?;
-    let after = head_declared_physical(io, route, &selected).await?;
-    validate_restore_index_version(&after.value, descriptor)?;
+
+    let after = head_declared_physical(io, route, selected.value()).await?;
+    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+        validate_restore_index_version(&after.value, descriptor)
+    })?);
     drop(after);
     Ok(())
 }
@@ -9022,7 +9130,7 @@ mod native_descriptor_tests {
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let ledger = io.ledger.clone();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 1024, &io).expect("carry");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 1024, &mut io).expect("carry");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -9052,7 +9160,7 @@ mod native_descriptor_tests {
                         "fixed allocation qualification"
                     );
                 }
-                assert_eq!(io.work.decode_operations, if *valid { 2 } else { 1 });
+                assert_eq!(io.work.decode_operations, if *valid { 9 } else { 4 });
                 assert_eq!(io.work.metadata_heads, if *valid { 4 } else { 1 });
                 println!(
                     "restore metadata descriptor: P={} F={} final={final_stream} valid={valid} reserved={reservation} allocated={}",
@@ -9161,7 +9269,7 @@ mod native_descriptor_tests {
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let ledger = io.ledger.clone();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 1024, &io).expect("carry");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 1024, &mut io).expect("carry");
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut route = if final_stream {
@@ -9179,7 +9287,7 @@ mod native_descriptor_tests {
                     "Q={} final={final_stream}",
                     raw.len()
                 );
-                assert_eq!(io.work.decode_operations, 1);
+                assert_eq!(io.work.decode_operations, if *valid { 4 } else { 3 });
                 assert_eq!(io.work.metadata_heads, if *valid { 2 } else { 1 });
                 assert!(
                     usize::try_from(io.work.decoded_owned_allocation_bytes).expect("count")
@@ -9244,7 +9352,7 @@ mod native_descriptor_tests {
                     } else {
                         0
                     },
-                    &io,
+                    &mut io,
                 )
                 .expect("chunk");
                 let mut route = if final_stream {
@@ -9275,7 +9383,11 @@ mod native_descriptor_tests {
         }
         for (final_stream, index, rejected, heads, reads, decodes, stopped) in observations {
             assert!(
-                rejected && stopped && heads == 1 && reads == 1 && decodes == 0,
+                rejected
+                    && stopped
+                    && heads == 1
+                    && reads == 1
+                    && decodes == if index { 2 } else { 3 },
                 "metadata admission missing: final={final_stream} index={index} rejected={rejected} heads={heads} reads={reads} decodes={decodes} stopped={stopped}"
             );
         }
@@ -9352,7 +9464,12 @@ mod native_descriptor_tests {
             let expected_reads = if mutation < 3 { 1 } else { 2 };
             assert_eq!(io.work.range_reads, expected_reads, "mutation {mutation}");
             assert_eq!(
-                io.work.decode_operations, expected_reads,
+                io.work.decode_operations,
+                match mutation {
+                    0 | 1 => 4,
+                    2 => 7,
+                    _ => 8,
+                },
                 "mutation {mutation}"
             );
             assert_eq!(
@@ -9383,7 +9500,7 @@ mod native_descriptor_tests {
             let descriptor;
             {
                 let mut chunk =
-                    FinalMicrochunk::begin(&mut totals, 0, &io).expect("descriptor chunk");
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("descriptor chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -9410,7 +9527,7 @@ mod native_descriptor_tests {
             );
             assert_eq!(io.work.range_reads, 2);
             assert_eq!(io.work.metadata_heads, 4);
-            assert_eq!(io.work.decode_operations, 2);
+            assert_eq!(io.work.decode_operations, 9);
             assert_eq!(
                 io.ledger
                     .lock()
@@ -9420,7 +9537,8 @@ mod native_descriptor_tests {
                 descriptor.working.bytes
             );
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("payload chunk");
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("payload chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -9444,7 +9562,7 @@ mod native_descriptor_tests {
                 println!("native-parity kv final={final_stream} {:?}", io.work.native);
                 assert_eq!(io.work.range_reads, 3);
                 assert_eq!(io.work.metadata_heads, 6);
-                assert_eq!(io.work.decode_operations, 3);
+                assert_eq!(io.work.decode_operations, 14);
             }
             drop(descriptor);
             assert!(io.ledger.lock().expect("ledger").report().passing());
@@ -9465,7 +9583,8 @@ mod native_directory_tests {
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
         let builder = {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor chunk");
+            let mut chunk =
+                FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("constructor chunk");
             new_directory_builder(
                 &mut io,
                 &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -9473,7 +9592,7 @@ mod native_directory_tests {
             .expect("admitted native builder")
         };
         let root = {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("finish chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("finish chunk");
             builder
                 .finish_directory(
                     &mut io,
@@ -9493,7 +9612,7 @@ mod native_directory_tests {
         let (store, _) = native_counter_fixture().await;
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
         let bytes = encode_directory_output(
             &mut io,
             &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -9559,7 +9678,7 @@ mod native_directory_tests {
                 let mut totals = FinalStreamTotals::new();
                 let mut builder = {
                     let mut chunk =
-                        FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor");
+                        FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("constructor");
                     new_directory_builder(
                         &mut io,
                         &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -9575,7 +9694,7 @@ mod native_directory_tests {
                 assert!(retained >= 256 * 1024);
                 for index in 0..count {
                     let mut chunk =
-                        FinalMicrochunk::begin(&mut totals, 0, &io).expect("push chunk");
+                        FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("push chunk");
                     let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                     let input = decode_with_reservation(
                         &mut io,
@@ -9599,7 +9718,8 @@ mod native_directory_tests {
                     );
                 }
                 let root = {
-                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("finish");
+                    let mut chunk =
+                        FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("finish");
                     builder
                         .finish_directory(
                             &mut io,
@@ -9668,7 +9788,7 @@ mod native_directory_tests {
             let ledger = io.ledger.clone();
             let mut totals = FinalStreamTotals::new();
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let result = new_directory_builder(
                     &mut io,
                     &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
@@ -9711,7 +9831,7 @@ mod native_directory_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
             let input = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
@@ -9782,7 +9902,7 @@ mod native_directory_tests {
                 let ledger = io.ledger.clone();
                 let mut totals = FinalStreamTotals::new();
                 {
-                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                     let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                     let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
                     let input =
@@ -9834,7 +9954,7 @@ mod native_directory_tests {
                 let ledger = io.ledger.clone();
                 let mut totals = FinalStreamTotals::new();
                 {
-                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                    let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                     let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                     let builder = new_directory_builder(&mut io, &mut route).expect("builder");
                     let mut future = Box::pin(builder.finish_directory(&mut io, &mut route));
@@ -9870,7 +9990,8 @@ mod native_directory_tests {
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
             let (mut builder, input) = {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("constructor");
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("constructor");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 let builder = new_directory_builder(&mut io, &mut route).expect("builder");
                 let input = decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
@@ -9920,7 +10041,7 @@ mod native_directory_tests {
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
             let mut oracle =
@@ -10019,7 +10140,7 @@ mod native_directory_tests {
                 let mut io =
                     RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
                 if key {
@@ -10063,7 +10184,7 @@ mod native_directory_tests {
             .expect("fixture receipt");
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
-        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("receipt chunk");
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("receipt chunk");
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
         let (raw, metadata) = read_final_restore_receipt(&mut io, &mut route, &candidate, 0)
             .await
@@ -10271,7 +10392,7 @@ mod native_directory_tests {
         let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
         let mut totals = FinalStreamTotals::new();
         for expected in 1..=2 {
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             drop(
                 decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
@@ -10312,7 +10433,7 @@ mod native_directory_tests {
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -10414,7 +10535,7 @@ mod native_directory_tests {
                 let mut workspace = WorkspaceIoBudget::new();
                 let mut payload = UnitPayloadAdmission::new();
                 let mut totals = FinalStreamTotals::new();
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = if final_stream {
                     RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
                 } else {
@@ -10706,7 +10827,7 @@ mod native_directory_tests {
             let mut workspace = WorkspaceIoBudget::new();
             let mut payload = UnitPayloadAdmission::new();
             let mut totals = FinalStreamTotals::new();
-            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("chunk");
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = if final_stream {
                 RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
             } else {
@@ -10746,5 +10867,60 @@ mod native_directory_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod final_descriptor_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn final_chunk_admission_failure_retains_diagnostic_and_stops_owner() {
+        let (store, _) = window_pending_store();
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let error = FinalMicrochunk::begin(&mut totals, usize::MAX, &mut io)
+            .err()
+            .unwrap();
+        assert_eq!(
+            io.live_ownership_evidence(),
+            (catalog_error_string_capacity(&error).unwrap(), 0),
+            "the returned admission diagnostic remains owned until the invocation drops"
+        );
+        assert!(io.stopped);
+        assert!(totals.stopped);
+        assert_eq!(io.allocation_underestimates(), 0);
+    }
+
+    #[tokio::test]
+    async fn final_descriptor_declaration_is_owned_across_pending_head() {
+        use std::sync::atomic::Ordering;
+        let (_, _, leaf) = super::super::tests::fixture().await;
+        let (store, remaining) = window_pending_store();
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let ledger = io.ledger.clone();
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).unwrap();
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let leaf =
+            decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaf.clone()))
+                .unwrap();
+        let baseline = ledger.lock().unwrap().report().working_live_bytes;
+        remaining.store(1, Ordering::SeqCst);
+        let mut pending = Box::pin(read_final_descriptor(&mut io, &mut route, &leaf));
+        assert!(matches!(
+            futures::poll!(pending.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let carried = ledger.lock().unwrap().report().working_live_bytes;
+        assert!(
+            carried > baseline,
+            "descriptor declaration must retain its owner across the HEAD await: baseline={baseline}, carried={carried}"
+        );
+        drop(pending);
+        assert_eq!(ledger.lock().unwrap().report().working_live_bytes, baseline);
+        drop(leaf);
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+        assert_eq!(io.allocation_underestimates(), 0);
     }
 }

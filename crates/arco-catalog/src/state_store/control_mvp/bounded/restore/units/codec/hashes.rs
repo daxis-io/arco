@@ -374,7 +374,8 @@ mod tests {
             } else {
                 0
             };
-            let mut chunk = FinalMicrochunk::begin(&mut totals, carry, &io).expect("final chunk");
+            let mut chunk =
+                FinalMicrochunk::begin(&mut totals, carry, &mut io).expect("final chunk");
             if case == 4 {
                 route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
             }

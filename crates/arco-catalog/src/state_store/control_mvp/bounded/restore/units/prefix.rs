@@ -336,7 +336,8 @@ mod tests {
                 .expect("long-domain prefix constructor");
             let mut totals = FinalStreamTotals::new();
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("receipt chunk");
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("receipt chunk");
                 let mut final_route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
                 let receipt = prefix
                     .next(&mut io, &mut final_route)
@@ -346,7 +347,8 @@ mod tests {
                 assert_eq!(receipt.value().ordinal, 0);
             }
             {
-                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &io).expect("closure chunk");
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("closure chunk");
                 assert!(
                     prefix
                         .next(

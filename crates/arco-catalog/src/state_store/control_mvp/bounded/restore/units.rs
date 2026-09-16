@@ -17,6 +17,7 @@ mod codec;
 mod coverage;
 mod decode;
 mod driver;
+mod history;
 mod prefix;
 mod publication;
 mod window;

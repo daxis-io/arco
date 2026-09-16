@@ -31,9 +31,33 @@ impl Side {
     }
 }
 struct Output {
-    _leaf: WorkingValue<directory::Leaf>,
+    leaf: WorkingValue<directory::Leaf>,
     _descriptor: FinalDescriptor,
     rows: WorkingValue<Vec<ControlMvpSegmentRow>>,
+}
+
+pub(super) struct VerifiedInterval {
+    outputs: [Option<Output>; 32],
+}
+
+impl VerifiedInterval {
+    async fn append(
+        self,
+        io: &mut RestorePhysicalIo<'_>,
+        totals: &mut FinalStreamTotals,
+        history: &mut WorkingValue<super::super::super::super::logical_v2::RestoreHistory>,
+        builder: &mut WorkingValue<directory::restore::NativeBuilder>,
+    ) -> Result<()> {
+        for output in self.outputs.into_iter().flatten() {
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            history.push_restore_history_rows(io, &mut route, &output.rows)?;
+            builder
+                .push_directory_leaf(io, &mut route, &output.leaf)
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 fn reservation(io: &RestorePhysicalIo<'_>) -> Result<usize> {
@@ -53,7 +77,7 @@ pub(super) async fn verify_standard(
     plan: &WorkingValue<OwnedSelectedPlan>,
     expected: &WorkingValue<ExpectedPlan<'_>>,
     receipt: &WorkingValue<ControlMvpRestoreReceiptV1>,
-) -> Result<()> {
+) -> Result<VerifiedInterval> {
     let result = verify_inner(io, totals, plan, expected, receipt).await;
     if result.is_err() {
         io.stop_final(totals);
@@ -71,7 +95,7 @@ async fn verify_inner(
     plan: &WorkingValue<OwnedSelectedPlan>,
     expected: &WorkingValue<ExpectedPlan<'_>>,
     receipt: &WorkingValue<ControlMvpRestoreReceiptV1>,
-) -> Result<()> {
+) -> Result<VerifiedInterval> {
     let owned = plan.is_owned_by(io) && expected.is_owned_by(io) && receipt.is_owned_by(io);
     let store = io.store();
     // Preflight belongs to the first source directory path, not a separate chunk.
@@ -276,7 +300,7 @@ async fn verify_inner(
         )
         .await?;
         *slot = Some(Output {
-            _leaf: leaf,
+            leaf,
             _descriptor: descriptor,
             rows,
         });
@@ -299,7 +323,7 @@ async fn verify_inner(
             )
         },
     )?);
-    Ok(())
+    Ok(VerifiedInterval { outputs })
 }
 
 #[allow(
@@ -715,4 +739,77 @@ fn compare_merge(
         }
     }
     Ok(())
+}
+
+pub(super) struct StandardAssembly {
+    root: WorkingValue<directory::Root>,
+    digest: WorkingValue<String>,
+    _history: WorkingValue<super::super::super::super::logical_v2::RestoreHistory>,
+}
+impl StandardAssembly {
+    pub(super) fn root(&self) -> &directory::Root {
+        self.root.value()
+    }
+    pub(super) fn digest(&self) -> &str {
+        self.digest.value()
+    }
+}
+
+#[allow(
+    clippy::large_futures,
+    reason = "bounded verified interval owners remain on stack through builder writes"
+)]
+pub(super) async fn assemble_standard(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    totals: &mut FinalStreamTotals,
+    plan: &WorkingValue<OwnedSelectedPlan>,
+    expected: &WorkingValue<ExpectedPlan<'_>>,
+    selected: &super::SelectedProgress,
+) -> Result<StandardAssembly> {
+    let result = async {
+        let mut prefix = super::prefix::Prefix::new(io, route, expected, selected)?;
+        // Initialization shares the first actual receipt's allowance.
+        let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+        let mut final_route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let mut history = super::history::new(
+            io,
+            &mut final_route,
+            plan,
+            selected.progress.value().cumulative_counts.mutations,
+        )?;
+        let mut builder = physical::restore_io::new_directory_builder(io, &mut final_route)?;
+        for _ in 0..selected.progress.value().receipt_count {
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let Some(receipt) = prefix.next(io, &mut route).await? else {
+                return decode_with_reservation::<()>(io, &mut route, Some(64 * 1024), || {
+                    Err(invariant_violation("final receipt prefix ended early"))
+                })
+                .map(|_| unreachable!("admitted rejection always returns an error"));
+            };
+            let totals = chunk.finish();
+            let interval = verify_standard(io, totals, plan, expected, &receipt).await?;
+            interval
+                .append(io, totals, &mut history, &mut builder)
+                .await?;
+            // Renew for the next receipt, or for builder finish after the last.
+            chunk = FinalMicrochunk::begin(totals, 0, io)?;
+        }
+        // The final receipt already checked exact terminal closure. Do not
+        // create a CPU-only extra chunk to ask the prefix for None.
+        drop(prefix);
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let root = builder.finish_directory(io, &mut route).await?;
+        let digest = history.finish_restore_history(io, &mut route)?;
+        Ok(StandardAssembly {
+            root,
+            digest,
+            _history: history,
+        })
+    }
+    .await;
+    if result.is_err() {
+        io.stop_final(totals);
+    }
+    result
 }

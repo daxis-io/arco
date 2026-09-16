@@ -462,10 +462,15 @@ impl RestoreHistory {
         })
     }
 
-    pub(super) fn push(&mut self, key: &[u8], generation: u64, value: Option<&[u8]>) -> Result<()> {
+    pub(super) fn ensure_open(&self) -> Result<()> {
         if self.poisoned {
             return Err(invariant_violation("restore history stream is poisoned"));
         }
+        Ok(())
+    }
+
+    pub(super) fn push(&mut self, key: &[u8], generation: u64, value: Option<&[u8]>) -> Result<()> {
+        self.ensure_open()?;
         if self.accepted_mutations == self.declared_mutations {
             self.poisoned = true;
             return Err(invariant_violation(
@@ -497,10 +502,14 @@ impl RestoreHistory {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> Result<(String, ProjectionIntentV2)> {
-        if self.poisoned {
-            return Err(invariant_violation("restore history stream is poisoned"));
-        }
+    pub(super) fn result_sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Finish while retaining the notice under the original allocation owner.
+    pub(super) fn finish_digest(&mut self) -> Result<String> {
+        self.ensure_open()?;
+        self.poisoned = true;
         if self.accepted_mutations != self.declared_mutations {
             return Err(invariant_violation(
                 "restore history accepted mutation count differs from declaration",
@@ -514,7 +523,12 @@ impl RestoreHistory {
             &self.logical_commit_id,
         )?;
         encode_trims(&mut self.out, &[], self.sequence)?;
-        Ok((self.out.finish(), self.notice))
+        Ok(hex::encode(self.out.hasher.clone().finalize()))
+    }
+
+    pub(super) fn finish(mut self) -> Result<(String, ProjectionIntentV2)> {
+        let digest = self.finish_digest()?;
+        Ok((digest, self.notice))
     }
 }
 

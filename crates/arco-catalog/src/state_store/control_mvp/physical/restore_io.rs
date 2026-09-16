@@ -10924,3 +10924,58 @@ mod final_descriptor_ownership_tests {
         assert_eq!(io.allocation_underestimates(), 0);
     }
 }
+
+impl WorkingValue<super::super::logical_v2::RestoreHistory> {
+    pub(in super::super) fn push_restore_history_rows(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+        rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    ) -> CatalogResult<()> {
+        let owned = self.is_owned_by(io) && rows.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !owned || !final_stream {
+                return Err(physical_backpressure(
+                    "restore history rows owner or phase differs",
+                ));
+            }
+            self.value.ensure_open()?;
+            let sequence = self.value.result_sequence();
+            for row in rows.value() {
+                if row.logical_sequence != sequence
+                    || row.generation > sequence
+                    || row.record_kind != super::SEGMENT_RECORD_KV
+                    || row.tombstone != row.value.is_none()
+                {
+                    return Err(super::invariant_violation(
+                        "restore history row metadata differs",
+                    ));
+                }
+                if row.generation == sequence {
+                    self.value
+                        .push(&row.key, row.generation, row.value.as_deref())?;
+                }
+            }
+            Ok(())
+        })?);
+        Ok(())
+    }
+
+    pub(in super::super) fn finish_restore_history(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> CatalogResult<WorkingValue<String>> {
+        let owned = self.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !owned || !final_stream {
+                return Err(physical_backpressure(
+                    "restore history finish owner or phase differs",
+                ));
+            }
+            self.value.finish_digest()
+        })
+    }
+}

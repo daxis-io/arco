@@ -872,7 +872,6 @@ mod tests {
     pub(super) async fn inspection_fixture_for_domain(
         domain: &str,
     ) -> (ControlMvpStateStore, ControlMvpRestorePlanV7) {
-        use crate::state_store::{ArcoStateTxn, PersistedAuthorityAdapter, TxnOptions};
         let storage = arco_core::ScopedStorage::new(
             std::sync::Arc::new(arco_core::MemoryBackend::new()),
             "tenant",
@@ -885,6 +884,14 @@ mod tests {
         )
         .expect("store")
         .with_durable_authority_binding(DurableAuthorityBinding::new([39; 32]));
+        inspection_fixture_on_store(store).await
+    }
+
+    pub(super) async fn inspection_fixture_on_store(
+        store: ControlMvpStateStore,
+    ) -> (ControlMvpStateStore, ControlMvpRestorePlanV7) {
+        use crate::state_store::{ArcoStateTxn, PersistedAuthorityAdapter, TxnOptions};
+        let domain = store.scope.domain();
         let mut txn = store
             .begin_control_txn(TxnOptions::default())
             .await

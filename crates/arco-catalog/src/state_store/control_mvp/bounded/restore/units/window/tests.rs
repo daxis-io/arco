@@ -2013,3 +2013,473 @@ async fn final_coverage_cancellation_stops_every_physical_await_and_releases_car
         println!("final physical cancellation resumed={resumed} boundaries={boundaries}");
     }
 }
+
+#[tokio::test]
+async fn standard_final_assembly_matches_actual_restore_roots_and_history() {
+    use crate::state_store::{
+        ArcoStateTxn, PersistedAuthorityAdapter, RestorePlanningContext, TxnOptions,
+    };
+    use physical::restore_io::FinalStreamTotals;
+    for (changed, large) in [(false, false), (true, false), (true, true)] {
+        let (store, mut plan) = super::super::super::tests::inspection_fixture().await;
+        if large {
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            txn.set_logical_operation("assembly-source", "test", &"ae".repeat(32))
+                .unwrap();
+            for key in [b"a".as_slice(), b"z".as_slice()] {
+                txn.put(key, bytes::Bytes::from(vec![7; 180_000]))
+                    .await
+                    .unwrap();
+            }
+            let token = txn.commit_v2().await.unwrap().token().clone();
+            let source = store
+                .persist_state_reference(
+                    &token,
+                    plan.fields.source_retention_deadline.datetime().unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut budget = WorkspaceIoBudget::new();
+            let mut context = RestorePlanningContext::new(
+                plan.fields.workspace_request_sha256.clone(),
+                plan.fields.requested_at.datetime().unwrap(),
+                plan.fields.execution_deadline.datetime().unwrap(),
+                plan.fields.requested_at.datetime().unwrap(),
+                crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            );
+            plan = super::super::super::plan(&store, &source, &plan.fields.identity, &mut context)
+                .await
+                .unwrap();
+        }
+        if changed {
+            // Explicit fixture construction of the protected retained root;
+            // this is not an executed workspace capture operation.
+            store
+                .install_test_retained_source(&plan.fields.source)
+                .await
+                .unwrap();
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            txn.set_logical_operation("assembly-target", "test", &"ad".repeat(32))
+                .unwrap();
+            txn.put(b"key", bytes::Bytes::from_static(b"changed"))
+                .await
+                .unwrap();
+            txn.put(b"extra", bytes::Bytes::from_static(b"remove"))
+                .await
+                .unwrap();
+            txn.commit_v2().await.unwrap();
+            let mut budget = WorkspaceIoBudget::new();
+            let mut context = RestorePlanningContext::new(
+                plan.fields.workspace_request_sha256.clone(),
+                plan.fields.requested_at.datetime().unwrap(),
+                plan.fields.execution_deadline.datetime().unwrap(),
+                // Keep the fixture's fixed-nanosecond logical clock. Wall time
+                // can still precede that instant within the same second.
+                plan.fields.requested_at.datetime().unwrap(),
+                crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            );
+            plan = super::super::super::plan(
+                &store,
+                &plan.fields.source,
+                &plan.fields.identity,
+                &mut context,
+            )
+            .await
+            .unwrap();
+        }
+        let digest = prefixed_sha256(
+            &super::super::jcs(
+                &crate::state_store::PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
+                    plan.clone(),
+                )),
+            )
+            .unwrap(),
+        );
+        let expected = ExpectedPlan::from_selected(&plan, &digest).unwrap();
+        behavioral_tests::seed_selected_read_case(&store, &expected, 14).await;
+        let mut terminal = false;
+        for ordinal in 0..8 {
+            advance_once(&store, &plan, &digest).await;
+            let raw = store
+                .storage
+                .get(&expected.progress_path(ordinal + 1))
+                .await
+                .unwrap();
+            let progress: RestoreProgressV1 = control::decode_json(&raw, "progress").unwrap();
+            if progress.terminal {
+                terminal = true;
+                break;
+            }
+        }
+        assert!(terminal);
+        let request = plan.logical_request().unwrap();
+        let mut oracle = request
+            .history(
+                super::super::raw_digest(&plan.fields.logical_commit_id).unwrap(),
+                if changed { 2 } else { 0 },
+            )
+            .unwrap();
+        if changed {
+            oracle
+                .push(b"extra", plan.fields.result_logical_sequence, None)
+                .unwrap();
+            oracle
+                .push(b"key", plan.fields.result_logical_sequence, Some(b"value"))
+                .unwrap();
+        }
+        let expected_digest = oracle.finish().unwrap().0;
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        if large {
+            assert!(selected.progress.value().receipt_count >= 3);
+            assert!(selected.progress.value().cumulative_counts.output_blocks >= 2);
+        }
+        let mut totals = FinalStreamTotals::new();
+        let assembled = super::super::coverage::assemble_standard(
+            &mut io,
+            &mut route,
+            &mut totals,
+            &owned,
+            &expected,
+            &selected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(assembled.digest(), expected_digest);
+        assert_eq!(io.allocation_underestimates(), 0);
+        assert!(io.peak_owned_evidence() <= 64 * 1024 * 1024);
+        let mut last = None;
+        let mut actual = BTreeMap::new();
+        loop {
+            let position = directory::restore::first_after(
+                &mut io,
+                &mut route,
+                assembled.root(),
+                last.as_deref(),
+            )
+            .await
+            .unwrap();
+            let Some(position) = position.value() else {
+                break;
+            };
+            let (_, rows) = physical::restore_io::read_restore_leaf(
+                &mut io,
+                &mut route,
+                physical::Role::Kv,
+                &position.leaf,
+            )
+            .await
+            .unwrap();
+            for row in rows.value() {
+                actual.insert(row.key.clone(), (row.value.clone(), row.generation));
+            }
+            last = Some(position.leaf.last.clone());
+        }
+        let mut expected_rows = BTreeMap::new();
+        expected_rows.insert(
+            b"key".to_vec(),
+            (
+                Some(b"value".to_vec()),
+                if changed {
+                    plan.fields.result_logical_sequence
+                } else {
+                    plan.fields.base_logical_sequence
+                },
+            ),
+        );
+        if changed {
+            expected_rows.insert(
+                b"extra".to_vec(),
+                (None, plan.fields.result_logical_sequence),
+            );
+        }
+        if large {
+            for key in [b"a".as_slice(), b"z".as_slice()] {
+                expected_rows.insert(
+                    key.to_vec(),
+                    (Some(vec![7; 180_000]), plan.fields.source_logical_sequence),
+                );
+            }
+        }
+        assert_eq!(actual, expected_rows);
+    }
+}
+
+#[tokio::test]
+async fn standard_final_assembly_cancellation_releases_all_internal_owners() {
+    use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+    use std::sync::atomic::Ordering;
+    let mut boundaries = 0;
+    for at in 0..100 {
+        if at > 0 && at > boundaries {
+            break;
+        }
+        let (store, remaining) = physical::restore_io::window_pending_store();
+        let store = store.with_durable_authority_binding(
+            crate::state_store::DurableAuthorityBinding::new([39; 32]),
+        );
+        let (store, plan) = super::super::super::tests::inspection_fixture_on_store(store).await;
+        let digest = prefixed_sha256(
+            &super::super::jcs(
+                &crate::state_store::PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
+                    plan.clone(),
+                )),
+            )
+            .unwrap(),
+        );
+        let expected = ExpectedPlan::from_selected(&plan, &digest).unwrap();
+        behavioral_tests::seed_selected_read_case(&store, &expected, 14).await;
+        advance_once(&store, &plan, &digest).await;
+        advance_once(&store, &plan, &digest).await;
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        let baseline = io.live_ownership_evidence();
+        let mut totals = FinalStreamTotals::new();
+        remaining.store(if at == 0 { usize::MAX } else { at }, Ordering::SeqCst);
+        let diagnostic = if at == 0 {
+            let assembled = super::super::coverage::assemble_standard(
+                &mut io,
+                &mut route,
+                &mut totals,
+                &owned,
+                &expected,
+                &selected,
+            )
+            .await
+            .unwrap();
+            assert!(io.live_ownership_evidence().0 > baseline.0 + MAX_BLOCK_BYTES);
+            boundaries = usize::MAX - remaining.load(Ordering::SeqCst);
+            assert!(boundaries > 20 && boundaries < 100);
+            drop(assembled);
+            assert_eq!(io.live_ownership_evidence(), baseline);
+            0
+        } else {
+            let mut pending = Box::pin(super::super::coverage::assemble_standard(
+                &mut io,
+                &mut route,
+                &mut totals,
+                &owned,
+                &expected,
+                &selected,
+            ));
+            assert!(
+                matches!(futures::poll!(pending.as_mut()), std::task::Poll::Pending),
+                "boundary={at}"
+            );
+            drop(pending);
+            assert_eq!(io.live_ownership_evidence(), baseline, "boundary={at}");
+            let reads = io.reading_evidence();
+            let writes = io.writing_evidence();
+            let mut fresh = FinalStreamTotals::new();
+            let error = FinalMicrochunk::begin(&mut fresh, 0, &mut io)
+                .err()
+                .expect("cancelled assembly owner stops");
+            assert_eq!(remaining.load(Ordering::SeqCst), 0);
+            assert_eq!(io.reading_evidence(), reads);
+            assert_eq!(io.writing_evidence(), writes);
+            crate::workspace_io_budget::catalog_error_string_capacity(&error).unwrap()
+        };
+        assert_eq!(io.allocation_underestimates(), 0);
+        assert!(io.peak_owned_evidence() <= 64 * 1024 * 1024);
+        drop(selected);
+        drop(expected);
+        drop(owned);
+        assert_eq!(io.live_ownership_evidence(), (diagnostic, 0));
+    }
+    println!("standard final assembly cancellation boundaries={boundaries}");
+}
+
+#[tokio::test]
+async fn standard_final_assembly_rejects_coherent_terminal_and_output_forgery() {
+    use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+    for mutation in 0..3 {
+        let (store, plan) = super::super::super::tests::inspection_fixture().await;
+        let digest = prefixed_sha256(
+            &super::super::jcs(
+                &crate::state_store::PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
+                    plan.clone(),
+                )),
+            )
+            .unwrap(),
+        );
+        let e = ExpectedPlan::from_selected(&plan, &digest).unwrap();
+        behavioral_tests::seed_selected_read_case(&store, &e, 14).await;
+        advance_once(&store, &plan, &digest).await;
+        advance_once(&store, &plan, &digest).await;
+        let head = store
+            .storage
+            .get(&store.paths.current_pointer())
+            .await
+            .unwrap();
+        let mut first: ControlMvpRestoreReceiptV1 = control::decode_json(
+            &store.storage.get(&e.receipt_path(0)).await.unwrap(),
+            "first",
+        )
+        .unwrap();
+        let mut last: ControlMvpRestoreReceiptV1 = control::decode_json(
+            &store.storage.get(&e.receipt_path(1)).await.unwrap(),
+            "last",
+        )
+        .unwrap();
+        if mutation == 0 {
+            last.prefix_cumulative_counts.mutations += 1;
+        }
+        if mutation == 1 {
+            last.predecessor_chain_sha256 = prefixed_sha256(b"forged predecessor");
+        }
+        if mutation == 2 {
+            first.outputs.clear();
+            first.counts.output_blocks = 0;
+            first.counts.output_encoded_bytes = 0;
+            first.receipt_body_sha256 = super::super::receipt_body_sha256(&first).unwrap();
+            first.chain_sha256 = super::super::receipt_chain_sha256(&first).unwrap();
+            super::super::validate_receipt_shape(&e, &first).unwrap();
+            let raw = super::super::jcs(&first).unwrap();
+            last.predecessor_receipt_sha256 = prefixed_sha256(&raw);
+            last.predecessor_chain_sha256 = first.chain_sha256.clone();
+            last.prefix_cumulative_counts =
+                checked_sum(&first.prefix_cumulative_counts, &first.counts).unwrap();
+            store
+                .retention
+                .put_raw(
+                    &e.receipt_path(0),
+                    raw.into(),
+                    arco_core::WritePrecondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        last.receipt_body_sha256 = super::super::receipt_body_sha256(&last).unwrap();
+        last.chain_sha256 = super::super::receipt_chain_sha256(&last).unwrap();
+        super::super::validate_receipt_shape(&e, &last).unwrap();
+        let raw = super::super::jcs(&last).unwrap();
+        let mut progress: RestoreProgressV1 = control::decode_json(
+            &store.storage.get(&e.progress_path(2)).await.unwrap(),
+            "progress",
+        )
+        .unwrap();
+        progress.last_receipt.as_mut().unwrap().raw_sha256 = prefixed_sha256(&raw);
+        progress.chain_sha256 = last.chain_sha256.clone();
+        progress.cumulative_counts =
+            checked_sum(&last.prefix_cumulative_counts, &last.counts).unwrap();
+        store
+            .retention
+            .put_raw(
+                &e.receipt_path(1),
+                raw.into(),
+                arco_core::WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        let raw = super::super::jcs(&progress).unwrap();
+        let mut selector: super::super::RestoreProgressSelectorV1 = control::decode_json(
+            &store.storage.get(&e.selector_path()).await.unwrap(),
+            "selector",
+        )
+        .unwrap();
+        selector.current_progress_sha256 = prefixed_sha256(&raw);
+        store
+            .retention
+            .put_raw(
+                &e.progress_path(2),
+                raw.into(),
+                arco_core::WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        store
+            .retention
+            .put_raw(
+                &e.selector_path(),
+                super::super::jcs(&selector).unwrap().into(),
+                arco_core::WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .expect("coherent locally valid terminal selection");
+        let baseline = io.live_ownership_evidence();
+        let mut totals = FinalStreamTotals::new();
+        let error = super::super::coverage::assemble_standard(
+            &mut io,
+            &mut route,
+            &mut totals,
+            &owned,
+            &expected,
+            &selected,
+        )
+        .await
+        .err()
+        .expect("independent final proof rejects forgery");
+        let diagnostic = crate::workspace_io_budget::catalog_error_string_capacity(&error).unwrap();
+        assert_eq!(
+            io.live_ownership_evidence(),
+            (baseline.0 + diagnostic, baseline.1)
+        );
+        assert_eq!(io.allocation_underestimates(), 0);
+        assert_eq!(
+            store
+                .storage
+                .get(&store.paths.current_pointer())
+                .await
+                .unwrap(),
+            head
+        );
+        let mut fresh = FinalStreamTotals::new();
+        assert!(FinalMicrochunk::begin(&mut fresh, 0, &mut io).is_err());
+    }
+}

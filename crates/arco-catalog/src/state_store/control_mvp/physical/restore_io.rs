@@ -929,6 +929,8 @@ fn validate_physical_segment(segment: &ControlMvpSegmentRef) -> CatalogResult<()
 struct RestoreReadWork {
     native: super::super::cost::NativeWork,
     range_reads: u64,
+    payload_reads: u64,
+    payload_writes: u64,
     metadata_heads: u64,
     returned_range_bytes: u64,
     write_attempts: u64,
@@ -959,6 +961,9 @@ pub(in super::super) struct RestorePhysicalIo<'store> {
     // service invoices its returned error before any subsequent service I/O.
     failed_allocation: Option<WorkingMemory>,
     failed_storage_response: Option<OwnershipHandle>,
+    // Set once after descriptor/index authentication; the enclosing mutable
+    // borrow immediately consumes it for that descriptor, before returning.
+    singleton_payload: Option<usize>,
     stopped: bool,
 }
 impl<'store> RestorePhysicalIo<'store> {
@@ -1090,6 +1095,7 @@ impl<'store> RestorePhysicalIo<'store> {
             ))),
             failed_allocation: None,
             failed_storage_response: None,
+            singleton_payload: None,
             stopped: false,
         }
     }
@@ -1512,9 +1518,28 @@ async fn read_declared_physical_range(
             "restore physical I/O stopped after prior failure",
         ));
     }
+    if declared.payload {
+        if let Some(bytes) = io.singleton_payload {
+            let admissible = io.work.payload_reads == 0
+                && !declared.final_stream
+                && matches!(route, RestorePhysicalRoute::OrdinaryUnit { .. })
+                && declared.reservation_bytes == bytes;
+            drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+                if !admissible {
+                    return Err(physical_backpressure(
+                        "singleton payload allowance already used or differs",
+                    ));
+                }
+                Ok(())
+            })?);
+        }
+    }
     let mut attempt = RestoreReadAttempt::new(&mut io.stopped, route);
     validate_declared_read(io.store, &io.ledger, attempt.route, declared)?;
     attempt.route.reserve_before_io(declared)?;
+    if declared.payload {
+        add_read_work(&mut io.work.payload_reads, 1)?;
+    }
     add_read_work(&mut io.work.range_reads, 1)?;
     let response = io
         .store
@@ -1599,6 +1624,18 @@ async fn put_restore_conditional(
             "restore physical I/O stopped after prior failure",
         ));
     }
+    if declared.payload && io.singleton_payload.is_some() {
+        drop(decode_with_reservation::<()>(
+            io,
+            route,
+            Some(64 * 1024),
+            || {
+                Err(physical_backpressure(
+                    "singleton read allowance cannot publish ordinary payloads",
+                ))
+            },
+        )?);
+    }
     let result = {
         let mut attempt = RestoreReadAttempt::new(&mut io.stopped, route);
         validate_declared_read(io.store, &io.ledger, attempt.route, declared)?;
@@ -1630,6 +1667,9 @@ async fn put_restore_conditional(
                 chunk.reserve_io(bytes.value().len())?;
             }
             _ => return Err(physical_backpressure("restore output route differs")),
+        }
+        if declared.payload {
+            add_read_work(&mut io.work.payload_writes, 1)?;
         }
         add_read_work(&mut io.work.write_attempts, 1)?;
         add_read_work(&mut io.work.submitted_write_bytes, bytes.value().len())?;
@@ -10977,5 +11017,613 @@ impl WorkingValue<super::super::logical_v2::RestoreHistory> {
             }
             self.value.finish_digest()
         })
+    }
+}
+
+/// One singleton payload; directory membership remains the caller's proof.
+pub(in super::super) async fn read_singleton_leaf(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    leaf: &WorkingValue<super::directory::Leaf>,
+) -> CatalogResult<(
+    WorkingValue<super::Descriptor>,
+    WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    u64,
+)> {
+    let result = async {
+        let fresh = leaf.is_owned_by(io)
+            && io.store.authority_format == 8
+            && io.singleton_payload.is_none()
+            && io.work.payload_reads == 0
+            && io.work.payload_writes == 0
+            && matches!(route, RestorePhysicalRoute::OrdinaryUnit { payload, .. }
+                if payload.input_bytes == 0 && payload.output_bytes == 0 && payload.output_blocks == 0);
+        let ledger = io.ledger.clone();
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !fresh || checked_ownership_ledger(&ledger)?.request_owned_limit != FINAL_MICROCHUNK_BYTES {
+                return Err(physical_backpressure("singleton read requires a fresh ordinary 64 MiB owner"));
+            }
+            Ok(())
+        })?);
+        let (descriptor, raw_bytes) =
+            read_restore_descriptor_sized(io, route, super::Role::Kv, leaf.value()).await?;
+        let admission = decode_with_reservation(io, route, Some(64 * 1024), || {
+            let descriptor = descriptor.value();
+            let bytes = usize::try_from(descriptor.block.length)
+                .map_err(|_| physical_backpressure("singleton payload length overflow"))?;
+            if descriptor.block.row_count != 1 || bytes == 0 || bytes > MAX_SEGMENT_BYTES {
+                return Err(physical_backpressure("singleton admission requires one bounded KV row"));
+            }
+            let limit = bytes.checked_mul(24).and_then(|n| n.checked_add(FINAL_MICROCHUNK_BYTES))
+                .ok_or_else(|| physical_backpressure("singleton scratch admission overflow"))?;
+            Ok((bytes, limit))
+        })?;
+        let (bytes, limit) = *admission.value();
+        drop(admission);
+        checked_ownership_ledger(&io.ledger)?.request_owned_limit = limit;
+        io.singleton_payload = Some(bytes);
+        let rows = read_restore_payload(io, route, descriptor.value()).await?;
+        Ok((descriptor, rows, raw_bytes))
+    }.await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+#[cfg(test)]
+mod singleton_read_tests {
+    use super::*;
+    use crate::state_store::control_mvp::{PRODUCTION_SEGMENT_LIMITS, encode_segment};
+    use crate::workspace_io_budget::WorkspaceIoBudget;
+
+    #[tokio::test]
+    async fn singleton_read_admits_one_large_value_and_retains_ownership() {
+        for byte in [41, 42] {
+            let (fixture, _, leaf) =
+                super::super::tests::fixture_with_rows(vec![super::super::ControlMvpSegmentRow {
+                    record_kind: super::super::SEGMENT_RECORD_KV,
+                    key: b"large".to_vec(),
+                    value: Some(vec![byte; 40 * 1024 * 1024]),
+                    generation: 1,
+                    tombstone: false,
+                    logical_sequence: 2,
+                    logical_ordinal: 0,
+                    origin_sequence: None,
+                }])
+                .await;
+            let store = ControlMvpStateStore::new_synthetic_bounded(
+                fixture.retention.clone(),
+                fixture.scope.clone(),
+            )
+            .unwrap();
+            let encoded = leaf.bytes as usize;
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned =
+                decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaf)).unwrap();
+            let (descriptor, rows, raw_size) = read_singleton_leaf(&mut io, &mut route, &owned)
+                .await
+                .expect("one separately admitted oversized value");
+            assert!(raw_size > 0);
+            assert_eq!(
+                io.reading_evidence(),
+                (
+                    3,
+                    6,
+                    raw_size + descriptor.value().segment.index_size_bytes + encoded as u64
+                )
+            );
+            assert_eq!(io.writing_evidence(), (0, 0));
+            assert_eq!(io.work.payload_reads, 1);
+            assert_eq!(io.native_work_evidence().bounded.decoded_rows, 1);
+            assert!(io.native_work_evidence().slots[1] >= encoded as u64);
+            assert_eq!(
+                usize::try_from(descriptor.value().block.length).unwrap(),
+                encoded
+            );
+            assert_eq!(rows.value().len(), 1);
+            assert_eq!(
+                rows.value()[0].value.as_ref().unwrap().len(),
+                40 * 1024 * 1024
+            );
+            assert!(
+                rows.value()[0]
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|v| *v == byte)
+            );
+            assert!(io.live_ownership_evidence().0 >= 40 * 1024 * 1024);
+            assert!(io.peak_owned_evidence() <= FINAL_MICROCHUNK_BYTES + 24 * encoded);
+            assert_eq!(io.allocation_underestimates(), 0);
+            println!(
+                "singleton byte={byte} encoded={encoded} peak={}",
+                io.peak_owned_evidence()
+            );
+            drop((descriptor, rows, owned));
+            assert_eq!(io.live_ownership_evidence(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix covers singleton owner and phase admission"
+    )]
+    async fn singleton_read_rejects_owner_phase_reuse_and_corruption() {
+        let mut accepted = Vec::new();
+        for case in 0..12 {
+            let (fixture, mut descriptor, mut leaf) = if case == 10 {
+                super::super::tests::fixture_with_rows(
+                    (0..2)
+                        .map(|ordinal| super::super::ControlMvpSegmentRow {
+                            record_kind: super::super::SEGMENT_RECORD_KV,
+                            key: vec![b'a' + u8::try_from(ordinal).unwrap()],
+                            value: Some(vec![4; 32]),
+                            generation: 1,
+                            tombstone: false,
+                            logical_sequence: 2,
+                            logical_ordinal: ordinal,
+                            origin_sequence: None,
+                        })
+                        .collect(),
+                )
+                .await
+            } else {
+                super::super::tests::fixture().await
+            };
+            let store = ControlMvpStateStore::new_synthetic_bounded(
+                fixture.retention.clone(),
+                fixture.scope.clone(),
+            )
+            .unwrap();
+            if case == 11 {
+                descriptor.role = super::super::Role::ActiveId;
+                leaf = super::super::tests::persist(&store, &descriptor).await;
+            }
+            if case == 4 {
+                let path = store.paths.segment_index(&descriptor.segment.segment_id);
+                store
+                    .retention
+                    .put_raw(
+                        &path,
+                        Bytes::from_static(b"bad index"),
+                        arco_core::WritePrecondition::None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if case == 5 {
+                leaf.rows = 2;
+            }
+            if case == 6 {
+                let path = store.paths.state_object(&descriptor.segment.segment_id);
+                store
+                    .retention
+                    .put_raw(
+                        &path,
+                        Bytes::from_static(b"bad payload"),
+                        arco_core::WritePrecondition::None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let limit = FINAL_MICROCHUNK_BYTES - usize::from(case == 2);
+            let mut io = RestorePhysicalIo::new(&store, limit, FINAL_MICROCHUNK_BYTES);
+            let mut other =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut ordinary = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned = decode_with_reservation(
+                if case == 0 { &mut other } else { &mut io },
+                &mut ordinary,
+                Some(64 * 1024),
+                || Ok(leaf),
+            )
+            .unwrap();
+            if case == 3 {
+                drop(
+                    read_restore_leaf_sized(
+                        &mut io,
+                        &mut ordinary,
+                        super::super::Role::Kv,
+                        owned.value(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            if (7..=9).contains(&case) {
+                drop(
+                    read_singleton_leaf(&mut io, &mut ordinary, &owned)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let mut fresh = UnitPayloadAdmission::new();
+            let mut totals = FinalStreamTotals::new();
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).unwrap();
+            let mut route = if case == 1 || case == 9 {
+                RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+            } else {
+                RestorePhysicalRoute::OrdinaryUnit {
+                    workspace: &mut workspace,
+                    payload: &mut fresh,
+                }
+            };
+            let result = if (8..=9).contains(&case) {
+                read_restore_leaf_sized(&mut io, &mut route, super::super::Role::Kv, owned.value())
+                    .await
+            } else {
+                read_singleton_leaf(&mut io, &mut route, &owned).await
+            };
+            if result.is_ok() {
+                accepted.push(case);
+            }
+            if matches!(case, 3 | 7 | 8 | 9) {
+                assert_eq!(io.work.payload_reads, 1, "case={case}");
+                let error = result.as_ref().err().expect("admission refusal");
+                assert!(
+                    error.to_string().contains(if case <= 7 {
+                        "fresh ordinary"
+                    } else {
+                        "already used or differs"
+                    }),
+                    "case={case}: {error}"
+                );
+            }
+            drop(result);
+            if case <= 2 {
+                assert_eq!(io.reading_evidence(), (0, 0, 0));
+            }
+            assert_eq!(io.allocation_underestimates(), 0, "case={case}");
+        }
+        assert!(
+            accepted.is_empty(),
+            "accepted invalid singleton cases {accepted:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_read_cancellation_releases_each_physical_boundary() {
+        use std::sync::atomic::Ordering;
+        let (fixture, original, _) =
+            super::super::tests::fixture_with_rows(vec![super::super::ControlMvpSegmentRow {
+                record_kind: super::super::SEGMENT_RECORD_KV,
+                key: b"large".to_vec(),
+                value: Some(vec![17; 40 * 1024 * 1024]),
+                generation: 1,
+                tombstone: false,
+                logical_sequence: 2,
+                logical_ordinal: 0,
+                origin_sequence: None,
+            }])
+            .await;
+        let mut boundaries = 0;
+        for at in 0..=9 {
+            let (store, remaining) = window_pending_store();
+            let mut descriptor = original.clone();
+            for path in [
+                store.paths.state_object(&descriptor.segment.segment_id),
+                store.paths.segment_index(&descriptor.segment.segment_id),
+            ] {
+                let bytes = fixture.retention.get_raw(&path).await.unwrap();
+                store
+                    .retention
+                    .put_raw(&path, bytes, arco_core::WritePrecondition::DoesNotExist)
+                    .await
+                    .unwrap();
+            }
+            descriptor.segment_version = store
+                .storage
+                .head(&store.paths.state_object(&descriptor.segment.segment_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .version;
+            descriptor.index_version = store
+                .storage
+                .head(&store.paths.segment_index(&descriptor.segment.segment_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .version;
+            let leaf = super::super::tests::persist(&store, &descriptor).await;
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned =
+                decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaf)).unwrap();
+            let baseline = io.live_ownership_evidence();
+            remaining.store(if at == 0 { usize::MAX } else { at }, Ordering::SeqCst);
+            if at == 0 {
+                let result = read_singleton_leaf(&mut io, &mut route, &owned)
+                    .await
+                    .unwrap();
+                boundaries = usize::MAX - remaining.load(Ordering::SeqCst);
+                assert_eq!(boundaries, 9);
+                drop(result);
+            } else {
+                let mut pending = Box::pin(read_singleton_leaf(&mut io, &mut route, &owned));
+                assert!(
+                    matches!(futures::poll!(pending.as_mut()), std::task::Poll::Pending),
+                    "at={at}"
+                );
+                drop(pending);
+                assert!(io.stopped, "at={at}");
+                assert_eq!(remaining.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(io.live_ownership_evidence(), baseline, "at={at}");
+            let diagnostic = if at == 0 {
+                0
+            } else {
+                let reads = io.reading_evidence();
+                let error = read_singleton_leaf(&mut io, &mut route, &owned)
+                    .await
+                    .err()
+                    .expect("cancelled owner cannot retry");
+                assert_eq!(io.reading_evidence(), reads);
+                catalog_error_string_capacity(&error).unwrap()
+            };
+            assert_eq!(io.allocation_underestimates(), 0);
+            drop(owned);
+            assert_eq!(io.live_ownership_evidence(), (diagnostic, 0));
+        }
+        println!("singleton cancellation boundaries={boundaries}");
+    }
+
+    #[tokio::test]
+    async fn singleton_read_and_ordinary_payload_write_are_mutually_exclusive() {
+        for read_first in [false, true] {
+            let (fixture, _, leaf) = super::super::tests::fixture().await;
+            let store = ControlMvpStateStore::new_synthetic_bounded(
+                fixture.retention.clone(),
+                fixture.scope.clone(),
+            )
+            .unwrap();
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned =
+                decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaf)).unwrap();
+            if read_first {
+                drop(
+                    read_singleton_leaf(&mut io, &mut route, &owned)
+                        .await
+                        .unwrap(),
+                );
+            }
+            // Exercise the real common immutable PUT admission with an exact
+            // binary payload; this is not a published Arrow artifact.
+            let declared = DeclaredPhysicalRange {
+                scope: store.scope.clone(),
+                final_stream: false,
+                payload: true,
+                path: store.paths.state_object(&"ed".repeat(32)),
+                range: 0..5,
+                reservation_bytes: 5,
+                min_response_bytes: 4,
+                max_response_bytes: 4,
+            };
+            let raw = encode_with_reservation(&mut io, &mut route, 64 * 1024, || {
+                Ok(Bytes::from_static(b"data"))
+            })
+            .unwrap();
+            let result = put_restore_conditional(
+                &mut io,
+                &mut route,
+                &declared,
+                &raw,
+                arco_core::AuthorityWritePrecondition::DoesNotExist,
+            )
+            .await;
+            assert_eq!(result.is_ok(), !read_first);
+            drop((result, raw));
+            assert_eq!(io.writing_evidence().0, u64::from(!read_first));
+            if !read_first {
+                let reads = io.reading_evidence();
+                let mut fresh = UnitPayloadAdmission::new();
+                let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                    workspace: &mut workspace,
+                    payload: &mut fresh,
+                };
+                assert!(
+                    read_singleton_leaf(&mut io, &mut route, &owned)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(io.reading_evidence(), reads);
+            }
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn singleton_read_maximum_writer_valid_value_stays_within_scratch() {
+        let mut row = super::super::ControlMvpSegmentRow {
+            record_kind: super::super::SEGMENT_RECORD_KV,
+            key: b"maximum".to_vec(),
+            value: Some(Vec::new()),
+            generation: 1,
+            tombstone: false,
+            logical_sequence: 2,
+            logical_ordinal: 0,
+            origin_sequence: None,
+        };
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        // Fixture construction finds the actual production codec ceiling;
+        // these encodes are not measured restore operations.
+        let mut low = 40 * 1024 * 1024;
+        let mut high = MAX_SEGMENT_BYTES;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            row.value.as_mut().unwrap().resize(mid, 31);
+            if encode_segment(
+                "physical-test",
+                ControlMvpSegmentLevel::L1,
+                2,
+                &scope,
+                std::slice::from_ref(&row),
+                PRODUCTION_SEGMENT_LIMITS,
+            )
+            .is_ok()
+            {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        row.value.as_mut().unwrap().resize(low + 1, 31);
+        assert!(
+            encode_segment(
+                "physical-test",
+                ControlMvpSegmentLevel::L1,
+                2,
+                &scope,
+                std::slice::from_ref(&row),
+                PRODUCTION_SEGMENT_LIMITS
+            )
+            .is_err()
+        );
+        row.value.as_mut().unwrap().truncate(low);
+        let (fixture, descriptor, leaf) = super::super::tests::fixture_with_rows(vec![row]).await;
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            fixture.retention.clone(),
+            fixture.scope.clone(),
+        )
+        .unwrap();
+        let encoded = leaf.bytes as usize;
+        assert!(descriptor.segment.segment_size_bytes <= MAX_SEGMENT_BYTES as u64);
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned =
+            decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaf)).unwrap();
+        let result = read_singleton_leaf(&mut io, &mut route, &owned)
+            .await
+            .unwrap();
+        assert_eq!(result.1.value()[0].value.as_ref().unwrap().len(), low);
+        assert!(
+            result.1.value()[0]
+                .value
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 31)
+        );
+        assert_eq!(io.allocation_underestimates(), 0);
+        assert!(io.peak_owned_evidence() <= FINAL_MICROCHUNK_BYTES + 24 * encoded);
+        println!(
+            "singleton maximum value={low} encoded={encoded} peak={}",
+            io.peak_owned_evidence()
+        );
+        drop((result, owned));
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn singleton_read_cannot_spend_allowance_on_another_same_length_payload() {
+        let (fixture, _, first) = super::super::tests::fixture().await;
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            fixture.retention.clone(),
+            fixture.scope.clone(),
+        )
+        .unwrap();
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned =
+            decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(first)).unwrap();
+        drop(
+            read_singleton_leaf(&mut io, &mut route, &owned)
+                .await
+                .unwrap(),
+        );
+        let (other, mut descriptor, second) =
+            super::super::tests::fixture_with_rows(vec![super::super::ControlMvpSegmentRow {
+                record_kind: super::super::SEGMENT_RECORD_KV,
+                key: b"key".to_vec(),
+                value: Some(vec![99; 1024]),
+                generation: 1,
+                tombstone: false,
+                logical_sequence: 2,
+                logical_ordinal: 0,
+                origin_sequence: None,
+            }])
+            .await;
+        assert_eq!(owned.value().bytes, second.bytes);
+        assert_ne!(owned.value().digest, second.digest);
+        for path in [
+            store.paths.state_object(&descriptor.segment.segment_id),
+            store.paths.segment_index(&descriptor.segment.segment_id),
+        ] {
+            store
+                .retention
+                .put_raw(
+                    &path,
+                    other.retention.get_raw(&path).await.unwrap(),
+                    arco_core::WritePrecondition::None,
+                )
+                .await
+                .unwrap();
+        }
+        descriptor.segment_version = store
+            .storage
+            .head(&store.paths.state_object(&descriptor.segment.segment_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        descriptor.index_version = store
+            .storage
+            .head(&store.paths.segment_index(&descriptor.segment.segment_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        let second = super::super::tests::persist(&store, &descriptor).await;
+        let mut fresh = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut fresh,
+        };
+        let error = read_restore_leaf_sized(&mut io, &mut route, super::super::Role::Kv, &second)
+            .await
+            .err()
+            .expect("second payload rejected");
+        assert!(error.to_string().contains("already used or differs"));
+        assert_eq!(io.work.payload_reads, 1);
+        assert!(io.stopped);
+        assert_eq!(io.allocation_underestimates(), 0);
     }
 }

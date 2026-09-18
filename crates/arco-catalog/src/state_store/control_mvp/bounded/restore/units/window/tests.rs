@@ -2483,3 +2483,612 @@ async fn standard_final_assembly_rejects_coherent_terminal_and_output_forgery() 
         assert!(FinalMicrochunk::begin(&mut fresh, 0, &mut io).is_err());
     }
 }
+
+#[tokio::test]
+async fn singleton_comparison_restarts_with_compact_witnesses() {
+    use super::super::{SingletonPhase, SingletonState};
+    let source = vec![41; 40 * 1024 * 1024];
+    let current = vec![42; 40 * 1024 * 1024];
+    let (store, plan, digest) = fixture(
+        &[vec![row(b"large", Some(&source), 6)]],
+        &[vec![row(b"large", Some(&current), 9)]],
+        false,
+    )
+    .await;
+    for (ordinal, phase) in [
+        SingletonPhase::CompareSource,
+        SingletonPhase::CompareCurrent,
+        SingletonPhase::Emit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        let unit =
+            super::super::singleton::prepare(&mut io, &mut route, &owned, &expected, &selected)
+                .await
+                .expect("one bounded singleton comparison");
+        assert!(
+            io.live_ownership_evidence().0 < 1024 * 1024,
+            "decoded payload must be dropped before staging"
+        );
+        assert_eq!(
+            publication::publish(&mut io, &mut route, unit)
+                .await
+                .unwrap(),
+            publication::Publication::Written
+        );
+        drop(selected);
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        let p = selected.progress.value();
+        assert_eq!(p.next_ordinal, ordinal as u64 + 1);
+        assert!(matches!(p.cursor.global, GlobalCut::Start));
+        assert!(matches!(p.cursor.source, SideCursor::Start));
+        assert!(matches!(p.cursor.current, SideCursor::Start));
+        let SingletonState::Pending {
+            source: s,
+            current: c,
+            phase: actual,
+            ..
+        } = &p.singleton_state
+        else {
+            panic!("pending singleton");
+        };
+        assert_eq!(*actual, phase);
+        assert_eq!(s.as_ref().unwrap().value_sha256, prefixed_sha256(&source));
+        assert_eq!(s.as_ref().unwrap().value_length, source.len() as u64);
+        assert!(io.hashing_evidence().1 >= source.len() as u64);
+        assert!(
+            io.peak_owned_evidence()
+                <= 64 * 1024 * 1024
+                    + 24 * usize::try_from(s.as_ref().unwrap().block.length).unwrap()
+        );
+        println!(
+            "singleton ordinal={ordinal} reads={:?} writes={:?} hashes={:?} peak={}",
+            io.reading_evidence(),
+            io.writing_evidence(),
+            io.hashing_evidence(),
+            io.peak_owned_evidence()
+        );
+        if ordinal > 0 {
+            assert_eq!(c.as_ref().unwrap().value_sha256, prefixed_sha256(&current));
+        } else {
+            assert!(c.is_none());
+        }
+        assert_eq!(p.cumulative_counts.decoded_blocks, ordinal as u64 + 1);
+        assert_eq!(p.cumulative_counts.decoded_rows, ordinal as u64 + 1);
+        assert_eq!(p.cumulative_counts.output_blocks, 0);
+        assert_eq!(io.allocation_underestimates(), 0);
+        drop(selected);
+        drop(expected);
+        drop(owned);
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+    }
+}
+
+async fn singleton_test_step(
+    store: &ControlMvpStateStore,
+    plan: &super::super::ControlMvpRestorePlanV7,
+    digest: &str,
+) -> RestoreProgressV1 {
+    let mut io = RestorePhysicalIo::new(store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+    let mut workspace = WorkspaceIoBudget::new();
+    let mut payload = UnitPayloadAdmission::new();
+    let mut route = RestorePhysicalRoute::OrdinaryUnit {
+        workspace: &mut workspace,
+        payload: &mut payload,
+    };
+    let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+        Ok(OwnedSelectedPlan {
+            plan: plan.clone(),
+            plan_sha256: digest.into(),
+        })
+    })
+    .unwrap();
+    let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+    let selected = read_selected_progress(&mut io, &mut route, &expected)
+        .await
+        .unwrap();
+    let unit = super::super::singleton::prepare(&mut io, &mut route, &owned, &expected, &selected)
+        .await
+        .unwrap();
+    let target = unit.recovery_target();
+    assert_eq!(
+        publication::publish(&mut io, &mut route, unit)
+            .await
+            .unwrap(),
+        publication::Publication::Written
+    );
+    assert_eq!(
+        publication::reconcile(&mut io, &mut route, &expected, target)
+            .await
+            .unwrap(),
+        publication::Reconciliation::Exact
+    );
+    let next = read_selected_progress(&mut io, &mut route, &expected)
+        .await
+        .unwrap();
+    assert_eq!(io.allocation_underestimates(), 0);
+    next.progress.value().clone()
+}
+
+#[tokio::test]
+async fn singleton_comparison_absence_empty_tombstone_and_opaque_values() {
+    use super::super::{SingletonPhase, SingletonState};
+    for case in 0..6 {
+        let source = match case {
+            0 => vec![],
+            1 => vec![vec![row(b"key", Some(b""), 6)]],
+            2 => vec![vec![row(b"key", None, 6)]],
+            3 => vec![vec![row(b"key", Some(&[0, 255, 128, 0]), 6)]],
+            4 => vec![vec![row(b"later", Some(b"later"), 6)]],
+            _ => vec![vec![row(b"key", Some(b"source"), 6)]],
+        };
+        let current = match case {
+            0 | 1 | 4 => vec![vec![row(b"key", None, 9)]],
+            2 => vec![vec![row(b"key", Some(b""), 9)]],
+            _ => vec![],
+        };
+        let (store, plan, digest) = fixture(&source, &current, case == 5).await;
+        for phase in [
+            SingletonPhase::CompareSource,
+            SingletonPhase::CompareCurrent,
+            SingletonPhase::Emit,
+        ] {
+            let p = singleton_test_step(&store, &plan, &digest).await;
+            let SingletonState::Pending {
+                source: s,
+                current: c,
+                phase: actual,
+                ..
+            } = p.singleton_state
+            else {
+                panic!("pending");
+            };
+            assert_eq!(actual, phase);
+            for (actual, rows) in [(s.as_ref(), &source), (c.as_ref(), &current)] {
+                if let Some(w) = actual {
+                    let r = &rows[0][0];
+                    assert_eq!(w.generation, r.generation);
+                    assert_eq!(w.tombstone, r.tombstone);
+                    assert_eq!(
+                        w.value_length,
+                        r.value.as_ref().map_or(0, |v| v.len() as u64)
+                    );
+                    assert_eq!(
+                        w.value_sha256,
+                        prefixed_sha256(r.value.as_deref().unwrap_or_default())
+                    );
+                }
+            }
+            if case == 0 || case == 4 {
+                assert!(s.is_none());
+                assert!(c.is_some());
+            }
+            if case >= 3 && case != 4 {
+                assert!(s.is_some());
+                assert!(c.is_none());
+            }
+            if case == 1 && phase != SingletonPhase::CompareSource {
+                let (s, c) = (s.unwrap(), c.unwrap());
+                assert_eq!(s.value_sha256, c.value_sha256);
+                assert!(!s.tombstone && c.tombstone);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn singleton_comparison_rejects_forged_observations_and_unsupported_boundaries() {
+    use super::super::{SingletonPhase, SingletonState};
+    for case in 0..9 {
+        let source = if case == 1 {
+            vec![vec![
+                row(b"a", Some(b"a"), 6),
+                row(b"key", Some(b"source"), 6),
+            ]]
+        } else {
+            vec![vec![row(
+                b"key",
+                Some(b"source"),
+                if case == 0 { 99 } else { 6 },
+            )]]
+        };
+        let (store, plan, digest) =
+            fixture(&source, &[vec![row(b"key", Some(b"current"), 9)]], false).await;
+        if case >= 4 {
+            singleton_test_step(&store, &plan, &digest).await;
+            if case >= 5 {
+                singleton_test_step(&store, &plan, &digest).await;
+            }
+            if case == 8 {
+                singleton_test_step(&store, &plan, &digest).await;
+            }
+        }
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let mut selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        selected.progress = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            let mut p = selected.progress.value().clone();
+            match case {
+                2 => p.cursor.source = SideCursor::End,
+                3 => {
+                    p.cursor.global = GlobalCut::After {
+                        key_b64url: URL_SAFE_NO_PAD.encode(b"z"),
+                    }
+                }
+                4 => {
+                    if let SingletonState::Pending { source, .. } = &mut p.singleton_state {
+                        *source = None;
+                    }
+                }
+                5 => {
+                    if let SingletonState::Pending {
+                        source: Some(w), ..
+                    } = &mut p.singleton_state
+                    {
+                        w.value_sha256 = prefixed_sha256(b"forged");
+                    }
+                }
+                6 => {
+                    if let SingletonState::Pending {
+                        source: Some(w), ..
+                    } = &mut p.singleton_state
+                    {
+                        w.generation += 1;
+                    }
+                }
+                7 => {
+                    if let SingletonState::Pending { key_b64url, .. } = &mut p.singleton_state {
+                        *key_b64url = URL_SAFE_NO_PAD.encode(b"skip");
+                    }
+                }
+                _ => {}
+            }
+            Ok(p)
+        })
+        .unwrap();
+        if case == 8 {
+            assert!(matches!(
+                selected.progress.value().singleton_state,
+                SingletonState::Pending {
+                    phase: SingletonPhase::Emit,
+                    ..
+                }
+            ));
+        }
+        let error = match super::super::singleton::prepare(
+            &mut io, &mut route, &owned, &expected, &selected,
+        )
+        .await
+        {
+            Ok(_) => panic!("accepted singleton case {case}"),
+            Err(e) => e,
+        };
+        println!("singleton refusal {case}: {error}");
+        assert_eq!(io.writing_evidence(), (0, 0));
+        assert_eq!(io.allocation_underestimates(), 0);
+        let before = io.reading_evidence();
+        assert!(
+            super::super::singleton::prepare(&mut io, &mut route, &owned, &expected, &selected)
+                .await
+                .is_err()
+        );
+        assert_eq!(io.reading_evidence(), before);
+    }
+}
+
+#[tokio::test]
+async fn singleton_comparison_resumes_after_an_authenticated_standard_boundary() {
+    let (store, plan, digest) = fixture(
+        &[
+            vec![row(b"a", Some(b"same"), 6)],
+            vec![row(b"z", Some(&vec![1; 1024 * 1024]), 6)],
+        ],
+        &[
+            vec![row(b"a", Some(b"same"), 9)],
+            vec![row(b"z", Some(&vec![2; 1024 * 1024]), 9)],
+        ],
+        false,
+    )
+    .await;
+    advance_once(&store, &plan, &digest).await;
+    for ordinal in 2..=4 {
+        let p = singleton_test_step(&store, &plan, &digest).await;
+        assert_eq!(p.next_ordinal, ordinal);
+        assert_eq!(
+            p.cursor.global,
+            GlobalCut::After {
+                key_b64url: URL_SAFE_NO_PAD.encode(b"a")
+            }
+        );
+        assert!(matches!(p.cursor.source, SideCursor::After { .. }));
+        assert!(matches!(p.cursor.current, SideCursor::After { .. }));
+    }
+}
+
+#[tokio::test]
+async fn singleton_comparison_cancellation_releases_every_await() {
+    use std::sync::atomic::Ordering;
+    for phase in 0..3 {
+        let mut boundaries = 0;
+        for at in 0..100 {
+            if at > 0 && at > boundaries {
+                break;
+            }
+            let (store, remaining) = physical::restore_io::window_pending_store();
+            let store = store.with_durable_authority_binding(
+                crate::state_store::DurableAuthorityBinding::new([39; 32]),
+            );
+            let (_, plan) = super::super::super::tests::inspection_fixture().await;
+            let (store, plan, digest) = fixture_on_store(
+                store,
+                plan,
+                &[vec![row(b"key", Some(&vec![1; 1024 * 1024]), 6)]],
+                &[vec![row(b"key", Some(&vec![2; 1024 * 1024]), 9)]],
+                false,
+            )
+            .await;
+            for _ in 0..phase {
+                singleton_test_step(&store, &plan, &digest).await;
+            }
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                Ok(OwnedSelectedPlan {
+                    plan,
+                    plan_sha256: digest,
+                })
+            })
+            .unwrap();
+            let expected =
+                super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+            let selected = read_selected_progress(&mut io, &mut route, &expected)
+                .await
+                .unwrap();
+            let baseline = io.live_ownership_evidence();
+            remaining.store(if at == 0 { usize::MAX } else { at }, Ordering::SeqCst);
+            if at == 0 {
+                let unit = super::super::singleton::prepare(
+                    &mut io, &mut route, &owned, &expected, &selected,
+                )
+                .await
+                .unwrap();
+                drop(unit);
+                boundaries = usize::MAX - remaining.load(Ordering::SeqCst);
+                assert!(boundaries > 9 && boundaries < 100);
+            } else {
+                let mut pending = Box::pin(super::super::singleton::prepare(
+                    &mut io, &mut route, &owned, &expected, &selected,
+                ));
+                assert!(size_of_val(pending.as_ref().get_ref()) <= 64 * 1024);
+                assert!(
+                    matches!(futures::poll!(pending.as_mut()), std::task::Poll::Pending),
+                    "phase {phase} await {at}"
+                );
+                drop(pending);
+                assert_eq!(remaining.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    io.live_ownership_evidence(),
+                    baseline,
+                    "phase {phase} await {at}"
+                );
+                let reads = io.reading_evidence();
+                assert!(
+                    super::super::singleton::prepare(
+                        &mut io, &mut route, &owned, &expected, &selected
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(io.reading_evidence(), reads);
+            }
+            assert_eq!(io.writing_evidence(), (0, 0));
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+        println!("singleton phase {phase}: {boundaries} canceled physical awaits");
+    }
+}
+
+#[tokio::test]
+async fn singleton_comparison_publication_reconciles_competitors_and_immutable_collision() {
+    for case in 0..3 {
+        let (store, plan, digest) = fixture(
+            &[vec![row(b"key", Some(&vec![1; 1024 * 1024]), 6)]],
+            &[vec![row(b"key", Some(&vec![2; 1024 * 1024]), 9)]],
+            false,
+        )
+        .await;
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        let unit =
+            super::super::singleton::prepare(&mut io, &mut route, &owned, &expected, &selected)
+                .await
+                .unwrap();
+        let target = unit.recovery_target();
+        if case < 2 {
+            for _ in 0..=case {
+                singleton_test_step(&store, &plan, &digest).await;
+            }
+        } else {
+            store
+                .retention
+                .put_raw(
+                    &expected.value().receipt_path(0),
+                    bytes::Bytes::from_static(b"immutable collision"),
+                    arco_core::WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+        }
+        let result = publication::publish(&mut io, &mut route, unit).await;
+        match case {
+            0 => assert_eq!(result.unwrap(), publication::Publication::ExactSelected),
+            1 => assert_eq!(
+                result.unwrap(),
+                publication::Publication::Conflict(publication::Reconciliation::Different)
+            ),
+            _ => assert!(result.is_err()),
+        }
+        assert_eq!(io.allocation_underestimates(), 0);
+        drop(selected);
+        drop(expected);
+        drop(owned);
+        drop(io);
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let expected = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            ExpectedPlan::from_selected(&plan, &digest)
+        })
+        .unwrap();
+        assert_eq!(
+            publication::reconcile(&mut io, &mut route, &expected, target)
+                .await
+                .unwrap(),
+            match case {
+                0 => publication::Reconciliation::Exact,
+                1 => publication::Reconciliation::Different,
+                _ => publication::Reconciliation::Prior,
+            }
+        );
+        let next = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        assert_eq!(
+            next.progress.value().next_ordinal,
+            if case == 2 { 0 } else { case + 1 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn singleton_comparison_rejects_foreign_owner_final_route_and_current_tampering() {
+    use super::super::SingletonState;
+    use physical::restore_io::{FinalMicrochunk, FinalStreamTotals};
+    for case in 0..3 {
+        let (store, plan, digest) =
+            fixture(&[], &[vec![row(b"key", Some(b"current"), 9)]], false).await;
+        singleton_test_step(&store, &plan, &digest).await;
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut other = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let owned = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+            Ok(OwnedSelectedPlan {
+                plan: plan.clone(),
+                plan_sha256: digest.clone(),
+            })
+        })
+        .unwrap();
+        let expected = super::super::admitted_expected_plan(&mut io, &mut route, &owned).unwrap();
+        let mut selected = read_selected_progress(&mut io, &mut route, &expected)
+            .await
+            .unwrap();
+        if case == 0 || case == 2 {
+            selected.progress = decode_with_reservation(
+                if case == 0 { &mut other } else { &mut io },
+                &mut route,
+                Some(1024 * 1024),
+                || {
+                    let mut p = selected.progress.value().clone();
+                    if case == 2 {
+                        if let SingletonState::Pending {
+                            current: Some(w), ..
+                        } = &mut p.singleton_state
+                        {
+                            w.value_sha256 = prefixed_sha256(b"forged");
+                        }
+                    }
+                    Ok(p)
+                },
+            )
+            .unwrap();
+        }
+        let mut totals = FinalStreamTotals::new();
+        let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).unwrap();
+        let mut final_route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let before = io.reading_evidence();
+        let result = super::super::singleton::prepare(
+            &mut io,
+            if case == 1 {
+                &mut final_route
+            } else {
+                &mut route
+            },
+            &owned,
+            &expected,
+            &selected,
+        )
+        .await;
+        assert!(result.is_err(), "case {case}");
+        if case < 2 {
+            assert_eq!(io.reading_evidence(), before);
+        }
+        assert_eq!(io.writing_evidence(), (0, 0));
+        assert_eq!(io.allocation_underestimates(), 0);
+    }
+}

@@ -20,6 +20,7 @@ mod driver;
 mod history;
 mod prefix;
 mod publication;
+mod singleton;
 mod window;
 pub(super) use driver::advance;
 

@@ -138,3 +138,42 @@ archive's own base. The earlier Gate 7 recovery archive remains preserved.
 Cloud compute remains at its previously verified teardown disposition; this
 follow-up did not recreate or query it. Stored S3 evidence was preserved. No claim
 of zero total AWS storage cost follows from terminating compute.
+
+
+## 2026-09-17 private singleton comparison component
+
+The private authority-8 restore path now prepares durable singleton comparisons
+through the existing receipt/progress/selector publisher. Three separate
+invocations persist CompareSource, CompareCurrent and Emit, while holding the
+merge cursor fixed. Each reads one authenticated payload, hashes exact opaque
+value bytes and releases decoded rows before staging compact witnesses. No
+singleton output or final restore HEAD publication is enabled.
+
+A restarted pair of different 40 MiB values passed the component regression.
+Observed peaks for its three invocations were 302,036,909; 302,053,298; and
+302,066,990 bytes, below the separate singleton allowance of 64 MiB + 24P.
+These are owned-allocation measurements, not RSS or a standard-unit 64 MiB claim.
+Fixture construction is excluded. Each invocation wrote three control records
+(receipt, progress, selector); no payload output was written. Additional cases
+cover rooted gaps/absence, empty versus deleted values, opaque non-UTF8 bytes,
+a saved singleton boundary, altered observations, owner/phase refusal, exact
+competitor reconciliation and immutable receipt collision. Cancellation probes
+cover all 23 physical awaits of each comparison phase with no allocation
+underestimates and restoration of the retained-owner baseline.
+
+The exact contract and commands are retained under
+`evidence/state-store-step3-20260917-01/witness-phase-01`. The preceding component's
+82 evidence files were copied out of temporary storage and hash-verified under
+`evidence/state-store-step3-20260917-01/singleton-read-444188e2`. The original
+September 13 raw evidence directory remains unavailable; historical reports do
+not substitute for those missing bytes.
+
+Next: implement Emit and its bounded output encoder, mixed standard/singleton
+boundaries, and independent final replay of every singleton phase. A selected
+comparison receipt alone does not prove its historical prefix or all retained
+value witnesses. Native advancement remains disabled. Remaining Step 3 gates
+include full request ownership, deadlines/fences, paired outbox notice insertion,
+sealed candidate/manifest validation, durable publication dispatch and read-only
+reconciliation, and the large resumable workflow. Step 4 must trace directory,
+descriptor/index/data, receipt/progress, proof and projection-source references.
+These component results do not qualify the full restore protocol or a provider.

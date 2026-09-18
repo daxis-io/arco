@@ -8914,7 +8914,7 @@ async fn read_restore_descriptor(
         .0)
 }
 
-async fn read_restore_descriptor_sized(
+pub(in super::super) async fn read_restore_descriptor_sized(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
     role: super::Role,

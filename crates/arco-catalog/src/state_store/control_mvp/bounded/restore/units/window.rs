@@ -680,7 +680,7 @@ fn side_after(
         prior.clone()
     })
 }
-fn block_witness(d: &physical::Descriptor) -> Result<BlockWitness> {
+pub(super) fn block_witness(d: &physical::Descriptor) -> Result<BlockWitness> {
     let (first, last) = crate::state_store::control_mvp::block_key_bounds(&d.block)?
         .ok_or_else(|| invariant_violation("KV block endpoints missing"))?;
     Ok(BlockWitness {
@@ -842,7 +842,7 @@ fn counts(
         },
     }
 }
-fn finish_receipt(
+pub(super) fn finish_receipt(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
     receipt: WorkingValue<ControlMvpRestoreReceiptV1>,

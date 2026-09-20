@@ -20,21 +20,21 @@ use physical::restore_io::{
 // total <=1 MiB; repeated base64 endpoints and bounded old cursor fit this bound.
 const MODEL_BYTES: usize = 16 * 1024 * 1024;
 
-struct Input {
-    position: WorkingValue<Option<directory::restore::Position>>,
-    descriptor: WorkingValue<physical::Descriptor>,
-    rows: WorkingValue<Vec<ControlMvpSegmentRow>>,
-    descriptor_bytes: u64,
+pub(super) struct Input {
+    pub(super) position: WorkingValue<Option<directory::restore::Position>>,
+    pub(super) descriptor: WorkingValue<physical::Descriptor>,
+    pub(super) rows: WorkingValue<Vec<ControlMvpSegmentRow>>,
+    pub(super) descriptor_bytes: u64,
 }
-struct Side {
-    boundary: Option<Input>,
-    candidate: Option<Input>,
+pub(super) struct Side {
+    pub(super) candidate: Option<Input>,
+    blocked: Option<WorkingValue<Option<directory::restore::Position>>>,
 }
 impl Side {
-    fn inputs(&self) -> impl Iterator<Item = &Input> {
-        self.boundary.iter().chain(self.candidate.iter())
+    pub(super) fn inputs(&self) -> impl Iterator<Item = &Input> {
+        self.candidate.iter()
     }
-    fn rows(&self) -> &[ControlMvpSegmentRow] {
+    pub(super) fn rows(&self) -> &[ControlMvpSegmentRow] {
         self.candidate.as_ref().map_or(&[], |v| v.rows.value())
     }
     fn sequence(&self) -> u64 {
@@ -60,7 +60,14 @@ pub(super) async fn prepare<'a, 'p>(
     expected: &'a WorkingValue<ExpectedPlan<'p>>,
     selected: &'a SelectedProgress,
 ) -> Result<publication::PreparedUnit<'a, 'p>> {
-    let result = prepare_inner(io, route, plan, expected, selected).await;
+    let result = if matches!(
+        selected.progress.value().singleton_state,
+        SingletonState::Pending { .. }
+    ) {
+        super::singleton::prepare(io, route, plan, expected, selected).await
+    } else {
+        prepare_inner(io, route, plan, expected, selected).await
+    };
     if result.is_err() {
         io.stop(route);
     }
@@ -110,7 +117,7 @@ async fn prepare_inner<'a, 'p>(
             || p.owner_generation != e.owner_generation
             || p.terminal
             || p.next_ordinal == u64::MAX
-            || p.singleton_state != SingletonState::None
+            || matches!(p.singleton_state, SingletonState::Pending { .. })
             || f.base_logical_sequence.checked_add(1) != Some(f.result_logical_sequence)
             || (f.mode == Mode::Absent && f.base_logical_sequence != f.source_logical_sequence)
         {
@@ -142,6 +149,7 @@ async fn prepare_inner<'a, 'p>(
         expected.value().source_kv_root_b64,
         &before.source,
         roots.value().2.as_deref(),
+        f.source_logical_sequence,
     )
     .await?;
     let current = if f.mode == Mode::Absent {
@@ -154,8 +162,8 @@ async fn prepare_inner<'a, 'p>(
             Ok(())
         })?);
         Side {
-            boundary: None,
             candidate: None,
+            blocked: None,
         }
     } else {
         read_side(
@@ -165,6 +173,7 @@ async fn prepare_inner<'a, 'p>(
             expected.value().base_kv_root_b64,
             &before.current,
             roots.value().2.as_deref(),
+            f.base_logical_sequence,
         )
         .await?
     };
@@ -184,13 +193,29 @@ async fn prepare_inner<'a, 'p>(
         }
         Ok(())
     })?);
-    let cut = source
-        .rows()
-        .last()
-        .map(|r| r.key.as_slice())
+    let singleton_key = source
+        .blocked
+        .as_ref()
         .into_iter()
-        .chain(current.rows().last().map(|r| r.key.as_slice()))
+        .chain(current.blocked.as_ref())
+        .filter_map(|p| p.value().as_ref().map(|p| p.leaf.first.as_slice()))
         .min();
+    let cut = last_prefix(source.rows(), roots.value().2.as_deref(), singleton_key)
+        .into_iter()
+        .chain(last_prefix(
+            current.rows(),
+            roots.value().2.as_deref(),
+            singleton_key,
+        ))
+        .min();
+    if let Some(key) = singleton_key.filter(|_| cut.is_none()) {
+        if source.inputs().count() + current.inputs().count() == 0 {
+            return super::singleton::prepare(io, route, plan, expected, selected).await;
+        }
+        return super::singleton::standard_first(
+            io, route, expected, selected, &source, &current, key,
+        );
+    }
     let source_rows = fragment(source.rows(), roots.value().2.as_deref(), cut)?;
     let current_rows = fragment(current.rows(), roots.value().2.as_deref(), cut)?;
     let reservation = standard_kv_merge_reservation(source_rows, current_rows).unwrap_or(64 * 1024);
@@ -283,7 +308,7 @@ async fn prepare_inner<'a, 'p>(
                 source: side_after(&source, source_rows, &before.source, e.source_kv_root_b64)?,
                 current: side_after(&current, current_rows, &before.current, e.base_kv_root_b64)?,
             },
-            singleton_before: SingletonState::None,
+            singleton_before: p.singleton_state.clone(),
             singleton_after: SingletonState::None,
             source_inputs,
             current_inputs,
@@ -303,8 +328,8 @@ async fn prepare_inner<'a, 'p>(
                 expected.value(),
                 &receipt.value().before,
                 &receipt.value().after,
-                &SingletonState::None,
-                &SingletonState::None,
+                &receipt.value().singleton_before,
+                &receipt.value().singleton_after,
             )
         },
     )?);
@@ -401,26 +426,53 @@ async fn load(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
     position: WorkingValue<Option<directory::restore::Position>>,
-) -> Result<Option<Input>> {
+    sequence: u64,
+) -> Result<(
+    Option<Input>,
+    Option<WorkingValue<Option<directory::restore::Position>>>,
+)> {
     let Some(p) = position.value() else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
-        if p.leaf.bytes as usize > MAX_BLOCK_BYTES {
-            return Err(capacity());
-        }
-        Ok(())
-    })?);
+    if p.leaf.bytes as usize > MAX_BLOCK_BYTES {
+        let (descriptor, _) = physical::restore_io::read_restore_descriptor_sized(
+            io,
+            route,
+            physical::Role::Kv,
+            &p.leaf,
+        )
+        .await?;
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if p.leaf.rows != 1
+                || p.leaf.first != p.leaf.last
+                || descriptor.value().segment.logical_sequence == 0
+                || descriptor.value().segment.logical_sequence > sequence
+            {
+                return Err(invariant_violation(
+                    "oversized lookahead is not a bounded singleton",
+                ));
+            }
+            Ok(())
+        })?);
+        return Ok((None, Some(position)));
+    }
     let (descriptor, rows, descriptor_bytes) =
         read_restore_leaf_sized(io, route, physical::Role::Kv, &p.leaf).await?;
-    Ok(Some(Input {
-        position,
-        descriptor,
-        rows,
-        descriptor_bytes,
-    }))
+    Ok((
+        Some(Input {
+            position,
+            descriptor,
+            rows,
+            descriptor_bytes,
+        }),
+        None,
+    ))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "authenticate exact endpoint floors and decoded partial boundaries in one guarded path"
+)]
 async fn read_side(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
@@ -428,6 +480,7 @@ async fn read_side(
     root_b64: &str,
     cursor: &SideCursor,
     global: Option<&[u8]>,
+    sequence: u64,
 ) -> Result<Side> {
     let key = decode_with_reservation(io, route, Some(MODEL_BYTES), || {
         super::validate_side_cursor(root_b64, cursor)?;
@@ -460,49 +513,80 @@ async fn read_side(
         )
         .await?
     };
-    let mut boundary = None;
-    let mut candidate = load(io, route, position).await?;
+    let position = if let (
+        SideCursor::After {
+            position: saved, ..
+        },
+        Some(p),
+    ) = (cursor, position.value())
+    {
+        if key.value().as_deref() == Some(p.leaf.last.as_slice()) {
+            let (d, _) = physical::restore_io::read_restore_descriptor_sized(
+                io,
+                route,
+                physical::Role::Kv,
+                &p.leaf,
+            )
+            .await?;
+            drop(decode_with_reservation(
+                io,
+                route,
+                Some(MODEL_BYTES),
+                || {
+                    if d.value().segment.logical_sequence > sequence {
+                        return Err(invariant_violation(
+                            "window evidence block exceeds pinned manifest sequence",
+                        ));
+                    }
+                    if super::singleton::position_witness(root_b64, p) != *saved
+                        || d.value().segment.logical_sequence == 0
+                    {
+                        return Err(invariant_violation("consumed singleton floor differs"));
+                    }
+                    Ok(())
+                },
+            )?);
+            directory::restore::first_after(io, route, root, key.value().as_deref()).await?
+        } else {
+            position
+        }
+    } else {
+        position
+    };
+    let consumed_floor = matches!(cursor, SideCursor::After { position, key_b64url } if *key_b64url == position.leaf.last_b64url);
+    let (candidate, blocked) = load(io, route, position, sequence).await?;
     if let SideCursor::After { position, .. } = cursor {
-        drop(decode_with_reservation(
-            io,
-            route,
-            Some(MODEL_BYTES),
-            || {
-                let input = candidate
-                    .as_ref()
-                    .ok_or_else(|| invariant_violation("saved cursor leaf missing"))?;
-                if position_witness(root_b64, input)? != *position
-                    || input
-                        .rows
-                        .value()
-                        .binary_search_by(|row| {
-                            row.key
-                                .as_slice()
-                                .cmp(key.value().as_deref().unwrap_or_default())
-                        })
-                        .is_err()
-                {
-                    return Err(invariant_violation(
-                        "saved cursor path or key is not authenticated",
-                    ));
-                }
-                Ok(())
-            },
-        )?);
-        if candidate
-            .as_ref()
-            .and_then(|v| v.rows.value().last())
-            .map(|r| r.key.as_slice())
-            == key.value().as_deref()
-        {
-            boundary = candidate.take();
-            let next =
-                directory::restore::first_after(io, route, root, key.value().as_deref()).await?;
-            candidate = load(io, route, next).await?;
+        if !consumed_floor {
+            drop(decode_with_reservation(
+                io,
+                route,
+                Some(MODEL_BYTES),
+                || {
+                    let input = candidate
+                        .as_ref()
+                        .ok_or_else(|| invariant_violation("saved cursor leaf missing"))?;
+                    if position_witness(root_b64, input)? != *position
+                        || input
+                            .rows
+                            .value()
+                            .binary_search_by(|row| {
+                                row.key
+                                    .as_slice()
+                                    .cmp(key.value().as_deref().unwrap_or_default())
+                            })
+                            .is_err()
+                    {
+                        return Err(invariant_violation(
+                            "saved cursor path or key is not authenticated",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?);
         }
     }
     drop(decode_with_reservation(io, route, Some(64 * 1024), || {
-        if matches!(cursor, SideCursor::End) && candidate.is_some() {
+        if matches!(cursor, SideCursor::End) && (candidate.is_some() || blocked.is_some()) {
             return Err(invariant_violation("end cursor omits remaining input"));
         }
         if let Some(input) = &candidate {
@@ -517,10 +601,21 @@ async fn read_side(
         }
         Ok(())
     })?);
-    Ok(Side {
-        boundary,
-        candidate,
-    })
+    Ok(Side { candidate, blocked })
+}
+
+fn last_prefix<'a>(
+    rows: &'a [ControlMvpSegmentRow],
+    before: Option<&[u8]>,
+    singleton: Option<&[u8]>,
+) -> Option<&'a [u8]> {
+    rows.iter()
+        .rev()
+        .find(|row| {
+            before.is_none_or(|key| row.key.as_slice() > key)
+                && singleton.is_none_or(|key| row.key.as_slice() < key)
+        })
+        .map(|row| row.key.as_slice())
 }
 
 fn fragment<'a>(
@@ -642,7 +737,7 @@ fn leaf_witness(input: &Input) -> Result<DirectoryPositionLeafWitness> {
         digest: format!("sha256:{}", hex::encode(p.leaf.digest)),
     })
 }
-fn position_witness(root: &str, input: &Input) -> Result<DirectoryPosition> {
+pub(super) fn position_witness(root: &str, input: &Input) -> Result<DirectoryPosition> {
     let p = input
         .position
         .value()
@@ -669,7 +764,11 @@ fn side_after(
     root: &str,
 ) -> Result<SideCursor> {
     let Some(input) = &side.candidate else {
-        return Ok(SideCursor::End);
+        return Ok(if side.blocked.is_some() {
+            prior.clone()
+        } else {
+            SideCursor::End
+        });
     };
     Ok(if let Some(row) = rows.last() {
         SideCursor::After {
@@ -692,7 +791,7 @@ pub(super) fn block_witness(d: &physical::Descriptor) -> Result<BlockWitness> {
         max_key_b64url: URL_SAFE_NO_PAD.encode(last),
     })
 }
-fn input_witnesses(
+pub(super) fn input_witnesses(
     store: &super::super::super::super::ControlMvpStateStore,
     root: &str,
     side: &Side,
@@ -724,7 +823,7 @@ fn input_witnesses(
         })
         .collect()
 }
-fn output_witness(
+pub(super) fn output_witness(
     store: &super::super::super::super::ControlMvpStateStore,
     output: &StandardRestoreOutput,
     part: u32,

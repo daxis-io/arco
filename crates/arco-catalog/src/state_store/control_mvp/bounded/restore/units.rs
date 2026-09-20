@@ -21,8 +21,10 @@ mod history;
 mod prefix;
 mod publication;
 mod singleton;
+mod singleton_coverage;
 mod window;
 pub(super) use driver::advance;
+pub(in crate::state_store::control_mvp) use singleton::SingletonEmitAdmission;
 
 // Read-only local selection authentication; Ready cannot settle an uncertain
 // workspace epoch and does not attest the unseen receipt prefix.
@@ -1787,10 +1789,13 @@ fn validate_singleton_shape(state: &SingletonState) -> Result<()> {
             Ok(())
         }
         SingletonState::Pending {
-            source, current, ..
+            source,
+            current,
+            phase,
+            ..
         } => {
             pending_key(state)?;
-            if source.is_none() && current.is_none() {
+            if source.is_none() && current.is_none() && *phase != SingletonPhase::CompareSource {
                 return Err(invariant_violation("pending singleton has no side witness"));
             }
             if let Some(value) = source {
@@ -1809,13 +1814,13 @@ fn validate_singleton_transition(before: &SingletonState, after: &SingletonState
     validate_singleton_shape(after)?;
     match (before, after) {
         (
-            SingletonState::None,
+            SingletonState::None | SingletonState::Complete { .. },
             SingletonState::Pending {
                 phase: SingletonPhase::CompareSource,
                 ..
-            },
-        )
-        | (SingletonState::None | SingletonState::Complete { .. }, SingletonState::None) => Ok(()),
+            }
+            | SingletonState::None,
+        ) => Ok(()),
         (
             SingletonState::Pending {
                 key_b64url: before_key,
@@ -1845,8 +1850,9 @@ fn validate_singleton_transition(before: &SingletonState, after: &SingletonState
             },
         ) => {
             if before_key == after_key
-                && before_source == after_source
-                // The first comparison may add the not-yet-observed current row.
+                && (before_source == after_source
+                    || (*before_phase == SingletonPhase::CompareSource && before_source.is_none()))
+                // The first comparison may fill either missing observation.
                 // Every already observed witness remains immutable.
                 && (before_current == after_current
                     || (*before_phase == SingletonPhase::CompareSource && before_current.is_none()))
@@ -2322,6 +2328,18 @@ fn validate_counts(
     receipt: &ControlMvpRestoreReceiptV1,
     output_ids: &[&str],
 ) -> Result<()> {
+    if matches!(
+        receipt.counts.reservation,
+        UnitReservationV1::Singleton { .. }
+    ) && receipt
+        .outputs
+        .first()
+        .is_some_and(|output| output.part != 0)
+    {
+        return Err(invariant_violation(
+            "singleton output must use canonical part zero",
+        ));
+    }
     let (source_bytes, source_rows) =
         strictly_ordered_inputs(expected.source_kv_root_b64, &receipt.source_inputs)?;
     let (current_bytes, current_rows) =
@@ -8333,7 +8351,7 @@ mod behavioral_tests {
             "invariant violation: cumulative semantic count overflow"
         );
     }
-    fn audit_singleton_value(key_b64url: &str) -> SingletonValueWitness {
+    pub(super) fn audit_singleton_value(key_b64url: &str) -> SingletonValueWitness {
         let digest = format!("sha256:{}", "0".repeat(64));
         SingletonValueWitness {
             generation: 1,
@@ -8780,6 +8798,46 @@ mod behavioral_tests {
             "one ordinal cannot bind two distinct leaves to the same output part/id"
         );
     }
+
+    #[tokio::test]
+    async fn singleton_output_part_must_be_zero() {
+        let (plan, plan_sha256) = selected_plan().await;
+        let expected = ExpectedPlan::from_selected(&plan, &plan_sha256).expect("selected");
+        let mut receipt = receipt(
+            &expected,
+            0,
+            genesis_receipt_raw_sha256(&expected).expect("genesis receipt"),
+            genesis_chain_sha256(&expected).expect("chain"),
+            zero_cursor(),
+            audit_after("YQ"),
+            CumulativeSemanticCounts::default(),
+        );
+        receipt.singleton_before = audit_pending("YQ", SingletonPhase::Emit);
+        receipt.singleton_after = SingletonState::Complete {
+            key_b64url: "YQ".into(),
+        };
+        receipt.outputs = vec![audit_output(&expected, 0, 1, "YQ")];
+        receipt.counts = SemanticCounts {
+            output_blocks: 1,
+            output_encoded_bytes: 1,
+            mutations: 1,
+            reservation: UnitReservationV1::Singleton {
+                phase: SingletonPhase::Emit,
+                authenticated_payload_bytes: 1,
+                input_byte_limit: SINGLETON_INPUT_BYTE_LIMIT,
+                segment_byte_limit: SINGLETON_SEGMENT_BYTE_LIMIT,
+                scratch_base_bytes: SINGLETON_SCRATCH_BASE_BYTES,
+                scratch_payload_multiplier: SINGLETON_SCRATCH_PAYLOAD_MULTIPLIER,
+            },
+            ..standard_counts()
+        };
+        rehash_receipt(&mut receipt);
+        assert!(
+            validate_receipt_shape(&expected, &receipt).is_err(),
+            "singleton Emit has exactly one canonical output part"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_selected_progress_cannot_accept_another_receipt() {
         let (plan, plan_sha256) = selected_plan().await;
@@ -9153,5 +9211,31 @@ mod behavioral_tests {
                 .is_err(),
             "forward validation must reject a receipt after the terminal cut"
         );
+    }
+}
+
+#[cfg(test)]
+mod comparison_amendment_tests {
+    use super::*;
+    #[test]
+    fn singleton_empty_first_state_and_source_witness_accumulation() {
+        let first = SingletonState::Pending {
+            key_b64url: "YQ".into(),
+            source: None,
+            current: None,
+            phase: SingletonPhase::CompareSource,
+        };
+        assert!(validate_singleton_shape(&first).is_ok());
+        let mut observed = first.clone();
+        if let SingletonState::Pending { source, phase, .. } = &mut observed {
+            *source = Some(Box::new(behavioral_tests::audit_singleton_value("YQ")));
+            *phase = SingletonPhase::CompareCurrent;
+        }
+        assert!(validate_singleton_transition(&first, &observed).is_ok());
+        let mut empty_later = first;
+        if let SingletonState::Pending { phase, .. } = &mut empty_later {
+            *phase = SingletonPhase::CompareCurrent;
+        }
+        assert!(validate_singleton_shape(&empty_later).is_err());
     }
 }

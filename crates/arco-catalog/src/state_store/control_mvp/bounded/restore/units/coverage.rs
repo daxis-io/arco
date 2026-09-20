@@ -22,7 +22,10 @@ struct Side {
 }
 impl Side {
     fn inputs(&self) -> impl Iterator<Item = &Input> {
-        self.boundary.iter().chain(self.candidate.iter())
+        self.boundary
+            .iter()
+            .chain(self.candidate.iter())
+            .filter(|i| !i.rows.value().is_empty())
     }
     fn rows(&self) -> &[ControlMvpSegmentRow] {
         self.candidate
@@ -111,7 +114,10 @@ async fn verify_inner(
                     receipt.value().counts.reservation,
                     UnitReservationV1::Standard { .. }
                 )
-                || receipt.value().singleton_before != SingletonState::None
+                || matches!(
+                    receipt.value().singleton_before,
+                    SingletonState::Pending { .. }
+                )
                 || receipt.value().singleton_after != SingletonState::None
                 || matches!(receipt.value().before.global, GlobalCut::End)
             {
@@ -173,13 +179,27 @@ async fn verify_inner(
         chunk = last;
         current
     };
-    let cut = source
-        .rows()
-        .last()
-        .map(|row| row.key.as_slice())
+    let singleton_key = source
+        .candidate
+        .as_ref()
         .into_iter()
-        .chain(current.rows().last().map(|row| row.key.as_slice()))
+        .chain(current.candidate.as_ref())
+        .filter(|i| i.descriptor.value().block.length > MAX_BLOCK_BYTES as u64)
+        .filter_map(|i| i.position.value().as_ref().map(|p| p.leaf.first.as_slice()))
         .min();
+    let cut = last_prefix(source.rows(), roots.value().2.as_deref(), singleton_key)
+        .into_iter()
+        .chain(last_prefix(
+            current.rows(),
+            roots.value().2.as_deref(),
+            singleton_key,
+        ))
+        .min();
+    if singleton_key.is_some() && cut.is_none() {
+        return Err(invariant_violation(
+            "standard final receipt must enter singleton comparison",
+        ));
+    }
     // Last input payload (or empty directory path) includes interval closure.
     {
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
@@ -202,6 +222,14 @@ async fn verify_inner(
                         f.base_logical_sequence,
                     ),
                 ] {
+                    if side.boundary.iter().chain(side.candidate.iter()).any(|i| {
+                        i.descriptor.value().segment.logical_sequence == 0
+                            || i.descriptor.value().segment.logical_sequence > sequence
+                    }) {
+                        return Err(invariant_violation(
+                            "final input sequence exceeds pinned root",
+                        ));
+                    }
                     if side.inputs().count() != witnesses.len() {
                         return Err(invariant_violation(
                             "final input coverage cardinality differs",
@@ -370,7 +398,8 @@ async fn read_side<'a>(
         };
         (key, position)
     };
-    let (mut candidate, mut chunk) = load(io, chunk, position).await?;
+    let metadata_only = matches!(before, SideCursor::After { position, key_b64url } if *key_b64url == position.leaf.last_b64url);
+    let (mut candidate, mut chunk) = load(io, chunk, position, metadata_only).await?;
     let mut boundary = None;
     if let SideCursor::After { position, .. } = before {
         let exhausted = {
@@ -392,15 +421,26 @@ async fn read_side<'a>(
                     .value()
                     .as_deref()
                     .ok_or_else(|| invariant_violation("final saved key missing"))?;
-                if input
-                    .rows
-                    .value()
-                    .binary_search_by(|row| row.key.as_slice().cmp(key))
-                    .is_err()
-                {
+                if if input.rows.value().is_empty() {
+                    input
+                        .position
+                        .value()
+                        .as_ref()
+                        .is_none_or(|p| p.leaf.last.as_slice() != key)
+                } else {
+                    input
+                        .rows
+                        .value()
+                        .binary_search_by(|row| row.key.as_slice().cmp(key))
+                        .is_err()
+                } {
                     return Err(invariant_violation("final cursor row missing"));
                 }
-                Ok(input.rows.value().last().is_some_and(|row| row.key == key))
+                Ok(input
+                    .position
+                    .value()
+                    .as_ref()
+                    .is_some_and(|p| p.leaf.last.as_slice() == key))
             })?
         };
         if *exhausted.value() {
@@ -413,7 +453,7 @@ async fn read_side<'a>(
                 key.value().as_deref(),
             )
             .await?;
-            (candidate, chunk) = load(io, chunk, position).await?;
+            (candidate, chunk) = load(io, chunk, position, false).await?;
         }
     }
     drop(decode_with_reservation(
@@ -450,6 +490,7 @@ async fn load<'a>(
     io: &mut RestorePhysicalIo<'_>,
     chunk: FinalMicrochunk<'a>,
     position: WorkingValue<Option<directory::restore::Position>>,
+    metadata_only: bool,
 ) -> Result<(Option<Input>, FinalMicrochunk<'a>)> {
     let Some(value) = position.value() else {
         return Ok((None, chunk));
@@ -458,22 +499,33 @@ async fn load<'a>(
     let descriptor = {
         let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
         let leaf = decode_with_reservation(io, &mut route, Some(reservation(io)?), || {
-            if value.leaf.bytes as usize > MAX_BLOCK_BYTES {
-                return Err(invariant_violation(
-                    "standard final input exceeds block limit",
-                ));
-            }
             Ok(value.leaf.clone())
         })?;
         physical::restore_io::read_final_descriptor(io, &mut route, &leaf).await?
     };
-    let mut chunk = FinalMicrochunk::begin(chunk.finish(), 0, io)?;
-    let rows = physical::restore_io::read_final_payload(
-        io,
-        &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
-        &descriptor,
-    )
-    .await?;
+    let rows = if metadata_only || value.leaf.bytes as usize > MAX_BLOCK_BYTES {
+        decode_with_reservation(
+            io,
+            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+            Some(64 * 1024),
+            || {
+                if value.leaf.bytes as usize > MAX_BLOCK_BYTES
+                    && (value.leaf.rows != 1 || value.leaf.first != value.leaf.last)
+                {
+                    return Err(invariant_violation("oversized final lookahead differs"));
+                }
+                Ok(vec![])
+            },
+        )?
+    } else {
+        chunk = FinalMicrochunk::begin(chunk.finish(), 0, io)?;
+        physical::restore_io::read_final_payload(
+            io,
+            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+            &descriptor,
+        )
+        .await?
+    };
     Ok((
         Some(Input {
             position,
@@ -788,10 +840,26 @@ pub(super) async fn assemble_standard(
                 .map(|_| unreachable!("admitted rejection always returns an error"));
             };
             let totals = chunk.finish();
-            let interval = verify_standard(io, totals, plan, expected, &receipt).await?;
-            interval
-                .append(io, totals, &mut history, &mut builder)
+            if matches!(
+                receipt.value().counts.reservation,
+                UnitReservationV1::Singleton { .. }
+            ) {
+                super::singleton_coverage::verify_append(
+                    io,
+                    totals,
+                    plan,
+                    expected,
+                    &receipt,
+                    &mut history,
+                    &mut builder,
+                )
                 .await?;
+            } else {
+                let interval = verify_standard(io, totals, plan, expected, &receipt).await?;
+                interval
+                    .append(io, totals, &mut history, &mut builder)
+                    .await?;
+            }
             // Renew for the next receipt, or for builder finish after the last.
             chunk = FinalMicrochunk::begin(totals, 0, io)?;
         }
@@ -812,4 +880,18 @@ pub(super) async fn assemble_standard(
         io.stop_final(totals);
     }
     result
+}
+
+fn last_prefix<'a>(
+    rows: &'a [ControlMvpSegmentRow],
+    before: Option<&[u8]>,
+    singleton: Option<&[u8]>,
+) -> Option<&'a [u8]> {
+    rows.iter()
+        .rev()
+        .find(|row| {
+            before.is_none_or(|key| row.key.as_slice() > key)
+                && singleton.is_none_or(|key| row.key.as_slice() < key)
+        })
+        .map(|row| row.key.as_slice())
 }

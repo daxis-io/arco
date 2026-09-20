@@ -925,6 +925,22 @@ mod tests {
     }
 
     #[test]
+    fn restore_history_matches_independent_empty_opaque_and_delete_transcript() {
+        let request = restore_request(RestoreMode::Present);
+        let commit = "8d493be3d5f0e7ebedab8a393c9ae74cd6f7cc14a09aa2489159090d2c92b9ba";
+        let mut history = request.history(commit, 3).unwrap();
+        history.push(b"\0empty", 12, Some(b"")).unwrap();
+        history
+            .push(b"opaque", 12, Some(&[0, 255, 128, 0]))
+            .unwrap();
+        history.push(b"tombstone", 12, None).unwrap();
+        assert_eq!(
+            history.finish_digest().unwrap(),
+            "5cacfb9fb65d147dabe960b86f7474a807c1fcaba49ef1166cb2c5a63c957935"
+        );
+    }
+
+    #[test]
     fn restore_absent_matches_frozen_vector_and_history_rejects_retry_after_invalid_tuple() {
         let scope = scope();
         let request = restore_request(RestoreMode::Absent);

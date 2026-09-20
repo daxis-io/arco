@@ -77,6 +77,7 @@ impl RestoreOwnershipReport {
 struct RestoreOwnershipLedger {
     request_owned_limit: usize,
     backend_origin_shared_limit: usize,
+    live_payloads: usize,
     report: RestoreOwnershipReport,
 }
 
@@ -95,6 +96,7 @@ impl RestoreOwnershipLedger {
         Self {
             request_owned_limit,
             backend_origin_shared_limit,
+            live_payloads: 0,
             report: RestoreOwnershipReport {
                 request_owned_live_bytes: 0,
                 request_owned_peak_bytes: 0,
@@ -964,6 +966,9 @@ pub(in super::super) struct RestorePhysicalIo<'store> {
     // Set once after descriptor/index authentication; the enclosing mutable
     // borrow immediately consumes it for that descriptor, before returning.
     singleton_payload: Option<usize>,
+    standard_owned_limit: usize,
+    singleton_input_sha256: Option<[u8; 32]>,
+    singleton_output_id: Option<[u8; 32]>,
     stopped: bool,
 }
 impl<'store> RestorePhysicalIo<'store> {
@@ -1015,6 +1020,15 @@ impl<'store> RestorePhysicalIo<'store> {
             .expect("ledger")
             .report
             .request_owned_peak_bytes
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn peak_shared_evidence(&self) -> usize {
+        self.ledger
+            .lock()
+            .expect("ledger")
+            .report
+            .backend_origin_shared_peak_bytes
     }
 
     #[cfg(test)]
@@ -1096,6 +1110,9 @@ impl<'store> RestorePhysicalIo<'store> {
             failed_allocation: None,
             failed_storage_response: None,
             singleton_payload: None,
+            standard_owned_limit: request_limit,
+            singleton_input_sha256: None,
+            singleton_output_id: None,
             stopped: false,
         }
     }
@@ -1133,14 +1150,25 @@ pub(in super::super) struct UnitPayloadAdmission {
     input_bytes: usize,
     output_bytes: usize,
     output_blocks: usize,
+    collision_probe_bytes: usize,
 }
 
 impl UnitPayloadAdmission {
+    #[cfg(test)]
+    pub(in super::super) fn evidence(&self) -> (usize, usize, usize, usize) {
+        (
+            self.input_bytes,
+            self.output_bytes,
+            self.output_blocks,
+            self.collision_probe_bytes,
+        )
+    }
     pub(in super::super) const fn new() -> Self {
         Self {
             input_bytes: 0,
             output_bytes: 0,
             output_blocks: 0,
+            collision_probe_bytes: 0,
         }
     }
 
@@ -1185,6 +1213,16 @@ pub(in super::super) struct FinalStreamTotals {
 }
 
 impl FinalStreamTotals {
+    #[cfg(test)]
+    pub(in super::super) fn evidence(&self) -> (u64, u64, u64, usize, usize) {
+        (
+            self.total_operations,
+            self.total_io_reservation_bytes,
+            self.total_returned_request_owned_bytes,
+            self.peak_request_owned_live_bytes,
+            self.peak_chunk_owned_upper_bound_bytes,
+        )
+    }
     #[cfg(test)]
     pub(in super::super) fn microchunks(&self) -> u64 {
         self.microchunks
@@ -1246,6 +1284,9 @@ pub(in super::super) struct FinalMicrochunk<'a> {
     external_owned_carry_bytes: usize,
     starting_owned_carry_bytes: usize,
     ledger: Arc<Mutex<RestoreOwnershipLedger>>,
+    owned_byte_limit: usize,
+    singleton_payload_bytes: Option<usize>,
+    payload_reads: usize,
 }
 
 impl<'a> FinalMicrochunk<'a> {
@@ -1259,6 +1300,65 @@ impl<'a> FinalMicrochunk<'a> {
         external_owned_carry_bytes: usize,
         io: &mut RestorePhysicalIo<'_>,
     ) -> CatalogResult<Self> {
+        Self::begin_inner(
+            totals,
+            external_owned_carry_bytes,
+            io,
+            FINAL_MICROCHUNK_BYTES,
+            None,
+        )
+    }
+
+    pub(in super::super) fn begin_singleton(
+        totals: &'a mut FinalStreamTotals,
+        external_owned_carry_bytes: usize,
+        io: &mut RestorePhysicalIo<'_>,
+        descriptor: &FinalDescriptor,
+    ) -> CatalogResult<Self> {
+        let bytes = usize::try_from(descriptor.value().block.length).unwrap_or(usize::MAX);
+        let owned = descriptor.descriptor.is_owned_by(io);
+        let limit = FINAL_MICROCHUNK_BYTES + 24 * bytes.min(MAX_SEGMENT_BYTES);
+        let mut chunk =
+            Self::begin_inner(totals, external_owned_carry_bytes, io, limit, Some(bytes))?;
+        let ledger = io.ledger.clone();
+        let admission = decode_with_reservation(
+            io,
+            &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+            Some(64 * 1024),
+            || {
+                let no_payload_carry = checked_ownership_ledger(&ledger)?.live_payloads == 0;
+                if !owned
+                    || descriptor.value().block.row_count != 1
+                    || bytes == 0
+                    || bytes > MAX_SEGMENT_BYTES
+                    || !no_payload_carry
+                {
+                    return Err(physical_backpressure(
+                        "singleton final owner, size or carried payload differs",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        match admission {
+            Ok(admission) => {
+                drop(admission);
+                Ok(chunk)
+            }
+            Err(error) => {
+                io.stop_final(chunk.totals);
+                Err(error)
+            }
+        }
+    }
+
+    fn begin_inner(
+        totals: &'a mut FinalStreamTotals,
+        external_owned_carry_bytes: usize,
+        io: &mut RestorePhysicalIo<'_>,
+        owned_byte_limit: usize,
+        singleton_payload_bytes: Option<usize>,
+    ) -> CatalogResult<Self> {
         let mut chunk = Self {
             totals,
             io_reservation_bytes: 0,
@@ -1268,8 +1368,17 @@ impl<'a> FinalMicrochunk<'a> {
             external_owned_carry_bytes,
             starting_owned_carry_bytes: external_owned_carry_bytes,
             ledger: io.ledger.clone(),
+            owned_byte_limit,
+            singleton_payload_bytes,
+            payload_reads: 0,
         };
         let admitted = (|| {
+            checked_ownership_ledger(&io.ledger)?.request_owned_limit =
+                if singleton_payload_bytes.is_some() {
+                    owned_byte_limit
+                } else {
+                    io.standard_owned_limit.min(owned_byte_limit)
+                };
             chunk.totals.microchunks = chunk
                 .totals
                 .microchunks
@@ -1289,7 +1398,7 @@ impl<'a> FinalMicrochunk<'a> {
                 .max(chunk.starting_owned_carry_bytes);
             if chunk.totals.stopped
                 || io.stopped
-                || chunk.starting_owned_carry_bytes > FINAL_MICROCHUNK_BYTES
+                || chunk.starting_owned_carry_bytes > owned_byte_limit
             {
                 return Err(physical_backpressure(
                     "final stream stopped or carried ownership exceeds 64 MiB",
@@ -1344,7 +1453,7 @@ impl<'a> FinalMicrochunk<'a> {
             .totals
             .peak_chunk_owned_upper_bound_bytes
             .max(self.owned_upper_bound());
-        if self.owned_upper_bound() > FINAL_MICROCHUNK_BYTES {
+        if self.owned_upper_bound() > self.owned_byte_limit {
             self.totals.stop();
         }
     }
@@ -1361,7 +1470,7 @@ impl<'a> FinalMicrochunk<'a> {
         let total = ranges
             .checked_add(self.returned_request_owned_bytes)
             .ok_or_else(|| physical_backpressure("final microchunk admission overflow"))?;
-        if operations > FINAL_MICROCHUNK_OPERATIONS || total > FINAL_MICROCHUNK_BYTES {
+        if operations > FINAL_MICROCHUNK_OPERATIONS || total > self.owned_byte_limit {
             return Err(physical_backpressure(
                 "final stream exceeds its 64 MiB or 4096-operation microchunk",
             ));
@@ -1402,9 +1511,9 @@ impl<'a> FinalMicrochunk<'a> {
             .totals
             .peak_chunk_owned_upper_bound_bytes
             .max(self.owned_upper_bound());
-        if cumulative > FINAL_MICROCHUNK_BYTES
-            || combined_live.is_none_or(|bytes| bytes > FINAL_MICROCHUNK_BYTES)
-            || self.owned_upper_bound() > FINAL_MICROCHUNK_BYTES
+        if cumulative > self.owned_byte_limit
+            || combined_live.is_none_or(|bytes| bytes > self.owned_byte_limit)
+            || self.owned_upper_bound() > self.owned_byte_limit
             || self.totals.stopped
         {
             return Err(physical_backpressure(
@@ -1434,6 +1543,21 @@ impl RestorePhysicalRoute<'_, '_> {
                 }
             }
             Self::FinalMicrochunk(chunk) if declared.final_stream => {
+                if let Some(bytes) = chunk.singleton_payload_bytes {
+                    if !declared.payload
+                        || declared.reservation_bytes != bytes
+                        || chunk.payload_reads != 0
+                    {
+                        return Err(physical_backpressure(
+                            "singleton final microchunk permits one exact payload",
+                        ));
+                    }
+                    chunk.payload_reads += 1;
+                } else if declared.payload && declared.reservation_bytes > MAX_BLOCK_BYTES {
+                    return Err(physical_backpressure(
+                        "oversized final payload requires singleton microchunk",
+                    ));
+                }
                 chunk.reserve_io(declared.reservation_bytes)
             }
             _ => Err(physical_backpressure(
@@ -1512,13 +1636,29 @@ async fn read_declared_physical_range(
     route: &mut RestorePhysicalRoute<'_, '_>,
     declared: &DeclaredPhysicalRange,
 ) -> CatalogResult<AccountedBytes> {
+    read_declared_physical_range_inner(io, route, declared, false).await
+}
+async fn read_emit_collision(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    declared: &DeclaredPhysicalRange,
+) -> CatalogResult<AccountedBytes> {
+    read_declared_physical_range_inner(io, route, declared, true).await
+}
+
+async fn read_declared_physical_range_inner(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    declared: &DeclaredPhysicalRange,
+    emit_collision: bool,
+) -> CatalogResult<AccountedBytes> {
     if io.stopped {
         route.stop();
         return Err(physical_backpressure(
             "restore physical I/O stopped after prior failure",
         ));
     }
-    if declared.payload {
+    if declared.payload && !emit_collision {
         if let Some(bytes) = io.singleton_payload {
             let admissible = io.work.payload_reads == 0
                 && !declared.final_stream
@@ -1536,8 +1676,16 @@ async fn read_declared_physical_range(
     }
     let mut attempt = RestoreReadAttempt::new(&mut io.stopped, route);
     validate_declared_read(io.store, &io.ledger, attempt.route, declared)?;
-    attempt.route.reserve_before_io(declared)?;
-    if declared.payload {
+    if emit_collision {
+        if let RestorePhysicalRoute::OrdinaryUnit { workspace, .. } = attempt.route {
+            workspace.charge_operations(1)?;
+        } else {
+            return Err(physical_backpressure("Emit collision route differs"));
+        }
+    } else {
+        attempt.route.reserve_before_io(declared)?;
+    }
+    if declared.payload && !emit_collision {
         add_read_work(&mut io.work.payload_reads, 1)?;
     }
     add_read_work(&mut io.work.range_reads, 1)?;
@@ -1600,6 +1748,11 @@ fn validate_declared_read(
     let report = checked_ownership_ledger(ledger)?.report();
     if let RestorePhysicalRoute::FinalMicrochunk(chunk) = route {
         chunk.validate_ledger(ledger)?;
+        if chunk.singleton_payload_bytes.is_some() && !declared.payload {
+            return Err(physical_backpressure(
+                "singleton final microchunk cannot read metadata",
+            ));
+        }
         // Existing ownership and external carry are known before I/O.
         chunk.charge_returned_request_owned(0, report.owned_live_upper_bound())?;
     }
@@ -1624,7 +1777,7 @@ async fn put_restore_conditional(
             "restore physical I/O stopped after prior failure",
         ));
     }
-    if declared.payload && io.singleton_payload.is_some() {
+    if declared.payload && io.singleton_payload.is_some() && io.singleton_output_id.is_none() {
         drop(decode_with_reservation::<()>(
             io,
             route,
@@ -1658,7 +1811,17 @@ async fn put_restore_conditional(
             RestorePhysicalRoute::OrdinaryUnit { workspace, payload } if !declared.final_stream => {
                 workspace.charge_operations(1)?;
                 if declared.payload {
-                    payload.reserve_output(bytes.value().len())?;
+                    if io.singleton_output_id.is_some() {
+                        if payload.output_blocks != 0 || bytes.value().len() > MAX_SEGMENT_BYTES {
+                            return Err(physical_backpressure(
+                                "singleton Emit permits one bounded output",
+                            ));
+                        }
+                        payload.output_bytes = bytes.value().len();
+                        payload.output_blocks = 1;
+                    } else {
+                        payload.reserve_output(bytes.value().len())?;
+                    }
                 } else {
                     workspace.reserve_bytes(bytes.value().len())?;
                 }
@@ -1740,23 +1903,44 @@ async fn put_restore_output(
             arco_core::WriteResult::PreconditionFailed { .. }
         ) {
             let before = head_declared_physical(io, route, declared).await?;
-            if before.value.size != bytes.value().len() as u64
-                || before.value.version != *restore_output_version(&result.value)
-            {
-                return Err(super::invariant_violation(
-                    "restore collision metadata differs",
-                ));
-            }
-            let existing = read_declared_physical_range(io, route, declared).await?;
+            drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+                if before.value.size != bytes.value().len() as u64
+                    || before.value.version != *restore_output_version(&result.value)
+                {
+                    return Err(super::invariant_violation(
+                        "restore collision metadata differs",
+                    ));
+                }
+                Ok(())
+            })?);
+            let existing = if declared.payload && io.singleton_output_id.is_some() {
+                if let RestorePhysicalRoute::OrdinaryUnit { workspace, payload } = route {
+                    let _ = workspace;
+                    payload.collision_probe_bytes = payload
+                        .collision_probe_bytes
+                        .checked_add(declared.reservation_bytes)
+                        .ok_or_else(|| physical_backpressure("Emit collision probe overflow"))?;
+                } else {
+                    return Err(physical_backpressure("Emit collision route differs"));
+                }
+                // The exact immutable output is a separate admitted probe. Keep
+                // the range and response accounting in the common reader.
+                read_emit_collision(io, route, declared).await?
+            } else {
+                read_declared_physical_range(io, route, declared).await?
+            };
             let after = head_declared_physical(io, route, declared).await?;
-            if after.value.size != before.value.size
-                || after.value.version != before.value.version
-                || existing.as_slice() != bytes.value().as_ref()
-            {
-                return Err(super::invariant_violation(
-                    "restore immutable collision differs",
-                ));
-            }
+            drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+                if after.value.size != before.value.size
+                    || after.value.version != before.value.version
+                    || existing.as_slice() != bytes.value().as_ref()
+                {
+                    return Err(super::invariant_violation(
+                        "restore immutable collision differs",
+                    ));
+                }
+                Ok(())
+            })?);
         }
         Ok(result)
     }
@@ -2367,6 +2551,14 @@ pub(in super::super) fn window_pending_store()
 }
 
 #[cfg(test)]
+pub(in super::super) fn armed_publication_store(
+    after: bool,
+    pending: bool,
+) -> (ControlMvpStateStore, Arc<std::sync::atomic::AtomicUsize>) {
+    range_tests::armed_publication_store(after, pending)
+}
+
+#[cfg(test)]
 pub(in super::super) fn unit_publication_test_store(
     at: usize,
     after: bool,
@@ -2402,6 +2594,11 @@ mod range_tests {
         WriteOpaqueError,
         WritePending,
         WritePendingAt(usize),
+        ArmedPublicationFault {
+            remaining: Arc<AtomicUsize>,
+            after: bool,
+            pending: bool,
+        },
         PublicationFault {
             at: usize,
             after: bool,
@@ -2479,6 +2676,7 @@ mod range_tests {
                 | Response::WritePending
                 | Response::WritePendingAt(_)
                 | Response::PublicationFault { .. }
+                | Response::ArmedPublicationFault { .. }
                 | Response::SelectorBarrier(_)
                 | Response::ChangedHead(_)
                 | Response::ChangedSize(_)
@@ -2545,32 +2743,35 @@ mod range_tests {
                     barrier.wait().await;
                 }
             }
-            if let Response::PublicationFault {
-                at,
-                after: false,
-                pending: wait,
-            } = self.response
-            {
-                if at == ordinal {
-                    if wait {
-                        return pending().await;
-                    }
-                    return Err(arco_core::Error::storage("before publication write"));
+            let fault = match &self.response {
+                Response::PublicationFault { at, after, pending } => {
+                    Some((*at == ordinal, *after, *pending))
                 }
+                Response::ArmedPublicationFault {
+                    remaining,
+                    after,
+                    pending,
+                } => Some((
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        == Ok(1),
+                    *after,
+                    *pending,
+                )),
+                _ => None,
+            };
+            if let Some((true, false, wait)) = fault {
+                if wait {
+                    return pending().await;
+                }
+                return Err(arco_core::Error::storage("before publication write"));
             }
             let mut result = self.inner.put(path, data, condition).await?;
-            if let Response::PublicationFault {
-                at,
-                after: true,
-                pending: wait,
-            } = self.response
-            {
-                if at == ordinal {
-                    if wait {
-                        return pending().await;
-                    }
-                    return Err(arco_core::Error::storage("lost publication response"));
+            if let Some((true, true, wait)) = fault {
+                if wait {
+                    return pending().await;
                 }
+                return Err(arco_core::Error::storage("lost publication response"));
             }
             if let Response::WriteOwned(capacity) = self.response {
                 let version = match &mut result {
@@ -2835,6 +3036,24 @@ mod range_tests {
         )
     }
 
+    pub(super) fn armed_publication_store(
+        after: bool,
+        pending: bool,
+    ) -> (ControlMvpStateStore, Arc<AtomicUsize>) {
+        let remaining = Arc::new(AtomicUsize::new(0));
+        (
+            store(
+                backend(Response::ArmedPublicationFault {
+                    remaining: remaining.clone(),
+                    after,
+                    pending,
+                }),
+                "catalog",
+                true,
+            ),
+            remaining,
+        )
+    }
     pub(super) fn unit_publication_test_store(
         at: usize,
         after: bool,
@@ -6068,9 +6287,27 @@ impl WorkingMemory {
 }
 
 // The output drops before its conservative allocation reservation.
+struct PayloadOwner {
+    ledger: Arc<Mutex<RestoreOwnershipLedger>>,
+}
+impl Drop for PayloadOwner {
+    fn drop(&mut self) {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = ledger.live_payloads.checked_sub(1) {
+            ledger.live_payloads = n;
+        } else {
+            ledger.report.counter_overflow = true;
+        }
+    }
+}
+
 pub(in super::super) struct WorkingValue<T> {
     value: T,
     working: WorkingMemory,
+    payload_owner: Option<PayloadOwner>,
 }
 
 // Prevent moving the value out and releasing its reservation independently.
@@ -6460,7 +6697,8 @@ fn allocate_with_reservation<T>(
     if let RestorePhysicalRoute::FinalMicrochunk(chunk) = &mut attempt.route {
         chunk.validate_ledger(&io.ledger)?;
         remaining = remaining.min(
-            FINAL_MICROCHUNK_BYTES
+            chunk
+                .owned_byte_limit
                 .checked_sub(chunk.owned_upper_bound())
                 .ok_or_else(|| {
                     physical_backpressure("final decoder cumulative admission exhausted")
@@ -6578,7 +6816,11 @@ fn allocate_with_reservation<T>(
     match result {
         Ok(value) => {
             attempt.disarm();
-            Ok(WorkingValue { value, working })
+            Ok(WorkingValue {
+                value,
+                working,
+                payload_owner: None,
+            })
         }
         Err(error) => {
             io.failed_allocation = Some(working);
@@ -6622,7 +6864,14 @@ fn declare_restore_output(
                     "restore output identity is not a frozen digest",
                 ));
             }
-            RestoreOutputObject::Segment(_) => (MAX_BLOCK_BYTES, true),
+            RestoreOutputObject::Segment(_) => (
+                if io.singleton_output_id.is_some() {
+                    MAX_SEGMENT_BYTES
+                } else {
+                    MAX_BLOCK_BYTES
+                },
+                true,
+            ),
             RestoreOutputObject::Index(_) => (MAX_SEGMENT_INDEX_BYTES, false),
             RestoreOutputObject::Descriptor(_) => (MAX_CONTROL_JSON_BYTES, false),
         };
@@ -6721,12 +6970,14 @@ pub(in super::super) async fn write_standard_restore_output(
     let result = async {
         let ordinary = matches!(route, RestorePhysicalRoute::OrdinaryUnit { .. });
         let owned = rows.is_owned_by(io);
+        let scoped_id = io.singleton_output_id;
         drop(decode_with_reservation(
             io,
             route,
             Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
             || {
-                if !ordinary || !owned || !valid_raw_digest(output_id) {
+                let scoped_id_matches = scoped_id.is_none_or(|id| hex::encode(id) == output_id);
+                if !ordinary || !owned || !valid_raw_digest(output_id) || !scoped_id_matches {
                     return Err(physical_backpressure(
                         "restore output requires ordinary owned rows and a frozen identity",
                     ));
@@ -6816,7 +7067,11 @@ fn build_restore_output_index(
 ) -> CatalogResult<WorkingValue<super::ControlMvpSegmentIndex>> {
     let result = (|| {
         let capacity = || physical_backpressure("restore output index model exceeds admission");
-        let (envelope, _) = standard_output_reservation(rows)?;
+        let (envelope, _) = if io.singleton_output_id.is_some() {
+            one_row_output_reservation(rows, MAX_SEGMENT_BYTES)?
+        } else {
+            standard_output_reservation(rows)?
+        };
         if size_of::<super::ControlMvpSegmentIndex>() > 512
             || size_of::<ControlMvpBlock>() > 192
             || !super::super::integrity::valid_immutable_id(segment_id)
@@ -6914,7 +7169,12 @@ fn build_restore_output_descriptor(
             || block.row_count != index.row_count
             || block.offset != 0
             || block.length != index.segment_size_bytes
-            || index.segment_size_bytes > MAX_BLOCK_BYTES as u64
+            || index.segment_size_bytes
+                > if io.singleton_output_id.is_some() {
+                    MAX_SEGMENT_BYTES as u64
+                } else {
+                    MAX_BLOCK_BYTES as u64
+                }
             || !valid_raw_digest(&index.segment_checksum_sha256)
             || !valid_raw_digest(&block.checksum_sha256)
             || !super::super::integrity::valid_immutable_id(&index.segment_id)
@@ -7680,7 +7940,11 @@ fn encode_standard_restore_output(
     rows: &[super::ControlMvpSegmentRow],
 ) -> CatalogResult<WorkingValue<Bytes>> {
     let result = (|| {
-        let (envelope, reservation) = standard_output_reservation(rows)?;
+        let (envelope, reservation) = if io.singleton_output_id.is_some() {
+            one_row_output_reservation(rows, MAX_SEGMENT_BYTES)?
+        } else {
+            standard_output_reservation(rows)?
+        };
         allocate_with_reservation(io, route, Some(reservation), true, || {
             let bytes = super::super::encode_arrow_block(rows)?;
             if bytes.len() > envelope {
@@ -7698,6 +7962,98 @@ fn encode_standard_restore_output(
     result
 }
 
+fn one_row_output_reservation(
+    rows: &[super::ControlMvpSegmentRow],
+    cap: usize,
+) -> CatalogResult<(usize, usize)> {
+    let [row] = rows else {
+        return Err(physical_backpressure("singleton output requires one row"));
+    };
+    let capacity = || physical_backpressure("singleton output exceeds encoded admission");
+    let align = |n: usize| n.checked_add(63).map(|n| n / 64 * 64).ok_or_else(capacity);
+    // Pinned metadata-free V5 IPC: 8 nodes, 18 buffers; all fixed buffers
+    // occupy 896 padded bytes, framing/schema/messages/footer occupy 1858.
+    let envelope = 2754_usize
+        .checked_add(align(row.key.len())?)
+        .and_then(|n| n.checked_add(align(row.value.as_ref().map_or(0, Vec::len)).ok()?))
+        .ok_or_else(capacity)?;
+    if envelope > cap || row.key.len() > MAX_BLOCK_BYTES {
+        return Err(capacity());
+    }
+    let reservation = envelope
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(3 * 1024 * 1024 + 64 * 1024))
+        .ok_or_else(capacity)?;
+    Ok((envelope, reservation))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "scoped authenticated input and canonical output selection"
+)]
+pub(in super::super) async fn write_singleton_restore_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    output_id: &str,
+    logical_sequence: u64,
+    descriptor: &WorkingValue<super::Descriptor>,
+    phase: &super::super::bounded::restore::SingletonEmitAdmission<'_>,
+    selected_ordinal: usize,
+    rows: &mut WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    spec: (bool, u64),
+) -> CatalogResult<StandardRestoreOutput> {
+    let owned = descriptor.is_owned_by(io) && rows.is_owned_by(io) && rows.payload_owner.is_some();
+    let ordinary = matches!(route, RestorePhysicalRoute::OrdinaryUnit { .. });
+    let input_identity = io.singleton_input_sha256;
+    let phase_owned = phase.is_owned_by(io);
+    let output_unused = io.singleton_output_id.is_none();
+    let admission = decode_with_reservation(io, route, Some(64 * 1024), || {
+        let d = descriptor.value();
+        let input = rows
+            .value()
+            .get(selected_ordinal)
+            .ok_or_else(|| physical_backpressure("Emit ordinal differs"))?;
+        if !phase.permits(phase_owned, d, selected_ordinal, &input.key) {
+            return Err(physical_backpressure(
+                "selected progress does not admit Emit input",
+            ));
+        }
+        let mut input_sha = [0; 32];
+        let mut output_sha = [0; 32];
+        hex::decode_to_slice(&d.block.checksum_sha256, &mut input_sha)
+            .map_err(|_| physical_backpressure("Emit input identity differs"))?;
+        hex::decode_to_slice(output_id, &mut output_sha)
+            .map_err(|_| physical_backpressure("Emit output identity differs"))?;
+        if !owned || !ordinary || input_identity != Some(input_sha) || !output_unused {
+            return Err(physical_backpressure(
+                "Emit owner or authenticated input differs",
+            ));
+        }
+        // Keep the decoded allocation and payload owner throughout transformation
+        // and encoding; moving a selected row avoids another oversized value copy.
+        rows.value.swap(0, selected_ordinal);
+        rows.value.truncate(1);
+        let output = rows
+            .value
+            .get_mut(0)
+            .ok_or_else(|| physical_backpressure("Emit selected row missing"))?;
+        if spec.0 {
+            output.value = None;
+        }
+        output.generation = spec.1;
+        output.tombstone = spec.0;
+        output.logical_sequence = logical_sequence;
+        output.logical_ordinal = 0;
+        output.origin_sequence = None;
+        one_row_output_reservation(rows.value(), MAX_SEGMENT_BYTES)?;
+        Ok(output_sha)
+    })?;
+    io.singleton_output_id = Some(*admission.value());
+    let result = write_standard_restore_output(io, route, output_id, logical_sequence, rows).await;
+    io.singleton_output_id = None;
+    result
+}
+
 pub(in super::super) fn standard_output_reservation(
     rows: &[super::ControlMvpSegmentRow],
 ) -> CatalogResult<(usize, usize)> {
@@ -7705,6 +8061,9 @@ pub(in super::super) fn standard_output_reservation(
         physical_backpressure("standard restore output exceeds its allocation or encoded admission")
     };
     let row_count = rows.len();
+    if row_count == 1 {
+        return one_row_output_reservation(rows, MAX_BLOCK_BYTES);
+    }
     // Bound the metadata-only scan before examining any row, including invalid
     // caller slices. The file envelope rejects more tightly below.
     if usize::BITS != 64 || row_count == 0 || row_count > MAX_BLOCK_BYTES / 41 {
@@ -7968,12 +8327,14 @@ mod owned_encode_tests {
             drop(output);
             assert!(io.ledger.lock().expect("ledger").report().passing());
         }
-        let exact = rows(1, 8, 211_568, None);
-        assert_eq!(
-            standard_output_reservation(&exact).expect("exact"),
-            (262_144, 4_904_760)
-        );
-        assert!(standard_output_reservation(&rows(1, 8, 211_569, None)).is_err());
+        let exact = rows(1, 8, 259_264, None);
+        let encoded = encode_arrow_block(&exact).expect("production boundary");
+        let (envelope, _) = standard_output_reservation(&exact).expect("exact");
+        assert_eq!(envelope, encoded.len());
+        assert!(encoded.len() <= MAX_BLOCK_BYTES);
+        let invalid = rows(1, 8, 259_265, None);
+        assert!(encode_arrow_block(&invalid).expect("next alignment").len() > MAX_BLOCK_BYTES);
+        assert!(standard_output_reservation(&invalid).is_err());
         assert!(standard_output_reservation(&[]).is_err());
     }
 
@@ -8549,6 +8910,16 @@ async fn read_restore_payload(
             validate_restore_payload_version(&after.value, descriptor)
         })?);
         drop(after);
+        let mut rows = rows;
+        let mut ledger = checked_ownership_ledger(&io.ledger)?;
+        ledger.live_payloads = ledger
+            .live_payloads
+            .checked_add(1)
+            .ok_or_else(|| physical_backpressure("payload ownership count overflow"))?;
+        rows.payload_owner = Some(PayloadOwner {
+            ledger: io.ledger.clone(),
+        });
+        drop(ledger);
         Ok(rows)
     }
     .await;
@@ -8858,8 +9229,15 @@ pub(in super::super) async fn read_final_payload(
     route: &mut RestorePhysicalRoute<'_, '_>,
     descriptor: &FinalDescriptor,
 ) -> CatalogResult<WorkingValue<Vec<super::ControlMvpSegmentRow>>> {
+    let length = descriptor.value().block.length;
     let admissible = descriptor.descriptor.is_owned_by(io)
-        && matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        && match route {
+            RestorePhysicalRoute::FinalMicrochunk(chunk) => match chunk.singleton_payload_bytes {
+                Some(bytes) => bytes as u64 == length && chunk.payload_reads == 0,
+                None => length <= MAX_BLOCK_BYTES as u64,
+            },
+            RestorePhysicalRoute::OrdinaryUnit { .. } => false,
+        };
     drop(decode_with_reservation(io, route, Some(64 * 1024), || {
         if !admissible {
             return Err(physical_backpressure(
@@ -11030,6 +11408,30 @@ pub(in super::super) async fn read_singleton_leaf(
     WorkingValue<Vec<super::ControlMvpSegmentRow>>,
     u64,
 )> {
+    read_singleton_phase_leaf_inner(io, route, leaf, false).await
+}
+pub(in super::super) async fn read_singleton_phase_leaf(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    leaf: &WorkingValue<super::directory::Leaf>,
+) -> CatalogResult<(
+    WorkingValue<super::Descriptor>,
+    WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    u64,
+)> {
+    read_singleton_phase_leaf_inner(io, route, leaf, true).await
+}
+
+async fn read_singleton_phase_leaf_inner(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    leaf: &WorkingValue<super::directory::Leaf>,
+    allow_standard: bool,
+) -> CatalogResult<(
+    WorkingValue<super::Descriptor>,
+    WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+    u64,
+)> {
     let result = async {
         let fresh = leaf.is_owned_by(io)
             && io.store.authority_format == 8
@@ -11051,7 +11453,7 @@ pub(in super::super) async fn read_singleton_leaf(
             let descriptor = descriptor.value();
             let bytes = usize::try_from(descriptor.block.length)
                 .map_err(|_| physical_backpressure("singleton payload length overflow"))?;
-            if descriptor.block.row_count != 1 || bytes == 0 || bytes > MAX_SEGMENT_BYTES {
+            if (descriptor.block.row_count != 1 && (!allow_standard || bytes > MAX_BLOCK_BYTES)) || bytes == 0 || bytes > MAX_SEGMENT_BYTES {
                 return Err(physical_backpressure("singleton admission requires one bounded KV row"));
             }
             let limit = bytes.checked_mul(24).and_then(|n| n.checked_add(FINAL_MICROCHUNK_BYTES))
@@ -11062,6 +11464,10 @@ pub(in super::super) async fn read_singleton_leaf(
         drop(admission);
         checked_ownership_ledger(&io.ledger)?.request_owned_limit = limit;
         io.singleton_payload = Some(bytes);
+        let mut input_sha = [0; 32];
+        hex::decode_to_slice(&descriptor.value().block.checksum_sha256, &mut input_sha)
+            .map_err(|_| physical_backpressure("singleton input checksum differs"))?;
+        io.singleton_input_sha256 = Some(input_sha);
         let rows = read_restore_payload(io, route, descriptor.value()).await?;
         Ok((descriptor, rows, raw_bytes))
     }.await;
@@ -11625,5 +12031,71 @@ mod singleton_read_tests {
         assert_eq!(io.work.payload_reads, 1);
         assert!(io.stopped);
         assert_eq!(io.allocation_underestimates(), 0);
+    }
+}
+
+#[cfg(test)]
+mod singleton_output_size_tests {
+    use super::*;
+    #[test]
+    fn singleton_output_admission_accepts_writer_maximum_and_rejects_next_alignment() {
+        let mut row = super::super::ControlMvpSegmentRow {
+            record_kind: 0,
+            key: b"m".to_vec(),
+            value: Some(vec![]),
+            generation: 2,
+            tombstone: false,
+            logical_sequence: 2,
+            logical_ordinal: 0,
+            origin_sequence: None,
+        };
+        let overhead = super::super::super::encode_arrow_block(std::slice::from_ref(&row))
+            .unwrap()
+            .len();
+        let maximum = (MAX_SEGMENT_BYTES - overhead) / 64 * 64;
+        row.value = Some(vec![7; maximum]);
+        let (envelope, _) =
+            one_row_output_reservation(std::slice::from_ref(&row), MAX_SEGMENT_BYTES).unwrap();
+        assert_eq!(
+            super::super::super::encode_arrow_block(std::slice::from_ref(&row))
+                .unwrap()
+                .len(),
+            envelope
+        );
+        row.value.as_mut().unwrap().push(7);
+        assert!(one_row_output_reservation(std::slice::from_ref(&row), MAX_SEGMENT_BYTES).is_err());
+        assert!(
+            super::super::super::encode_arrow_block(std::slice::from_ref(&row))
+                .unwrap()
+                .len()
+                > MAX_SEGMENT_BYTES
+        );
+    }
+    #[test]
+    fn singleton_output_grammar_matches_production_and_standard_boundary() {
+        for k in [1, 63, 64, 65, 4096] {
+            for v in [0, 1, 63, 64, 65, MAX_BLOCK_BYTES - 2818] {
+                let row = super::super::ControlMvpSegmentRow {
+                    record_kind: 0,
+                    key: vec![0xff; k],
+                    value: Some(vec![0x80; v]),
+                    generation: 10,
+                    tombstone: false,
+                    logical_sequence: 10,
+                    logical_ordinal: 0,
+                    origin_sequence: None,
+                };
+                let (length, _) =
+                    one_row_output_reservation(std::slice::from_ref(&row), MAX_SEGMENT_BYTES)
+                        .unwrap();
+                let encoded =
+                    super::super::super::encode_arrow_block(std::slice::from_ref(&row)).unwrap();
+                assert_eq!(length, encoded.len(), "key={k} value={v}");
+                assert_eq!(
+                    standard_output_reservation(std::slice::from_ref(&row)).is_ok(),
+                    encoded.len() <= MAX_BLOCK_BYTES
+                );
+            }
+        }
     }
 }

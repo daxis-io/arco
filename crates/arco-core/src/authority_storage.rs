@@ -3,8 +3,8 @@
 use bytes::Bytes;
 use std::ops::Range;
 
-use crate::Result;
-use crate::scoped_storage::ScopedStorage;
+use crate::error::Result;
+use crate::root_storage::RootStorage;
 use crate::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 
 /// Preconditions allowed for authority-object publication.
@@ -37,13 +37,13 @@ impl From<AuthorityWritePrecondition> for WritePrecondition {
 /// responsibilities.
 #[derive(Clone)]
 pub struct ScopedAuthorityStore {
-    storage: ScopedStorage,
+    storage: RootStorage,
 }
 
 impl ScopedAuthorityStore {
-    /// Narrows workspace-scoped storage to the authority capability.
+    /// Narrows root-scoped storage to the authority capability.
     #[must_use]
-    pub const fn new(storage: ScopedStorage) -> Self {
+    pub const fn new(storage: RootStorage) -> Self {
         Self { storage }
     }
 
@@ -59,12 +59,16 @@ impl ScopedAuthorityStore {
         self.storage.scope()
     }
 
-    /// Returns the legacy request workspace context, not the physical root ID.
+    /// Returns the legacy request workspace context for workspace and metastore
+    /// roots, not the physical root ID.
+    ///
+    /// Unavailable for tenant identity roots to preserve their typed boundary.
+    ///
     /// Use [`Self::scope`] for authority identity; state kernels must reject root
     /// families that their persisted scope representation cannot distinguish.
     #[must_use]
-    pub fn workspace_id(&self) -> &str {
-        self.storage.workspace_id()
+    pub fn workspace_id(&self) -> Option<&str> {
+        Some(self.storage.as_legacy_scoped()?.workspace_id())
     }
 
     /// Reads an authority object at a scope-relative path.
@@ -117,17 +121,17 @@ mod tests {
     use bytes::Bytes;
 
     use super::{AuthorityWritePrecondition, ScopedAuthorityStore};
-    use crate::ScopedStorage;
     use crate::storage::{MemoryBackend, WriteResult};
+    use crate::{RootStorage, ScopedStorage};
 
     #[tokio::test]
     async fn exposes_only_scoped_reads_heads_and_conditional_writes() {
         let scoped =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let authority = ScopedAuthorityStore::new(scoped);
+        let authority = ScopedAuthorityStore::new(RootStorage::Scoped(scoped));
 
         assert_eq!(authority.tenant_id(), "tenant");
-        assert_eq!(authority.workspace_id(), "workspace");
+        assert_eq!(authority.workspace_id(), Some("workspace"));
         assert_eq!(authority.scope().workspace_id(), Some("workspace"));
         let created = authority
             .put(
@@ -172,7 +176,7 @@ mod tests {
     async fn retains_scoped_path_validation() {
         let scoped =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let authority = ScopedAuthorityStore::new(scoped);
+        let authority = ScopedAuthorityStore::new(RootStorage::Scoped(scoped));
 
         assert!(authority.get("../other/head.json").await.is_err());
         assert!(
@@ -196,11 +200,12 @@ mod tests {
     #[tokio::test]
     async fn ranges_preserve_scope_and_exact_bytes() {
         let backend = Arc::new(MemoryBackend::new());
-        let authority = ScopedAuthorityStore::new(
+        let authority = ScopedAuthorityStore::new(RootStorage::Scoped(
             ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
-        );
-        let other =
-            ScopedAuthorityStore::new(ScopedStorage::new(backend, "tenant", "other").unwrap());
+        ));
+        let other = ScopedAuthorityStore::new(RootStorage::Scoped(
+            ScopedStorage::new(backend, "tenant", "other").unwrap(),
+        ));
         authority
             .put(
                 "segment",
@@ -218,5 +223,26 @@ mod tests {
             Bytes::from_static(b"abcdef")
         );
         assert!(other.get_range("segment", 0..1).await.is_err());
+    }
+
+    #[test]
+    fn workspace_id_is_none_for_identity_authority_store() {
+        let authority = ScopedAuthorityStore::new(RootStorage::Identity(
+            crate::IdentityStorage::new(Arc::new(MemoryBackend::new()), "acme").unwrap(),
+        ));
+        assert_eq!(authority.tenant_id(), "acme");
+        assert!(authority.workspace_id().is_none());
+        assert!(matches!(
+            authority.scope().root(),
+            crate::AuthorityRoot::TenantIdentity
+        ));
+    }
+
+    #[test]
+    fn workspace_id_is_some_for_scoped_authority_store() {
+        let authority = ScopedAuthorityStore::new(RootStorage::Scoped(
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "acme", "prod").unwrap(),
+        ));
+        assert_eq!(authority.workspace_id(), Some("prod"));
     }
 }

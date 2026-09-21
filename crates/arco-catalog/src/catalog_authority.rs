@@ -877,12 +877,9 @@ impl CatalogProjectionMaterializer {
     ///
     /// Returns scope or state-store construction errors.
     pub fn new(storage: ScopedStorage) -> Result<Self> {
-        let source_scope = StateScope::new(storage.tenant_id(), storage.workspace_id(), "catalog");
-        let ack_scope = StateScope::new(
-            storage.tenant_id(),
-            storage.workspace_id(),
-            PROJECTION_OUTBOX_ACK_DOMAIN,
-        );
+        let source_scope = StateScope::from_authority_scope(storage.scope(), "catalog")?;
+        let ack_scope =
+            StateScope::from_authority_scope(storage.scope(), PROJECTION_OUTBOX_ACK_DOMAIN)?;
         Ok(Self {
             source: ControlMvpStateStore::new(storage.clone(), source_scope)?,
             status: ProjectionOutboxAckWriter::new(storage.clone(), ack_scope)?,

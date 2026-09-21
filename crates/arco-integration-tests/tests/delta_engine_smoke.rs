@@ -49,7 +49,7 @@ async fn seed_create_table_authority(
     let scope = ControlPlaneScope::workspace_alias(tenant, workspace).expect("control scope");
     let storage = ScopedStorage::new(Arc::clone(backend), tenant, workspace)
         .expect("scoped metastore storage");
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage).expect("metastore ledger");
     for event in [
         MetastoreEvent::new_scoped(
             &scope,

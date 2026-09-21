@@ -267,6 +267,7 @@ async fn failed_publication_fails_loud_and_next_admin_request_heals() {
 
     let scoped = scoped(&backend);
     let events = MetastoreLedger::new(scoped.clone())
+        .expect("metastore ledger")
         .load_events()
         .await
         .expect("ledger events");
@@ -441,6 +442,7 @@ async fn republish_route_heals_projection_without_appending_ledger_events() {
 
     let scoped = scoped(&backend);
     let events = MetastoreLedger::new(scoped.clone())
+        .expect("metastore ledger")
         .load_events()
         .await
         .expect("ledger events");
@@ -468,6 +470,7 @@ async fn republish_route_heals_projection_without_appending_ledger_events() {
     assert_eq!(payload["ledger_watermark"], events[0].event_id.as_str());
 
     let events_after = MetastoreLedger::new(scoped.clone())
+        .expect("metastore ledger")
         .load_events()
         .await
         .expect("ledger events after republish");
@@ -519,6 +522,7 @@ async fn append_binding_event(backend: &Arc<dyn StorageBackend>, event_id: &str,
         }),
     );
     MetastoreLedger::new(scoped(backend))
+        .expect("metastore ledger")
         .append_event(&event)
         .await
         .expect("append binding event");
@@ -542,6 +546,7 @@ async fn append_revocation_event(backend: &Arc<dyn StorageBackend>, event_id: &s
         }),
     );
     MetastoreLedger::new(scoped(backend))
+        .expect("metastore ledger")
         .append_event(&event)
         .await
         .expect("append revocation event");
@@ -953,7 +958,7 @@ async fn vended_prefixes_are_the_canonical_governed_path() {
 /// publishes the projection at the resulting watermark.
 async fn seed_published_governance(backend: &Arc<dyn StorageBackend>) {
     let scope = ControlPlaneScope::workspace_alias("tenant1", "workspace1").expect("scope");
-    let ledger = MetastoreLedger::new(scoped(backend));
+    let ledger = MetastoreLedger::new(scoped(backend)).expect("metastore ledger");
     ledger
         .append_event(&MetastoreEvent::new_scoped(
             &scope,

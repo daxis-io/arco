@@ -120,7 +120,7 @@ async fn seeded_router() -> SeededRouter {
 }
 
 async fn publish_empty_storage_governance_projection(scoped: &ScopedStorage) -> String {
-    let ledger = MetastoreLedger::new(scoped.clone());
+    let ledger = MetastoreLedger::new(scoped.clone()).expect("metastore ledger");
     let latest = ledger
         .latest_watermark()
         .await

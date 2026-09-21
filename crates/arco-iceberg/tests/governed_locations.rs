@@ -460,7 +460,7 @@ async fn seed_and_publish_governance(backend: &Arc<dyn StorageBackend>) {
         ),
     ];
     let storage = scoped(backend);
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
     for event in events {
         ledger.append_event(&event).await.expect("append event");
     }
@@ -477,6 +477,7 @@ async fn append_governance_event(
 ) {
     let scope = ControlPlaneScope::workspace_alias(TENANT, WORKSPACE).expect("scope");
     MetastoreLedger::new(scoped(backend))
+        .expect("metastore ledger")
         .append_event(&MetastoreEvent::new_scoped(
             &scope, event_id, sequence, mutation,
         ))

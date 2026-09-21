@@ -233,7 +233,7 @@ impl PublishedStorageGovernanceCache {
         storage: &ScopedStorage,
     ) -> Result<ObservedStorageGovernance> {
         let manifest = load_projection_manifest(storage).await?;
-        let latest = MetastoreLedger::new(storage.clone())
+        let latest = MetastoreLedger::new(storage.clone())?
             .latest_watermark()
             .await?;
         validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
@@ -260,7 +260,7 @@ impl PublishedStorageGovernanceCache {
 
         let _guard = self.refresh.lock().await;
         let manifest = load_projection_manifest(storage).await?;
-        let latest = MetastoreLedger::new(storage.clone())
+        let latest = MetastoreLedger::new(storage.clone())?
             .latest_watermark()
             .await?;
         validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;
@@ -450,7 +450,7 @@ pub async fn publish_current_metastore_projection(
     storage: &ScopedStorage,
     registry: &ProjectionRegistry,
 ) -> Result<MetastoreProjectionPublication> {
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let Some(latest) = ledger.latest_watermark().await? else {
         return Ok(MetastoreProjectionPublication::EmptyLedger);
     };
@@ -514,7 +514,7 @@ pub async fn load_published_storage_governance(
     storage: &ScopedStorage,
 ) -> Result<PublishedStorageGovernance> {
     let manifest = load_projection_manifest(storage).await?;
-    let latest = MetastoreLedger::new(storage.clone())
+    let latest = MetastoreLedger::new(storage.clone())?
         .latest_watermark()
         .await?;
     validate_storage_governance_manifest_freshness(&manifest, latest.as_ref())?;

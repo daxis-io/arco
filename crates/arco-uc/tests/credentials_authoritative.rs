@@ -853,7 +853,7 @@ async fn seed_catalog_table(backend: Arc<MemoryBackend>) -> String {
 
 async fn seed_storage_governance(backend: Arc<MemoryBackend>, include_binding: bool) {
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage).expect("metastore ledger");
     let scope = ControlPlaneScope::workspace_alias("tenant1", "workspace1").expect("scope");
     for event in storage_events(&scope, include_binding) {
         ledger.append_event(&event).await.expect("append event");
@@ -862,7 +862,7 @@ async fn seed_storage_governance(backend: Arc<MemoryBackend>, include_binding: b
 
 async fn seed_and_publish_storage_governance(backend: Arc<MemoryBackend>, include_binding: bool) {
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
     let scope = ControlPlaneScope::workspace_alias("tenant1", "workspace1").expect("scope");
     for event in storage_events(&scope, include_binding) {
         ledger.append_event(&event).await.expect("append event");

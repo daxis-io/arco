@@ -82,6 +82,7 @@ async fn metastore_admin_can_republish_through_the_production_router() {
 
     let scoped = scoped(&backend);
     let events = MetastoreLedger::new(scoped.clone())
+        .expect("metastore ledger")
         .load_events()
         .await
         .expect("ledger events");
@@ -123,6 +124,7 @@ async fn metastore_admin_can_republish_through_the_production_router() {
         .expect("healed projection");
     assert_eq!(published.ledger_watermark, latest.event_id);
     let events_after = MetastoreLedger::new(scoped)
+        .expect("metastore ledger")
         .load_events()
         .await
         .expect("ledger events after republish");
@@ -196,7 +198,7 @@ fn scoped(backend: &Arc<dyn StorageBackend>) -> ScopedStorage {
 /// production permission source compiles into an administrator.
 async fn seed_metastore_admin(backend: &Arc<dyn StorageBackend>) {
     let scope = ControlPlaneScope::workspace_alias(TENANT, WORKSPACE).expect("scope");
-    let ledger = MetastoreLedger::new(scoped(backend));
+    let ledger = MetastoreLedger::new(scoped(backend)).expect("metastore ledger");
     ledger
         .append_event(&MetastoreEvent::new_scoped(
             &scope,

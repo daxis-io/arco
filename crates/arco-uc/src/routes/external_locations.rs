@@ -232,7 +232,7 @@ fn ledger(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
 ) -> Result<MetastoreLedger, UnityCatalogError> {
-    Ok(MetastoreLedger::new(scoped_storage(state, ctx)?))
+    MetastoreLedger::new(scoped_storage(state, ctx)?).map_err(map_catalog_error)
 }
 
 async fn require_storage_governance_admin(

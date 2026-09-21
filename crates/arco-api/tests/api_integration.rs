@@ -872,7 +872,7 @@ mod catalogs {
                 }),
             ),
         ];
-        let ledger = MetastoreLedger::new(storage.clone());
+        let ledger = MetastoreLedger::new(storage.clone()).context("metastore ledger")?;
         for event in events {
             ledger
                 .append_event(&event)

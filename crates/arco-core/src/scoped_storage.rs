@@ -119,6 +119,29 @@ impl ScopedStorage {
         })
     }
 
+    /// Builds scoped storage from a pre-validated authority scope.
+    ///
+    /// Crate-internal: only arco-core typed capabilities may construct
+    /// a root-scoped storage through this path.
+    ///
+    /// # Errors
+    ///
+    /// This constructor currently returns `Ok` for every validated [`AuthorityScope`].
+    /// It returns a `Result` to match [`Self::new`] and leave room for future authority
+    /// scope checks without changing the API.
+    #[expect(clippy::unnecessary_wraps)]
+    pub(crate) fn from_authority_scope(
+        backend: Arc<dyn StorageBackend>,
+        scope: &AuthorityScope,
+        workspace_context: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            backend,
+            scope: scope.clone(),
+            workspace_context: workspace_context.into(),
+        })
+    }
+
     /// Validates a relative path for traversal and encoding attacks.
     ///
     /// This is the canonical path validator used by scoped APIs to reject
@@ -1290,6 +1313,16 @@ mod tests {
 
         let data = storage.get_raw("file.txt").await.expect("get");
         assert_eq!(data, Bytes::from("data"));
+    }
+
+    #[test]
+    fn from_authority_scope_preserves_scope_and_context() {
+        let backend = Arc::new(MemoryBackend::new());
+        let scope = AuthorityScope::tenant_identity("acme").unwrap();
+        let storage = ScopedStorage::from_authority_scope(backend, &scope, "ctx").unwrap();
+        assert_eq!(storage.scope().prefix(), "tenant=acme/identity");
+        assert_eq!(storage.tenant_id(), "acme");
+        assert_eq!(storage.workspace_id(), "ctx");
     }
 
     // =========================================================================

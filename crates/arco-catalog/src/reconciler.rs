@@ -1749,7 +1749,7 @@ mod tests {
             .expect("workspace scope");
         let authority = PersistedAuthorityReference::new(
             "arco-state-control-mvp",
-            StateScope::new(storage.tenant_id(), storage.workspace_id(), "catalog"),
+            StateScope::from_authority_scope(storage.scope(), "catalog").expect("state scope"),
             PersistedAuthorityKind::StateToken,
             "manifest-1",
             1,

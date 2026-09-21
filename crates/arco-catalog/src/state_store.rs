@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arco_core::storage::StorageBackend;
-use arco_core::{AuthorityRoot, ScopedStorage};
+use arco_core::{AuthorityRoot, AuthorityScope, RootStorage};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -65,13 +65,13 @@ pub struct StateStoreBindingIdentity {
 }
 
 impl StateStoreBindingIdentity {
-    /// Derives an opaque identity from a workspace-scoped backend handle.
+    /// Derives an opaque identity from a root-scoped storage backend.
     ///
     /// Clones of storage backed by the same [`Arc`] compare equal. Separately
     /// constructed backend handles compare unequal even when their scope strings
     /// or provider configuration happen to match.
     #[must_use]
-    pub fn from_scoped_storage(storage: &ScopedStorage) -> Self {
+    pub fn from_root_storage(storage: &RootStorage) -> Self {
         Self {
             backend: storage.backend().clone(),
         }
@@ -1886,6 +1886,30 @@ impl StateScope {
         }
     }
 
+    /// Create a state scope for `domain` from a physical authority scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an unsupported root family or invalid scope.
+    pub fn from_authority_scope(scope: &AuthorityScope, domain: impl Into<String>) -> Result<Self> {
+        let state_scope = match scope.root() {
+            AuthorityRoot::Workspace { workspace_id } => {
+                Self::new(scope.tenant_id(), workspace_id, domain)
+            }
+            AuthorityRoot::Metastore { metastore_id } => {
+                Self::metastore(scope.tenant_id(), metastore_id, domain)
+            }
+            AuthorityRoot::TenantIdentity => Self::tenant_identity(scope.tenant_id(), domain),
+            _ => {
+                return Err(CatalogError::Validation {
+                    message: "unsupported authority root for state scope".into(),
+                });
+            }
+        };
+        state_scope.validate()?;
+        Ok(state_scope)
+    }
+
     /// Returns the tenant identifier.
     #[must_use]
     pub fn tenant_id(&self) -> &str {
@@ -3347,6 +3371,35 @@ mod tests {
 
             assert!(error.to_string().contains(expected_fragment), "case {name}");
         }
+    }
+
+    #[test]
+    fn state_scope_from_authority_scope_maps_each_root_family() {
+        use arco_core::AuthorityScope;
+        assert_eq!(
+            StateScope::from_authority_scope(
+                &AuthorityScope::workspace("acme", "prod").unwrap(),
+                "catalog"
+            )
+            .unwrap(),
+            StateScope::new("acme", "prod", "catalog")
+        );
+        assert_eq!(
+            StateScope::from_authority_scope(
+                &AuthorityScope::metastore("acme", "lakehouse").unwrap(),
+                "catalog"
+            )
+            .unwrap(),
+            StateScope::metastore("acme", "lakehouse", "catalog")
+        );
+        assert_eq!(
+            StateScope::from_authority_scope(
+                &AuthorityScope::tenant_identity("acme").unwrap(),
+                "catalog"
+            )
+            .unwrap(),
+            StateScope::tenant_identity("acme", "catalog")
+        );
     }
 
     #[tokio::test]

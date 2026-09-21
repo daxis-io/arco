@@ -99,6 +99,7 @@ async fn governed_scope_stale_projection_denies_closed() {
     // pre-revocation state.
     let scope = ControlPlaneScope::workspace_alias(TENANT, WORKSPACE).expect("scope");
     MetastoreLedger::new(scoped(&backend))
+        .expect("metastore ledger")
         .append_event(&MetastoreEvent::new_scoped(
             &scope,
             "event_stale_004",
@@ -280,7 +281,7 @@ async fn seed_and_publish_governance(backend: &Arc<dyn StorageBackend>) {
         ),
     ];
     let storage = scoped(backend);
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
     for event in events {
         ledger.append_event(&event).await.expect("append event");
     }
@@ -402,6 +403,7 @@ async fn governed_scope_stale_projection_denies_property_validation_closed() {
 
     let scope = ControlPlaneScope::workspace_alias(TENANT, WORKSPACE).expect("scope");
     MetastoreLedger::new(scoped(&backend))
+        .expect("metastore ledger")
         .append_event(&MetastoreEvent::new_scoped(
             &scope,
             "event_stale_property_004",

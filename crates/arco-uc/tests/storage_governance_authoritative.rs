@@ -193,7 +193,7 @@ async fn storage_governance_routes_append_scoped_metastore_events() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage).expect("metastore ledger");
     let events = ledger.load_events().await.expect("load events");
     assert_eq!(events.len(), 1);
     let scope = events[0].scope.as_ref().expect("durable event scope");

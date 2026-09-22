@@ -7,7 +7,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use arco_core::storage::StorageBackend;
+use arco_core::root_storage::RootBackendIdentity;
 use arco_core::{AuthorityRoot, AuthorityScope, RootStorage};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -61,7 +61,7 @@ pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 /// same in-process backend authority.
 #[derive(Clone)]
 pub struct StateStoreBindingIdentity {
-    backend: Arc<dyn StorageBackend>,
+    backend: RootBackendIdentity,
 }
 
 impl StateStoreBindingIdentity {
@@ -73,7 +73,7 @@ impl StateStoreBindingIdentity {
     #[must_use]
     pub fn from_root_storage(storage: &RootStorage) -> Self {
         Self {
-            backend: storage.backend().clone(),
+            backend: storage.backend_identity(),
         }
     }
 }
@@ -86,7 +86,7 @@ impl fmt::Debug for StateStoreBindingIdentity {
 
 impl PartialEq for StateStoreBindingIdentity {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.backend, &other.backend)
+        self.backend == other.backend
     }
 }
 

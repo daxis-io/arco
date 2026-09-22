@@ -14,6 +14,16 @@ use crate::scoped_storage::{ScopedListPage, ScopedObjectMeta, ScopedPath, Scoped
 use crate::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 
 /// Typed storage roots shared kernel can operate over.
+///
+/// The raw backend is not available through this capability:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use arco_core::{IdentityStorage, MemoryBackend, RootStorage};
+/// let root: RootStorage = IdentityStorage::new(Arc::new(MemoryBackend::new()), "acme")
+///     .unwrap().into();
+/// let _ = root.backend();
+/// ```
 #[derive(Clone)]
 pub enum RootStorage {
     /// Workspace- or metastore-rooted legacy storage.
@@ -21,6 +31,18 @@ pub enum RootStorage {
     /// Tenant identity-rooted storage.
     Identity(IdentityStorage),
 }
+
+/// Opaque process-local identity that retains one storage backend handle.
+#[derive(Clone)]
+pub struct RootBackendIdentity(Arc<dyn StorageBackend>);
+
+impl PartialEq for RootBackendIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for RootBackendIdentity {}
 
 impl RootStorage {
     #[must_use]
@@ -43,10 +65,10 @@ impl RootStorage {
         self.storage().tenant_id()
     }
 
-    /// Returns the backend.
+    /// Returns a comparable identity without exposing the raw backend.
     #[must_use]
-    pub fn backend(&self) -> &Arc<dyn StorageBackend> {
-        self.storage().backend()
+    pub fn backend_identity(&self) -> RootBackendIdentity {
+        RootBackendIdentity(self.storage().backend().clone())
     }
 
     /// Returns the legacy root-scoped storage.
@@ -224,6 +246,8 @@ impl StorageBackend for RootStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::IdentityStorage;
     use crate::ScopedStorage;
     use crate::storage::{MemoryBackend, StorageBackend, WritePrecondition};
@@ -279,5 +303,58 @@ mod tests {
                 .size,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn storage_backend_operations_keep_both_roots_scoped() {
+        let backend = Arc::new(MemoryBackend::new());
+        let roots = [
+            RootStorage::from(ScopedStorage::new(backend.clone(), "acme", "prod").unwrap()),
+            RootStorage::from(IdentityStorage::new(backend.clone(), "acme").unwrap()),
+        ];
+        for root in roots {
+            let physical = format!("{}/dir/a", root.scope().prefix());
+            root.put(
+                "dir/a",
+                Bytes::from_static(b"first"),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                root.get_range("dir/a", 1..4).await.unwrap(),
+                Bytes::from_static(b"irs")
+            );
+            assert_eq!(
+                StorageBackend::list(&root, "dir/").await.unwrap()[0].path,
+                "dir/a"
+            );
+            assert_eq!(
+                root.list_page("dir/", None, 1).await.unwrap().objects[0].path,
+                "dir/a"
+            );
+            assert!(
+                root.signed_url("dir/a", Duration::from_secs(60))
+                    .await
+                    .unwrap()
+                    .contains(&physical)
+            );
+            root.delete("dir/a").await.unwrap();
+            assert!(backend.head(&physical).await.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn backend_identity_follows_backend_arc_across_roots() {
+        let backend = Arc::new(MemoryBackend::new());
+        let scoped =
+            RootStorage::from(ScopedStorage::new(backend.clone(), "acme", "prod").unwrap());
+        let identity = RootStorage::from(IdentityStorage::new(backend, "acme").unwrap());
+        let other = RootStorage::from(
+            IdentityStorage::new(Arc::new(MemoryBackend::new()), "acme").unwrap(),
+        );
+
+        assert!(scoped.backend_identity() == identity.backend_identity());
+        assert!(identity.backend_identity() != other.backend_identity());
     }
 }

@@ -216,7 +216,7 @@ const PRODUCTION_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
 #[derive(Clone)]
 pub struct ControlMvpStateStore {
     storage: ScopedAuthorityStore,
-    retention: RootStorage,
+    retention: ScopedStorage,
     binding_identity: StateStoreBindingIdentity,
     scope: StateScope,
     paths: ControlMvpPaths,
@@ -366,7 +366,6 @@ impl ControlMvpStateStore {
         }
 
         scope.validate()?;
-        Self::validate_control_root(scope.root())?;
         let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
@@ -376,11 +375,14 @@ impl ControlMvpStateStore {
 
         let paths = ControlMvpPaths::new(scope.domain());
         RootStorage::validate_path(&paths.current_pointer())?;
+        let retention = storage.as_legacy_scoped().cloned().ok_or_else(|| {
+            validation_failed("control MVP requires legacy scoped retention storage")
+        })?;
         let binding_identity = StateStoreBindingIdentity::from_root_storage(&storage);
 
         let store = Self {
             storage: ScopedAuthorityStore::new(storage.clone()),
-            retention: storage,
+            retention,
             binding_identity,
             scope,
             paths,
@@ -394,17 +396,6 @@ impl ControlMvpStateStore {
             bounded_recovery_bytes: None,
         };
         store.with_read_cache_config(ControlMvpReadCacheConfig::default())
-    }
-
-    fn validate_control_root(root: &AuthorityRoot) -> Result<()> {
-        match root {
-            AuthorityRoot::Workspace { .. }
-            | AuthorityRoot::Metastore { .. }
-            | AuthorityRoot::TenantIdentity => Ok(()),
-            _ => Err(validation_failed(
-                "control MVP requires a supported authority root",
-            )),
-        }
     }
 
     /// Creates an explicit synthetic authority-8 store.
@@ -1883,12 +1874,7 @@ impl ControlMvpStateStore {
         now: DateTime<Utc>,
         matches: impl Fn(&PersistedAuthorityReference) -> bool,
     ) -> Result<bool> {
-        let Some(retention) = self.retention.as_legacy_scoped() else {
-            return Err(CatalogError::UnsupportedOperation {
-                message: "retention protection is not implemented for identity roots".into(),
-            });
-        };
-        let mut roots = RetainedAuthorityRoots::new(retention, now);
+        let mut roots = RetainedAuthorityRoots::new(&self.retention, now);
         while let Some(root) = roots.next().await? {
             for reference in root.authorities {
                 if reference.scope() == &self.scope
@@ -5161,25 +5147,20 @@ impl ArcoStateAdmin for ControlMvpStateStore {
         if opts.is_externally_retention_coordinated() {
             return self.publish_checkpoint_under_retention(&opts).await;
         }
-        let Some(retention) = self.retention.as_legacy_scoped() else {
-            return Err(CatalogError::UnsupportedOperation {
-                message: "control/v1 checkpoint publication is not enabled for identity roots"
-                    .to_string(),
-            });
-        };
-        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
-            .acquire_with_operation(
-                RETENTION_GC_LOCK_TTL,
-                RETENTION_GC_LOCK_MAX_RETRIES,
-                Some(format!("control-v1-checkpoint:{}", self.scope.domain())),
-            )
-            .await
-            .map_err(CatalogError::from)?;
+        let mut guard =
+            DistributedLock::new(Arc::new(self.retention.clone()), RETENTION_GC_LOCK_PATH)
+                .acquire_with_operation(
+                    RETENTION_GC_LOCK_TTL,
+                    RETENTION_GC_LOCK_MAX_RETRIES,
+                    Some(format!("control-v1-checkpoint:{}", self.scope.domain())),
+                )
+                .await
+                .map_err(CatalogError::from)?;
         let operation_id = format!(
             "control-v1-checkpoint-{}",
             cost::nonce().to_string().to_ascii_lowercase()
         );
-        let lifecycle = retention.clone();
+        let lifecycle = self.retention.clone();
         let mut epoch = match RetentionMutationEpoch::claim(
             lifecycle,
             &mut guard,

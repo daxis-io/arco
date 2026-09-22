@@ -12,6 +12,15 @@ use crate::storage::StorageBackend;
 /// It acts as a thin capability wrapper over [`ScopedStorage`],
 /// hiding its workspace-shaped APIs. This ensures that `IdentityStorage`
 /// cannot enter legacy catalog or ledger APIs.
+///
+/// The raw backend is not available through this capability:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use arco_core::{IdentityStorage, MemoryBackend};
+/// let identity = IdentityStorage::new(Arc::new(MemoryBackend::new()), "acme").unwrap();
+/// let _ = identity.backend();
+/// ```
 #[derive(Clone)]
 pub struct IdentityStorage {
     inner: ScopedStorage,
@@ -48,12 +57,6 @@ impl IdentityStorage {
     #[must_use]
     pub fn scope(&self) -> &AuthorityScope {
         self.inner.scope()
-    }
-
-    /// Returns the backend.
-    #[must_use]
-    pub fn backend(&self) -> &Arc<dyn StorageBackend> {
-        self.inner.backend()
     }
 }
 

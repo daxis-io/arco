@@ -381,7 +381,7 @@ impl ControlMvpStateStore {
         let binding_identity = StateStoreBindingIdentity::from_root_storage(&storage);
 
         let store = Self {
-            storage: ScopedAuthorityStore::new(storage.clone()),
+            storage: ScopedAuthorityStore::new(storage),
             retention,
             binding_identity,
             scope,

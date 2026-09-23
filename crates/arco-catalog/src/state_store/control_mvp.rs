@@ -86,7 +86,9 @@ use std::sync::Arc;
 
 use arco_core::lock::DistributedLock;
 use arco_core::storage::WriteResult;
-use arco_core::{AuthorityRoot, AuthorityWritePrecondition, ScopedAuthorityStore, ScopedStorage};
+use arco_core::{
+    AuthorityRoot, AuthorityWritePrecondition, RootStorage, ScopedAuthorityStore, ScopedStorage,
+};
 use arrow::array::{
     Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, UInt8Array, UInt8Builder,
     UInt64Array, UInt64Builder,
@@ -345,23 +347,26 @@ impl ControlMvpStateStore {
     /// Default number of committed transactions between automatic replay anchors.
     pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 32;
 
-    /// Creates a control-state MVP store over workspace-scoped storage.
+    /// Creates a control-state MVP store over supported root-scoped storage.
     ///
     /// # Errors
     ///
-    /// Returns validation errors when the storage scope does not match the state
-    /// scope, the physical root is not a workspace, or the domain cannot be
-    /// represented as a safe object path, or default cache administration cannot
-    /// fit its byte capacity. Non-workspace roots remain disabled until the
-    /// metastore and identity authority APIs are implemented; they must not
-    /// alias a workspace `StateScope`.
-    pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
-        scope.validate()?;
+    /// Returns validation errors for an invalid scope, an unsupported root family,
+    /// a mismatch between the storage scope and state scope, a domain that cannot
+    /// be represented as a safe object path, or default cache administration that
+    /// cannot fit within its byte capacity.
+    ///
+    /// Non-workspace roots can be passed to `new`, but are intentionally disabled
+    /// until the metastore and identity authority APIs are implemented and tested.
+    pub fn new(storage: impl Into<RootStorage>, scope: StateScope) -> Result<Self> {
         if !matches!(scope.root(), AuthorityRoot::Workspace { .. }) {
             return Err(validation_failed(
                 "control MVP requires a workspace physical root",
             ));
         }
+
+        scope.validate()?;
+        let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
                 "control MVP storage scope does not match StateScope",
@@ -369,12 +374,15 @@ impl ControlMvpStateStore {
         }
 
         let paths = ControlMvpPaths::new(scope.domain());
-        ScopedStorage::validate_path(&paths.current_pointer())?;
-        let binding_identity = StateStoreBindingIdentity::from_scoped_storage(&storage);
+        RootStorage::validate_path(&paths.current_pointer())?;
+        let retention = storage.as_legacy_scoped().cloned().ok_or_else(|| {
+            validation_failed("control MVP requires legacy scoped retention storage")
+        })?;
+        let binding_identity = StateStoreBindingIdentity::from_root_storage(&storage);
 
         let store = Self {
-            storage: ScopedAuthorityStore::new(storage.clone()),
-            retention: storage,
+            storage: ScopedAuthorityStore::new(storage),
+            retention,
             binding_identity,
             scope,
             paths,
@@ -395,7 +403,10 @@ impl ControlMvpStateStore {
     /// # Errors
     /// Returns the same scope and cache validation errors as `new`.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_synthetic_bounded(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+    pub fn new_synthetic_bounded(
+        storage: impl Into<RootStorage>,
+        scope: StateScope,
+    ) -> Result<Self> {
         let mut store = Self::new(storage, scope)?;
         store.authority_format = 8;
         Ok(store)

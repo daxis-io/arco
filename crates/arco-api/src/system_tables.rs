@@ -208,11 +208,7 @@ async fn register_catalog_projection_status(
     let observed_head_sequence = backlog.committed_sequence;
     let status = ProjectionOutboxAckWriter::new(
         storage.clone(),
-        StateScope::new(
-            storage.tenant_id(),
-            storage.workspace_id(),
-            PROJECTION_OUTBOX_ACK_DOMAIN,
-        ),
+        StateScope::from_authority_scope(storage.scope(), PROJECTION_OUTBOX_ACK_DOMAIN)?,
     )
     .map_err(ApiError::from)?
     .projection_status(CATALOG_PARQUET_PROJECTION_CONSUMER_ID)

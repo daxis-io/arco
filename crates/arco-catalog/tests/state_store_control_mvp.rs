@@ -63,6 +63,79 @@ fn store(storage: ScopedStorage) -> ControlMvpStateStore {
 }
 
 #[test]
+fn control_mvp_new_accepts_root_storage_seam() {
+    let backend = Arc::new(MemoryBackend::new());
+    let scoped = ScopedStorage::new(backend, "acme", "prod").expect("workspace storage");
+    let root = arco_core::RootStorage::Scoped(scoped);
+    assert!(
+        ControlMvpStateStore::new(root, StateScope::new("acme", "prod", "catalog")).is_ok(),
+        "the seam must be accepted for workspace roots"
+    );
+}
+
+#[test]
+fn control_mvp_new_rejects_metastore_root() {
+    let backend = Arc::new(MemoryBackend::new());
+    let request =
+        arco_core::ControlPlaneScope::new("acme", "notebooks", "lakehouse").expect("request scope");
+    let storage =
+        ScopedStorage::new_metastore_scoped(backend, &request).expect("metastore storage");
+    let error = ControlMvpStateStore::new(
+        storage,
+        StateScope::metastore("acme", "lakehouse", "catalog"),
+    )
+    .err()
+    .expect("metastore roots are disabled");
+    assert!(matches!(error, CatalogError::Validation { .. }));
+}
+
+#[test]
+fn control_mvp_new_rejects_identity_root() {
+    let backend = Arc::new(MemoryBackend::new());
+    let storage = arco_core::IdentityStorage::new(backend, "acme").expect("identity storage");
+    let error = ControlMvpStateStore::new(storage, StateScope::tenant_identity("acme", "identity"))
+        .err()
+        .expect("identity roots are disabled");
+    assert!(matches!(error, CatalogError::Validation { .. }));
+}
+
+#[test]
+fn control_mvp_new_rejects_non_workspace_storage_with_workspace_scope() {
+    let backend = Arc::new(MemoryBackend::new());
+
+    let request =
+        arco_core::ControlPlaneScope::new("acme", "notebooks", "lakehouse").expect("request scope");
+    let metastore =
+        ScopedStorage::new_metastore_scoped(backend.clone(), &request).expect("metastore storage");
+    assert!(
+        ControlMvpStateStore::new(metastore, StateScope::new("acme", "lakehouse", "catalog"))
+            .is_err(),
+        "metastore storage must not alias a workspace StateScope"
+    );
+
+    let identity = arco_core::IdentityStorage::new(backend, "acme").expect("identity storage");
+    assert!(
+        ControlMvpStateStore::new(identity, StateScope::new("acme", "acme", "catalog")).is_err(),
+        "identity storage must not alias a workspace StateScope"
+    );
+}
+
+#[test]
+fn control_mvp_new_rejects_workspace_scope_mismatch() {
+    let backend = Arc::new(MemoryBackend::new());
+
+    let storage = ScopedStorage::new(backend.clone(), "acme", "prod").expect("workspace storage");
+    assert!(
+        ControlMvpStateStore::new(storage, StateScope::new("acme", "other", "catalog")).is_err()
+    );
+
+    let storage = ScopedStorage::new(backend, "acme", "prod").expect("workspace storage");
+    assert!(
+        ControlMvpStateStore::new(storage, StateScope::new("globex", "prod", "catalog")).is_err()
+    );
+}
+
+#[test]
 fn legacy_state_scope_rejects_metastore_physical_roots() {
     let backend = Arc::new(MemoryBackend::new());
     for workspace in ["notebooks", "lakehouse"] {

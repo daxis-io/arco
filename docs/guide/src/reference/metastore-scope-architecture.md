@@ -140,6 +140,21 @@ storage can already construct a prefix while retaining a separate request
 workspace; it is not yet a supported `control/v1` root. The first ADR-043 pilot
 uses `metastore_id = workspace_id` and preserves that workspace layout.
 
+### Rust API migration for the root storage seam
+
+- Wrap existing `ScopedStorage` with `.into()` when calling
+  `ScopedAuthorityStore::new`; `RootStorage` also accepts `IdentityStorage`.
+- Handle `ScopedAuthorityStore::workspace_id()` as `Option<&str>` and use
+  `scope().root()` when durable root identity matters.
+- Propagate or handle the validation error from `MetastoreLedger::new`, which
+  now returns `Result<MetastoreLedger>`.
+- Use `StateStoreBindingIdentity::from_root_storage` for backend binding checks.
+  The root capability does not expose its raw backend.
+
+Existing workspace paths and persisted scope encodings do not move. Although
+`ControlMvpStateStore::new` accepts `Into<RootStorage>`, it still rejects
+metastore and identity roots before state-store I/O.
+
 The target catalog authority should be able to use paths shaped as:
 
 ```text

@@ -411,6 +411,7 @@ async fn revalidate_observed_watermark(
 ) -> UnityCatalogResult<()> {
     let storage = scoped_storage(state, ctx)?;
     let latest = MetastoreLedger::new(storage)
+        .map_err(map_catalog_error)?
         .latest_watermark()
         .await
         .map_err(|err| credential_projection_error(&err))?;

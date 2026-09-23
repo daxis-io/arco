@@ -130,7 +130,7 @@ impl CompiledPermissionSource for MetastorePermissionSource {
                     message: err.to_string(),
                 }
             })?;
-        let ledger = MetastoreLedger::new(storage);
+        let ledger = MetastoreLedger::new(storage)?;
         let latest = ledger.latest_watermark().await?;
         let watermark = latest.as_ref().map(|watermark| watermark.event_id.clone());
 

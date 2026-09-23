@@ -216,7 +216,7 @@ fn storage_governance_pointer_publication_is_all_or_nothing() {
 async fn metastore_ledger_persists_storage_governance_events_and_replays_state() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
 
     for event in scoped_storage_governance_events(&test_scope()) {
         ledger.append_event(&event).await?;
@@ -240,8 +240,8 @@ async fn metastore_ledger_shares_authority_across_workspace_contexts() -> Result
     let pipelines = ControlPlaneScope::new("tenant1", "pipelines", "lakehouse")?;
     let first_storage = ScopedStorage::new_metastore_scoped(backend.clone(), &notebooks)?;
     let second_storage = ScopedStorage::new_metastore_scoped(backend, &pipelines)?;
-    let first_ledger = MetastoreLedger::new(first_storage);
-    let second_ledger = MetastoreLedger::new(second_storage);
+    let first_ledger = MetastoreLedger::new(first_storage)?;
+    let second_ledger = MetastoreLedger::new(second_storage)?;
     let first = scoped_storage_credential_event(&notebooks, "event_001", 1, "cred_01");
     let second = scoped_storage_credential_event(&pipelines, "event_002", 2, "cred_02");
 
@@ -261,7 +261,7 @@ async fn metastore_ledger_rejects_wrong_authority_before_storage_io() -> Result<
     let backend = Arc::new(SpyBackend::new(Arc::new(MemoryBackend::new())));
     let scope = ControlPlaneScope::new("tenant1", "notebooks", "lakehouse")?;
     let storage = ScopedStorage::new_metastore_scoped(backend.clone(), &scope)?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
 
     for wrong in [
         ControlPlaneScope::new("other", "notebooks", "lakehouse")?,
@@ -290,7 +290,7 @@ async fn metastore_ledger_rejects_wrong_authority_before_storage_io() -> Result<
 async fn workspace_ledger_preserves_workspace_authority_checks() -> Result<()> {
     let backend = Arc::new(SpyBackend::new(Arc::new(MemoryBackend::new())));
     let storage = ScopedStorage::new(backend.clone(), "tenant1", "notebooks")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     for (sequence, metastore) in [(1, "lakehouse"), (2, "other")] {
         let scope = ControlPlaneScope::new("tenant1", "notebooks", metastore)?;
         let event = scoped_storage_credential_event(&scope, metastore, sequence, metastore);
@@ -318,7 +318,7 @@ async fn workspace_ledger_preserves_workspace_authority_checks() -> Result<()> {
 async fn metastore_ledger_rejects_unscoped_durable_events() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     let event = sample_events().remove(0);
 
     let err = ledger
@@ -334,7 +334,7 @@ async fn metastore_ledger_rejects_unscoped_durable_events() -> Result<()> {
 async fn metastore_ledger_rejects_duplicate_event_id_with_different_payload() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let conflicting = scoped_storage_credential_event(&scope, "event_001", 1, "cred_02");
@@ -359,7 +359,7 @@ async fn metastore_ledger_rejects_duplicate_event_id_with_different_payload() ->
 async fn metastore_ledger_rejects_duplicate_sequence_for_different_events() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let conflicting = scoped_storage_credential_event(&scope, "event_002", 1, "cred_02");
@@ -384,7 +384,7 @@ async fn metastore_ledger_rejects_duplicate_sequence_for_different_events() -> R
 async fn metastore_ledger_does_not_reserve_sequence_for_conflicting_event_id() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let conflicting = scoped_storage_credential_event(&scope, "event_001", 2, "cred_02");
@@ -412,7 +412,7 @@ async fn metastore_ledger_next_sequence_skips_orphan_sequence_reservations() -> 
             WritePrecondition::DoesNotExist,
         )
         .await?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
 
     assert_eq!(ledger.next_sequence().await?, 2);
     Ok(())
@@ -422,7 +422,7 @@ async fn metastore_ledger_next_sequence_skips_orphan_sequence_reservations() -> 
 async fn metastore_ledger_latest_watermark_tracks_latest_persisted_event() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage);
+    let ledger = MetastoreLedger::new(storage)?;
     let scope = test_scope();
 
     assert!(ledger.latest_watermark().await?.is_none());
@@ -475,7 +475,7 @@ async fn storage_governance_projection_requires_latest_ledger_watermark_after_au
 -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -512,7 +512,7 @@ async fn storage_governance_projection_requires_latest_ledger_watermark_after_au
 async fn publish_current_metastore_projection_publishes_at_latest_watermark() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     // Empty ledger publishes nothing and leaves vending deny-closed.
@@ -568,7 +568,7 @@ async fn publish_current_metastore_projection_publishes_at_latest_watermark() ->
 async fn revocation_with_stale_projection_denies_closed_until_republished() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -636,7 +636,7 @@ async fn revocation_with_stale_projection_denies_closed_until_republished() -> R
 async fn optional_storage_governance_load_fails_closed_once_configured() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     assert!(
@@ -677,7 +677,7 @@ async fn storage_governance_projection_denies_when_latest_watermark_update_is_pe
 {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -709,7 +709,7 @@ async fn metastore_ledger_missing_latest_marker_repairs_to_real_latest_on_old_id
 -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let latest = scoped_principal_event(&scope, "event_005", 5, "principal_01");
@@ -734,7 +734,7 @@ async fn metastore_ledger_missing_latest_marker_repairs_to_real_latest_on_old_id
 async fn metastore_ledger_does_not_advance_latest_over_lower_pending_sequence() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let blocked = scoped_storage_credential_event(&scope, "event_005", 5, "cred_05");
@@ -778,7 +778,7 @@ async fn metastore_ledger_does_not_advance_latest_over_lower_pending_sequence() 
 async fn metastore_ledger_recovers_stale_pending_after_event_write_failure() -> Result<()> {
     let backend = Arc::new(FailOncePutBackend::new(Arc::new(MemoryBackend::new())));
     let storage = ScopedStorage::new(backend.clone(), "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
     let first = scoped_storage_credential_event(&scope, "event_001", 1, "cred_01");
     let failed = scoped_storage_credential_event(&scope, "event_002", 2, "cred_02");
@@ -813,7 +813,7 @@ async fn metastore_ledger_recovers_stale_pending_after_event_write_failure() -> 
 async fn metastore_ledger_corrupt_latest_marker_fails_closed() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     ledger
@@ -844,7 +844,7 @@ async fn metastore_ledger_corrupt_latest_marker_fails_closed() -> Result<()> {
 async fn storage_governance_projection_uses_ledger_when_sidecar_marker_is_missing() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -875,7 +875,7 @@ async fn storage_governance_projection_uses_ledger_when_sidecar_marker_is_missin
 async fn storage_governance_projection_accepts_latest_non_storage_event_watermark() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -907,7 +907,7 @@ async fn storage_governance_projection_cache_reuses_hot_state() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(backend));
     let storage = ScopedStorage::new(spy.clone(), "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -945,7 +945,7 @@ async fn storage_governance_projection_cache_hot_hit_does_not_read_ledger_events
     let backend = Arc::new(MemoryBackend::new());
     let spy = Arc::new(SpyBackend::new(backend));
     let storage = ScopedStorage::new(spy.clone(), "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1175,7 +1175,7 @@ async fn storage_governance_projection_cache_reloads_same_identity_object_replac
 async fn storage_governance_projection_cache_revalidates_after_refresh_wait() -> Result<()> {
     let backend = Arc::new(CacheRaceBackend::new(Arc::new(MemoryBackend::new())));
     let storage = ScopedStorage::new(backend.clone(), "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1229,7 +1229,7 @@ async fn storage_governance_projection_cache_revalidates_after_refresh_wait() ->
 async fn storage_governance_projection_denies_manifest_ahead_of_ledger() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1250,7 +1250,7 @@ async fn storage_governance_projection_denies_manifest_ahead_of_ledger() -> Resu
 async fn storage_governance_projection_denies_corrupt_projection_file() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1279,7 +1279,7 @@ async fn storage_governance_projection_denies_corrupt_projection_file() -> Resul
 async fn storage_governance_projection_denies_row_watermark_mismatch() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1316,7 +1316,7 @@ async fn storage_governance_projection_denies_row_watermark_mismatch() -> Result
 async fn stale_projection_publish_does_not_roll_back_pointer() -> Result<()> {
     let backend = Arc::new(MemoryBackend::new());
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1")?;
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     let scope = test_scope();
 
     for event in scoped_storage_governance_events(&scope) {
@@ -1783,7 +1783,7 @@ async fn publish_storage_governance_projection(
     storage: &ScopedStorage,
     events: Vec<MetastoreEvent>,
 ) -> Result<arco_catalog::metastore::publish::MetastoreProjectionManifest> {
-    let ledger = MetastoreLedger::new(storage.clone());
+    let ledger = MetastoreLedger::new(storage.clone())?;
     for event in events {
         ledger.append_event(&event).await?;
     }

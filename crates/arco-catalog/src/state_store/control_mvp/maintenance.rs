@@ -1077,7 +1077,7 @@ pub async fn retention_root(
         // GC has no independently configured worker binding; interpret pins directly.
         let store = ControlMvpStateStore::new(
             storage.clone(),
-            StateScope::new(storage.tenant_id(), storage.workspace_id(), domain),
+            StateScope::from_authority_scope(storage.scope(), domain)?,
         )?
         .without_read_cache();
         let bytes = store

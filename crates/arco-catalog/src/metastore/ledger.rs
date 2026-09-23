@@ -1,5 +1,6 @@
 //! Native metastore ledger persistence.
 
+use arco_core::AuthorityRoot;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
@@ -41,21 +42,23 @@ pub struct MetastoreLedger {
 impl MetastoreLedger {
     /// Creates a metastore ledger over scoped storage.
     ///
-    /// Tenant identity cannot be constructed through the legacy storage API.
-    /// Its future ledger requires a separate typed identity mutation envelope.
+    /// # Errors
     ///
-    /// ```compile_fail
-    /// use std::sync::Arc;
-    /// use arco_core::{MemoryBackend, ScopedStorage};
-    /// use arco_catalog::metastore::ledger::MetastoreLedger;
-    /// let storage = ScopedStorage::new_identity_scoped(
-    ///     Arc::new(MemoryBackend::new()), "acme",
-    /// ).unwrap();
-    /// let ledger = MetastoreLedger::new(storage);
-    /// ```
-    #[must_use]
-    pub fn new(storage: ScopedStorage) -> Self {
-        Self { storage }
+    /// Returns a validation error for authority roots other than workspace and metastore.
+    ///
+    /// Tenant identity cannot be constructed through the legacy [`ScopedStorage`] API.
+    /// It can be constructed through [`arco_core::IdentityStorage`] and its future ledger
+    /// requires a separate typed identity mutation envelope.
+    pub fn new(storage: ScopedStorage) -> Result<Self> {
+        if !matches!(
+            storage.scope().root(),
+            AuthorityRoot::Workspace { .. } | AuthorityRoot::Metastore { .. }
+        ) {
+            return Err(CatalogError::Validation {
+                message: "metastore ledger requires a workspace or metastore authority root".into(),
+            });
+        }
+        Ok(Self { storage })
     }
 
     /// Appends a metastore event at a deterministic event path.
@@ -565,7 +568,7 @@ impl MetastoreLedger {
     fn validate_event_scope(&self, event: &MetastoreEvent) -> Result<()> {
         if !matches!(
             self.storage.scope().root(),
-            arco_core::AuthorityRoot::Workspace { .. } | arco_core::AuthorityRoot::Metastore { .. }
+            AuthorityRoot::Workspace { .. } | AuthorityRoot::Metastore { .. }
         ) {
             return Err(CatalogError::Validation {
                 message: "metastore ledger requires a workspace or metastore authority root".into(),

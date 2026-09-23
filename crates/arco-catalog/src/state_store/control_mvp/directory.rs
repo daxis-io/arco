@@ -10,7 +10,7 @@ use super::{
 };
 use crate::error::{CatalogError, Result};
 use crate::state_store::StateScope;
-use arco_core::{AuthorityRoot, ScopedAuthorityStore, ScopedStorage};
+use arco_core::{AuthorityRoot, RootStorage, ScopedAuthorityStore, ScopedStorage};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
@@ -172,8 +172,9 @@ impl ReadBudget {
 }
 
 impl Directory {
-    pub fn new(storage: ScopedStorage, scope: &StateScope) -> Result<Self> {
+    pub fn new(storage: impl Into<RootStorage>, scope: &StateScope) -> Result<Self> {
         scope.validate()?;
+        let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
                 "directory storage and state scopes differ",

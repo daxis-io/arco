@@ -358,7 +358,7 @@ pub async fn load_extended_catalog_shadow_source(
 ) -> Result<CatalogShadowExtendedSource> {
     let base = load_current_catalog_shadow_source(storage).await?;
 
-    let metastore_state = MetastoreLedger::new(storage.clone()).replay().await?;
+    let metastore_state = MetastoreLedger::new(storage.clone())?.replay().await?;
     let metastore = if metastore_state.ledger_watermark.is_none() {
         None
     } else {
@@ -464,7 +464,7 @@ pub async fn load_current_catalog_shadow_source(
 pub fn open_catalog_shadow_store(storage: &ScopedStorage) -> Result<ControlMvpStateStore> {
     ControlMvpStateStore::new(
         storage.clone(),
-        StateScope::new(storage.tenant_id(), storage.workspace_id(), SHADOW_DOMAIN),
+        StateScope::from_authority_scope(storage.scope(), SHADOW_DOMAIN)?,
     )
 }
 
@@ -2227,7 +2227,7 @@ mod tests {
         publish_catalog_fixture(&storage, fixture_state()).await;
         let scope =
             ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
-        let ledger = MetastoreLedger::new(storage.clone());
+        let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
         ledger
             .append_event(&MetastoreEvent::new_scoped(
                 &scope,
@@ -2298,7 +2298,7 @@ mod tests {
         publish_catalog_fixture(&storage, fixture_state()).await;
         let scope =
             ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
-        let ledger = MetastoreLedger::new(storage.clone());
+        let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
         let event = MetastoreEvent::new_scoped(
             &scope,
             "event_001",
@@ -2575,7 +2575,7 @@ mod tests {
         publish_catalog_fixture(&storage, fixture_state()).await;
         let scope =
             ControlPlaneScope::workspace_alias("tenant", "workspace").expect("control plane scope");
-        let ledger = MetastoreLedger::new(storage.clone());
+        let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
         let first = credential_event(&scope, "event_001", 1, "cred_01");
         ledger.append_event(&first).await.expect("append event one");
         let first_state = replay_events(std::iter::once(&first)).expect("replay event one");

@@ -1194,13 +1194,9 @@ impl ProjectionOutboxWorker {
                     .to_string(),
             ));
         }
-        let source_scope =
-            StateScope::new(storage.tenant_id(), storage.workspace_id(), source_domain);
-        let ack_scope = StateScope::new(
-            storage.tenant_id(),
-            storage.workspace_id(),
-            PROJECTION_OUTBOX_ACK_DOMAIN,
-        );
+        let source_scope = StateScope::from_authority_scope(storage.scope(), source_domain)?;
+        let ack_scope =
+            StateScope::from_authority_scope(storage.scope(), PROJECTION_OUTBOX_ACK_DOMAIN)?;
         let source = ControlMvpStateStore::new(storage.clone(), source_scope.clone())?;
         let acks = ProjectionOutboxAckWriter::new(storage, ack_scope)?;
         Ok(Self {

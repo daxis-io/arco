@@ -45,6 +45,7 @@ pub mod control_plane_transactions;
 pub mod error;
 pub mod flow_paths;
 pub mod id;
+pub mod identity_storage;
 pub mod internal_oidc;
 pub mod lock;
 pub mod observability;
@@ -53,6 +54,7 @@ pub mod partition;
 pub mod publish;
 /// Shared repair backlog tracking helpers for automated repair loops.
 pub mod repair_backlog;
+pub mod root_storage;
 pub mod scoped_storage;
 pub mod storage;
 pub mod storage_keys;
@@ -84,12 +86,14 @@ pub mod prelude {
     pub use crate::error::{Error, Result};
     pub use crate::flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
     pub use crate::id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+    pub use crate::identity_storage::IdentityStorage;
     pub use crate::lock::{DistributedLock, LockGuard, LockInfo};
     pub use crate::orchestration_compaction::{
         OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
     };
     pub use crate::partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
     pub use crate::publish::{FencingToken, PermitIssuer, PublishPermit, Publisher};
+    pub use crate::root_storage::RootStorage;
     pub use crate::scoped_storage::{ScopedListPage, ScopedStorage};
     pub use crate::storage::{
         ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
@@ -128,6 +132,7 @@ pub use control_plane_transactions::{
 pub use error::{Error, Result};
 pub use flow_paths::{ApiPaths, DeltaPaths, FlowPaths, IcebergPaths};
 pub use id::{AssetId, EventId, MaterializationId, RunId, TaskId};
+pub use identity_storage::IdentityStorage;
 pub use internal_oidc::{
     InternalOidcConfig, InternalOidcError, InternalOidcVerifier, VerifiedPrincipal,
 };
@@ -137,6 +142,7 @@ pub use orchestration_compaction::{
     OrchestrationCompactRequest, OrchestrationCompactionResponse, OrchestrationRebuildRequest,
 };
 pub use partition::{PartitionId, PartitionKey, PartitionKeyParseError, ScalarValue};
+pub use root_storage::RootStorage;
 pub use scoped_storage::{ScopedListPage, ScopedStorage};
 pub use storage::{
     ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,

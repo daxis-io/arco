@@ -127,6 +127,15 @@ resource "google_cloud_run_v2_job" "control_store_worker" {
     template {
       service_account = google_service_account.api.email
 
+      # One execution must be allowed to finish: Cloud Run's 10-minute default is
+      # exactly the window in which a maintenance activation gets killed between
+      # claiming the retention epoch and settling it. Never let Cloud Run retry a
+      # task either: a retry is a fresh process that would re-enter activation
+      # instead of replaying the persisted job identity; the scheduler's next
+      # trigger performs that replay.
+      timeout     = "1800s"
+      max_retries = 0
+
       containers {
         image = var.control_store_worker_image
 

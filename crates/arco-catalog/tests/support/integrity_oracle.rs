@@ -891,11 +891,12 @@ impl LogicalTransaction {
             .is_some_and(|(g, v)| *g == generation && v.is_some())
     }
     pub fn range_empty(&self, start: &[u8], end: &[u8]) -> bool {
+        // Tombstones are not entries; `range_witness` still covers them.
         !self
             .pinned
             .kv
-            .keys()
-            .any(|k| k.as_slice() >= start && k.as_slice() < end)
+            .iter()
+            .any(|(k, (_, v))| v.is_some() && k.as_slice() >= start && k.as_slice() < end)
     }
     pub fn range_witness(&self, start: &[u8], end: &[u8]) -> u64 {
         let mut encoded = Vec::new();

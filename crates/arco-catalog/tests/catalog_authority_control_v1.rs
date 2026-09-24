@@ -214,6 +214,132 @@ impl StorageBackend for FailProjectionPutBackend {
     }
 }
 
+/// Counts projection manifest publications and, when armed, holds the first
+/// one until the test releases it so a burst of authority commits lands while
+/// exactly one drain pass is in flight.
+struct GatedProjectionManifestBackend {
+    inner: MemoryBackend,
+    manifest_puts: AtomicUsize,
+    hold_first: AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl GatedProjectionManifestBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            manifest_puts: AtomicUsize::new(0),
+            hold_first: AtomicBool::new(false),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn manifest_puts(&self) -> usize {
+        self.manifest_puts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GatedProjectionManifestBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        if path.contains("control/v1/projections/") && path.ends_with("/manifest.json") {
+            self.manifest_puts.fetch_add(1, Ordering::SeqCst);
+            if self.hold_first.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        }
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.inner.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+/// Commits eight catalog mutations while the first post-commit drain is held
+/// at its manifest publication, releases it, and waits until every intent is
+/// acknowledged. Returns the backlog observed at settle time.
+async fn commit_burst_and_settle(
+    backend: &GatedProjectionManifestBackend,
+    storage: &ScopedStorage,
+    authority: &ControlCatalogAuthority,
+) {
+    backend.hold_first.store(true, Ordering::SeqCst);
+    authority
+        .create_catalog("burst-0", None, WriteOptions::default())
+        .await
+        .expect("first burst commit");
+    tokio::time::timeout(Duration::from_secs(10), backend.reached.notified())
+        .await
+        .expect("the post-commit drain must reach its first manifest publication");
+    for index in 1..8 {
+        authority
+            .create_catalog(&format!("burst-{index}"), None, WriteOptions::default())
+            .await
+            .expect("burst commit");
+    }
+    backend.release.notify_one();
+
+    let worker = ProjectionOutboxWorker::new(
+        storage.clone(),
+        "catalog",
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    )
+    .expect("worker");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let backlog = worker.backlog().await.expect("backlog");
+        if backlog.pending_record_ids.is_empty()
+            && backlog.latest_projected_sequence == Some(8)
+            && backlog.committed_sequence == Some(8)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "post-commit drains did not settle: {backlog:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn scoped_storage() -> ScopedStorage {
     ScopedStorage::new(
         Arc::new(MemoryBackend::new()),
@@ -729,6 +855,57 @@ async fn materializer_publishes_parquet_before_ack_and_recovers_by_anti_entropy(
         backlog.latest_projected_sequence
     );
     assert!(backlog.pending_record_ids.is_empty());
+}
+
+/// A burst of commits must not fan out into concurrent drains that all
+/// materialize the same intents and race on the ack-root pointer: with the
+/// default notifier, every intent is materialized exactly once and acked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_commits_materialize_each_projection_intent_exactly_once() {
+    let backend = GatedProjectionManifestBackend::new();
+    let storage =
+        ScopedStorage::new(backend.clone(), "burst-tenant", "burst-exactly-once").expect("storage");
+    let authority = ControlCatalogAuthority::new(
+        storage.clone(),
+        StateScope::new("burst-tenant", "burst-exactly-once", "catalog"),
+    )
+    .expect("control authority");
+
+    commit_burst_and_settle(&backend, &storage, &authority).await;
+
+    assert_eq!(
+        8,
+        backend.manifest_puts(),
+        "serialized drains publish each projection manifest exactly once"
+    );
+}
+
+/// The process-local wake-up serializes drains per root and coalesces the
+/// wake-ups that arrive while a drain is running into one further pass.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_commits_coalesce_into_at_most_three_drain_passes() {
+    use arco_catalog::catalog_authority::CatalogProjectionDrainNotifier;
+
+    let backend = GatedProjectionManifestBackend::new();
+    let storage =
+        ScopedStorage::new(backend.clone(), "burst-tenant", "burst-coalesce").expect("storage");
+    let notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
+    let authority = ControlCatalogAuthority::new(
+        storage.clone(),
+        StateScope::new("burst-tenant", "burst-coalesce", "catalog"),
+    )
+    .expect("control authority")
+    .with_projection_notifier(notifier.clone());
+
+    commit_burst_and_settle(&backend, &storage, &authority).await;
+
+    let passes = notifier.drain_passes();
+    assert!(
+        (1..=3).contains(&passes),
+        "eight wake-ups must coalesce into at most three drain passes, got {passes}"
+    );
+    assert_eq!(8, backend.manifest_puts());
 }
 
 #[tokio::test]

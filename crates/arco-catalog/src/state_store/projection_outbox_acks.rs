@@ -484,10 +484,16 @@ impl ProjectionOutboxAckWriter {
     /// token without a new sequence. Distinct incarnations of the same record
     /// id are distinct events and are acknowledged independently.
     ///
+    /// The ack domain is shared by every consumer, so the ack-root pointer
+    /// CAS can be lost to an acknowledgement of an unrelated event. Such a
+    /// loss is retried with a fresh transaction (up to the status CAS budget)
+    /// after checking whether this acknowledgement became visible meanwhile.
+    ///
     /// # Errors
     ///
-    /// Returns storage/CAS errors, or an invariant violation when the ack key
-    /// resolves to a record that is not the acknowledgement it names.
+    /// Returns storage errors, the last CAS error once the retry budget is
+    /// exhausted, or an invariant violation when the ack key resolves to a
+    /// record that is not the acknowledgement it names.
     pub async fn acknowledge(
         &self,
         delivery: &ProjectionOutboxDeliveryId,
@@ -498,31 +504,38 @@ impl ProjectionOutboxAckWriter {
             return Ok(receipt);
         }
 
-        let mut txn = self
-            .writer_store()
-            .await?
-            .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
-            .await?;
-        txn.assert_absent(&key).await?;
-        txn.put(&key, encode_ack_record(&record)?).await?;
-        match txn.commit().await {
-            Ok(outcome) => Ok(ProjectionOutboxAckReceipt {
-                token: outcome.into_state_token(),
-                record,
-            }),
-            Err(CatalogError::CasFailed { .. }) => {
-                self.existing_receipt_for(&key, &record).await?.map_or_else(
-                    || {
-                        Err(CatalogError::CasFailed {
-                            message: "projection outbox ack pointer CAS lost without a visible ack"
-                                .to_string(),
-                        })
-                    },
-                    Ok,
-                )
+        let mut lost_race = None;
+        for _attempt in 0..STATUS_CAS_ATTEMPTS {
+            let mut txn = self
+                .writer_store()
+                .await?
+                .begin_control_txn(TxnOptions::new(Some(self.scope.clone())))
+                .await?;
+            txn.assert_absent(&key).await?;
+            txn.put(&key, encode_ack_record(&record)?).await?;
+            match txn.commit().await {
+                Ok(outcome) => {
+                    return Ok(ProjectionOutboxAckReceipt {
+                        token: outcome.into_state_token(),
+                        record,
+                    });
+                }
+                Err(CatalogError::CasFailed { message }) => {
+                    if let Some(receipt) = self.existing_receipt_for(&key, &record).await? {
+                        return Ok(receipt);
+                    }
+                    lost_race = Some(message);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
+        Err(CatalogError::CasFailed {
+            message: format!(
+                "projection outbox ack pointer CAS lost without a visible ack after \
+                 {STATUS_CAS_ATTEMPTS} attempts: {}",
+                lost_race.unwrap_or_default()
+            ),
+        })
     }
 
     /// Reads a committed acknowledgement pinned at a state token.
@@ -2002,6 +2015,7 @@ mod tests {
 
     const SOURCE_DOMAIN: &str = "phase5-source";
     const SOURCE_POINTER: &str = "/control/v1/domains/phase5-source/head/current.json";
+    const ACK_POINTER: &str = "/control/v1/domains/projection-outbox-acks/head/current.json";
 
     fn ack_scope() -> StateScope {
         StateScope::new("tenant", "workspace", PROJECTION_OUTBOX_ACK_DOMAIN)
@@ -2306,6 +2320,56 @@ mod tests {
         assert_ne!(
             ProjectionOutboxDeliveryId::new("consumer-a", 1, "record-r", 1).ack_key(),
             ProjectionOutboxDeliveryId::new("consumer-a", 1, "record-r", 3).ack_key()
+        );
+    }
+
+    /// Two acknowledgements for different records race on the ack-root
+    /// pointer. The loser's CAS failure names a key it never touched, so it
+    /// must retry with a fresh transaction instead of failing the drain pass.
+    #[tokio::test]
+    async fn acknowledge_retries_when_an_unrelated_ack_advances_the_pointer() {
+        let backend = Arc::new(PauseOncePutBackend::new(
+            Arc::new(MemoryBackend::new()),
+            ACK_POINTER,
+        ));
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        let paused = writer(storage.clone());
+        let racing = writer(storage.clone());
+
+        let (reached, release) = backend.arm();
+        let paused_ack =
+            tokio::spawn(async move { paused.acknowledge(&delivery("record-a", 1)).await });
+        reached
+            .await
+            .expect("paused ack reached its pointer publish");
+
+        let racing_receipt = racing
+            .acknowledge(&delivery("record-b", 2))
+            .await
+            .expect("racing ack publishes first");
+        assert_eq!(1, racing_receipt.token().logical_sequence());
+
+        release.send(()).expect("release the paused ack");
+        let paused_receipt = paused_ack
+            .await
+            .expect("paused ack task")
+            .expect("an unrelated pointer race is retried, not surfaced");
+        assert_eq!(2, paused_receipt.token().logical_sequence());
+        assert_eq!(&ack_record("record-a", 1), paused_receipt.record());
+
+        let visible = writer(storage)
+            .acknowledged_event_ids("consumer-a", FIRST_BINDING_INCARNATION)
+            .await
+            .expect("acked events");
+        assert_eq!(
+            [
+                control_mvp_outbox_event_id(1, "record-a"),
+                control_mvp_outbox_event_id(2, "record-b"),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            visible
         );
     }
 

@@ -89,27 +89,116 @@ pub trait CatalogProjectionNotifierV2: Send + Sync {
     fn notify(&self, intent: &ProjectionIntentV2) -> Result<()>;
 }
 
-#[derive(Clone)]
-struct CatalogProjectionDrainNotifier {
-    storage: ScopedStorage,
-}
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use projection_drain::CatalogProjectionDrainNotifier;
+#[cfg(not(feature = "test-utils"))]
+use projection_drain::CatalogProjectionDrainNotifier;
 
-impl CatalogProjectionNotifier for CatalogProjectionDrainNotifier {
-    fn notify(&self, intent: &ProjectionIntentV1) -> Result<()> {
-        let materializer = CatalogProjectionMaterializer::new(self.storage.clone())?;
-        let intent_id = intent.intent_id().to_string();
-        let projection_kind = intent.projection_kind().to_string();
-        tokio::spawn(async move {
-            if let Err(error) = materializer.drain_once().await {
-                warn!(
-                    intent_id,
-                    projection_kind,
-                    error = %error,
-                    "best-effort catalog projection wake failed; durable anti-entropy will retry"
-                );
+/// Process-local post-commit wake-up that serializes and coalesces drains.
+mod projection_drain {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+    use arco_core::{AuthorityRoot, ScopedStorage};
+    use tracing::warn;
+
+    use super::{CatalogProjectionMaterializer, CatalogProjectionNotifier};
+    use crate::error::Result;
+    use crate::state_store::ProjectionIntentV1;
+
+    /// One drain gate per authority root.
+    ///
+    /// `lock` admits one drain at a time. `pending` records wake-ups that
+    /// arrived while a drain was running, so the lock holder runs one more
+    /// pass covering all of them instead of each queued task replaying full
+    /// state and racing on the ack-root pointer.
+    #[derive(Default)]
+    struct ProjectionDrainGate {
+        lock: tokio::sync::Mutex<()>,
+        pending: AtomicBool,
+    }
+
+    type GateKey = (String, AuthorityRoot);
+
+    /// Gates shared by every notifier for the same root in this process.
+    ///
+    /// The API constructs one authority per request, so a gate held only by
+    /// the authority would not serialize across requests. Entries are weak:
+    /// a gate lives exactly as long as some notifier or in-flight drain task
+    /// references it, and dead entries are pruned on insertion.
+    static GATES: Mutex<BTreeMap<GateKey, Weak<ProjectionDrainGate>>> = Mutex::new(BTreeMap::new());
+
+    fn gate_for(storage: &ScopedStorage) -> Arc<ProjectionDrainGate> {
+        let scope = storage.scope();
+        let key = (scope.tenant_id().to_string(), scope.root().clone());
+        let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(ProjectionDrainGate::default());
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Default catalog projection notifier: schedules a local anti-entropy
+    /// drain after each commit, with at most one drain running per root.
+    #[derive(Clone)]
+    pub struct CatalogProjectionDrainNotifier {
+        storage: ScopedStorage,
+        gate: Arc<ProjectionDrainGate>,
+        drain_passes: Arc<AtomicU64>,
+    }
+
+    impl CatalogProjectionDrainNotifier {
+        /// Creates the notifier for one exact scoped catalog root.
+        #[must_use]
+        pub fn new(storage: ScopedStorage) -> Self {
+            let gate = gate_for(&storage);
+            Self {
+                storage,
+                gate,
+                drain_passes: Arc::new(AtomicU64::new(0)),
             }
-        });
-        Ok(())
+        }
+
+        /// Number of drain passes run by wake-ups from this notifier.
+        #[cfg(feature = "test-utils")]
+        #[must_use]
+        pub fn drain_passes(&self) -> u64 {
+            self.drain_passes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CatalogProjectionNotifier for CatalogProjectionDrainNotifier {
+        fn notify(&self, intent: &ProjectionIntentV1) -> Result<()> {
+            let materializer = CatalogProjectionMaterializer::new(self.storage.clone())?;
+            let intent_id = intent.intent_id().to_string();
+            let projection_kind = intent.projection_kind().to_string();
+            let gate = Arc::clone(&self.gate);
+            let drain_passes = Arc::clone(&self.drain_passes);
+            // Publish the wake-up before queueing on the gate: a drain that
+            // is already running observes it on its next loop check, and a
+            // queued task that finds it consumed simply exits.
+            gate.pending.store(true, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _serialized = gate.lock.lock().await;
+                while gate.pending.swap(false, Ordering::SeqCst) {
+                    drain_passes.fetch_add(1, Ordering::SeqCst);
+                    if let Err(error) = materializer.drain_once().await {
+                        warn!(
+                            intent_id,
+                            projection_kind,
+                            error = %error,
+                            "best-effort catalog projection wake failed; durable anti-entropy will retry"
+                        );
+                    }
+                }
+            });
+            Ok(())
+        }
     }
 }
 
@@ -1138,9 +1227,7 @@ impl ControlCatalogAuthority {
         scope: StateScope,
         continuation_key: ScanContinuationKey,
     ) -> Result<Self> {
-        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier {
-            storage: storage.clone(),
-        });
+        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
         if scope.domain() != "catalog" {
             return Err(CatalogError::Validation {
                 message: "control catalog authority requires the catalog state domain".to_string(),
@@ -1173,9 +1260,7 @@ impl ControlCatalogAuthority {
                 message: "control catalog authority requires the catalog state domain".to_string(),
             });
         }
-        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier {
-            storage: storage.clone(),
-        });
+        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
         Ok(Self {
             store: ControlMvpStateStore::new_synthetic_bounded(storage, scope)?,
             continuation_key: ScanContinuationKey::generate()?,

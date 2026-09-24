@@ -284,6 +284,21 @@ fn api_service_account_can_invoke_sync_compactors() {
 /// Every `.tf` file under infra/terraform, not just the two IAM files: a second
 /// writer for a scoped prefix is just as dangerous when it is declared in
 /// main.tf or cloud_run.tf.
+#[test]
+fn control_store_worker_job_runs_under_the_api_service_account() {
+    let terraform = terraform_iam_text();
+    let job = resource_block(&terraform, "google_cloud_run_v2_job", "control_store_worker")
+        .expect("control-store worker job should exist");
+    assert!(
+        job.contains("service_account = google_service_account.api.email"),
+        "the control-store worker must run under the API service account, the sole control/ writer"
+    );
+    assert!(
+        !job.contains("compactor"),
+        "the control-store worker must not borrow a compactor identity"
+    );
+}
+
 fn terraform_iam_text() -> String {
     let dir = repo_root().join("infra/terraform");
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)

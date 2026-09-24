@@ -2263,6 +2263,7 @@ impl DurableMaintenanceWorker {
             logical_sequence: current.logical_sequence,
             manifest_checksum_sha256: candidate_digest.clone(),
             writer_epoch: pointer.writer_epoch,
+            claim_id: None,
         };
         let pointer_bytes = encode_json_limited(
             &candidate_pointer,

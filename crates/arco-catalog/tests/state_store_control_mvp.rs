@@ -2155,6 +2155,44 @@ async fn landed_writer_claim_with_lost_response_adopts_exact_claimed_epoch() {
 }
 
 #[tokio::test]
+async fn concurrent_writer_claims_with_lost_response_cannot_both_adopt_the_epoch() {
+    let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(GatedDroppedPointerWriteBackend::new(inner));
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let store_a = store(storage.clone());
+    let store_b = store(storage);
+    commit_value(&store_a, b"catalog/default", "v1").await;
+    backend.arm();
+
+    // B reads epoch 0 and its claim PUT is parked before it reaches storage.
+    let claim_b = tokio::spawn(store_b.claim_writer_authority());
+    backend.wait_until_parked().await;
+
+    // A claims the same epoch from the same base and lands.
+    let claimed_a = store_a
+        .claim_writer_authority()
+        .await
+        .expect("A's claim lands while B's write is parked");
+    assert_eq!(1, claimed_a.writer_epoch());
+
+    // B's PUT is lost in transit: storage never applies it and B sees an error.
+    backend.release_dropped_write();
+    let result_b = claim_b.await.expect("claim task");
+    assert!(backend.fault_fired(), "the dropped pointer write must fire");
+    let error = match result_b {
+        Ok(store) => panic!(
+            "B never published its claim and must not adopt A's epoch (adopted {})",
+            store.writer_epoch()
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:?}").starts_with("AmbiguousAuthorityOutcome"),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[tokio::test]
 async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
     let (_backend, storage) = storage();
     let store = store(storage);
@@ -2987,6 +3025,17 @@ struct GatedPointerWriteThenErrorBackend {
     release: Notify,
 }
 
+/// Parks the first armed pointer PUT before it reaches storage, then fails it
+/// without applying it once released: a claim that was lost in transit.
+struct GatedDroppedPointerWriteBackend {
+    inner: Arc<dyn StorageBackend>,
+    armed: AtomicBool,
+    fired: AtomicBool,
+    current_pointer: String,
+    parked: Notify,
+    release: Notify,
+}
+
 struct FailOncePathBackend {
     inner: Arc<dyn StorageBackend>,
     needle: String,
@@ -3264,6 +3313,80 @@ impl StorageBackend for GatedPointerWriteThenErrorBackend {
             ));
         }
         Ok(result)
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+impl GatedDroppedPointerWriteBackend {
+    fn new(inner: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            current_pointer: ControlMvpPaths::new("catalog").current_pointer(),
+            parked: Notify::new(),
+            release: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.fired.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_parked(&self) {
+        while !self.fired.load(Ordering::SeqCst) {
+            self.parked.notified().await;
+        }
+    }
+
+    fn release_dropped_write(&self) {
+        self.release.notify_one();
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GatedDroppedPointerWriteBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        if path.ends_with(&self.current_pointer) && self.armed.swap(false, Ordering::SeqCst) {
+            self.fired.store(true, Ordering::SeqCst);
+            self.parked.notify_one();
+            self.release.notified().await;
+            return Err(arco_core::Error::storage("injected dropped pointer write"));
+        }
+        self.inner.put(path, data, precondition).await
     }
 
     async fn delete(&self, path: &str) -> arco_core::Result<()> {
@@ -4531,12 +4654,63 @@ async fn force_pointer_writer_epoch(storage: &ScopedStorage, epoch: u64) {
         .expect("force pointer writer epoch");
 }
 
-async fn published_writer_epoch(storage: &ScopedStorage) -> u64 {
+async fn published_pointer(storage: &ScopedStorage) -> Value {
     let path = ControlMvpPaths::new("catalog").current_pointer();
-    let pointer: Value =
-        serde_json::from_slice(&storage.get_raw(&path).await.expect("published pointer"))
-            .expect("pointer json");
-    pointer["writer_epoch"].as_u64().expect("writer epoch")
+    serde_json::from_slice(&storage.get_raw(&path).await.expect("published pointer"))
+        .expect("pointer json")
+}
+
+async fn published_writer_epoch(storage: &ScopedStorage) -> u64 {
+    published_pointer(storage).await["writer_epoch"]
+        .as_u64()
+        .expect("writer epoch")
+}
+
+async fn published_claim_id(storage: &ScopedStorage) -> String {
+    published_pointer(storage).await["claim_id"]
+        .as_str()
+        .expect("claimed head carries a claim id")
+        .to_string()
+}
+
+/// Every claim renders byte-distinct head content, so a claimer's readback can
+/// only ever match its own write; ordinary commits publish heads without a
+/// claim id, so pre-claim head bytes stay exactly as before.
+#[tokio::test]
+async fn writer_claims_bind_distinct_claim_ids_and_commits_clear_them() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    commit_value(&store, b"catalog/default", "v1").await;
+    assert!(
+        published_pointer(&storage).await.get("claim_id").is_none(),
+        "an ordinary commit head must not carry a claim id"
+    );
+
+    let first = store
+        .clone()
+        .claim_writer_authority()
+        .await
+        .expect("first claim");
+    let first_claim = published_claim_id(&storage).await;
+    let second = first
+        .clone()
+        .claim_writer_authority()
+        .await
+        .expect("second claim");
+    let second_claim = published_claim_id(&storage).await;
+    assert_ne!(
+        first_claim, second_claim,
+        "consecutive claims must publish distinct claim ids"
+    );
+    assert_eq!(2, second.writer_epoch());
+
+    commit_value(&second, b"catalog/default", "v2").await;
+    let head = published_pointer(&storage).await;
+    assert!(
+        head.get("claim_id").is_none(),
+        "a commit under the claimed epoch clears the claim id"
+    );
+    assert_eq!(2, published_writer_epoch(&storage).await);
 }
 
 /// R4: the epoch ceiling has to be exercised through the real claim state

@@ -567,8 +567,15 @@ impl ControlMvpStateStore {
         if claimed_epoch == u64::MAX {
             return Err(unclaimable_writer_epoch());
         }
+        // A fresh claim id makes this head byte-distinct from any concurrent
+        // claim of the same epoch, so readback after a storage failure proves
+        // only *this* write landed.
         let claimed = ControlMvpPointer {
             writer_epoch: claimed_epoch,
+            claim_id: Some(format!(
+                "claim-{}",
+                cost::nonce().to_string().to_ascii_lowercase()
+            )),
             ..pointer
         };
         let claimed_bytes = encode_json_limited(
@@ -2429,6 +2436,7 @@ impl ControlMvpStateStore {
             logical_sequence: result_sequence,
             manifest_checksum_sha256: manifest_checksum,
             writer_epoch: stable.writer_epoch,
+            claim_id: None,
         };
         let pointer_bytes =
             encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "Control MVP restore head")?;
@@ -4175,6 +4183,7 @@ impl ControlMvpRestoreParticipant {
             logical_sequence: plan.result_logical_sequence,
             manifest_checksum_sha256: sha256_hex(&manifest_bytes),
             writer_epoch: plan.observed_writer_epoch,
+            claim_id: None,
         };
         if prefixed_sha256(&encode_json(
             &candidate_pointer,
@@ -4834,6 +4843,7 @@ impl ControlMvpTxn {
             logical_sequence: next_sequence,
             manifest_checksum_sha256: manifest_checksum,
             writer_epoch: self.store.writer_epoch,
+            claim_id: None,
         };
         let pointer_bytes =
             encode_json_limited(&pointer, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
@@ -6174,6 +6184,15 @@ struct ControlMvpPointer {
     logical_sequence: u64,
     manifest_checksum_sha256: String,
     writer_epoch: u64,
+    /// Identity of the writer-epoch claim that published this head, if any.
+    ///
+    /// Two writers pinning the same base and claiming the same epoch would
+    /// otherwise render byte-identical heads, so a claimer whose PUT response
+    /// was lost could read back a concurrent claim and adopt it. The id binds
+    /// readback reconciliation to exactly one claimer's write. Commits and
+    /// maintenance publications clear it; reclamation fences preserve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_id: Option<String>,
 }
 
 impl ControlMvpPointer {
@@ -6202,6 +6221,13 @@ impl ControlMvpPointer {
             || !valid_raw_digest(&self.manifest_checksum_sha256)
         {
             return Err(invariant_violation("invalid pointer manifest reference"));
+        }
+        if self
+            .claim_id
+            .as_deref()
+            .is_some_and(|id| !integrity::valid_immutable_id(id))
+        {
+            return Err(invariant_violation("invalid pointer writer claim id"));
         }
         Ok(())
     }

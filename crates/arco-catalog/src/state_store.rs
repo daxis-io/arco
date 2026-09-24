@@ -2895,6 +2895,9 @@ pub trait ArcoStateTxn: Send + Sync {
 
     /// Asserts that a key range is empty at commit time.
     ///
+    /// Tombstoned keys are not entries; the recorded witness still covers
+    /// them, so a concurrent resurrection conflicts at commit.
+    ///
     /// # Errors
     ///
     /// Returns an error when range preconditions are unsupported or invalid.

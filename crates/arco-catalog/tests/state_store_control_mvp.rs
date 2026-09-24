@@ -1062,17 +1062,17 @@ async fn checksum_coherent_terminal_logical_sequence_is_typed_not_a_panic() {
 }
 
 #[tokio::test]
-async fn tombstoned_keys_keep_range_empty_preconditions_from_succeeding() {
+async fn range_empty_ignores_tombstoned_keys() {
     let (_backend, storage) = storage();
     let store = store(storage);
-    let range = KeyRange::new(b"catalog/".to_vec(), b"catalog0".to_vec());
+    let range = KeyRange::new(b"a/".to_vec(), b"a0".to_vec());
 
     let mut seed_txn = store
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin seed transaction");
     seed_txn
-        .put(b"catalog/default", Bytes::from_static(b"v1"))
+        .put(b"a/b", Bytes::from_static(b"v1"))
         .await
         .expect("stage seed");
     seed_txn.commit().await.expect("commit seed");
@@ -1081,21 +1081,81 @@ async fn tombstoned_keys_keep_range_empty_preconditions_from_succeeding() {
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin delete transaction");
-    delete_txn
-        .delete(b"catalog/default")
-        .await
-        .expect("stage delete");
+    delete_txn.delete(b"a/b").await.expect("stage delete");
     delete_txn.commit().await.expect("commit delete");
 
     let mut txn = store
         .begin_control_txn(TxnOptions::default())
         .await
         .expect("begin range assertion transaction");
-    let error = txn
+    txn.assert_range_empty(range)
+        .await
+        .expect("a retained tombstone is not a range entry");
+    txn.put(b"c", Bytes::from_static(b"after"))
+        .await
+        .expect("stage unrelated write");
+    txn.commit()
+        .await
+        .expect("range-empty over a tombstoned key commits");
+}
+
+#[tokio::test]
+async fn range_empty_witness_still_covers_tombstone_resurrection() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let range = KeyRange::new(b"a/".to_vec(), b"a0".to_vec());
+
+    let mut seed_txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin seed transaction");
+    seed_txn
+        .put(b"a/b", Bytes::from_static(b"v1"))
+        .await
+        .expect("stage seed");
+    seed_txn.commit().await.expect("commit seed");
+
+    let mut delete_txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin delete transaction");
+    delete_txn.delete(b"a/b").await.expect("stage delete");
+    delete_txn.commit().await.expect("commit delete");
+
+    let mut stale_txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin stale transaction");
+    stale_txn
         .assert_range_empty(range)
         .await
-        .expect_err("tombstoned key should still occupy the folded range");
-    assert!(matches!(error, CatalogError::PreconditionFailed { .. }));
+        .expect("a retained tombstone is not a range entry");
+    stale_txn
+        .put(b"c", Bytes::from_static(b"stale"))
+        .await
+        .expect("stage stale write");
+
+    let mut resurrect_txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin resurrection transaction");
+    resurrect_txn
+        .put(b"a/b", Bytes::from_static(b"v2"))
+        .await
+        .expect("stage resurrection");
+    resurrect_txn.commit().await.expect("commit resurrection");
+
+    let error = stale_txn
+        .commit()
+        .await
+        .expect_err("the tombstone witness must catch a concurrent resurrection");
+    assert!(
+        matches!(
+            error,
+            CatalogError::CasFailed { .. } | CatalogError::PreconditionFailed { .. }
+        ),
+        "unexpected conflict classification: {error:?}"
+    );
 }
 
 #[tokio::test]

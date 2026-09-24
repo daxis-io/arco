@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_empty_blocks_tombstoned_descendant_index() {
+    async fn range_empty_ignores_tombstoned_descendant_index() {
         let storage = storage();
         let writer = writer(storage.clone());
         let store = ControlMvpStateStore::new(storage, metadata_scope()).expect("control store");
@@ -852,12 +852,14 @@ mod tests {
             .expect("tombstone descendant index");
         delete_txn.commit().await.expect("commit tombstone");
 
-        assert_precondition_contains(
-            writer
-                .declare_path(declaration("decl_parent", "gs://bucket/warehouse"))
-                .await,
-            "cannot assert a non-empty control MVP range",
-        );
+        // A tombstoned descendant index is not a live descendant, so the
+        // parent declaration must not be blocked forever by it.
+        let receipt = writer
+            .declare_path(declaration("decl_parent", "gs://bucket/warehouse"))
+            .await
+            .expect("parent declaration succeeds over a tombstoned descendant index");
+        assert_eq!(3, receipt.token().logical_sequence());
+        assert_eq!("decl_parent", receipt.declaration().declaration_id());
     }
 
     #[tokio::test]

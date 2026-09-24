@@ -188,11 +188,9 @@ async fn point_assertions_always_use_pinned_base_and_preserve_tombstones() {
         PointWitness::Tombstone(1)
     );
     assert_eq!(tx.reads.points[b"never".as_slice()], PointWitness::Absent);
-    assert!(
-        tx.assert_range_empty(KeyRange::new(b"deleted".to_vec(), b"deletee".to_vec()))
-            .await
-            .is_err()
-    );
+    tx.assert_range_empty(KeyRange::new(b"deleted".to_vec(), b"deletee".to_vec()))
+        .await
+        .unwrap();
     tx.assert_range_empty(KeyRange::new(b"z".to_vec(), b"a".to_vec()))
         .await
         .unwrap();

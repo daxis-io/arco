@@ -6041,7 +6041,10 @@ impl ReplayState {
     }
 
     fn range_has_entries(&self, range: &KeyRange) -> bool {
-        self.kv.keys().any(|key| key_in_range(key, range))
+        // Tombstoned keys are not entries; `range_witness` still covers them.
+        self.kv
+            .iter()
+            .any(|(key, value)| !value.tombstone && key_in_range(key, range))
     }
 
     fn range_witness(&self, range: &KeyRange) -> u64 {

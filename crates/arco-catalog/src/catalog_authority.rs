@@ -2584,9 +2584,16 @@ fn freeze_mutation(
         .idempotency_key
         .as_ref()
         .map(|key| sha256_hex(key.as_str().as_bytes()));
-    let operation_id = idempotency_hash.as_ref().map_or_else(
+    // The audit key and projection intent id are derived from the operation
+    // id alone, while the receipt key is scoped by family. Folding the family
+    // into a keyed operation id keeps one idempotency key reusable across
+    // families without colliding on those family-agnostic identities.
+    let operation_id = opts.idempotency_key.as_ref().map_or_else(
         || format!("op-{}", Ulid::new().to_string().to_ascii_lowercase()),
-        |hash| format!("op-{}", &hash[..32]),
+        |key| {
+            let scoped = sha256_hex(format!("{family}\0{}", key.as_str()).as_bytes());
+            format!("op-{}", &scoped[..32])
+        },
     );
     let receipt_identity = idempotency_hash.as_deref().unwrap_or(&operation_id);
     let receipt_key = receipt_key(family, receipt_identity);
@@ -2788,8 +2795,9 @@ async fn stage_commit_records_v2(
     let (receipt, audit) =
         commit_record_bytes_v2(frozen, response, logical_commit_id, logical_sequence)?;
     txn.put(&frozen.receipt_key, receipt).await?;
-    txn.put(&audit_key(&frozen.operation_id), audit.clone())
-        .await?;
+    let audit_key = audit_key(&frozen.operation_id);
+    txn.assert_absent(&audit_key).await?;
+    txn.put(&audit_key, audit.clone()).await?;
     txn.stage_projection_intent_v2(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
@@ -2828,8 +2836,9 @@ async fn stage_commit_records(
         logical_sequence: predicted.logical_sequence(),
     };
     let audit_bytes = encode_json(&audit, "catalog audit record")?;
-    txn.put(&audit_key(&frozen.operation_id), audit_bytes.clone())
-        .await?;
+    let audit_key = audit_key(&frozen.operation_id);
+    txn.assert_absent(&audit_key).await?;
+    txn.put(&audit_key, audit_bytes.clone()).await?;
     txn.stage_projection_intent(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,

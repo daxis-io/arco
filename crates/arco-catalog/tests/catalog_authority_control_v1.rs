@@ -1030,6 +1030,67 @@ async fn idempotency_replay_is_exact_and_mismatched_reuse_conflicts() {
 }
 
 #[tokio::test]
+async fn reusing_an_idempotency_key_across_operation_families_keeps_both_audit_records() {
+    let storage = scoped_storage();
+    let authority =
+        ControlCatalogAuthority::new(storage.clone(), scope()).expect("control authority");
+    authority
+        .create_catalog("c", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    authority
+        .create_schema("c", "s", None, WriteOptions::with_idempotency("shared-key"))
+        .await
+        .expect("create schema with the shared key");
+    authority
+        .register_table_in_schema(
+            "c",
+            "s",
+            RegisterTableInSchemaRequest {
+                name: "t".to_string(),
+                description: None,
+                location: None,
+                format: Some("parquet".to_string()),
+                table_type: None,
+                properties: None,
+                columns: Vec::new(),
+            },
+            WriteOptions::with_idempotency("shared-key"),
+        )
+        .await
+        .expect("a different operation family may reuse the same idempotency key");
+
+    let store = ControlMvpStateStore::new(storage, scope()).expect("control store");
+    let audit = store
+        .scan(arco_catalog::ScanRequest::new(b"\x04"))
+        .await
+        .expect("audit records");
+    let mut families = audit
+        .entries()
+        .iter()
+        .map(|entry| {
+            let record: serde_json::Value =
+                serde_json::from_slice(entry.value().bytes()).expect("audit record json");
+            record["operationFamily"]
+                .as_str()
+                .expect("operation family")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    families.sort();
+    assert_eq!(
+        vec!["create_catalog", "create_schema", "register_table"],
+        families,
+        "every mutation keeps its own audit record when a key is shared across families"
+    );
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents");
+    assert_eq!(3, outbox.len());
+}
+
+#[tokio::test]
 async fn accepted_head_with_lost_response_reconciles_one_logical_catalog_mutation() {
     let backend = LoseAcceptedCatalogHeadResponseBackend::new();
     let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")

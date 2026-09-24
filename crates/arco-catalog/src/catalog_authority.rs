@@ -53,6 +53,13 @@ const TABLE_KIND: u8 = 3;
 const COLUMN_KIND: u8 = 4;
 const RECORD_VERSION: u32 = 1;
 const RETRY_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Exponential conflict backoff with ULID-derived jitter, capped at 200-400 ms.
+fn conflict_backoff(attempt: u32) -> Duration {
+    let base = (5_u64 << attempt.min(6)).min(200);
+    let jitter = u64::try_from(Ulid::new().random() % u128::from(base)).unwrap_or(0);
+    Duration::from_millis(base + jitter)
+}
 /// Durable outbox kind and single-consumer identity for the catalog Parquet
 /// projection worker.
 pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
@@ -4098,7 +4105,23 @@ impl ControlCatalogAuthority {
             if let Some(request_id) = &frozen.request_id {
                 options = options.with_request_id(request_id);
             }
-            let mut txn = self.store.begin_control_txn(options).await?;
+            // A HEAD pin that loses its retry budget is a conflict like a lost
+            // commit CAS; it shares the same wall-clock budget and backoff.
+            let mut txn = match self.store.begin_control_txn(options).await {
+                Ok(txn) => txn,
+                Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
+                    sleep(conflict_backoff(attempt)).await;
+                    continue;
+                }
+                Err(CatalogError::CasFailed { .. }) => {
+                    return Err(CatalogError::CasFailed {
+                        message:
+                            "control catalog conflict retry budget exhausted after 1.5 seconds"
+                                .to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(receipt) = load_receipt(&mut txn, &frozen.receipt_key).await? {
                 if receipt.operation_family != frozen.family
                     || receipt.request_digest != frozen.digest
@@ -4132,8 +4155,7 @@ impl ControlCatalogAuthority {
                     return Ok(response);
                 }
                 Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
-                    let jitter = 5_u64 + u64::from(attempt % 11);
-                    sleep(Duration::from_millis(jitter)).await;
+                    sleep(conflict_backoff(attempt)).await;
                 }
                 Err(CatalogError::CasFailed { .. }) => {
                     return Err(CatalogError::CasFailed {
@@ -4161,7 +4183,23 @@ impl ControlCatalogAuthority {
             if let Some(request_id) = &frozen.request_id {
                 options = options.with_request_id(request_id);
             }
-            let mut txn = self.store.begin_control_txn(options).await?;
+            // A HEAD pin that loses its retry budget is a conflict like a lost
+            // commit CAS; it shares the same wall-clock budget and backoff.
+            let mut txn = match self.store.begin_control_txn(options).await {
+                Ok(txn) => txn,
+                Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
+                    sleep(conflict_backoff(attempt)).await;
+                    continue;
+                }
+                Err(CatalogError::CasFailed { .. }) => {
+                    return Err(CatalogError::CasFailed {
+                        message:
+                            "bounded catalog conflict retry budget exhausted after 1.5 seconds"
+                                .to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             txn.set_logical_operation(&frozen.operation_id, frozen.family, &frozen.digest)?;
             if let Some(receipt) = load_receipt_v2(&mut txn, &frozen.receipt_key).await? {
                 if receipt.operation_family != frozen.family
@@ -4206,8 +4244,7 @@ impl ControlCatalogAuthority {
                     return Ok(response);
                 }
                 Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
-                    let jitter = 5_u64 + u64::from(attempt % 11);
-                    sleep(Duration::from_millis(jitter)).await;
+                    sleep(conflict_backoff(attempt)).await;
                 }
                 Err(CatalogError::CasFailed { .. }) => {
                     return Err(CatalogError::CasFailed {

@@ -1542,3 +1542,116 @@ async fn control_v1_bound_rejects_a_metastore_scope_without_a_metastore_binding(
         "a workspace binding must not authorize a metastore root"
     );
 }
+
+/// Reports a fresh pointer HEAD version for the first `unstable_remaining`
+/// pointer `head()` calls, then passes the real version through.
+struct UnstablePointerHeadBackend {
+    inner: MemoryBackend,
+    unstable_remaining: AtomicUsize,
+    counter: AtomicUsize,
+}
+
+impl UnstablePointerHeadBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            unstable_remaining: AtomicUsize::new(0),
+            counter: AtomicUsize::new(0),
+        })
+    }
+
+    fn arm(&self, calls: usize) {
+        self.unstable_remaining.store(calls, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StorageBackend for UnstablePointerHeadBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.inner.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        let mut meta = self.inner.head(path).await?;
+        if path.ends_with("/control/v1/domains/catalog/head/current.json")
+            && let Some(meta) = &mut meta
+            && self
+                .unstable_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            meta.version = format!("unstable-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        }
+        Ok(meta)
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[tokio::test]
+async fn head_pin_conflicts_retry_inside_the_catalog_budget() {
+    let backend = UnstablePointerHeadBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("scoped storage");
+    let authority = ControlCatalogAuthority::new(storage, scope()).expect("control authority");
+    authority
+        .create_catalog("seed", None, WriteOptions::default())
+        .await
+        .expect("seed mutation publishes the pointer");
+
+    // The pin reads HEAD before and after the pointer body for three attempts;
+    // six fresh versions exhaust that budget exactly once.
+    backend.arm(6);
+    let created = authority
+        .create_catalog("after-unstable-head", None, WriteOptions::default())
+        .await
+        .expect("a transient head-pin conflict must be retried inside the catalog budget");
+    assert_eq!("after-unstable-head", created.name);
+    assert_eq!(
+        0,
+        backend.unstable_remaining.load(Ordering::SeqCst),
+        "the unstable head fault must fire"
+    );
+    assert!(
+        authority
+            .get_catalog("after-unstable-head")
+            .await
+            .expect("authority read")
+            .is_some(),
+        "the retried mutation must be durable"
+    );
+}

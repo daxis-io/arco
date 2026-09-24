@@ -1655,3 +1655,47 @@ async fn head_pin_conflicts_retry_inside_the_catalog_budget() {
         "the retried mutation must be durable"
     );
 }
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_head_pin_conflicts_retry_inside_the_catalog_budget() {
+    let backend = UnstablePointerHeadBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("scoped storage");
+    let authority = ControlCatalogAuthority::new_synthetic_bounded(
+        storage,
+        scope(),
+        Arc::new(NoopProjectionNotifierV2),
+    )
+    .expect("bounded authority");
+    authority
+        .create_catalog_v2("seed", None, WriteOptions::with_idempotency("seed"))
+        .await
+        .expect("seed mutation publishes the pointer");
+
+    // Format 8 classifies pin exhaustion as an ambiguous outcome; at begin
+    // nothing has been written, so the authority must still retry it.
+    backend.arm(6);
+    let created = authority
+        .create_catalog_v2(
+            "after-unstable-head",
+            None,
+            WriteOptions::with_idempotency("after-unstable-head"),
+        )
+        .await
+        .expect("a transient head-pin conflict must be retried inside the bounded budget");
+    assert_eq!("after-unstable-head", created.name);
+    assert_eq!(
+        0,
+        backend.unstable_remaining.load(Ordering::SeqCst),
+        "the unstable head fault must fire"
+    );
+    assert!(
+        authority
+            .get_catalog("after-unstable-head")
+            .await
+            .expect("authority read")
+            .is_some(),
+        "the retried bounded mutation must be durable"
+    );
+}

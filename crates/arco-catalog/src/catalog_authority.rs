@@ -4113,11 +4113,11 @@ impl ControlCatalogAuthority {
                     sleep(conflict_backoff(attempt)).await;
                     continue;
                 }
-                Err(CatalogError::CasFailed { .. }) => {
+                Err(CatalogError::CasFailed { message }) => {
                     return Err(CatalogError::CasFailed {
-                        message:
-                            "control catalog conflict retry budget exhausted after 1.5 seconds"
-                                .to_string(),
+                        message: format!(
+                            "control catalog conflict retry budget exhausted after 1.5 seconds: {message}"
+                        ),
                     });
                 }
                 Err(error) => return Err(error),
@@ -4185,17 +4185,29 @@ impl ControlCatalogAuthority {
             }
             // A HEAD pin that loses its retry budget is a conflict like a lost
             // commit CAS; it shares the same wall-clock budget and backoff.
+            // Format 8 classifies pin exhaustion as `AmbiguousAuthorityOutcome`
+            // (the kernel keeps that classification for restore preflight). At
+            // begin nothing has been written yet, so the outcome is not actually
+            // ambiguous for this mutation and re-executing is safe. The same
+            // error from `commit_v2` below is left alone: after a HEAD put the
+            // mutation may already be durable, and only candidate recovery may
+            // decide that.
             let mut txn = match self.store.begin_control_txn(options).await {
                 Ok(txn) => txn,
-                Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
+                Err(
+                    CatalogError::CasFailed { .. } | CatalogError::AmbiguousAuthorityOutcome { .. },
+                ) if started.elapsed() < RETRY_BUDGET => {
                     sleep(conflict_backoff(attempt)).await;
                     continue;
                 }
-                Err(CatalogError::CasFailed { .. }) => {
+                Err(
+                    CatalogError::CasFailed { message }
+                    | CatalogError::AmbiguousAuthorityOutcome { message },
+                ) => {
                     return Err(CatalogError::CasFailed {
-                        message:
-                            "bounded catalog conflict retry budget exhausted after 1.5 seconds"
-                                .to_string(),
+                        message: format!(
+                            "bounded catalog conflict retry budget exhausted after 1.5 seconds: {message}"
+                        ),
                     });
                 }
                 Err(error) => return Err(error),

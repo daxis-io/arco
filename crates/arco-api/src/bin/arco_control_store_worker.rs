@@ -722,6 +722,31 @@ async fn recover_selected_job(
         expired,
         "replaying persisted maintenance job activation"
     );
+    // A job whose activation completed resumes directly. `resume_at` observes a
+    // Publishing/Published attempt without re-checking source compatibility,
+    // which a publication that already reached HEAD would otherwise fail
+    // (publication bumps the layout generation). Activation is replayed only
+    // when the job is not directly resumable, e.g. its selector never landed.
+    if !expired {
+        match worker.resume_at(&job_id, now).await {
+            Ok(progress) => return Ok(Recovery::Resume(job_id, progress)),
+            Err(error)
+                if is_deferrable(&error) || matches!(error, CatalogError::NotFound { .. }) =>
+            {
+                tracing::info!(
+                    phase = "maintenance",
+                    domain = %domain,
+                    job_id = job_id.as_str(),
+                    error = %error,
+                    "persisted maintenance job is not directly resumable; replaying activation"
+                );
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("maintenance resume for domain {domain}"));
+            }
+        }
+    }
     let disposition = match worker.recover_activation_at(&job_id, now).await {
         Ok(_) if !expired => return resume_recovered_job(worker, &domain, job_id).await,
         Ok(_) => RecoveryDisposition::Abandon(
@@ -1353,6 +1378,57 @@ mod tests {
         assert!(catalog.recovered, "the persisted identity must be replayed");
         assert_eq!(catalog.job_id.as_deref(), Some(persisted.as_str()));
         assert!(load_selected_job(&storage, "catalog").await?.is_none());
+        assert!(!pending_intent(&storage).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_finishes_a_persisted_job_whose_publication_already_landed() -> Result<()> {
+        let storage = test_storage()?;
+        seed_plain_commits(&storage, 16).await?;
+        // A previous run prepared, persisted, activated and PUBLISHED a job,
+        // then died before clearing its record. Publication bumped the layout
+        // generation, so replaying activation would report the source as
+        // consumed; the record must resume and finish instead of deferring.
+        let dead = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
+        let now = Utc::now();
+        let plan = dead
+            .prepare_at(now)
+            .await?
+            .ok_or_else(|| anyhow!("16 L0 segments must select a maintenance intent"))?;
+        let persisted = plan.job_id().as_str().to_owned();
+        persist_selected_job(
+            &storage,
+            &SelectedJobRecord {
+                job_id: persisted.clone(),
+                domain: "catalog".to_owned(),
+                prepared_at_ms: now.timestamp_millis(),
+            },
+        )
+        .await?;
+        let mut progress = dead.start_at(&plan, now).await?;
+        for _ in 0..512 {
+            if progress.status == MaintenanceStatus::ReadyToPublish {
+                break;
+            }
+            progress = dead.advance_at(plan.job_id(), now).await?;
+        }
+        dead.publish_at(plan.job_id(), now)
+            .await?
+            .ok_or_else(|| anyhow!("direct publication was consumed"))?;
+        drop(dead);
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        let catalog = domain_summary(&summary, "catalog")?;
+        assert_eq!(catalog.outcome, MaintenanceOutcome::Published);
+        assert!(catalog.recovered, "the persisted identity must be resumed");
+        assert_eq!(catalog.job_id.as_deref(), Some(persisted.as_str()));
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "a finished job must clear its persisted record"
+        );
         assert!(!pending_intent(&storage).await?);
         Ok(())
     }

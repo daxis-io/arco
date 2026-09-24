@@ -26,10 +26,13 @@ history.
    worker prepares a durable maintenance job, **persists its identity** at
    `locks/control-store-worker/<domain>/selected-job.json`, then starts,
    advances and publishes it through `DurableMaintenanceWorker`. If a persisted
-   identity already exists from an earlier run, the worker replays that exact
-   job (`recover_activation_at` → `resume_at` → advance → publish) instead of
-   preparing a new one. Commits refuse at 32 unconsolidated L0 segments, so a
-   domain that never sees this phase wedges.
+   identity already exists from an earlier run, the worker resumes that exact
+   job first (`resume_at` → advance → publish, which also finishes a job whose
+   publication already reached HEAD before the record was cleared) and only
+   replays activation (`recover_activation_at` → `resume_at`) when the job is
+   not directly resumable, for example because its selector never landed. It
+   never prepares a new plan while a record exists. Commits refuse at 32
+   unconsolidated L0 segments, so a domain that never sees this phase wedges.
 3. **Catalog projection drain** (`phase="drain"`, `domain="catalog"`).
    `CatalogProjectionMaterializer::drain_once` materializes every pending
    catalog projection outbox record and acknowledges it, then reads the durable

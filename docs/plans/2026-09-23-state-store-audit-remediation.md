@@ -1,6 +1,6 @@
 # State Store Audit Remediation (defects + plumbing) Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans (or subagent-driven-development) to implement this plan task-by-task.
+> **Execution contract:** implement task-by-task with TDD, one implementer per package, and a two-stage (spec, then quality) review after each package before the next dependent package starts.
 
 **Goal:** Close the confirmed P1/P2 code defects and the missing deployment plumbing from `docs/reports/2026-09-23-state-store-architecture-audit.md` without changing authority format 7, restore-plan 6, or the retention contract.
 

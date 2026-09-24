@@ -282,7 +282,7 @@ pub struct Config {
     /// routes; when disabled the routes are not mounted at all, so they 404.
     ///
     /// They live in this service because platform IAM makes `arco-api` the
-    /// sole writer of the `state-store/` object prefix — no other service
+    /// sole writer of the `control/` object prefix — no other service
     /// account may mutate it, so no other service can host them.
     ///
     /// Enabling the routes is not enough to use them: every request must also

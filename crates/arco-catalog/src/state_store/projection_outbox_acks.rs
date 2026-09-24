@@ -4,7 +4,7 @@
 //! internal or operator-only access"). Nothing here is a public compatibility
 //! API: the writer and worker are exposed so internal services (arco-api's
 //! operator endpoints, which is the service platform IAM makes the sole
-//! writer of the `state-store/` prefix) can construct them, not for
+//! writer of the `control/` prefix) can construct them, not for
 //! tenant-facing routes.
 //!
 //! The domain records durable acknowledgements for consumed projection outbox

@@ -127,6 +127,13 @@ pub struct ProjectionMaterializationStatus {
     last_attempt_at_ms: i64,
     last_success_at_ms: Option<i64>,
     artifact_manifest_path: Option<String>,
+    /// Redacted `retryable:<code>` or `terminal:<code>` state, or `None`.
+    ///
+    /// A retryable state is cleared by a success at or beyond the observed
+    /// sequence. A terminal state (quarantine or non-retryable failure) is
+    /// retained across later successes and transient failures until a newer
+    /// terminal state replaces it: the event it names is never retried, only
+    /// an operator resolves it, and it stays unacknowledged backlog meanwhile.
     failure_state: Option<String>,
 }
 
@@ -149,7 +156,9 @@ impl ProjectionMaterializationStatus {
         self.last_success_at_ms
     }
 
-    /// Returns the redacted stable failure state.
+    /// Returns the redacted stable failure state (`retryable:<code>` or
+    /// `terminal:<code>`); a terminal state persists until an operator
+    /// resolves it or a newer terminal state replaces it.
     #[must_use]
     pub fn failure_state(&self) -> Option<&str> {
         self.failure_state.as_deref()
@@ -1840,8 +1849,14 @@ fn merge_projection_status(
         .observed_authority_sequence
         .max(proposed.observed_authority_sequence);
     let merged_applied = applied_authority_sequence.unwrap_or(0);
-    let failure_state = if proposed.failure_state.is_none() && proposed_applied >= current_observed
-    {
+    // A terminal state (quarantine or non-retryable failure) is never retried
+    // and only an operator resolves it, so neither a later success nor a later
+    // transient failure may hide it; only a newer terminal state replaces it.
+    let current_terminal = is_terminal_failure_state(current.failure_state.as_deref());
+    let proposed_terminal = is_terminal_failure_state(proposed.failure_state.as_deref());
+    let failure_state = if current_terminal && !proposed_terminal {
+        current.failure_state.clone()
+    } else if proposed.failure_state.is_none() && proposed_applied >= current_observed {
         None
     } else if proposed.failure_state.is_some()
         && proposed_observed > current_observed
@@ -1862,6 +1877,12 @@ fn merge_projection_status(
         artifact_manifest_path,
         failure_state,
     })
+}
+
+/// Terminal states are written by [`ProjectionOutboxAckWriter::record_projection_quarantine`]
+/// and by non-retryable [`ProjectionOutboxAckWriter::record_projection_failure`].
+fn is_terminal_failure_state(failure_state: Option<&str>) -> bool {
+    failure_state.is_some_and(|state| state.starts_with("terminal:"))
 }
 
 fn validate_status_identity(value: &str, label: &str) -> Result<()> {
@@ -2188,6 +2209,89 @@ mod tests {
         assert_eq!(
             Some("retryable:CATALOG_PROJECTION_FAILED"),
             status.failure_state()
+        );
+    }
+
+    /// A quarantined event is never retried and only an operator resolves it,
+    /// so later successes must not hide it from the materialization status
+    /// while it is still unacknowledged backlog.
+    #[tokio::test]
+    async fn terminal_quarantine_stays_visible_across_later_successes() {
+        let writer = writer(storage());
+        writer
+            .record_projection_quarantine(
+                "catalog-parquet-v1",
+                5,
+                "malformed-record",
+                "INVALID_PROJECTION_INTENT",
+                5_000,
+            )
+            .await
+            .expect("quarantine");
+        writer
+            .record_projection_success(
+                "catalog-parquet-v1",
+                6,
+                "control/v1/projections/catalog-parquet/0006/manifest.json",
+                6_000,
+            )
+            .await
+            .expect("later success");
+        let status = writer
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("status")
+            .expect("status exists");
+        assert_eq!(Some(6), status.applied_authority_sequence());
+        assert_eq!(Some(6), status.observed_authority_sequence());
+        assert_eq!(Some(6_000), status.last_success_at_ms());
+        assert_eq!(
+            Some("terminal:INVALID_PROJECTION_INTENT"),
+            status.failure_state(),
+            "a later success must not clear an unresolved terminal state"
+        );
+
+        writer
+            .record_projection_failure(
+                "catalog-parquet-v1",
+                7,
+                "CATALOG_PROJECTION_FAILED",
+                true,
+                7_000,
+            )
+            .await
+            .expect("later retryable failure");
+        let status = writer
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("status")
+            .expect("status exists");
+        assert_eq!(Some(7), status.observed_authority_sequence());
+        assert_eq!(
+            Some("terminal:INVALID_PROJECTION_INTENT"),
+            status.failure_state(),
+            "a transient failure must not replace an unresolved terminal state"
+        );
+
+        writer
+            .record_projection_failure(
+                "catalog-parquet-v1",
+                8,
+                "UNSUPPORTED_PROJECTION_KIND",
+                false,
+                8_000,
+            )
+            .await
+            .expect("later terminal failure");
+        let status = writer
+            .projection_status("catalog-parquet-v1")
+            .await
+            .expect("status")
+            .expect("status exists");
+        assert_eq!(
+            Some("terminal:UNSUPPORTED_PROJECTION_KIND"),
+            status.failure_state(),
+            "a newer terminal state replaces the older one"
         );
     }
 

@@ -975,7 +975,14 @@ async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_lat
         .await
         .expect("status")
         .expect("materialized status");
-    assert_eq!(None, status.failure_state());
+    // The later valid intent is applied, but the quarantined events remain
+    // unacknowledged backlog that only an operator resolves, so the newest
+    // terminal state stays visible instead of being cleared by that success.
+    assert_eq!(
+        Some("terminal:INCOMPATIBLE_PROJECTION_INTENT"),
+        status.failure_state()
+    );
+    assert!(status.applied_authority_sequence() > Some(incompatible_sequence));
     let ack_writer = ProjectionOutboxAckWriter::new(
         storage.clone(),
         StateScope::new(

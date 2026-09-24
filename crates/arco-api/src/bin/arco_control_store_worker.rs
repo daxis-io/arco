@@ -217,7 +217,7 @@ impl EpochSummary {
         tracing::info!(
             phase = "epoch",
             domain = "workspace",
-            outcome = ?self.outcome,
+            outcome = self.outcome.as_str(),
             epoch = self.epoch,
             operation_kind = self.operation_kind.as_deref(),
             operation_id = self.operation_id.as_deref(),
@@ -285,6 +285,41 @@ enum DrainOutcome {
     Deferred,
 }
 
+// Summary logs name outcomes by their stable snake_case serde names, which is
+// what the runbook's Logs Explorer filters match.
+impl EpochOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Idle => "idle",
+            Self::InFlight => "in_flight",
+            Self::Recoverable => "recoverable",
+            Self::StuckEpoch => "stuck_epoch",
+        }
+    }
+}
+
+impl MaintenanceOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Published => "published",
+            Self::Deferred => "deferred",
+            Self::Terminal => "terminal",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+impl DrainOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DrainSummary {
     outcome: DrainOutcome,
@@ -308,7 +343,7 @@ impl DrainSummary {
         tracing::info!(
             phase = "drain",
             domain = "catalog",
-            outcome = ?self.outcome,
+            outcome = self.outcome.as_str(),
             drained_records = self.drained_records,
             quarantined_records = self.quarantined_records,
             already_acknowledged = self.already_acknowledged,
@@ -357,7 +392,7 @@ impl DomainMaintenanceSummary {
         tracing::info!(
             phase = "maintenance",
             domain = %self.domain,
-            outcome = ?self.outcome,
+            outcome = self.outcome.as_str(),
             job_id = self.job_id.as_deref(),
             recovered = self.recovered,
             advances = self.advances,
@@ -1571,6 +1606,31 @@ mod tests {
             EpochOutcome::StuckEpoch,
             "only maintenance-root epochs are replayable by job id"
         );
+    }
+
+    #[test]
+    fn outcome_log_names_match_their_serde_names() {
+        for outcome in [
+            EpochOutcome::Absent,
+            EpochOutcome::Idle,
+            EpochOutcome::InFlight,
+            EpochOutcome::Recoverable,
+            EpochOutcome::StuckEpoch,
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
+        }
+        for outcome in [
+            MaintenanceOutcome::Idle,
+            MaintenanceOutcome::Published,
+            MaintenanceOutcome::Deferred,
+            MaintenanceOutcome::Terminal,
+            MaintenanceOutcome::Exhausted,
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
+        }
+        for outcome in [DrainOutcome::Ok, DrainOutcome::Deferred] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
+        }
     }
 
     #[test]

@@ -33,7 +33,8 @@ All state-store program surfaces above are landed with CI-run test suites but ar
 - Range-empty assertions ignore tombstoned rows, so a range holding only deletions counts as empty.
 - Head-pin conflicts on control-bound catalog routes are retried within the conflict budget and return `Retry-After` on exhaustion.
 - Projection drains are coalesced and acknowledgements retried, so overlapping wakes share one drain instead of duplicating or dropping work.
-- A terminal projection quarantine status is sticky and cannot be reopened by a later status update.
+- A terminal projection quarantine status is retained across later successes and retryable failures; only a newer terminal state replaces it.
+- Control-bound catalog routes reject `%` in request and scope identifiers with a 400 instead of failing later at the first artifact write.
 - The Terraform sole-writer IAM grant (`api_write_state_store`) is conditioned on the `control/` prefix the kernel writes instead of the unused `state-store/` prefix.
 
 ## [0.2.1] - 2026-06-27

@@ -445,8 +445,8 @@ pub fn record_idempotency_takeover(operation: &str, result: &str) {
 
 /// Records one control-store head pointer CAS publish attempt.
 ///
-/// `outcome` is `success`, `cas_lost`, `stale_epoch`, `transport`, or
-/// `ambiguous`; anything but `success` also counts as a failure by reason.
+/// `outcome` is `success`, `cas_lost`, `stale_epoch`, `transport`, `integrity`,
+/// or `ambiguous`; anything but `success` also counts as a failure by reason.
 pub fn record_state_store_cas_publish(domain: &str, outcome: &str) {
     counter!(STATE_STORE_CAS_PUBLISH, "domain" => domain.to_string()).increment(1);
     if outcome != "success" {

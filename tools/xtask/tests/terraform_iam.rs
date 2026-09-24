@@ -281,9 +281,6 @@ fn api_service_account_can_invoke_sync_compactors() {
     );
 }
 
-/// Every `.tf` file under infra/terraform, not just the two IAM files: a second
-/// writer for a scoped prefix is just as dangerous when it is declared in
-/// main.tf or cloud_run.tf.
 #[test]
 fn control_store_worker_job_runs_under_the_api_service_account() {
     let terraform = terraform_iam_text();
@@ -303,6 +300,9 @@ fn control_store_worker_job_runs_under_the_api_service_account() {
     );
 }
 
+/// Every `.tf` file under infra/terraform, not just the two IAM files: a second
+/// writer for a scoped prefix is just as dangerous when it is declared in
+/// main.tf or cloud_run.tf.
 fn terraform_iam_text() -> String {
     let dir = repo_root().join("infra/terraform");
     let mut files: Vec<PathBuf> = fs::read_dir(&dir)

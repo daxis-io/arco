@@ -329,6 +329,46 @@ async fn authority8_competing_writers_preserve_point_and_empty_range_observation
 }
 
 #[tokio::test]
+async fn authority8_range_empty_ignores_tombstones_but_witnesses_resurrection() {
+    let store = store();
+    let range = KeyRange::new(b"a/".to_vec(), b"a0".to_vec());
+    let mut seed = transaction(&store, "seed").await;
+    seed.put(b"a/b", Bytes::from_static(b"v1")).await.unwrap();
+    seed.commit_v2().await.unwrap();
+    let mut delete = transaction(&store, "delete").await;
+    delete.delete(b"a/b").await.unwrap();
+    delete.commit_v2().await.unwrap();
+
+    // The bounded range branch must not count the retained tombstone.
+    let mut empty = transaction(&store, "empty").await;
+    empty.assert_range_empty(range.clone()).await.unwrap();
+    empty.put(b"c", Bytes::from_static(b"after")).await.unwrap();
+    empty.commit_v2().await.unwrap();
+    assert!(store.get(b"a/b").await.unwrap().is_none());
+    assert_eq!(
+        store.get(b"c").await.unwrap(),
+        Some(Bytes::from_static(b"after"))
+    );
+
+    // The bounded witness still covers the tombstone, so a concurrent
+    // resurrection conflicts at commit.
+    let mut stale = transaction(&store, "stale").await;
+    stale.assert_range_empty(range).await.unwrap();
+    stale.put(b"d", Bytes::from_static(b"stale")).await.unwrap();
+    let mut resurrect = transaction(&store, "resurrect").await;
+    resurrect
+        .put(b"a/b", Bytes::from_static(b"v2"))
+        .await
+        .unwrap();
+    resurrect.commit_v2().await.unwrap();
+    assert!(matches!(
+        stale.commit_v2().await,
+        Err(CatalogError::CasFailed { .. } | CatalogError::PreconditionFailed { .. })
+    ));
+    assert!(store.get(b"d").await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn authority8_deleted_generations_and_retained_values_survive_recreation() {
     let store = store();
     let mut seed = transaction(&store, "seed").await;

@@ -11703,6 +11703,46 @@ mod tests {
     }
 
     #[test]
+    fn range_empty_witness_still_covers_tombstones() {
+        let range = KeyRange::new(b"a/".to_vec(), b"a0".to_vec());
+        let stored = |generation: u64, tombstone: bool| StoredValue {
+            bytes: Bytes::from_static(b"v"),
+            generation,
+            tombstone,
+        };
+        let mut state = ReplayState::default();
+        state.kv.insert(b"a/b".to_vec(), stored(1, false));
+        assert!(state.range_has_entries(&range));
+
+        // Tombstone the key: no entries remain, so RangeEmpty is recordable.
+        state.kv.insert(b"a/b".to_vec(), stored(2, true));
+        assert!(!state.range_has_entries(&range));
+        let recorded = Precondition::RangeEmpty {
+            range: range.clone(),
+            witness: state.range_witness(&range),
+        };
+        state
+            .validate_precondition(&recorded)
+            .expect("a retained tombstone is not a range entry");
+
+        // Resurrect the key: the witness changes and the range has an entry.
+        state.kv.insert(b"a/b".to_vec(), stored(3, false));
+        assert!(matches!(
+            state.validate_precondition(&recorded),
+            Err(CatalogError::PreconditionFailed { .. })
+        ));
+
+        // Re-tombstone at a later generation: still no entries, but the
+        // witness hashes tombstones and generations, so it must still differ.
+        state.kv.insert(b"a/b".to_vec(), stored(4, true));
+        assert!(!state.range_has_entries(&range));
+        assert!(matches!(
+            state.validate_precondition(&recorded),
+            Err(CatalogError::PreconditionFailed { .. })
+        ));
+    }
+
+    #[test]
     fn replay_rejects_sequence_zero_after_terminal_logical_sequence_without_panicking() {
         let scope = StateScope::new("tenant", "workspace", "catalog");
         let tx = ControlMvpTxObject {

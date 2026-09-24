@@ -261,7 +261,12 @@ impl ControlMvpStateStore {
                 MAX_CONTROL_JSON_BYTES,
             )
             .await?;
-        validate_raw_checksum(&bytes, Some(witness), "retained manifest format witness")?;
+        validate_raw_checksum_for(
+            self.scope.domain(),
+            &bytes,
+            Some(witness),
+            "retained manifest format witness",
+        )?;
         let header: Format = decode_json(&bytes, "retained manifest format")?;
         if !matches!(header.format_version, 7 | 8) {
             return Err(CatalogError::UnsupportedAuthorityFormat {
@@ -613,9 +618,12 @@ impl ControlMvpStateStore {
                     self.writer_epoch = claimed_epoch;
                     Ok(self)
                 } else {
-                    Err(ambiguous_authority_outcome(format!(
-                        "control MVP writer epoch claim could not be reconciled after storage failure: {error}"
-                    )))
+                    Err(ambiguous_authority_outcome_for(
+                        self.scope.domain(),
+                        format!(
+                            "control MVP writer epoch claim could not be reconciled after storage failure: {error}"
+                        ),
+                    ))
                 }
             }
         }
@@ -904,7 +912,8 @@ impl ControlMvpStateStore {
                 0..MAX_CONTROL_JSON_PROBE_BYTES,
             )
             .await?;
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &bytes,
             expected_checksum,
             "control MVP manifest reference checksum",
@@ -920,6 +929,27 @@ impl ControlMvpStateStore {
     }
 
     async fn replay_manifest(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
+        let started = std::time::Instant::now();
+        let replayed = self.replay_manifest_inner(manifest).await;
+        let declared_bytes = manifest
+            .base_states
+            .iter()
+            .map(|state| {
+                state
+                    .segment_size_bytes
+                    .saturating_add(state.index_size_bytes)
+            })
+            .chain(manifest.tx_refs.iter().map(|tx_ref| tx_ref.size_bytes))
+            .fold(0_u64, u64::saturating_add);
+        crate::metrics::record_state_store_replay(
+            self.scope.domain(),
+            started.elapsed().as_secs_f64(),
+            declared_bytes,
+        );
+        replayed
+    }
+
+    async fn replay_manifest_inner(&self, manifest: &ControlMvpManifest) -> Result<ReplayState> {
         let mut state = self.load_state_snapshots(&manifest.base_states).await?;
         state.history_root.clone_from(&manifest.history_anchor.root);
         if let Some(render) = manifest
@@ -1068,7 +1098,8 @@ impl ControlMvpStateStore {
                     "directory length differs from owning reference",
                 ));
             }
-            validate_raw_checksum(
+            validate_raw_checksum_for(
+                self.scope.domain(),
                 &index_bytes,
                 Some(&reference.index_checksum_sha256),
                 "control MVP segment index reference checksum",
@@ -1140,7 +1171,7 @@ impl ControlMvpStateStore {
                 .checked_add(block.length)
                 .ok_or_else(|| invariant_violation("block range overflow"))?;
             let bytes = self.storage.get_range(&path, block.offset..end).await?;
-            let rows = decode_block_rows(&bytes, block)?;
+            let rows = decode_block_rows(&bytes, block, self.scope.domain())?;
             for row in &rows {
                 if row.logical_sequence != reference.logical_sequence {
                     return Err(invariant_violation("block sequence mismatch"));
@@ -1430,7 +1461,8 @@ impl ControlMvpStateStore {
                 "transaction length differs from owning reference",
             ));
         }
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &bytes,
             Some(&tx_ref.checksum_sha256),
             "control MVP transaction reference checksum",
@@ -1632,9 +1664,12 @@ impl ControlMvpStateStore {
                 {
                     Ok(())
                 } else {
-                    Err(ambiguous_authority_outcome(format!(
-                        "control MVP checkpoint publication could not be reconciled: {error}"
-                    )))
+                    Err(ambiguous_authority_outcome_for(
+                        self.scope.domain(),
+                        format!(
+                            "control MVP checkpoint publication could not be reconciled: {error}"
+                        ),
+                    ))
                 }
             }
         }
@@ -1741,7 +1776,8 @@ impl ControlMvpStateStore {
                 MAX_CONTROL_JSON_BYTES,
             )
             .await?;
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &bytes,
             Some(token.checkpoint_witness()?),
             "checkpoint token witness",
@@ -1987,7 +2023,8 @@ impl ControlMvpStateStore {
         let mut child: Option<AncestorTransition> = None;
         while let Some((id, digest)) = next {
             if visited.len() >= max_manifests || metadata_bytes >= max_bytes {
-                return Err(ambiguous_authority_outcome(
+                return Err(ambiguous_authority_outcome_for(
+                    self.scope.domain(),
                     "authenticated ancestry resolution budget exhausted",
                 ));
             }
@@ -2001,9 +2038,10 @@ impl ControlMvpStateStore {
                 .get_range(&self.paths.manifest_object(&id), 0..probe_end)
                 .await
                 .map_err(|error| {
-                    ambiguous_authority_outcome(format!(
-                        "authenticated ancestry is unavailable: {error}"
-                    ))
+                    ambiguous_authority_outcome_for(
+                        self.scope.domain(),
+                        format!("authenticated ancestry is unavailable: {error}"),
+                    )
                 })?;
             metadata_bytes = metadata_bytes
                 .checked_add(bytes.len())
@@ -2011,11 +2049,17 @@ impl ControlMvpStateStore {
             if metadata_bytes > max_bytes
                 || (bytes.len() == remaining && sha256_hex(&bytes) != digest)
             {
-                return Err(ambiguous_authority_outcome(
+                return Err(ambiguous_authority_outcome_for(
+                    self.scope.domain(),
                     "authenticated ancestry metadata budget exhausted",
                 ));
             }
-            validate_raw_checksum(&bytes, Some(&digest), "authenticated ancestry manifest")?;
+            validate_raw_checksum_for(
+                self.scope.domain(),
+                &bytes,
+                Some(&digest),
+                "authenticated ancestry manifest",
+            )?;
             let manifest: ControlMvpManifest = decode_envelope_limited(
                 &bytes,
                 "control-mvp-manifest",
@@ -2372,8 +2416,13 @@ impl ControlMvpStateStore {
         candidate_state.apply_tx(&tx)?;
         let mut tx_refs = stable.candidate_parent.tx_refs.clone();
         tx_refs.push(transaction_ref.clone());
+        crate::metrics::record_state_store_l0_segments(
+            self.scope.domain(),
+            u64::try_from(tx_refs.len()).unwrap_or(u64::MAX),
+        );
         let production_async_layout = checkpoint_interval == Self::DEFAULT_CHECKPOINT_INTERVAL;
         if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
+            crate::metrics::record_state_store_backpressure(self.scope.domain());
             return Err(CatalogError::MaintenanceBackpressure {
                 message: "control MVP reached 32 L0 segments before layout maintenance completed"
                     .to_string(),
@@ -3014,9 +3063,10 @@ impl ControlMvpMaintenanceWorker {
                 {
                     return Ok(after.version);
                 }
-                Err(ambiguous_authority_outcome(format!(
-                    "control MVP reclamation fence could not be reconciled: {error}"
-                )))
+                Err(ambiguous_authority_outcome_for(
+                    self.store.scope.domain(),
+                    format!("control MVP reclamation fence could not be reconciled: {error}"),
+                ))
             }
         }
     }
@@ -4772,10 +4822,15 @@ impl ControlMvpTxn {
 
         let mut tx_refs = base.tx_refs.clone();
         tx_refs.push(candidate_tx_ref.clone());
+        crate::metrics::record_state_store_l0_segments(
+            self.store.scope.domain(),
+            u64::try_from(tx_refs.len()).unwrap_or(u64::MAX),
+        );
 
         let production_async_layout =
             self.store.checkpoint_interval == ControlMvpStateStore::DEFAULT_CHECKPOINT_INTERVAL;
         if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
+            crate::metrics::record_state_store_backpressure(self.store.scope.domain());
             return Err(CatalogError::MaintenanceBackpressure {
                 message: "control MVP reached 32 L0 segments before layout maintenance completed"
                     .to_string(),
@@ -4902,7 +4957,8 @@ impl ControlMvpTxn {
             ),
         )
         .await;
-        match pointer_write {
+        let domain = self.store.scope.domain();
+        let outcome = match pointer_write {
             Err(error) => {
                 // S3 may accept a conditional PUT and lose the response. The
                 // exact canonical pointer bytes prove direct publication. A
@@ -4921,29 +4977,30 @@ impl ControlMvpTxn {
                         match self.store.load_current_base_state().await {
                             Ok(visible) => {
                                 match self.store.tx_in_lineage(&visible, &candidate_tx_ref).await {
-                                    Ok(found) => found,
+                                    Ok(found) => Ok(found),
                                     Err(
                                         error @ (CatalogError::InvariantViolation { .. }
                                         | CatalogError::Validation { .. }),
-                                    ) => {
-                                        return Err(error);
-                                    }
-                                    Err(_) => false,
+                                    ) => Err(error),
+                                    Err(_) => Ok(false),
                                 }
                             }
                             Err(
                                 error @ (CatalogError::InvariantViolation { .. }
                                 | CatalogError::Validation { .. }),
-                            ) => return Err(error),
-                            Err(_) => false,
+                            ) => Err(error),
+                            Err(_) => Ok(false),
                         };
-                    if visible_lineage_contains_candidate {
-                        Ok(CommitOutcome::new(committed_token, projection_intents))
-                    } else {
-                        Err(ambiguous_authority_outcome(format!(
-                            "control MVP commit {} could not be reconciled after storage failure: {error}",
-                            candidate_tx_ref.tx_id
-                        )))
+                    match visible_lineage_contains_candidate {
+                        Ok(true) => Ok(CommitOutcome::new(committed_token, projection_intents)),
+                        Ok(false) => Err(ambiguous_authority_outcome_for(
+                            domain,
+                            format!(
+                                "control MVP commit {} could not be reconciled after storage failure: {error}",
+                                candidate_tx_ref.tx_id
+                            ),
+                        )),
+                        Err(inspection_error) => Err(inspection_error),
                     }
                 }
             }
@@ -4956,16 +5013,19 @@ impl ControlMvpTxn {
                 if let Ok(current) = self.store.load_pointer().await
                     && current.writer_epoch > self.store.writer_epoch
                 {
-                    return Err(stale_writer_epoch(
+                    Err(stale_writer_epoch(
                         self.store.writer_epoch,
                         current.writer_epoch,
-                    ));
+                    ))
+                } else {
+                    Err(CatalogError::CasFailed {
+                        message: "control MVP pointer CAS lost to a newer manifest".to_string(),
+                    })
                 }
-                Err(CatalogError::CasFailed {
-                    message: "control MVP pointer CAS lost to a newer manifest".to_string(),
-                })
             }
-        }
+        };
+        crate::metrics::record_state_store_cas_publish(domain, cas_publish_outcome(&outcome));
+        outcome
     }
 }
 
@@ -5241,7 +5301,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         let bytes = self
             .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
             .await?;
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &bytes,
             Some(token.manifest_witness()?),
             "persisted state token witness",
@@ -5292,7 +5353,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         let checkpoint_bytes = self
             .get_json(&checkpoint_path, MAX_CONTROL_JSON_BYTES)
             .await?;
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &checkpoint_bytes,
             Some(token.checkpoint_witness()?),
             "persisted checkpoint token witness",
@@ -5311,7 +5373,8 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         let manifest_bytes = self
             .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
             .await?;
-        validate_raw_checksum(
+        validate_raw_checksum_for(
+            self.scope.domain(),
             &manifest_bytes,
             Some(&checkpoint.manifest_checksum_sha256),
             "control MVP checkpoint manifest checksum",
@@ -5622,9 +5685,12 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
                 "Control MVP pointer CAS reported success but restore is not visible",
             )),
             (Err(error), Ok(RestoreParticipantInspection::Ready)) => Err(error.into()),
-            (Err(write_error), Err(inspection_error)) => Err(ambiguous_authority_outcome(format!(
-                "control MVP restore pointer write could not be reconciled after storage failure: {write_error}; reconciliation inspection failed: {inspection_error}"
-            ))),
+            (Err(write_error), Err(inspection_error)) => Err(ambiguous_authority_outcome_for(
+                self.store.scope.domain(),
+                format!(
+                    "control MVP restore pointer write could not be reconciled after storage failure: {write_error}; reconciliation inspection failed: {inspection_error}"
+                ),
+            )),
             (_, Err(error)) => Err(error),
         }
     }
@@ -7847,12 +7913,14 @@ fn decode_segment_rows(
             "control MVP segment index exceeds the supported byte limit",
         ));
     }
-    validate_raw_checksum(
+    validate_raw_checksum_for(
+        scope.domain(),
         bytes,
         Some(&reference.checksum_sha256),
         "control MVP segment reference checksum",
     )?;
-    validate_raw_checksum(
+    validate_raw_checksum_for(
+        scope.domain(),
         index_bytes,
         Some(&reference.index_checksum_sha256),
         "control MVP segment index reference checksum",
@@ -7882,7 +7950,7 @@ fn decode_segment_rows(
                         .map_err(|_| invariant_violation("block end overflow"))?,
             )
             .ok_or_else(|| invariant_violation("block span outside segment"))?;
-        rows.extend(decode_block_rows(data, block)?);
+        rows.extend(decode_block_rows(data, block, scope.domain())?);
     }
     let mut expected_index = build_segment_index(
         &reference.segment_id,
@@ -7907,11 +7975,15 @@ fn decode_segment_rows(
     Ok(rows)
 }
 
-fn decode_block_rows(bytes: &[u8], block: &ControlMvpBlock) -> Result<Vec<ControlMvpSegmentRow>> {
+fn decode_block_rows(
+    bytes: &[u8],
+    block: &ControlMvpBlock,
+    domain: &str,
+) -> Result<Vec<ControlMvpSegmentRow>> {
     if bytes.len() as u64 != block.length {
         return Err(invariant_violation("block length mismatch"));
     }
-    validate_raw_checksum(bytes, Some(&block.checksum_sha256), "block digest")?;
+    validate_raw_checksum_for(domain, bytes, Some(&block.checksum_sha256), "block digest")?;
     let preflight = preflight_arrow_segment(bytes)?;
     if preflight.row_count != block.row_count {
         return Err(invariant_violation(
@@ -8585,7 +8657,20 @@ fn valid_raw_digest(digest: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Fail-closed raw-byte digest check for callers without a domain at hand
+/// (maintenance artifacts); mismatches are counted under domain `unknown`.
 fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) -> Result<()> {
+    validate_raw_checksum_for("unknown", bytes, expected, context)
+}
+
+/// Fail-closed raw-byte digest check; a mismatch is counted as a read
+/// integrity failure for `domain` under the `context` artifact label.
+fn validate_raw_checksum_for(
+    domain: &str,
+    bytes: &[u8],
+    expected: Option<&str>,
+    context: &str,
+) -> Result<()> {
     if let Some(expected) = expected {
         #[cfg(feature = "test-utils")]
         {
@@ -8594,6 +8679,7 @@ fn validate_raw_checksum(bytes: &[u8], expected: Option<&str>, context: &str) ->
         }
         let actual = sha256_hex(bytes);
         if actual != expected {
+            crate::metrics::record_state_store_integrity_failure(domain, context);
             return Err(invariant_violation(format!("{context} mismatch")));
         }
     }
@@ -8855,9 +8941,28 @@ fn next_logical_sequence(current: u64, context: &str) -> Result<u64> {
     })
 }
 
+/// Typed ambiguous-outcome error for callers without a domain at hand
+/// (maintenance publication); counted under domain `unknown`.
 fn ambiguous_authority_outcome(message: impl Into<String>) -> CatalogError {
+    ambiguous_authority_outcome_for("unknown", message)
+}
+
+/// Builds the typed ambiguous-outcome error and counts it for `domain`.
+fn ambiguous_authority_outcome_for(domain: &str, message: impl Into<String>) -> CatalogError {
+    crate::metrics::record_state_store_ambiguous(domain);
     CatalogError::AmbiguousAuthorityOutcome {
         message: message.into(),
+    }
+}
+
+/// Labels one head-CAS publish outcome for `arco_state_store_cas_publish_*`.
+fn cas_publish_outcome(outcome: &Result<CommitOutcome>) -> &'static str {
+    match outcome {
+        Ok(_) => "success",
+        Err(CatalogError::CasFailed { .. }) => "cas_lost",
+        Err(CatalogError::StaleWriterEpoch { .. }) => "stale_epoch",
+        Err(CatalogError::AmbiguousAuthorityOutcome { .. }) => "ambiguous",
+        Err(_) => "transport",
     }
 }
 
@@ -9643,11 +9748,11 @@ mod tests {
         }
         let mut substituted = bytes.to_vec();
         substituted[20] ^= 1;
-        assert!(decode_block_rows(&substituted, &index.blocks[0]).is_err());
-        assert!(decode_block_rows(&bytes[..bytes.len() - 1], &index.blocks[0]).is_err());
+        assert!(decode_block_rows(&substituted, &index.blocks[0], "catalog").is_err());
+        assert!(decode_block_rows(&bytes[..bytes.len() - 1], &index.blocks[0], "catalog").is_err());
         let mut appended = bytes.to_vec();
         appended.push(0);
-        assert!(decode_block_rows(&appended, &index.blocks[0]).is_err());
+        assert!(decode_block_rows(&appended, &index.blocks[0], "catalog").is_err());
         let mut replaced = reference;
         replaced.index_size_bytes += 1;
         assert!(decode_segment_rows(&bytes, &index_bytes, &replaced, &scope).is_err());
@@ -12043,7 +12148,7 @@ mod tests {
             writer.finish().unwrap();
             let block = block_metadata(0, &output, &rows);
             assert!(
-                decode_block_rows(&output, &block).is_err(),
+                decode_block_rows(&output, &block, "catalog").is_err(),
                 "compressed files must fail preflight"
             );
         }

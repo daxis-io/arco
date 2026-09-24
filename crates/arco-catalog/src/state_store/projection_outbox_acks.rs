@@ -1442,14 +1442,61 @@ impl ProjectionOutboxWorker {
                 pending_record_ids.push(record.record_id().to_string());
             }
         }
+        let latest_projected_sequence = self
+            .acks
+            .latest_projected_sequence(&self.consumer_id)
+            .await?;
+        self.record_watermark(
+            committed_sequence,
+            latest_projected_sequence,
+            pending_record_ids.is_empty(),
+        )
+        .await?;
         Ok(ProjectionOutboxBacklog {
             committed_sequence,
-            latest_projected_sequence: self
-                .acks
-                .latest_projected_sequence(&self.consumer_id)
-                .await?,
+            latest_projected_sequence,
             pending_record_ids,
         })
+    }
+
+    /// Publishes the watermark lag and age gauges for this consumer.
+    ///
+    /// Lag is the committed source sequence minus the latest acknowledged
+    /// one. Age is zero while nothing is pending; otherwise it is the time
+    /// since the consumer's last recorded materialization success, read from
+    /// the projection status kept under the consumer id (consumers without a
+    /// status report zero, and the publish-absent alert covers them).
+    async fn record_watermark(
+        &self,
+        committed_sequence: Option<u64>,
+        latest_projected_sequence: Option<u64>,
+        nothing_pending: bool,
+    ) -> Result<()> {
+        let lag = committed_sequence.map_or(0, |committed| {
+            committed.saturating_sub(latest_projected_sequence.unwrap_or(0))
+        });
+        let age_seconds = if nothing_pending {
+            0.0
+        } else {
+            let last_success_at_ms = match self.acks.projection_status(&self.consumer_id).await {
+                Ok(status) => status.and_then(|status| status.last_success_at_ms()),
+                Err(CatalogError::Validation { .. }) => None,
+                Err(error) => return Err(error),
+            };
+            last_success_at_ms.map_or(0.0, |last_success_at_ms| {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                #[allow(clippy::cast_precision_loss)]
+                let age_ms = now_ms.saturating_sub(last_success_at_ms).max(0) as f64;
+                age_ms / 1_000.0
+            })
+        };
+        crate::metrics::record_projection_watermark(
+            self.source_scope.domain(),
+            &self.consumer_id,
+            lag,
+            age_seconds,
+        );
+        Ok(())
     }
 
     /// Drains unacknowledged records through the handler in replay order.
@@ -1548,6 +1595,10 @@ impl ProjectionOutboxWorker {
                 )),
             )
             .await?;
+            crate::metrics::record_projection_publish(
+                self.source_scope.domain(),
+                &self.consumer_id,
+            );
             drained_record_ids.push(record.record_id().to_string());
             drained_event_ids.push(event_id);
         }

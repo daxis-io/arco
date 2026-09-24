@@ -495,3 +495,37 @@ variable "flow_queue_max_concurrent_dispatches" {
   type        = number
   default     = 500
 }
+
+# ============================================================================
+# Control-Store Worker (projection drain, layout maintenance, GC)
+# ============================================================================
+
+variable "control_store_worker_image" {
+  description = "Container image for the scheduled control-store worker job (arco_control_store_worker). Empty disables the job."
+  type        = string
+  default     = ""
+}
+
+variable "control_store_tenant_id" {
+  description = "Tenant ID of the control/v1 root the control-store worker maintains (same value as the API's ARCO_CATALOG_CONTROL_V1_TENANT_ID)"
+  type        = string
+  default     = ""
+}
+
+variable "control_store_workspace_id" {
+  description = "Workspace ID of the control/v1 root the control-store worker maintains (same value as the API's ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID)"
+  type        = string
+  default     = ""
+}
+
+variable "control_store_worker_schedule" {
+  description = "Cron schedule for the control-store worker trigger"
+  type        = string
+  default     = "*/5 * * * *"
+}
+
+variable "control_store_maintenance_binding_secret" {
+  description = "Secret Manager secret id holding ARCO_CONTROL_STORE_MAINTENANCE_BINDING (base64 of exactly 32 bytes). Per-deployment identity that must never change for a live control root."
+  type        = string
+  default     = ""
+}

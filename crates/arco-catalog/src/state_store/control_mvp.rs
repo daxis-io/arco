@@ -8962,6 +8962,9 @@ fn cas_publish_outcome(outcome: &Result<CommitOutcome>) -> &'static str {
         Err(CatalogError::CasFailed { .. }) => "cas_lost",
         Err(CatalogError::StaleWriterEpoch { .. }) => "stale_epoch",
         Err(CatalogError::AmbiguousAuthorityOutcome { .. }) => "ambiguous",
+        Err(CatalogError::InvariantViolation { .. } | CatalogError::Validation { .. }) => {
+            "integrity"
+        }
         Err(_) => "transport",
     }
 }

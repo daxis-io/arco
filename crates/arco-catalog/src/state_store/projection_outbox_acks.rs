@@ -1478,10 +1478,21 @@ impl ProjectionOutboxWorker {
         let age_seconds = if nothing_pending {
             0.0
         } else {
+            // This read only feeds a gauge: a storage failure here must not
+            // fail the backlog inspection that operator routes and the
+            // `projection_status` system table depend on.
             let last_success_at_ms = match self.acks.projection_status(&self.consumer_id).await {
                 Ok(status) => status.and_then(|status| status.last_success_at_ms()),
                 Err(CatalogError::Validation { .. }) => None,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        domain = self.source_scope.domain(),
+                        consumer = %self.consumer_id,
+                        error = %error,
+                        "projection status unavailable for watermark age; reporting zero age"
+                    );
+                    None
+                }
             };
             last_success_at_ms.map_or(0.0, |last_success_at_ms| {
                 let now_ms = chrono::Utc::now().timestamp_millis();

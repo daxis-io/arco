@@ -13,8 +13,9 @@ proceed to `FINALIZING` / `VISIBLE`.
 - Restore commands report a failure category of `CAS_LOST`,
   `PARTICIPANT_FAILED`, or `STORAGE_UNCERTAIN` (`RestoreFailureCategory`).
 - A control-store participant reports plan/visible mismatches such as
-  `visible restore transaction checksum mismatch` or
-  `visible restore manifest checksum mismatch`
+  `visible restore manifest checksum mismatch`,
+  `visible restore candidate pointer digest mismatch`, or
+  `visible restore transaction does not match planned restore metadata`
   (`ControlMvpRestoreParticipant` in
   `crates/arco-catalog/src/state_store/control_mvp.rs`).
 
@@ -54,9 +55,15 @@ visible bytes match the plan.
      restore must re-render from its pinned base or be abandoned;
    - artifacts absent: the participant never became durable and can be
      re-applied from the plan.
-4. `ControlMvpRestorePlan::validate` fails closed on any scope/checksum/shape
-   inconsistency (`invalid Control MVP restore plan`) — a plan that no longer
-   validates must not be re-applied.
+4. The restore participant validates every plan it loads (restore-plan
+   format 6 with its pinned `observed_writer_epoch` and checkpoint interval,
+   scope, checksums, and shape) and fails closed with
+   `invalid Control MVP restore plan` before touching storage — a plan that no
+   longer validates must not be re-applied. Retired v1/v2 plans are
+   supersession-only, and a plan that references a non-`control/v1` authority
+   layout (including the retired format-4 to format-6 layouts; only on-disk
+   authority format 7 is readable) returns `UnsupportedAuthorityFormat` with
+   hard-cut recovery direction.
 
 ## Remediation
 
@@ -81,9 +88,13 @@ visible bytes match the plan.
 
 ## Current Wiring Status
 
-Honest status as of 2026-07-30 (program audit): the restore machinery
-(Phase 7C/7D) is implemented and heavily tested but hermetic — there is no
-production restore command, operator surface, or scheduled recovery job, and
-no restore metric or alert. This runbook describes code behavior exercised by
+Status as of 2026-09-23: the restore machinery (Phase 7C/7D) is implemented
+and heavily tested but still has no production restore command, operator
+route, scheduled recovery job, restore metric, or alert; the scheduled
+`arco-control-store-worker` job runs projection drain, layout maintenance,
+and GC only, never restore. The control store it restores into is
+route-wired for one exact root behind `ARCO_CATALOG_CONTROL_V1_*`, legacy by
+default, not provider-qualified, and not authoritative on any deployed root.
+This runbook describes code behavior exercised by
 `crates/arco-catalog/tests/workspace_snapshot_restore.rs` and is the intended
 procedure once the operator surface lands.

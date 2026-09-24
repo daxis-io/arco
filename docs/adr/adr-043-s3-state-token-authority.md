@@ -154,7 +154,8 @@ reference; mutation and outbox payloads live only in the Arrow segment.
 Indexes bind the segment checksum and record key bounds, actual Arrow
 record-batch offsets, Bloom data, and row counts.
 
-The current v4 kernel validates ordered L1 shard bounds, consults checksummed
+The current kernel (fourth revision, on-disk authority format 7) validates
+ordered L1 shard bounds, consults checksummed
 index ranges and Bloom data before Arrow fetches, and pins scan continuations
 to an exact authority manifest. JSON artifacts and decoded pages are bounded.
 Logical commits durably request layout maintenance at 16 reachable L0 segments
@@ -181,6 +182,9 @@ throughput, corruption, recovery, retention, and maintenance gates.
 The provider adapters use a distinct single-attempt client for conditional
 writes so ambiguous transport failures reach the kernel's reconciliation path,
 while safe reads and legacy operations retain the upstream bounded retry policy.
+As of 2026-09-23 a scheduled control-store worker job (projection drain, layout
+maintenance, GC) and the state-store metric emitters exist, while provider
+queue delivery and always-on wake remain cutover requirements.
 Any future provider-internal conditional retry mode, plus the deployed HTTP
 error-envelope behavior for the new kernel errors, must be qualified during
 route cutover; repository-only mappings and tests do not establish live

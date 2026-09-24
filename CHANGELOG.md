@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 6A path-governance metadata domain with canonical ancestor/descendant predicate model and deny-closed compiled-state readiness helpers (#318).
 - External location and workspace/metastore binding metadata domains with atomic companion-path declarations and secret-free credential references (#320).
 - Workspace snapshot export, roll-forward restore with REPAIR_REQUIRED journaling, and durable control-plane transaction handles with review-token workflow (#322).
+- State-store metric emitters for the `arco_state_store_cas_publish_*`, replay, read-integrity, and projection-watermark series, plus new `arco_state_store_maintenance_backpressure_total`, `arco_state_store_ambiguous_outcomes_total`, and `arco_state_store_l0_segments`.
+- Scheduled `arco-control-store-worker` Cloud Run job that runs the catalog projection drain, durable layout maintenance, and conservative GC for the `catalog` and `projection-outbox-acks` domains under the API service account (`docs/runbooks/control-store-worker.md`).
 
-All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: crate-private with zero production callers, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
+All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: the `control/v1` catalog authority is route-wired for exactly one root configured through `ARCO_CATALOG_CONTROL_V1_*` (default-disabled; every other root stays legacy), it is not authoritative on any deployed root, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
 
 ### Changed
 - **Breaking for Rust 0.3.0:** moved the published
@@ -24,6 +26,15 @@ All state-store program surfaces above are landed with CI-run test suites but ar
   custom adapters must depend on `arco-storage-object-store` and provide an
   explicit single-attempt conditional-write client.
 - deps(rust): bumped `serde_with` from 3.16.1 to 3.21.0 (#321).
+
+### Fixed
+- Writer-authority claims are fenced by claim id, so an ambiguous claim adopts only its exact claimed bytes.
+- Catalog operation ids are family-qualified, so operations of different families can no longer share an id.
+- Range-empty assertions ignore tombstoned rows, so a range holding only deletions counts as empty.
+- Head-pin conflicts on control-bound catalog routes are retried within the conflict budget and return `Retry-After` on exhaustion.
+- Projection drains are coalesced and acknowledgements retried, so overlapping wakes share one drain instead of duplicating or dropping work.
+- A terminal projection quarantine status is sticky and cannot be reopened by a later status update.
+- The Terraform sole-writer IAM grant (`api_write_state_store`) is conditioned on the `control/` prefix the kernel writes instead of the unused `state-store/` prefix.
 
 ## [0.2.1] - 2026-06-27
 ### Added

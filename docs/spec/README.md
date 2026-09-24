@@ -41,8 +41,9 @@ decisions, and future conformance-test surfaces.
 
 - The implemented baseline remains ledger append -> synchronous compaction ->
   immutable manifest snapshot -> pointer CAS.
-- The control-store path is prototype-approved only, not accepted production
-  architecture.
+- The control-store path is accepted by ADR-043 as the target `control/v1`
+  authority; it is not yet provider-qualified or authoritative on any deployed
+  root.
 - Public/API exposure decisions are unresolved unless a spec explicitly states a
   current decision.
 - Follow-up ADRs are still required before Phase 0 is complete.

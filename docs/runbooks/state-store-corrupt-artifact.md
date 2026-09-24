@@ -2,7 +2,7 @@
 
 Failure state (Tier-1 control-store strategy, 2026-06-25, Failure States
 table): "segment corruption detected — fail closed for control reads; repair
-from txlog/checkpoint/archive."
+from [transaction log]/checkpoint/archive."
 
 ## Symptoms
 
@@ -27,22 +27,27 @@ current base first.
 ## Detection
 
 - Alert: `ArcoControlStoreReadIntegrityFailures`
-  (`infra/monitoring/alerts.yaml`, group `arco.state_store`; metric reserved,
-  no emitter yet).
-- Client-visible fallout rolls up into `ArcoApiErrorRateHigh` once the control
-  store has API callers.
+  (`infra/monitoring/alerts.yaml`, group `arco.state_store`; the
+  `arco_state_store_read_integrity_failures_total` emitter exists as of
+  2026-09-23).
+- Client-visible fallout rolls up into `ArcoApiErrorRateHigh` on any root bound
+  to the control authority.
 
 ## Diagnosis
 
 The integrity chain, validated on every read
-(`load_pointer` -> `load_manifest_for_pointer` -> `replay_manifest` ->
-`load_tx`):
+(`load_pointer` -> `load_manifest_for_pointer` -> `replay_manifest`, which
+loads the `base_states` L1 segments through their checksummed indexes and then
+each `tx_refs` transaction via `load_tx`); all paths below are relative to
+`tenant={tenant}/workspace={workspace}/control/v1/domains/{domain}/`:
 
 ```
-current.pointer.json
+head/current.json
   └─ manifest_id + manifest_checksum_sha256
        └─ manifests/{manifest_id}.json
-            ├─ tx_refs[]: tx_id + checksum_sha256   (each txlog object)
+            ├─ base_states[]: L1 segment refs      (segments/l1/{id}.arrow + indexes/{id}.idx)
+            ├─ tx_refs[]: tx_id + checksum_sha256   (transactions/{tx_id}.json, each naming
+            │                                        its segments/l0/{id}.arrow + indexes/{id}.idx)
             └─ state_checksum_sha256                (post-replay state)
 ```
 
@@ -51,13 +56,16 @@ Steps:
 1. Fetch the pointer and verify the manifest hash yourself:
 
    ```bash
-   BASE="gs://${BUCKET}/tenant=${TENANT}/workspace=${WORKSPACE}/state-store/control-mvp/${DOMAIN}"
-   gcloud storage cat "${BASE}/current.pointer.json" | jq
+   BASE="gs://${BUCKET}/tenant=${TENANT}/workspace=${WORKSPACE}/control/v1/domains/${DOMAIN}"
+   gcloud storage cat "${BASE}/head/current.json" | jq
    gcloud storage cat "${BASE}/manifests/${MANIFEST_ID}.json" | shasum -a 256
    ```
 
-2. Walk `tx_refs` and hash each `txlog/{tx_id}.json`, comparing against the
-   recorded `checksum_sha256`, to locate the first broken link.
+2. Walk `tx_refs` and hash each `transactions/{tx_id}.json`, comparing against
+   the recorded `checksum_sha256`, to locate the first broken link. Segment
+   bytes are bound by the checksum in their `indexes/{id}.idx` sidecar and the
+   Arrow footer, so hash those the same way for any segment named by a
+   transaction or `base_states` entry.
 3. Classify the break:
    - one transaction object corrupt: manifest and pointer are fine; state is
      unreconstructable only from that manifest chain;
@@ -68,7 +76,8 @@ Steps:
      affected; current reads keep working.
 4. Check object generation history and audit logs for the corrupt object to
    find what wrote it. Given immutable-create preconditions
-   (`DoesNotExist`) on txlog/manifest/checkpoint objects, corruption implies
+   (`DoesNotExist`) on transaction/segment/index/manifest/checkpoint objects,
+   corruption implies
    out-of-band mutation, storage-layer fault, or a torn client — all
    reportable incidents.
 5. For the general storage-side procedure (listing, hashing, quarantine), the
@@ -95,9 +104,14 @@ Recovery is roll-forward from verified artifacts; never patch bytes in place.
 
 ## Current Wiring Status
 
-Honest status as of 2026-07-30 (program audit): the fail-closed validation
-described here is implemented and adversarially tested (field-by-field JSON
-corruption rejection in `crates/arco-catalog/tests/state_store_control_mvp.rs`),
-but the store has no production callers, the integrity-failure metric has no
-emitter, and there is no automated repair — the restore path exists in code
-(Phase 7) yet is likewise hermetic.
+Status as of 2026-09-23: the fail-closed validation described here is
+implemented and adversarially tested (field-by-field JSON corruption rejection
+in `crates/arco-catalog/tests/state_store_control_mvp.rs`, checksum-bound Arrow
+footers and index bounds for segments). The control store is route-wired for
+one exact root behind `ARCO_CATALOG_CONTROL_V1_*` (legacy for every other
+root), is not provider-qualified, and is not authoritative on any deployed
+root. The `arco_state_store_read_integrity_failures_total` emitter exists as
+of 2026-09-23. There is still no automated repair: the restore participant
+runs only when an operator drives a workspace restore, and no restore
+operator route exists; the scheduled `arco-control-store-worker` job runs
+projection drain, layout maintenance, and GC only.

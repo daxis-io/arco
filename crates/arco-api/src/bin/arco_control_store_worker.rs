@@ -720,7 +720,7 @@ async fn recover_selected_job(
         job_id = job_id.as_str(),
         age_ms,
         expired,
-        "replaying persisted maintenance job activation"
+        "resuming persisted maintenance job"
     );
     // A job whose activation completed resumes directly. `resume_at` observes a
     // Publishing/Published attempt without re-checking source compatibility,

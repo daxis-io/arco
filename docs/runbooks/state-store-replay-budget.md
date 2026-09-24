@@ -32,8 +32,9 @@ The corresponding promotion-gate measurements are
 
 ## Diagnosis
 
-Grounding: `crates/arco-catalog/src/state_store/control_mvp.rs`.
-`replay_manifest` loads the manifest's `base_states` (consolidated L1
+Code reference (internal, not operator-callable): `replay_manifest` in
+`crates/arco-catalog/src/state_store/control_mvp.rs`. It loads the
+manifest's `base_states` (consolidated L1
 segments, verified through their checksummed indexes), then loads and applies
 **every** `tx_refs` entry in the L0 suffix, and verifies the result against
 `manifest.state_checksum_sha256`. Replay is therefore bounded by layout

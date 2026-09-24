@@ -45,8 +45,8 @@ Two different fencing regimes exist today:
    (`infra/terraform/iam_conditions.tf`, `api_write_state_store`: only the API
    service account can write `control/`), the exact-version CAS precondition
    on `head/current.json`, and the `writer_epoch` carried in the head and manifest.
-   Publication requires the held epoch to equal the published one
-   (`validate_publication_epoch`): a lower epoch fails closed with
+   Publication requires the held epoch to equal the published one (internal
+   check `validate_publication_epoch`): a lower epoch fails closed with
    `CatalogError::StaleWriterEpoch`, and a higher, never-claimed epoch fails
    with `PreconditionFailed`. Only
    `ControlMvpStateStore::claim_writer_authority` advances the epoch, through

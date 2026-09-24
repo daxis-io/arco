@@ -33,9 +33,9 @@ Grounding: `crates/arco-catalog/src/state_store/control_mvp.rs`.
 - A `StateToken` is `{ scope, logical_sequence, authority_manifest_id }`,
   issued by `current_state_token()` and returned from every commit as
   `CommitOutcome::state_token`. `ArcoStateReader::read_at` resolves it by
-  loading the named manifest (`load_state_at_token`), verifying the sequence
-  matches, then replaying the manifest's L1 anchors and transaction suffix
-  with full checksum validation.
+  loading the named manifest (internally `load_state_at_token`), verifying
+  the sequence matches, then replaying the manifest's L1 anchors and
+  transaction suffix with full checksum validation.
 - A `CheckpointToken` is `{ scope, checkpoint_id }`. `read_checkpoint` loads
   the immutable checkpoint object, then the manifest it names, verified
   against `checkpoint.manifest_checksum_sha256`.

@@ -27,8 +27,9 @@ cleanup; caller retries on new head."
 
 ## Diagnosis
 
-Grounding: `crates/arco-catalog/src/state_store/control_mvp.rs`,
-`ControlMvpTxn::commit_inner`. The publish protocol is:
+Code reference (internal, not operator-callable): `ControlMvpTxn::commit_inner`
+in `crates/arco-catalog/src/state_store/control_mvp.rs`. The publish protocol
+is:
 
 1. write the immutable transaction object (`transactions/{tx_id}.json`,
    precondition `DoesNotExist`);
@@ -38,7 +39,8 @@ Grounding: `crates/arco-catalog/src/state_store/control_mvp.rs`,
    `indexes/{id}.idx`, create-if-absent, byte-identical collisions tolerated);
 3. write the immutable manifest object (`manifests/{manifest_id}.json`,
    precondition `DoesNotExist`);
-4. CAS-overwrite `head/current.json` — the only mutable object — with
+4. CAS-overwrite `head/current.json` — the only mutable authority object —
+   with
    precondition `MatchesVersion(base head version)` (or `DoesNotExist` for the
    first commit). A precondition failure is the CAS loss.
 
@@ -53,8 +55,8 @@ Steps:
    ```
 
 2. Occasional CAS losses under concurrency are expected behavior: the losing
-   writer must retry from `begin_control_txn`, which reloads the pointer and
-   replays the new head (`load_current_base_state`).
+   writer must retry from `begin_control_txn`, which reloads the head and
+   replays the new base (internally `load_current_base_state`).
 3. A sustained failure rate means a competing writer is publishing against the
    same domain. Verify the sole-writer assumption: only the API service account
    holds write authority under `control/`

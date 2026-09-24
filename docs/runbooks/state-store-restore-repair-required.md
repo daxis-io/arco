@@ -48,7 +48,7 @@ visible bytes match the plan.
 3. For a control-store participant, compare plan vs visible artifacts. The
    plan pins `transaction_sha256`, `candidate_manifest_sha256`, and
    `candidate_pointer_sha256` (`ControlMvpRestorePlan`); inspection
-   (`inspect_visible_restore`) hashes what is actually visible:
+   (internal `inspect_visible_restore`) hashes what is actually visible:
    - visible bytes match the plan: the participant's work is durably applied
      and repair can mark it complete;
    - visible bytes differ: the artifacts belong to some other lineage — the
@@ -56,14 +56,18 @@ visible bytes match the plan.
    - artifacts absent: the participant never became durable and can be
      re-applied from the plan.
 4. The restore participant validates every plan it loads (restore-plan
-   format 6 with its pinned `observed_writer_epoch` and checkpoint interval,
+   version 6 with its pinned `observed_writer_epoch` and checkpoint interval,
    scope, checksums, and shape) and fails closed with
    `invalid Control MVP restore plan` before touching storage — a plan that no
-   longer validates must not be re-applied. Retired v1/v2 plans are
-   supersession-only, and a plan that references a non-`control/v1` authority
-   layout (including the retired format-4 to format-6 layouts; only on-disk
-   authority format 7 is readable) returns `UnsupportedAuthorityFormat` with
-   hard-cut recovery direction.
+   longer validates must not be re-applied. Restore-plan versions 1 through 5
+   are supersession-only: a version-6 plan may supersede them, but they are
+   never re-applied. A plan whose authority reference does not have the
+   canonical `control/v1` manifest and checkpoint path shape returns
+   `UnsupportedAuthorityFormat` with hard-cut recovery direction; separately,
+   the head and manifest validators fail closed on any `format_version` other
+   than the current on-disk authority format 7, and retained-token reads
+   accept formats 7 and 8 only (8 being the synthetic authority-8 bounded
+   roots that exist under test-utils).
 
 ## Remediation
 

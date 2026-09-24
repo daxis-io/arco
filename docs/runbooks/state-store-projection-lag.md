@@ -51,8 +51,11 @@ Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
    and note `logical_sequence`.
 2. Determine the projected watermark: query
    `system.catalog.projection_status` (built from
-   `CatalogProjectionMaterializer::status`, `crates/arco-api/src/system_tables.rs`),
-   or read the consumer's ack watermark in the separate acknowledgement root
+   `ProjectionOutboxAckWriter::projection_status` and
+   `ProjectionOutboxWorker::backlog`, `crates/arco-api/src/system_tables.rs`;
+   `CatalogProjectionMaterializer::status` reads the same durable status and
+   is what the worker job logs), or read the consumer's ack watermark in the
+   separate acknowledgement root
    (`control/v1/domains/projection-outbox-acks/head/current.json` under the
    same workspace prefix).
 3. Classify:

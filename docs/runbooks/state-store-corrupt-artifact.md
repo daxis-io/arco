@@ -2,7 +2,8 @@
 
 Failure state (Tier-1 control-store strategy, 2026-06-25, Failure States
 table): "segment corruption detected — fail closed for control reads; repair
-from [transaction log]/checkpoint/archive."
+from txlog/checkpoint/archive." The quote predates the `transactions/` object
+naming; its `txlog` means the immutable transaction objects.
 
 ## Symptoms
 
@@ -35,10 +36,11 @@ current base first.
 
 ## Diagnosis
 
-The integrity chain, validated on every read
-(`load_pointer` -> `load_manifest_for_pointer` -> `replay_manifest`, which
-loads the `base_states` L1 segments through their checksummed indexes and then
-each `tx_refs` transaction via `load_tx`); all paths below are relative to
+The integrity chain, validated on every read (internal code path, not
+operator-callable: `load_pointer` -> `load_manifest_for_pointer` ->
+`replay_manifest`, which loads the `base_states` L1 segments through their
+checksummed indexes and then each `tx_refs` transaction via `load_tx`); all
+paths below are relative to
 `tenant={tenant}/workspace={workspace}/control/v1/domains/{domain}/`:
 
 ```

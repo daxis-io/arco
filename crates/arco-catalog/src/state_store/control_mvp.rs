@@ -8971,6 +8971,10 @@ mod tests {
         let candidate = first.candidate_manifest_id().to_owned();
         backend.lose_head_response.store(true, Ordering::SeqCst);
         let _ = first.commit_v2().await;
+        assert!(
+            !backend.lose_head_response.load(Ordering::SeqCst),
+            "the lost head response must fire"
+        );
         assert_eq!(backend.head_puts.load(Ordering::SeqCst), 1);
         bounded_fault_txn(&store, "second")
             .await
@@ -10855,6 +10859,10 @@ mod tests {
             let result = worker
                 .collect_gc_at(Utc::now() + ChronoDuration::days(8), Vec::new())
                 .await;
+            assert!(
+                !backend.lose_head_response.load(Ordering::SeqCst),
+                "the lost fence response must fire (fail_readback={fail_readback})"
+            );
             assert_eq!(result.is_err(), fail_readback);
             assert_eq!(
                 storage.head_raw(&orphan).await.unwrap().is_some(),
@@ -11285,6 +11293,10 @@ mod tests {
             .checkpoint(CheckpointOptions::default())
             .await
             .unwrap();
+        assert!(
+            !backend.lose_checkpoint_response.load(Ordering::SeqCst),
+            "the lost checkpoint response must fire"
+        );
         store.read_checkpoint(token).await.unwrap();
         let epoch: serde_json::Value = serde_json::from_slice(
             &storage

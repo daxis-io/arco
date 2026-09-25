@@ -355,7 +355,7 @@ verification.
 ## Design assessment
 
 **Root cause 1: retention policy, not physical format.** The capacity design
-(`docs/plans/2026-09-12-state-store-capacity-design.md`) rejected expiring or
+(`../plans/2026-09-12-state-store-capacity-design.md`) rejected expiring or
 externalising receipts and audits on the grounds that it changes restore and
 retained-read semantics and needs an atomic reachability protocol. Neither
 holds: idempotency receipts are contractually a bounded window (the API layer

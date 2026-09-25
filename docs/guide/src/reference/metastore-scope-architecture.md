@@ -134,10 +134,10 @@ tenant={tenant}/identity/
 ```
 
 Identity storage and its event envelope are not enabled by the prefix type.
-The persisted authority scope is now versioned and carries root kind, but the
-`control/v1` kernel still accepts only workspace physical roots. Metastore-scoped
+The persisted authority scope is now versioned and carries root kind, and the
+`control/v1` kernel now also accepts non-workspace physical roots. Metastore-scoped
 storage can already construct a prefix while retaining a separate request
-workspace; it is not yet a supported `control/v1` root. The first ADR-043 pilot
+workspace; it is now a supported `control/v1` root. The first ADR-043 pilot
 uses `metastore_id = workspace_id` and preserves that workspace layout.
 
 ### Rust API migration for the root storage seam

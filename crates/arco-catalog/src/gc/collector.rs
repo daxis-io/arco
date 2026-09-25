@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use arco_core::lock::DistributedLock;
 use arco_core::scoped_storage::ScopedStorage;
-use arco_core::{CatalogDomain, CatalogPaths};
+use arco_core::{CatalogDomain, CatalogPaths, RootStorage};
 
 use crate::error::{CatalogError, Result};
 use crate::gc::RetentionPolicy;
@@ -162,18 +162,21 @@ impl GarbageCollector {
     /// Returns an error if critical operations fail. Non-fatal errors are
     /// collected in the result's `errors` field without aborting the run.
     pub async fn collect(&self) -> Result<GcResult> {
-        let mut guard =
-            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
-                .acquire_with_operation(
-                    RETENTION_GC_LOCK_TTL,
-                    RETENTION_GC_LOCK_MAX_RETRIES,
-                    Some("catalog-gc".to_string()),
-                )
-                .await
-                .map_err(CatalogError::from)?;
+        // The legacy catalog collector stays workspace-scoped for its artifact
+        // layout, but retention coordination is root-aware. Hand the shared
+        // epoch/lock the exact root once, at the boundary.
+        let retention = RootStorage::from(self.storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire_with_operation(
+                RETENTION_GC_LOCK_TTL,
+                RETENTION_GC_LOCK_MAX_RETRIES,
+                Some("catalog-gc".to_string()),
+            )
+            .await
+            .map_err(CatalogError::from)?;
         let operation_id = guard.holder_id().to_string();
         let mut epoch = match RetentionMutationEpoch::claim(
-            self.storage.clone(),
+            retention,
             &mut guard,
             RetentionMutationKind::CatalogGc,
             operation_id,
@@ -653,9 +656,9 @@ impl GarbageCollector {
     // =========================================================================
 
     async fn load_protection_set(&self, now: DateTime<Utc>) -> Result<ProtectionSet> {
+        let retention = RootStorage::from(self.storage.clone());
         let current_heads = self.get_referenced_snapshots().await?.into_iter().collect();
-        let mut pin_objects = self
-            .storage
+        let mut pin_objects = retention
             .list_meta("retention/pins/")
             .await
             .map_err(|error| CatalogError::Storage {
@@ -677,7 +680,7 @@ impl GarbageCollector {
                     message: "retention pin selector path is not canonical".to_string(),
                 });
             };
-            selected_pins.push(load_selected_retention_pin(&self.storage, pin_id).await?);
+            selected_pins.push(load_selected_retention_pin(&retention, pin_id).await?);
         }
 
         // No retained target is read until every selected pin has passed full
@@ -695,12 +698,12 @@ impl GarbageCollector {
             match &target {
                 RetentionTarget::Snapshot(snapshot_id) => {
                     let snapshot_path = snapshot_record_path(snapshot_id)?;
-                    let bytes = self.storage.get_raw(&snapshot_path).await?;
+                    let bytes = retention.get_raw(&snapshot_path).await?;
                     snapshots.push(decode_workspace_snapshot(&bytes)?);
                 }
                 RetentionTarget::Export(export_id) => {
                     let export_path = export_record_path(export_id)?;
-                    let bytes = self.storage.get_raw(&export_path).await?;
+                    let bytes = retention.get_raw(&export_path).await?;
                     exports.push(decode_export_manifest(&bytes)?);
                 }
                 RetentionTarget::Maintenance(id) => {
@@ -708,9 +711,7 @@ impl GarbageCollector {
                     // each complete control closure, then discard it before the next
                     // job. Control GC separately streams these roots over its page.
                     crate::state_store::control_mvp::maintenance::retention_root(
-                        &self.storage,
-                        id,
-                        selected,
+                        &retention, id, selected,
                     )
                     .await?;
                 }
@@ -1332,9 +1333,12 @@ mod tests {
             .unwrap()
             .strip_suffix("/latest.json")
             .unwrap();
-        let pin = load_selected_retention_pin(&storage, pin_id).await.unwrap();
+        let retention = RootStorage::from(storage.clone());
+        let pin = load_selected_retention_pin(&retention, pin_id)
+            .await
+            .unwrap();
         let root = crate::state_store::control_mvp::maintenance::retention_root(
-            &storage,
+            &retention,
             pin.latest_revision().unwrap().target().id(),
             &pin,
         )
@@ -2261,13 +2265,14 @@ mod tests {
         assert!(candidates.contains(&old_dir));
 
         move_current_catalog_head_to_version_one(&storage).await;
-        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
+        let retention = RootStorage::from(storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
             .acquire(RETENTION_GC_LOCK_TTL, 1)
             .await
             .expect("retention coordination");
         let operation_id = guard.holder_id().to_string();
         let mut epoch = RetentionMutationEpoch::claim(
-            storage.clone(),
+            retention,
             &mut guard,
             RetentionMutationKind::CatalogGc,
             operation_id,

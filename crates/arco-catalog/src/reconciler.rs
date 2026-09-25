@@ -22,7 +22,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use arco_core::lock::DistributedLock;
-use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
+use arco_core::{CatalogDomain, CatalogPaths, RootStorage, ScopedStorage};
 use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -514,18 +514,18 @@ impl Reconciler {
         // Coordinated deletion: the same distributed lock and durable mutation
         // epoch that `GarbageCollector::collect` takes, so repair can never
         // race a retained-root publication or a concurrent GC pass.
-        let mut guard =
-            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
-                .acquire_with_operation(
-                    RETENTION_GC_LOCK_TTL,
-                    RETENTION_GC_LOCK_MAX_RETRIES,
-                    Some("catalog-reconciler-repair".to_string()),
-                )
-                .await
-                .map_err(CatalogError::from)?;
+        let retention = RootStorage::from(self.storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire_with_operation(
+                RETENTION_GC_LOCK_TTL,
+                RETENTION_GC_LOCK_MAX_RETRIES,
+                Some("catalog-reconciler-repair".to_string()),
+            )
+            .await
+            .map_err(CatalogError::from)?;
         let operation_id = guard.holder_id().to_string();
         let mut epoch = match RetentionMutationEpoch::claim(
-            self.storage.clone(),
+            retention,
             &mut guard,
             RetentionMutationKind::CatalogRepair,
             operation_id,
@@ -2127,12 +2127,15 @@ mod tests {
 
         // A holder claims the epoch and dies: the handle goes away without
         // settling, exactly as a process crash leaves the durable record.
-        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
-            .acquire(RETENTION_GC_LOCK_TTL, 1)
-            .await
-            .expect("retention lock");
+        let mut guard = DistributedLock::new(
+            Arc::new(RootStorage::from(storage.clone())),
+            RETENTION_GC_LOCK_PATH,
+        )
+        .acquire(RETENTION_GC_LOCK_TTL, 1)
+        .await
+        .expect("retention lock");
         let _dead_holder_epoch = RetentionMutationEpoch::claim(
-            storage.clone(),
+            RootStorage::from(storage.clone()),
             &mut guard,
             RetentionMutationKind::WorkspaceSnapshotFinalize,
             TEST_SNAPSHOT_ID,
@@ -2155,7 +2158,7 @@ mod tests {
         );
 
         let recovered = crate::retention_coordination::recover_stale_retention_epoch(
-            &storage,
+            &RootStorage::from(storage.clone()),
             "holder dead; no publication mutations were issued in incident 4711",
         )
         .await
@@ -2207,12 +2210,15 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         // Leave a foreign epoch in flight (a crashed snapshot finalize).
-        let mut guard = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
-            .acquire(RETENTION_GC_LOCK_TTL, 1)
-            .await
-            .expect("retention lock");
+        let mut guard = DistributedLock::new(
+            Arc::new(RootStorage::from(storage.clone())),
+            RETENTION_GC_LOCK_PATH,
+        )
+        .acquire(RETENTION_GC_LOCK_TTL, 1)
+        .await
+        .expect("retention lock");
         let _in_flight = RetentionMutationEpoch::claim(
-            storage.clone(),
+            RootStorage::from(storage.clone()),
             &mut guard,
             RetentionMutationKind::WorkspaceSnapshotFinalize,
             TEST_SNAPSHOT_ID,

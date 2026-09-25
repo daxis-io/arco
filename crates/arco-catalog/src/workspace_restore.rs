@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arco_core::ScopedStorage;
 use arco_core::lock::{DistributedLock, LockGuard};
 use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::{RootStorage, ScopedStorage};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -948,20 +948,20 @@ impl WorkspaceRestoreService {
         participant_attempt: u64,
         domain: &str,
         plan_sha256: &str,
-    ) -> Result<(LockGuard<ScopedStorage>, RetentionMutationEpoch)> {
+    ) -> Result<(LockGuard<RootStorage>, RetentionMutationEpoch)> {
         let operation_id =
             restore_apply_operation_id(restore_id, participant_attempt, domain, plan_sha256);
-        let mut guard =
-            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
-                .acquire_with_operation(
-                    RETENTION_GC_LOCK_TTL,
-                    RETENTION_GC_LOCK_MAX_RETRIES,
-                    Some("workspace-restore-apply".to_string()),
-                )
-                .await
-                .map_err(CatalogError::from)?;
+        let retention = RootStorage::from(self.storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire_with_operation(
+                RETENTION_GC_LOCK_TTL,
+                RETENTION_GC_LOCK_MAX_RETRIES,
+                Some("workspace-restore-apply".to_string()),
+            )
+            .await
+            .map_err(CatalogError::from)?;
         match RetentionMutationEpoch::claim(
-            self.storage.clone(),
+            retention,
             &mut guard,
             RetentionMutationKind::WorkspaceRestoreApply,
             operation_id,
@@ -977,7 +977,7 @@ impl WorkspaceRestoreService {
     }
 
     async fn finish_apply_coordination<T>(
-        guard: LockGuard<ScopedStorage>,
+        guard: LockGuard<RootStorage>,
         epoch: RetentionMutationEpoch,
         operation: Result<T>,
     ) -> Result<T> {
@@ -1002,17 +1002,17 @@ impl WorkspaceRestoreService {
         {
             return Ok(());
         }
-        let mut guard =
-            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
-                .acquire_with_operation(
-                    RETENTION_GC_LOCK_TTL,
-                    RETENTION_GC_LOCK_MAX_RETRIES,
-                    Some("workspace-restore-recovery".to_string()),
-                )
-                .await
-                .map_err(CatalogError::from)?;
+        let retention = RootStorage::from(self.storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire_with_operation(
+                RETENTION_GC_LOCK_TTL,
+                RETENTION_GC_LOCK_MAX_RETRIES,
+                Some("workspace-restore-recovery".to_string()),
+            )
+            .await
+            .map_err(CatalogError::from)?;
         let settlement = RetentionMutationEpoch::settle_terminal_matching(
-            self.storage.clone(),
+            retention,
             &mut guard,
             RetentionMutationKind::WorkspaceRestoreApply,
             terminal_operation_ids,
@@ -1030,7 +1030,7 @@ impl WorkspaceRestoreService {
         terminal_operation_ids: &BTreeSet<String>,
     ) -> Result<bool> {
         RetentionMutationEpoch::terminal_match_is_in_flight(
-            &self.storage,
+            &RootStorage::from(self.storage.clone()),
             RetentionMutationKind::WorkspaceRestoreApply,
             terminal_operation_ids,
         )

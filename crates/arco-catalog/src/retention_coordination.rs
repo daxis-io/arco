@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use arco_core::lock::{DistributedLock, LockGuard};
-use arco_core::{ScopedStorage, WritePrecondition, WriteResult};
+use arco_core::{RootStorage, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
 use crate::workspace_snapshot::{
@@ -168,7 +168,7 @@ impl RetentionMutationEpochRecord {
 
 /// An invocation-local capability for mutations covered by one durable epoch.
 pub struct RetentionMutationEpoch {
-    storage: ScopedStorage,
+    storage: RootStorage,
     record: RetentionMutationEpochRecord,
     claimed_version: String,
     uncertain_mutation: bool,
@@ -187,8 +187,8 @@ impl RetentionMutationEpoch {
     /// `adopt_stale_reclamation_epoch`). Every other in-flight record still
     /// fails closed and requires `recover_stale_retention_epoch`.
     pub(crate) async fn claim(
-        storage: ScopedStorage,
-        guard: &mut LockGuard<ScopedStorage>,
+        storage: RootStorage,
+        guard: &mut LockGuard<RootStorage>,
         operation_kind: RetentionMutationKind,
         operation_id: impl Into<String>,
     ) -> Result<Self> {
@@ -207,8 +207,8 @@ impl RetentionMutationEpoch {
     /// operation. Replacing the epoch fences the old holder's delayed settlement;
     /// every delayed root PUT still has identical bytes and an immutable condition.
     pub(crate) async fn claim_maintenance_root(
-        storage: ScopedStorage,
-        guard: &mut LockGuard<ScopedStorage>,
+        storage: RootStorage,
+        guard: &mut LockGuard<RootStorage>,
         job_id: &str,
         execution_admission: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<Self> {
@@ -224,8 +224,8 @@ impl RetentionMutationEpoch {
     }
 
     async fn claim_inner(
-        storage: ScopedStorage,
-        guard: &mut LockGuard<ScopedStorage>,
+        storage: RootStorage,
+        guard: &mut LockGuard<RootStorage>,
         operation_kind: RetentionMutationKind,
         operation_id: String,
         replay_maintenance_root: bool,
@@ -400,7 +400,7 @@ impl RetentionMutationEpoch {
     /// Performs a stable, read-only check for the exact uncertain epoch that a
     /// workflow has independently proven terminal.
     pub(crate) async fn terminal_match_is_in_flight(
-        storage: &ScopedStorage,
+        storage: &RootStorage,
         operation_kind: RetentionMutationKind,
         terminal_operation_ids: &BTreeSet<String>,
     ) -> Result<bool> {
@@ -434,7 +434,7 @@ impl RetentionMutationEpoch {
     /// Authenticates the original activation submission before permitting exact
     /// repair after expiry. Call while holding retention coordination.
     pub(crate) async fn maintenance_root_submitted_before(
-        storage: &ScopedStorage,
+        storage: &RootStorage,
         job_id: &str,
         created_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
@@ -466,8 +466,8 @@ impl RetentionMutationEpoch {
     /// other operation remains in flight and fails closed. The caller must prove
     /// the supplied identities terminal before invoking this method.
     pub(crate) async fn settle_terminal_matching(
-        storage: ScopedStorage,
-        guard: &mut LockGuard<ScopedStorage>,
+        storage: RootStorage,
+        guard: &mut LockGuard<RootStorage>,
         operation_kind: RetentionMutationKind,
         terminal_operation_ids: &BTreeSet<String>,
     ) -> Result<bool> {
@@ -642,7 +642,7 @@ impl RetentionMutationEpoch {
 /// retention lease cannot be acquired (a live holder is still running), or when
 /// the record cannot be read or settled exactly.
 pub async fn recover_stale_retention_epoch(
-    storage: &ScopedStorage,
+    storage: &RootStorage,
     reason: &str,
 ) -> Result<Option<RecoveredRetentionEpoch>> {
     validate_override_reason(reason)?;
@@ -663,8 +663,8 @@ pub async fn recover_stale_retention_epoch(
 }
 
 async fn recover_stale_epoch_while_locked(
-    storage: &ScopedStorage,
-    guard: &LockGuard<ScopedStorage>,
+    storage: &RootStorage,
+    guard: &LockGuard<RootStorage>,
     reason: &str,
 ) -> Result<Option<RecoveredRetentionEpoch>> {
     let Some(meta) = storage.head_raw(RETENTION_MUTATION_EPOCH_PATH).await? else {
@@ -721,8 +721,8 @@ async fn recover_stale_epoch_while_locked(
 /// `STALE_RECLAMATION_EPOCH_MIN_AGE_SECS`, and the adopting caller currently
 /// owns the durable retention lease (so the recorded holder does not).
 async fn adopt_stale_reclamation_epoch(
-    storage: &ScopedStorage,
-    guard: &LockGuard<ScopedStorage>,
+    storage: &RootStorage,
+    guard: &LockGuard<RootStorage>,
     previous: &RetentionMutationEpochRecord,
     observed_version: &str,
     now: DateTime<Utc>,
@@ -763,8 +763,8 @@ async fn adopt_stale_reclamation_epoch(
 /// This is the liveness key for recovery: the lease is single-holder, so a
 /// caller that owns it has proven the epoch's recorded holder does not.
 async fn holds_live_retention_lease(
-    storage: &ScopedStorage,
-    guard: &LockGuard<ScopedStorage>,
+    storage: &RootStorage,
+    guard: &LockGuard<RootStorage>,
 ) -> Result<bool> {
     let Some(info) = DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
         .read_lock_info()
@@ -779,7 +779,7 @@ async fn holds_live_retention_lease(
 /// Rewrites one exact in-flight record to idle under CAS on its observed
 /// version, preserving the dead holder's identity in the settled record.
 async fn settle_stale_record(
-    storage: &ScopedStorage,
+    storage: &RootStorage,
     record: &RetentionMutationEpochRecord,
     observed_version: &str,
 ) -> Result<String> {
@@ -865,26 +865,28 @@ mod tests {
     use serde_json::Value;
 
     use arco_core::lock::DistributedLock;
-    use arco_core::{MemoryBackend, ScopedStorage, WritePrecondition};
+    use arco_core::{MemoryBackend, RootStorage, ScopedStorage, WritePrecondition};
 
     use super::*;
     use crate::workspace_snapshot::RETENTION_GC_LOCK_PATH;
 
     const SNAPSHOT_ID: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
-    fn storage() -> ScopedStorage {
-        ScopedStorage::new(Arc::new(MemoryBackend::default()), "tenant", "workspace")
-            .expect("scoped storage")
+    fn storage() -> RootStorage {
+        RootStorage::from(
+            ScopedStorage::new(Arc::new(MemoryBackend::default()), "tenant", "workspace")
+                .expect("scoped storage"),
+        )
     }
 
-    async fn acquire(storage: &ScopedStorage) -> LockGuard<ScopedStorage> {
+    async fn acquire(storage: &RootStorage) -> LockGuard<RootStorage> {
         DistributedLock::new(Arc::new(storage.clone()), RETENTION_GC_LOCK_PATH)
             .acquire(RETENTION_GC_LOCK_TTL, 1)
             .await
             .expect("retention lock")
     }
 
-    async fn read_epoch(storage: &ScopedStorage) -> Value {
+    async fn read_epoch(storage: &RootStorage) -> Value {
         serde_json::from_slice(
             &storage
                 .get_raw(RETENTION_MUTATION_EPOCH_PATH)
@@ -949,7 +951,8 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_borrowed_legacy_delete_prevents_settlement_after_later_success() {
         let backend = Arc::new(PausedReadbackBackend::default());
-        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let storage =
+            RootStorage::from(ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap());
         let mut guard = acquire(&storage).await;
         let mut epoch = RetentionMutationEpoch::claim(
             storage.clone(),
@@ -977,7 +980,8 @@ mod tests {
     #[tokio::test]
     async fn cancelled_immutable_precondition_readback_cannot_settle_the_epoch() {
         let backend = Arc::new(PausedReadbackBackend::default());
-        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let storage =
+            RootStorage::from(ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap());
         storage
             .put_raw(
                 "retention/exact.json",
@@ -1271,7 +1275,7 @@ mod tests {
 
     /// Seeds one in-flight record from a holder that is no longer running.
     async fn seed_dead_holder_epoch(
-        storage: &ScopedStorage,
+        storage: &RootStorage,
         operation_kind: RetentionMutationKind,
         in_flight_for: Duration,
     ) {

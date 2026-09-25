@@ -1,5 +1,7 @@
 //! Durable-maintenance planning and execution. Authority, continuation and
 //! maintenance wire versions are deliberately independent.
+use arco_core::RootStorage;
+
 use super::{
     Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
     CONTROL_MVP_FORMAT_VERSION, CatalogError, ChronoDuration, ControlMvpBlock,
@@ -11,11 +13,11 @@ use super::{
     MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS, RETENTION_GC_LOCK_MAX_RETRIES,
     RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RenderedControlMvpStateSegment, ReplayState,
     Result, RetainedAuthorityRoots, RetentionMutationEpoch, RewriteEquivalence,
-    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, ScopedStorage, Serialize,
-    Sha256, StateScope, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds,
-    cost, decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited,
-    encode_json, encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag,
-    hash_u64, integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
+    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256,
+    StateScope, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds, cost,
+    decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited, encode_json,
+    encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag, hash_u64,
+    integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
     precondition_failed, put_immutable_matching, segment_row_key_bounds_hex, sha256_hex,
     sort_segment_rows, state_segment_reference, valid_raw_digest, validate_raw_checksum,
     validation_failed,
@@ -1063,7 +1065,7 @@ fn expected_pin(
 /// here for structural consistency; it never grants an execution capability or
 /// public retained-cut authority. Workers separately require configured binding.
 pub async fn retention_root(
-    storage: &ScopedStorage,
+    storage: &RootStorage,
     target: &str,
     selected: &crate::gc::reachability::SelectedRetentionPin,
 ) -> Result<crate::gc::reachability::RetainedAuthorityRoot> {
@@ -1219,7 +1221,7 @@ impl DurableMaintenanceWorker {
     /// # Errors
     /// Rejects invalid or mismatched storage scopes.
     pub fn new(
-        storage: ScopedStorage,
+        storage: impl Into<RootStorage>,
         scope: StateScope,
         binding: DurableAuthorityBinding,
     ) -> Result<Self> {

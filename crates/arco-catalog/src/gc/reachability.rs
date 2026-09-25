@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
 
-use arco_core::ScopedStorage;
+use arco_core::RootStorage;
 
 use crate::error::{CatalogError, Result};
 use crate::state_store::PersistedAuthorityReference;
@@ -238,7 +238,7 @@ impl SelectedRetentionPin {
 
 /// Directly loads and validates one selected retention pin without listing.
 pub async fn load_selected_retention_pin(
-    storage: &ScopedStorage,
+    storage: &RootStorage,
     pin_id: &str,
 ) -> Result<SelectedRetentionPin> {
     let selector_path = pin_latest_path(pin_id)?;
@@ -299,7 +299,7 @@ pub struct RetainedAuthorityRoot {
 /// one target's authority references at a time. Mutating callers must own the
 /// durable retention epoch for the entire traversal and publication/deletion.
 pub struct RetainedAuthorityRoots<'a> {
-    storage: &'a ScopedStorage,
+    storage: &'a RootStorage,
     now: DateTime<Utc>,
     cursor: Option<String>,
     pending: VecDeque<String>,
@@ -307,7 +307,7 @@ pub struct RetainedAuthorityRoots<'a> {
 }
 
 impl<'a> RetainedAuthorityRoots<'a> {
-    pub(crate) fn new(storage: &'a ScopedStorage, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(storage: &'a RootStorage, now: DateTime<Utc>) -> Self {
         Self {
             storage,
             now,
@@ -383,11 +383,17 @@ impl<'a> RetainedAuthorityRoots<'a> {
                         return Err(validation("maintenance target dispatch mismatch"));
                     }
                 };
-                if scope.tenant_id() != self.storage.tenant_id()
-                    || scope.workspace_id() != self.storage.workspace_id()
-                {
+                // Retained snapshot/export cuts are workspace-owned records. They
+                // are only meaningful under the exact workspace root that produced
+                // them; any other root fails closed rather than aliasing a
+                // workspace-shaped record onto a metastore or identity root.
+                let storage_scope = self.storage.scope();
+                let expected_workspace = Some(scope.workspace_id());
+                let matches_workspace_root = storage_scope.workspace_id() == expected_workspace
+                    && storage_scope.tenant_id() == scope.tenant_id();
+                if !matches_workspace_root {
                     return Err(validation(
-                        "retained authority root scope does not match storage",
+                        "retained authority root scope does not match storage root",
                     ));
                 }
                 return Ok(Some(RetainedAuthorityRoot {

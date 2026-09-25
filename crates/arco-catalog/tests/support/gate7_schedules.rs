@@ -7,6 +7,7 @@ use arco_catalog::{
     ControlMvpRestoreParticipant, DurableAuthorityBinding, DurableMaintenanceWorker,
     MaintenanceStatus, RestoreAttemptIdentity, StateRestoreParticipant as _,
 };
+use arco_core::RootStorage;
 
 #[derive(serde::Serialize)]
 struct Notice {
@@ -206,9 +207,12 @@ async fn run(boundary: usize, mode: usize, fault: Fault) {
                     })
                     .await;
                     f.backend.expire_lease(&f.storage).await;
-                    recover_stale_retention_epoch(&f.storage, "Gate 7 completed remote deletion")
-                        .await
-                        .unwrap();
+                    recover_stale_retention_epoch(
+                        &RootStorage::from(f.storage.clone()),
+                        "Gate 7 completed remote deletion",
+                    )
+                    .await
+                    .unwrap();
                     assert!(f.storage.head_raw(&path).await.unwrap().is_none());
                 }
                 6..=7 => {

@@ -49,6 +49,7 @@ use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
 #[path = "support/integrity_oracle.rs"]
 mod integrity_oracle;
+use arco_core::test_inputs::FixedInputs;
 use integrity_oracle::{LogicalOracle, OracleWrite};
 
 const RETENTION_GC_LOCK_PATH: &str = "locks/workspace-retention-gc.lock.json";
@@ -1135,7 +1136,15 @@ impl RootOracle {
     }
 }
 async fn compare(reader: &dyn ArcoStateReader, expected: &Contents) {
-    for key in [b"key".as_slice(), b"a", b"b", b"c", b"receipt"] {
+    for key in [
+        b"key".as_slice(),
+        b"a",
+        b"b",
+        b"c",
+        b"receipt",
+        b"filler",
+        b"aged",
+    ] {
         assert_eq!(
             reader.get(key).await.unwrap(),
             expected.get(key).cloned(),
@@ -1149,9 +1158,204 @@ fn next_random(state: &mut u64) -> u64 {
     *state ^= *state << 17;
     *state
 }
+/// What a model run observed about retention horizons, for the reduced
+/// inline run to assert on.
+#[derive(Debug, Default)]
+struct ModelSummary {
+    horizons_published: usize,
+    tombstones_purged: u64,
+    /// A published horizon's age bound was established by an anchor that is
+    /// itself a previously published horizon manifest.
+    walked_over_horizon: bool,
+}
+
+/// Commits one tracked write, keeping the logical oracle and the expected
+/// contents in step. `value: None` deletes.
+async fn commit_tracked(
+    f: &Fixture,
+    logical: &mut LogicalOracle,
+    contents: &mut Contents,
+    key: &[u8],
+    value: Option<Bytes>,
+    expires_at_ms: Option<i64>,
+) {
+    let mut txn = f
+        .store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    match (&value, expires_at_ms) {
+        (Some(value), Some(expires_at_ms)) => txn
+            .put_with_expiry(key, value.clone(), expires_at_ms)
+            .await
+            .unwrap(),
+        (Some(value), None) => txn.put(key, value.clone()).await.unwrap(),
+        (None, _) => txn.delete(key).await.unwrap(),
+    }
+    txn.commit().await.unwrap();
+    match &value {
+        Some(value) => {
+            contents.insert(key.to_vec(), value.clone());
+        }
+        None => {
+            contents.remove(key);
+        }
+    }
+    logical.commit_writes(
+        vec![OracleWrite {
+            key: key.to_vec(),
+            value,
+            expires_at_ms,
+        }],
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+}
+
+async fn head_manifest_json(f: &Fixture, manifest_id: &str) -> Option<serde_json::Value> {
+    let bytes = f
+        .storage
+        .get_raw(&format!(
+            "control/v1/domains/catalog/manifests/{manifest_id}.json"
+        ))
+        .await
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether the head carries a layout-maintenance intent, i.e. production
+/// admission (`prepare_at`) would admit a consolidation.
+async fn head_carries_intent(f: &Fixture) -> bool {
+    let id = f
+        .store
+        .current_state_token()
+        .await
+        .unwrap()
+        .authority_manifest_id()
+        .to_string();
+    head_manifest_json(f, &id)
+        .await
+        .and_then(|doc| doc.get("payload")?.get("maintenance_intent").cloned())
+        .is_some_and(|intent| !intent.is_null())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn horizon_step(
+    f: &Fixture,
+    now: DateTime<Utc>,
+    logical: &mut LogicalOracle,
+    contents: &mut Contents,
+    tokens: &mut Vec<TokenOracle>,
+    roots: &[RootOracle],
+    checkpoints: &[CheckpointOracle],
+    summary: &mut ModelSummary,
+    trace: &Mutex<Vec<String>>,
+) {
+    // A retention horizon on the worker's schedule. Its inputs are computed
+    // by the kernel; the model independently bounds the horizon by every
+    // pin it knows about and recomputes the certificate from its own rows.
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        f.storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+        arco_catalog::DurableAuthorityBinding::new([23; 32]),
+    )
+    .unwrap()
+    .with_test_segment_sizing(2, 8 * 1024)
+    .unwrap();
+    let Some(outcome) = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .unwrap()
+    else {
+        trace
+            .lock()
+            .unwrap()
+            .push("horizon: nothing eligible".into());
+        return;
+    };
+    let manifest_id = outcome.selected_token().authority_manifest_id().to_string();
+    let doc = head_manifest_json(f, &manifest_id).await.unwrap();
+    let certificate = doc
+        .get("payload")
+        .and_then(|payload| payload.get("retention_horizon"))
+        .expect("a published horizon carries its certificate");
+    let horizon_sequence = certificate
+        .get("horizon_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap();
+    let purge_cutoff_ms = certificate
+        .get("purge_cutoff_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap();
+    assert!(purge_cutoff_ms <= now.timestamp_millis() - 60 * 60 * 1000);
+    let pinned = roots
+        .iter()
+        .filter(|root| root.active(now))
+        .map(|root| root.logical.sequence)
+        .chain(
+            checkpoints
+                .iter()
+                .filter(|checkpoint| now <= checkpoint.until)
+                .map(|checkpoint| checkpoint.logical.sequence),
+        )
+        .min();
+    assert!(
+        pinned.is_none_or(|pin| horizon_sequence <= pin),
+        "an active pin at {pinned:?} bounds the horizon {horizon_sequence}"
+    );
+    // The age bound's evidence names the anchor that established it; when
+    // that anchor is itself a published horizon, the walk crossed one.
+    let age_evidence_id = certificate
+        .get("pinned_evidence")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|evidence| {
+            evidence.iter().find(|entry| {
+                entry.get("kind").and_then(serde_json::Value::as_str) == Some("manifest_age")
+            })
+        })
+        .and_then(|entry| entry.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_owned);
+    let anchor_is_horizon = match age_evidence_id {
+        Some(id) => head_manifest_json(f, &id)
+            .await
+            .and_then(|doc| doc.get("payload")?.get("retention_horizon").cloned())
+            .is_some_and(|certificate| !certificate.is_null()),
+        None => false,
+    };
+    trace.lock().unwrap().push(format!(
+        "horizon published sequence={horizon_sequence} cutoff={purge_cutoff_ms} pinned={pinned:?} anchor_is_horizon={anchor_is_horizon}"
+    ));
+    // The oracle recomputes the certificate from its own rows; the manifest
+    // assertion at the end of the step binds it.
+    let expected = logical.horizon(purge_cutoff_ms, horizon_sequence);
+    assert!(
+        expected.expired_rows + expected.tombstones > 0,
+        "a published horizon purged something"
+    );
+    contents.retain(|key, _| logical.is_live(key));
+    summary.horizons_published += 1;
+    summary.tombstones_purged += expected.tombstones;
+    summary.walked_over_horizon |= anchor_is_horizon;
+    tokens.push(TokenOracle {
+        logical: logical.clone(),
+        token: f.store.current_state_token().await.unwrap(),
+        contents: contents.clone(),
+        until: now + chrono::Duration::days(30),
+    });
+}
+
 // Keep operation generation and oracle updates together for schedule review.
 #[allow(clippy::cognitive_complexity)]
-async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: usize) {
+#[allow(
+    clippy::future_not_send,
+    reason = "the model pins the fixture clock (thread-bound by design) so writer stamps follow simulated time"
+)]
+async fn run_model(
+    seed: u64,
+    trace: &Mutex<Vec<String>>,
+    durable: bool,
+    steps: usize,
+) -> ModelSummary {
     let mut f = Fixture::new().await;
     let orphan = f.store.paths().tx_object("model-orphan");
     f.storage
@@ -1164,6 +1368,9 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: 
         .unwrap();
     let mut random = seed;
     let mut now = f.start;
+    // Writer stamps follow the model's clock, not the wall clock, so the
+    // age-anchor chain and the retention floor see simulated time passing.
+    let mut clock = FixedInputs::at(now);
     let mut contents = Contents::from([(b"key".to_vec(), Bytes::from_static(b"value"))]);
     let mut logical = LogicalOracle::new();
     logical.commit(
@@ -1179,11 +1386,11 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: 
     }];
     let mut checkpoints: Vec<CheckpointOracle> = Vec::new();
     let mut roots: Vec<RootOracle> = Vec::new();
-    let families = if durable { 19 } else { 12 };
+    let families = if durable { 20 } else { 12 };
     assert!(steps >= families, "every family runs at least once");
     let mut counts = vec![0_u32; families];
     let mut job = None;
-    let mut forced_published = false;
+    let mut summary = ModelSummary::default();
     for step in 0..steps {
         // Each seed exercises every operation family once, then a fixed PRNG
         // drives ordering. The oracle never calls the collector's planner.
@@ -1399,6 +1606,10 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: 
             8 => {
                 now += chrono::Duration::days(11);
                 *f.backend.now.lock().unwrap() = now;
+                // Drop the old guard first: assigning over it would build the
+                // new pin and then let the old guard's drop restore its prior.
+                drop(clock);
+                clock = FixedInputs::at(now);
             }
             9 => {
                 durable_maintenance::consolidate_pending(
@@ -1436,96 +1647,75 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: 
                 );
             }
             13..=16 | 18 => {
-                durable_model_step(&f, &mut job, &mut forced_published, now, op, trace).await;
+                durable_model_step(&f, &mut job, &mut logical, &mut contents, now, op, trace).await;
             }
             12 => {
-                // A retention horizon on the worker's schedule. Its inputs are
-                // computed by the kernel; the model independently bounds the
-                // horizon by every pin it knows about and recomputes the
-                // certificate from its own rows.
-                let worker = arco_catalog::DurableMaintenanceWorker::new(
-                    f.storage.clone(),
-                    StateScope::new("tenant", "workspace", "catalog"),
-                    arco_catalog::DurableAuthorityBinding::new([23; 32]),
+                horizon_step(
+                    &f,
+                    now,
+                    &mut logical,
+                    &mut contents,
+                    &mut tokens,
+                    &roots,
+                    &checkpoints,
+                    &mut summary,
+                    trace,
                 )
-                .unwrap()
-                .with_test_segment_sizing(2, 8 * 1024)
-                .unwrap();
-                match durable_maintenance::horizon_pending(&worker, now).await {
-                    Err(arco_catalog::CatalogError::InvariantViolation { message })
-                        if forced_published
-                            && message == "invalid authenticated ancestry transition" =>
-                    {
-                        // The model's forced consolidations (test-only
-                        // admission without a parent intent) are rewrites
-                        // production never publishes. The age walk refuses
-                        // to certify a horizon across one: fail-closed is
-                        // the required outcome, not a model defect.
-                        trace.lock().unwrap().push(
-                            "horizon: fail-closed across a forced intent-less consolidation".into(),
-                        );
-                    }
-                    Err(error) => panic!("horizon model error: {error:?}"),
-                    Ok(None) => trace
-                        .lock()
-                        .unwrap()
-                        .push("horizon: nothing eligible".into()),
-                    Ok(Some(outcome)) => {
-                        let bytes = f
-                            .storage
-                            .get_raw(&format!(
-                                "control/v1/domains/catalog/manifests/{}.json",
-                                outcome.selected_token().authority_manifest_id()
-                            ))
-                            .await
-                            .unwrap();
-                        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                        let certificate = doc
-                            .get("payload")
-                            .and_then(|payload| payload.get("retention_horizon"))
-                            .expect("a published horizon carries its certificate");
-                        let horizon_sequence = certificate
-                            .get("horizon_sequence")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap();
-                        let purge_cutoff_ms = certificate
-                            .get("purge_cutoff_ms")
-                            .and_then(serde_json::Value::as_i64)
-                            .unwrap();
-                        assert!(purge_cutoff_ms <= now.timestamp_millis() - 60 * 60 * 1000);
-                        let pinned = roots
-                            .iter()
-                            .filter(|root| root.active(now))
-                            .map(|root| root.logical.sequence)
-                            .chain(
-                                checkpoints
-                                    .iter()
-                                    .filter(|checkpoint| now <= checkpoint.until)
-                                    .map(|checkpoint| checkpoint.logical.sequence),
-                            )
-                            .min();
-                        assert!(
-                            pinned.is_none_or(|pin| horizon_sequence <= pin),
-                            "an active pin at {pinned:?} bounds the horizon {horizon_sequence}"
-                        );
-                        trace.lock().unwrap().push(format!(
-                            "horizon published sequence={horizon_sequence} cutoff={purge_cutoff_ms} pinned={pinned:?}"
-                        ));
-                        // The oracle recomputes the certificate from its own
-                        // rows; the manifest assertion below binds it.
-                        let expected = logical.horizon(purge_cutoff_ms, horizon_sequence);
-                        assert!(
-                            expected.expired_rows + expected.tombstones > 0,
-                            "a published horizon purged something"
-                        );
-                        contents.retain(|key, _| logical.is_live(key));
-                        tokens.push(TokenOracle {
-                            logical: logical.clone(),
-                            token: f.store.current_state_token().await.unwrap(),
-                            contents: contents.clone(),
-                            until: now + chrono::Duration::days(30),
-                        });
-                    }
+                .await;
+            }
+            19 => {
+                // An age cycle: a tombstone and a receipt that outlives the
+                // first cycle, then 32 days pass twice. The first horizon
+                // reaches its age bound through the anchor the young filler
+                // recorded and purges the tombstone; the second reaches it
+                // through the first horizon's manifest and purges the
+                // receipt. Active pins may legitimately hold either bound.
+                let value = Bytes::from(format!("{seed}-{step}"));
+                commit_tracked(
+                    &f,
+                    &mut logical,
+                    &mut contents,
+                    b"aged",
+                    Some(value.clone()),
+                    None,
+                )
+                .await;
+                commit_tracked(&f, &mut logical, &mut contents, b"aged", None, None).await;
+                commit_tracked(
+                    &f,
+                    &mut logical,
+                    &mut contents,
+                    b"receipt",
+                    Some(value.clone()),
+                    Some((now + chrono::Duration::days(33)).timestamp_millis()),
+                )
+                .await;
+                for _ in 0..2 {
+                    now += chrono::Duration::days(32);
+                    *f.backend.now.lock().unwrap() = now;
+                    drop(clock);
+                    clock = FixedInputs::at(now);
+                    commit_tracked(
+                        &f,
+                        &mut logical,
+                        &mut contents,
+                        b"filler",
+                        Some(value.clone()),
+                        None,
+                    )
+                    .await;
+                    horizon_step(
+                        &f,
+                        now,
+                        &mut logical,
+                        &mut contents,
+                        &mut tokens,
+                        &roots,
+                        &checkpoints,
+                        &mut summary,
+                        trace,
+                    )
+                    .await;
                 }
             }
             17 => {
@@ -1696,12 +1886,15 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: 
         f.storage.head_raw(&orphan).await.unwrap().is_none(),
         "model must perform real reclamation"
     );
+    drop(clock);
+    summary
 }
 
 async fn durable_model_step(
     f: &Fixture,
     job: &mut Option<(arco_catalog::MaintenanceJobId, DateTime<Utc>)>,
-    forced_published: &mut bool,
+    logical: &mut LogicalOracle,
+    contents: &mut Contents,
     now: DateTime<Utc>,
     op: usize,
     trace: &Mutex<Vec<String>>,
@@ -1716,8 +1909,23 @@ async fn durable_model_step(
     .with_test_segment_sizing(2, 8 * 1024)
     .unwrap();
     if job.is_none() {
+        // Production admission needs the head to declare a layout-maintenance
+        // intent (16 L0 segments). Commit fillers until it does: a forced,
+        // intent-less consolidation is a rewrite the ancestry walker
+        // rejects, and production never publishes one.
+        while !head_carries_intent(f).await {
+            commit_tracked(
+                f,
+                logical,
+                contents,
+                b"filler",
+                Some(Bytes::from_static(b"filler")),
+                None,
+            )
+            .await;
+        }
         let before = f.backend.trace.lock().unwrap().len();
-        let plan = match worker.test_prepare_forced_at(now).await {
+        let plan = match worker.prepare_at(now).await {
             Ok(Some(plan)) => plan,
             Err(error @ arco_catalog::CatalogError::MaintenanceBackpressure { .. }) => {
                 assert!(
@@ -1766,11 +1974,7 @@ async fn durable_model_step(
         }
         match progress.status {
             MaintenanceStatus::Active => { worker.advance_at(id, now).await?; Ok(false) }
-            MaintenanceStatus::ReadyToPublish | MaintenanceStatus::Publishing => {
-                let published = worker.publish_at(id, now).await?.is_some();
-                *forced_published |= published;
-                Ok(published)
-            }
+            MaintenanceStatus::ReadyToPublish | MaintenanceStatus::Publishing => Ok(worker.publish_at(id, now).await?.is_some()),
             MaintenanceStatus::Published | MaintenanceStatus::Abandoned | MaintenanceStatus::Superseded => Ok(true),
             _ => panic!("unexpected durable model state: {:?}", progress.status),
         }
@@ -1815,6 +2019,11 @@ async fn durable_maintenance_model_32_seeds_of_128_operations() {
             "durable model failed seed={seed}\n{}",
             trace.lock().unwrap().join("\n")
         );
+        let summary = result.unwrap();
+        assert!(
+            summary.tombstones_purged > 0 && summary.walked_over_horizon,
+            "seed={seed}: the age cycle must purge a tombstone and walk over a horizon: {summary:?}"
+        );
     }
 }
 
@@ -1832,13 +2041,12 @@ async fn durable_maintenance_model_reduced_two_seeds_of_thirty_two_operations() 
             "reduced durable model failed seed={seed}\n{}",
             trace.lock().unwrap().join("\n")
         );
+        let summary = result.unwrap();
         assert!(
-            trace
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|line| line.starts_with("horizon published")),
-            "the reduced run must publish at least one horizon\n{}",
+            summary.horizons_published >= 2
+                && summary.tombstones_purged > 0
+                && summary.walked_over_horizon,
+            "seed={seed}: at least one horizon purged a tombstone by age and one walked over a previously published horizon: {summary:?}\n{}",
             trace.lock().unwrap().join("\n")
         );
     }
@@ -1850,7 +2058,8 @@ async fn independent_reclamation_model_32_seeds_of_64_operations() {
         let trace = Mutex::new(Vec::new());
         let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, false, 64)))
             .catch_unwind()
-            .await;
+            .await
+            .map(drop);
         assert!(
             result.is_ok(),
             "model failed seed={seed}\n{}",

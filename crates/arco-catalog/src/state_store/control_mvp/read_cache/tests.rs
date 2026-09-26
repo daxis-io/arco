@@ -1055,6 +1055,10 @@ async fn shared_work_keeps_the_initiating_phase_after_initiator_cancellation() {
 #[cfg(feature = "test-utils")]
 #[tokio::test]
 async fn long_suffix_cold_allocations_stay_within_twice_disabled() {
+    // Bytes each authority-format-9 transaction object adds to the cold cached
+    // path only: 32 JSON bytes for `"committed_at_ms":<13 digits>,`, 8 decoded
+    // and 8 in the cached clone. The direct read never loads that JSON.
+    const STAMP_BYTES_PER_TRANSACTION: u64 = 48;
     let writer = store().without_read_cache();
     seed(&writer).await;
     let key = 0_u32.to_be_bytes();
@@ -1090,13 +1094,20 @@ async fn long_suffix_cold_allocations_stay_within_twice_disabled() {
     });
     // The cold cached read does the direct read's work plus the transaction
     // metadata it retains for later hits, so only its cost tracks transaction
-    // object size (authority format 9 stamps every transaction with
-    // `committed_at_ms`; the direct path never loads that JSON). The 2x budget
-    // had 0.03% of slack on format 7, so allow 1% drift on top of it: the
-    // effective ceiling is 2.01x.
+    // object size: the 2x budget is widened by exactly the per-transaction
+    // stamp cost over the suffix it loads.
+    let suffix_len = u64::try_from(
+        writer
+            .load_manifest_for_pointer(&writer.load_pointer().await.unwrap())
+            .await
+            .unwrap()
+            .tx_refs
+            .len(),
+    )
+    .unwrap();
     assert!(
-        enabled.bytes_total <= 2 * disabled.bytes_total + disabled.bytes_total / 100,
-        "cold suffix allocations: enabled={}, disabled={}",
+        enabled.bytes_total <= 2 * disabled.bytes_total + suffix_len * STAMP_BYTES_PER_TRANSACTION,
+        "cold suffix allocations: enabled={}, disabled={}, suffix={suffix_len}",
         enabled.bytes_total,
         disabled.bytes_total
     );

@@ -197,7 +197,7 @@ impl TransactionBase {
     pub(super) async fn materialize(&self, store: &ControlMvpStateStore) -> Result<ControlMvpBase> {
         if matches!(self, Self::Bounded(_)) {
             return Err(CatalogError::UnsupportedAuthorityFormat {
-                message: "authority-8 cannot materialize format-7 state".into(),
+                message: "authority-8 cannot materialize format-9 state".into(),
             });
         }
         let (state, history_anchor, base_states, tx_refs) = match self.manifest() {

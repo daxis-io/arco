@@ -245,7 +245,7 @@ const CANONICAL_VECTORS: &str = include_str!(concat!(
 ));
 
 #[test]
-fn canonical_hashes_match_independent_binary_vectors() {
+fn canonical_hashes_match_recorded_binary_vectors() {
     let vectors: serde_json::Value = serde_json::from_str(CANONICAL_VECTORS).unwrap();
     assert_eq!(
         vectors["authority_format"].as_u64(),
@@ -481,6 +481,7 @@ fn checksummed_legacy_workspace_envelopes_remain_readable() {
 /// Rewrites one checksummed envelope so its payload carries the legacy
 /// (unversioned) workspace `StateScope` shape, re-deriving the payload checksum
 /// over the exact bytes written.
+#[cfg(feature = "test-utils")]
 fn legacy_scope_envelope(bytes: &[u8], scope: &StateScope) -> Vec<u8> {
     let envelope: ChecksumEnvelope<&RawValue> = serde_json::from_slice(bytes).unwrap();
     let versioned = serde_json::to_string(scope).unwrap();
@@ -600,7 +601,7 @@ fn control_mvp_envelope_rejects_cross_root_scope() {
 }
 
 #[tokio::test]
-async fn nonempty_physical_layouts_match_independent_vectors() {
+async fn nonempty_physical_layouts_match_recorded_vectors() {
     let (_, store) = fixture();
     let (layout, state) = nonempty_vector_layout(&store).await;
     let vectors: serde_json::Value = serde_json::from_str(CANONICAL_VECTORS).unwrap();

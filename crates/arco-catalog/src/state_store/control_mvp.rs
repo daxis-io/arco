@@ -9740,8 +9740,20 @@ mod tests {
         ));
     }
 
-    /// Authority format 9 replaces format 7 with no migration: a HEAD, manifest
-    /// envelope, or transaction envelope that still says `format_version: 7`
+    /// Rewrites the first `format_version` of a JSON artifact to the retired
+    /// format 7, leaving every other byte intact.
+    fn downgrade_format_header(bytes: &Bytes) -> Bytes {
+        let text = std::str::from_utf8(bytes).unwrap();
+        let current = format!("\"format_version\":{CONTROL_MVP_FORMAT_VERSION}");
+        assert!(
+            text.contains(&current),
+            "artifact carries the current format"
+        );
+        Bytes::from(text.replacen(&current, "\"format_version\":7", 1))
+    }
+
+    /// Authority format 9 replaces format 7 with no migration: a HEAD, manifest,
+    /// transaction, or checkpoint envelope that still says `format_version: 7`
     /// must fail closed at every load boundary, and the payload validators must
     /// refuse the retired number outright.
     #[tokio::test]
@@ -9759,11 +9771,22 @@ mod tests {
             .unwrap();
         tx.put(b"key", Bytes::from_static(b"value")).await.unwrap();
         tx.commit().await.unwrap();
+        let checkpoint_token = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let checkpoint = store.load_checkpoint(&checkpoint_token).await.unwrap();
         let mut pointer = store.load_pointer().await.unwrap();
         let manifest = store.load_manifest_for_pointer(&pointer).await.unwrap();
         let tx_ref = manifest.tx_refs.last().unwrap().clone();
 
         // Payload validators refuse the retired format number.
+        let mut stale_checkpoint = checkpoint.clone();
+        stale_checkpoint.format_version = 7;
+        assert!(matches!(
+            stale_checkpoint.validate(&store.scope, &checkpoint.checkpoint_id),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
         pointer.format_version = 7;
         assert!(matches!(
             pointer.validate(&store.scope),
@@ -9777,17 +9800,8 @@ mod tests {
         ));
 
         // A format-7 envelope header is refused before any payload is decoded.
-        let downgrade_header = |bytes: &Bytes| -> Bytes {
-            let text = std::str::from_utf8(bytes).unwrap();
-            let current = format!("\"format_version\":{CONTROL_MVP_FORMAT_VERSION}");
-            assert!(
-                text.contains(&current),
-                "artifact carries the current format"
-            );
-            Bytes::from(text.replacen(&current, "\"format_version\":7", 1))
-        };
         let tx_path = store.paths.tx_object(&tx_ref.tx_id);
-        let stale_tx = downgrade_header(&storage.get_raw(&tx_path).await.unwrap());
+        let stale_tx = downgrade_format_header(&storage.get_raw(&tx_path).await.unwrap());
         storage
             .put_raw(&tx_path, stale_tx.clone(), WritePrecondition::None)
             .await
@@ -9804,7 +9818,7 @@ mod tests {
 
         let manifest_path = store.paths.manifest_object(&manifest.manifest_id);
         let stale_manifest_bytes =
-            downgrade_header(&storage.get_raw(&manifest_path).await.unwrap());
+            downgrade_format_header(&storage.get_raw(&manifest_path).await.unwrap());
         storage
             .put_raw(
                 &manifest_path,
@@ -9823,8 +9837,21 @@ mod tests {
             Err(CatalogError::UnsupportedAuthorityFormat { .. })
         ));
 
+        let checkpoint_path = store.paths.checkpoint_object(&checkpoint.checkpoint_id);
+        let stale_checkpoint_bytes =
+            downgrade_format_header(&storage.get_raw(&checkpoint_path).await.unwrap());
+        assert!(matches!(
+            decode_envelope_limited::<ControlMvpCheckpoint>(
+                &stale_checkpoint_bytes,
+                "control-mvp-checkpoint",
+                MAX_CONTROL_JSON_BYTES,
+                "control MVP checkpoint",
+            ),
+            Err(CatalogError::UnsupportedAuthorityFormat { .. })
+        ));
+
         let head_path = store.paths.current_pointer();
-        let stale_head = downgrade_header(&storage.get_raw(&head_path).await.unwrap());
+        let stale_head = downgrade_format_header(&storage.get_raw(&head_path).await.unwrap());
         storage
             .put_raw(&head_path, stale_head, WritePrecondition::None)
             .await

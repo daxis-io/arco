@@ -2798,7 +2798,7 @@ impl ControlMvpStateStore {
         }
         let TransactionBase::Bounded(base) = &txn.base else {
             return Err(CatalogError::UnsupportedAuthorityFormat {
-                message: "bounded commit received a format-7 transaction base".into(),
+                message: "bounded commit received a format-9 transaction base".into(),
             });
         };
         base.selection().check()?;

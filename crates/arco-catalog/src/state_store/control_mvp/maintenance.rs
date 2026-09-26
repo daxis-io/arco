@@ -2211,9 +2211,16 @@ impl DurableMaintenanceWorker {
             .checked_add(1)
             .ok_or_else(|| invariant_violation("maintenance layout generation overflow"))?;
         // A pending publication must reconstruct this candidate byte for byte,
-        // so the stamp is the job-bound preparation clock, never the wall
-        // clock at publication.
-        candidate.committed_at_ms = job.descriptor.created_at.timestamp_millis();
+        // so the stamp is job-bound: the preparation clock, never the wall
+        // clock at publication. It also never runs backwards along ancestry:
+        // `created_at` can be up to 24 h older than the parent HEAD (`current`,
+        // fixed by the pending attempt's source digest) and the suffix
+        // transactions it carries, so take the later of the two.
+        candidate.committed_at_ms = job
+            .descriptor
+            .created_at
+            .timestamp_millis()
+            .max(current.committed_at_ms);
         candidate.base_states = job.pages.iter().map(|page| page.output.clone()).collect();
         candidate.anchor_states.clear();
         candidate.tx_refs = suffix;

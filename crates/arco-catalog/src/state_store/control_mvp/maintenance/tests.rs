@@ -1393,3 +1393,77 @@ async fn expired_activation_claim_is_not_prior_submission_evidence() {
             .is_none()
     );
 }
+
+/// A publication's stamp must not run backwards along the ancestry it
+/// extends: the descriptor's `created_at` can be up to 24 h older than the
+/// parent HEAD and the suffix transactions the candidate carries, so the
+/// candidate takes the later of the job clock and the parent's stamp, which
+/// is itself at least every suffix transaction's stamp.
+#[tokio::test]
+async fn publication_stamp_never_precedes_its_parent_or_suffix_transactions() {
+    let (worker, _, now) = prepared_fixture().await;
+    let store = &worker.worker.store;
+    // Prepare on a clock 12 h behind the commits this job will carry.
+    let stale = now - ChronoDuration::hours(12);
+    let plan = worker.prepare_at(stale).await.unwrap().unwrap();
+    worker.start_at(&plan, stale).await.unwrap();
+    while worker.advance_at(&plan.id, stale).await.unwrap().status
+        != MaintenanceStatus::ReadyToPublish
+    {}
+    for value in [&b"after the render cut"[..], b"newest suffix"] {
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(b"suffix", Bytes::copy_from_slice(value))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let parent = store
+        .load_manifest_for_pointer(&store.load_pointer().await.unwrap())
+        .await
+        .unwrap();
+    let mut transaction_stamps = Vec::new();
+    for reference in &parent.tx_refs {
+        transaction_stamps.push(
+            store
+                .load_tx_metadata(reference)
+                .await
+                .unwrap()
+                .committed_at_ms,
+        );
+    }
+    let newest_transaction = transaction_stamps.iter().copied().max().unwrap();
+    assert!(
+        plan.descriptor.created_at.timestamp_millis() < newest_transaction,
+        "fixture: the job must be prepared before the commits it carries"
+    );
+
+    let outcome = worker
+        .publish_at(&plan.id, stale + ChronoDuration::hours(1))
+        .await
+        .unwrap();
+    assert!(outcome.is_some(), "publication must select the candidate");
+    let published = store
+        .load_manifest_for_pointer(&store.load_pointer().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        published.base_manifest_id.as_deref(),
+        Some(parent.manifest_id.as_str())
+    );
+    assert_eq!(published.layout_generation, parent.layout_generation + 1);
+    assert!(parent.tx_refs.ends_with(&published.tx_refs));
+    assert!(
+        published.committed_at_ms >= parent.committed_at_ms,
+        "publication stamp {} precedes its parent's {}",
+        published.committed_at_ms,
+        parent.committed_at_ms
+    );
+    assert!(
+        published.committed_at_ms >= newest_transaction,
+        "publication stamp {} precedes a suffix transaction's {newest_transaction}",
+        published.committed_at_ms
+    );
+}

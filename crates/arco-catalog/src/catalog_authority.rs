@@ -1243,7 +1243,7 @@ impl ControlCatalogAuthority {
 
     /// Creates the explicit synthetic authority-8 catalog path.
     ///
-    /// Production construction remains authority 7; callers must inject the
+    /// Production construction remains authority 9; callers must inject the
     /// V2 notifier because V1 notifiers cannot consume V2 envelopes.
     ///
     /// # Errors

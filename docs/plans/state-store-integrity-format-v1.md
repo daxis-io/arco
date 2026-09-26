@@ -5,6 +5,19 @@ format 1 and continuation version 3 are unchanged. Fresh fixtures are required;
 older authority formats are rejected and older restore plans are supersession-only.
 The approved authority-6 candidate remains in the Gate 2 checkpoint archive.
 
+**Authority 9 (2026-09-26).** This document records the format-7 contract as
+Gates 3 and 4 landed it and is kept as history. Authority format 9 keeps every
+primitive, domain tag and collection rule below and frames
+`u32(authority format = 9)` in place of 7, so every digest changed. It adds
+`committed_at_ms` stamps, the segment-format-2 expiry hint (an `optional_i64`
+after each mutation entry's value, and a field of each full-state checksum
+entry), age anchors, and the `retention_horizon` certificate with a third
+ancestry transition; those are specified in
+[state-store-retention-format-v1.md](state-store-retention-format-v1.md).
+The `../reports/2026-09-06-gate3-canonical-vectors.json` vectors cited below
+describe format 7; the format-9 vectors are
+`../reports/2026-09-26-format9-canonical-vectors.json`.
+
 ## Canonical primitives
 
 All roots use SHA-256 and lowercase hexadecimal output. Encoded digests are

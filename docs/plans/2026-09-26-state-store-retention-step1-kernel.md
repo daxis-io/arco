@@ -22,7 +22,7 @@
 
 ### Task 1: bump to authority 9, stamp manifests/transactions, restore plan 7, regenerate fixtures
 
-**Files:** `crates/arco-catalog/src/state_store/control_mvp.rs` (`CONTROL_MVP_FORMAT_VERSION` :177, `RESTORE_PLAN_VERSION` :168 and the supersession `match` ~:3718-3760, `authenticated_token_format` `matches!(.., 7 | 8)` :271, `ControlMvpManifest` :6470ff, `ControlMvpTxObject` ~:6900ff, every manifest/tx render site that sets `format_version`), `control_mvp/integrity.rs` (framing binds the const automatically; docs), `control_mvp/integrity/tests.rs` (fixture and vector paths :171, :304-324, :414), `crates/arco-catalog/tests/fixtures/control_mvp_authority_v7/*` → new `control_mvp_authority_v9/*`, `docs/reports/2026-09-06-gate3-canonical-vectors.json` → new `docs/reports/2026-09-26-format9-canonical-vectors.json`, `crates/arco-catalog/tests/fixtures/control_mvp_restore_plans/*` (add a v7 current plan fixture; v2 stays), `docs/runbooks/state-store-restore-repair-required.md` (format numbers).
+**Files:** `crates/arco-catalog/src/state_store/control_mvp.rs` (`CONTROL_MVP_FORMAT_VERSION` :177, `RESTORE_PLAN_VERSION` :168 and the supersession `match` ~:3718-3760, `authenticated_token_format` `matches!(.., 7 | 8)` :271, `ControlMvpManifest` :6470ff, `ControlMvpTxObject` ~:6900ff, every manifest/tx render site that sets `format_version`), `control_mvp/integrity.rs` (framing binds the const automatically; docs), `control_mvp/integrity/tests.rs` (fixture and vector paths :171, :304-324, :414), `crates/arco-catalog/tests/fixtures/control_mvp_authority_v9/*` (new; the format-7 fixture directory is removed), `docs/reports/2026-09-06-gate3-canonical-vectors.json` → new `docs/reports/2026-09-26-format9-canonical-vectors.json`, `crates/arco-catalog/tests/fixtures/control_mvp_restore_plans/*` (add a v7 current plan fixture; v2 stays), `docs/runbooks/state-store-restore-repair-required.md` (format numbers).
 
 Steps:
 1. Failing tests first: (a) in `control_mvp.rs` tests, a head pointer, manifest and transaction envelope with `format_version: 7` must fail closed at `load_pinned_pointer`, `ControlMvpManifest::validate`, and tx metadata load with the existing mismatch errors; (b) a committed manifest and its transaction object carry `committed_at_ms` within `[staging_time, now]`; (c) a restore plan with `version: 6` decodes as supersession-only (`inspect` returns `Superseded`, `apply` refuses without writes), a `version: 7` plan applies. Run each by name; expect FAIL.
@@ -93,3 +93,57 @@ cargo clippy -p arco-catalog --features test-utils --lib --tests --benches --loc
 cargo clippy -p arco-api --all-targets --locked -- -D warnings
 cargo fmt --all -- --check && git diff --check && cargo xtask repo-hygiene-check && cargo xtask adr-check
 ```
+
+---
+
+## As implemented (2026-09-26)
+
+Packages A through D landed on this branch (bf3694da, f526db45, f0702f29,
+7e8f326a, 6484e5dc, 7c9aae9b, e8eee31e, 16587f2d, then the Package D docs
+commit). The resulting contract is `state-store-retention-format-v1.md`.
+Deviations from the plan above:
+
+- **Restore plan 7 pins the stamp.** The plan-7 wire format carries
+  `committed_at_ms` (required, positive; legacy plans must not carry it) so a
+  pending restore reconstructs its format-9 candidate bytes exactly, instead
+  of stamping at apply time. `render_restore_candidate` rejects a stamp before
+  the candidate parent.
+- **Maintenance stamps are `max(descriptor.created_at, parent stamp)`**, and
+  commit and restore stamps are `max(clock, parent stamp)`; the ancestry
+  walker rejects a child stamped before its parent. The plan only said "set
+  from the wall clock at render".
+- **Restore source scan.** `live_entries_bounded` is synchronous and serves
+  only the materialized checkpoint cut restore resolves; a manifest-backed
+  reader is an invariant violation rather than an unbounded replay. Receipts
+  are not skipped (that is design step 4); they are re-staged with their hint.
+- **Age-anchor chain instead of the per-commit walk.** Task 4's walk over
+  `base_manifest_id` cannot span 30 days at the pilot rate, so every manifest
+  carries `age_anchor` (`AgeAnchorV1`, hour buckets), the walker checks the
+  render rule as a transition invariant, and the age bound follows anchors
+  under a 1,024-hop budget plus a matching byte budget. The floor is
+  `now - 30 d - 1 h` (`CONTROL_MVP_RETENTION_CLOCK_SKEW_MS`), not
+  `now - 30 d`; the purge cutoff is `now - 1 h` as planned. The input helper
+  is `ControlMvpMaintenanceWorker::retention_horizon_inputs` in
+  `maintenance.rs`, not a method on the store.
+- **Bound-0 evidence shape.** When the chain ends above the floor the
+  certificate still cites one `manifest_age` entry, the newest manifest
+  examined, with sequence 0, so `pinned_evidence` is never empty. Evidence is
+  one entry per kind at that kind's lowest sequence, and
+  `validate_horizon_inputs` requires every cited sequence to be at or above
+  the horizon.
+- **Digest encoding of the hint.** The mutation and purged-rows digests
+  encode `expires_at_ms` as `optional_i64` (one byte 0, or 1 plus the 8-byte
+  big-endian signed value), not the `optional u64` written above, and the
+  purged-rows digest frames the row count first.
+- **Model family renumbering.** The durable model has 20 families (12 when
+  not durable): `RetentionHorizon` is family 12, family 19 runs a two-cycle
+  age scenario over 32-day jumps, and the forced, intent-less consolidations
+  are gone (the model commits tracked filler until the head carries a
+  maintenance intent, then calls `prepare_at`). Family 0 writes an expiring
+  `receipt` row, and the run pins `FixedInputs::at(now)` so stamps follow
+  model time. The reduced inline run is
+  `durable_maintenance_model_reduced_two_seeds_of_thirty_two_operations`
+  (2 seeds x 32 operations).
+- **Vectors.** `2026-09-26-format9-canonical-vectors.json` is generated by the
+  Rust implementation and is a regression pin only; independent regeneration
+  is a follow-up, as the file's header records.

@@ -101,6 +101,17 @@ Preflight requires exactly nine field nodes and the exact nine-field schema, so
 an eight-column format-1 block fails closed before decoding. Format 9 is a hard
 cut: no format-1 segment is migrated or read.
 
+The authority-9 contract this segment format belongs to (the `committed_at_ms`
+stamps, age anchors, the `retention_horizon` certificate and the horizon
+maintenance job that drops purge-eligible rows) is
+[state-store-retention-format-v1.md](state-store-retention-format-v1.md). The
+rest of this document describes format 1 as Gate 2 landed it and is kept as
+history. The 2026-09-06 canonical vectors
+(`../reports/2026-09-06-gate3-canonical-vectors.json`) describe authority
+format 7; the Bloom encoding below and its
+`../reports/2026-09-06-gate2-bloom-vectors.json` vectors are unchanged by
+format 9, since the Bloom hash covers key bytes only.
+
 ## Bloom encoding
 
 The directory persists `bloomHashVersion = 1`, mode, probe count, distinct KV-key

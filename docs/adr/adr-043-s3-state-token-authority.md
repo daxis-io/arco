@@ -80,7 +80,10 @@ This ADR fixes the following invariants.
    return `MaintenanceBackpressure` at 32 if consolidation has not completed.
    A separate worker publishes equivalent L1 state through exact CAS without
    incrementing logical sequence. Row, byte, index, or envelope overflow fails
-   before the oversized candidate is published.
+   before the oversized candidate is published. Retention-horizon maintenance
+   may likewise remove expired rows and tombstones that no retained reader
+   can observe, under a certificate bound to the parent state, without
+   advancing logical sequence.
 10. Current restore plans persist the positive checkpoint interval used to
     decide and render their replay anchor. Inspection and application use that
     durable value, not the receiving process's current configuration. Retired
@@ -154,7 +157,7 @@ reference; mutation and outbox payloads live only in the Arrow segment.
 Indexes bind the segment checksum and record key bounds, actual Arrow
 record-batch offsets, Bloom data, and row counts.
 
-The current kernel (fourth revision, on-disk authority format 7) validates
+The current kernel (fourth revision, on-disk authority format 9) validates
 ordered L1 shard bounds, consults checksummed
 index ranges and Bloom data before Arrow fetches, and pins scan continuations
 to an exact authority manifest. JSON artifacts and decoded pages are bounded.

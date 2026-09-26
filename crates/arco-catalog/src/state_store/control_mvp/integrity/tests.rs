@@ -1279,3 +1279,288 @@ async fn rendered_rewrites_reject_lost_altered_and_duplicated_rows() {
         );
     }
 }
+
+fn horizon_certificate() -> RetentionHorizonV1 {
+    RetentionHorizonV1 {
+        encoding_version: 1,
+        horizon_sequence: 7,
+        purge_cutoff_ms: 1_700_000_000_000,
+        pinned_evidence: vec![
+            PinnedSequenceV1 {
+                kind: "manifest_age".into(),
+                id: "manifest-00000000000000000009".into(),
+                sequence: 9,
+            },
+            PinnedSequenceV1 {
+                kind: "snapshot".into(),
+                id: "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                sequence: 7,
+            },
+            PinnedSequenceV1 {
+                kind: "export".into(),
+                id: "exp_01ARZ3NDEKTSV4RRFFQ69G5FAW".into(),
+                sequence: 8,
+            },
+            PinnedSequenceV1 {
+                kind: "checkpoint".into(),
+                id: "checkpoint-00000000000000000008".into(),
+                sequence: 8,
+            },
+        ],
+        parent_state_checksum_sha256: "a".repeat(64),
+        purged_rows_sha256: "b".repeat(64),
+        purged_counts: PurgedCountsV1 {
+            expired_rows: 3,
+            tombstones: 2,
+        },
+    }
+}
+
+#[test]
+fn retention_horizon_certificate_validation_is_fail_closed() {
+    let valid = horizon_certificate();
+    valid.validate(10).unwrap();
+    valid.validate(7).unwrap();
+    let mut no_evidence = valid.clone();
+    no_evidence.pinned_evidence.clear();
+    no_evidence.validate(10).unwrap();
+
+    let mut cases: Vec<(&str, RetentionHorizonV1, u64)> = Vec::new();
+    let mut forged = valid.clone();
+    forged.encoding_version = 2;
+    cases.push(("encoding version", forged, 10));
+    let mut forged = valid.clone();
+    forged.parent_state_checksum_sha256 = "A".repeat(64);
+    cases.push(("uppercase parent digest", forged, 10));
+    let mut forged = valid.clone();
+    forged.purged_rows_sha256 = "b".repeat(63);
+    cases.push(("short purged digest", forged, 10));
+    cases.push(("horizon above logical sequence", valid.clone(), 6));
+    let mut forged = valid.clone();
+    forged.purge_cutoff_ms = 0;
+    cases.push(("zero cutoff", forged, 10));
+    let mut forged = valid.clone();
+    forged.purge_cutoff_ms = -1;
+    cases.push(("negative cutoff", forged, 10));
+    let mut forged = valid.clone();
+    forged.pinned_evidence[1].kind = "token".into();
+    cases.push(("unknown evidence kind", forged, 10));
+    let mut forged = valid.clone();
+    forged.pinned_evidence[3].id = "../checkpoint".into();
+    cases.push(("unfollowable evidence id", forged, 10));
+    let mut forged = valid;
+    forged.pinned_evidence[1].sequence = 6;
+    cases.push(("evidence below the horizon", forged, 10));
+    for (case, certificate, logical_sequence) in cases {
+        assert!(
+            matches!(
+                certificate.validate(logical_sequence),
+                Err(CatalogError::InvariantViolation { .. })
+            ),
+            "{case} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn purged_rows_digest_binds_order_count_and_every_row_field() {
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let rows = [
+        PurgedRow {
+            key: b"a",
+            generation: 3,
+            tombstone: false,
+            expires_at_ms: Some(5),
+        },
+        PurgedRow {
+            key: b"b",
+            generation: 4,
+            tombstone: true,
+            expires_at_ms: None,
+        },
+    ];
+    let digest = purged_rows_digest(&scope, &rows).unwrap();
+    assert!(valid_raw_digest(&digest));
+    assert_ne!(digest, purged_rows_digest(&scope, &rows[..1]).unwrap());
+    assert_ne!(
+        digest,
+        purged_rows_digest(&scope, &[]).unwrap(),
+        "an empty purge set still has a scope-bound digest"
+    );
+    let mut altered = rows.clone();
+    altered[0].generation = 4;
+    assert_ne!(digest, purged_rows_digest(&scope, &altered).unwrap());
+    let mut altered = rows.clone();
+    altered[0].expires_at_ms = None;
+    assert_ne!(digest, purged_rows_digest(&scope, &altered).unwrap());
+    let mut altered = rows.clone();
+    altered[1].tombstone = false;
+    assert_ne!(digest, purged_rows_digest(&scope, &altered).unwrap());
+    let mut unordered = rows.clone();
+    unordered.swap(0, 1);
+    assert!(
+        purged_rows_digest(&scope, &unordered).is_err(),
+        "purged rows are digested in strict key order"
+    );
+    let duplicate = [rows[0].clone(), rows[0].clone()];
+    assert!(purged_rows_digest(&scope, &duplicate).is_err());
+}
+
+type Forgery = Box<dyn FnOnce(&mut ControlMvpManifest)>;
+
+/// Publishes a hand-built horizon child of the current (consolidated) head
+/// through raw storage and returns `(child id, child digest)`.
+async fn publish_horizon_child(
+    storage: &ScopedStorage,
+    store: &ControlMvpStateStore,
+    parent: &ControlMvpManifest,
+    parent_digest: &str,
+    forge: impl FnOnce(&mut ControlMvpManifest),
+) -> (String, String) {
+    let mut child = parent.clone();
+    child.manifest_id = format!("horizon-child-{}", cost::nonce());
+    child.base_manifest_id = Some(parent.manifest_id.clone());
+    child.parent_manifest_sha256 = Some(parent_digest.to_string());
+    child.layout_generation = parent.layout_generation + 1;
+    child.committed_at_ms = parent.committed_at_ms + 1;
+    child.maintenance_intent = None;
+    // The hand-built child reuses the parent's shards: the walk validates
+    // transitions, never replays, so the pruned checksum is any digest.
+    child.state_checksum_sha256 = "c".repeat(64);
+    child.equivalence = Some(RewriteEquivalence {
+        encoding_version: 1,
+        source_manifest_id: parent.manifest_id.clone(),
+        source_manifest_sha256: parent_digest.to_string(),
+        source_history_root: parent.history_root.clone(),
+        source_physical_root: parent.physical_root.clone(),
+        logical_sequence: parent.logical_sequence,
+        state_checksum_sha256: child.state_checksum_sha256.clone(),
+        render_source: None,
+    });
+    child.retention_horizon = Some(RetentionHorizonV1 {
+        encoding_version: 1,
+        horizon_sequence: parent.logical_sequence,
+        purge_cutoff_ms: 1_700_000_000_000,
+        pinned_evidence: vec![PinnedSequenceV1 {
+            kind: "manifest_age".into(),
+            id: parent.manifest_id.clone(),
+            sequence: parent.logical_sequence,
+        }],
+        parent_state_checksum_sha256: parent.state_checksum_sha256.clone(),
+        purged_rows_sha256: "d".repeat(64),
+        purged_counts: PurgedCountsV1 {
+            expired_rows: 1,
+            tombstones: 1,
+        },
+    });
+    forge(&mut child);
+    child.physical_root = child.physical_digest().unwrap();
+    child.validate(&store.scope, &child.manifest_id).unwrap();
+    let mut unbound = child.clone();
+    unbound.equivalence = None;
+    assert!(
+        unbound
+            .validate(&store.scope, &unbound.manifest_id)
+            .is_err(),
+        "a certificate without rewrite equivalence evidence is rejected"
+    );
+    let bytes = encode_envelope("control-mvp-manifest", &child).unwrap();
+    let digest = sha256_hex(&bytes);
+    storage
+        .put_raw(
+            &store.paths.manifest_object(&child.manifest_id),
+            bytes,
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    (child.manifest_id, digest)
+}
+
+#[tokio::test]
+async fn ancestry_accepts_a_horizon_transition_bound_to_its_parent_and_rejects_forgeries() {
+    let (storage, store) = fixture();
+    for _ in 0..16 {
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(b"row", Bytes::from_static(b"value")).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone())
+        .unwrap()
+        .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
+        .await
+        .unwrap()
+        .unwrap();
+    let parent = manifest(&store).await;
+    assert!(parent.tx_refs.is_empty(), "consolidated parent");
+    let parent_digest = store.load_pointer().await.unwrap().manifest_checksum_sha256;
+    let grandparent = parent.base_manifest_id.clone().unwrap();
+
+    let (child, digest) =
+        publish_horizon_child(&storage, &store, &parent, &parent_digest, |_| {}).await;
+    assert_eq!(
+        store
+            .resolve_ancestor(&child, &digest, |m, _| {
+                (m.manifest_id == grandparent).then_some(m.logical_sequence)
+            })
+            .await
+            .unwrap(),
+        Some(parent.logical_sequence),
+        "a well-formed horizon child walks through its parent to older ancestry"
+    );
+
+    let forgeries: Vec<(&str, Forgery)> = vec![
+        (
+            "parent state checksum",
+            Box::new(|child: &mut ControlMvpManifest| {
+                child
+                    .retention_horizon
+                    .as_mut()
+                    .unwrap()
+                    .parent_state_checksum_sha256 = "e".repeat(64);
+            }),
+        ),
+        (
+            "logical sequence",
+            Box::new(|child: &mut ControlMvpManifest| {
+                let sequence = child.logical_sequence + 1;
+                child.logical_sequence = sequence;
+                child.history_anchor.sequence = sequence;
+                for state in &mut child.base_states {
+                    state.logical_sequence = sequence;
+                }
+                child.equivalence.as_mut().unwrap().logical_sequence = sequence;
+                child.retention_horizon.as_mut().unwrap().horizon_sequence = sequence;
+                child.retention_horizon.as_mut().unwrap().pinned_evidence[0].sequence = sequence;
+            }),
+        ),
+        (
+            "history root",
+            Box::new(|child: &mut ControlMvpManifest| {
+                let root = "f".repeat(64);
+                child.history_root.clone_from(&root);
+                child.history_anchor.root.clone_from(&root);
+                child.equivalence.as_mut().unwrap().source_history_root = root;
+            }),
+        ),
+    ];
+    for (case, forge) in forgeries {
+        let (child, digest) =
+            publish_horizon_child(&storage, &store, &parent, &parent_digest, forge).await;
+        let error = store
+            .resolve_ancestor(&child, &digest, |m, _| {
+                (m.manifest_id == grandparent).then_some(())
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid authenticated ancestry transition"),
+            "{case}: {error}"
+        );
+    }
+}

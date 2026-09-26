@@ -102,6 +102,7 @@ impl ControlMvpMaintenanceWorker {
                 tx_refs: Vec::new(),
                 state_checksum_sha256: source_manifest.state_checksum_sha256.clone(),
                 maintenance_intent: None,
+                retention_horizon: None,
             };
             candidate_manifest.physical_root = candidate_manifest.physical_digest()?;
             candidate_manifest.validate(&self.store.scope, &candidate_manifest_id)?;

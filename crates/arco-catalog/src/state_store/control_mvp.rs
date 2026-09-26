@@ -162,7 +162,9 @@ pub use read_cache::{
     ControlMvpReadCacheStatistics,
 };
 pub(crate) mod maintenance;
-use integrity::{CheckpointValidation, HistoryAnchor, HistoryLink, RewriteEquivalence};
+use integrity::{
+    CheckpointValidation, HistoryAnchor, HistoryLink, RetentionHorizonV1, RewriteEquivalence,
+};
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
     DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
@@ -1755,6 +1757,7 @@ impl ControlMvpStateStore {
             manifest_checksum_sha256: pointer.manifest_checksum_sha256,
             states: state_refs,
             min_retention_seconds: opts.min_retention_seconds(),
+            retention_horizon: manifest.retention_horizon.clone(),
         };
         checkpoint.validate(&self.scope, &checkpoint.checkpoint_id)?;
         checkpoint.validate_source(&manifest)?;
@@ -2074,19 +2077,32 @@ impl ControlMvpStateStore {
                 let mutation = manifest.logical_sequence.checked_add(1) == Some(child.sequence)
                     && manifest.layout_generation == child.layout
                     && child.equivalence.is_none()
+                    && child.retention_horizon.is_none()
                     && successor_digest == child.predecessor_digest;
+                let source_physical_matches = child.equivalence.as_ref().is_some_and(|evidence| {
+                    evidence.source_physical_root == manifest.physical_root
+                });
                 let maintenance = manifest.logical_sequence == child.sequence
                     && manifest.layout_generation.checked_add(1) == Some(child.layout)
                     && manifest.state_checksum_sha256 == child.checksum
-                    && child.equivalence.as_ref().is_some_and(|evidence| {
-                        evidence.source_physical_root == manifest.physical_root
-                    })
+                    && child.retention_horizon.is_none()
+                    && source_physical_matches
                     && manifest
                         .maintenance_intent
                         .as_ref()
                         .is_some_and(|intent| intent.layout_generation() == child.layout);
+                // A retention-horizon rewrite keeps the sequence, advances
+                // the layout and changes the state checksum; its certificate
+                // binds the parent's checksum instead. No maintenance intent
+                // is required: the horizon runs on the worker's schedule.
+                let horizon = manifest.logical_sequence == child.sequence
+                    && manifest.layout_generation.checked_add(1) == Some(child.layout)
+                    && child.retention_horizon.as_ref().is_some_and(|certificate| {
+                        certificate.parent_state_checksum_sha256 == manifest.state_checksum_sha256
+                    })
+                    && source_physical_matches;
                 let history_matches = child.parent_history_root == manifest.history_root;
-                if (!mutation && !maintenance) || !history_matches {
+                if (!mutation && !maintenance && !horizon) || !history_matches {
                     return Err(invariant_violation(
                         "invalid authenticated ancestry transition",
                     ));
@@ -2117,6 +2133,7 @@ impl ControlMvpStateStore {
                         |tx| tx.history.preceding_root.clone(),
                     ),
                 equivalence: manifest.equivalence,
+                retention_horizon: manifest.retention_horizon,
             });
             next = manifest
                 .base_manifest_id
@@ -2466,6 +2483,7 @@ impl ControlMvpStateStore {
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
+            retention_horizon: None,
         };
         manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.scope, &manifest.manifest_id)?;
@@ -4952,6 +4970,7 @@ impl ControlMvpTxn {
             tx_refs,
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
+            retention_horizon: None,
         };
         manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.store.scope, &manifest.manifest_id)?;
@@ -5833,6 +5852,7 @@ struct AncestorTransition {
     predecessor_digest: String,
     parent_history_root: String,
     equivalence: Option<RewriteEquivalence>,
+    retention_horizon: Option<RetentionHorizonV1>,
 }
 
 struct StableRestoreBase {
@@ -6634,6 +6654,12 @@ struct ControlMvpManifest {
     tx_refs: Vec<ControlMvpTxRef>,
     state_checksum_sha256: String,
     maintenance_intent: Option<LayoutMaintenanceIntentV1>,
+    /// Present exactly on manifests published by a `RetentionHorizon`
+    /// maintenance transition: the certified purged set this manifest's
+    /// state omits relative to its parent. Absent on mutations,
+    /// consolidations and restores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_horizon: Option<RetentionHorizonV1>,
 }
 
 impl ControlMvpManifest {
@@ -8573,6 +8599,11 @@ struct ControlMvpCheckpoint {
     manifest_checksum_sha256: String,
     states: Vec<ControlMvpStateRef>,
     min_retention_seconds: Option<u64>,
+    /// Pass-through copy of the source manifest's retention-horizon
+    /// certificate, taken at checkpoint creation and bound to the manifest
+    /// whenever the checkpoint is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_horizon: Option<RetentionHorizonV1>,
 }
 
 impl ControlMvpCheckpoint {
@@ -8614,6 +8645,9 @@ impl ControlMvpCheckpoint {
             return Err(invariant_violation(
                 "control MVP checkpoint id does not match requested path",
             ));
+        }
+        if let Some(certificate) = &self.retention_horizon {
+            certificate.validate(self.logical_sequence)?;
         }
         Ok(())
     }

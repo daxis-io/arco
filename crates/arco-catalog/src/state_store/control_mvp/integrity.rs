@@ -59,6 +59,110 @@ pub(super) struct RenderSource {
     pub tx_refs: Vec<super::ControlMvpTxRef>,
 }
 
+/// Evidence kinds a retention-horizon certificate may cite. `manifest_age`
+/// names the ancestor that established the token-retention age bound; the
+/// other three name active pins whose sequence held the horizon.
+pub(super) const PINNED_EVIDENCE_KINDS: [&str; 4] =
+    ["manifest_age", "snapshot", "export", "checkpoint"];
+
+/// One retained root that bounded `horizon_sequence` when the certificate was
+/// computed. `sequence` is that root's logical sequence; the horizon is never
+/// above any cited sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PinnedSequenceV1 {
+    pub kind: String,
+    pub id: String,
+    pub sequence: u64,
+}
+
+/// How many rows a horizon rewrite dropped, by purge reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PurgedCountsV1 {
+    pub expired_rows: u64,
+    pub tombstones: u64,
+}
+
+/// Certificate a `RetentionHorizon` maintenance transition binds into its
+/// manifest. Logical sequence and history root are unchanged by the
+/// transition; the equivalence rule is "parent state minus the certified
+/// purged set equals the new state". The worker verifies that identity
+/// against a fresh parent replay before its head CAS; ancestry walkers bind
+/// `parent_state_checksum_sha256` to the immediate parent. Readers cannot
+/// recompute the purged digest after the rows are gone, so this is
+/// verification by independent code at rewrite time, as consolidation
+/// evidence is today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RetentionHorizonV1 {
+    pub encoding_version: u32,
+    pub horizon_sequence: u64,
+    pub purge_cutoff_ms: i64,
+    pub pinned_evidence: Vec<PinnedSequenceV1>,
+    pub parent_state_checksum_sha256: String,
+    pub purged_rows_sha256: String,
+    pub purged_counts: PurgedCountsV1,
+}
+
+impl RetentionHorizonV1 {
+    /// Structural validation against the carrying manifest's logical
+    /// sequence. It cannot prove the purged set; it proves the certificate
+    /// is well formed and internally consistent (the horizon is at or below
+    /// every cited pinned sequence and the manifest's own sequence).
+    pub(super) fn validate(&self, logical_sequence: u64) -> Result<()> {
+        if self.encoding_version != 1
+            || !valid_raw_digest(&self.parent_state_checksum_sha256)
+            || !valid_raw_digest(&self.purged_rows_sha256)
+            || self.horizon_sequence > logical_sequence
+            || self.purge_cutoff_ms <= 0
+            || self.pinned_evidence.iter().any(|evidence| {
+                !PINNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str())
+                    || !valid_immutable_id(&evidence.id)
+                    || evidence.sequence < self.horizon_sequence
+            })
+        {
+            return Err(invariant_violation("invalid retention horizon certificate"));
+        }
+        Ok(())
+    }
+}
+
+/// One row a horizon rewrite dropped, in the shape the purged digest binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "bound by the RetentionHorizon job kind")
+)]
+pub(super) struct PurgedRow<'a> {
+    pub key: &'a [u8],
+    pub generation: u64,
+    pub tombstone: bool,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Digest over the ordered purged rows of one horizon rewrite: the row
+/// count, then per row in strictly increasing key order the key, generation,
+/// tombstone flag and expiry hint. Rows out of key order (or duplicated) are
+/// an invariant violation rather than silently reordered.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "bound by the RetentionHorizon job kind")
+)]
+pub(super) fn purged_rows_digest(scope: &StateScope, rows: &[PurgedRow<'_>]) -> Result<String> {
+    let mut out = Canonical::new(b"arco/control-v1/retention-purge", scope)?;
+    out.u64(rows.len() as u64);
+    let mut previous: Option<&[u8]> = None;
+    for row in rows {
+        if previous.is_some_and(|prior| prior >= row.key) {
+            return Err(invariant_violation("purged rows are not in key order"));
+        }
+        previous = Some(row.key);
+        out.bytes(row.key);
+        out.u64(row.generation);
+        out.u8(u8::from(row.tombstone));
+        out.optional_i64(row.expires_at_ms);
+    }
+    Ok(out.finish())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct CheckpointValidation {
     pub encoding_version: u32,
@@ -358,6 +462,14 @@ impl ControlMvpManifest {
         if preceding != self.history_root || self.physical_digest()? != self.physical_root {
             return Err(invariant_violation("manifest integrity root mismatch"));
         }
+        if let Some(certificate) = &self.retention_horizon {
+            if self.equivalence.is_none() {
+                return Err(invariant_violation(
+                    "retention horizon certificate requires rewrite equivalence evidence",
+                ));
+            }
+            certificate.validate(self.logical_sequence)?;
+        }
         if let Some(evidence) = &self.equivalence {
             if self.base_manifest_id.as_deref() != Some(&evidence.source_manifest_id)
                 || self.parent_manifest_sha256.as_deref() != Some(&evidence.source_manifest_sha256)
@@ -527,6 +639,7 @@ impl ControlMvpCheckpoint {
             || evidence.source_history_root != manifest.history_root
             || evidence.source_physical_root != manifest.physical_root
             || evidence.state_checksum_sha256 != manifest.state_checksum_sha256
+            || self.retention_horizon != manifest.retention_horizon
         {
             return Err(invariant_violation(
                 "checkpoint source validation evidence mismatch",

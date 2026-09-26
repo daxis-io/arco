@@ -2217,6 +2217,9 @@ impl DurableMaintenanceWorker {
         candidate.base_states = job.pages.iter().map(|page| page.output.clone()).collect();
         candidate.anchor_states.clear();
         candidate.tx_refs = suffix;
+        // The candidate starts as a clone of `current`; a parent's horizon
+        // certificate is never inherited by a consolidation.
+        candidate.retention_horizon = None;
         candidate.history_anchor = HistoryAnchor {
             sequence: render.logical_sequence,
             root: render.history_root.clone(),

@@ -24,8 +24,8 @@ use arco_catalog::{
     PersistedAuthorityAdapter as _, Result, TxnOptions,
 };
 use arco_core::{
-    ListPage, MemoryBackend, ObjectMeta, ScopedStorage, StorageBackend, WritePrecondition,
-    WriteResult,
+    ListPage, MemoryBackend, ObjectMeta, RootStorage, ScopedStorage, StorageBackend,
+    WritePrecondition, WriteResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -777,7 +777,7 @@ async fn unresolved_publications_exclude_gc_even_after_cancellation_and_lease_ex
                 schedule.finish().await;
                 *f.backend.denied.lock().unwrap() = None;
                 recover_stale_retention_epoch(
-                    &f.storage,
+                    &RootStorage::from(f.storage.clone()),
                     "all simulated publication operations completed and reconciled",
                 )
                 .await
@@ -878,7 +878,7 @@ async fn checkpoint_artifacts_and_record_obey_publication_exclusion() {
             *f.backend.denied.lock().unwrap() = None;
             if !success {
                 recover_stale_retention_epoch(
-                    &f.storage,
+                    &RootStorage::from(f.storage.clone()),
                     "checkpoint remote task completed; partial cut reconciled",
                 )
                 .await
@@ -948,7 +948,7 @@ async fn lost_epoch_claim_and_settlement_responses_are_conservative() {
                 schedule.finish().await;
                 *f.backend.denied.lock().unwrap() = None;
                 recover_stale_retention_epoch(
-                    &f.storage,
+                    &RootStorage::from(f.storage.clone()),
                     "epoch remote task terminal; no publication requests pending",
                 )
                 .await

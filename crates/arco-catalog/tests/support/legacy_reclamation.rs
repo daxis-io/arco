@@ -10,7 +10,7 @@ use arco_catalog::workspace_snapshot::{
     LegacyCompatibilityArtifact, RequiredObject, RequiredObjectKind,
 };
 use arco_catalog::workspace_snapshot_service::RestoreSource;
-use arco_core::{CatalogDomain, CatalogPaths};
+use arco_core::{CatalogDomain, CatalogPaths, RootStorage};
 
 #[derive(Debug)]
 struct LegacyProjection(ProjectionWatermarkCut);
@@ -273,7 +273,7 @@ async fn legacy_delete_uncertainty_blocks_publication_even_after_stale_recovery_
                 schedule.finish().await;
                 assert!(f.storage.head_raw(&candidate).await.unwrap().is_none());
                 recover_stale_retention_epoch(
-                    &f.storage,
+                    &RootStorage::from(f.storage.clone()),
                     "all legacy DELETE requests completed; affected closure reconciled",
                 )
                 .await

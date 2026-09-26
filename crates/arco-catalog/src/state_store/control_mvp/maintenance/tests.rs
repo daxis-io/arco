@@ -3,7 +3,7 @@ use super::super::{
     ArcoStateTxn, ControlMvpProjectionOutboxRecord, TxnOptions, state_object_from_segment_rows,
 };
 use super::*;
-use arco_core::MemoryBackend;
+use arco_core::{MemoryBackend, ScopedStorage};
 
 async fn prepared_fixture() -> (DurableMaintenanceWorker, PreparedMaintenance, DateTime<Utc>) {
     let storage =

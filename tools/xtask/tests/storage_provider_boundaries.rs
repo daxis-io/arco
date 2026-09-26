@@ -169,7 +169,7 @@ fn control_state_kernel_uses_the_narrow_authority_capability() {
         );
     }
     assert!(
-        maintenance_kernel.contains("lifecycle: ScopedStorage"),
+        maintenance_kernel.contains("lifecycle: RootStorage"),
         "{source} maintenance worker must hold its separate lifecycle capability"
     );
 }

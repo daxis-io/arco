@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use arco_core::ScopedStorage;
 use arco_core::lock::{DistributedLock, LockGuard};
+use arco_core::{RootStorage, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -976,8 +976,11 @@ impl WorkspaceSnapshotService {
         usable_retention_deadline: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        let selected =
-            load_selected_retention_pin(&self.storage, expected_initial.pin_id()).await?;
+        let selected = load_selected_retention_pin(
+            &RootStorage::from(self.storage.clone()),
+            expected_initial.pin_id(),
+        )
+        .await?;
         let latest = selected.latest_revision()?;
         if selected.initial_revision()? != expected_initial
             || latest.target() != expected_initial.target()
@@ -1009,7 +1012,12 @@ impl WorkspaceSnapshotService {
             ));
             return Ok(());
         }
-        let selected = match load_selected_retention_pin(&self.storage, source.pin_id()).await {
+        let selected = match load_selected_retention_pin(
+            &RootStorage::from(self.storage.clone()),
+            source.pin_id(),
+        )
+        .await
+        {
             Ok(selected) => selected,
             Err(CatalogError::NotFound { .. }) => {
                 issues.push(RestorePreflightIssue::new(
@@ -2058,23 +2066,18 @@ impl WorkspaceSnapshotService {
         operation: &str,
         operation_kind: RetentionMutationKind,
         operation_id: &str,
-    ) -> Result<(LockGuard<ScopedStorage>, RetentionMutationEpoch)> {
-        let mut guard =
-            DistributedLock::new(Arc::new(self.storage.clone()), RETENTION_GC_LOCK_PATH)
-                .acquire_with_operation(
-                    RETENTION_GC_LOCK_TTL,
-                    RETENTION_GC_LOCK_MAX_RETRIES,
-                    Some(operation.to_string()),
-                )
-                .await
-                .map_err(CatalogError::from)?;
-        match RetentionMutationEpoch::claim(
-            self.storage.clone(),
-            &mut guard,
-            operation_kind,
-            operation_id,
-        )
-        .await
+    ) -> Result<(LockGuard<RootStorage>, RetentionMutationEpoch)> {
+        let retention = RootStorage::from(self.storage.clone());
+        let mut guard = DistributedLock::new(Arc::new(retention.clone()), RETENTION_GC_LOCK_PATH)
+            .acquire_with_operation(
+                RETENTION_GC_LOCK_TTL,
+                RETENTION_GC_LOCK_MAX_RETRIES,
+                Some(operation.to_string()),
+            )
+            .await
+            .map_err(CatalogError::from)?;
+        match RetentionMutationEpoch::claim(retention, &mut guard, operation_kind, operation_id)
+            .await
         {
             Ok(epoch) => Ok((guard, epoch)),
             Err(error) => {
@@ -2085,7 +2088,7 @@ impl WorkspaceSnapshotService {
     }
 
     async fn finish_retention_coordination<T>(
-        guard: LockGuard<ScopedStorage>,
+        guard: LockGuard<RootStorage>,
         epoch: RetentionMutationEpoch,
         operation: Result<T>,
     ) -> Result<T> {
@@ -2114,7 +2117,9 @@ impl WorkspaceSnapshotService {
         let selector_path = retention_pin_latest_path(pin_id)?;
         match self.storage.get_raw(&selector_path).await {
             Ok(_) => {
-                let selected = load_selected_retention_pin(&self.storage, pin_id).await?;
+                let selected =
+                    load_selected_retention_pin(&RootStorage::from(self.storage.clone()), pin_id)
+                        .await?;
                 if selected.initial_revision()? != expected_initial
                     || selected.latest_revision()?.target() != expected_initial.target()
                     || selected.latest_revision()?.retained_until() > usable_retention_deadline

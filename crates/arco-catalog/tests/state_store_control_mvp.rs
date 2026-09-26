@@ -74,29 +74,104 @@ fn control_mvp_new_accepts_root_storage_seam() {
 }
 
 #[test]
-fn control_mvp_new_rejects_metastore_root() {
+fn control_mvp_new_accepts_metastore_root() {
     let backend = Arc::new(MemoryBackend::new());
     let request =
         arco_core::ControlPlaneScope::new("acme", "notebooks", "lakehouse").expect("request scope");
     let storage =
         ScopedStorage::new_metastore_scoped(backend, &request).expect("metastore storage");
-    let error = ControlMvpStateStore::new(
-        storage,
-        StateScope::metastore("acme", "lakehouse", "catalog"),
-    )
-    .err()
-    .expect("metastore roots are disabled");
-    assert!(matches!(error, CatalogError::Validation { .. }));
+    assert!(
+        ControlMvpStateStore::new(
+            storage,
+            StateScope::metastore("acme", "lakehouse", "catalog"),
+        )
+        .is_ok(),
+        "metastore roots are root-aware for retention, GC, and checkpoints"
+    );
 }
 
 #[test]
-fn control_mvp_new_rejects_identity_root() {
+fn control_mvp_new_accepts_identity_root() {
     let backend = Arc::new(MemoryBackend::new());
     let storage = arco_core::IdentityStorage::new(backend, "acme").expect("identity storage");
-    let error = ControlMvpStateStore::new(storage, StateScope::tenant_identity("acme", "identity"))
-        .err()
-        .expect("identity roots are disabled");
-    assert!(matches!(error, CatalogError::Validation { .. }));
+    assert!(
+        ControlMvpStateStore::new(storage, StateScope::tenant_identity("acme", "identity")).is_ok(),
+        "identity roots are root-aware for retention, GC, and checkpoints"
+    );
+}
+
+#[tokio::test]
+async fn identity_root_commit_and_checkpoint_use_identity_retention_namespace() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        arco_core::IdentityStorage::new(backend.clone(), "acme").expect("identity storage");
+    let scope = StateScope::tenant_identity("acme", "identity");
+    let store = ControlMvpStateStore::new(identity, scope.clone()).expect("identity store");
+
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put(b"identity/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("stage value");
+    let token = txn.commit().await.expect("commit");
+    assert_eq!(&scope, token.scope());
+
+    // Commit artifacts land under the identity physical root, never a workspace alias.
+    assert!(
+        backend
+            .head("tenant=acme/identity/control/v1/domains/identity/head/current.json")
+            .await
+            .expect("head identity pointer")
+            .is_some()
+    );
+    assert!(
+        backend
+            .head("tenant=acme/workspace=identity/control/v1/domains/identity/head/current.json")
+            .await
+            .expect("head workspace pointer")
+            .is_none()
+    );
+
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope.clone())).with_min_retention_seconds(60))
+        .await
+        .expect("identity checkpoint");
+    assert_eq!(&scope, checkpoint.scope());
+
+    // Root-aware retention coordination is namespaced to the identity root.
+    assert!(
+        backend
+            .head("tenant=acme/identity/retention/coordination/mutation-epoch.json")
+            .await
+            .expect("head identity epoch")
+            .is_some()
+    );
+    assert!(
+        backend
+            .head("tenant=acme/workspace=identity/retention/coordination/mutation-epoch.json")
+            .await
+            .expect("head workspace epoch")
+            .is_none()
+    );
+
+    // Root-aware GC runs over the identity root with the same coordination.
+    let worker = ControlMvpMaintenanceWorker::new(
+        arco_core::IdentityStorage::new(backend.clone(), "acme").expect("identity storage"),
+        scope.clone(),
+    )
+    .expect("identity maintenance worker");
+    let plan = worker
+        .plan_gc_at(Utc::now(), std::iter::empty::<String>())
+        .await
+        .expect("identity GC plan");
+    assert_eq!(0, plan.candidate_bytes());
+    let outcome = worker
+        .collect_gc_at(Utc::now(), std::iter::empty::<String>())
+        .await
+        .expect("identity GC collect");
+    assert_eq!(0, outcome.objects_deleted());
 }
 
 #[test]

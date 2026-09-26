@@ -1004,15 +1004,20 @@ async fn leased_empty_records_cannot_bypass_either_record_limit() {
 
 #[test]
 fn handle_owns_backend_identity_until_its_last_clone_drops() {
-    let store = store();
-    let backend = Arc::downgrade(store.retention.backend());
+    let backend = Arc::new(MemoryBackend::new());
+    let weak_backend = Arc::downgrade(&backend);
+    let store = ControlMvpStateStore::new(
+        ScopedStorage::new(backend, "tenant", "workspace").unwrap(),
+        StateScope::new("tenant", "workspace", "catalog"),
+    )
+    .unwrap();
     let handle = store.read_cache().unwrap();
     let last = handle.clone();
     drop(store);
     drop(handle);
-    assert!(backend.upgrade().is_some());
+    assert!(weak_backend.upgrade().is_some());
     drop(last);
-    assert!(backend.upgrade().is_none());
+    assert!(weak_backend.upgrade().is_none());
 }
 
 #[tokio::test]

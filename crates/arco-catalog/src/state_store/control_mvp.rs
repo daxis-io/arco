@@ -216,7 +216,7 @@ const PRODUCTION_SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
 #[derive(Clone)]
 pub struct ControlMvpStateStore {
     storage: ScopedAuthorityStore,
-    retention: ScopedStorage,
+    retention: RootStorage,
     binding_identity: StateStoreBindingIdentity,
     scope: StateScope,
     paths: ControlMvpPaths,
@@ -355,16 +355,7 @@ impl ControlMvpStateStore {
     /// a mismatch between the storage scope and state scope, a domain that cannot
     /// be represented as a safe object path, or default cache administration that
     /// cannot fit within its byte capacity.
-    ///
-    /// Non-workspace roots can be passed to `new`, but are intentionally disabled
-    /// until the metastore and identity authority APIs are implemented and tested.
     pub fn new(storage: impl Into<RootStorage>, scope: StateScope) -> Result<Self> {
-        if !matches!(scope.root(), AuthorityRoot::Workspace { .. }) {
-            return Err(validation_failed(
-                "control MVP requires a workspace physical root",
-            ));
-        }
-
         scope.validate()?;
         let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
@@ -375,9 +366,7 @@ impl ControlMvpStateStore {
 
         let paths = ControlMvpPaths::new(scope.domain());
         RootStorage::validate_path(&paths.current_pointer())?;
-        let retention = storage.as_legacy_scoped().cloned().ok_or_else(|| {
-            validation_failed("control MVP requires legacy scoped retention storage")
-        })?;
+        let retention = storage.clone();
         let binding_identity = StateStoreBindingIdentity::from_root_storage(&storage);
 
         let store = Self {
@@ -2656,7 +2645,7 @@ fn layout_maintenance_intent_for_manifest(
 /// ```
 pub struct ControlMvpMaintenanceWorker {
     store: ControlMvpStateStore,
-    lifecycle: ScopedStorage,
+    lifecycle: RootStorage,
 }
 
 const CONTROL_MVP_GC_PAGE_SIZE: usize = 256;
@@ -2787,7 +2776,8 @@ impl ControlMvpMaintenanceWorker {
     /// # Errors
     ///
     /// Returns validation errors when storage and state scope differ.
-    pub fn new(storage: ScopedStorage, scope: StateScope) -> Result<Self> {
+    pub fn new(storage: impl Into<RootStorage>, scope: StateScope) -> Result<Self> {
+        let storage = storage.into();
         Ok(Self {
             store: ControlMvpStateStore::new(storage.clone(), scope)?.without_read_cache(),
             lifecycle: storage,

@@ -59,6 +59,72 @@ pub(super) struct RenderSource {
     pub tx_refs: Vec<super::ControlMvpTxRef>,
 }
 
+/// Width of the wall-clock bucket the age-anchor chain steps by: one hour.
+/// Following anchors therefore steps back at least one hour per hop, so the
+/// 30-day retention floor is reached in at most about 721 authenticated
+/// reads regardless of the commit rate.
+pub(super) const AGE_ANCHOR_BUCKET_MS: i64 = 60 * 60 * 1000;
+
+/// The hour bucket a `committed_at_ms` stamp falls in.
+pub(super) fn age_bucket(committed_at_ms: i64) -> i64 {
+    committed_at_ms.div_euclid(AGE_ANCHOR_BUCKET_MS)
+}
+
+/// One link of the age-anchor chain: the last manifest of the hour bucket
+/// before the one this manifest's chain crossed into. Authenticated at use by
+/// the recorded digest, sequence and stamp; never part of a canonical digest
+/// (the manifest envelope authenticates it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct AgeAnchorV1 {
+    pub manifest_id: String,
+    pub manifest_sha256: String,
+    pub sequence: u64,
+    pub committed_at_ms: i64,
+}
+
+impl AgeAnchorV1 {
+    pub(super) fn validate(&self) -> Result<()> {
+        if !valid_immutable_id(&self.manifest_id)
+            || !valid_raw_digest(&self.manifest_sha256)
+            || self.committed_at_ms <= 0
+        {
+            return Err(invariant_violation("invalid age anchor"));
+        }
+        Ok(())
+    }
+}
+
+/// What the render rule needs to know about a child's parent.
+#[derive(Debug, Clone)]
+pub(super) struct AnchorParent<'a> {
+    pub manifest_id: &'a str,
+    pub manifest_sha256: &'a str,
+    pub sequence: u64,
+    pub committed_at_ms: i64,
+    pub age_anchor: &'a Option<AgeAnchorV1>,
+}
+
+/// The age-anchor render rule, applied on every manifest render and checked
+/// by the ancestry walker as a transition invariant: a child stamped in a
+/// later hour bucket than its parent records the parent; otherwise it
+/// inherits the parent's anchor. Genesis (no parent) has none.
+pub(super) fn age_anchor_for_child(
+    committed_at_ms: i64,
+    parent: Option<AnchorParent<'_>>,
+) -> Option<AgeAnchorV1> {
+    let parent = parent?;
+    if age_bucket(committed_at_ms) > age_bucket(parent.committed_at_ms) {
+        Some(AgeAnchorV1 {
+            manifest_id: parent.manifest_id.to_string(),
+            manifest_sha256: parent.manifest_sha256.to_string(),
+            sequence: parent.sequence,
+            committed_at_ms: parent.committed_at_ms,
+        })
+    } else {
+        parent.age_anchor.clone()
+    }
+}
+
 /// Evidence kinds a retention-horizon certificate may cite. `manifest_age`
 /// names the ancestor that established the token-retention age bound; the
 /// other three name active pins whose sequence held the horizon.
@@ -475,6 +541,18 @@ impl ControlMvpManifest {
         }
         if preceding != self.history_root || self.physical_digest()? != self.physical_root {
             return Err(invariant_violation("manifest integrity root mismatch"));
+        }
+        if let Some(anchor) = &self.age_anchor {
+            anchor.validate()?;
+            if self.base_manifest_id.is_none()
+                || anchor.sequence > self.logical_sequence
+                || anchor.committed_at_ms > self.committed_at_ms
+                || age_bucket(anchor.committed_at_ms) >= age_bucket(self.committed_at_ms)
+            {
+                return Err(invariant_violation(
+                    "age anchor is not from an earlier bucket of this manifest's ancestry",
+                ));
+            }
         }
         if let Some(certificate) = &self.retention_horizon {
             if self.equivalence.is_none() {

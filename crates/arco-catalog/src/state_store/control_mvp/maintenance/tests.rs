@@ -2196,7 +2196,8 @@ mod horizon {
     }
 
     #[tokio::test]
-    async fn a_tampered_certificate_fails_reads_and_ancestry_closed() {
+    async fn tampering_the_certificate_breaks_the_manifest_digest_binding_so_reads_and_ancestry_fail_closed()
+     {
         let storage =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
         let worker = worker_on(storage.clone(), 48);
@@ -2264,6 +2265,290 @@ mod horizon {
         assert!(
             store.replay_for_successor(&horizon_manifest).await.is_ok(),
             "the decoded manifest still replays; only its authenticated bytes are gone"
+        );
+    }
+
+    /// Counts manifest object reads so a test can show the age bound is
+    /// reached through anchors rather than one hop per commit.
+    struct CountingBackend {
+        inner: MemoryBackend,
+        manifest_reads: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl StorageBackend for CountingBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            if path.contains("/manifests/") {
+                self.manifest_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner.get_range(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            self.inner.put(path, data, precondition).await
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    async fn commit_put(store: &ControlMvpStateStore, key: &[u8]) -> String {
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(key, Bytes::from_static(VALUE)).await.unwrap();
+        tx.commit().await.unwrap();
+        manifest_id(store).await
+    }
+
+    fn floor_reached_at(aged_stamp: DateTime<Utc>) -> DateTime<Utc> {
+        // `now` such that `now - 30 d - 1 h` is exactly the aged stamp.
+        aged_stamp + ChronoDuration::days(30) + ChronoDuration::hours(1)
+    }
+
+    #[tokio::test]
+    async fn age_bound_follows_anchors_in_a_few_hops_across_thirty_commits() {
+        let backend = Arc::new(CountingBackend {
+            inner: MemoryBackend::new(),
+            manifest_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 51);
+        let store = &worker.worker.store;
+        let start = fixture_instant();
+        // Six simulated hours, five commits each: 30 manifests, one anchor per hour.
+        let mut last_of_hour = Vec::new();
+        for hour in 0..6 {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(hour));
+            let mut last = String::new();
+            for _ in 0..5 {
+                last = commit_put(store, b"row").await;
+            }
+            last_of_hour.push(last);
+        }
+        let (_, head) = head(store).await;
+        assert_eq!(head.logical_sequence, 30);
+        assert_eq!(
+            head.age_anchor.as_ref().unwrap().manifest_id,
+            last_of_hour[4],
+            "the head's anchor is the last manifest of the previous hour"
+        );
+        // Thirty-one days on, with the floor falling inside hour 3: hours 0-3
+        // are past it, the head and hour 4 are not.
+        let now = floor_reached_at(start + ChronoDuration::minutes(3 * 60 + 30));
+        backend
+            .manifest_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let inputs = worker.worker.retention_horizon_inputs(now).await.unwrap();
+        assert_eq!(
+            inputs.pinned_evidence,
+            vec![PinnedSequenceV1 {
+                kind: "manifest_age".into(),
+                id: last_of_hour[3].clone(),
+                sequence: 20,
+            }]
+        );
+        assert_eq!(inputs.horizon_sequence, 20);
+        let reads = backend
+            .manifest_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            reads <= 3,
+            "head plus two anchor hops, not one read per commit: {reads} reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collected_anchor_decides_by_its_record_only_below_the_floor() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage.clone(), 52);
+        let store = &worker.worker.store;
+        let start = fixture_instant();
+        let hour0 = {
+            let _clock = FixedInputs::at(start);
+            commit_put(store, b"a").await;
+            commit_put(store, b"b").await
+        };
+        let hour1 = {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(1));
+            commit_put(store, b"c").await
+        };
+        {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(2));
+            commit_put(store, b"d").await;
+        }
+        let evidence = |id: &str, sequence: u64| {
+            vec![PinnedSequenceV1 {
+                kind: "manifest_age".into(),
+                id: id.to_string(),
+                sequence,
+            }]
+        };
+        // Floor at 30 minutes past the start: hour 1 is still above it, so
+        // the walk follows two anchors to hour 0.
+        let early = floor_reached_at(start + ChronoDuration::minutes(30));
+        let inputs = worker.worker.retention_horizon_inputs(early).await.unwrap();
+        assert_eq!(inputs.pinned_evidence, evidence(&hour0, 2));
+        // Floor at 90 minutes past the start: hour 1 is the bound.
+        let late = floor_reached_at(start + ChronoDuration::minutes(90));
+        let inputs = worker.worker.retention_horizon_inputs(late).await.unwrap();
+        assert_eq!(inputs.pinned_evidence, evidence(&hour1, 3));
+
+        // GC collects the hour-1 anchor object.
+        storage
+            .delete(&store.paths.manifest_object(&hour1))
+            .await
+            .unwrap();
+        // Its record, stamped at or below the floor, still yields the bound.
+        let inputs = worker.worker.retention_horizon_inputs(late).await.unwrap();
+        assert_eq!(inputs.pinned_evidence, evidence(&hour1, 3));
+        // Stamped above the floor, a missing anchor is corruption: fail closed.
+        assert!(matches!(
+            worker.worker.retention_horizon_inputs(early).await,
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+    }
+
+    /// Checkpoints the current head and restores from it at `now`, which
+    /// renders one restore manifest on top of the head.
+    #[allow(
+        clippy::future_not_send,
+        reason = "the fixture clock guard is thread-bound by design"
+    )]
+    async fn restore_from_current_checkpoint(store: &ControlMvpStateStore, now: DateTime<Utc>) {
+        use crate::{
+            ControlMvpRestoreParticipant, PersistedAuthorityAdapter as _, RestoreAttemptIdentity,
+            StateRestoreParticipant as _,
+        };
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reference = store
+            .persist_checkpoint_reference(&checkpoint, now + ChronoDuration::days(1))
+            .await
+            .unwrap();
+        let identity =
+            RestoreAttemptIdentity::new("rst_01ARZ3NDEKTSV4RRFFQ69G5FAV", 1, "catalog").unwrap();
+        let participant = ControlMvpRestoreParticipant::new(store.clone());
+        let plan = participant
+            .plan_restore(&reference, &identity, now)
+            .await
+            .unwrap();
+        participant.apply_restore(&plan, now).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consolidation_horizon_and_restore_candidates_carry_the_anchor_rule() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage.clone(), 53);
+        let store = &worker.worker.store;
+        let start = fixture_instant();
+        let commits_head = {
+            let _clock = FixedInputs::at(start);
+            let mut last = String::new();
+            for _ in 0..16 {
+                last = commit_put(store, b"row").await;
+            }
+            let mut tx = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            tx.put_with_expiry(
+                b"receipt",
+                Bytes::from_static(VALUE),
+                (start + ChronoDuration::minutes(30)).timestamp_millis(),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            let _ = last;
+            manifest_id(store).await
+        };
+        // A consolidation two hours later crosses a bucket: it records the head.
+        let consolidation = {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(2));
+            let outcome = worker
+                .prepare_at(arco_core::test_inputs::now())
+                .await
+                .unwrap()
+                .unwrap();
+            let id = outcome.job_id().clone();
+            let now = arco_core::test_inputs::now();
+            let mut progress = worker.start_at(&outcome, now).await.unwrap();
+            while progress.status == MaintenanceStatus::Active {
+                progress = worker.advance_at(&id, now).await.unwrap();
+            }
+            worker.publish_at(&id, now).await.unwrap().unwrap();
+            head(store).await.1
+        };
+        assert_eq!(
+            consolidation
+                .age_anchor
+                .as_ref()
+                .map(|a| a.manifest_id.as_str()),
+            Some(commits_head.as_str())
+        );
+        // A horizon in the same bucket inherits; the expired receipt makes it eligible.
+        let horizon = {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(2));
+            run(&worker, arco_core::test_inputs::now())
+                .await
+                .expect("eligible");
+            head(store).await.1
+        };
+        assert!(horizon.retention_horizon.is_some());
+        assert_eq!(horizon.age_anchor, consolidation.age_anchor);
+        // A restore two hours later again crosses a bucket: it records the horizon.
+        let (restore_pointer, restore) = {
+            let _clock = FixedInputs::at(start + ChronoDuration::hours(4));
+            restore_from_current_checkpoint(store, arco_core::test_inputs::now()).await;
+            head(store).await
+        };
+        assert_eq!(
+            restore.age_anchor.as_ref().map(|a| a.manifest_id.as_str()),
+            Some(horizon.manifest_id.as_str())
+        );
+        assert!(restore.committed_at_ms >= horizon.committed_at_ms);
+        // Every transition from the restore back to genesis satisfies the
+        // walker, anchor rule and monotone stamps included.
+        assert_eq!(
+            store
+                .resolve_ancestor(
+                    &restore_pointer.manifest_id,
+                    &restore_pointer.manifest_checksum_sha256,
+                    |_, _| None::<()>,
+                )
+                .await
+                .unwrap(),
+            None
         );
     }
 }

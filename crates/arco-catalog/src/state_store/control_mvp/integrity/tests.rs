@@ -1422,7 +1422,7 @@ async fn publish_horizon_child(
     child.base_manifest_id = Some(parent.manifest_id.clone());
     child.parent_manifest_sha256 = Some(parent_digest.to_string());
     child.layout_generation = parent.layout_generation + 1;
-    child.committed_at_ms = parent.committed_at_ms + 1;
+    child.committed_at_ms = parent.committed_at_ms;
     child.maintenance_intent = None;
     // The hand-built child reuses the parent's shards: the walk validates
     // transitions, never replays, so the pruned checksum is any digest.
@@ -1563,4 +1563,185 @@ async fn ancestry_accepts_a_horizon_transition_bound_to_its_parent_and_rejects_f
             "{case}: {error}"
         );
     }
+}
+
+#[test]
+fn age_anchor_rule_inherits_within_a_bucket_and_records_the_parent_across_one() {
+    let bucket = AGE_ANCHOR_BUCKET_MS;
+    assert_eq!(
+        age_anchor_for_child(bucket + 1, None),
+        None,
+        "genesis has no anchor"
+    );
+    let older = AgeAnchorV1 {
+        manifest_id: "manifest-older".into(),
+        manifest_sha256: "1".repeat(64),
+        sequence: 3,
+        committed_at_ms: bucket - 5,
+    };
+    let inherited = Some(older.clone());
+    let digest = "2".repeat(64);
+    let parent = AnchorParent {
+        manifest_id: "manifest-parent",
+        manifest_sha256: &digest,
+        sequence: 9,
+        committed_at_ms: 2 * bucket + 10,
+        age_anchor: &inherited,
+    };
+    // Same hour bucket as the parent: the parent's anchor is inherited.
+    assert_eq!(
+        age_anchor_for_child(2 * bucket + 500, Some(parent.clone())),
+        Some(older.clone())
+    );
+    assert_eq!(
+        age_anchor_for_child(3 * bucket - 1, Some(parent.clone())),
+        Some(older)
+    );
+    // A later bucket: the parent itself becomes the anchor.
+    assert_eq!(
+        age_anchor_for_child(3 * bucket, Some(parent)),
+        Some(AgeAnchorV1 {
+            manifest_id: "manifest-parent".into(),
+            manifest_sha256: digest,
+            sequence: 9,
+            committed_at_ms: 2 * bucket + 10,
+        })
+    );
+}
+
+/// Sixteen commits at `start`, then a consolidation two hours later: it
+/// crosses a bucket, so the consolidated head carries an anchor of its own.
+#[allow(
+    clippy::future_not_send,
+    reason = "the fixture clock guard is thread-bound by design"
+)]
+async fn anchored_consolidated_head(
+    storage: &ScopedStorage,
+    store: &ControlMvpStateStore,
+    start: DateTime<Utc>,
+) -> arco_core::test_inputs::FixedInputs {
+    use arco_core::test_inputs::FixedInputs;
+    {
+        let _clock = FixedInputs::at(start);
+        for _ in 0..16 {
+            let mut tx = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .unwrap();
+            tx.put(b"row", Bytes::from_static(b"value")).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+    }
+    let clock = FixedInputs::at(start + ChronoDuration::hours(2));
+    ControlMvpMaintenanceWorker::new(storage.clone(), store.scope.clone())
+        .unwrap()
+        .test_consolidate_pending(DurableAuthorityBinding::new([17; 32]))
+        .await
+        .unwrap()
+        .unwrap();
+    clock
+}
+
+async fn walks_to(
+    store: &ControlMvpStateStore,
+    child: &str,
+    digest: &str,
+    target: &str,
+) -> Result<bool> {
+    store
+        .resolve_ancestor(child, digest, |m, _| {
+            (m.manifest_id == target).then_some(())
+        })
+        .await
+        .map(|found| found.is_some())
+}
+
+#[tokio::test]
+async fn ancestry_rejects_a_wrong_anchor_and_a_stamp_before_the_parent() {
+    let (storage, store) = fixture();
+    let start = DateTime::from_timestamp(1_893_456_000, 0).unwrap();
+    let _clock = anchored_consolidated_head(&storage, &store, start).await;
+    let parent = manifest(&store).await;
+    let parent_digest = store.load_pointer().await.unwrap().manifest_checksum_sha256;
+    let grandparent = parent.base_manifest_id.clone().unwrap();
+    assert_eq!(
+        parent
+            .age_anchor
+            .as_ref()
+            .map(|anchor| anchor.manifest_id.as_str()),
+        Some(grandparent.as_str()),
+        "a consolidation rendered in a later bucket records its parent"
+    );
+    // A well-formed child in the parent's bucket inherits the parent's anchor.
+    let (child, digest) =
+        publish_horizon_child(&storage, &store, &parent, &parent_digest, |_| {}).await;
+    assert!(
+        walks_to(&store, &child, &digest, &grandparent)
+            .await
+            .unwrap()
+    );
+    let forgeries: Vec<(&str, Forgery)> = vec![
+        (
+            "anchor not inherited inside the bucket",
+            Box::new(|child: &mut ControlMvpManifest| {
+                child.age_anchor = Some(AgeAnchorV1 {
+                    manifest_id: "manifest-forged".into(),
+                    manifest_sha256: "3".repeat(64),
+                    sequence: 1,
+                    committed_at_ms: 1,
+                });
+            }),
+        ),
+        (
+            "anchor dropped inside the bucket",
+            Box::new(|child: &mut ControlMvpManifest| {
+                child.age_anchor = None;
+            }),
+        ),
+        (
+            "bucket crossed without recording the parent",
+            Box::new(|child: &mut ControlMvpManifest| {
+                child.committed_at_ms += AGE_ANCHOR_BUCKET_MS;
+            }),
+        ),
+        (
+            "stamp before the parent",
+            Box::new(|child: &mut ControlMvpManifest| {
+                child.committed_at_ms -= 1;
+            }),
+        ),
+    ];
+    for (case, forge) in forgeries {
+        let (child, digest) =
+            publish_horizon_child(&storage, &store, &parent, &parent_digest, forge).await;
+        let error = walks_to(&store, &child, &digest, &grandparent)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid authenticated ancestry transition"),
+            "{case}: {error}"
+        );
+    }
+    // Crossing the bucket with the parent recorded is accepted.
+    let recorded = AgeAnchorV1 {
+        manifest_id: parent.manifest_id.clone(),
+        manifest_sha256: parent_digest.clone(),
+        sequence: parent.logical_sequence,
+        committed_at_ms: parent.committed_at_ms,
+    };
+    let (child, digest) = publish_horizon_child(&storage, &store, &parent, &parent_digest, {
+        let recorded = recorded.clone();
+        move |child: &mut ControlMvpManifest| {
+            child.committed_at_ms += AGE_ANCHOR_BUCKET_MS;
+            child.age_anchor = Some(recorded);
+        }
+    })
+    .await;
+    assert!(
+        walks_to(&store, &child, &digest, &grandparent)
+            .await
+            .unwrap()
+    );
 }

@@ -231,6 +231,8 @@ impl TransactionBase {
             manifest_id: self.manifest().map(|m| m.manifest_id.clone()),
             writer_epoch: self.writer_epoch(),
             layout_generation: self.manifest().map_or(0, |m| m.layout_generation),
+            committed_at_ms: self.manifest().map_or(0, |m| m.committed_at_ms),
+            age_anchor: self.manifest().and_then(|m| m.age_anchor.clone()),
             state,
             base_states,
             tx_refs,

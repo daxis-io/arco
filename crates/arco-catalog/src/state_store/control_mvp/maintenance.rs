@@ -3,19 +3,20 @@
 use arco_core::RootStorage;
 
 use super::{
-    AncestryGap, Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
-    CONTROL_MVP_FORMAT_VERSION, CONTROL_MVP_GC_PAGE_SIZE, CONTROL_MVP_TOKEN_RETENTION_DAYS,
-    CatalogError, ChronoDuration, ControlMvpBlock, ControlMvpCheckpoint, ControlMvpGcCandidate,
-    ControlMvpGcPlan, ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker,
-    ControlMvpManifest, ControlMvpPointer, ControlMvpSegmentIndex, ControlMvpSegmentLevel,
-    ControlMvpSegmentRef, ControlMvpSegmentRow, ControlMvpStateRef, ControlMvpStateStore, DateTime,
-    Deserialize, Digest, DistributedLock, HistoryAnchor, IMPLEMENTATION, KeyRange, MAX_BLOCK_BYTES,
-    MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES, MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES,
-    MAX_SEGMENT_ROWS, PinnedSequenceV1, PurgedCountsV1, PurgedRow, RETENTION_GC_LOCK_MAX_RETRIES,
-    RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RenderedControlMvpStateSegment, ReplayState,
-    Result, RetainedAuthorityRoots, RetentionHorizonV1, RetentionMutationEpoch, RewriteEquivalence,
-    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256,
-    StateScope, StoredValue, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds,
+    AnchorParent, Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
+    CONTROL_MVP_FORMAT_VERSION, CONTROL_MVP_GC_PAGE_SIZE, CONTROL_MVP_RETENTION_CLOCK_SKEW_MS,
+    CONTROL_MVP_TOKEN_RETENTION_DAYS, CatalogError, ChronoDuration, ControlMvpBlock,
+    ControlMvpCheckpoint, ControlMvpGcCandidate, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
+    ControlMvpMaintenanceWorker, ControlMvpManifest, ControlMvpPointer, ControlMvpSegmentIndex,
+    ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow, ControlMvpStateRef,
+    ControlMvpStateStore, DateTime, Deserialize, Digest, DistributedLock, HistoryAnchor,
+    IMPLEMENTATION, KeyRange, MAX_BLOCK_BYTES, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES,
+    MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS, PinnedSequenceV1, PurgedCountsV1,
+    PurgedRow, RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
+    RenderedControlMvpStateSegment, ReplayState, Result, RetainedAuthorityRoots,
+    RetentionHorizonV1, RetentionMutationEpoch, RewriteEquivalence, SEGMENT_FORMAT_VERSION,
+    SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256, StateScope, StoredValue, Ulid,
+    Utc, WriteResult, age_anchor_for_child, ambiguous_authority_outcome, block_key_bounds,
     checkpoint_retained_at, cost, decode_envelope_limited, decode_json, decode_json_limited,
     decode_segment_rows, encode_envelope_limited, encode_json, encode_json_limited, encode_segment,
     half_segment_limits, hash_bytes, hash_tag, hash_u64, integrity, invariant_violation,
@@ -31,13 +32,13 @@ const MAINTENANCE_POLICY_VERSION: u32 = 1;
 const MAX_UNITS: usize = 256;
 const MAX_PLAN_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PLAN_BYTES: usize = 8 * 1024 * 1024;
-/// Manifests the retention-age walk reads before giving up on finding an
-/// ancestor older than the token floor (the age bound is then zero).
-const HORIZON_AGE_WALK_MAX_MANIFESTS: usize = 4096;
-/// Expiry hints must precede the worker's clock by this margin before a row
-/// is purge-eligible, so a clock slightly ahead of the writers' cannot drop
-/// a row that is still inside its promised window.
-const HORIZON_PURGE_SAFETY_MS: i64 = 60 * 60 * 1000;
+/// Anchor hops the retention-age walk may follow. Each hop steps back at
+/// least one hour bucket, so the 30-day floor needs about 721; exhaustion
+/// is corruption of the chain and fails closed.
+const HORIZON_ANCHOR_HOP_BUDGET: usize = 1024;
+/// Total manifest bytes the anchor walk may read: every hop is one manifest.
+const HORIZON_ANCHOR_BYTE_BUDGET: u64 =
+    HORIZON_ANCHOR_HOP_BUDGET as u64 * MAX_CONTROL_JSON_BYTES as u64;
 
 /// Which physical rewrite a durable job performs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1300,25 +1301,18 @@ pub async fn retention_root(
     .await
 }
 
-/// How the retention-age walk ended.
-enum AgeWalk {
-    /// Found the newest ancestor whose stamp is older than the token floor.
-    Aged { id: String, sequence: u64 },
-    /// Read the hop budget without finding one; nothing is purgeable by age.
-    Capped { id: String },
-}
-
 impl ControlMvpMaintenanceWorker {
     /// Computes the inputs of a `RetentionHorizon` job at `now`:
     ///
-    /// 1. the age bound: a bounded, authenticated ancestry walk from the head
-    ///    to the newest manifest whose `committed_at_ms` is at or before the
-    ///    token-retention floor (`now - 30 d`) takes that manifest's
-    ///    sequence. The walk may end early: at genesis, or at the youngest
-    ///    retained manifest whose parent GC already collected past the same
-    ///    floor. Every retained reader is at or after that manifest, so its
-    ///    sequence minus one is the bound. A walk that reads its hop budget
-    ///    first yields zero (nothing purgeable by age);
+    /// 1. the age bound: the sequence of the newest manifest whose stamp is
+    ///    at or before the token-retention floor plus the clock-skew margin
+    ///    (`now - 30 d - 1 h`), found by following `age_anchor` links from
+    ///    the head. Each anchor is authenticated by its recorded digest,
+    ///    sequence and stamp. An anchor GC already collected still decides
+    ///    by its record when the record is at or below the floor; a missing
+    ///    anchor recorded above the floor, a chain longer than the hop
+    ///    budget, or a record its manifest contradicts fails closed. A chain
+    ///    that ends above the floor yields zero (nothing purgeable by age);
     /// 2. every active snapshot or export pin naming this scope, streamed by
     ///    the same retained-root inventory GC uses, contributes its manifest's
     ///    authenticated sequence;
@@ -1326,8 +1320,9 @@ impl ControlMvpMaintenanceWorker {
     ///    (`max(min_retention_seconds, 30 d)` from the object's age)
     ///    contributes its sequence.
     ///
-    /// `horizon_sequence` is the minimum of all of them; `purge_cutoff_ms` is
-    /// `now` minus a one-hour safety margin. Any unreadable or invalid input
+    /// The certificate cites one entry per evidence kind (its lowest
+    /// sequence); `horizon_sequence` is the minimum of them. `purge_cutoff_ms`
+    /// is `now` minus the same skew margin. Any unreadable or invalid input
     /// is an error: the job never renders on a guess.
     pub(super) async fn retention_horizon_inputs(
         &self,
@@ -1335,16 +1330,28 @@ impl ControlMvpMaintenanceWorker {
     ) -> Result<HorizonInputs> {
         cost::phase("maintenance-horizon-inputs", async {
             let pointer = self.store.load_pointer().await?;
+            let head = self.store.load_manifest_for_pointer(&pointer).await?;
             let purge_cutoff_ms = now
                 .timestamp_millis()
-                .checked_sub(HORIZON_PURGE_SAFETY_MS)
+                .checked_sub(CONTROL_MVP_RETENTION_CLOCK_SKEW_MS)
                 .filter(|cutoff| *cutoff > 0)
                 .ok_or_else(|| {
                     validation_failed("retention horizon clock precedes the Unix epoch")
                 })?;
-            let mut pinned_evidence = vec![Box::pin(self.age_bound_evidence(&pointer, now)).await?];
-            Box::pin(self.pin_evidence(now, &mut pinned_evidence)).await?;
-            Box::pin(self.checkpoint_evidence(now, &mut pinned_evidence)).await?;
+            let mut gathered = vec![Box::pin(self.age_bound_evidence(&head, now)).await?];
+            Box::pin(self.pin_evidence(now, &mut gathered)).await?;
+            Box::pin(self.checkpoint_evidence(now, &mut gathered)).await?;
+            // One entry per kind: the lowest pinned sequence of that kind.
+            let pinned_evidence = integrity::PINNED_EVIDENCE_KINDS
+                .iter()
+                .filter_map(|kind| {
+                    gathered
+                        .iter()
+                        .filter(|evidence| evidence.kind == *kind)
+                        .min_by_key(|evidence| evidence.sequence)
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
             let horizon_sequence = pinned_evidence
                 .iter()
                 .map(|evidence| evidence.sequence)
@@ -1361,58 +1368,81 @@ impl ControlMvpMaintenanceWorker {
         .await
     }
 
-    /// Input 1: the token-retention age bound, as `manifest_age` evidence.
+    /// Input 1: the token-retention age bound, as `manifest_age` evidence
+    /// citing the manifest that established it (or, for a bound of zero, the
+    /// newest manifest examined).
     async fn age_bound_evidence(
         &self,
-        pointer: &ControlMvpPointer,
+        head: &ControlMvpManifest,
         now: DateTime<Utc>,
     ) -> Result<PinnedSequenceV1> {
-        let age_cutoff_ms = now
+        let store = &self.store;
+        let floor_ms = now
             .checked_sub_signed(ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS))
             .ok_or_else(|| validation_failed("retention horizon clock underflow"))?
-            .timestamp_millis();
-        let mut hops = 0_usize;
-        let mut youngest: Option<(String, u64)> = None;
-        let walk = self
-            .store
-            .resolve_ancestor_bounded(
-                &pointer.manifest_id,
-                &pointer.manifest_checksum_sha256,
-                |manifest, _| {
-                    hops += 1;
-                    if manifest.committed_at_ms <= age_cutoff_ms {
-                        return Some(AgeWalk::Aged {
-                            id: manifest.manifest_id.clone(),
-                            sequence: manifest.logical_sequence,
-                        });
-                    }
-                    youngest = Some((manifest.manifest_id.clone(), manifest.logical_sequence));
-                    (hops >= HORIZON_AGE_WALK_MAX_MANIFESTS).then(|| AgeWalk::Capped {
-                        id: manifest.manifest_id.clone(),
-                    })
-                },
-                HORIZON_AGE_WALK_MAX_MANIFESTS.saturating_add(1),
-                64 * 1024 * 1024,
-                AncestryGap::EndWalk,
-            )
-            .await?;
-        let (id, sequence) = match walk {
-            Some(AgeWalk::Aged { id, sequence }) => (id, sequence),
-            Some(AgeWalk::Capped { id }) => (id, 0),
-            None => match youngest {
-                Some((id, sequence)) => (id, sequence.saturating_sub(1)),
-                None => {
-                    return Err(invariant_violation(
-                        "retention horizon walk read no manifest",
-                    ));
-                }
-            },
-        };
-        Ok(PinnedSequenceV1 {
+            .timestamp_millis()
+            .checked_sub(CONTROL_MVP_RETENTION_CLOCK_SKEW_MS)
+            .ok_or_else(|| validation_failed("retention horizon clock underflow"))?;
+        let evidence = |id: &str, sequence: u64| PinnedSequenceV1 {
             kind: "manifest_age".into(),
-            id,
+            id: id.to_string(),
             sequence,
-        })
+        };
+        if head.committed_at_ms <= floor_ms {
+            return Ok(evidence(&head.manifest_id, head.logical_sequence));
+        }
+        let mut newest_examined = head.manifest_id.clone();
+        let mut next = head.age_anchor.clone();
+        let mut hops = 0_usize;
+        let mut bytes = 0_u64;
+        while let Some(record) = next {
+            hops += 1;
+            if hops > HORIZON_ANCHOR_HOP_BUDGET {
+                return Err(invariant_violation(
+                    "retention horizon anchor chain exceeds the hop budget",
+                ));
+            }
+            let Some(meta) = store
+                .storage
+                .head(&store.paths.manifest_object(&record.manifest_id))
+                .await?
+            else {
+                // GC collected the anchor. Its record still decides, in the
+                // only direction that cannot purge too much: at or below the
+                // floor it is the bound; above the floor the chain is corrupt.
+                if record.committed_at_ms <= floor_ms {
+                    return Ok(evidence(&record.manifest_id, record.sequence));
+                }
+                return Err(invariant_violation(
+                    "retention horizon anchor is missing while stamped above the floor",
+                ));
+            };
+            bytes = bytes
+                .checked_add(meta.size)
+                .filter(|total| *total <= HORIZON_ANCHOR_BYTE_BUDGET)
+                .ok_or_else(|| {
+                    invariant_violation("retention horizon anchor chain exceeds the byte budget")
+                })?;
+            let manifest = store
+                .load_manifest_with_expected_checksum(
+                    &record.manifest_id,
+                    Some(&record.manifest_sha256),
+                )
+                .await?;
+            let recorded = (record.sequence, record.committed_at_ms);
+            if (manifest.logical_sequence, manifest.committed_at_ms) != recorded {
+                return Err(invariant_violation(
+                    "retention horizon anchor record does not match its manifest",
+                ));
+            }
+            if manifest.committed_at_ms <= floor_ms {
+                return Ok(evidence(&record.manifest_id, record.sequence));
+            }
+            newest_examined = record.manifest_id;
+            next = manifest.age_anchor;
+        }
+        // The whole chain is younger than the floor: nothing is purgeable by age.
+        Ok(evidence(&newest_examined, 0))
     }
 
     /// Input 2: every active snapshot or export pin naming this scope, with
@@ -1710,7 +1740,6 @@ impl DurableMaintenanceWorker {
                 },
                 32,
                 64 * 1024 * 1024,
-                AncestryGap::FailClosed,
             ))
             .await?;
             if found.is_none() {
@@ -2744,6 +2773,16 @@ impl DurableMaintenanceWorker {
             .created_at
             .timestamp_millis()
             .max(current.committed_at_ms);
+        candidate.age_anchor = age_anchor_for_child(
+            candidate.committed_at_ms,
+            Some(AnchorParent {
+                manifest_id: &current.manifest_id,
+                manifest_sha256: &pointer.manifest_checksum_sha256,
+                sequence: current.logical_sequence,
+                committed_at_ms: current.committed_at_ms,
+                age_anchor: &current.age_anchor,
+            }),
+        );
         candidate.base_states = job.pages.iter().map(|page| page.output.clone()).collect();
         candidate.anchor_states.clear();
         candidate.tx_refs = suffix;
@@ -2876,7 +2915,6 @@ impl DurableMaintenanceWorker {
                 },
                 64,
                 64 * 1024 * 1024,
-                AncestryGap::FailClosed,
             ))
             .await?
             .ok_or_else(|| {

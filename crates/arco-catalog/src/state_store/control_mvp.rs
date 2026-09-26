@@ -163,8 +163,9 @@ pub use read_cache::{
 };
 pub(crate) mod maintenance;
 use integrity::{
-    CheckpointValidation, HistoryAnchor, HistoryLink, PinnedSequenceV1, PurgedCountsV1, PurgedRow,
-    RetentionHorizonV1, RewriteEquivalence, purged_rows_digest, validate_horizon_inputs,
+    AgeAnchorV1, AnchorParent, CheckpointValidation, HistoryAnchor, HistoryLink, PinnedSequenceV1,
+    PurgedCountsV1, PurgedRow, RetentionHorizonV1, RewriteEquivalence, age_anchor_for_child,
+    purged_rows_digest, validate_horizon_inputs,
 };
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
@@ -2007,24 +2008,15 @@ impl ControlMvpStateStore {
         digest: &str,
         select: impl FnMut(&ControlMvpManifest, &str) -> Option<T>,
     ) -> Result<Option<T>> {
-        self.resolve_ancestor_bounded(
-            id,
-            digest,
-            select,
-            4096,
-            64 * 1024 * 1024,
-            AncestryGap::FailClosed,
-        )
-        .await
+        self.resolve_ancestor_bounded(id, digest, select, 4096, 64 * 1024 * 1024)
+            .await
     }
 
     /// Walks authenticated ancestry from `id`/`digest` toward genesis,
-    /// validating every parent→child transition, until `select` answers,
+    /// validating every parent→child transition (kind, history, monotone
+    /// stamp and the age-anchor render rule), until `select` answers,
     /// genesis is reached (`Ok(None)`), or a budget is exhausted (error).
-    /// `gap` decides what a parent that no longer exists means: every
-    /// lineage witness fails closed, while the retention-age walk ends at
-    /// the youngest retained manifest because GC collects ancestors past
-    /// the token floor.
+    /// A parent object that no longer exists is an unavailable lineage.
     #[allow(clippy::too_many_lines)]
     async fn resolve_ancestor_bounded<T>(
         &self,
@@ -2033,7 +2025,6 @@ impl ControlMvpStateStore {
         mut select: impl FnMut(&ControlMvpManifest, &str) -> Option<T>,
         max_manifests: usize,
         max_bytes: usize,
-        gap: AncestryGap,
     ) -> Result<Option<T>> {
         let mut next = Some((id.to_string(), digest.to_string()));
         let mut visited = BTreeSet::new();
@@ -2118,7 +2109,26 @@ impl ControlMvpStateStore {
                     })
                     && source_physical_matches;
                 let history_matches = child.parent_history_root == manifest.history_root;
-                if (!mutation && !maintenance && !horizon) || !history_matches {
+                // Stamps never run backwards along ancestry, and the child
+                // carries exactly the anchor the render rule derives from
+                // this parent (recorded across a bucket, inherited within).
+                let stamp_monotone = child.committed_at_ms >= manifest.committed_at_ms;
+                let anchor_matches = child.age_anchor
+                    == age_anchor_for_child(
+                        child.committed_at_ms,
+                        Some(AnchorParent {
+                            manifest_id: &manifest.manifest_id,
+                            manifest_sha256: &digest,
+                            sequence: manifest.logical_sequence,
+                            committed_at_ms: manifest.committed_at_ms,
+                            age_anchor: &manifest.age_anchor,
+                        }),
+                    );
+                if (!mutation && !maintenance && !horizon)
+                    || !history_matches
+                    || !stamp_monotone
+                    || !anchor_matches
+                {
                     return Err(invariant_violation(
                         "invalid authenticated ancestry transition",
                     ));
@@ -2148,22 +2158,14 @@ impl ControlMvpStateStore {
                         || manifest.history_root.clone(),
                         |tx| tx.history.preceding_root.clone(),
                     ),
+                committed_at_ms: manifest.committed_at_ms,
                 equivalence: manifest.equivalence,
                 retention_horizon: manifest.retention_horizon,
+                age_anchor: manifest.age_anchor,
             });
             next = manifest
                 .base_manifest_id
                 .zip(manifest.parent_manifest_sha256);
-            if gap == AncestryGap::EndWalk
-                && let Some((parent_id, _)) = &next
-                && self
-                    .storage
-                    .head(&self.paths.manifest_object(parent_id))
-                    .await?
-                    .is_none()
-            {
-                return Ok(None);
-            }
         }
         Ok(None)
     }
@@ -2199,10 +2201,12 @@ impl ControlMvpStateStore {
             history_anchor: manifest.successor_history_anchor(),
             reclamation_generation: manifest.reclamation_generation,
             pointer_version: None,
-            manifest_id: Some(manifest.manifest_id),
             manifest_checksum_sha256: Some(sha256_hex(&manifest_bytes)),
             writer_epoch: 0,
             layout_generation: manifest.layout_generation,
+            committed_at_ms: manifest.committed_at_ms,
+            age_anchor: manifest.age_anchor,
+            manifest_id: Some(manifest.manifest_id),
             state,
             base_states,
             tx_refs,
@@ -2234,6 +2238,8 @@ impl ControlMvpStateStore {
                         manifest_checksum_sha256: None,
                         writer_epoch: 0,
                         layout_generation: 0,
+                        committed_at_ms: 0,
+                        age_anchor: None,
                         state: ReplayState::empty(&self.scope)?,
                         base_states: Vec::new(),
                         tx_refs: Vec::new(),
@@ -2272,6 +2278,8 @@ impl ControlMvpStateStore {
                 manifest_checksum_sha256: Some(pointer.manifest_checksum_sha256),
                 writer_epoch: pointer.writer_epoch,
                 layout_generation: manifest.layout_generation,
+                committed_at_ms: manifest.committed_at_ms,
+                age_anchor: manifest.age_anchor,
                 state,
                 base_states,
                 tx_refs,
@@ -2358,6 +2366,11 @@ impl ControlMvpStateStore {
             .manifest_id
             .as_deref()
             .ok_or_else(|| validation_failed("Control MVP restore lineage has no manifest"))?;
+        if committed_at_ms < stable.candidate_parent.committed_at_ms {
+            return Err(validation_failed(
+                "Control MVP restore stamp precedes its candidate parent",
+            ));
+        }
         let result_sequence = stable
             .candidate_parent
             .state
@@ -2510,6 +2523,10 @@ impl ControlMvpStateStore {
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
             retention_horizon: None,
+            age_anchor: age_anchor_for_child(
+                committed_at_ms,
+                stable.candidate_parent.anchor_parent(),
+            ),
         };
         manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.scope, &manifest.manifest_id)?;
@@ -2559,9 +2576,12 @@ impl ControlMvpStateStore {
         if identity.domain() != self.scope.domain() {
             return Err(validation_failed("restore identity domain mismatch"));
         }
-        let committed_at_ms = restore_commit_stamp(now)?;
         let source_values = self.restore_source_values(source, now).await?;
         let stable = self.load_stable_restore_base(source).await?;
+        // Stamps are monotone along ancestry: never before the candidate parent.
+        let committed_at_ms = stable
+            .candidate_parent
+            .child_stamp(restore_commit_stamp(now)?);
         let rendered = self.render_restore_candidate(
             source,
             &source_values,
@@ -2841,6 +2861,13 @@ pub struct ControlMvpMaintenanceWorker {
 const CONTROL_MVP_GC_PAGE_SIZE: usize = 256;
 const CONTROL_MVP_ORPHAN_MIN_AGE_DAYS: i64 = 7;
 const CONTROL_MVP_TOKEN_RETENTION_DAYS: i64 = 30;
+/// Clock-skew margin the retention horizon adds to the token-retention floor.
+/// Token validity and GC judge age by backend object time; the horizon judges
+/// it by writer stamps, and the two clocks can disagree by up to this much
+/// without a still-valid token's manifest being treated as past the floor.
+/// The same margin keeps an expiry hint from being purged by a worker clock
+/// slightly ahead of the writer that set it.
+const CONTROL_MVP_RETENTION_CLOCK_SKEW_MS: i64 = 60 * 60 * 1000;
 
 /// One immutable `control/v1` artifact proven eligible for deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4895,7 +4922,8 @@ impl ControlMvpTxn {
                 encoded,
             ));
         }
-        let committed_at_ms = cost::now().timestamp_millis();
+        // Stamps are monotone along ancestry: never before the pinned parent.
+        let committed_at_ms = base.child_stamp(cost::now().timestamp_millis());
         let mut tx = ControlMvpTxObject {
             history: HistoryLink::default(),
             reclamation_generation: base.reclamation_generation,
@@ -4987,6 +5015,7 @@ impl ControlMvpTxn {
             tx_refs.len(),
         )?;
 
+        let age_anchor = age_anchor_for_child(committed_at_ms, base.anchor_parent());
         let mut manifest = ControlMvpManifest {
             history_anchor: base.history_anchor.clone(),
             history_root: candidate_state.history_root.clone(),
@@ -5009,6 +5038,7 @@ impl ControlMvpTxn {
             state_checksum_sha256: candidate_state.checksum()?,
             maintenance_intent,
             retention_horizon: None,
+            age_anchor,
         };
         manifest.physical_root = manifest.physical_digest()?;
         manifest.validate(&self.store.scope, &manifest.manifest_id)?;
@@ -5878,21 +5908,32 @@ struct ControlMvpBase {
     manifest_id: Option<String>,
     writer_epoch: u64,
     layout_generation: u64,
+    /// The parent manifest's stamp (0 at genesis): a child is stamped no
+    /// earlier than this.
+    committed_at_ms: i64,
+    /// The parent manifest's age anchor, inherited or replaced by the render rule.
+    age_anchor: Option<AgeAnchorV1>,
     state: ReplayState,
     base_states: Vec<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
 }
 
-/// What an ancestry walk does when a manifest's parent object is absent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AncestryGap {
-    /// The parent is required: an absent object is an unavailable lineage.
-    FailClosed,
-    /// The walk ends at the last manifest that could be read, as if it
-    /// were genesis. Only the retention-age walk uses this: GC legitimately
-    /// collects ancestors older than the token floor, and the caller treats
-    /// the youngest retained manifest as the age boundary.
-    EndWalk,
+impl ControlMvpBase {
+    /// The parent as the age-anchor render rule sees it; `None` at genesis.
+    fn anchor_parent(&self) -> Option<AnchorParent<'_>> {
+        Some(AnchorParent {
+            manifest_id: self.manifest_id.as_deref()?,
+            manifest_sha256: self.manifest_checksum_sha256.as_deref()?,
+            sequence: self.state.logical_sequence,
+            committed_at_ms: self.committed_at_ms,
+            age_anchor: &self.age_anchor,
+        })
+    }
+
+    /// Monotone stamp for a child rendered at `clock_ms`: never before the parent.
+    fn child_stamp(&self, clock_ms: i64) -> i64 {
+        clock_ms.max(self.committed_at_ms)
+    }
 }
 
 struct AncestorTransition {
@@ -5901,8 +5942,10 @@ struct AncestorTransition {
     checksum: String,
     predecessor_digest: String,
     parent_history_root: String,
+    committed_at_ms: i64,
     equivalence: Option<RewriteEquivalence>,
     retention_horizon: Option<RetentionHorizonV1>,
+    age_anchor: Option<AgeAnchorV1>,
 }
 
 struct StableRestoreBase {
@@ -6710,6 +6753,12 @@ struct ControlMvpManifest {
     /// consolidations and restores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retention_horizon: Option<RetentionHorizonV1>,
+    /// Age-anchor chain link: the last manifest of the previous hour bucket,
+    /// recorded when this manifest's stamp crossed into a new bucket and
+    /// otherwise inherited from the parent. Genesis has none. Not part of any
+    /// canonical digest; the manifest envelope authenticates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    age_anchor: Option<AgeAnchorV1>,
 }
 
 impl ControlMvpManifest {
@@ -12526,7 +12575,6 @@ mod tests {
                     |_, _| None::<()>,
                     count,
                     bytes,
-                    AncestryGap::FailClosed,
                 )
                 .await
                 .unwrap_err();

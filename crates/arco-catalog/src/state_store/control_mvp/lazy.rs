@@ -22,6 +22,8 @@ use crate::state_store::{ScanContinuation, ScanContinuationOrigin};
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REQUEST_ENTRIES: usize = 1_000_000;
 const ENTRY_BYTES: usize = 96;
+/// Staged-byte accounting for a carried expiry hint (one `i64`).
+const EXPIRY_BYTES: usize = 8;
 
 /// One transaction's authenticated old-block and predicate-boundary inventory.
 #[derive(Clone, Debug, Default)]
@@ -810,7 +812,10 @@ impl ControlMvpTxn {
             key.len()
                 + ENTRY_BYTES
                 + match write {
-                    StagedWrite::Put(value) => value.len(),
+                    StagedWrite::Put {
+                        value,
+                        expires_at_ms,
+                    } => value.len() + expires_at_ms.map_or(0, |_| EXPIRY_BYTES),
                     StagedWrite::Delete => 0,
                 }
         };
@@ -1031,7 +1036,9 @@ impl ControlMvpTxn {
                 None
             };
             let value = match staged {
-                Some(StagedWrite::Put(value)) => Some(VersionedValue::new(value.clone(), None)),
+                Some(StagedWrite::Put { value, .. }) => {
+                    Some(VersionedValue::new(value.clone(), None))
+                }
                 Some(StagedWrite::Delete) => None,
                 None => base
                     .as_ref()
@@ -1106,7 +1113,7 @@ impl ArcoStateTxn for ControlMvpTxn {
     async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
         if let Some(write) = self.writes.get(key) {
             let value = match write {
-                StagedWrite::Put(value) => Some(VersionedValue::new(value.clone(), None)),
+                StagedWrite::Put { value, .. } => Some(VersionedValue::new(value.clone(), None)),
                 StagedWrite::Delete => None,
             };
             self.reads.overlay(key)?;
@@ -1130,7 +1137,7 @@ impl ArcoStateTxn for ControlMvpTxn {
             for (key, write) in &self.writes {
                 if key.starts_with(request.prefix()) {
                     match write {
-                        StagedWrite::Put(value) => {
+                        StagedWrite::Put { value, .. } => {
                             entries.insert(key.clone(), VersionedValue::new(value.clone(), None));
                         }
                         StagedWrite::Delete => {
@@ -1149,7 +1156,39 @@ impl ArcoStateTxn for ControlMvpTxn {
         self.scan_lazy(request).await
     }
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
-        self.stage_write(key, StagedWrite::Put(value))
+        self.stage_write(
+            key,
+            StagedWrite::Put {
+                value,
+                expires_at_ms: None,
+            },
+        )
+    }
+    async fn put_with_expiry(
+        &mut self,
+        key: &[u8],
+        value: Bytes,
+        expires_at_ms: i64,
+    ) -> Result<()> {
+        if expires_at_ms <= 0 {
+            return Err(validation_failed(
+                "expires_at_ms must be a positive Unix millisecond timestamp",
+            ));
+        }
+        // Format-8 bounded segments carry no expiry column; refuse before
+        // anything is staged so a following commit is unaffected.
+        if matches!(self.base, TransactionBase::Bounded(_)) {
+            return Err(validation_failed(
+                "expiry is not supported on bounded authority",
+            ));
+        }
+        self.stage_write(
+            key,
+            StagedWrite::Put {
+                value,
+                expires_at_ms: Some(expires_at_ms),
+            },
+        )
     }
     async fn delete(&mut self, key: &[u8]) -> Result<()> {
         self.stage_write(key, StagedWrite::Delete)

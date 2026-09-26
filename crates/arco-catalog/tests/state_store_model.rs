@@ -582,11 +582,12 @@ async fn replay_from_committed_events_equals_folded_kv_state() {
     assert_eq!(store.explain_transitions(), replayed.explain_transitions());
     assert_eq!(
         vec![
-            (b"catalog/default".to_vec(), None, 2,),
+            (b"catalog/default".to_vec(), None, 2, None),
             (
                 b"catalog/other".to_vec(),
                 Some(Bytes::from_static(b"v2")),
                 1,
+                None,
             ),
         ],
         replayed.folded_entries()
@@ -691,4 +692,141 @@ async fn failed_transactions_publish_no_partial_state() {
             .logical_sequence()
     );
     assert_eq!(2, store.committed_records().len());
+}
+
+#[tokio::test]
+async fn put_with_expiry_is_folded_replayed_and_explained_without_filtering_reads() {
+    let store = ModelStateStore::new(scope());
+
+    let mut txn = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.put_with_expiry(
+        b"catalog/expiring",
+        Bytes::from_static(b"soon"),
+        1_900_000_000_000,
+    )
+    .await
+    .expect("stage expiring write");
+    txn.put(b"catalog/plain", Bytes::from_static(b"kept"))
+        .await
+        .expect("stage plain write");
+    // In-transaction reads return the staged value; the hint is invisible.
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        txn.get(b"catalog/expiring")
+            .await
+            .expect("overlay read")
+            .map(|value| value.bytes().clone())
+    );
+    txn.commit().await.expect("commit");
+
+    // Point and scan reads never filter on the hint.
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        store.get(b"catalog/expiring").await.expect("get")
+    );
+    let page = store
+        .scan(ScanRequest::new(b"catalog/"))
+        .await
+        .expect("scan");
+    assert_eq!(
+        vec![b"catalog/expiring".to_vec(), b"catalog/plain".to_vec()],
+        page.entries()
+            .iter()
+            .map(|entry| entry.key().to_vec())
+            .collect::<Vec<_>>()
+    );
+
+    // The folded state carries the hint on exactly the expiring row.
+    assert_eq!(
+        vec![
+            (
+                b"catalog/expiring".to_vec(),
+                Some(Bytes::from_static(b"soon")),
+                1,
+                Some(1_900_000_000_000),
+            ),
+            (
+                b"catalog/plain".to_vec(),
+                Some(Bytes::from_static(b"kept")),
+                1,
+                None,
+            ),
+        ],
+        store.folded_entries()
+    );
+    let records = store.committed_records();
+    assert_eq!(
+        Some(1_900_000_000_000),
+        records[0].writes()[0].expires_at_ms()
+    );
+    assert_eq!(None, records[0].writes()[1].expires_at_ms());
+    assert_eq!(
+        [
+            "put catalog/expiring generation=1 bytes=4 expires_at_ms=1900000000000",
+            "put catalog/plain generation=1 bytes=4",
+        ],
+        records[0].logical_events()
+    );
+
+    // Replay from committed records preserves the hint and the explanation.
+    let replayed =
+        ModelStateStore::replay_from_committed_records(scope(), records).expect("replay");
+    assert_eq!(store.folded_entries(), replayed.folded_entries());
+    assert_eq!(store.explain_transitions(), replayed.explain_transitions());
+    assert!(
+        store.explain_transitions()[0]
+            .contains("put(catalog/expiring@1 expires_at_ms=1900000000000)"),
+        "transition explanation must name the expiry: {:?}",
+        store.explain_transitions()
+    );
+
+    // A plain put over an expiring row clears the hint.
+    let mut clear = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin clearing transaction");
+    clear
+        .put(b"catalog/expiring", Bytes::from_static(b"forever"))
+        .await
+        .expect("stage plain overwrite");
+    clear.commit().await.expect("commit clearing transaction");
+    assert_eq!(
+        Some(&(
+            b"catalog/expiring".to_vec(),
+            Some(Bytes::from_static(b"forever")),
+            2,
+            None,
+        )),
+        store.folded_entries().first()
+    );
+}
+
+#[tokio::test]
+async fn model_put_with_expiry_rejects_non_positive_hints_before_staging() {
+    let store = ModelStateStore::new(scope());
+    let mut txn = store
+        .begin_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    for expires_at_ms in [0_i64, -1, i64::MIN] {
+        let error = txn
+            .put_with_expiry(b"catalog/row", Bytes::from_static(b"v"), expires_at_ms)
+            .await
+            .expect_err("non-positive expiry must be rejected");
+        assert!(
+            matches!(error, CatalogError::Validation { .. }),
+            "expected Validation, got {error:?}"
+        );
+    }
+    assert!(
+        txn.get(b"catalog/row")
+            .await
+            .expect("overlay read")
+            .is_none()
+    );
+    txn.commit().await.expect("empty commit");
+    assert!(store.folded_entries().is_empty());
 }

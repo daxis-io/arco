@@ -14,10 +14,10 @@ use super::{
     RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RenderedControlMvpStateSegment, ReplayState,
     Result, RetainedAuthorityRoots, RetentionMutationEpoch, RewriteEquivalence,
     SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256,
-    StateScope, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds, cost,
-    decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited, encode_json,
-    encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag, hash_u64,
-    integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
+    StateScope, StoredValue, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds,
+    cost, decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited,
+    encode_json, encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag,
+    hash_u64, integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
     precondition_failed, put_immutable_matching, segment_row_key_bounds_hex, sha256_hex,
     sort_segment_rows, state_segment_reference, valid_raw_digest, validate_raw_checksum,
     validation_failed,
@@ -236,16 +236,12 @@ impl PreparedPlan {
                 .saturating_add(key.len())
                 .saturating_add(value.bytes.len())
                 .saturating_add(128);
-            candidate.push(ControlMvpSegmentRow {
-                record_kind: SEGMENT_RECORD_KV,
-                key: key.clone(),
-                value: (!value.tombstone).then(|| value.bytes.to_vec()),
-                generation: value.generation,
-                tombstone: value.tombstone,
-                logical_sequence: state.logical_sequence,
-                logical_ordinal: ordinal as u64,
-                origin_sequence: None,
-            });
+            candidate.push(kv_segment_row(
+                key.clone(),
+                value,
+                state.logical_sequence,
+                ordinal as u64,
+            ));
             if candidate.len() >= row_limit || candidate_bytes >= MAX_SEGMENT_BYTES / 2 {
                 plan.add_chunk(store, seed, &sources, &mut candidate)?;
                 candidate.clear();
@@ -271,6 +267,7 @@ impl PreparedPlan {
                 logical_sequence: state.logical_sequence,
                 logical_ordinal: ordinal as u64,
                 origin_sequence: record.origin_sequence,
+                expires_at_ms: None,
             });
             if candidate.len() >= row_limit || candidate_bytes >= MAX_SEGMENT_BYTES / 2 {
                 plan.add_chunk(store, seed, &sources, &mut candidate)?;
@@ -479,16 +476,12 @@ impl PlanPage {
                         let logical_ordinal = ordinal
                             .checked_add(rows.len() as u64)
                             .ok_or_else(|| invariant_violation("maintenance ordinal overflow"))?;
-                        rows.push(ControlMvpSegmentRow {
-                            record_kind: SEGMENT_RECORD_KV,
+                        rows.push(kv_segment_row(
                             key,
-                            value: (!value.tombstone).then(|| value.bytes.to_vec()),
-                            generation: value.generation,
-                            tombstone: value.tombstone,
-                            logical_sequence: source.logical_sequence,
+                            &value,
+                            source.logical_sequence,
                             logical_ordinal,
-                            origin_sequence: None,
-                        });
+                        ));
                         if rows.len() > self.rows {
                             return Err(invariant_violation(
                                 "maintenance range contains excess rows",
@@ -2858,4 +2851,26 @@ pub(super) async fn expired_pin_page(
         }))
     }))
     .await
+}
+
+/// Renders one replayed KV entry as an L1 segment row. The expiry hint is
+/// carried row for row so consolidation never flattens a purge-eligible row
+/// into a permanent one.
+fn kv_segment_row(
+    key: Vec<u8>,
+    value: &StoredValue,
+    logical_sequence: u64,
+    logical_ordinal: u64,
+) -> ControlMvpSegmentRow {
+    ControlMvpSegmentRow {
+        record_kind: SEGMENT_RECORD_KV,
+        key,
+        value: (!value.tombstone).then(|| value.bytes.to_vec()),
+        generation: value.generation,
+        tombstone: value.tombstone,
+        logical_sequence,
+        logical_ordinal,
+        origin_sequence: None,
+        expires_at_ms: value.expires_at_ms,
+    }
 }

@@ -123,6 +123,15 @@ impl Canonical {
             }
         }
     }
+    fn optional_i64(&mut self, value: Option<i64>) {
+        match value {
+            None => self.u8(0),
+            Some(value) => {
+                self.u8(1);
+                self.0.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+    }
     fn digest(&mut self, value: &str) -> Result<()> {
         if !valid_raw_digest(value) {
             return Err(invariant_violation("invalid canonical digest"));
@@ -192,6 +201,10 @@ fn mutation_canonical(tx: &ControlMvpTxObject) -> Result<Canonical> {
         out.bytes(&write.key);
         out.u64(write.generation);
         out.optional_bytes(write.value.as_deref());
+        // Format 9 / segment format 2: the expiry hint is part of the
+        // mutation. The absent case is the one-byte `0` discriminant, the
+        // same shape `optional_bytes` uses.
+        out.optional_i64(write.expires_at_ms);
     }
     out.u64(tx.outbox.len() as u64);
     for entry in &tx.outbox {

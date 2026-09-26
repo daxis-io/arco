@@ -243,6 +243,7 @@ impl ControlMvpStateStore {
                 logical_sequence,
                 logical_ordinal: ordinal,
                 origin_sequence: None,
+                expires_at_ms: None,
             });
             ordinal = ordinal
                 .checked_add(1)
@@ -287,6 +288,7 @@ impl ControlMvpStateStore {
                 logical_sequence,
                 logical_ordinal: intent.ordinal(),
                 origin_sequence: Some(intent.source_logical_sequence()),
+                expires_at_ms: None,
             });
             delivery_part.push(ControlMvpSegmentRow {
                 record_kind: super::super::SEGMENT_RECORD_OUTBOX,
@@ -301,6 +303,7 @@ impl ControlMvpStateStore {
                 logical_sequence,
                 logical_ordinal: intent.ordinal(),
                 origin_sequence: Some(intent.source_logical_sequence()),
+                expires_at_ms: None,
             });
             if active_part.len() == rows_per_part {
                 active_writer

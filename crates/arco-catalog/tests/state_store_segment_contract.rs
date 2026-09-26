@@ -11,8 +11,9 @@ use arco_catalog::{
 };
 use arco_core::storage::{WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
-use arrow::array::{BinaryArray, BooleanArray, UInt8Array, UInt64Array};
+use arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use arrow::ipc::{Block, Footer, FooterArgs};
 use arrow::record_batch::RecordBatch;
@@ -27,8 +28,9 @@ fn storage() -> ScopedStorage {
         .expect("scoped storage")
 }
 
-fn segment_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
+/// The eight columns every segment format has carried since format 1.
+fn format1_fields() -> Vec<Field> {
+    vec![
         Field::new("record_kind", DataType::UInt8, false),
         Field::new("key", DataType::Binary, false),
         Field::new("value", DataType::Binary, true),
@@ -37,7 +39,20 @@ fn segment_schema() -> Arc<Schema> {
         Field::new("logical_sequence", DataType::UInt64, false),
         Field::new("logical_ordinal", DataType::UInt64, false),
         Field::new("origin_sequence", DataType::UInt64, true),
-    ]))
+    ]
+}
+
+/// Segment format 1: the retired eight-column shape, kept only to prove the
+/// reader rejects it.
+fn legacy_format1_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(format1_fields()))
+}
+
+/// Segment format 2: format 1 plus the nullable per-row expiry hint.
+fn segment_schema() -> Arc<Schema> {
+    let mut fields = format1_fields();
+    fields.push(Field::new("expires_at_ms", DataType::Int64, true));
+    Arc::new(Schema::new(fields))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,6 +66,32 @@ fn segment_batch(
     ordinals: Vec<u64>,
     origins: Vec<Option<u64>>,
 ) -> RecordBatch {
+    let expiries = vec![None; record_kinds.len()];
+    segment_batch_with_expiry(
+        record_kinds,
+        keys,
+        values,
+        generations,
+        tombstones,
+        sequences,
+        ordinals,
+        origins,
+        expiries,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn segment_batch_with_expiry(
+    record_kinds: Vec<u8>,
+    keys: Vec<&'static [u8]>,
+    values: Vec<Option<&'static [u8]>>,
+    generations: Vec<u64>,
+    tombstones: Vec<bool>,
+    sequences: Vec<u64>,
+    ordinals: Vec<u64>,
+    origins: Vec<Option<u64>>,
+    expiries: Vec<Option<i64>>,
+) -> RecordBatch {
     RecordBatch::try_new(
         segment_schema(),
         vec![
@@ -62,9 +103,66 @@ fn segment_batch(
             Arc::new(UInt64Array::from(sequences)),
             Arc::new(UInt64Array::from(ordinals)),
             Arc::new(UInt64Array::from(origins)),
+            Arc::new(Int64Array::from(expiries)),
         ],
     )
     .expect("test segment batch")
+}
+
+/// A format-1 (eight-column) batch, buildable only through the legacy schema.
+fn legacy_format1_batch() -> RecordBatch {
+    RecordBatch::try_new(
+        legacy_format1_schema(),
+        vec![
+            Arc::new(UInt8Array::from(vec![0_u8])),
+            Arc::new(BinaryArray::from(vec![&b"catalogs/seed"[..]])),
+            Arc::new(BinaryArray::from(vec![Some(&b"seed"[..])])),
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(BooleanArray::from(vec![false])),
+            Arc::new(UInt64Array::from(vec![1_u64])),
+            Arc::new(UInt64Array::from(vec![0_u64])),
+            Arc::new(UInt64Array::from(vec![None::<u64>])),
+        ],
+    )
+    .expect("legacy format-1 batch")
+}
+
+/// Decodes `(key, expires_at_ms)` for every row of a single-block segment.
+fn segment_key_expiries(bytes: &Bytes) -> Vec<(Vec<u8>, Option<i64>)> {
+    let reader = FileReader::try_new(std::io::Cursor::new(bytes.clone()), None)
+        .expect("Arrow IPC reader over committed segment");
+    assert_eq!(
+        segment_schema().as_ref(),
+        reader.schema().as_ref(),
+        "committed segment must carry exactly the format-2 schema"
+    );
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode committed segment");
+    assert_eq!(
+        1,
+        batches.len(),
+        "single-block segment must hold exactly one batch"
+    );
+    let batch = &batches[0];
+    let keys = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("key column");
+    let expiries = batch
+        .column(8)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("expires_at_ms column");
+    (0..batch.num_rows())
+        .map(|row| {
+            (
+                keys.value(row).to_vec(),
+                (!expiries.is_null(row)).then(|| expiries.value(row)),
+            )
+        })
+        .collect()
 }
 
 fn arrow_file(schema: &Schema, batches: &[RecordBatch]) -> Vec<u8> {
@@ -295,8 +393,10 @@ fn fixture_physical_root(manifest: &MirrorManifest) -> String {
             ] {
                 out.extend_from_slice(&integer.to_be_bytes());
             }
-            out.extend_from_slice(&1_u32.to_be_bytes());
-            out.extend_from_slice(&1_u32.to_be_bytes());
+            // Segment format 2 (the nine-column Arrow shape), bound twice:
+            // once for the segment and once for its index directory.
+            out.extend_from_slice(&2_u32.to_be_bytes());
+            out.extend_from_slice(&2_u32.to_be_bytes());
             for bound in [&state.min_key_hex, &state.max_key_hex] {
                 out.push(u8::from(bound.is_some()));
                 if let Some(bound) = bound {
@@ -654,6 +754,99 @@ async fn commit_persists_indexed_l0_and_l1_arrow_segments() {
     }
     assert_eq!("catalogs/sales", l1_index["minKeyUtf8"]);
     assert_eq!("catalogs/sales", l1_index["maxKeyUtf8"]);
+}
+
+#[tokio::test]
+async fn committed_segments_carry_a_nullable_expiry_column_under_segment_format_2() {
+    let storage = storage();
+    let store = store(storage.clone());
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    let tx_id = txn.tx_id().to_string();
+    let state_id = txn.candidate_manifest_id().replace("manifest-", "state-");
+    txn.put_with_expiry(
+        b"catalogs/expiring",
+        Bytes::from_static(b"soon"),
+        1_900_000_000_000,
+    )
+    .await
+    .expect("stage expiring write");
+    txn.put(b"catalogs/sales", Bytes::from_static(b"active"))
+        .await
+        .expect("stage plain write");
+    txn.commit().await.expect("commit");
+
+    let paths = store.paths();
+    for (segment_id, segment_path) in [
+        (tx_id.as_str(), paths.l0_segment_object(&tx_id)),
+        (state_id.as_str(), paths.state_object(&state_id)),
+    ] {
+        let index: Value = serde_json::from_slice(
+            &storage
+                .get_raw(&paths.segment_index(segment_id))
+                .await
+                .expect("read segment index"),
+        )
+        .expect("decode segment index");
+        assert_eq!(
+            2, index["formatVersion"],
+            "segment {segment_id} index format"
+        );
+        let segment = storage
+            .get_raw(&segment_path)
+            .await
+            .expect("read committed segment");
+        let reader = FileReader::try_new(std::io::Cursor::new(segment.clone()), None)
+            .expect("Arrow IPC reader");
+        let schema = reader.schema();
+        assert_eq!(
+            9,
+            schema.fields().len(),
+            "segment {segment_id} column count"
+        );
+        assert_eq!(
+            &Field::new("expires_at_ms", DataType::Int64, true),
+            schema.field(8),
+            "segment {segment_id} ninth column"
+        );
+        assert_eq!(
+            vec![
+                (b"catalogs/expiring".to_vec(), Some(1_900_000_000_000)),
+                (b"catalogs/sales".to_vec(), None),
+            ],
+            segment_key_expiries(&segment),
+            "segment {segment_id} expiry values"
+        );
+    }
+    // Reads never filter on the hint: the expiring row is an ordinary entry.
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        store.get(b"catalogs/expiring").await.expect("read")
+    );
+}
+
+#[tokio::test]
+async fn eight_column_format_1_segments_are_rejected_at_preflight() {
+    let (storage, store, state_id, selected_manifest_id) = anchored_store().await;
+    let legacy = arrow_file(legacy_format1_schema().as_ref(), &[legacy_format1_batch()]);
+    install_malformed_l1(
+        &storage,
+        &store,
+        &state_id,
+        &selected_manifest_id,
+        legacy,
+        1,
+        &[b"catalogs/seed"],
+        None,
+    )
+    .await;
+    let error = assert_typed_read_error(store).await;
+    assert!(
+        error.to_string().contains("schema"),
+        "a format-1 segment must be rejected by the exact-schema preflight, got {error}"
+    );
 }
 
 #[tokio::test]

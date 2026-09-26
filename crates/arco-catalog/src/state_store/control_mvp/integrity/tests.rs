@@ -138,6 +138,7 @@ async fn retained_suffix_rewrite_binds_both_cuts_and_traverses_publish_history()
             bytes: Bytes::from_static(b"masked corruption"),
             generation: 1,
             tombstone: false,
+            expires_at_ms: None,
         },
     );
     let forged_rows = store
@@ -192,17 +193,26 @@ fn populate_vector_mutation(tx: &mut ControlMvpTxObject) {
             key: vec![0, 255],
             generation: 1,
             value: Some(Vec::new()),
+            expires_at_ms: None,
         },
         ControlMvpWriteEntry {
             key: Vec::new(),
             generation: 1,
             value: None,
+            expires_at_ms: None,
         },
     ];
     tx.outbox = vec![ControlMvpOutboxEntry {
         record_id: "event".to_string(),
         payload: vec![255],
     }];
+}
+
+/// Segment format 2: the same mutation with one live write carrying an expiry
+/// hint. Pins the `optional i64` encoding that follows the optional value.
+fn populate_expiring_vector_mutation(tx: &mut ControlMvpTxObject) {
+    populate_vector_mutation(tx);
+    tx.writes[0].expires_at_ms = Some(1_893_456_000_000);
 }
 
 async fn nonempty_vector_layout(
@@ -280,6 +290,19 @@ fn canonical_hashes_match_recorded_binary_vectors() {
     tx.reclamation_generation = 32;
     tx.committed_at_ms = 1_893_456_000_000;
     assert_eq!(mutation_digest(&tx).unwrap(), expected("one_mutation"));
+    let mut expiring = vector_tx(&scope);
+    populate_expiring_vector_mutation(&mut expiring);
+    assert_eq!(
+        mutation_digest(&expiring).unwrap(),
+        expected("expiring_mutation")
+    );
+    assert_ne!(expected("expiring_mutation"), expected("one_mutation"));
+    assert_eq!(
+        HistoryLink::new(&expiring, &genesis(&scope).unwrap().root)
+            .unwrap()
+            .resulting_root,
+        expected("expiring_commit_history")
+    );
     assert_eq!(
         physical_digest(&scope, &[], &[], &[], &[]).unwrap(),
         expected("empty_manifest_layout")
@@ -316,6 +339,14 @@ async fn generate_format_canonical_vectors() {
     entries.push((
         "one_commit_history",
         history_step_canonical(&scope, &genesis_root, 1, &one_mutation).unwrap(),
+    ));
+    let mut expiring = vector_tx(&scope);
+    populate_expiring_vector_mutation(&mut expiring);
+    let expiring_mutation = mutation_digest(&expiring).unwrap();
+    entries.push(("expiring_mutation", mutation_canonical(&expiring).unwrap()));
+    entries.push((
+        "expiring_commit_history",
+        history_step_canonical(&scope, &genesis_root, 1, &expiring_mutation).unwrap(),
     ));
     entries.push((
         "empty_manifest_layout",
@@ -375,6 +406,54 @@ async fn generate_format_canonical_vectors() {
         out,
     )
     .unwrap();
+}
+
+#[test]
+fn mutation_preimage_encodes_the_expiry_hint_as_an_optional_i64_after_the_value() {
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let mut plain = vector_tx(&scope);
+    populate_vector_mutation(&mut plain);
+    let mut expiring = plain.clone();
+    expiring.writes[0].expires_at_ms = Some(0x0102_0304_0506_0708);
+    let plain_preimage = mutation_canonical(&plain).unwrap().preimage().to_vec();
+    let expiring_preimage = mutation_canonical(&expiring).unwrap().preimage().to_vec();
+    // Writes sort by key, so `vec![]` precedes `vec![0, 255]`: the expiring
+    // write is the second one. Its absent hint is the single `0` byte that
+    // ends the write; present, it is `1` followed by the big-endian i64.
+    let value_absent = [0_u8];
+    let (before, after) = split_at_second_write_hint(&plain_preimage);
+    assert_eq!(after, value_absent, "absent hint is one zero byte");
+    let mut expected = before.to_vec();
+    expected.push(1);
+    expected.extend_from_slice(&0x0102_0304_0506_0708_i64.to_be_bytes());
+    expected.extend_from_slice(&plain_preimage[before.len() + 1..]);
+    assert_eq!(expiring_preimage, expected);
+    assert_ne!(
+        mutation_digest(&plain).unwrap(),
+        mutation_digest(&expiring).unwrap()
+    );
+}
+
+/// Splits a two-write mutation preimage right before the second write's
+/// expiry-hint discriminant, returning the trailing hint region of exactly
+/// the bytes that follow that write's value up to the outbox count.
+fn split_at_second_write_hint(preimage: &[u8]) -> (&[u8], &[u8]) {
+    // Layout after the second write's value: hint bytes, then the u64
+    // outbox count (1), then the outbox entry. Locate the outbox count.
+    let outbox_count = 1_u64.to_be_bytes();
+    let record_id = b"event";
+    let tail = [
+        &outbox_count[..],
+        &(record_id.len() as u64).to_be_bytes()[..],
+        record_id,
+    ]
+    .concat();
+    let position = preimage
+        .windows(tail.len())
+        .rposition(|window| window == tail.as_slice())
+        .expect("outbox section");
+    let hint_start = position - 1;
+    (&preimage[..hint_start], &preimage[hint_start..position])
 }
 
 #[test]
@@ -1155,6 +1234,7 @@ async fn rendered_rewrites_reject_lost_altered_and_duplicated_rows() {
                 bytes: Bytes::from_static(b"value"),
                 generation: 1,
                 tombstone: false,
+                expires_at_ms: None,
             },
         );
     }

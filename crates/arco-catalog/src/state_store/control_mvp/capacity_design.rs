@@ -38,7 +38,7 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
     assert_eq!(source_values.len(), 8);
     let decoded_bytes = source_values
         .iter()
-        .map(|(k, v)| k.len() + v.len())
+        .map(|(k, v)| k.len() + v.bytes.len())
         .sum::<usize>();
     assert!(decoded_bytes < MAX_SEGMENT_BYTES);
     let mut txn = store
@@ -83,7 +83,10 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
             > before.logical_sequence()
     );
     for (key, expected) in &source_values {
-        assert_eq!(store.get(key).await.unwrap().as_ref(), Some(expected));
+        assert_eq!(
+            store.get(key).await.unwrap().as_ref(),
+            Some(&expected.bytes)
+        );
     }
     println!(
         "{}",
@@ -250,6 +253,7 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
             logical_sequence: mutations,
             logical_ordinal: index,
             origin_sequence: None,
+            expires_at_ms: None,
         });
     }
     if !batch.is_empty() {

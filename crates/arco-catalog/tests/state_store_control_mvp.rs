@@ -5845,3 +5845,440 @@ async fn gate4_cancelled_multi_trim_stages_nothing() {
         2
     );
 }
+
+// ---------------------------------------------------------------------------
+// Per-row expiry hint (segment format 2)
+// ---------------------------------------------------------------------------
+
+/// Decodes `(record_kind, key, expires_at_ms)` for every row of a segment by
+/// walking its authenticated index directory block by block.
+async fn segment_row_expiries(
+    storage: &ScopedStorage,
+    paths: &ControlMvpPaths,
+    segment_id: &str,
+    segment_path: &str,
+) -> Vec<(u8, Vec<u8>, Option<i64>)> {
+    use arrow::array::{Array, BinaryArray, Int64Array, UInt8Array};
+    use arrow::ipc::reader::FileReader;
+    let index: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&paths.segment_index(segment_id))
+            .await
+            .expect("read segment index"),
+    )
+    .expect("decode segment index");
+    assert_eq!(
+        2, index["formatVersion"],
+        "segment {segment_id} index format"
+    );
+    let segment = storage
+        .get_raw(segment_path)
+        .await
+        .expect("read segment bytes");
+    let mut rows = Vec::new();
+    for block in index["blocks"].as_array().expect("index blocks") {
+        let offset = usize::try_from(block["offset"].as_u64().expect("block offset"))
+            .expect("block offset fits usize");
+        let length = usize::try_from(block["length"].as_u64().expect("block length"))
+            .expect("block length fits usize");
+        let reader = FileReader::try_new(
+            std::io::Cursor::new(segment.slice(offset..offset + length)),
+            None,
+        )
+        .expect("Arrow IPC block reader");
+        assert_eq!(9, reader.schema().fields().len(), "format-2 column count");
+        for batch in reader {
+            let batch = batch.expect("decode block batch");
+            let kinds = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("record_kind column");
+            let keys = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("key column");
+            let expiries = batch
+                .column(8)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("expires_at_ms column");
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    kinds.value(row),
+                    keys.value(row).to_vec(),
+                    (!expiries.is_null(row)).then(|| expiries.value(row)),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+fn kv_expiry(rows: &[(u8, Vec<u8>, Option<i64>)], key: &[u8]) -> Option<i64> {
+    let matches = rows
+        .iter()
+        .filter(|(kind, row_key, _)| *kind == 0 && row_key == key)
+        .collect::<Vec<_>>();
+    assert_eq!(1, matches.len(), "exactly one KV row for {key:?}");
+    matches[0].2
+}
+
+async fn manifest_payload(storage: &ScopedStorage, paths: &ControlMvpPaths, id: &str) -> Value {
+    let mut doc: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&paths.manifest_object(id))
+            .await
+            .expect("read manifest"),
+    )
+    .expect("decode manifest");
+    doc["payload"].take()
+}
+
+async fn current_manifest_payload(store: &ControlMvpStateStore, storage: &ScopedStorage) -> Value {
+    let token = store.current_state_token().await.expect("current token");
+    manifest_payload(storage, &store.paths(), token.authority_manifest_id()).await
+}
+
+const EXPIRES_AT_MS: i64 = 1_900_000_000_000;
+
+#[tokio::test]
+async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_without_filtering_reads()
+ {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let paths = store.paths();
+
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    let first_tx_id = txn.tx_id().to_string();
+    txn.put_with_expiry(
+        b"catalog/expiring",
+        Bytes::from_static(b"soon"),
+        EXPIRES_AT_MS,
+    )
+    .await
+    .expect("stage expiring write");
+    txn.put(b"catalog/plain", Bytes::from_static(b"kept"))
+        .await
+        .expect("stage plain write");
+    // A read inside the transaction sees the staged value, not the hint.
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        txn.get(b"catalog/expiring")
+            .await
+            .expect("overlay read")
+            .map(|value| value.bytes().clone())
+    );
+    let first = txn.commit().await.expect("commit");
+
+    // Reads never filter on expiry: point, scan and token-pinned reads all
+    // return the value unchanged.
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        store.get(b"catalog/expiring").await.expect("get")
+    );
+    let page = store
+        .scan(ScanRequest::new(b"catalog/"))
+        .await
+        .expect("scan");
+    assert_eq!(
+        vec![
+            (b"catalog/expiring".to_vec(), Bytes::from_static(b"soon")),
+            (b"catalog/plain".to_vec(), Bytes::from_static(b"kept")),
+        ],
+        page.entries()
+            .iter()
+            .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
+            .collect::<Vec<_>>()
+    );
+    let pinned = store
+        .read_at(first.into_state_token())
+        .await
+        .expect("read_at");
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        pinned.get(b"catalog/expiring").await.expect("pinned get")
+    );
+
+    // The L0 segment carries the hint on the expiring row and null elsewhere.
+    let l0 = segment_row_expiries(
+        &storage,
+        &paths,
+        &first_tx_id,
+        &paths.l0_segment_object(&first_tx_id),
+    )
+    .await;
+    assert_eq!(Some(EXPIRES_AT_MS), kv_expiry(&l0, b"catalog/expiring"));
+    assert_eq!(None, kv_expiry(&l0, b"catalog/plain"));
+
+    // L0 replay through a fresh store instance keeps the value readable, and
+    // the replayed state checksum (which covers the hint) still authenticates.
+    let replayed = ControlMvpStateStore::new(storage.clone(), scope()).expect("fresh store");
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        replayed
+            .get(b"catalog/expiring")
+            .await
+            .expect("replayed get")
+    );
+
+    // Consolidation: sixteen L0 segments trigger the durable maintenance
+    // intent; the rendered L1 must preserve the hint row for row.
+    for sequence in 2..=16_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin filler");
+        txn.put(
+            format!("catalog/filler-{sequence:02}").as_bytes(),
+            Bytes::from(sequence.to_be_bytes().to_vec()),
+        )
+        .await
+        .expect("stage filler");
+        txn.commit().await.expect("commit filler");
+    }
+    let durable = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([23; 32]),
+    )
+    .unwrap();
+    let maintenance = durable_maintenance::consolidate_pending(&durable)
+        .await
+        .expect("consolidate pending suffix")
+        .expect("selected maintenance layout");
+    assert_eq!(16, maintenance.selected_token().logical_sequence());
+    let consolidated = current_manifest_payload(&store, &storage).await;
+    assert!(
+        consolidated["tx_refs"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "consolidation must fold the L0 suffix into L1"
+    );
+    let base_states = consolidated["base_states"].as_array().expect("base states");
+    let mut l1_rows = Vec::new();
+    for state in base_states {
+        let state_id = state["state_id"].as_str().expect("state id");
+        l1_rows.extend(
+            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
+        );
+    }
+    assert_eq!(
+        Some(EXPIRES_AT_MS),
+        kv_expiry(&l1_rows, b"catalog/expiring")
+    );
+    assert_eq!(None, kv_expiry(&l1_rows, b"catalog/plain"));
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        store
+            .get(b"catalog/expiring")
+            .await
+            .expect("consolidated get")
+    );
+
+    // A checkpoint read opens the snapshot without filtering, and the
+    // checkpoint's own state segment keeps the hint.
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint");
+    let checkpoint_reader = store
+        .read_checkpoint(checkpoint.clone())
+        .await
+        .expect("open checkpoint");
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        checkpoint_reader
+            .get(b"catalog/expiring")
+            .await
+            .expect("checkpoint get")
+    );
+    let checkpoint_doc: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&paths.checkpoint_object(checkpoint.checkpoint_id()))
+            .await
+            .expect("read checkpoint"),
+    )
+    .expect("decode checkpoint");
+    let mut checkpoint_rows = Vec::new();
+    for state in checkpoint_doc["payload"]["states"]
+        .as_array()
+        .expect("checkpoint states")
+    {
+        let state_id = state["state_id"].as_str().expect("state id");
+        checkpoint_rows.extend(
+            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
+        );
+    }
+    assert_eq!(
+        Some(EXPIRES_AT_MS),
+        kv_expiry(&checkpoint_rows, b"catalog/expiring")
+    );
+
+    // Restore: overwrite the expiring row with a plain value, then roll back
+    // to the checkpoint. The restore render must re-stage the source row with
+    // its expiry rather than flattening it into a permanent row.
+    let reference = store
+        .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+        .await
+        .expect("persist checkpoint reference");
+    let mut overwrite = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin overwrite");
+    overwrite
+        .put(b"catalog/expiring", Bytes::from_static(b"permanent"))
+        .await
+        .expect("stage overwrite");
+    overwrite.commit().await.expect("commit overwrite");
+    assert_eq!(
+        Some(Bytes::from_static(b"permanent")),
+        store
+            .get(b"catalog/expiring")
+            .await
+            .expect("overwritten get")
+    );
+
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000002", 1, "catalog")
+        .expect("identity");
+    let plan = adapter
+        .plan_restore(&reference, &identity, Utc::now())
+        .await
+        .expect("plan restore");
+    let RestoreParticipantInspection::Visible { token, .. } = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect("apply restore")
+    else {
+        panic!("restore must become visible");
+    };
+    assert_eq!(18, token.logical_sequence());
+    assert_eq!(
+        Some(Bytes::from_static(b"soon")),
+        store.get(b"catalog/expiring").await.expect("restored get")
+    );
+    let restored = current_manifest_payload(&store, &storage).await;
+    let restore_tx_id = restored["tx_refs"]
+        .as_array()
+        .and_then(|refs| refs.last())
+        .and_then(|reference| reference["tx_id"].as_str())
+        .expect("restore transaction reference")
+        .to_string();
+    assert!(restore_tx_id.starts_with("tx-restore-"));
+    let restore_rows = segment_row_expiries(
+        &storage,
+        &paths,
+        &restore_tx_id,
+        &paths.l0_segment_object(&restore_tx_id),
+    )
+    .await;
+    assert_eq!(
+        Some(EXPIRES_AT_MS),
+        kv_expiry(&restore_rows, b"catalog/expiring"),
+        "the restore render must carry the source row's expiry"
+    );
+}
+
+#[tokio::test]
+async fn expiry_changes_the_state_checksum_and_mutation_digest_but_plain_puts_are_null() {
+    async fn commit_pair(with_expiry: bool) -> (Value, Value) {
+        let (_backend, storage) = storage();
+        let store = store(storage.clone());
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin");
+        let tx_id = txn.tx_id().to_string();
+        if with_expiry {
+            txn.put_with_expiry(b"catalog/row", Bytes::from_static(b"same"), EXPIRES_AT_MS)
+                .await
+                .expect("stage expiring write");
+        } else {
+            txn.put(b"catalog/row", Bytes::from_static(b"same"))
+                .await
+                .expect("stage plain write");
+        }
+        txn.put(b"catalog/other", Bytes::from_static(b"same"))
+            .await
+            .expect("stage sibling write");
+        txn.commit().await.expect("commit");
+        let paths = store.paths();
+        let manifest = current_manifest_payload(&store, &storage).await;
+        let mut tx: Value = serde_json::from_slice(
+            &storage
+                .get_raw(&paths.tx_object(&tx_id))
+                .await
+                .expect("read transaction"),
+        )
+        .expect("decode transaction");
+        let rows =
+            segment_row_expiries(&storage, &paths, &tx_id, &paths.l0_segment_object(&tx_id)).await;
+        assert_eq!(
+            with_expiry.then_some(EXPIRES_AT_MS),
+            kv_expiry(&rows, b"catalog/row")
+        );
+        assert_eq!(None, kv_expiry(&rows, b"catalog/other"));
+        (manifest, tx["payload"].take())
+    }
+
+    let (plain_manifest, plain_tx) = commit_pair(false).await;
+    let (plain_again_manifest, plain_again_tx) = commit_pair(false).await;
+    let (expiring_manifest, expiring_tx) = commit_pair(true).await;
+
+    // Same writes: identical digests, so the comparison below is meaningful.
+    assert_eq!(
+        plain_manifest["state_checksum_sha256"],
+        plain_again_manifest["state_checksum_sha256"]
+    );
+    assert_eq!(
+        plain_tx["history"]["mutation_sha256"],
+        plain_again_tx["history"]["mutation_sha256"]
+    );
+    // One row's expiry is the only difference: both digests must move.
+    assert_ne!(
+        plain_manifest["state_checksum_sha256"], expiring_manifest["state_checksum_sha256"],
+        "the full-state checksum must cover expires_at_ms"
+    );
+    assert_ne!(
+        plain_tx["history"]["mutation_sha256"], expiring_tx["history"]["mutation_sha256"],
+        "the mutation digest must cover expires_at_ms"
+    );
+    assert_ne!(
+        plain_manifest["history_root"],
+        expiring_manifest["history_root"]
+    );
+}
+
+#[tokio::test]
+async fn put_with_expiry_rejects_non_positive_hints_before_staging() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin");
+    for expires_at_ms in [0_i64, -1, i64::MIN] {
+        let error = txn
+            .put_with_expiry(b"catalog/row", Bytes::from_static(b"v"), expires_at_ms)
+            .await
+            .expect_err("non-positive expiry must be rejected");
+        assert!(
+            matches!(error, CatalogError::Validation { .. }),
+            "expected Validation, got {error:?}"
+        );
+    }
+    assert!(
+        txn.get(b"catalog/row")
+            .await
+            .expect("overlay read")
+            .is_none(),
+        "a rejected expiring write must stage nothing"
+    );
+    txn.commit().await.expect("empty commit");
+    assert_eq!(None, store.get(b"catalog/row").await.expect("get"));
+}

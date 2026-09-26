@@ -1240,6 +1240,7 @@ fn verify_kv_mutation(
                 key,
                 generation: candidate.generation,
                 value: (!write.delete).then(|| candidate.value.clone()).flatten(),
+                expires_at_ms: candidate.expires_at_ms,
             })
         })
         .collect()
@@ -1591,6 +1592,7 @@ async fn rewrite_kv(
                     logical_sequence: sequence,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: write.expires_at_ms,
                 },
             );
         }
@@ -1633,6 +1635,7 @@ async fn rewrite_kv(
                 logical_sequence: sequence,
                 logical_ordinal: ordinal as u64,
                 origin_sequence: None,
+                expires_at_ms: write.expires_at_ms,
             })
             .collect::<Vec<_>>();
         let replacements = persist_role_rows(
@@ -1844,6 +1847,7 @@ fn outbox_mutations(
             logical_sequence: sequence,
             logical_ordinal: intent.ordinal(),
             origin_sequence: Some(intent.source_logical_sequence()),
+            expires_at_ms: None,
         };
         let delivery_key = delivery_key(
             intent.source_logical_sequence(),
@@ -1859,6 +1863,7 @@ fn outbox_mutations(
             logical_sequence: sequence,
             logical_ordinal: intent.ordinal(),
             origin_sequence: Some(intent.source_logical_sequence()),
+            expires_at_ms: None,
         };
         if active
             .insert(active_row.key.clone(), Some(active_row))
@@ -2821,19 +2826,36 @@ impl ControlMvpStateStore {
             logical_v2::commit_id(&self.scope, &prior_history, sequence, operation)?;
         let additions = staged_v2_intents(&txn, sequence, &logical_commit_id)?;
         let trims = txn.bounded_trims.clone();
+        // `put_with_expiry` is refused at staging on a bounded base; a hint
+        // reaching this point is a broken invariant, not user input.
+        if txn.writes.values().any(|write| {
+            matches!(
+                write,
+                StagedWrite::Put {
+                    expires_at_ms: Some(_),
+                    ..
+                }
+            )
+        }) {
+            return Err(invariant_violation(
+                "bounded authority cannot commit an expiring write",
+            ));
+        }
         let writes = txn
             .writes
             .iter()
             .map(|(key, write)| match write {
-                StagedWrite::Put(value) => ControlMvpWriteEntry {
+                StagedWrite::Put { value, .. } => ControlMvpWriteEntry {
                     key: key.clone(),
                     generation: sequence,
                     value: Some(value.to_vec()),
+                    expires_at_ms: None,
                 },
                 StagedWrite::Delete => ControlMvpWriteEntry {
                     key: key.clone(),
                     generation: sequence,
                     value: None,
+                    expires_at_ms: None,
                 },
             })
             .collect::<Vec<_>>();
@@ -3449,6 +3471,7 @@ mod tests {
             logical_sequence: sequence,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         }];
         let leaves = persist_role_rows(
             &store,

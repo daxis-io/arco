@@ -286,6 +286,7 @@ async fn oversized_completion_is_charged_until_last_lease() {
                         logical_sequence: 1,
                         logical_ordinal: 0,
                         origin_sequence: None,
+                        expires_at_ms: None,
                     }]),
                     true,
                 ))

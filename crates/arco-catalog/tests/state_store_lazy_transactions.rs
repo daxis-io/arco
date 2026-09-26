@@ -14,7 +14,7 @@ use arco_catalog::{
 };
 use arco_core::{MemoryBackend, ScopedStorage};
 use bytes::Bytes;
-use oracle::{LogicalOracle, LogicalTransaction};
+use oracle::{LogicalOracle, LogicalTransaction, OracleWrite};
 use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc};
 
 #[tokio::test]
@@ -53,12 +53,29 @@ async fn pinned_overlays_and_assertions_match_eager_and_independent_oracle() {
                     generation % 3
                 ]))
             };
-            match &value {
-                Some(v) => tx.put(&key, v.clone()).await.unwrap(),
-                None => tx.delete(&key).await.unwrap(),
+            // Every third live write carries a purge-eligibility hint so the
+            // pinned base holds expiring rows the oracle must account for.
+            let expires_at_ms = value.as_ref().and_then(|_| {
+                (generation % 3 == 2).then(|| 1_000_000 + i64::try_from(generation).unwrap())
+            });
+            match (&value, expires_at_ms) {
+                (Some(v), Some(expiry)) => {
+                    tx.put_with_expiry(&key, v.clone(), expiry).await.unwrap();
+                }
+                (Some(v), None) => tx.put(&key, v.clone()).await.unwrap(),
+                (None, _) => tx.delete(&key).await.unwrap(),
             }
             tx.commit().await.unwrap();
-            state.commit(vec![(key, value)], vec![], vec![]);
+            state.commit_writes(
+                vec![OracleWrite {
+                    key,
+                    value,
+                    expires_at_ms,
+                }],
+                vec![],
+                vec![],
+                None,
+            );
             head += 1;
         }
         let mut model = LogicalTransaction::pin(&state, head);
@@ -73,14 +90,23 @@ async fn pinned_overlays_and_assertions_match_eager_and_independent_oracle() {
         for operation in 0..64_usize {
             let key = &keys[(operation * 5 + seed) % keys.len()];
             match operation % 7 {
-                0 | 1 => {
+                0 => {
                     let value = Bytes::from(vec![u8::try_from(operation).unwrap(); operation % 4]);
-                    model.writes.insert(key.clone(), Some(value.clone()));
+                    model.put(key, value.clone());
                     lazy.put(key, value.clone()).await.unwrap();
                     eager.put(key, value).await.unwrap();
                 }
+                1 => {
+                    let value = Bytes::from(vec![u8::try_from(operation).unwrap(); operation % 4]);
+                    let expiry = 2_000_000 + i64::try_from(operation).unwrap();
+                    model.put_with_expiry(key, value.clone(), expiry);
+                    lazy.put_with_expiry(key, value.clone(), expiry)
+                        .await
+                        .unwrap();
+                    eager.put_with_expiry(key, value, expiry).await.unwrap();
+                }
                 2 => {
-                    model.writes.insert(key.clone(), None);
+                    model.delete(key);
                     lazy.delete(key).await.unwrap();
                     eager.delete(key).await.unwrap();
                 }

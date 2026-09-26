@@ -92,8 +92,8 @@ use arco_core::{
     AuthorityRoot, AuthorityWritePrecondition, RootStorage, ScopedAuthorityStore, ScopedStorage,
 };
 use arrow::array::{
-    Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, UInt8Array, UInt8Builder,
-    UInt64Array, UInt64Builder,
+    Array, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Int64Array, Int64Builder,
+    UInt8Array, UInt8Builder, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::MetadataVersion;
@@ -109,6 +109,8 @@ use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
+#[cfg(test)]
+use super::scan_all_entries_bounded;
 use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
     CheckpointToken, CommitOutcome, KeyRange, KvPair, LayoutMaintenanceIntentV1,
@@ -117,7 +119,7 @@ use super::{
     ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
     RestoredAuthorityEvidence, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
-    build_scan_page, build_scan_page_with_backend_boundary, scan_all_entries_bounded,
+    build_scan_page, build_scan_page_with_backend_boundary,
 };
 use crate::error::{CatalogError, Result};
 use crate::gc::reachability::RetainedAuthorityRoots;
@@ -181,7 +183,7 @@ const RESTORE_PLAN_VERSION_V3: u32 = 3;
 const RESTORE_PLAN_VERSION_V1: u32 = 1;
 const RESTORE_PLAN_VERSION_V2: u32 = 2;
 const CONTROL_MVP_FORMAT_VERSION: u32 = 9;
-const SEGMENT_FORMAT_VERSION: u32 = 1;
+const SEGMENT_FORMAT_VERSION: u32 = 2;
 const BLOCK_TARGET_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 256 * 1024;
 const MAX_SEGMENT_BLOCKS: usize = 4096;
@@ -1486,6 +1488,7 @@ impl ControlMvpStateStore {
                 key: key.to_vec(),
                 generation: value.generation,
                 value: (!value.tombstone).then(|| value.bytes.to_vec()),
+                expires_at_ms: value.expires_at_ms,
             }))
     }
 
@@ -1533,6 +1536,7 @@ impl ControlMvpStateStore {
                     bytes: Bytes::from(write.value.clone().unwrap_or_default()),
                     generation: write.generation,
                     tombstone: write.value.is_none(),
+                    expires_at_ms: write.expires_at_ms,
                 });
             }
         }
@@ -2246,7 +2250,7 @@ impl ControlMvpStateStore {
         &self,
         source: &PersistedAuthorityReference,
         now: DateTime<Utc>,
-    ) -> Result<BTreeMap<Vec<u8>, Bytes>> {
+    ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
         self.validate_restore_authority_format(source)?;
         if source.reference_kind() != PersistedAuthorityKind::Checkpoint
             || source.checkpoint_path().is_none()
@@ -2256,14 +2260,12 @@ impl ControlMvpStateStore {
                 "Control MVP restore requires checkpoint authority evidence",
             ));
         }
-        let reader = self.resolve_persisted_reference_at(source, now).await?;
-        Ok(
-            scan_all_entries_bounded(reader.as_ref(), b"", MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
-                .await?
-                .into_iter()
-                .map(|entry| (entry.key().to_vec(), entry.value().bytes().clone()))
-                .collect(),
-        )
+        let reader = self
+            .resolve_persisted_retained_reader_at(source, now)
+            .await?;
+        reader
+            .live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+            .await
     }
 
     fn validate_restore_authority_format(
@@ -2274,24 +2276,27 @@ impl ControlMvpStateStore {
     }
 
     fn restore_writes(
-        source_values: &BTreeMap<Vec<u8>, Bytes>,
+        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
         current: &ReplayState,
     ) -> BTreeMap<Vec<u8>, StagedWrite> {
         let mut writes = BTreeMap::new();
         for (key, current) in current.kv.iter().filter(|(_key, value)| !value.tombstone) {
             match source_values.get(key) {
-                Some(source_value) if source_value == &current.bytes => {}
-                Some(source_value) => {
-                    writes.insert(key.clone(), StagedWrite::Put(source_value.clone()));
+                // A row whose bytes and hint both match needs no rewrite; a
+                // hint-only difference is still a difference the restore
+                // must reproduce.
+                Some(source) if source.matches(current) => {}
+                Some(source) => {
+                    writes.insert(key.clone(), source.staged());
                 }
                 None => {
                     writes.insert(key.clone(), StagedWrite::Delete);
                 }
             }
         }
-        for (key, source_value) in source_values {
+        for (key, source) in source_values {
             if current.kv.get(key).is_none_or(|current| current.tombstone) {
-                writes.insert(key.clone(), StagedWrite::Put(source_value.clone()));
+                writes.insert(key.clone(), source.staged());
             }
         }
         writes
@@ -2301,7 +2306,7 @@ impl ControlMvpStateStore {
     fn render_restore_candidate(
         &self,
         source: &PersistedAuthorityReference,
-        source_values: &BTreeMap<Vec<u8>, Bytes>,
+        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
         identity: &RestoreAttemptIdentity,
         stable: &StableRestoreBase,
         checkpoint_interval: u64,
@@ -5167,6 +5172,16 @@ impl ArcoStateReader for ControlMvpStateStore {
     }
 
     async fn read_at(&self, token: StateToken) -> Result<Box<dyn ArcoStateReader>> {
+        Ok(Box::new(self.retained_reader_at(token).await?))
+    }
+
+    async fn read_checkpoint(&self, token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>> {
+        Ok(Box::new(self.retained_checkpoint_reader(token).await?))
+    }
+}
+
+impl ControlMvpStateStore {
+    async fn retained_reader_at(&self, token: StateToken) -> Result<ControlMvpRetainedReader> {
         if token.scope() != &self.scope {
             return Err(validation_failed(
                 "StateToken scope does not match control MVP store",
@@ -5174,14 +5189,14 @@ impl ArcoStateReader for ControlMvpStateStore {
         }
         if self.authenticated_token_format(&token).await? == 8 {
             let base = self.read_bounded_token(&token).await?;
-            return Ok(Box::new(ControlMvpRetainedReader {
+            return Ok(ControlMvpRetainedReader {
                 scope: self.scope.clone(),
                 token,
                 source: ControlMvpRetainedSource::Bounded {
                     store: Box::new(self.clone()),
                     base: Box::new(base),
                 },
-            }));
+            });
         }
         let manifest = self
             .load_manifest_with_expected_checksum(
@@ -5195,17 +5210,20 @@ impl ArcoStateReader for ControlMvpStateStore {
             ));
         }
         self.validate_manifest_read_metadata(&manifest)?;
-        Ok(Box::new(ControlMvpRetainedReader {
+        Ok(ControlMvpRetainedReader {
             scope: self.scope.clone(),
             token,
             source: ControlMvpRetainedSource::Manifest {
                 store: Box::new(self.clone()),
                 manifest: Box::new(manifest),
             },
-        }))
+        })
     }
 
-    async fn read_checkpoint(&self, token: CheckpointToken) -> Result<Box<dyn ArcoStateReader>> {
+    async fn retained_checkpoint_reader(
+        &self,
+        token: CheckpointToken,
+    ) -> Result<ControlMvpRetainedReader> {
         if token.scope() != &self.scope {
             return Err(validation_failed(
                 "CheckpointToken scope does not match control MVP store",
@@ -5239,13 +5257,13 @@ impl ArcoStateReader for ControlMvpStateStore {
         checkpoint.validate_source(&manifest)?;
         let mut state = self.load_state_snapshots(&checkpoint.states).await?;
         checkpoint.validate_state(&mut state)?;
-        Ok(Box::new(ControlMvpRetainedReader {
+        Ok(ControlMvpRetainedReader {
             scope: self.scope.clone(),
             token: self
                 .token(checkpoint.manifest_id, checkpoint.logical_sequence)
                 .with_manifest_witness(checkpoint.manifest_checksum_sha256),
             source: ControlMvpRetainedSource::Materialized(state),
-        }))
+        })
     }
 }
 
@@ -5475,12 +5493,28 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
         )
     }
 
-    #[allow(clippy::too_many_lines)] // Keep the persisted-reference validation boundary together.
     async fn resolve_persisted_reference_at(
         &self,
         reference: &PersistedAuthorityReference,
         now: DateTime<Utc>,
     ) -> Result<Box<dyn ArcoStateReader>> {
+        Ok(Box::new(
+            self.resolve_persisted_retained_reader_at(reference, now)
+                .await?,
+        ))
+    }
+}
+
+impl ControlMvpStateStore {
+    /// Resolves a persisted reference to the concrete retained reader so the
+    /// restore source scan can carry expiry hints; the trait wrapper above
+    /// boxes it for public callers.
+    #[allow(clippy::too_many_lines)] // Keep the persisted-reference validation boundary together.
+    async fn resolve_persisted_retained_reader_at(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+    ) -> Result<ControlMvpRetainedReader> {
         reference.validate()?;
         if reference.implementation() != IMPLEMENTATION {
             return Err(validation_failed(
@@ -5533,7 +5567,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                         reference.logical_sequence(),
                     )
                     .with_manifest_witness(sha256_hex(&manifest_bytes));
-                self.read_at(token).await
+                self.retained_reader_at(token).await
             }
             PersistedAuthorityKind::Checkpoint => {
                 let checkpoint_path = reference
@@ -5578,7 +5612,7 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
                         "persisted checkpoint does not match authority manifest",
                     ));
                 }
-                self.read_checkpoint(
+                self.retained_checkpoint_reader(
                     self.checkpoint_token(checkpoint_id.to_string())
                         .with_checkpoint_witness(sha256_hex(&checkpoint_bytes)),
                 )
@@ -5950,6 +5984,28 @@ fn stored_row_value(row: ControlMvpSegmentRow) -> StoredValue {
         bytes: Bytes::from(row.value.unwrap_or_default()),
         generation: row.generation,
         tombstone: row.tombstone,
+        expires_at_ms: row.expires_at_ms,
+    }
+}
+
+/// A live row read from a restore source, with the hint the restore render
+/// must reproduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreSourceValue {
+    bytes: Bytes,
+    expires_at_ms: Option<i64>,
+}
+
+impl RestoreSourceValue {
+    fn matches(&self, current: &StoredValue) -> bool {
+        self.bytes == current.bytes && self.expires_at_ms == current.expires_at_ms
+    }
+
+    fn staged(&self) -> StagedWrite {
+        StagedWrite::Put {
+            value: self.bytes.clone(),
+            expires_at_ms: self.expires_at_ms,
+        }
     }
 }
 
@@ -5997,6 +6053,7 @@ impl ReplayState {
                 tombstone: entry.value.is_none(),
                 bytes: Bytes::from(entry.value.unwrap_or_default()),
                 generation: entry.generation,
+                expires_at_ms: entry.expires_at_ms,
             };
             if self.kv.insert(entry.key, value).is_some() {
                 return Err(invariant_violation("duplicate L1 key"));
@@ -6047,12 +6104,20 @@ impl ReplayState {
                     "control MVP write generation does not match transaction sequence",
                 ));
             }
+            if write.expires_at_ms.is_some_and(|expiry| expiry <= 0)
+                || (write.value.is_none() && write.expires_at_ms.is_some())
+            {
+                return Err(invariant_violation(
+                    "control MVP write carries an invalid expiry hint",
+                ));
+            }
             self.kv.insert(
                 write.key.clone(),
                 StoredValue {
                     bytes: Bytes::from(write.value.clone().unwrap_or_default()),
                     generation: write.generation,
                     tombstone: write.value.is_none(),
+                    expires_at_ms: write.expires_at_ms,
                 },
             );
         }
@@ -6249,6 +6314,7 @@ impl ReplayState {
                     key: key.clone(),
                     generation: value.generation,
                     value: (!value.tombstone).then(|| value.bytes.to_vec()),
+                    expires_at_ms: value.expires_at_ms,
                 })
                 .collect(),
             outbox: self
@@ -6269,11 +6335,20 @@ struct StoredValue {
     bytes: Bytes,
     generation: u64,
     tombstone: bool,
+    /// Purge-eligibility hint (segment format 2). Reads, witnesses and range
+    /// preconditions ignore it; only the full-state checksum and the
+    /// mutation digest bind it.
+    expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug)]
 enum StagedWrite {
-    Put(Bytes),
+    Put {
+        value: Bytes,
+        /// Purge-eligibility hint carried onto the committed row. Never a
+        /// read filter.
+        expires_at_ms: Option<i64>,
+    },
     Delete,
 }
 
@@ -6462,6 +6537,8 @@ struct ControlMvpSegmentRow {
     logical_sequence: u64,
     logical_ordinal: u64,
     origin_sequence: Option<u64>,
+    /// Segment format 2: positive only on live KV rows, null otherwise.
+    expires_at_ms: Option<i64>,
 }
 
 /// Immutable materialized replay state anchored to one manifest.
@@ -6494,6 +6571,7 @@ impl ControlMvpStateObject {
                     key: key.clone(),
                     generation: value.generation,
                     value: (!value.tombstone).then(|| value.bytes.to_vec()),
+                    expires_at_ms: value.expires_at_ms,
                 })
                 .collect(),
             outbox_start_ordinal: (!state.outbox.is_empty()).then_some(0),
@@ -6860,6 +6938,7 @@ impl ControlMvpTxObject {
                             key: row.key,
                             generation: row.generation,
                             value: row.value,
+                            expires_at_ms: row.expires_at_ms,
                         },
                     ));
                 }
@@ -6867,6 +6946,7 @@ impl ControlMvpTxObject {
                     if row.tombstone
                         || row.generation != 0
                         || row.origin_sequence != Some(self.sequence)
+                        || row.expires_at_ms.is_some()
                     {
                         return Err(invariant_violation(
                             "control MVP L0 outbox row metadata is invalid",
@@ -6888,6 +6968,7 @@ impl ControlMvpTxObject {
                         || row.generation != 0
                         || row.value.is_some()
                         || row.origin_sequence.is_none()
+                        || row.expires_at_ms.is_some()
                     {
                         return Err(invariant_violation(
                             "control MVP L0 outbox-trim row metadata is invalid",
@@ -7000,20 +7081,28 @@ struct ControlMvpWriteEntry {
     key: Vec<u8>,
     generation: u64,
     value: Option<Vec<u8>>,
+    /// Purge-eligibility hint; `None` for plain puts and every delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
 }
 
 impl ControlMvpWriteEntry {
     fn from_staged(key: Vec<u8>, generation: u64, write: StagedWrite) -> Self {
         match write {
-            StagedWrite::Put(bytes) => Self {
+            StagedWrite::Put {
+                value,
+                expires_at_ms,
+            } => Self {
                 key,
                 generation,
-                value: Some(bytes.to_vec()),
+                value: Some(value.to_vec()),
+                expires_at_ms,
             },
             StagedWrite::Delete => Self {
                 key,
                 generation,
                 value: None,
+                expires_at_ms: None,
             },
         }
     }
@@ -7090,6 +7179,7 @@ fn segment_rows_for_state(state: &ControlMvpStateObject) -> Vec<ControlMvpSegmen
             logical_sequence: state.logical_sequence,
             logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
             origin_sequence: None,
+            expires_at_ms: entry.expires_at_ms,
         })
         .chain(state.outbox.iter().enumerate().map(|(ordinal, entry)| {
             ControlMvpSegmentRow {
@@ -7105,6 +7195,7 @@ fn segment_rows_for_state(state: &ControlMvpStateObject) -> Vec<ControlMvpSegmen
                     .checked_add(u64::try_from(ordinal).unwrap_or(u64::MAX))
                     .unwrap_or(u64::MAX),
                 origin_sequence: entry.origin_sequence,
+                expires_at_ms: None,
             }
         }))
         .collect::<Vec<_>>();
@@ -7142,6 +7233,7 @@ fn state_object_from_segment_rows(
                     key: row.key,
                     generation: row.generation,
                     value: row.value,
+                    expires_at_ms: row.expires_at_ms,
                 });
             }
             SEGMENT_RECORD_OUTBOX => {
@@ -7226,6 +7318,7 @@ fn segment_rows_for_tx(tx: &ControlMvpTxObject) -> Vec<ControlMvpSegmentRow> {
             logical_sequence: tx.sequence,
             logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
             origin_sequence: None,
+            expires_at_ms: write.expires_at_ms,
         })
         .chain(
             tx.outbox
@@ -7240,6 +7333,7 @@ fn segment_rows_for_tx(tx: &ControlMvpTxObject) -> Vec<ControlMvpSegmentRow> {
                     logical_sequence: tx.sequence,
                     logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
                     origin_sequence: Some(tx.sequence),
+                    expires_at_ms: None,
                 }),
         )
         .chain(
@@ -7255,6 +7349,7 @@ fn segment_rows_for_tx(tx: &ControlMvpTxObject) -> Vec<ControlMvpSegmentRow> {
                     logical_sequence: tx.sequence,
                     logical_ordinal: u64::try_from(ordinal).unwrap_or(u64::MAX),
                     origin_sequence: Some(entry.origin_sequence()),
+                    expires_at_ms: None,
                 }),
         )
         .collect::<Vec<_>>();
@@ -7486,6 +7581,7 @@ fn encode_arrow_block(rows: &[ControlMvpSegmentRow]) -> Result<Vec<u8>> {
     let mut logical_sequences = UInt64Builder::new();
     let mut logical_ordinals = UInt64Builder::new();
     let mut origin_sequences = UInt64Builder::new();
+    let mut expiries = Int64Builder::new();
     for row in rows {
         record_kinds.append_value(row.record_kind);
         keys.append_value(&row.key);
@@ -7503,6 +7599,11 @@ fn encode_arrow_block(rows: &[ControlMvpSegmentRow]) -> Result<Vec<u8>> {
         } else {
             origin_sequences.append_null();
         }
+        if let Some(expires_at_ms) = row.expires_at_ms {
+            expiries.append_value(expires_at_ms);
+        } else {
+            expiries.append_null();
+        }
     }
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -7515,6 +7616,7 @@ fn encode_arrow_block(rows: &[ControlMvpSegmentRow]) -> Result<Vec<u8>> {
             Arc::new(logical_sequences.finish()),
             Arc::new(logical_ordinals.finish()),
             Arc::new(origin_sequences.finish()),
+            Arc::new(expiries.finish()),
         ],
     )
     .map_err(|error| segment_serialization_error("build Arrow record batch", error))?;
@@ -7546,6 +7648,9 @@ fn block_metadata(offset: u64, bytes: &[u8], rows: &[ControlMvpSegmentRow]) -> C
     }
 }
 
+/// Segment format 2: the eight format-1 columns plus the nullable per-row
+/// expiry hint. Format-1 (eight-column) segments fail the exact-schema
+/// preflight; the authority format 9 hard cut carries no migration.
 fn control_mvp_segment_schema() -> Schema {
     Schema::new(vec![
         Field::new("record_kind", DataType::UInt8, false),
@@ -7556,6 +7661,7 @@ fn control_mvp_segment_schema() -> Schema {
         Field::new("logical_sequence", DataType::UInt64, false),
         Field::new("logical_ordinal", DataType::UInt64, false),
         Field::new("origin_sequence", DataType::UInt64, true),
+        Field::new("expires_at_ms", DataType::Int64, true),
     ])
 }
 
@@ -7734,7 +7840,7 @@ fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
         let nodes = batch
             .nodes()
             .ok_or_else(|| invariant_violation("Arrow batch nodes absent"))?;
-        if nodes.len() != 8
+        if nodes.len() != 9
             || nodes.iter().any(|node| {
                 node.length() != batch.length()
                     || node.null_count() < 0
@@ -8359,6 +8465,7 @@ fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>
     let logical_sequences = segment_column::<UInt64Array>(batch, 5, "logical_sequence")?;
     let logical_ordinals = segment_column::<UInt64Array>(batch, 6, "logical_ordinal")?;
     let origin_sequences = segment_column::<UInt64Array>(batch, 7, "origin_sequence")?;
+    let expiries = segment_column::<Int64Array>(batch, 8, "expires_at_ms")?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for row_index in 0..batch.num_rows() {
         let record_kind = record_kinds.value(row_index);
@@ -8377,6 +8484,16 @@ fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>
                 "control MVP Arrow segment tombstone/value polarity is invalid",
             ));
         }
+        let expires_at_ms = (!expiries.is_null(row_index)).then(|| expiries.value(row_index));
+        // The hint is a property of live KV rows only, and a non-positive
+        // stamp is never a valid wall-clock instant.
+        if expires_at_ms
+            .is_some_and(|expiry| expiry <= 0 || tombstone || record_kind != SEGMENT_RECORD_KV)
+        {
+            return Err(invariant_violation(
+                "control MVP Arrow segment expiry hint is invalid for its row",
+            ));
+        }
         rows.push(ControlMvpSegmentRow {
             record_kind,
             key: keys.value(row_index).to_vec(),
@@ -8387,6 +8504,7 @@ fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>
             logical_ordinal: logical_ordinals.value(row_index),
             origin_sequence: (!origin_sequences.is_null(row_index))
                 .then(|| origin_sequences.value(row_index)),
+            expires_at_ms,
         });
     }
     if rows.windows(2).any(|pair| match pair {
@@ -8441,6 +8559,10 @@ struct ReplayStateDigestEntry {
     key: Vec<u8>,
     generation: u64,
     value: Option<Vec<u8>>,
+    /// Bound into the full-state checksum; omitted from the JSON when absent
+    /// so states without hints keep their format-9 checksums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8520,6 +8642,58 @@ enum ControlMvpRetainedSource {
         manifest: Box<ControlMvpManifest>,
     },
     Materialized(ReplayState),
+}
+
+impl ControlMvpRetainedReader {
+    /// Collects every live entry with its expiry hint, bounded like a
+    /// restore source scan. This is the only path that surfaces the hint
+    /// past the reader boundary, and it is internal: public reads never
+    /// expose or filter on it.
+    async fn live_entries_bounded(
+        &self,
+        max_total_rows: usize,
+        max_total_bytes: usize,
+    ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
+        let materialized;
+        let state = match &self.source {
+            ControlMvpRetainedSource::Bounded { .. } => {
+                return Err(validation_failed(
+                    "bounded authority cannot serve an expiry-aware restore source scan",
+                ));
+            }
+            ControlMvpRetainedSource::Manifest { store, manifest } => {
+                materialized = store.replay_manifest(manifest).await?;
+                &materialized
+            }
+            ControlMvpRetainedSource::Materialized(state) => state,
+        };
+        let mut entries = BTreeMap::new();
+        let mut decoded_bytes = 0_usize;
+        for (key, value) in state.kv.iter().filter(|(_, value)| !value.tombstone) {
+            decoded_bytes = key
+                .len()
+                .checked_add(value.bytes.len())
+                .and_then(|entry_bytes| decoded_bytes.checked_add(entry_bytes))
+                .ok_or_else(|| CatalogError::MaintenanceBackpressure {
+                    message: "bounded scan aggregate byte count overflow".to_string(),
+                })?;
+            if entries.len() == max_total_rows || decoded_bytes > max_total_bytes {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: format!(
+                        "bounded scan exceeds aggregate limit of {max_total_rows} rows or {max_total_bytes} decoded bytes"
+                    ),
+                });
+            }
+            entries.insert(
+                key.clone(),
+                RestoreSourceValue {
+                    bytes: value.bytes.clone(),
+                    expires_at_ms: value.expires_at_ms,
+                },
+            );
+        }
+        Ok(entries)
+    }
 }
 
 #[async_trait]
@@ -9463,6 +9637,7 @@ mod tests {
             logical_sequence: 1,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         }
     }
 
@@ -12034,6 +12209,7 @@ mod tests {
                 Arc::new(UInt64Array::from(vec![1, 1])),
                 Arc::new(UInt64Array::from(vec![0, 1])),
                 Arc::new(UInt64Array::from(vec![None, None])),
+                Arc::new(Int64Array::from(vec![None, None])),
             ],
         )
         .expect("duplicate-key batch")
@@ -12090,6 +12266,7 @@ mod tests {
                 logical_sequence: 1,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             }])
             .expect_err("trim rows must identify the removed event incarnation");
 
@@ -12103,6 +12280,7 @@ mod tests {
             bytes: Bytes::from_static(b"v"),
             generation,
             tombstone,
+            expires_at_ms: None,
         };
         let mut state = ReplayState::default();
         state.kv.insert(b"a/b".to_vec(), stored(1, false));

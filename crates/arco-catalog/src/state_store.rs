@@ -2874,6 +2874,25 @@ pub trait ArcoStateTxn: Send + Sync {
     /// Returns an error when the backend cannot stage the write.
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()>;
 
+    /// Stages a value write that also carries a purge-eligibility hint.
+    ///
+    /// `expires_at_ms` (milliseconds since the Unix epoch, must be positive)
+    /// is recorded on the committed row and nowhere else. It is never a read
+    /// filter: point reads, scans, witnesses, range preconditions and
+    /// predicate inputs see the row exactly as a plain [`put`](Self::put)
+    /// would leave it, so an expired row stays visible until a retention
+    /// rewrite drops it. Only the committed mutation digest and the
+    /// full-state checksum bind the hint. A later plain `put` or `delete`
+    /// of the same key clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Validation`] when `expires_at_ms` is not
+    /// positive or the backend authority cannot carry the hint, and any
+    /// error staging a plain write would return.
+    async fn put_with_expiry(&mut self, key: &[u8], value: Bytes, expires_at_ms: i64)
+    -> Result<()>;
+
     /// Stages a value delete.
     ///
     /// # Errors

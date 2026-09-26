@@ -78,6 +78,29 @@ origin sequence. L0 KV generations equal the transaction sequence. IPC record
 batch compression is rejected during bounded message preflight, before decoding.
 Selective reads validate authenticated directories and selected blocks only.
 
+## Segment format 2
+
+Authority format 9 raises the segment directory `formatVersion` to 2 and adds a
+ninth Arrow column, `expires_at_ms: Int64, nullable`, after `origin_sequence`.
+The eight format-1 columns keep their names, types, nullability and order.
+
+`expires_at_ms` is the per-row purge-eligibility hint set by
+`ArcoStateTxn::put_with_expiry`. It is non-null only on live KV rows (record
+kind 0 with a value), and its value is a positive Unix millisecond timestamp;
+outbox, outbox-trim and tombstone rows carry null. Decoding rejects a hint on
+any other row or a non-positive stamp, and a plain `put` or `delete` of the
+same key clears it. Reads, scans, point and range witnesses and predicate
+inputs ignore the column: an expired row stays visible until a retention
+rewrite drops it. The column is bound by the full-state checksum (as
+`expires_at_ms` on a digest entry, omitted when null so hint-free states keep
+their checksums) and by the mutation digest (an `optional i64` after the
+optional value, absent encoded as the one-byte `0` discriminant). L1 rendering,
+durable maintenance and restore renders carry the hint row for row.
+
+Preflight requires exactly nine field nodes and the exact nine-field schema, so
+an eight-column format-1 block fails closed before decoding. Format 9 is a hard
+cut: no format-1 segment is migrated or read.
+
 ## Bloom encoding
 
 The directory persists `bloomHashVersion = 1`, mode, probe count, distinct KV-key

@@ -12,8 +12,15 @@ thread_local! {
 }
 
 /// Restores the previous fixture inputs when dropped on its originating thread.
+///
+/// Guards nest and must be dropped in LIFO order: dropping a guard while a
+/// later one is still installed would restore the earlier prior underneath
+/// it, which debug builds assert against.
 pub struct FixedInputs {
     prior: Option<(DateTime<Utc>, u128)>,
+    /// The instant this guard installed; the clock must still read it when
+    /// the guard drops.
+    pinned: DateTime<Utc>,
     /// `at` scopes carry their identifier serial forward on drop; `scoped`
     /// restores it so nested repeatable scopes replay the same identifiers.
     keep_serial: bool,
@@ -27,6 +34,7 @@ impl FixedInputs {
         let now = DateTime::from_timestamp(1_893_456_000, 0).expect("fixed fixture timestamp");
         Self {
             prior: INPUTS.with(|state| state.replace(Some((now, 0)))),
+            pinned: now,
             keep_serial: false,
             thread_bound: PhantomData,
         }
@@ -35,7 +43,10 @@ impl FixedInputs {
     /// Pins the fixture clock to `now` while keeping identifiers unique:
     /// the identifier serial continues from wherever this thread's previous
     /// `at` scope (or an enclosing scope) left it, and is carried forward on
-    /// drop. Use successive `at` scopes to simulate time passing.
+    /// drop. Use successive `at` scopes to simulate time passing. To move an
+    /// existing guard's clock, drop it before creating the next one:
+    /// assigning over a live guard installs the new instant and then lets
+    /// the old guard's drop restore its own prior underneath it.
     #[must_use]
     pub fn at(now: DateTime<Utc>) -> Self {
         let serial = INPUTS
@@ -43,6 +54,7 @@ impl FixedInputs {
             .max(SERIAL_FLOOR.with(Cell::get));
         Self {
             prior: INPUTS.with(|state| state.replace(Some((now, serial)))),
+            pinned: now,
             keep_serial: true,
             thread_bound: PhantomData,
         }
@@ -51,6 +63,11 @@ impl FixedInputs {
 impl Drop for FixedInputs {
     fn drop(&mut self) {
         INPUTS.with(|state| {
+            debug_assert_eq!(
+                state.get().map(|(now, _)| now),
+                Some(self.pinned),
+                "FixedInputs guards must be dropped in LIFO order"
+            );
             if self.keep_serial {
                 let serial = state.get().map_or(0, |(_, serial)| serial);
                 SERIAL_FLOOR.with(|floor| floor.set(floor.get().max(serial)));

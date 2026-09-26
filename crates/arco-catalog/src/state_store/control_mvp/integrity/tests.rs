@@ -1611,6 +1611,9 @@ fn age_anchor_rule_inherits_within_a_bucket_and_records_the_parent_across_one() 
 
 /// Sixteen commits at `start`, then a consolidation two hours later: it
 /// crosses a bucket, so the consolidated head carries an anchor of its own.
+/// The render clock consults the fixture only under `test-utils`; without
+/// it the consolidation would land in the commits' wall-clock hour.
+#[cfg(feature = "test-utils")]
 #[allow(
     clippy::future_not_send,
     reason = "the fixture clock guard is thread-bound by design"
@@ -1642,6 +1645,7 @@ async fn anchored_consolidated_head(
     clock
 }
 
+#[cfg(feature = "test-utils")]
 async fn walks_to(
     store: &ControlMvpStateStore,
     child: &str,
@@ -1656,6 +1660,7 @@ async fn walks_to(
         .map(|found| found.is_some())
 }
 
+#[cfg(feature = "test-utils")]
 #[tokio::test]
 async fn ancestry_rejects_a_wrong_anchor_and_a_stamp_before_the_parent() {
     let (storage, store) = fixture();

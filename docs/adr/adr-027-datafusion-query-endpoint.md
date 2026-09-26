@@ -1,7 +1,9 @@
 # ADR-027: DataFusion Query Endpoint
 
 ## Status
-Accepted
+Superseded by the engine-independent API boundary (2026-09-26). The
+`/api/v1/query` and `/api/v1/query-data` routes were removed; this document
+records the former implementation.
 
 ## Context
 We need a server-side SQL query path for catalog snapshots to support audit and operational queries without standing up separate query infrastructure. The API must remain read-only and return efficient, structured results for clients.

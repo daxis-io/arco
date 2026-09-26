@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use axum::http::{Method, StatusCode};
 use tower::ServiceExt;
 
-#[path = "support/query.rs"]
+#[path = "support/catalog_inventory.rs"]
 mod support;
 
 use support::{helpers, test_router_with_backend};
@@ -34,7 +34,7 @@ async fn catalog_inventory_reports_manifest_identity_and_safe_counts() -> Result
     })?;
 
     assert_eq!(payload["manifest_type"], "catalog_inventory_snapshot");
-    assert_eq!(payload["version"], 1);
+    assert_eq!(payload["version"], 2);
     assert_eq!(payload["catalog_snapshot_version"], 3);
 
     let manifest_id = payload["catalog_manifest_id"]
@@ -60,14 +60,12 @@ async fn catalog_inventory_reports_manifest_identity_and_safe_counts() -> Result
         .context("object_families missing")?;
     assert_eq!(families.len(), 4);
     assert!(families.iter().any(|family| {
-        family["name"] == "tables"
-            && family["available"] == true
-            && family["row_count"] == 1
-            && family["query_handle"] == "system.catalog.tables"
+        family["name"] == "tables" && family["available"] == true && family["row_count"] == 1
     }));
 
     let raw = String::from_utf8_lossy(&body);
     assert!(!raw.contains("manifest_path"));
+    assert!(!raw.contains("query_handle"));
     assert!(!raw.contains("snapshot_path"));
     assert!(!raw.contains(".parquet"));
     assert!(!raw.contains("credential"));

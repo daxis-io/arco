@@ -2,7 +2,9 @@
 
 **Goal:** Add a tenant-visible, read-only `system` catalog for Arco that exposes the control-plane, lineage, and the Daxis-relevant runtime state users actually need for debugging, governance, scheduling, backfills, and run operations through SQL, then add a first-class visible publication history table as `system.catalog.commits`.
 
-**Architecture:** Reuse the existing pointer-first snapshot model and the existing `/api/v1/query` DataFusion path instead of inventing a new serving stack. Introduce an API-local system-table registry that maps logical names like `system.catalog.namespaces`, `system.orchestration.partition_status`, and `system.orchestration.backfills` to manifest-selected Parquet artifacts, then extend the catalog snapshot writer to emit `commits.parquet` for visible Tier-1 head publications. Keep system tables derived, asynchronous, and read-only; they must never become the synchronous authz or correctness path.
+**Historical plan:** The `/api/v1/query` DataFusion path and API-local `system.*` registry described below were removed on 2026-09-26. Arco retains pointer-published Parquet projections; query engines run outside Arco. See [API migration](../guide/src/reference/api.md#query-endpoint-migration).
+
+**Architecture at drafting:** Reuse the existing pointer-first snapshot model and the existing `/api/v1/query` DataFusion path instead of inventing a new serving stack. Introduce an API-local system-table registry that maps logical names like `system.catalog.namespaces`, `system.orchestration.partition_status`, and `system.orchestration.backfills` to manifest-selected Parquet artifacts, then extend the catalog snapshot writer to emit `commits.parquet` for visible Tier-1 head publications. Keep system tables derived, asynchronous, and read-only; they must never become the synchronous authz or correctness path.
 
 **Tech Stack:** Rust, Axum, DataFusion, Arrow/Parquet, `arco-api`, `arco-catalog`, `arco-flow`, mdBook, `cargo test`.
 
@@ -657,4 +659,4 @@ git commit -m "docs: add system catalog reference"
 - `system.query.history` after `/api/v1/query` and `/api/v1/query-data` emit durable history records.
 - `system.storage.retention_policies`, `system.storage.gc_runs`, `system.storage.snapshot_inventory`, and `system.storage.reconciliation_issues` after GC/reconciler outputs are materialized as first-class Arco projections.
 - `system.billing.*`, `system.compute.*`, `system.classification.*`, and policy/grant tables only after those domains become authoritative runtime state in Arco.
-- Browser-specific logical `system` catalog affordances if the UI needs direct DuckDB-WASM access to the same logical names instead of going through `/api/v1/query`.
+- Client-specific logical `system` catalog affordances if a query engine needs direct access to the same logical names instead of going through `/api/v1/query`.

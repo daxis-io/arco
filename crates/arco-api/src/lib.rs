@@ -63,13 +63,11 @@ pub(crate) mod grpc_transactions;
 pub mod metrics;
 pub mod openapi;
 pub(crate) mod orchestration_compaction;
-pub(crate) mod parquet_table;
 pub(crate) mod paths;
 pub mod rate_limit;
 pub(crate) mod redaction;
 pub mod routes;
 pub mod server;
-pub(crate) mod system_tables;
 
 /// Prelude module for convenient imports.
 pub mod prelude {

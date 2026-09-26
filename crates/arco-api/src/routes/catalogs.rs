@@ -220,8 +220,6 @@ pub struct CatalogInventoryObjectFamily {
     pub available: bool,
     /// Number of rows in the selected snapshot for this family.
     pub row_count: u64,
-    /// Stable query handle for paging or querying this family.
-    pub query_handle: String,
 }
 
 /// Creates catalog routes.
@@ -297,31 +295,27 @@ pub(crate) async fn get_catalog_inventory(
             "catalogs",
             snapshot_contains(snapshot, "catalogs.parquet"),
             counts.catalogs,
-            "system.catalog.catalogs",
         ),
         object_family(
             "schemas",
             snapshot_contains(snapshot, "namespaces.parquet"),
             counts.schemas,
-            "system.catalog.namespaces",
         ),
         object_family(
             "tables",
             snapshot_contains(snapshot, "tables.parquet"),
             counts.tables,
-            "system.catalog.tables",
         ),
         object_family(
             "columns",
             snapshot_contains(snapshot, "columns.parquet"),
             counts.columns,
-            "system.catalog.columns",
         ),
     ];
 
     Ok(Json(CatalogInventoryResponse {
         manifest_type: "catalog_inventory_snapshot".to_string(),
-        version: 1,
+        version: 2,
         catalog_snapshot_version: descriptor.snapshot_version.as_u64(),
         catalog_manifest_id: descriptor.manifest_id,
         published_at: descriptor.published_at.to_rfc3339(),
@@ -1322,13 +1316,11 @@ fn object_family(
     name: impl Into<String>,
     available: bool,
     row_count: u64,
-    query_handle: impl Into<String>,
 ) -> CatalogInventoryObjectFamily {
     CatalogInventoryObjectFamily {
         name: name.into(),
         available,
         row_count,
-        query_handle: query_handle.into(),
     }
 }
 

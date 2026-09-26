@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed
+Superseded for SQL serving by the engine-independent API boundary (2026-09-26).
+Projection publication remains Arco-owned, but Arco does not register the
+`system.*` SQL catalog or serve `/api/v1/query`.
 
 ## Context
 

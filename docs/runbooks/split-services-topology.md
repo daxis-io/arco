@@ -245,4 +245,4 @@ should treat it as the repair path racing pruning, not as a worker bug.
 
 - No in-process ETL execution engine in API/orchestration services.
 - No Spark/dbt/Flink adapter implementation.
-- No server-side DuckDB runtime for browser query path.
+- No query-engine runtime is required for Arco's signed-URL read path.

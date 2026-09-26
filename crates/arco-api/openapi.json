@@ -1877,146 +1877,6 @@
         ]
       }
     },
-    "/api/v1/query": {
-      "post": {
-        "tags": [
-          "query"
-        ],
-        "summary": "Execute a SQL query against catalog snapshots.",
-        "description": "POST /api/v1/query",
-        "operationId": "query",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/QueryRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Query results (Arrow IPC stream or JSON)"
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ]
-      }
-    },
-    "/api/v1/query-data": {
-      "post": {
-        "tags": [
-          "query"
-        ],
-        "summary": "Execute a SQL query against registered user tables.",
-        "description": "POST /api/v1/query-data",
-        "operationId": "query_data",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/QueryRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Query results (Arrow IPC stream or JSON)"
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ]
-      }
-    },
     "/api/v1/tasks/{task_id}/completed": {
       "post": {
         "tags": [
@@ -4863,8 +4723,7 @@
         "required": [
           "name",
           "available",
-          "row_count",
-          "query_handle"
+          "row_count"
         ],
         "properties": {
           "available": {
@@ -4874,10 +4733,6 @@
           "name": {
             "type": "string",
             "description": "Logical object family name."
-          },
-          "query_handle": {
-            "type": "string",
-            "description": "Stable query handle for paging or querying this family."
           },
           "row_count": {
             "type": "integer",
@@ -6581,19 +6436,6 @@
           "value": {
             "type": "string",
             "description": "Partition value."
-          }
-        }
-      },
-      "QueryRequest": {
-        "type": "object",
-        "description": "Query request payload.",
-        "required": [
-          "sql"
-        ],
-        "properties": {
-          "sql": {
-            "type": "string",
-            "description": "SQL query to execute (read-only)."
           }
         }
       },

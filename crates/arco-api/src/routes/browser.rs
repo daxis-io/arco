@@ -1,6 +1,6 @@
 //! Browser URL minting routes.
 //!
-//! Provides signed URL minting for browser-based Parquet reads via DuckDB-WASM.
+//! Provides signed URL minting for client-side Parquet reads.
 //!
 //! ## Security Design
 //!
@@ -10,9 +10,8 @@
 //! 1. **Manifest-driven allowlist**: Only paths in `SnapshotInfo.files` are mintable
 //! 2. **No ledger access**: Ledger paths are never mintable (internal)
 //! 3. **No manifest access**: Manifest paths are never mintable (metadata leak)
-//! 4. **No internal artifacts**: `commits.parquet` is never mintable — its private
-//!    commit-authority columns are only visible through the redacted
-//!    `system.catalog.commits` projection
+//! 4. **No internal artifacts**: `commits.parquet` is never mintable because it
+//!    contains private commit-authority columns
 //! 5. **Tenant scoping**: All paths are scoped to auth context tenant/workspace
 //! 6. **TTL bounded**: Maximum 1 hour, default 15 minutes
 //! 7. **No data proxying**: Only URLs returned, never actual data
@@ -280,8 +279,7 @@ fn prepare_mint_paths(
                 &state.config.audit,
             );
             return Err(ApiError::projection_only_artifact(format!(
-                "'{path}' is an internal artifact with redacted columns; query the \
-                 system.catalog.commits projection via POST /api/v1/query instead"
+                "'{path}' is an internal artifact with private columns and cannot be minted"
             )));
         }
     }
@@ -331,14 +329,12 @@ fn dedup_paths(paths: &[String]) -> Vec<String> {
         .cloned()
         .collect()
 }
-/// Returns true for snapshot artifacts whose raw bytes must never be minted
-/// because a redacted system-table projection is their only public surface.
+/// Returns true for snapshot artifacts whose raw bytes must never be minted.
 ///
 /// `commits.parquet` carries the private commit-authority witness columns
-/// that `system.catalog.commits` strips (see `crate::system_tables`). The
-/// classification itself lives in the catalog reader, which also filters these
-/// artifacts out of every mint allowlist; this route adds the typed refusal
-/// that points callers at the projection.
+/// that are not available through public catalog reads. The classification
+/// lives in the catalog reader, which filters these artifacts out of every
+/// mint allowlist; this route adds a typed refusal.
 fn is_projection_only_artifact(path: &str) -> bool {
     arco_catalog::is_projection_only_artifact(path)
 }

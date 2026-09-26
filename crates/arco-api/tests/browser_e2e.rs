@@ -1,9 +1,9 @@
-//! E2E Browser Read and Signed URL Security Tests.
+//! Signed URL publication and security tests.
 //!
-//! Tests the complete browser read path:
+//! Tests the Arco-owned catalog and URL path:
 //! 1. Create namespace and register table (via API)
 //! 2. Mint signed URLs for catalog domain
-//! 3. Verify URLs are returned with correct structure
+//! 3. Verify a minted URL serves the published Parquet bytes
 //!
 //! Also tests signed URL security invariants:
 //! - Path traversal rejection
@@ -282,37 +282,27 @@ async fn response_json<T: serde::de::DeserializeOwned>(
         .with_context(|| format!("deserialize JSON: {}", String::from_utf8_lossy(&body)))
 }
 
-fn ensure_httpfs_loaded(conn: &duckdb::Connection) -> Result<()> {
-    if conn.execute("LOAD httpfs", []).is_err() {
-        conn.execute("INSTALL httpfs", [])
-            .context("install DuckDB httpfs extension")?;
-        conn.execute("LOAD httpfs", [])
-            .context("load DuckDB httpfs extension")?;
-    }
-    Ok(())
-}
-
 // ============================================================================
-// E2E Browser Read Tests (Task 5.2)
+// Signed URL Publication Tests (Task 5.2)
 // ============================================================================
 
-mod e2e_browser_read {
+mod signed_url_publication {
     use super::*;
 
     #[tokio::test]
-    async fn test_browser_read_full_lifecycle() -> Result<()> {
-        // This test verifies the complete browser read path:
+    async fn test_catalog_signed_url_full_lifecycle() -> Result<()> {
+        // This test verifies Arco's catalog publication and URL contract:
         // 1. Initialize catalog by creating a namespace
         // 2. Register a table with columns
         // 3. Mint signed URLs for the catalog domain
-        // 4. Verify URLs are returned with correct structure
+        // 4. Fetch a byte range from the published Parquet file
 
         use arco_catalog::CatalogReader;
         use arco_core::CatalogDomain;
         use arco_core::ScopedStorage;
         let Some((router, inner)) = test_router_with_storage().await? else {
             // This environment does not allow binding to localhost, so we can't
-            // validate the full HTTP → DuckDB httpfs path. The signed URL
+            // validate the HTTP signed-URL path. The signed URL
             // minting security tests still run using a dummy backend.
             return Ok(());
         };
@@ -396,34 +386,21 @@ mod e2e_browser_read {
             "expected signed URL path to include /objects/"
         );
 
-        // Query Parquet bytes via signed URL using DuckDB (browser read analogue).
-
-        let signed_url = signed.url.clone();
-        let count = tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || {
-                let conn = duckdb::Connection::open_in_memory().context("open duckdb")?;
-                ensure_httpfs_loaded(&conn)?;
-                let mut stmt = conn
-                    .prepare("SELECT count(*) FROM read_parquet(?) WHERE name = ?")
-                    .context("prepare query")?;
-                let count: i64 = stmt
-                    .query_row([signed_url.as_str(), "test_ns"], |row| row.get(0))
-                    .context("query namespaces parquet")?;
-                Ok::<i64, anyhow::Error>(count)
-            }),
-        )
-        .await
-        .context("duckdb query timed out")?
-        .context("duckdb task join")??;
-
-        assert_eq!(count, 1, "expected namespace row to be queryable");
+        let response = reqwest::Client::new()
+            .get(&signed.url)
+            .header(header::RANGE, "bytes=0-3")
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .context("fetch published Parquet header")?;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.bytes().await?, Bytes::from_static(b"PAR1"));
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_browser_read_empty_catalog() -> Result<()> {
+    async fn test_signed_url_empty_catalog() -> Result<()> {
         let router = test_router().await?;
 
         // Catalog isn't initialized (no manifests), so minting should fail.
@@ -438,7 +415,7 @@ mod e2e_browser_read {
     }
 
     #[tokio::test]
-    async fn test_browser_read_different_domains() -> Result<()> {
+    async fn test_signed_url_different_domains() -> Result<()> {
         let router = test_router().await?;
 
         // Initialize catalog
@@ -804,9 +781,8 @@ mod signed_url_security {
 
     /// Regression for #354: the raw `commits.parquet` artifact carries the
     /// private commit-authority columns (`manifest_id`,
-    /// `event_witnesses_json`) that the `system.catalog.commits` projection
-    /// deliberately redacts. Minting a signed URL for it defeats that
-    /// projection, so the browser route must refuse it with a typed error even
+    /// `event_witnesses_json`). Minting a signed URL would expose them, so the
+    /// browser route must refuse it with a typed error even
     /// though the manifest snapshot file list contains it - while benign
     /// artifacts from the same snapshot keep minting normally.
     #[tokio::test]
@@ -857,8 +833,8 @@ mod signed_url_security {
         let error: ApiErrorResponse = response_json(response).await?;
         assert_eq!(error.code, "PROJECTION_ONLY_ARTIFACT");
         assert!(
-            error.message.contains("system.catalog.commits"),
-            "denial must point at the redacted projection: {}",
+            error.message.contains("internal artifact"),
+            "denial must identify the protected artifact: {}",
             error.message
         );
 

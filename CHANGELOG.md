@@ -52,6 +52,13 @@ All state-store program surfaces above are landed with CI-run test suites but ar
 - Applied shared public-route rate limiting, internal-error redaction, thrift allocation bounds, and JWT feature-provider compatibility for Iceberg and Unity Catalog protocol surfaces.
 - Preserved deployed UAT as an explicit live-proof gate instead of claiming completion from local or readiness-only evidence.
 
+### Removed
+- Removed the server-side SQL query endpoints and DataFusion runtime from Arco.
+- Removed the catalog inventory `query_handle` field; inventory response version is now 2.
+
+### Changed
+- Signed-URL tests now cover Arco's HTTP and Parquet publication contract without a query engine.
+
 ## [0.2.0] - 2026-05-31
 ### Added
 - Catalog control-plane release surface covering scoped metastore mutations, catalog product APIs, Unity Catalog compatibility inventory, and system-table contracts.

@@ -8,8 +8,8 @@
 //! - `commits.parquet`
 //! - `lineage_edges.parquet`
 //!
-//! The schemas here are the contract for browser reads (DuckDB-WASM) and API
-//! clients. Keep changes backwards-compatible and gated by snapshot versioning.
+//! The schemas here are the contract for Parquet readers and API clients.
+//! Keep changes backwards-compatible and gated by snapshot versioning.
 
 use std::io::Cursor;
 use std::sync::Arc;
@@ -756,7 +756,7 @@ pub fn transaction_handle_schema() -> Schema {
 }
 
 fn writer_properties() -> WriterProperties {
-    // Keep properties minimal and widely compatible with DuckDB readers.
+    // Keep properties minimal and widely compatible with Parquet readers.
     let created_by = KeyValue {
         key: "created_by".to_string(),
         value: Some("arco-catalog".to_string()),

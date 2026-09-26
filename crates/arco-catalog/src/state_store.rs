@@ -1680,6 +1680,15 @@ impl ScanPage {
     }
 }
 
+/// The one rule every committed expiry hint satisfies, shared by transaction
+/// replay, segment decoding and the deterministic model: a hint is a positive
+/// Unix-millisecond instant and rides only on a live KV row. Tombstones,
+/// outbox rows and trims never carry one.
+#[must_use]
+pub(crate) fn expiry_hint_is_valid(expires_at_ms: Option<i64>, live_kv_row: bool) -> bool {
+    expires_at_ms.is_none_or(|expiry| expiry > 0 && live_kv_row)
+}
+
 pub(crate) fn build_scan_page(
     scope: &StateScope,
     request: ScanRequest,

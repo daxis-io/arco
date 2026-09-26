@@ -119,7 +119,7 @@ use super::{
     ProjectionIntentV1, RestoreAttemptIdentity, RestoreParticipantInspection,
     RestoredAuthorityEvidence, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
-    build_scan_page, build_scan_page_with_backend_boundary,
+    build_scan_page, build_scan_page_with_backend_boundary, expiry_hint_is_valid,
 };
 use crate::error::{CatalogError, Result};
 use crate::gc::reachability::RetainedAuthorityRoots;
@@ -2263,9 +2263,7 @@ impl ControlMvpStateStore {
         let reader = self
             .resolve_persisted_retained_reader_at(source, now)
             .await?;
-        reader
-            .live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
-            .await
+        reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
     }
 
     fn validate_restore_authority_format(
@@ -6104,9 +6102,7 @@ impl ReplayState {
                     "control MVP write generation does not match transaction sequence",
                 ));
             }
-            if write.expires_at_ms.is_some_and(|expiry| expiry <= 0)
-                || (write.value.is_none() && write.expires_at_ms.is_some())
-            {
+            if !expiry_hint_is_valid(write.expires_at_ms, write.value.is_some()) {
                 return Err(invariant_violation(
                     "control MVP write carries an invalid expiry hint",
                 ));
@@ -8485,11 +8481,10 @@ fn decode_segment_batch(batch: &RecordBatch) -> Result<Vec<ControlMvpSegmentRow>
             ));
         }
         let expires_at_ms = (!expiries.is_null(row_index)).then(|| expiries.value(row_index));
-        // The hint is a property of live KV rows only, and a non-positive
-        // stamp is never a valid wall-clock instant.
-        if expires_at_ms
-            .is_some_and(|expiry| expiry <= 0 || tombstone || record_kind != SEGMENT_RECORD_KV)
-        {
+        if !expiry_hint_is_valid(
+            expires_at_ms,
+            !tombstone && record_kind == SEGMENT_RECORD_KV,
+        ) {
             return Err(invariant_violation(
                 "control MVP Arrow segment expiry hint is invalid for its row",
             ));
@@ -8649,21 +8644,25 @@ impl ControlMvpRetainedReader {
     /// restore source scan. This is the only path that surfaces the hint
     /// past the reader boundary, and it is internal: public reads never
     /// expose or filter on it.
-    async fn live_entries_bounded(
+    ///
+    /// Only the materialized checkpoint cut restore resolves is served. A
+    /// manifest-backed reader would need an unbounded replay to answer, so it
+    /// is an invariant violation here rather than a silent full replay.
+    fn live_entries_bounded(
         &self,
         max_total_rows: usize,
         max_total_bytes: usize,
     ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
-        let materialized;
         let state = match &self.source {
             ControlMvpRetainedSource::Bounded { .. } => {
                 return Err(validation_failed(
                     "bounded authority cannot serve an expiry-aware restore source scan",
                 ));
             }
-            ControlMvpRetainedSource::Manifest { store, manifest } => {
-                materialized = store.replay_manifest(manifest).await?;
-                &materialized
+            ControlMvpRetainedSource::Manifest { .. } => {
+                return Err(invariant_violation(
+                    "expiry-aware restore source scan requires a materialized checkpoint cut",
+                ));
             }
             ControlMvpRetainedSource::Materialized(state) => state,
         };
@@ -12738,6 +12737,106 @@ mod tests {
             workspace_suffix, legacy,
             "workspace restore identity must keep the legacy byte order"
         );
+    }
+
+    #[tokio::test]
+    async fn live_entries_bounded_only_serves_a_materialized_restore_source() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put_with_expiry(b"row", Bytes::from_static(b"value"), 5)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let token = store.current_state_token().await.unwrap();
+        let manifest_reader = store.retained_reader_at(token).await.unwrap();
+        assert!(matches!(
+            manifest_reader.source,
+            ControlMvpRetainedSource::Manifest { .. }
+        ));
+        // A manifest-backed reader would need an unbounded replay; the scan is
+        // only defined over the materialized checkpoint cut restore resolves.
+        assert!(matches!(
+            manifest_reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let materialized = store.retained_checkpoint_reader(checkpoint).await.unwrap();
+        assert!(matches!(
+            materialized.source,
+            ControlMvpRetainedSource::Materialized(_)
+        ));
+        let entries = materialized
+            .live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+            .unwrap();
+        assert_eq!(
+            entries.get(b"row".as_slice()),
+            Some(&RestoreSourceValue {
+                bytes: Bytes::from_static(b"value"),
+                expires_at_ms: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn restore_writes_reproduce_hint_only_differences_in_both_directions() {
+        fn stored(expires_at_ms: Option<i64>) -> StoredValue {
+            StoredValue {
+                bytes: Bytes::from_static(b"same"),
+                generation: 1,
+                tombstone: false,
+                expires_at_ms,
+            }
+        }
+        fn source(expires_at_ms: Option<i64>) -> RestoreSourceValue {
+            RestoreSourceValue {
+                bytes: Bytes::from_static(b"same"),
+                expires_at_ms,
+            }
+        }
+        fn put_hint(write: Option<&StagedWrite>) -> Option<i64> {
+            match write {
+                Some(StagedWrite::Put {
+                    value,
+                    expires_at_ms,
+                }) => {
+                    assert_eq!(value.as_ref(), b"same");
+                    *expires_at_ms
+                }
+                other => panic!("expected a put, got {other:?}"),
+            }
+        }
+        let mut current = ReplayState::default();
+        current.kv.insert(b"gain".to_vec(), stored(None));
+        current.kv.insert(b"clear".to_vec(), stored(Some(7)));
+        current.kv.insert(b"shift".to_vec(), stored(Some(7)));
+        current.kv.insert(b"equal".to_vec(), stored(Some(7)));
+        current.kv.insert(b"plain".to_vec(), stored(None));
+        let source_values = BTreeMap::from([
+            (b"gain".to_vec(), source(Some(7))),
+            (b"clear".to_vec(), source(None)),
+            (b"shift".to_vec(), source(Some(9))),
+            (b"equal".to_vec(), source(Some(7))),
+            (b"plain".to_vec(), source(None)),
+        ]);
+        let writes = ControlMvpStateStore::restore_writes(&source_values, &current);
+        assert_eq!(
+            writes.keys().collect::<Vec<_>>(),
+            vec![&b"clear".to_vec(), &b"gain".to_vec(), &b"shift".to_vec()],
+            "equal bytes with an equal or equally absent hint need no rewrite"
+        );
+        assert_eq!(put_hint(writes.get(b"gain".as_slice())), Some(7));
+        assert_eq!(put_hint(writes.get(b"clear".as_slice())), None);
+        assert_eq!(put_hint(writes.get(b"shift".as_slice())), Some(9));
     }
 }
 

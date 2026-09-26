@@ -11,6 +11,7 @@ use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
     CheckpointToken, CommitOutcome, KeyRange, KvPair, PredicateInputSet, ScanPage, ScanRequest,
     StateScope, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue, build_scan_page,
+    expiry_hint_is_valid,
 };
 use crate::error::{CatalogError, Result};
 
@@ -311,9 +312,7 @@ impl ModelState {
                     write.generation, record.sequence
                 )));
             }
-            if write.expires_at_ms.is_some_and(|expiry| expiry <= 0)
-                || (write.value.is_none() && write.expires_at_ms.is_some())
-            {
+            if !expiry_hint_is_valid(write.expires_at_ms, write.value.is_some()) {
                 return Err(invariant_violation(format!(
                     "model write for sequence {} carries an invalid expiry hint",
                     record.sequence

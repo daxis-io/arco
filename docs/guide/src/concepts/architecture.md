@@ -11,7 +11,7 @@ Arco is a file-native metadata platform with two tightly integrated domains:
 - Metadata as immutable files on object storage.
 - Open table-format contracts, with new table registrations defaulting to
   Delta Lake and Iceberg/Parquet exposed through explicit support levels.
-- Query-native reads (DataFusion and browser-friendly read paths).
+- Published Parquet read paths independent of the client's query engine.
 - Deterministic planning and replayable execution history.
 - Tenant isolation at storage path, API, and policy boundaries.
 - Compatibility APIs are adapters over native Arco state.
@@ -31,10 +31,9 @@ Arco is a file-native metadata platform with two tightly integrated domains:
 - Operational facts are append-first, then compacted into bounded-staleness views.
 - Read paths are designed for stable contracts and predictable eventual convergence.
 
-That same boundary applies to tenant-visible system tables: catalog reads remain
-pointer-first, `/api/v1/query` is the initial SQL surface, and `system.*`
-relations are read-only projections over published artifacts rather than a new
-commit point.
+That same boundary applies to tenant-visible projections: catalog reads remain
+pointer-first, and published artifacts are derived read models rather than a
+new commit point.
 
 Current scope note:
 

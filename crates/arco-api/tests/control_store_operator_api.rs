@@ -16,7 +16,9 @@ use arco_api::server::Server;
 use arco_catalog::state_store::{
     ControlMvpProjectionOutboxRecord, ControlMvpStateStore, StateScope, TxnOptions,
 };
-use arco_catalog::{ArcoStateTxn, ControlCatalogAuthority, WriteOptions};
+use arco_catalog::{
+    ArcoStateTxn, CatalogProjectionMaterializer, ControlCatalogAuthority, WriteOptions,
+};
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use axum::body::Body;
@@ -65,17 +67,6 @@ fn post(body: &'static str) -> Request<Body> {
         .header("X-Tenant-Id", TENANT)
         .header("X-Workspace-Id", WORKSPACE)
         .header("X-Groups", OPERATOR_GROUP)
-        .body(Body::from(body))
-        .expect("request build failed")
-}
-
-fn query(body: &'static str) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri("/api/v1/query?format=json")
-        .header("content-type", "application/json")
-        .header("X-Tenant-Id", TENANT)
-        .header("X-Workspace-Id", WORKSPACE)
         .body(Body::from(body))
         .expect("request build failed")
 }
@@ -149,20 +140,16 @@ async fn catalog_projection_outbox_materializes_before_operator_drain_acknowledg
         "acknowledged drain must leave a materialized manifest: {artifacts:?}"
     );
 
-    let status_response = router_with(Arc::clone(&backend), true)
-        .oneshot(query(
-            r#"{"sql":"SELECT projection_kind, applied_authority_sequence, observed_head_sequence, lag, last_success_at_ms, failure_state FROM system.catalog.projection_status"}"#,
-        ))
+    let status = CatalogProjectionMaterializer::new(scoped(Arc::clone(&backend)))
+        .expect("catalog materializer")
+        .status()
         .await
-        .expect("projection status query");
-    assert_eq!(StatusCode::OK, status_response.status());
-    let status = json_body(status_response).await;
-    assert_eq!("catalog-parquet-v1", status[0]["projection_kind"]);
-    assert_eq!(1, status[0]["applied_authority_sequence"]);
-    assert_eq!(1, status[0]["observed_head_sequence"]);
-    assert_eq!(0, status[0]["lag"]);
-    assert!(status[0]["last_success_at_ms"].as_str().is_some());
-    assert!(status[0]["failure_state"].is_null());
+        .expect("projection status read")
+        .expect("projection status exists");
+    assert_eq!(Some(1), status.applied_authority_sequence());
+    assert_eq!(Some(1), status.observed_authority_sequence());
+    assert!(status.last_success_at_ms().is_some());
+    assert!(status.failure_state().is_none());
 
     for body in [
         r#"{"sourceDomain":"catalog","consumerId":"catalog-parquet-v1","trim":true}"#,

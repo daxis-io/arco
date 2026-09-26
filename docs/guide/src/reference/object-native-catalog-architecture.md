@@ -399,7 +399,7 @@ for ordinary reads.
 
 1. Read accelerator for existing Delta tables:
    register tables, bootstrap from Delta checkpoints, write Arco table heads,
-   snapshots, base manifests, and DataFusion scan integration.
+   snapshots, base manifests, and external query-engine scan integration.
 2. Authoritative catalog-managed commits:
    add staged Delta commits, table-head CAS, Delta publish repair, and conflict
    validation.

@@ -64,12 +64,12 @@ Or jump straight to:
 
 - [Quick Start](docs/guide/src/getting-started/quickstart.md)
 - [Architecture](docs/guide/src/concepts/architecture.md)
-- [System Catalog](docs/guide/src/reference/system-catalog.md)
+- [Published Projections](docs/guide/src/reference/system-catalog.md)
 
 ## How it fits together
 
 ```
-arco-api        HTTP/gRPC entry point (read only SQL via DataFusion)
+arco-api        HTTP/gRPC control-plane and catalog entry point
 arco-catalog    Table format catalog, lineage, Parquet metadata snapshots
 arco-flow       Planning, scheduling, run state
 arco-compactor  Tier-2 event consolidation
@@ -77,7 +77,7 @@ arco-proto      Cross-language protobuf contracts
 arco-core       Shared primitives (tenant context, IDs, errors)
 ```
 
-Task execution runs in external workers via a canonical dispatch envelope. The browser query path uses DuckDB-WASM against signed URLs - no always-on infrastructure required.
+Task execution runs in external workers via a canonical dispatch envelope. Arco mints scoped URLs for published files; clients choose their own query engine.
 
 ## Proto compatibility
 

@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use arco_api::config::{Config, ControlV1CatalogRootConfig, ControlV1CursorKeyConfig};
 use arco_api::server::Server;
-use arco_catalog::CatalogAuthorityBindings;
+use arco_catalog::{CatalogAuthorityBindings, CatalogProjectionMaterializer};
+use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_iceberg::{IcebergConfig, IcebergState, iceberg_router};
 use arco_uc::{UnityCatalogState, unity_catalog_router};
@@ -216,50 +217,33 @@ async fn native_uc_and_iceberg_reads_resolve_one_control_v1_authority() -> Resul
     assert_eq!(status, StatusCode::CREATED);
     assert!(!String::from_utf8_lossy(&native_body).contains("StateToken"));
 
-    let mut projection_status = Value::Null;
+    let storage_backend: Arc<dyn StorageBackend> = backend.clone();
+    let materializer = CatalogProjectionMaterializer::new(ScopedStorage::new(
+        storage_backend,
+        TENANT,
+        WORKSPACE,
+    )?)?;
+    let mut projection_status = None;
     for _ in 0..50 {
-        let (status, projection_status_body) = call(
-            native.clone(),
-            Method::POST,
-            "/api/v1/query?format=json",
-            Some(json!({
-                "sql": "SELECT projection_kind, applied_authority_sequence, observed_head_sequence, lag, last_success_at_ms, failure_state FROM system.catalog.projection_status"
-            })),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::OK);
-        projection_status = serde_json::from_slice(&projection_status_body)?;
-        let row = &projection_status[0];
-        if row["applied_authority_sequence"].as_u64().is_some()
-            && row["applied_authority_sequence"] == row["observed_head_sequence"]
-        {
-            break;
+        if let Some(status) = materializer.status().await? {
+            if status.applied_authority_sequence().is_some()
+                && status.applied_authority_sequence() == status.observed_authority_sequence()
+            {
+                projection_status = Some(status);
+                break;
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let status_row = &projection_status[0];
-    assert_eq!(status_row["projection_kind"], "catalog-parquet-v1");
-    assert!(status_row["observed_head_sequence"].as_u64().is_some());
+    let status = projection_status.context("default notifier did not converge projection")?;
+    assert!(status.observed_authority_sequence().is_some());
     assert_eq!(
-        status_row["applied_authority_sequence"], status_row["observed_head_sequence"],
+        status.applied_authority_sequence(),
+        status.observed_authority_sequence(),
         "the default post-commit notifier must wake projection without an operator request"
     );
-    assert_eq!(status_row["lag"], 0);
-    assert!(
-        !status_row["last_success_at_ms"].is_null(),
-        "a converged projection must report its last success: {status_row}"
-    );
-    assert!(status_row["failure_state"].is_null());
-
-    let (status, query_data_body) = call(
-        native.clone(),
-        Method::POST,
-        "/api/v1/query-data?format=json",
-        Some(json!({"sql": "SELECT * FROM default.sales.orders"})),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&query_data_body).contains("only parquet tables"));
+    assert!(status.last_success_at_ms().is_some());
+    assert!(status.failure_state().is_none());
 
     for (uri, body) in [
         ("/api/v1/catalog/inventory", None),
@@ -1080,7 +1064,7 @@ async fn native_warmth_is_reused_by_first_uc_and_iceberg_requests() -> Result<()
     let backend = Arc::new(CacheReadBackend::default());
     let config = pilot_config();
     let bindings = protocol_bindings(&config);
-    let storage = arco_core::ScopedStorage::new(backend.clone(), TENANT, WORKSPACE)?;
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE)?;
     ControlCatalogAuthority::new(storage, StateScope::new(TENANT, WORKSPACE, "catalog"))?
         .with_projection_notifier(Arc::new(Quiet))
         .create_catalog("default", None, WriteOptions::default())

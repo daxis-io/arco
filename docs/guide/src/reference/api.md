@@ -8,6 +8,20 @@ The canonical REST contract snapshot is:
 
 Any API-facing change should update this file as part of the same pull request.
 
+## Query Endpoint Migration
+
+`POST /api/v1/query` and `POST /api/v1/query-data` have been removed. Calls to
+either path now return `404`; Arco no longer executes SQL or returns Arrow/JSON
+query results. The `query_handle` field was removed from catalog inventory
+object-family descriptors because its `system.*` aliases no longer resolve.
+The catalog inventory response version is now `2`.
+
+Use catalog REST reads for resource metadata. For allowed published catalog
+files, request scoped signed URLs from `POST /api/v1/browser/urls` and read the
+Parquet bytes with a client-supplied engine. For orchestration projections,
+resolve the published orchestration manifest or use the run/task REST API. The
+client runtime owns SQL planning, execution, and engine-specific tests.
+
 ## Service Implementation
 
 Primary API composition and routing live in:

@@ -10,8 +10,6 @@ pub mod manifests;
 pub mod namespaces;
 pub mod orchestration;
 pub(crate) mod pagination;
-pub mod query;
-pub mod query_data;
 pub mod tables;
 pub mod tasks;
 pub mod transactions;
@@ -30,8 +28,6 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
         .merge(tables::routes())
         .merge(lineage::routes())
         .merge(browser::routes())
-        .merge(query::routes())
-        .merge(query_data::routes())
         .merge(delta::routes())
         .merge(orchestration::routes())
         .merge(transactions::routes())

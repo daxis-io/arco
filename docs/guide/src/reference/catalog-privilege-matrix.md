@@ -65,7 +65,9 @@ access.
 | Share | create/read/update/delete | metastore admin, share manage, or owner | Planned |
 | Provider / recipient | create/read/update/delete | metastore admin, sharing manage, or owner | Planned |
 | Data product / business domain | create/read/update/delete | governance manage, domain owner, or metastore admin | Planned |
-| System table | query | explicit system-table read scope and row-level redaction | Partial for catalog/lineage/orchestration allowlist |
+
+Arco does not host SQL system tables. An integrating engine owns its table
+names and query authorization over artifacts Arco permits it to read.
 
 ## Canonical Operation Keys
 
@@ -97,7 +99,6 @@ or renaming a key is a product-contract change.
 | `governance.attachment.list` | Governance attachment | object read/manage or governance visibility privilege, redacted policy payloads, no hidden-object leakage |
 | `governance.attachment.update` | Governance attachment | object manage or governance attach privilege, typed attachment validation, no implicit policy enforcement |
 | `credential.mint` | Table, Volume, External location, Managed root, Model version, governed path | Partial for UC table/path credential decisions over compiled authorization and published storage governance; provider token material, revocation metadata, volume/model vending, and full native product-contract parity remain planned |
-| `system.query` | System table | explicit system-table read scope, workspace filter, schema redaction, freshness watermark |
 | `admin.explain_access` | Any securable | safe deny reason, grant evidence visibility, no hidden policy payloads |
 | `sharing.manage` | Share, provider, recipient | stable sharing object ID, owner/admin privilege, redacted recipient/provider metadata, audit allow and deny |
 | `governance.domain.manage` | Data product, business domain, glossary/domain metadata | stable domain ID, owner/governance privilege, controlled vocabulary checks, no hidden policy payloads |

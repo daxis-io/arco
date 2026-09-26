@@ -30,9 +30,9 @@ worker reports lifecycle facts through callback endpoints using the scoped task
 token and active attempt identity. Workers heartbeat only when the selected
 runtime supports heartbeat callbacks. Workers do not write projections directly.
 
-The evidence surface is `system.orchestration.*`. It is a read-only SQL view
-over the current published projection plus un-compacted L0 orchestration events,
-not the enforcement path for authorization, dispatch, or correctness decisions.
+The evidence surface is the published orchestration projections. They are
+derived read models, not the enforcement path for authorization, dispatch, or
+correctness decisions.
 
 Catalog-facing readers that need run-backed asset metadata use the
 manifest-published `catalog_run_index` projection. It is a derived read index
@@ -43,22 +43,22 @@ worker-written object path.
 
 | Product step | Owner | Contract evidence |
 | --- | --- | --- |
-| Run request is emitted by automation | Schedule, sensor, or backfill controller | `RunRequested` paired with `ScheduleTicked`, `SensorEvaluated`, or `BackfillChunkPlanned`; `system.orchestration.schedule_ticks`, `system.orchestration.sensor_evals`, `system.orchestration.backfill_chunks`, and conflicts in `system.orchestration.run_key_conflicts` |
-| Run becomes executable | API or run bridge | `RunTriggered`; `system.orchestration.runs` |
-| Plan is created | Control plane | `PlanCreated`; `system.orchestration.tasks` and `system.orchestration.dep_satisfaction` |
-| Task becomes dispatchable | Control plane | `DispatchRequested`; `system.orchestration.dispatch_outbox` |
-| Queue accepts dispatch | Dispatch adapter | `DispatchEnqueued`; `system.orchestration.dispatch_outbox` |
-| Worker reports callback facts | Worker callback API | `TaskStarted`, optional `TaskHeartbeat`, and `TaskFinished`; `system.orchestration.tasks` |
-| Retry wait or timeout is scheduled | Timer controller | `TimerRequested`, `TimerEnqueued`, `TimerFired`; `system.orchestration.timers` |
-| Schedule tick is evaluated | Schedule controller | `ScheduleTicked`; `system.orchestration.schedule_ticks` and `system.orchestration.schedule_state` |
-| Sensor is evaluated | Sensor controller | `SensorEvaluated`; `system.orchestration.sensor_state` and `system.orchestration.sensor_evals` |
-| Backfill is created and chunked | Backfill controller | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged`; `system.orchestration.backfills` and `system.orchestration.backfill_chunks` |
-| Partition status changes | Projection fold | `system.orchestration.partition_status` |
+| Run request is emitted by automation | Schedule, sensor, or backfill controller | `RunRequested` paired with `ScheduleTicked`, `SensorEvaluated`, or `BackfillChunkPlanned`; `schedule_ticks`, `sensor_evals`, `backfill_chunks`, and conflicts in `run_key_conflicts` |
+| Run becomes executable | API or run bridge | `RunTriggered`; `runs` |
+| Plan is created | Control plane | `PlanCreated`; `tasks` and `dep_satisfaction` |
+| Task becomes dispatchable | Control plane | `DispatchRequested`; `dispatch_outbox` |
+| Queue accepts dispatch | Dispatch adapter | `DispatchEnqueued`; `dispatch_outbox` |
+| Worker reports callback facts | Worker callback API | `TaskStarted`, optional `TaskHeartbeat`, and `TaskFinished`; `tasks` |
+| Retry wait or timeout is scheduled | Timer controller | `TimerRequested`, `TimerEnqueued`, `TimerFired`; `timers` |
+| Schedule tick is evaluated | Schedule controller | `ScheduleTicked`; `schedule_ticks` and `schedule_state` |
+| Sensor is evaluated | Sensor controller | `SensorEvaluated`; `sensor_state` and `sensor_evals` |
+| Backfill is created and chunked | Backfill controller | `BackfillCreated`, `BackfillChunkPlanned`, `BackfillStateChanged`; `backfills` and `backfill_chunks` |
+| Partition status changes | Projection fold | `partition_status` |
 | Catalog reader enumerates run-backed asset metadata | Projection fold | Manifest-published `catalog_run_index_by_org` artifacts; see [Catalog Run Index](./catalog-run-index.md) |
-| Run-key conflict is detected | Projection fold | `system.orchestration.run_key_conflicts` |
+| Run-key conflict is detected | Projection fold | `run_key_conflicts` |
 
 Every public orchestration claim should map to one of these event contracts,
-system-table evidence paths, OpenAPI/proto contracts, or a runnable test.
+published projection evidence, OpenAPI/proto contracts, or a runnable test.
 
 ## Run Code Version
 
@@ -84,7 +84,7 @@ retry-wait or redispatched state for the next attempt.
 ## Local Development Parity
 
 Local development must use the same run, task, dispatch, callback, compaction,
-and system-table lifecycle as production. A local shortcut may use an in-memory
+and projection lifecycle as production. A local shortcut may use an in-memory
 or local queue backend, but it must still produce the same durable events and
 published evidence.
 
@@ -134,7 +134,7 @@ authorization headers.
 The current CLI exposes `arco dev --check` as a check-only workflow. It verifies
 CLI/configuration wiring and lists the missing runtime pieces, but it does not
 start a local run, deliver work to a worker, process callbacks, compact
-projections, or prove `system.orchestration.*` evidence. Its machine-readable
+projections, or verify their publication. Its machine-readable
 report marks `ready: false` until an end-to-end local loop exists. Until then,
 docs should describe the required lifecycle as planned behavior or as a
 dry-run/check workflow, not as shipped local orchestration.
@@ -173,7 +173,7 @@ Arco explicitly avoids these product and architecture defaults:
 - No opaque unsafe payload defaults. Worker inputs must stay explicit JSON or
   protobuf-compatible contracts.
 - No user-facing docs ahead of behavior. Future behavior belongs in plans or is
-  labeled as planned until tests, OpenAPI/proto contracts, or system-table
+  labeled as planned until tests, OpenAPI/proto contracts, or projection
   evidence prove it.
 
 ## Verification Expectations
@@ -183,11 +183,11 @@ Before a behavior is described as shipped, it should have one of:
 - a focused Rust test for the controller, worker envelope, callback, or API
   route;
 - an OpenAPI or protobuf contract test;
-- a system-table query test proving the evidence surface is registered and
-  routeable;
+- a projection publication test proving the manifest selects the expected
+  artifact;
 - a guide page that labels the behavior as planned rather than implemented.
 
 Relevant gates include `worker_dispatch_envelope_tests`,
 `orchestration_protocol_invariants`, `orchestration_parity_gates_m2`,
 `orchestration_sensor_tests`, `orchestration_sensor_e2e_tests`,
-`system_tables_api`, and `openapi_orchestration_routes`.
+`openapi_orchestration_routes`.

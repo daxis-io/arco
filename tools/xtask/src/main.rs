@@ -78,7 +78,7 @@ enum Commands {
         #[arg(long, value_name = "BUCKET")]
         bucket: Option<String>,
     },
-    /// Enforce engine dependency and query-read boundaries.
+    /// Keep SQL runtimes and query-engine dependencies outside Arco.
     EngineBoundaryCheck,
     /// Enforce API-to-flow contract boundary drift guards.
     FlowBoundaryCheck,
@@ -1460,8 +1460,6 @@ fn adr_id_from_filename(file_name: &str) -> Option<String> {
 fn run_engine_boundary_check() -> Result<()> {
     println!("Validating engine boundaries...\n");
 
-    let allowed_datafusion_crates: HashSet<&str> =
-        HashSet::from(["arco-api", "arco-test-utils", "arco-integration-tests"]);
     let mut errors = Vec::new();
 
     for entry in std::fs::read_dir("crates").context("read crates directory")? {
@@ -1470,7 +1468,6 @@ fn run_engine_boundary_check() -> Result<()> {
             continue;
         }
 
-        let crate_name = entry.file_name().to_string_lossy().to_string();
         let manifest_path = entry.path().join("Cargo.toml");
         if !manifest_path.exists() {
             continue;
@@ -1484,18 +1481,12 @@ fn run_engine_boundary_check() -> Result<()> {
         for (section, deps) in collect_dependency_tables(&manifest_value) {
             for dep_name in deps.keys() {
                 if dep_name == "datafusion"
-                    && !allowed_datafusion_crates.contains(crate_name.as_str())
+                    || dep_name.starts_with("datafusion-")
+                    || dep_name == "duckdb"
+                    || dep_name == "libduckdb-sys"
                 {
                     errors.push(format!(
-                        "{} [{}]: datafusion dependency is only allowed in arco-api/test utility crates",
-                        manifest_path.display(),
-                        section
-                    ));
-                }
-
-                if dep_name == "duckdb" && !section.ends_with("dev-dependencies") {
-                    errors.push(format!(
-                        "{} [{}]: duckdb must be declared only under dev-dependencies",
+                        "{} [{}]: query-engine dependency {dep_name} belongs outside Arco",
                         manifest_path.display(),
                         section
                     ));
@@ -1504,28 +1495,13 @@ fn run_engine_boundary_check() -> Result<()> {
         }
     }
 
-    let query_route = std::fs::read_to_string("crates/arco-api/src/routes/query.rs")
-        .context("read crates/arco-api/src/routes/query.rs")?;
-    if !query_route.contains("fn validate_query")
-        || !query_route.contains("DFParser::parse_sql")
-        || !query_route.contains("Only SELECT/CTE queries are supported")
-    {
-        errors.push(
-            "crates/arco-api/src/routes/query.rs: expected explicit SELECT/CTE-only guard"
-                .to_string(),
-        );
-    }
-
-    let query_data_route = std::fs::read_to_string("crates/arco-api/src/routes/query_data.rs")
-        .context("read crates/arco-api/src/routes/query_data.rs")?;
-    if !query_data_route.contains("fn extract_referenced_tables")
-        || !query_data_route.contains("DFParser::parse_sql")
-        || !query_data_route.contains("Only SELECT/CTE queries are supported")
-    {
-        errors.push(
-            "crates/arco-api/src/routes/query_data.rs: expected explicit SELECT/CTE-only guard"
-                .to_string(),
-        );
+    for route in [
+        "crates/arco-api/src/routes/query.rs",
+        "crates/arco-api/src/routes/query_data.rs",
+    ] {
+        if Path::new(route).exists() {
+            errors.push(format!("{route}: SQL execution route belongs outside Arco"));
+        }
     }
 
     if !errors.is_empty() {

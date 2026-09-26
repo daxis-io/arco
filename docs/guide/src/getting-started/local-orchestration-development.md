@@ -2,7 +2,7 @@
 
 Arco does not yet ship an end-to-end `arco dev` loop that starts the API,
 flow runtime, local dispatch queue, worker shim, callbacks, compaction, and
-system-table evidence path.
+published projection evidence path.
 
 The shipped CLI surface for this slice is check-only:
 
@@ -12,13 +12,13 @@ arco dev --check
 
 This command verifies CLI/configuration wiring and lists the missing runtime
 pieces. It does not start a run, enqueue work, invoke a worker, call back to the
-API, compact projections, or prove `system.orchestration.*` evidence. Its JSON
+API, compact projections, or prove published orchestration evidence. Its JSON
 output reports `ready: false` until a production-equivalent local loop exists.
 
 ## Current Local Pipeline UAT
 
 Use the no-cloud local pipeline UAT when you need proof that Arco can write
-real data, catalog it, query it, commit a Delta log, and move an orchestrated
+real data, catalog it, commit a Delta log, and move an orchestrated
 run through dispatch and callbacks without GCP:
 
 ```bash
@@ -68,7 +68,7 @@ describe it as shipped:
   task token and active attempt identity;
 - create a sample run through the API;
 - compact and publish run, task, dispatch, and callback evidence through the
-  existing API or `system.orchestration.*` projections.
+  existing API or published orchestration projections.
 
 Execution-location identity must come from planning or a real registry. It is
 not inferred from `worker_queue`, `kind`, `callback_base_url`, or `runtime_ref`.

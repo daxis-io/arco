@@ -16,7 +16,7 @@
 //! ```text
 //! 1. Browser calls get_mintable_paths() → list of allowed snapshot files
 //! 2. Browser calls mint_signed_urls(paths) → signed URLs for those files
-//! 3. Browser loads Parquet directly via DuckDB-WASM
+//! 3. Client loads Parquet directly with its chosen engine
 //! ```
 
 // MVP: Allow some pedantic lints that will be cleaned up in refinement

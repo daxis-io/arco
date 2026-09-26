@@ -40,10 +40,8 @@ Readers that combine base and L0 artifacts must merge by
 `row_version`. This matches the compactor merge rule and prevents stale attempt,
 heartbeat, or visibility events from regressing catalog metadata.
 
-The query API exposes the current workspace's base-snapshot org artifact as
-`system.orchestration.catalog_run_index` when that artifact has been merged into
-the visible base snapshot. Readers that need visible L0 freshness should use the
-manifest contract directly and merge base plus L0 artifacts.
+Readers use the manifest contract directly and merge base plus visible L0
+artifacts when they need current run-backed asset metadata.
 
 The projection is physically split by `org_id` at the manifest artifact level.
 That removes both the bucket-wide canonical run-object listing path and the need

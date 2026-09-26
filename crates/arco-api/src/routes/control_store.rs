@@ -2,7 +2,7 @@
 //!
 //! # Why these live in `arco-api`
 //!
-//! Platform IAM makes `arco-api` the **sole writer** of the `state-store/`
+//! Platform IAM makes `arco-api` the **sole writer** of the `control/`
 //! object prefix and prohibits other service accounts from mutating it. Both
 //! operations here write that prefix — the shadow import writes the isolated
 //! shadow scope, and the projection-outbox operations write acknowledgement

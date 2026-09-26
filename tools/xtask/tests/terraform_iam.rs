@@ -106,12 +106,22 @@ fn task_token_secret_is_wired_only_to_api_and_flow_controller() {
 }
 
 #[test]
-fn state_store_prefix_has_exactly_one_writer() {
+fn control_store_prefix_has_exactly_one_writer() {
     let terraform = terraform_iam_text();
+    let prefix = arco_core::storage_keys::CONTROL_STATE_OBJECT_PREFIX;
 
+    // The Terraform local must carry the exact prefix the state kernel writes
+    // under (ControlMvpPaths::base_prefix() -> control/v1/domains/{domain}/...
+    // and the authority-8 directory -> control/directory/v1/...). Pinning it to
+    // the arco-core constant means a kernel layout change that moves writes
+    // outside the granted prefix fails this test instead of returning 403s.
     assert!(
-        terraform.contains("state_store_object_prefix = \"state-store/\""),
-        "state-store/ object prefix local should be defined"
+        terraform.contains(&format!("control_store_object_prefix = \"{prefix}\"")),
+        "control_store_object_prefix local should be defined as {prefix:?}"
+    );
+    assert!(
+        !terraform.contains("state_store_object_prefix"),
+        "the retired state_store_object_prefix local must not be declared"
     );
 
     let block = resource_block(
@@ -119,20 +129,20 @@ fn state_store_prefix_has_exactly_one_writer() {
         "google_storage_bucket_iam_member",
         "api_write_state_store",
     )
-    .expect("API state-store write binding should exist");
+    .expect("API control-store write binding should exist");
     assert!(block.contains("roles/storage.objectUser"));
     assert!(block.contains("serviceAccount:${google_service_account.api.email}"));
     assert!(block.contains("condition {"));
-    assert!(block.contains("startsWith(\"${local.state_store_object_prefix}\")"));
+    assert!(block.contains("startsWith(\"${local.control_store_object_prefix}\")"));
     assert!(!block.contains("contains("));
 
     // Single-writer invariant, enforced structurally rather than by counting
     // occurrences of one local's name: walk EVERY google_storage_bucket_iam_member
     // block across all of infra/terraform and assert that no block other than
-    // api_write_state_store carries a condition reaching into state-store/.
+    // api_write_state_store carries a condition reaching into control/.
     // Resolving `local.` references first means an inlined literal, a second
     // local aliased to the same value, or a binding declared in main.tf /
-    // cloud_run.tf is caught just the same.
+    // cloud_run.tf / cloud_run_job.tf is caught just the same.
     let locals = terraform_string_locals(&terraform);
     let blocks = resource_blocks(&terraform, "google_storage_bucket_iam_member");
     assert!(
@@ -141,49 +151,86 @@ fn state_store_prefix_has_exactly_one_writer() {
         blocks.len()
     );
 
-    let mut state_store_writers = Vec::new();
+    let mut control_store_writers = Vec::new();
+    let mut retired_prefix_bindings = Vec::new();
     for (name, body) in &blocks {
         let Some(condition) = condition_expression(body) else {
             continue;
         };
         let resolved = resolve_terraform_locals(&condition, &locals);
-        if starts_with_arguments(&resolved)
+        let arguments = starts_with_arguments(&resolved);
+        if arguments
+            .iter()
+            .any(|argument| argument.starts_with(prefix))
+        {
+            control_store_writers.push(name.clone());
+        }
+        // The retired prefix must not be granted to anyone: a binding that still
+        // targets state-store/ grants authority over a prefix nothing writes,
+        // and a reader of the old comments could mistake it for the control
+        // store's protection.
+        if arguments
             .iter()
             .any(|argument| argument.starts_with("state-store"))
+            || resolved.contains("state-store/")
         {
-            state_store_writers.push(name.clone());
+            retired_prefix_bindings.push(name.clone());
         }
     }
 
     assert_eq!(
-        state_store_writers,
+        control_store_writers,
         vec!["api_write_state_store".to_string()],
-        "exactly one bucket IAM binding may grant authority under state-store/, found: {state_store_writers:?}"
+        "exactly one bucket IAM binding may grant authority under {prefix}, found: {control_store_writers:?}"
+    );
+    assert!(
+        retired_prefix_bindings.is_empty(),
+        "no bucket IAM binding may reference the retired state-store/ prefix, found: {retired_prefix_bindings:?}"
+    );
+
+    // Belt and braces: no resolved condition anywhere in infra/terraform (any
+    // resource kind, not just bucket IAM members) may mention state-store/.
+    let resolved_terraform = resolve_terraform_locals(&terraform, &locals);
+    let leaked: Vec<&str> = resolved_terraform
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .filter(|line| line.contains("state-store/"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "no non-comment terraform line may reference the retired state-store/ prefix, found: {leaked:?}"
     );
 }
 
 #[test]
 fn no_other_declared_prefix_shadows_control_store_paths() {
-    // The control store writes under state-store/control-mvp/...; that path must
-    // not be reachable through any other prefix local declared in the terraform
-    // (notably state/, whose name is a proper string prefix of "state-store"
-    // only if the trailing slash is ever dropped). Both operands come from the
-    // real terraform text, so deleting or editing iam_conditions.tf changes the
-    // outcome of this test.
+    // The control store writes under control/v1/domains/{domain}/... and
+    // control/directory/v1/...; those paths must not be reachable through any
+    // other prefix local declared in the terraform (notably state/, whose
+    // compactor grants must never widen to cover the kernel). Both operands come
+    // from the real terraform text, so deleting or editing iam_conditions.tf
+    // changes the outcome of this test.
     let terraform = terraform_iam_text();
     let locals = terraform_string_locals(&terraform);
-
-    let control_store_path = format!(
-        "{}control-mvp/catalog/current.pointer.json",
-        locals
-            .get("state_store_object_prefix")
-            .expect("state_store_object_prefix local should be declared")
+    let prefix = locals
+        .get("control_store_object_prefix")
+        .expect("control_store_object_prefix local should be declared");
+    assert_eq!(
+        prefix,
+        arco_core::storage_keys::CONTROL_STATE_OBJECT_PREFIX,
+        "the terraform local must equal the arco-core constant the kernel writes under"
     );
+
+    let control_store_paths = [
+        format!("{prefix}v1/domains/catalog/head/current.json"),
+        format!("{prefix}v1/domains/catalog/transactions/x.json"),
+        format!("{prefix}directory/v1/domains/catalog/keys/x"),
+    ];
 
     let other_prefixes: Vec<(&String, &String)> = locals
         .iter()
         .filter(|(name, _)| {
-            name.as_str() != "state_store_object_prefix"
+            name.as_str() != "control_store_object_prefix"
                 && (name.ends_with("_object_prefix") || name.ends_with("_state_prefix"))
         })
         .collect();
@@ -193,11 +240,13 @@ fn no_other_declared_prefix_shadows_control_store_paths() {
         other_prefixes.len()
     );
 
-    for (name, prefix) in other_prefixes {
-        assert!(
-            !control_store_path.starts_with(prefix.as_str()),
-            "control-store path {control_store_path} must not match the {name} ({prefix}) write condition"
-        );
+    for control_store_path in &control_store_paths {
+        for (name, other) in &other_prefixes {
+            assert!(
+                !control_store_path.starts_with(other.as_str()),
+                "control-store path {control_store_path} must not match the {name} ({other}) write condition"
+            );
+        }
     }
 }
 
@@ -229,6 +278,25 @@ fn api_service_account_can_invoke_sync_compactors() {
     assert!(
         flow_compactor
             .contains("member   = \"serviceAccount:${google_service_account.api.email}\"")
+    );
+}
+
+#[test]
+fn control_store_worker_job_runs_under_the_api_service_account() {
+    let terraform = terraform_iam_text();
+    let job = resource_block(
+        &terraform,
+        "google_cloud_run_v2_job",
+        "control_store_worker",
+    )
+    .expect("control-store worker job should exist");
+    assert!(
+        job.contains("service_account = google_service_account.api.email"),
+        "the control-store worker must run under the API service account, the sole control/ writer"
+    );
+    assert!(
+        !job.contains("compactor"),
+        "the control-store worker must not borrow a compactor identity"
     );
 }
 

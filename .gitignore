@@ -56,3 +56,6 @@ coverage/
 
 # Local session run manifests (never committed)
 .[a]i/
+
+# Audit and qualification evidence archives live outside the tree
+evidence/

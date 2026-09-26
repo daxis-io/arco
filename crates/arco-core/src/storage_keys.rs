@@ -19,6 +19,7 @@
 //! | `ManifestKey` | `manifests/` | Compactor | API, Compactor |
 //! | `LockKey` | `locks/` | API | API |
 //! | `CommitKey` | `commits/` | API | API, Compactor |
+//! | [`CONTROL_STATE_OBJECT_PREFIX`] | `control/` | API (sole writer) | API |
 //!
 //! # Example
 //!
@@ -36,6 +37,51 @@
 //! ```
 
 use crate::CatalogDomain;
+
+// ============================================================================
+// CONTROL_STATE_OBJECT_PREFIX - API is the sole writer of the state kernel
+// ============================================================================
+
+/// Tenant/workspace-relative object prefix beneath which the state kernel
+/// writes every control object.
+///
+/// Two layouts live under this prefix, both beneath the
+/// `tenant={tenant}/workspace={workspace}/` scope that `ScopedStorage`
+/// prepends:
+///
+/// - the authority layout, `control/v1/domains/{domain}/{head,transactions,
+///   manifests,segments,indexes,checkpoints,maintenance}/...`, produced by
+///   `ControlMvpPaths::base_prefix()` in
+///   `crates/arco-catalog/src/state_store/control_mvp.rs`;
+/// - the authority-8 directory layout, `control/directory/v1/domains/{domain}/...`,
+///   produced by `Directory::new` in
+///   `crates/arco-catalog/src/state_store/control_mvp/directory.rs`.
+///
+/// # Access
+///
+/// - **Write**: the API service account only. The `arco-api` service commits
+///   control-store transactions in-process, and the scheduled control-store
+///   worker job (projection drain, maintenance, GC) runs under that same
+///   service account. No other principal is granted write authority here.
+/// - **Read**: API.
+///
+/// # Contract
+///
+/// `infra/terraform/iam_conditions.tf` scopes the API's `roles/storage.objectUser`
+/// grant with `startsWith("<this value>")` on the tenant/workspace-relative
+/// object path, and `tools/xtask/tests/terraform_iam.rs` asserts that the
+/// Terraform local carries this exact value and that exactly one bucket IAM
+/// binding reaches into it. `crates/arco-catalog/tests/state_store_layout_contract.rs`
+/// asserts that every kernel path starts with it. Change all three together
+/// or not at all.
+///
+/// The value must be a directory prefix (trailing `/`): the IAM condition uses
+/// `startsWith()`, and `control` without the slash would also match an
+/// unrelated `controlX/` prefix.
+///
+/// The previous grant targeted `state-store/`; that prefix is retired and no
+/// code writes under it.
+pub const CONTROL_STATE_OBJECT_PREFIX: &str = "control/";
 
 /// A typed storage key that encodes path structure.
 ///
@@ -510,5 +556,18 @@ mod tests {
     fn test_keys_implement_display() {
         let key = LedgerKey::event(CatalogDomain::Catalog, "test");
         assert_eq!(format!("{key}"), "ledger/catalog/test.json");
+    }
+
+    #[test]
+    fn test_control_state_object_prefix_is_the_iam_scoped_directory() {
+        // Terraform's startsWith() condition and the xtask guard pin this exact
+        // literal; a change here must land together with iam_conditions.tf.
+        assert_eq!(CONTROL_STATE_OBJECT_PREFIX, "control/");
+        assert!(CONTROL_STATE_OBJECT_PREFIX.ends_with('/'));
+        assert!(!CONTROL_STATE_OBJECT_PREFIX.starts_with('/'));
+        // The retired prefix must not creep back in.
+        assert_ne!(CONTROL_STATE_OBJECT_PREFIX, "state-store/");
+        // startsWith("state/") (compactor grants) must not reach the kernel prefix.
+        assert!(!CONTROL_STATE_OBJECT_PREFIX.starts_with("state/"));
     }
 }

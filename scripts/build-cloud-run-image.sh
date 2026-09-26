@@ -34,6 +34,7 @@ Supported binaries:
   arco_flow_sweeper
   arco_flow_timer_ingest
   arco_flow_worker
+  arco_control_store_worker
 EOF
 }
 
@@ -92,7 +93,7 @@ done
 [[ -f "${ROOT_DIR}/Dockerfile.cloudrun" ]] || die "Dockerfile.cloudrun not found"
 
 case "$BIN" in
-arco-api | arco-compactor | arco_flow_compactor | arco_flow_dispatcher | arco_flow_sweeper | arco_flow_timer_ingest | arco_flow_worker) ;;
+arco-api | arco-compactor | arco_flow_compactor | arco_flow_dispatcher | arco_flow_sweeper | arco_flow_timer_ingest | arco_flow_worker | arco_control_store_worker) ;;
 *) die "Unsupported --bin '$BIN'" ;;
 esac
 

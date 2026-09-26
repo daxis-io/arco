@@ -1,7 +1,7 @@
 //! Operator-only control-store endpoint contracts.
 //!
 //! These endpoints live in `arco-api` because platform IAM makes this service
-//! the sole writer of the `state-store/` object prefix. They were previously
+//! the sole writer of the `control/` object prefix. They were previously
 //! mounted on `arco-compactor`, whose service account has no such grant.
 
 #![allow(

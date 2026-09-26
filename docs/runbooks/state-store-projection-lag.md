@@ -47,12 +47,17 @@ Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
 ## Diagnosis
 
 1. Determine the committed head: read
-   `state-store/control-mvp/{domain}/current.pointer.json` and note
-   `logical_sequence`.
-2. Determine the projected watermark: query the projection consumer's recorded
-   latest projected sequence (once a production publisher exists this is the
-   consumer's ack watermark; today the only implementations are the hermetic
-   ack surfaces above).
+   `tenant={tenant}/workspace={workspace}/control/v1/domains/{domain}/head/current.json`
+   and note `logical_sequence`.
+2. Determine the projected watermark: query
+   `system.catalog.projection_status` (built from
+   `ProjectionOutboxAckWriter::projection_status` and
+   `ProjectionOutboxWorker::backlog`, `crates/arco-api/src/system_tables.rs`;
+   `CatalogProjectionMaterializer::status` reads the same durable status and
+   is what the worker job logs), or read the consumer's ack watermark in the
+   separate acknowledgement root
+   (`control/v1/domains/projection-outbox-acks/head/current.json` under the
+   same workspace prefix).
 3. Classify:
    - `ProjectionUnavailable` (no watermark at all): the projection consumer
      never ran or lost its state — treat as publish absence;
@@ -60,22 +65,33 @@ Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
      wedged;
    - stale age but zero sequence lag: a low-volume domain with a stalled
      clock/heartbeat rather than real backlog.
-4. Check the projection publisher process (when wired: the control-store
-   projection compactor). Control writes continuing while watermarks lag is
-   the designed degradation mode — availability of writes is never coupled to
-   projection health.
+4. Check the projection drain. As of 2026-09-23 the scheduled
+   `arco-control-store-worker` job (`docs/runbooks/control-store-worker.md`)
+   runs `CatalogProjectionMaterializer::drain_once`, and an operator can drain
+   on demand through `POST /internal/control-store/projection-outbox` (mounted
+   only with `ARCO_CONTROL_STORE_OPERATOR_ENDPOINTS=true`, never on a public
+   posture, and requiring the verified principal to carry
+   `ARCO_CONTROL_STORE_OPERATOR_GROUP`). The API also attempts a fail-open
+   process-local wake after each committed intent. Control writes continuing
+   while watermarks lag is the designed degradation mode — availability of
+   writes is never coupled to projection health.
 5. Rule out the corrupt-artifact case: if the consumer fails while replaying
    outbox records (`current_projection_outbox()` errors), follow
    `docs/runbooks/state-store-corrupt-artifact.md`.
 
 ## Remediation
 
-- Restart or redeploy the projection consumer; it must resume from its last
-  acked record id (acks are idempotent: re-acking the same
-  `(consumer_id, record_id)` pair is a no-op returning the existing receipt).
-- Drain backlog: the consumer reads pending records through
-  `current_projection_outbox()` / `projection_outbox_at(token)` and acks each
-  processed record; no manual object surgery is involved.
+- Re-run the drain (`gcloud run jobs execute "arco-control-store-worker-${ENV}"`,
+  or the operator endpoint above); it resumes from its last acked record id
+  (acks are idempotent: re-acking the same `(consumer_id, record_id)` pair is
+  a no-op returning the existing receipt), and drains are coalesced with ack
+  retries, so a repeated invocation is safe.
+- Drain backlog: `drain_once` reads pending records through
+  `current_projection_outbox()` / `projection_outbox_at(token)`, materializes
+  each Parquet artifact, and acks each processed record; no manual object
+  surgery is involved. A malformed intent receives a sticky terminal
+  quarantine status and stays visible as unresolved backlog while later valid
+  intents continue — it needs an operator decision, not another retry.
 - If the watermark update itself keeps failing, retry the watermark publish;
   watermark publication is CAS-guarded like every other control write.
 - While lag persists, verify staleness is surfaced explicitly wherever the
@@ -86,10 +102,19 @@ Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
 
 ## Current Wiring Status
 
-Honest status as of 2026-07-30 (program audit): there is no production
-projection publisher or consumer. The outbox-ack writer, freshness, and
-watermark-lag types are implemented and tested but marked `#[allow(dead_code)]`
-with no production callers; the storage-governance projection publisher is an
-open issue (#362). The `arco_state_store_projection_*` metrics are reserved in
-`crates/arco-catalog/src/metrics.rs` with no emitter, so none of the detection
-alerts can fire yet. Diagnosis step 2 is aspirational until that wiring lands.
+Status as of 2026-09-23: the projection consumer is
+`CatalogProjectionMaterializer` (`crates/arco-catalog/src/catalog_authority.rs`),
+which materializes real Parquet artifacts, acks into the separate
+`projection-outbox-acks` root, and exposes durable status through
+`system.catalog.projection_status`. It runs from the scheduled
+`arco-control-store-worker` job and the operator drain endpoint; provider
+queue delivery and always-on wake do not exist, so the job's cron cadence
+cannot meet the 10 s p99 lag objective in ADR-043. The
+`arco_state_store_projection_watermark_lag_sequences`,
+`arco_state_store_projection_watermark_age_seconds`, and
+`arco_state_store_projection_publish_total` emitters exist as of 2026-09-23,
+so the detection alerts can fire once a root is bound. The control authority
+itself is route-wired for one exact root behind `ARCO_CATALOG_CONTROL_V1_*`,
+legacy by default, not provider-qualified, and not authoritative on any
+deployed root; the storage-governance projection publisher remains an open
+issue (#362).

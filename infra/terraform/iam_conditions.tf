@@ -18,7 +18,7 @@
 #   tenant={tenant}/workspace={workspace}/snapshots/  <- Compactor writes (Tier-1 Parquet)
 #   tenant={tenant}/workspace={workspace}/state/      <- Compactor writes (Tier-2 Parquet)
 #   tenant={tenant}/workspace={workspace}/l0/         <- Compactor writes (L0 tier)
-#   tenant={tenant}/workspace={workspace}/state-store/ <- API only (object-store control store; sole writer, not yet wired in production)
+#   tenant={tenant}/workspace={workspace}/control/    <- API only (state kernel: control/v1/domains/{domain}/... and control/directory/v1/...; sole writer)
 
 locals {
   # Base path pattern for all bucket objects
@@ -39,18 +39,29 @@ locals {
   l0_object_prefix          = "l0/"
   warehouse_object_prefix   = "warehouse/"
 
-  # Object-store control store (ControlMvpPaths::base_prefix() in
-  # crates/arco-catalog/src/state_store/control_mvp.rs lays out
-  # state-store/control-mvp/{domain}/... under the tenant/workspace root; the
-  # store has no production construction site yet, see api_write_state_store).
-  # NOTE: startsWith("state/") does NOT match "state-store/" (the 6th character
-  # differs), so this prefix needs its own binding and the compactor's state/
-  # conditions intentionally never cover it.
-  state_store_object_prefix = "state-store/"
+  # State kernel (object-store control store). Every control object is written
+  # under this prefix, relative to the tenant/workspace root:
+  #
+  #   control/v1/domains/{domain}/{head,transactions,manifests,segments,indexes,checkpoints,maintenance}/...
+  #     ControlMvpPaths::base_prefix() in crates/arco-catalog/src/state_store/control_mvp.rs
+  #   control/directory/v1/domains/{domain}/...
+  #     Directory::new in crates/arco-catalog/src/state_store/control_mvp/directory.rs
+  #
+  # The value MUST equal arco_core::storage_keys::CONTROL_STATE_OBJECT_PREFIX
+  # (crates/arco-core/src/storage_keys.rs); tools/xtask/tests/terraform_iam.rs
+  # pins this local to that constant and
+  # crates/arco-catalog/tests/state_store_layout_contract.rs pins every kernel
+  # path to it, so a layout change fails CI instead of producing 403s.
+  #
+  # This prefix needs its own binding: the compactor's startsWith("state/")
+  # conditions do not match "control/" and intentionally never cover it. The
+  # earlier grant targeted "state-store/"; that prefix is retired and is written
+  # by no code.
+  control_store_object_prefix = "control/"
 }
 
 # ============================================================================
-# API Service Account: ledger/, locks/, commits/, warehouse/, state-store/ (read all)
+# API Service Account: ledger/, locks/, commits/, warehouse/, control/ (read all)
 # ============================================================================
 
 # API can create ledger events (immutable, append-only)
@@ -117,35 +128,47 @@ resource "google_storage_bucket_iam_member" "api_write_warehouse_delta" {
   }
 }
 
-# API is the SOLE writer of the object-store control store under state-store/.
+# The API service account is the SOLE writer of the state kernel under control/.
 #
-# PROVISIONED AHEAD OF THE PRODUCTION WIRING (2026-07-30 program audit,
-# sections 5.4 and 9.2 item 8). As of this change ControlMvpStateStore /
-# ControlMvpTxn (crates/arco-catalog/src/state_store/control_mvp.rs) are
-# constructed only from crates/arco-catalog/tests/*; there is no production
-# construction site, so nothing writes under state-store/ in a deployed
-# environment yet. The intended writer is the arco-api service, which will
-# commit control-store transactions in-process, which is why the grant is
-# attached to google_service_account.api and to no other account.
+# Layout (tenant/workspace-relative; ScopedStorage prepends tenant=/workspace=):
 #
-# The invariant is enforced now, before the first byte is written, precisely so
-# the prefix can never acquire a second writer later: adding the binding
-# together with the exclusivity test means any future service that wants to
-# write here must make a deliberate single-writer decision instead of
-# discovering an already-shared prefix.
+#   control/v1/domains/{domain}/head/current.json          CAS-overwritten pointer
+#   control/v1/domains/{domain}/transactions/{tx_id}.json  immutable
+#   control/v1/domains/{domain}/manifests/{id}.json        immutable
+#   control/v1/domains/{domain}/segments/{l0,l1}/{id}.arrow immutable
+#   control/v1/domains/{domain}/indexes/{id}.idx           immutable
+#   control/v1/domains/{domain}/checkpoints/{id}.json      immutable
+#   control/v1/domains/{domain}/maintenance/...            maintenance intents/jobs
+#   control/directory/v1/domains/{domain}/...              authority-8 directory
 #
-# The publish protocol creates immutable txlog/, manifests/, and checkpoints/
-# objects and then CAS-overwrites current.pointer.json with a
-# generation-matched precondition; the pointer overwrite requires
+# Writers, both running as google_service_account.api:
+#   - the arco-api service, which commits control-store transactions
+#     in-process (ControlMvpStateStore / ControlMvpTxn in
+#     crates/arco-catalog/src/state_store/control_mvp.rs);
+#   - the scheduled control-store worker job (projection drain, maintenance,
+#     GC), which is deliberately deployed under the SAME service account so the
+#     prefix keeps exactly one writing principal.
+# The grant is attached to google_service_account.api and to no other account.
+#
+# The publish protocol creates immutable transactions/, manifests/, segments/,
+# indexes/ and checkpoints/ objects and then CAS-overwrites head/current.json
+# with a generation-matched precondition; the pointer overwrite requires
 # storage.objects.delete in addition to create, hence objectUser rather than
 # objectCreator (same reasoning as api_write_locks above).
 #
-# Do NOT grant any other service account a condition matching state-store/.
-# The compactor's startsWith("state/") conditions do not match "state-store/",
-# and tools/xtask/tests/terraform_iam.rs enforces that exactly one binding
-# references this prefix. If a control-store compactor/GC ever needs to clean
-# orphan state-store artifacts, that authority must be granted deliberately
-# with a new single-writer decision, not by widening an existing prefix.
+# Do NOT grant any other service account a condition matching control/.
+# The compactor's startsWith("state/") conditions do not match "control/", and
+# tools/xtask/tests/terraform_iam.rs enforces that exactly one binding
+# references this prefix. If a separate control-store compactor/GC principal is
+# ever needed, that authority must be granted deliberately with a new
+# single-writer decision, not by widening an existing prefix.
+#
+# History: this binding originally targeted "state-store/", matching the
+# pre-hard-cut state-store/control-mvp/{domain}/ layout. The control/v1 hard
+# cut moved the kernel under control/ and the grant was not updated, so it
+# scoped a prefix nothing wrote. "state-store/" is retired and written by no
+# code; the resource name api_write_state_store is kept only to avoid a
+# Terraform state move.
 resource "google_storage_bucket_iam_member" "api_write_state_store" {
   bucket = google_storage_bucket.catalog.name
   role   = "roles/storage.objectUser"
@@ -153,10 +176,10 @@ resource "google_storage_bucket_iam_member" "api_write_state_store" {
 
   condition {
     title       = "ApiWriteStateStore"
-    description = "Sole writer: API commits object-store control state under state-store/"
+    description = "Sole writer: API (service and control-store worker job) writes the state kernel under control/"
     expression  = <<-EOT
       resource.type == "storage.googleapis.com/Object" &&
-      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.state_store_object_prefix}")
+      resource.name.extract("${local.object_path_extract_template}").startsWith("${local.control_store_object_prefix}")
     EOT
   }
 }

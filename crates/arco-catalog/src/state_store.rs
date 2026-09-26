@@ -2099,14 +2099,16 @@ impl<'de> Deserialize<'de> for StateScope {
 }
 
 fn validate_scope_component(value: &str, field: &str) -> Result<()> {
+    // `%` is rejected so a percent-encoded separator can never smuggle a
+    // path segment through a decoding object store or URL layer.
     if value.trim().is_empty()
         || matches!(value, "." | "..")
-        || value.contains(['/', '\\'])
+        || value.contains(['/', '\\', '%'])
         || value.chars().any(char::is_control)
     {
         return Err(CatalogError::Validation {
             message: format!(
-                "{field} must be a nonblank path-safe component without separators, dot segments, or control characters"
+                "{field} must be a nonblank path-safe component without separators, percent signs, dot segments, or control characters"
             ),
         });
     }
@@ -2895,6 +2897,9 @@ pub trait ArcoStateTxn: Send + Sync {
 
     /// Asserts that a key range is empty at commit time.
     ///
+    /// Tombstoned keys are not entries; the recorded witness still covers
+    /// them, so a concurrent resurrection conflicts at commit.
+    ///
     /// # Errors
     ///
     /// Returns an error when range preconditions are unsupported or invalid.
@@ -3112,6 +3117,25 @@ mod tests {
             Err(error) => panic!("expected UnsupportedOperation for {expected}, got {error:?}"),
             Ok(_) => panic!("expected UnsupportedOperation for {expected}"),
         }
+    }
+
+    #[test]
+    fn request_ids_reject_percent_signs() {
+        let result = TxnOptions::default().with_request_id("a%2fb").validate();
+        match result {
+            Err(CatalogError::Validation { message }) => assert!(
+                message.contains("percent"),
+                "the rejection must name percent signs: {message:?}"
+            ),
+            other => panic!("percent-encoded request ids must be rejected, got {other:?}"),
+        }
+        assert!(
+            TxnOptions::default()
+                .with_request_id("a-b.c_d")
+                .validate()
+                .is_ok(),
+            "plain request ids stay valid"
+        );
     }
 
     #[test]

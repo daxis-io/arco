@@ -119,6 +119,7 @@ impl ControlMvpMaintenanceWorker {
                 logical_sequence: source_manifest.logical_sequence,
                 manifest_checksum_sha256: sha256_hex(&manifest_bytes),
                 writer_epoch: pointer.writer_epoch,
+                claim_id: None,
             };
             let pointer_bytes = encode_json_limited(
                 &candidate_pointer,

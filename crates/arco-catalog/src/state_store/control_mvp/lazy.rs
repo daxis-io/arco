@@ -680,7 +680,9 @@ impl ControlMvpTxn {
             for (key, value) in &rows {
                 hash_version(&mut hasher, key, value);
             }
-            if digest_u64(hasher) != *expected || rows.is_empty() == *present {
+            if digest_u64(hasher) != *expected
+                || rows.iter().any(|(_, value)| !value.tombstone) != *present
+            {
                 return Err(precondition_failed("authenticated bounded range changed"));
             }
         }
@@ -846,7 +848,12 @@ impl ControlMvpTxn {
             for (key, value) in &rows {
                 hash_version(&mut hasher, key, value);
             }
-            let result = (digest_u64(hasher), !rows.is_empty());
+            // Tombstones stay in the witness so a concurrent resurrection
+            // conflicts at commit, but they are not live entries.
+            let result = (
+                digest_u64(hasher),
+                rows.iter().any(|(_, value)| !value.tombstone),
+            );
             self.memo_range(cache_key, result)?;
             return Ok(result);
         }
@@ -880,7 +887,9 @@ impl ControlMvpTxn {
                         .take(&key)
                         .ok_or_else(|| invariant_violation("range stream lost row"))?;
                     hash_version(&mut hasher, &key, &value);
-                    present = true;
+                    if !value.tombstone {
+                        present = true;
+                    }
                     progressed = true;
                 }
                 if !progressed && budget.blocks == 64 {

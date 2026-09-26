@@ -13,8 +13,9 @@ proceed to `FINALIZING` / `VISIBLE`.
 - Restore commands report a failure category of `CAS_LOST`,
   `PARTICIPANT_FAILED`, or `STORAGE_UNCERTAIN` (`RestoreFailureCategory`).
 - A control-store participant reports plan/visible mismatches such as
-  `visible restore transaction checksum mismatch` or
-  `visible restore manifest checksum mismatch`
+  `visible restore manifest checksum mismatch`,
+  `visible restore candidate pointer digest mismatch`, or
+  `visible restore transaction does not match planned restore metadata`
   (`ControlMvpRestoreParticipant` in
   `crates/arco-catalog/src/state_store/control_mvp.rs`).
 
@@ -47,16 +48,26 @@ visible bytes match the plan.
 3. For a control-store participant, compare plan vs visible artifacts. The
    plan pins `transaction_sha256`, `candidate_manifest_sha256`, and
    `candidate_pointer_sha256` (`ControlMvpRestorePlan`); inspection
-   (`inspect_visible_restore`) hashes what is actually visible:
+   (internal `inspect_visible_restore`) hashes what is actually visible:
    - visible bytes match the plan: the participant's work is durably applied
      and repair can mark it complete;
    - visible bytes differ: the artifacts belong to some other lineage — the
      restore must re-render from its pinned base or be abandoned;
    - artifacts absent: the participant never became durable and can be
      re-applied from the plan.
-4. `ControlMvpRestorePlan::validate` fails closed on any scope/checksum/shape
-   inconsistency (`invalid Control MVP restore plan`) — a plan that no longer
-   validates must not be re-applied.
+4. The restore participant validates every plan it loads (restore-plan
+   version 6 with its pinned `observed_writer_epoch` and checkpoint interval,
+   scope, checksums, and shape) and fails closed with
+   `invalid Control MVP restore plan` before touching storage — a plan that no
+   longer validates must not be re-applied. Restore-plan versions 1 through 5
+   are supersession-only: a version-6 plan may supersede them, but they are
+   never re-applied. A plan whose authority reference does not have the
+   canonical `control/v1` manifest and checkpoint path shape returns
+   `UnsupportedAuthorityFormat` with hard-cut recovery direction; separately,
+   the head and manifest validators fail closed on any `format_version` other
+   than the current on-disk authority format 7, and retained-token reads
+   accept formats 7 and 8 only (8 being the synthetic authority-8 bounded
+   roots that exist under test-utils).
 
 ## Remediation
 
@@ -81,9 +92,13 @@ visible bytes match the plan.
 
 ## Current Wiring Status
 
-Honest status as of 2026-07-30 (program audit): the restore machinery
-(Phase 7C/7D) is implemented and heavily tested but hermetic — there is no
-production restore command, operator surface, or scheduled recovery job, and
-no restore metric or alert. This runbook describes code behavior exercised by
+Status as of 2026-09-23: the restore machinery (Phase 7C/7D) is implemented
+and heavily tested but still has no production restore command, operator
+route, scheduled recovery job, restore metric, or alert; the scheduled
+`arco-control-store-worker` job runs projection drain, layout maintenance,
+and GC only, never restore. The control store it restores into is
+route-wired for one exact root behind `ARCO_CATALOG_CONTROL_V1_*`, legacy by
+default, not provider-qualified, and not authoritative on any deployed root.
+This runbook describes code behavior exercised by
 `crates/arco-catalog/tests/workspace_snapshot_restore.rs` and is the intended
 procedure once the operator surface lands.

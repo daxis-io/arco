@@ -856,7 +856,7 @@ impl Server {
         // existing and refusing. A public posture never mounts them at all,
         // mirroring how `/metrics` is withheld there. They are hosted here
         // because platform IAM makes this service the sole writer of the
-        // `state-store/` prefix, so no other service account may run them.
+        // `control/` prefix, so no other service account may run them.
         // Authentication is the same middleware every other authenticated
         // route uses, so the tenant/workspace scope they operate on is the
         // verified request scope rather than a caller-supplied one.

@@ -67,7 +67,8 @@ jobs:
             (resource_count("google_cloud_run_v2_service"; "flow_sweeper") == 0) and
             (resource_count("google_cloud_run_v2_service"; "flow_timer_ingest") == 0) and
             (resource_count("google_cloud_run_v2_service"; "flow_worker") == 0) and
-            (resource_count("google_cloud_run_v2_service"; "flow_automation_reconciler") == 0)
+            (resource_count("google_cloud_run_v2_service"; "flow_automation_reconciler") == 0) and
+            (resource_count("google_cloud_run_v2_job"; "control_store_worker") == 0)
           ' /tmp/arco-base.tfplan.json >/dev/null
 
       - name: Terraform Plan (Flow-Enabled Vars, No Refresh)
@@ -98,7 +99,11 @@ jobs:
             -var="flow_timer_ingest_image=example.com/arco-flow-timer-ingest:test" \
             -var="flow_worker_image=example.com/arco-flow-worker:test" \
             -var="flow_tenant_id=flow-tenant" \
-            -var="flow_workspace_id=flow-workspace"
+            -var="flow_workspace_id=flow-workspace" \
+            -var="control_store_worker_image=example.com/arco-control-store-worker:test" \
+            -var="control_store_tenant_id=control-tenant" \
+            -var="control_store_workspace_id=control-workspace" \
+            -var="control_store_maintenance_binding_secret=ci-control-store-binding-secret"
 
       - name: Verify Flow Cutover Wiring In Plan
         run: |
@@ -127,6 +132,12 @@ jobs:
             def iam_member($name):
               resource("google_cloud_run_v2_service_iam_member"; $name)
               | .values.member;
+            def job_env_names($job):
+              resource("google_cloud_run_v2_job"; $job)
+              | [.values.template[0].template[0].containers[0].env[]?.name];
+            def job_service_account($job):
+              resource("google_cloud_run_v2_job"; $job)
+              | .values.template[0].template[0].service_account;
 
             (env_names("api") | index("ARCO_COMPACTOR_URL")) and
             (env_names("api") | index("ARCO_ORCH_COMPACTOR_URL")) and
@@ -187,5 +198,11 @@ jobs:
             (iam_member("flow_controller_flow_compactor_invoker") == "serviceAccount:arco-flow-controller-dev@test-project.iam.gserviceaccount.com") and
             (iam_member("flow_timer_ingest_flow_compactor_invoker") == "serviceAccount:arco-flow-timer-dev@test-project.iam.gserviceaccount.com") and
             (resource_count("google_service_account"; "flow_dispatcher") == 0) and
-            (resource_count("google_service_account"; "flow_sweeper") == 0)
+            (resource_count("google_service_account"; "flow_sweeper") == 0) and
+            (resource_count("google_cloud_run_v2_job"; "control_store_worker") == 1) and
+            (job_service_account("control_store_worker") == "arco-api-dev@test-project.iam.gserviceaccount.com") and
+            (job_env_names("control_store_worker") | index("ARCO_CONTROL_STORE_MAINTENANCE_BINDING")) and
+            (job_env_names("control_store_worker") | index("ARCO_CATALOG_CONTROL_V1_TENANT_ID")) and
+            (job_env_names("control_store_worker") | index("ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID")) and
+            (resource_count("google_cloud_scheduler_job"; "control_store_worker_trigger") == 1)
           ' /tmp/arco-flow.tfplan.json >/dev/null

@@ -66,6 +66,12 @@ Optional env vars:
   FLOW_SWEEPER_IMAGE
   FLOW_TIMER_INGEST_IMAGE
   FLOW_WORKER_IMAGE
+  CONTROL_STORE_WORKER_IMAGE
+  CONTROL_STORE_TENANT_ID
+  CONTROL_STORE_WORKSPACE_ID
+  CONTROL_STORE_MAINTENANCE_BINDING_SECRET
+                          Set all four together to deploy the scheduled
+                          control-store worker job (runs as the API SA)
   API_GIT_SHA
   API_CODE_VERSION
 EOF
@@ -307,6 +313,10 @@ build_terraform_var_args() {
   add_terraform_var_arg "flow_worker_image" "${FLOW_WORKER_IMAGE:-}"
   add_terraform_var_arg "flow_tenant_id" "$(effective_tfvar_value "flow_tenant_id")"
   add_terraform_var_arg "flow_workspace_id" "$(effective_tfvar_value "flow_workspace_id")"
+  add_terraform_var_arg "control_store_worker_image" "${CONTROL_STORE_WORKER_IMAGE:-}"
+  add_terraform_var_arg "control_store_tenant_id" "$(effective_tfvar_value "control_store_tenant_id" "CONTROL_STORE_TENANT_ID")"
+  add_terraform_var_arg "control_store_workspace_id" "$(effective_tfvar_value "control_store_workspace_id" "CONTROL_STORE_WORKSPACE_ID")"
+  add_terraform_var_arg "control_store_maintenance_binding_secret" "$(effective_tfvar_value "control_store_maintenance_binding_secret" "CONTROL_STORE_MAINTENANCE_BINDING_SECRET")"
   add_terraform_var_arg "project_number" "${TF_VAR_project_number:-}"
 }
 
@@ -343,6 +353,21 @@ validate_flow_core_config() {
   fi
 }
 
+validate_control_store_worker_config() {
+  local image tenant_id workspace_id binding_secret
+
+  image="$(effective_tfvar_value "control_store_worker_image" "CONTROL_STORE_WORKER_IMAGE")"
+  tenant_id="$(effective_tfvar_value "control_store_tenant_id" "CONTROL_STORE_TENANT_ID")"
+  workspace_id="$(effective_tfvar_value "control_store_workspace_id" "CONTROL_STORE_WORKSPACE_ID")"
+  binding_secret="$(effective_tfvar_value "control_store_maintenance_binding_secret" "CONTROL_STORE_MAINTENANCE_BINDING_SECRET")"
+
+  if [[ -n "${image}${tenant_id}${workspace_id}${binding_secret}" ]]; then
+    if [[ -z "$image" || -z "$tenant_id" || -z "$workspace_id" || -z "$binding_secret" ]]; then
+      die "Control-store worker config is partial. Set control_store_worker_image, control_store_tenant_id, control_store_workspace_id, and control_store_maintenance_binding_secret together."
+    fi
+  fi
+}
+
 validate_flow_compactor_ingress() {
   case "${FLOW_COMPACTOR_INGRESS:-}" in
   "" | internal | all) ;;
@@ -362,6 +387,7 @@ validate_env() {
   esac
 
   validate_flow_core_config
+  validate_control_store_worker_config
   validate_flow_compactor_ingress
 }
 
@@ -594,6 +620,13 @@ preflight_managed_live_resources() {
     "$tfvars_file" \
     "google_cloud_run_v2_job.compactor_antientropy" \
     "arco-compactor-antientropy-${ENVIRONMENT}"
+  if [[ -n "$(effective_tfvar_value "control_store_worker_image" "CONTROL_STORE_WORKER_IMAGE")" ]]; then
+    check_unmanaged_cloud_run_job \
+      "$state_addresses" \
+      "$tfvars_file" \
+      "google_cloud_run_v2_job.control_store_worker[0]" \
+      "arco-control-store-worker-${ENVIRONMENT}"
+  fi
 
   check_unmanaged_service_account \
     "$state_addresses" \
@@ -840,6 +873,10 @@ deploy_terraform() {
   export_tf_var_if_set "flow_sweeper_image" "FLOW_SWEEPER_IMAGE"
   export_tf_var_if_set "flow_timer_ingest_image" "FLOW_TIMER_INGEST_IMAGE"
   export_tf_var_if_set "flow_worker_image" "FLOW_WORKER_IMAGE"
+  export_tf_var_if_set "control_store_worker_image" "CONTROL_STORE_WORKER_IMAGE"
+  export_tf_var_if_set "control_store_tenant_id" "CONTROL_STORE_TENANT_ID"
+  export_tf_var_if_set "control_store_workspace_id" "CONTROL_STORE_WORKSPACE_ID"
+  export_tf_var_if_set "control_store_maintenance_binding_secret" "CONTROL_STORE_MAINTENANCE_BINDING_SECRET"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
   else
@@ -891,6 +928,10 @@ deploy_terraform_remaining() {
   export_tf_var_if_set "flow_sweeper_image" "FLOW_SWEEPER_IMAGE"
   export_tf_var_if_set "flow_timer_ingest_image" "FLOW_TIMER_INGEST_IMAGE"
   export_tf_var_if_set "flow_worker_image" "FLOW_WORKER_IMAGE"
+  export_tf_var_if_set "control_store_worker_image" "CONTROL_STORE_WORKER_IMAGE"
+  export_tf_var_if_set "control_store_tenant_id" "CONTROL_STORE_TENANT_ID"
+  export_tf_var_if_set "control_store_workspace_id" "CONTROL_STORE_WORKSPACE_ID"
+  export_tf_var_if_set "control_store_maintenance_binding_secret" "CONTROL_STORE_MAINTENANCE_BINDING_SECRET"
   if [[ -n "${PROJECT_NUMBER:-}" ]]; then
     export TF_VAR_project_number="$PROJECT_NUMBER"
   else

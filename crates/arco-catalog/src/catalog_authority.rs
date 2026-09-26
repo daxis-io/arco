@@ -53,6 +53,13 @@ const TABLE_KIND: u8 = 3;
 const COLUMN_KIND: u8 = 4;
 const RECORD_VERSION: u32 = 1;
 const RETRY_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Exponential conflict backoff with ULID-derived jitter, capped at 200-400 ms.
+fn conflict_backoff(attempt: u32) -> Duration {
+    let base = (5_u64 << attempt.min(6)).min(200);
+    let jitter = u64::try_from(Ulid::new().random() % u128::from(base)).unwrap_or(0);
+    Duration::from_millis(base + jitter)
+}
 /// Durable outbox kind and single-consumer identity for the catalog Parquet
 /// projection worker.
 pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
@@ -82,27 +89,116 @@ pub trait CatalogProjectionNotifierV2: Send + Sync {
     fn notify(&self, intent: &ProjectionIntentV2) -> Result<()>;
 }
 
-#[derive(Clone)]
-struct CatalogProjectionDrainNotifier {
-    storage: ScopedStorage,
-}
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use projection_drain::CatalogProjectionDrainNotifier;
+#[cfg(not(feature = "test-utils"))]
+use projection_drain::CatalogProjectionDrainNotifier;
 
-impl CatalogProjectionNotifier for CatalogProjectionDrainNotifier {
-    fn notify(&self, intent: &ProjectionIntentV1) -> Result<()> {
-        let materializer = CatalogProjectionMaterializer::new(self.storage.clone())?;
-        let intent_id = intent.intent_id().to_string();
-        let projection_kind = intent.projection_kind().to_string();
-        tokio::spawn(async move {
-            if let Err(error) = materializer.drain_once().await {
-                warn!(
-                    intent_id,
-                    projection_kind,
-                    error = %error,
-                    "best-effort catalog projection wake failed; durable anti-entropy will retry"
-                );
+/// Process-local post-commit wake-up that serializes and coalesces drains.
+mod projection_drain {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+    use arco_core::{AuthorityRoot, ScopedStorage};
+    use tracing::warn;
+
+    use super::{CatalogProjectionMaterializer, CatalogProjectionNotifier};
+    use crate::error::Result;
+    use crate::state_store::ProjectionIntentV1;
+
+    /// One drain gate per authority root.
+    ///
+    /// `lock` admits one drain at a time. `pending` records wake-ups that
+    /// arrived while a drain was running, so the lock holder runs one more
+    /// pass covering all of them instead of each queued task replaying full
+    /// state and racing on the ack-root pointer.
+    #[derive(Default)]
+    struct ProjectionDrainGate {
+        lock: tokio::sync::Mutex<()>,
+        pending: AtomicBool,
+    }
+
+    type GateKey = (String, AuthorityRoot);
+
+    /// Gates shared by every notifier for the same root in this process.
+    ///
+    /// The API constructs one authority per request, so a gate held only by
+    /// the authority would not serialize across requests. Entries are weak:
+    /// a gate lives exactly as long as some notifier or in-flight drain task
+    /// references it, and dead entries are pruned on insertion.
+    static GATES: Mutex<BTreeMap<GateKey, Weak<ProjectionDrainGate>>> = Mutex::new(BTreeMap::new());
+
+    fn gate_for(storage: &ScopedStorage) -> Arc<ProjectionDrainGate> {
+        let scope = storage.scope();
+        let key = (scope.tenant_id().to_string(), scope.root().clone());
+        let mut gates = GATES.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(gate) = gates.get(&key).and_then(Weak::upgrade) {
+            return gate;
+        }
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        let gate = Arc::new(ProjectionDrainGate::default());
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Default catalog projection notifier: schedules a local anti-entropy
+    /// drain after each commit, with at most one drain running per root.
+    #[derive(Clone)]
+    pub struct CatalogProjectionDrainNotifier {
+        storage: ScopedStorage,
+        gate: Arc<ProjectionDrainGate>,
+        drain_passes: Arc<AtomicU64>,
+    }
+
+    impl CatalogProjectionDrainNotifier {
+        /// Creates the notifier for one exact scoped catalog root.
+        #[must_use]
+        pub fn new(storage: ScopedStorage) -> Self {
+            let gate = gate_for(&storage);
+            Self {
+                storage,
+                gate,
+                drain_passes: Arc::new(AtomicU64::new(0)),
             }
-        });
-        Ok(())
+        }
+
+        /// Number of drain passes run by wake-ups from this notifier.
+        #[cfg(feature = "test-utils")]
+        #[must_use]
+        pub fn drain_passes(&self) -> u64 {
+            self.drain_passes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CatalogProjectionNotifier for CatalogProjectionDrainNotifier {
+        fn notify(&self, intent: &ProjectionIntentV1) -> Result<()> {
+            let materializer = CatalogProjectionMaterializer::new(self.storage.clone())?;
+            let intent_id = intent.intent_id().to_string();
+            let projection_kind = intent.projection_kind().to_string();
+            let gate = Arc::clone(&self.gate);
+            let drain_passes = Arc::clone(&self.drain_passes);
+            // Publish the wake-up before queueing on the gate: a drain that
+            // is already running observes it on its next loop check, and a
+            // queued task that finds it consumed simply exits.
+            gate.pending.store(true, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _serialized = gate.lock.lock().await;
+                while gate.pending.swap(false, Ordering::SeqCst) {
+                    drain_passes.fetch_add(1, Ordering::SeqCst);
+                    if let Err(error) = materializer.drain_once().await {
+                        warn!(
+                            intent_id,
+                            projection_kind,
+                            error = %error,
+                            "best-effort catalog projection wake failed; durable anti-entropy will retry"
+                        );
+                    }
+                }
+            });
+            Ok(())
+        }
     }
 }
 
@@ -1131,9 +1227,7 @@ impl ControlCatalogAuthority {
         scope: StateScope,
         continuation_key: ScanContinuationKey,
     ) -> Result<Self> {
-        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier {
-            storage: storage.clone(),
-        });
+        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
         if scope.domain() != "catalog" {
             return Err(CatalogError::Validation {
                 message: "control catalog authority requires the catalog state domain".to_string(),
@@ -1166,9 +1260,7 @@ impl ControlCatalogAuthority {
                 message: "control catalog authority requires the catalog state domain".to_string(),
             });
         }
-        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier {
-            storage: storage.clone(),
-        });
+        let projection_notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
         Ok(Self {
             store: ControlMvpStateStore::new_synthetic_bounded(storage, scope)?,
             continuation_key: ScanContinuationKey::generate()?,
@@ -2584,9 +2676,16 @@ fn freeze_mutation(
         .idempotency_key
         .as_ref()
         .map(|key| sha256_hex(key.as_str().as_bytes()));
-    let operation_id = idempotency_hash.as_ref().map_or_else(
+    // The audit key and projection intent id are derived from the operation
+    // id alone, while the receipt key is scoped by family. Folding the family
+    // into a keyed operation id keeps one idempotency key reusable across
+    // families without colliding on those family-agnostic identities.
+    let operation_id = opts.idempotency_key.as_ref().map_or_else(
         || format!("op-{}", Ulid::new().to_string().to_ascii_lowercase()),
-        |hash| format!("op-{}", &hash[..32]),
+        |key| {
+            let scoped = sha256_hex(format!("{family}\0{}", key.as_str()).as_bytes());
+            format!("op-{}", &scoped[..32])
+        },
     );
     let receipt_identity = idempotency_hash.as_deref().unwrap_or(&operation_id);
     let receipt_key = receipt_key(family, receipt_identity);
@@ -2788,8 +2887,9 @@ async fn stage_commit_records_v2(
     let (receipt, audit) =
         commit_record_bytes_v2(frozen, response, logical_commit_id, logical_sequence)?;
     txn.put(&frozen.receipt_key, receipt).await?;
-    txn.put(&audit_key(&frozen.operation_id), audit.clone())
-        .await?;
+    let audit_key = audit_key(&frozen.operation_id);
+    txn.assert_absent(&audit_key).await?;
+    txn.put(&audit_key, audit.clone()).await?;
     txn.stage_projection_intent_v2(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
@@ -2828,8 +2928,9 @@ async fn stage_commit_records(
         logical_sequence: predicted.logical_sequence(),
     };
     let audit_bytes = encode_json(&audit, "catalog audit record")?;
-    txn.put(&audit_key(&frozen.operation_id), audit_bytes.clone())
-        .await?;
+    let audit_key = audit_key(&frozen.operation_id);
+    txn.assert_absent(&audit_key).await?;
+    txn.put(&audit_key, audit_bytes.clone()).await?;
     txn.stage_projection_intent(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
@@ -4089,7 +4190,23 @@ impl ControlCatalogAuthority {
             if let Some(request_id) = &frozen.request_id {
                 options = options.with_request_id(request_id);
             }
-            let mut txn = self.store.begin_control_txn(options).await?;
+            // A HEAD pin that loses its retry budget is a conflict like a lost
+            // commit CAS; it shares the same wall-clock budget and backoff.
+            let mut txn = match self.store.begin_control_txn(options).await {
+                Ok(txn) => txn,
+                Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
+                    sleep(conflict_backoff(attempt)).await;
+                    continue;
+                }
+                Err(CatalogError::CasFailed { message }) => {
+                    return Err(CatalogError::CasFailed {
+                        message: format!(
+                            "control catalog conflict retry budget exhausted after 1.5 seconds: {message}"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(receipt) = load_receipt(&mut txn, &frozen.receipt_key).await? {
                 if receipt.operation_family != frozen.family
                     || receipt.request_digest != frozen.digest
@@ -4123,8 +4240,7 @@ impl ControlCatalogAuthority {
                     return Ok(response);
                 }
                 Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
-                    let jitter = 5_u64 + u64::from(attempt % 11);
-                    sleep(Duration::from_millis(jitter)).await;
+                    sleep(conflict_backoff(attempt)).await;
                 }
                 Err(CatalogError::CasFailed { .. }) => {
                     return Err(CatalogError::CasFailed {
@@ -4152,7 +4268,35 @@ impl ControlCatalogAuthority {
             if let Some(request_id) = &frozen.request_id {
                 options = options.with_request_id(request_id);
             }
-            let mut txn = self.store.begin_control_txn(options).await?;
+            // A HEAD pin that loses its retry budget is a conflict like a lost
+            // commit CAS; it shares the same wall-clock budget and backoff.
+            // Format 8 classifies pin exhaustion as `AmbiguousAuthorityOutcome`
+            // (the kernel keeps that classification for restore preflight). At
+            // begin nothing has been written yet, so the outcome is not actually
+            // ambiguous for this mutation and re-executing is safe. The same
+            // error from `commit_v2` below is left alone: after a HEAD put the
+            // mutation may already be durable, and only candidate recovery may
+            // decide that.
+            let mut txn = match self.store.begin_control_txn(options).await {
+                Ok(txn) => txn,
+                Err(
+                    CatalogError::CasFailed { .. } | CatalogError::AmbiguousAuthorityOutcome { .. },
+                ) if started.elapsed() < RETRY_BUDGET => {
+                    sleep(conflict_backoff(attempt)).await;
+                    continue;
+                }
+                Err(
+                    CatalogError::CasFailed { message }
+                    | CatalogError::AmbiguousAuthorityOutcome { message },
+                ) => {
+                    return Err(CatalogError::CasFailed {
+                        message: format!(
+                            "bounded catalog conflict retry budget exhausted after 1.5 seconds: {message}"
+                        ),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             txn.set_logical_operation(&frozen.operation_id, frozen.family, &frozen.digest)?;
             if let Some(receipt) = load_receipt_v2(&mut txn, &frozen.receipt_key).await? {
                 if receipt.operation_family != frozen.family
@@ -4197,8 +4341,7 @@ impl ControlCatalogAuthority {
                     return Ok(response);
                 }
                 Err(CatalogError::CasFailed { .. }) if started.elapsed() < RETRY_BUDGET => {
-                    let jitter = 5_u64 + u64::from(attempt % 11);
-                    sleep(Duration::from_millis(jitter)).await;
+                    sleep(conflict_backoff(attempt)).await;
                 }
                 Err(CatalogError::CasFailed { .. }) => {
                     return Err(CatalogError::CasFailed {

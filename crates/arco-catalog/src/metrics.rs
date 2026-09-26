@@ -91,13 +91,14 @@ pub const AUTHZ_INDEX_CANDIDATE_ROWS: &str = "arco_authz_index_candidate_rows";
 // State-Store Control-Plane Metrics (object-store control store, projections)
 // ============================================================================
 //
-// NOTE (2026-07-30 program audit, section 9.2 item 8): none of the
-// arco_state_store_* series below has a production emitter yet. The
-// object-store control store (state_store/control_mvp.rs) commits and replays
-// without recording metrics, and the projection watermark surfaces
-// (state_store/projection_outbox_acks.rs) are hermetic. The names are
-// reserved here so the alert rules in infra/monitoring/alerts.yaml stay tied
-// to code-owned metric names and light up when the emitters are wired.
+// Emitted by the control store (state_store/control_mvp.rs: commit_inner for
+// CAS publish outcomes, L0 segment count, and maintenance backpressure;
+// replay_manifest for replay duration and bytes; validate_raw_checksum_for
+// for read integrity failures; ambiguous_authority_outcome_for for ambiguous
+// outcomes) and by the projection outbox worker
+// (state_store/projection_outbox_acks.rs: drain_at_incarnation for publishes,
+// backlog for watermark lag and age). Alert rules in
+// infra/monitoring/alerts.yaml reference these code-owned names.
 
 /// Control-store pointer CAS publish attempts counter (label: domain).
 pub const STATE_STORE_CAS_PUBLISH: &str = "arco_state_store_cas_publish_total";
@@ -127,6 +128,16 @@ pub const STATE_STORE_PROJECTION_WATERMARK_AGE: &str =
 
 /// Projection publish counter (labels: domain, consumer).
 pub const STATE_STORE_PROJECTION_PUBLISH: &str = "arco_state_store_projection_publish_total";
+
+/// Commits refused because L0 maintenance has not caught up (label: domain).
+pub const STATE_STORE_MAINTENANCE_BACKPRESSURE: &str =
+    "arco_state_store_maintenance_backpressure_total";
+
+/// Authority writes whose outcome could not be reconciled (label: domain).
+pub const STATE_STORE_AMBIGUOUS_OUTCOMES: &str = "arco_state_store_ambiguous_outcomes_total";
+
+/// L0 segments carried by the latest candidate manifest gauge (label: domain).
+pub const STATE_STORE_L0_SEGMENTS: &str = "arco_state_store_l0_segments";
 
 // ============================================================================
 // ADR-034 Repair Metrics
@@ -246,6 +257,18 @@ pub fn register_metrics() {
     describe_counter!(
         STATE_STORE_PROJECTION_PUBLISH,
         "Total projection publishes by domain and consumer"
+    );
+    describe_counter!(
+        STATE_STORE_MAINTENANCE_BACKPRESSURE,
+        "Total control-store commits refused under L0 maintenance backpressure by domain"
+    );
+    describe_counter!(
+        STATE_STORE_AMBIGUOUS_OUTCOMES,
+        "Total control-store authority writes with an unreconciled ambiguous outcome by domain"
+    );
+    describe_gauge!(
+        STATE_STORE_L0_SEGMENTS,
+        "L0 segments carried by the latest control-store candidate manifest by domain"
     );
     describe_counter!(
         RECONCILER_ISSUES,
@@ -417,6 +440,89 @@ pub fn record_idempotency_takeover(operation: &str, result: &str) {
 }
 
 // ============================================================================
+// State-Store Control-Plane Recording
+// ============================================================================
+
+/// Records one control-store head pointer CAS publish attempt.
+///
+/// `outcome` is `success`, `cas_lost`, `stale_epoch`, `transport`, `integrity`,
+/// or `ambiguous`; anything but `success` also counts as a failure by reason.
+pub fn record_state_store_cas_publish(domain: &str, outcome: &str) {
+    counter!(STATE_STORE_CAS_PUBLISH, "domain" => domain.to_string()).increment(1);
+    if outcome != "success" {
+        counter!(
+            STATE_STORE_CAS_PUBLISH_FAILURES,
+            "domain" => domain.to_string(),
+            "reason" => outcome.to_string()
+        )
+        .increment(1);
+    }
+}
+
+/// Records one manifest-reachable replay: wall time and declared bytes.
+#[allow(clippy::cast_precision_loss)]
+pub fn record_state_store_replay(domain: &str, seconds: f64, bytes: u64) {
+    histogram!(STATE_STORE_REPLAY_DURATION, "domain" => domain.to_string()).record(seconds);
+    gauge!(STATE_STORE_REPLAY_BYTES, "domain" => domain.to_string()).set(bytes as f64);
+}
+
+/// Records one fail-closed read integrity failure for an artifact kind.
+pub fn record_state_store_integrity_failure(domain: &str, artifact: &str) {
+    counter!(
+        STATE_STORE_READ_INTEGRITY_FAILURES,
+        "domain" => domain.to_string(),
+        "artifact" => artifact.to_string()
+    )
+    .increment(1);
+}
+
+/// Records one commit refused under L0 maintenance backpressure.
+pub fn record_state_store_backpressure(domain: &str) {
+    counter!(STATE_STORE_MAINTENANCE_BACKPRESSURE, "domain" => domain.to_string()).increment(1);
+}
+
+/// Records one authority write whose outcome could not be reconciled.
+pub fn record_state_store_ambiguous(domain: &str) {
+    counter!(STATE_STORE_AMBIGUOUS_OUTCOMES, "domain" => domain.to_string()).increment(1);
+}
+
+/// Sets the L0 segment count carried by the latest candidate manifest.
+#[allow(clippy::cast_precision_loss)]
+pub fn record_state_store_l0_segments(domain: &str, n: u64) {
+    gauge!(STATE_STORE_L0_SEGMENTS, "domain" => domain.to_string()).set(n as f64);
+}
+
+/// Records one durably acknowledged projection publish.
+pub fn record_projection_publish(domain: &str, consumer: &str) {
+    counter!(
+        STATE_STORE_PROJECTION_PUBLISH,
+        "domain" => domain.to_string(),
+        "consumer" => consumer.to_string()
+    )
+    .increment(1);
+}
+
+/// Sets the projection watermark lag (sequences) and age (seconds).
+///
+/// Age is zero while nothing is pending; otherwise it is the time since the
+/// consumer's last recorded publish, so an idle domain never looks stale.
+#[allow(clippy::cast_precision_loss)]
+pub fn record_projection_watermark(domain: &str, consumer: &str, lag: u64, age_seconds: f64) {
+    gauge!(
+        STATE_STORE_PROJECTION_WATERMARK_LAG,
+        "domain" => domain.to_string(),
+        "consumer" => consumer.to_string()
+    )
+    .set(lag as f64);
+    gauge!(
+        STATE_STORE_PROJECTION_WATERMARK_AGE,
+        "domain" => domain.to_string(),
+        "consumer" => consumer.to_string()
+    )
+    .set(age_seconds);
+}
+
+// ============================================================================
 // ADR-034 Repair Metric Recording
 // ============================================================================
 
@@ -535,4 +641,83 @@ pub fn record_repair_repeat(
         "workspace_id" => workspace_id.to_string()
     )
     .increment(1);
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "metric emission tests fail fast on fixture setup errors"
+    )]
+
+    use std::sync::Arc;
+
+    use arco_core::{MemoryBackend, ScopedStorage};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use crate::state_store::{ControlMvpStateStore, StateScope, TxnOptions};
+
+    fn sample(rendered: &str, series: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix(series)
+                .and_then(|rest| rest.trim().parse().ok())
+        })
+    }
+
+    /// One control-store commit publishes its head once and carries one L0
+    /// segment; the counters must be observable through the metrics facade.
+    #[test]
+    fn control_store_commit_emits_cas_publish_and_l0_segment_metrics() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let storage = ScopedStorage::new(
+                    Arc::new(MemoryBackend::new()),
+                    "metrics-tenant",
+                    "metrics-workspace",
+                )
+                .expect("storage");
+                let store = ControlMvpStateStore::new(
+                    storage,
+                    StateScope::new("metrics-tenant", "metrics-workspace", "catalog"),
+                )
+                .expect("store");
+                store
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .expect("begin")
+                    .commit()
+                    .await
+                    .expect("commit");
+            });
+        });
+
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            Some(1.0),
+            sample(
+                &rendered,
+                "arco_state_store_cas_publish_total{domain=\"catalog\"}"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(
+            Some(1.0),
+            sample(
+                &rendered,
+                "arco_state_store_l0_segments{domain=\"catalog\"}"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| line.starts_with("arco_state_store_cas_publish_failures_total{")),
+            "a successful publish records no failure: {rendered}"
+        );
+    }
 }

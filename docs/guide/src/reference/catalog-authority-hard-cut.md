@@ -34,7 +34,10 @@ still fail closed because they are not yet wired to these artifacts. A
 cloud-neutral post-commit notifier schedules an immediate process-local drain
 and ignores notification failure after recording the durable intent; the
 operator drain remains the restart-safe anti-entropy path. Provider queue
-delivery and an always-on deployed scheduler remain private cutover work.
+delivery and an always-on deployed scheduler remain private cutover work; as
+of 2026-09-23 a cron-driven `arco-control-store-worker` job exists and, when
+deployed, runs the drain, layout maintenance, and GC on a schedule, but that
+cadence does not satisfy the 10 s p99 projection-lag objective.
 
 ## Pilot contract
 

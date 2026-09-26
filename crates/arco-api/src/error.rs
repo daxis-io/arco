@@ -332,7 +332,7 @@ impl From<CatalogError> for ApiError {
                 Self::not_found(format!("{entity} not found: {name}"))
             }
             CatalogError::PreconditionFailed { message } => Self::precondition_failed(message),
-            CatalogError::CasFailed { message } => Self::conflict(message),
+            CatalogError::CasFailed { message } => Self::conflict(message).with_retry_after(1),
             CatalogError::StaleWriterEpoch { message } => {
                 tracing::warn!(internal_error = %message, "catalog authority fencing failure");
                 Self::new(
@@ -469,5 +469,22 @@ mod tests {
         let response = error.into_response();
 
         assert!(response.headers().get("retry-after").is_none());
+    }
+
+    #[test]
+    fn cas_failed_conflict_advertises_retry_after() {
+        let error = ApiError::from(CatalogError::CasFailed {
+            message: "control catalog conflict retry budget exhausted after 1.5 seconds"
+                .to_string(),
+        });
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .expect("Retry-After header should be present on retry budget exhaustion");
+        assert_eq!(retry_after.to_str().unwrap(), "1");
     }
 }

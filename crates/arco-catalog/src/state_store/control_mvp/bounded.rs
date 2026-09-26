@@ -840,6 +840,7 @@ async fn publish_manifest_candidate(
         logical_sequence: manifest.logical_sequence,
         manifest_checksum_sha256: manifest_ref.sha256.clone(),
         writer_epoch: base.writer_epoch(),
+        claim_id: None,
     };
     let pointer_bytes = encode_json_limited(
         &pointer,

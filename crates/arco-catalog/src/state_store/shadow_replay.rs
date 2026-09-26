@@ -335,7 +335,7 @@ impl CatalogShadowExtendedSource {
 /// via `storage.list`, which is forbidden on request-time correctness paths —
 /// it may only be invoked from operator surfaces (arco-api's internal
 /// shadow-import endpoint, which is the service platform IAM makes the sole
-/// writer of the `state-store/` prefix).
+/// writer of the `control/` prefix).
 ///
 /// # Errors
 ///

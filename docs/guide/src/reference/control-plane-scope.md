@@ -31,16 +31,22 @@ public Git SHA; repository tests and ignored credentialed tests do not qualify.
 | Legacy catalog DDL (`CatalogWriter` -> ledger -> synchronous compaction -> Parquet manifest) | Yes, as the ADR-018 legacy path | Yes | Yes | Not recorded here | Yes through the shared adapter for every unbound root | Yes for every uncut root |
 | `ArcoStateStore` traits and `StateToken` contract | Yes (ADR-043) | Yes | Yes | N/A | Yes for an exact configured control root | No deployed authority |
 | Deterministic model store | Yes as a reference oracle | Yes | Yes | N/A | No | No |
-| `control/v1` object-store kernel | Yes (ADR-043) | Yes: v4 ordered L1 shards, bounded replay, checksum-bound Arrow/indexes, fencing, ambiguity reconciliation, restore | Yes | No | Yes, default-disabled for one exact root | No |
+| `control/v1` object-store kernel | Yes (ADR-043) | Yes: format-7 ordered L1 shards, bounded replay, checksum-bound Arrow/indexes, fencing, ambiguity reconciliation, restore | Yes | No | Yes, default-disabled for one exact root | No |
 | Bounded JSON envelopes and index-pruned paginated reads | Yes | Yes: 64 KiB head, 1/4 MiB envelopes, 4 MiB pages, authenticated-encrypted authority-pinned continuations, pinned and query-bound parent lookup, shared L0/L1 physical-read accounting, 64-segment budget, and unchanged native legacy keyset cursors | Yes for deterministic and control-kernel contracts | No | Yes through control authority reads | No |
-| Asynchronous L1 maintenance and conservative active GC | Yes | Yes: durable intent at 16 L0s, typed backpressure at 32, separate exact-CAS consolidation/GC capabilities, retention epochs and conservative marking | Yes for deterministic maintenance, recovery, retention, and deletion contracts | No | Worker APIs exist; no deployed scheduler | No |
-| Durable projection intents and acknowledgement root | Yes | Partial: intents, fixed consumer, real-Parquet materializer, separate ack root, exact terminal quarantine, monotonic durable redacted status, fail-open process-local notification, and fail-closed projection reads; provider queue delivery and always-on deployed scheduling absent | Yes for artifact-before-ack, retry/terminal recovery, poison-then-valid anti-entropy progress, concurrent status updates, sequence isolation, and status routing | No | Immediate local wake and operator drain exist; no deployed scheduler | No |
+| Asynchronous L1 maintenance and conservative active GC | Yes | Yes: durable intent at 16 L0s, typed backpressure at 32, separate exact-CAS consolidation/GC capabilities, retention epochs and conservative marking | Yes for deterministic maintenance, recovery, retention, and deletion contracts | No | Worker APIs and a cron-driven `arco-control-store-worker` job definition exist; not deployed on any root | No |
+| Durable projection intents and acknowledgement root | Yes | Partial: intents, fixed consumer, real-Parquet materializer, separate ack root, exact terminal quarantine, monotonic durable redacted status, fail-open process-local notification, and fail-closed projection reads; provider queue delivery and always-on deployed scheduling absent | Yes for artifact-before-ack, retry/terminal recovery, poison-then-valid anti-entropy progress, concurrent status updates, sequence isolation, and status routing | No | Immediate local wake, operator drain, and the cron-driven worker job exist; no queue-driven wake, not deployed on any root | No |
 | Shared native/UC/Iceberg `CatalogAuthority` | Yes | Yes | Yes, including cross-protocol reads and DDL | No | Yes, selected by exact binding | No deployed control root |
 | Exact per-root legacy/control binding | Yes | Yes: one validated tenant/workspace pair, no wildcard form, legacy default | Yes | No | Yes through server/native/UC/Iceberg state | No deployed control root |
 | S3 adapter | Yes, first qualification target | Yes | Yes for deterministic adapter contracts | No successful private gate recorded | Selectable by storage composition, not catalog authority | No catalog root |
 | GCS adapter | Yes as a future independent target | Yes | Yes for deterministic adapter contracts | No | Selectable by storage composition, not catalog authority | No catalog root |
 | Azure adapter | Yes as a future independent target | Yes | Yes for deterministic adapter contracts | No | Selectable by storage composition, not catalog authority | No catalog root |
 | Synthetic S3 catalog-DDL pilot | Yes | No | No | No | No | No |
+
+As of 2026-09-23 the `arco_state_store_*` alert series have real emitters and
+a scheduled `arco-control-store-worker` Cloud Run job (projection drain,
+layout maintenance, GC) is defined in Terraform, but no deployed environment
+binds a `control/v1` root, so nothing above is monitored or maintained in
+production and the cron cadence does not meet the 10 s p99 lag objective.
 
 ## Product-surface scorecard
 

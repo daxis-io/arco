@@ -347,6 +347,7 @@ fn control_mvp_envelope_scope_is_versioned_and_round_trips() {
         logical_sequence: 1,
         manifest_checksum_sha256: "0".repeat(64),
         writer_epoch: 0,
+        claim_id: None,
     };
 
     let value = serde_json::to_value(&pointer).unwrap();
@@ -373,6 +374,7 @@ fn control_mvp_envelope_rejects_cross_root_scope() {
         logical_sequence: 1,
         manifest_checksum_sha256: "0".repeat(64),
         writer_epoch: 0,
+        claim_id: None,
     };
     assert!(
         pointer.validate(&mts).is_err(),

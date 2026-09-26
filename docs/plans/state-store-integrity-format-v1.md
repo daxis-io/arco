@@ -149,8 +149,10 @@ generation. Staged values have no committed generation; staged deletes read as
 absence. Overlay-only point reads record their local origin. Explicit assertions
 always inspect the pinned base, even after a write/delete. Completed range
 fingerprints preserve the existing encoding, include tombstones and gaps, and
-are reused within the request. A retained tombstone makes range-empty fail.
-Empty and reversed half-open ranges remain empty. Wide ranges hash resolved
+are reused within the request. A retained tombstone is not a range entry, so
+range-empty passes over it; the witness still covers the tombstone, so a
+concurrent resurrection conflicts at commit. Empty and reversed half-open
+ranges remain empty. Wide ranges hash resolved
 rows in bounded chunks without collecting a full result or imposing a total
 range traversal limit.
 

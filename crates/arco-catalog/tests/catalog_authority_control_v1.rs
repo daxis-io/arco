@@ -214,6 +214,132 @@ impl StorageBackend for FailProjectionPutBackend {
     }
 }
 
+/// Counts projection manifest publications and, when armed, holds the first
+/// one until the test releases it so a burst of authority commits lands while
+/// exactly one drain pass is in flight.
+struct GatedProjectionManifestBackend {
+    inner: MemoryBackend,
+    manifest_puts: AtomicUsize,
+    hold_first: AtomicBool,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl GatedProjectionManifestBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            manifest_puts: AtomicUsize::new(0),
+            hold_first: AtomicBool::new(false),
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn manifest_puts(&self) -> usize {
+        self.manifest_puts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for GatedProjectionManifestBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        if path.contains("control/v1/projections/") && path.ends_with("/manifest.json") {
+            self.manifest_puts.fetch_add(1, Ordering::SeqCst);
+            if self.hold_first.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+        }
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.inner.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+/// Commits eight catalog mutations while the first post-commit drain is held
+/// at its manifest publication, releases it, and waits until every intent is
+/// acknowledged. Returns the backlog observed at settle time.
+async fn commit_burst_and_settle(
+    backend: &GatedProjectionManifestBackend,
+    storage: &ScopedStorage,
+    authority: &ControlCatalogAuthority,
+) {
+    backend.hold_first.store(true, Ordering::SeqCst);
+    authority
+        .create_catalog("burst-0", None, WriteOptions::default())
+        .await
+        .expect("first burst commit");
+    tokio::time::timeout(Duration::from_secs(10), backend.reached.notified())
+        .await
+        .expect("the post-commit drain must reach its first manifest publication");
+    for index in 1..8 {
+        authority
+            .create_catalog(&format!("burst-{index}"), None, WriteOptions::default())
+            .await
+            .expect("burst commit");
+    }
+    backend.release.notify_one();
+
+    let worker = ProjectionOutboxWorker::new(
+        storage.clone(),
+        "catalog",
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    )
+    .expect("worker");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let backlog = worker.backlog().await.expect("backlog");
+        if backlog.pending_record_ids.is_empty()
+            && backlog.latest_projected_sequence == Some(8)
+            && backlog.committed_sequence == Some(8)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "post-commit drains did not settle: {backlog:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn scoped_storage() -> ScopedStorage {
     ScopedStorage::new(
         Arc::new(MemoryBackend::new()),
@@ -731,6 +857,57 @@ async fn materializer_publishes_parquet_before_ack_and_recovers_by_anti_entropy(
     assert!(backlog.pending_record_ids.is_empty());
 }
 
+/// A burst of commits must not fan out into concurrent drains that all
+/// materialize the same intents and race on the ack-root pointer: with the
+/// default notifier, every intent is materialized exactly once and acked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_commits_materialize_each_projection_intent_exactly_once() {
+    let backend = GatedProjectionManifestBackend::new();
+    let storage =
+        ScopedStorage::new(backend.clone(), "burst-tenant", "burst-exactly-once").expect("storage");
+    let authority = ControlCatalogAuthority::new(
+        storage.clone(),
+        StateScope::new("burst-tenant", "burst-exactly-once", "catalog"),
+    )
+    .expect("control authority");
+
+    commit_burst_and_settle(&backend, &storage, &authority).await;
+
+    assert_eq!(
+        8,
+        backend.manifest_puts(),
+        "serialized drains publish each projection manifest exactly once"
+    );
+}
+
+/// The process-local wake-up serializes drains per root and coalesces the
+/// wake-ups that arrive while a drain is running into one further pass.
+#[cfg(feature = "test-utils")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn burst_commits_coalesce_into_at_most_three_drain_passes() {
+    use arco_catalog::catalog_authority::CatalogProjectionDrainNotifier;
+
+    let backend = GatedProjectionManifestBackend::new();
+    let storage =
+        ScopedStorage::new(backend.clone(), "burst-tenant", "burst-coalesce").expect("storage");
+    let notifier = Arc::new(CatalogProjectionDrainNotifier::new(storage.clone()));
+    let authority = ControlCatalogAuthority::new(
+        storage.clone(),
+        StateScope::new("burst-tenant", "burst-coalesce", "catalog"),
+    )
+    .expect("control authority")
+    .with_projection_notifier(notifier.clone());
+
+    commit_burst_and_settle(&backend, &storage, &authority).await;
+
+    let passes = notifier.drain_passes();
+    assert!(
+        (1..=3).contains(&passes),
+        "eight wake-ups must coalesce into at most three drain passes, got {passes}"
+    );
+    assert_eq!(8, backend.manifest_puts());
+}
+
 #[tokio::test]
 async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_later_work() {
     let storage = scoped_storage();
@@ -798,7 +975,14 @@ async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_lat
         .await
         .expect("status")
         .expect("materialized status");
-    assert_eq!(None, status.failure_state());
+    // The later valid intent is applied, but the quarantined events remain
+    // unacknowledged backlog that only an operator resolves, so the newest
+    // terminal state stays visible instead of being cleared by that success.
+    assert_eq!(
+        Some("terminal:INCOMPATIBLE_PROJECTION_INTENT"),
+        status.failure_state()
+    );
+    assert!(status.applied_authority_sequence() > Some(incompatible_sequence));
     let ack_writer = ProjectionOutboxAckWriter::new(
         storage.clone(),
         StateScope::new(
@@ -1027,6 +1211,67 @@ async fn idempotency_replay_is_exact_and_mismatched_reuse_conflicts() {
         .await
         .expect_err("mismatched reuse must fail");
     assert!(error.to_string().contains("idempotency"));
+}
+
+#[tokio::test]
+async fn reusing_an_idempotency_key_across_operation_families_keeps_both_audit_records() {
+    let storage = scoped_storage();
+    let authority =
+        ControlCatalogAuthority::new(storage.clone(), scope()).expect("control authority");
+    authority
+        .create_catalog("c", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    authority
+        .create_schema("c", "s", None, WriteOptions::with_idempotency("shared-key"))
+        .await
+        .expect("create schema with the shared key");
+    authority
+        .register_table_in_schema(
+            "c",
+            "s",
+            RegisterTableInSchemaRequest {
+                name: "t".to_string(),
+                description: None,
+                location: None,
+                format: Some("parquet".to_string()),
+                table_type: None,
+                properties: None,
+                columns: Vec::new(),
+            },
+            WriteOptions::with_idempotency("shared-key"),
+        )
+        .await
+        .expect("a different operation family may reuse the same idempotency key");
+
+    let store = ControlMvpStateStore::new(storage, scope()).expect("control store");
+    let audit = store
+        .scan(arco_catalog::ScanRequest::new(b"\x04"))
+        .await
+        .expect("audit records");
+    let mut families = audit
+        .entries()
+        .iter()
+        .map(|entry| {
+            let record: serde_json::Value =
+                serde_json::from_slice(entry.value().bytes()).expect("audit record json");
+            record["operationFamily"]
+                .as_str()
+                .expect("operation family")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    families.sort();
+    assert_eq!(
+        vec!["create_catalog", "create_schema", "register_table"],
+        families,
+        "every mutation keeps its own audit record when a key is shared across families"
+    );
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents");
+    assert_eq!(3, outbox.len());
 }
 
 #[tokio::test]
@@ -1479,5 +1724,162 @@ async fn control_v1_bound_rejects_a_metastore_scope_without_a_metastore_binding(
     assert!(
         CatalogAuthority::control_v1_bound(storage, metastore_scope, &bindings).is_err(),
         "a workspace binding must not authorize a metastore root"
+    );
+}
+
+/// Reports a fresh pointer HEAD version for the first `unstable_remaining`
+/// pointer `head()` calls, then passes the real version through.
+struct UnstablePointerHeadBackend {
+    inner: MemoryBackend,
+    unstable_remaining: AtomicUsize,
+    counter: AtomicUsize,
+}
+
+impl UnstablePointerHeadBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            unstable_remaining: AtomicUsize::new(0),
+            counter: AtomicUsize::new(0),
+        })
+    }
+
+    fn arm(&self, calls: usize) {
+        self.unstable_remaining.store(calls, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StorageBackend for UnstablePointerHeadBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.inner.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        let mut meta = self.inner.head(path).await?;
+        if path.ends_with("/control/v1/domains/catalog/head/current.json")
+            && let Some(meta) = &mut meta
+            && self
+                .unstable_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            meta.version = format!("unstable-{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        }
+        Ok(meta)
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[tokio::test]
+async fn head_pin_conflicts_retry_inside_the_catalog_budget() {
+    let backend = UnstablePointerHeadBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("scoped storage");
+    let authority = ControlCatalogAuthority::new(storage, scope()).expect("control authority");
+    authority
+        .create_catalog("seed", None, WriteOptions::default())
+        .await
+        .expect("seed mutation publishes the pointer");
+
+    // The pin reads HEAD before and after the pointer body for three attempts;
+    // six fresh versions exhaust that budget exactly once.
+    backend.arm(6);
+    let created = authority
+        .create_catalog("after-unstable-head", None, WriteOptions::default())
+        .await
+        .expect("a transient head-pin conflict must be retried inside the catalog budget");
+    assert_eq!("after-unstable-head", created.name);
+    assert_eq!(
+        0,
+        backend.unstable_remaining.load(Ordering::SeqCst),
+        "the unstable head fault must fire"
+    );
+    assert!(
+        authority
+            .get_catalog("after-unstable-head")
+            .await
+            .expect("authority read")
+            .is_some(),
+        "the retried mutation must be durable"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_head_pin_conflicts_retry_inside_the_catalog_budget() {
+    let backend = UnstablePointerHeadBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("scoped storage");
+    let authority = ControlCatalogAuthority::new_synthetic_bounded(
+        storage,
+        scope(),
+        Arc::new(NoopProjectionNotifierV2),
+    )
+    .expect("bounded authority");
+    authority
+        .create_catalog_v2("seed", None, WriteOptions::with_idempotency("seed"))
+        .await
+        .expect("seed mutation publishes the pointer");
+
+    // Format 8 classifies pin exhaustion as an ambiguous outcome; at begin
+    // nothing has been written, so the authority must still retry it.
+    backend.arm(6);
+    let created = authority
+        .create_catalog_v2(
+            "after-unstable-head",
+            None,
+            WriteOptions::with_idempotency("after-unstable-head"),
+        )
+        .await
+        .expect("a transient head-pin conflict must be retried inside the bounded budget");
+    assert_eq!("after-unstable-head", created.name);
+    assert_eq!(
+        0,
+        backend.unstable_remaining.load(Ordering::SeqCst),
+        "the unstable head fault must fire"
+    );
+    assert!(
+        authority
+            .get_catalog("after-unstable-head")
+            .await
+            .expect("authority read")
+            .is_some(),
+        "the retried bounded mutation must be durable"
     );
 }

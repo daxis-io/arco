@@ -50,6 +50,22 @@ backend object age; the horizon needs a sequence-to-time mapping that readers
 can verify from the artifacts themselves. The stamp is informational for
 ordering: logical order remains the sequence.
 
+Stamps are monotone along ancestry on every render path (commit, restore,
+maintenance): a child's stamp is `max(render clock, parent stamp)`, and the
+ancestry walker rejects a child stamped before its parent.
+
+*Amendment (2026-09-27, after Package C review):* one manifest per commit means
+a plain ancestry walk cannot span 30 days at the pilot rate (millions of
+manifests against a 4,096-hop budget). Every format-9 manifest therefore also
+carries `age_anchor: Option<{ manifest_id, manifest_sha256, sequence,
+committed_at_ms }>`, computed at render from the parent: if the child's stamp
+falls in a later hour bucket than the parent's, the anchor is the parent (the
+last manifest of the previous bucket); otherwise the child inherits the
+parent's anchor. Following anchors steps back at least one hour per hop, so the
+30-day floor is reached in at most about 721 authenticated reads. The walker
+checks the anchor rule as a transition invariant and authenticates each anchor
+by its recorded digest, sequence and stamp.
+
 ### Per-row expiry
 
 KV segment rows gain a nullable `expires_at_ms` column (segment format 2). A
@@ -73,8 +89,12 @@ Live rows are never purged by the horizon. Outbox rows are never purged by the
 horizon (see below). The worker computes `horizon_sequence` as the minimum of:
 
 1. the sequence of the newest manifest whose `committed_at_ms` is older than
-   the token retention floor (30 days), found by a bounded ancestry walk from
-   the current manifest (no listing);
+   the token retention floor plus a one-hour clock-skew margin (30 days + 1 h;
+   token validity and GC judge age by backend object time, the walk by writer
+   stamps), found by following `age_anchor` links from the current manifest
+   (no listing). If an anchor has been collected by GC, its recorded stamp and
+   sequence still decide: a recorded stamp at or below the floor yields that
+   sequence; a recorded stamp above the floor is corruption and fails closed;
 2. every sequence pinned by an active snapshot or export root, streamed by the
    same retained-root inventory GC uses; and
 3. every checkpoint's sequence while its own retention (`min_retention_seconds`,

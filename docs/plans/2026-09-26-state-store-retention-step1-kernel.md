@@ -99,8 +99,12 @@ cargo fmt --all -- --check && git diff --check && cargo xtask repo-hygiene-check
 ## As implemented (2026-09-26)
 
 Packages A through D landed on this branch (bf3694da, f526db45, f0702f29,
-7e8f326a, 6484e5dc, 7c9aae9b, e8eee31e, 16587f2d, d589ec82, then the Package D docs
-commit). The resulting contract is `state-store-retention-format-v1.md`.
+7e8f326a, 6484e5dc, 7c9aae9b, e8eee31e, 16587f2d, d589ec82, the Package D docs
+commits fd6043f3 and 1d34fb09, then the final-review follow-ups 5aeda066
+(durable-model horizon deferral), b0205f41 (GC holds manifests one skew
+margin past token retention) and the retention polish commit that
+introduced this list). The resulting contract is
+`state-store-retention-format-v1.md`.
 Deviations from the plan above:
 
 - **Restore plan 7 pins the stamp.** The plan-7 wire format carries

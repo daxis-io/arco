@@ -1360,6 +1360,20 @@ fn retention_horizon_certificate_validation_is_fail_closed() {
             "{case} must be rejected"
         );
     }
+    // Carried by a manifest, the cutoff must precede the manifest's stamp.
+    let valid = horizon_certificate();
+    valid
+        .validate_for_manifest(10, valid.purge_cutoff_ms + 1)
+        .unwrap();
+    for stamp in [valid.purge_cutoff_ms, valid.purge_cutoff_ms - 1] {
+        assert!(
+            matches!(
+                valid.validate_for_manifest(10, stamp),
+                Err(CatalogError::InvariantViolation { .. })
+            ),
+            "a cutoff at or after the manifest stamp must be rejected"
+        );
+    }
 }
 
 #[test]

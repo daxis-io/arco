@@ -1323,11 +1323,12 @@ impl ControlMvpMaintenanceWorker {
     /// The certificate cites one entry per evidence kind (its lowest
     /// sequence); `horizon_sequence` is the minimum of them. `purge_cutoff_ms`
     /// is `now` minus the same skew margin. Any unreadable or invalid input
-    /// is an error: the job never renders on a guess.
+    /// is an error: the job never renders on a guess. Returns the head the
+    /// inputs were computed against so admission binds the same manifest.
     pub(super) async fn retention_horizon_inputs(
         &self,
         now: DateTime<Utc>,
-    ) -> Result<HorizonInputs> {
+    ) -> Result<(ControlMvpPointer, ControlMvpManifest, HorizonInputs)> {
         cost::phase("maintenance-horizon-inputs", async {
             let pointer = self.store.load_pointer().await?;
             let head = self.store.load_manifest_for_pointer(&pointer).await?;
@@ -1363,14 +1364,14 @@ impl ControlMvpMaintenanceWorker {
                 pinned_evidence,
             };
             inputs.validate(pointer.logical_sequence)?;
-            Ok(inputs)
+            Ok((pointer, head, inputs))
         })
         .await
     }
 
     /// Input 1: the token-retention age bound, as `manifest_age` evidence
     /// citing the manifest that established it (or, for a bound of zero, the
-    /// newest manifest examined).
+    /// last manifest examined, i.e. the oldest one the chain reached).
     async fn age_bound_evidence(
         &self,
         head: &ControlMvpManifest,
@@ -1391,7 +1392,7 @@ impl ControlMvpMaintenanceWorker {
         if head.committed_at_ms <= floor_ms {
             return Ok(evidence(&head.manifest_id, head.logical_sequence));
         }
-        let mut newest_examined = head.manifest_id.clone();
+        let mut last_examined = head.manifest_id.clone();
         let mut next = head.age_anchor.clone();
         let mut hops = 0_usize;
         let mut bytes = 0_u64;
@@ -1438,11 +1439,11 @@ impl ControlMvpMaintenanceWorker {
             if manifest.committed_at_ms <= floor_ms {
                 return Ok(evidence(&record.manifest_id, record.sequence));
             }
-            newest_examined = record.manifest_id;
+            last_examined = record.manifest_id;
             next = manifest.age_anchor;
         }
         // The whole chain is younger than the floor: nothing is purgeable by age.
-        Ok(evidence(&newest_examined, 0))
+        Ok(evidence(&last_examined, 0))
     }
 
     /// Input 2: every active snapshot or export pin naming this scope, with
@@ -1825,17 +1826,22 @@ impl DurableMaintenanceWorker {
         now: DateTime<Utc>,
     ) -> Result<Option<PreparedMaintenance>> {
         cost::phase("maintenance-horizon-preflight", async {
-            if self.admission_source().await?.is_none() {
+            let store = &self.worker.store;
+            if store
+                .storage
+                .head(&store.paths.current_pointer())
+                .await?
+                .is_none()
+            {
                 return Ok(None);
             }
-            let inputs = Box::pin(self.worker.retention_horizon_inputs(now)).await?;
-            let Some((pointer, source)) = self.admission_source().await? else {
-                return Ok(None);
-            };
+            // The inputs and the descriptor bind the same head: one load.
+            let (pointer, head, inputs) =
+                Box::pin(self.worker.retention_horizon_inputs(now)).await?;
             let prepared = Box::pin(self.admit(
                 now,
                 &pointer,
-                &source,
+                &head,
                 MaintenanceKind::RetentionHorizon,
                 Some(inputs),
             ))

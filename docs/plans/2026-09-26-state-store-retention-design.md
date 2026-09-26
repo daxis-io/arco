@@ -88,13 +88,17 @@ A horizon job renders new L1 shards from the parent manifest's state omitting:
 Live rows are never purged by the horizon. Outbox rows are never purged by the
 horizon (see below). The worker computes `horizon_sequence` as the minimum of:
 
-1. the sequence of the newest manifest whose `committed_at_ms` is older than
-   the token retention floor plus a one-hour clock-skew margin (30 days + 1 h;
-   token validity and GC judge age by backend object time, the walk by writer
-   stamps), found by following `age_anchor` links from the current manifest
-   (no listing). If an anchor has been collected by GC, its recorded stamp and
+1. the sequence of the last manifest of the newest hour bucket whose last
+   manifest is stamped at or below the token retention floor plus a one-hour
+   clock-skew margin (30 days + 1 h; token validity and GC judge age by
+   backend object time, the walk by writer stamps). This is conservative by
+   up to one bucket, since anchors are the last manifest of each bucket. It
+   is found by following `age_anchor` links from the current manifest (no
+   listing). If an anchor has been collected by GC, its recorded stamp and
    sequence still decide: a recorded stamp at or below the floor yields that
-   sequence; a recorded stamp above the floor is corruption and fails closed;
+   sequence; a recorded stamp above the floor is corruption and fails closed.
+   GC holds manifest objects for the token retention plus the same margin,
+   so a collected anchor is never above the floor;
 2. every sequence pinned by an active snapshot or export root, streamed by the
    same retained-root inventory GC uses; and
 3. every checkpoint's sequence while its own retention (`min_retention_seconds`,
@@ -124,11 +128,12 @@ equivalence rule for this transition kind is "parent state minus the certified
 purged set equals the new state". The worker verifies it before its
 exact-version head CAS and binds the certificate into the manifest exactly as
 consolidation evidence is bound today. Ancestry walkers accept a horizon
-transition when the certificate binds to its parent, the sequence and history
-root are unchanged, and the purged counts are consistent with the parent's and
-child's row totals. As with consolidation evidence, this is verification by
-independent code at rewrite time, not by an independent party; readers cannot
-recompute the identity after the purged rows are gone.
+transition when the certificate binds to its parent's state checksum, the
+equivalence evidence names the parent's physical root, and the sequence and
+history root are unchanged; manifests carry no row totals, so walkers cannot
+check the purged counts against them. As with consolidation evidence, this is
+verification by independent code at rewrite time, not by an independent
+party; readers cannot recompute the identity after the purged rows are gone.
 
 ### Outbox rows
 
@@ -176,8 +181,9 @@ historical audit rows.
 | Case | Behaviour |
 |---|---|
 | Horizon rewrite loses its head CAS | Regenerates under the new generation, like consolidation. |
-| A pin is published between horizon computation and CAS | Caught by the retention-epoch fence and the exact-version CAS; the job regenerates. |
+| A pin is published between horizon computation and CAS | A new pin references the current head, whose sequence is at or above the computed horizon, so it cannot lower the bound; the exact-version CAS still regenerates the job if the head moved. |
 | Pin inventory unreadable or malformed | Job fails closed; nothing rendered. |
+| Anchor object collected while its stamp is still above the floor | Cannot happen: GC holds manifests for the token retention plus the skew margin, one margin longer than tokens, so any collected anchor is at or below the floor and decides by its record. |
 | Worker clock ahead of artifact stamps | The horizon walk uses `committed_at_ms` from artifacts; expiry purge carries a one-hour safety margin. |
 | Expired receipt read before purge | Returned as a valid receipt (replay short-circuits). Safe. |
 | Reader pinned before the rewrite | Reads its own manifest's L1 and still sees the tombstone. |

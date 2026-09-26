@@ -216,7 +216,8 @@ is an error and nothing is rendered.
    already collected decides by its record only when the record is at or
    below the floor; a missing anchor recorded above the floor, an exhausted
    budget, or a record its manifest contradicts fails closed. A chain that
-   ends above the floor yields bound 0, citing the newest manifest examined.
+   ends above the floor yields bound 0, citing the last manifest examined
+   (the oldest one the chain reached).
 2. `snapshot` and `export`: every active pin streamed by the retained-root
    inventory GC uses, skipping maintenance roots, for authorities naming this
    scope. Each pinned manifest is loaded with its recorded checksum and must
@@ -257,8 +258,7 @@ must then equal the pruned parent exactly, by value and by checksum.
 The candidate keeps the parent's logical sequence and history root; its
 history anchor moves to the render cut (`HistoryAnchor { sequence:
 render.logical_sequence, root: render.history_root }`), as for consolidation.
-The candidate keeps the parent's logical sequence and history
-root, advances the layout generation, sets `state_checksum_sha256` to the
+It advances the layout generation, sets `state_checksum_sha256` to the
 pruned state's checksum, binds the certificate with
 `parent_state_checksum_sha256` equal to the parent's checksum, and carries
 `equivalence` (encoding 2) naming the parent as its source, with a

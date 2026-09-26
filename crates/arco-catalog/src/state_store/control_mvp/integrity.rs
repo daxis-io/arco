@@ -211,6 +211,25 @@ impl RetentionHorizonV1 {
         )
         .map_err(|_| invariant_violation("invalid retention horizon certificate"))
     }
+
+    /// Validation for the manifest that carries the certificate: the
+    /// structural rules plus "the purge cutoff precedes the manifest's own
+    /// stamp", which every genuine render satisfies (the cutoff is the
+    /// preparation clock minus the skew margin; the stamp is at or after the
+    /// preparation clock).
+    pub(super) fn validate_for_manifest(
+        &self,
+        logical_sequence: u64,
+        committed_at_ms: i64,
+    ) -> Result<()> {
+        self.validate(logical_sequence)?;
+        if self.purge_cutoff_ms >= committed_at_ms {
+            return Err(invariant_violation(
+                "retention horizon purge cutoff is not before the manifest stamp",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One row a horizon rewrite dropped, in the shape the purged digest binds.
@@ -560,7 +579,7 @@ impl ControlMvpManifest {
                     "retention horizon certificate requires rewrite equivalence evidence",
                 ));
             }
-            certificate.validate(self.logical_sequence)?;
+            certificate.validate_for_manifest(self.logical_sequence, self.committed_at_ms)?;
         }
         if let Some(evidence) = &self.equivalence {
             if self.base_manifest_id.as_deref() != Some(&evidence.source_manifest_id)

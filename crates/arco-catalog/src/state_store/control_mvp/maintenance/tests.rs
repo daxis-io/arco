@@ -2364,7 +2364,7 @@ mod horizon {
         backend
             .manifest_reads
             .store(0, std::sync::atomic::Ordering::SeqCst);
-        let inputs = worker.worker.retention_horizon_inputs(now).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(now).await.unwrap();
         assert_eq!(
             inputs.pinned_evidence,
             vec![PinnedSequenceV1 {
@@ -2413,11 +2413,11 @@ mod horizon {
         // Floor at 30 minutes past the start: hour 1 is still above it, so
         // the walk follows two anchors to hour 0.
         let early = floor_reached_at(start + ChronoDuration::minutes(30));
-        let inputs = worker.worker.retention_horizon_inputs(early).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(early).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&hour0, 2));
         // Floor at 90 minutes past the start: hour 1 is the bound.
         let late = floor_reached_at(start + ChronoDuration::minutes(90));
-        let inputs = worker.worker.retention_horizon_inputs(late).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(late).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&hour1, 3));
 
         // GC collects the hour-1 anchor object.
@@ -2426,7 +2426,7 @@ mod horizon {
             .await
             .unwrap();
         // Its record, stamped at or below the floor, still yields the bound.
-        let inputs = worker.worker.retention_horizon_inputs(late).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(late).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&hour1, 3));
         // Stamped above the floor, a missing anchor is corruption: fail closed.
         assert!(matches!(
@@ -2686,7 +2686,7 @@ mod horizon {
                 .is_none(),
             "a manifest past the band is collected"
         );
-        let inputs = worker.worker.retention_horizon_inputs(now).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(now).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&last_of_hour[0], 2));
 
         // An hour later the hour-1 object is past the band: GC collects it,
@@ -2709,7 +2709,7 @@ mod horizon {
                 .is_some(),
             "the hour-2 anchor is inside the band and still readable"
         );
-        let inputs = worker.worker.retention_horizon_inputs(later).await.unwrap();
+        let (_, _, inputs) = worker.worker.retention_horizon_inputs(later).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&last_of_hour[1], 3));
     }
 }

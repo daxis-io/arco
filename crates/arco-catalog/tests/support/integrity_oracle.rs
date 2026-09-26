@@ -25,7 +25,7 @@ fn prefix(name: &str) -> Vec<u8> {
     field(&mut out, format!("arco/control-v1/{name}").as_bytes());
     out.extend_from_slice(&1_u32.to_be_bytes());
     field(&mut out, b"arco-state-control-mvp");
-    out.extend_from_slice(&7_u32.to_be_bytes());
+    out.extend_from_slice(&9_u32.to_be_bytes());
     for scope in [b"tenant".as_slice(), b"workspace", b"catalog"] {
         field(&mut out, scope);
     }
@@ -203,7 +203,7 @@ impl LogicalOracle {
             field(&mut physical, r["tx_id"].as_str().unwrap().as_bytes());
             physical.extend_from_slice(&r["sequence"].as_u64().unwrap().to_be_bytes());
             physical.extend_from_slice(&r["size_bytes"].as_u64().unwrap().to_be_bytes());
-            physical.extend_from_slice(&7_u32.to_be_bytes());
+            physical.extend_from_slice(&9_u32.to_be_bytes());
             physical
                 .extend_from_slice(&hex::decode(r["checksum_sha256"].as_str().unwrap()).unwrap());
         }
@@ -403,7 +403,7 @@ fn assert_envelope(bytes: &[u8], artifact: &str) -> serde_json::Value {
             }
     );
     let doc: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(doc["format_version"], 7);
+    assert_eq!(doc["format_version"], 9);
     assert_eq!(doc["artifact_type"], artifact);
     let checksum = doc["checksum_sha256"].as_str().unwrap();
     assert!(
@@ -413,7 +413,7 @@ fn assert_envelope(bytes: &[u8], artifact: &str) -> serde_json::Value {
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     );
     let prefix = format!(
-        "{{\"format_version\":7,\"artifact_type\":\"{artifact}\",\"checksum_sha256\":\"{checksum}\",\"payload\":"
+        "{{\"format_version\":9,\"artifact_type\":\"{artifact}\",\"checksum_sha256\":\"{checksum}\",\"payload\":"
     );
     let payload = bytes
         .strip_prefix(prefix.as_bytes())

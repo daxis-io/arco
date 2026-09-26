@@ -228,6 +228,7 @@ struct MirrorManifest {
     base_manifest_id: Option<String>,
     writer_epoch: u64,
     layout_generation: u64,
+    committed_at_ms: i64,
     base_states: Vec<MirrorStateRef>,
     anchor_states: Vec<MirrorStateRef>,
     tx_refs: Vec<MirrorTxRef>,
@@ -245,6 +246,7 @@ struct MirrorTransaction {
     base_manifest_id: Option<String>,
     sequence: u64,
     writer_epoch: u64,
+    committed_at_ms: i64,
     request_id: Option<String>,
     l0_segment: MirrorSegmentRef,
 }

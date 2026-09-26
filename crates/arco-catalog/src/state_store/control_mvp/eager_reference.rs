@@ -96,6 +96,7 @@ impl ControlMvpMaintenanceWorker {
                 base_manifest_id: Some(source_manifest.manifest_id.clone()),
                 writer_epoch: pointer.writer_epoch,
                 layout_generation: intent.layout_generation(),
+                committed_at_ms: super::cost::now().timestamp_millis(),
                 base_states,
                 anchor_states: Vec::new(),
                 tx_refs: Vec::new(),

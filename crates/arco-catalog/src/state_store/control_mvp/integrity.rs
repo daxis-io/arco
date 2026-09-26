@@ -1,4 +1,4 @@
-//! Canonical authority-format-7 integrity commitments. No storage I/O lives here.
+//! Canonical authority-format-9 integrity commitments. No storage I/O lives here.
 use arco_core::AuthorityRoot;
 
 use crate::StateScope;
@@ -138,13 +138,35 @@ impl Canonical {
         record_integrity_work(0, self.0.len());
         sha256_hex(&self.0)
     }
+    /// The exact bytes `finish` hashes; the vector generator records them.
+    #[cfg(test)]
+    fn preimage(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn genesis_canonical(scope: &StateScope) -> Result<Canonical> {
+    Canonical::new(b"arco/control-v1/history-genesis", scope)
 }
 
 pub(super) fn genesis(scope: &StateScope) -> Result<HistoryAnchor> {
     Ok(HistoryAnchor {
         sequence: 0,
-        root: Canonical::new(b"arco/control-v1/history-genesis", scope)?.finish(),
+        root: genesis_canonical(scope)?.finish(),
     })
+}
+
+fn history_step_canonical(
+    scope: &StateScope,
+    preceding: &str,
+    sequence: u64,
+    mutation: &str,
+) -> Result<Canonical> {
+    let mut out = Canonical::new(b"arco/control-v1/history-step", scope)?;
+    out.digest(preceding)?;
+    out.u64(sequence);
+    out.digest(mutation)?;
+    Ok(out)
 }
 
 pub(super) fn history_step(
@@ -153,14 +175,14 @@ pub(super) fn history_step(
     sequence: u64,
     mutation: &str,
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/history-step", scope)?;
-    out.digest(preceding)?;
-    out.u64(sequence);
-    out.digest(mutation)?;
-    Ok(out.finish())
+    Ok(history_step_canonical(scope, preceding, sequence, mutation)?.finish())
 }
 
 pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
+    Ok(mutation_canonical(tx)?.finish())
+}
+
+fn mutation_canonical(tx: &ControlMvpTxObject) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/mutation", &tx.scope)?;
     out.optional_bytes(tx.request_id.as_deref().map(str::as_bytes));
     let mut writes = tx.writes.iter().collect::<Vec<_>>();
@@ -184,7 +206,7 @@ pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
         out.bytes(trim.record_id.as_bytes());
         out.u64(trim.origin_sequence);
     }
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl HistoryLink {
@@ -359,6 +381,16 @@ fn physical_digest(
     transactions: &[super::ControlMvpTxRef],
     suffix: &[super::ControlMvpTxRef],
 ) -> Result<String> {
+    Ok(physical_canonical(scope, states, anchors, transactions, suffix)?.finish())
+}
+
+fn physical_canonical(
+    scope: &StateScope,
+    states: &[ControlMvpStateRef],
+    anchors: &[ControlMvpStateRef],
+    transactions: &[super::ControlMvpTxRef],
+    suffix: &[super::ControlMvpTxRef],
+) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope)?;
     encode_states(&mut out, 1, states)?;
     encode_states(&mut out, 2, anchors)?;
@@ -371,7 +403,7 @@ fn physical_digest(
         out.u32(CONTROL_MVP_FORMAT_VERSION);
         out.digest(&reference.checksum_sha256)?;
     }
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl RenderSource {
@@ -459,9 +491,16 @@ pub(super) fn checkpoint_physical_digest(
     scope: &StateScope,
     states: &[ControlMvpStateRef],
 ) -> Result<String> {
+    Ok(checkpoint_physical_canonical(scope, states)?.finish())
+}
+
+fn checkpoint_physical_canonical(
+    scope: &StateScope,
+    states: &[ControlMvpStateRef],
+) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/checkpoint-layout", scope)?;
     encode_states(&mut out, 4, states)?;
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl ControlMvpCheckpoint {

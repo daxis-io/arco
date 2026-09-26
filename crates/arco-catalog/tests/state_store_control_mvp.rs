@@ -1531,12 +1531,15 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("identity");
     let before = backend.list("").await.expect("inventory before").len();
 
+    // Planning is a pure function of its inputs; the clock is one of them
+    // because plan 7 pins the `committed_at_ms` stamp the candidate carries.
+    let now = Utc::now();
     let first = adapter
-        .plan_restore(&source, &identity, Utc::now())
+        .plan_restore(&source, &identity, now)
         .await
         .expect("first plan");
     let second = adapter
-        .plan_restore(&source, &identity, Utc::now())
+        .plan_restore(&source, &identity, now)
         .await
         .expect("second plan");
 
@@ -1562,7 +1565,7 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        6,
+        7,
         plan.version(),
         "planning writes the current plan version"
     );
@@ -1584,6 +1587,11 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("plan object")
         .remove("checkpoint_interval");
     assert_eq!(Some(Value::from(32_u64)), removed_interval);
+    let removed_stamp = downgraded
+        .as_object_mut()
+        .expect("plan object")
+        .remove("committed_at_ms");
+    assert!(removed_stamp.is_some_and(|stamp| stamp.as_i64().is_some_and(|ms| ms > 0)));
     downgraded["version"] = Value::from(1_u64);
     let migrated: PersistedRestoreParticipantPlan =
         serde_json::from_value(downgraded.clone()).expect("v1 plans must remain decodable");
@@ -1814,6 +1822,42 @@ fn literal_versioned_restore_plan_fixtures_pin_the_compatibility_policy() {
     );
 }
 
+/// R6: `v6_last_before_format9.json` is the last plan shape written on
+/// authority format 7 (control/v1 layout), captured from that revision. Plan 7
+/// added `committed_at_ms`; a v6 record never carried it and a v7 record cannot
+/// omit it, so neither direction can be guessed at.
+#[test]
+fn literal_v6_restore_plan_fixture_is_supersession_only_and_pins_the_stamp_policy() {
+    let v6 = include_str!("fixtures/control_mvp_restore_plans/v6_last_before_format9.json");
+    let v6_value: Value = serde_json::from_str(v6).expect("v6 fixture json");
+    assert_eq!(Value::from(6_u64), v6_value["version"]);
+    assert!(v6_value.get("committed_at_ms").is_none());
+    let PersistedRestoreParticipantPlan::ControlMvp(last_format7) =
+        serde_json::from_str(v6).expect("v6 fixture must decode");
+    assert_eq!(6, last_format7.version());
+    assert!(
+        last_format7.is_legacy_version(),
+        "a v6 plan is supersession-only once plan 7 pins the commit stamp"
+    );
+    assert_eq!(3, last_format7.result_logical_sequence());
+    let mut contradictory_v6 = v6_value.clone();
+    contradictory_v6["committed_at_ms"] = Value::from(1_i64);
+    let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(contradictory_v6)
+        .expect_err("a v6 record with committed_at_ms must fail closed");
+    assert!(
+        error.to_string().contains("committed_at_ms"),
+        "unexpected error: {error}"
+    );
+    let mut unstamped_v7 = v6_value;
+    unstamped_v7["version"] = Value::from(7_u64);
+    let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(unstamped_v7)
+        .expect_err("a v7 record without committed_at_ms must fail closed");
+    assert!(
+        error.to_string().contains("committed_at_ms"),
+        "unexpected error: {error}"
+    );
+}
+
 #[tokio::test]
 async fn literal_old_layout_restore_plans_are_superseded_without_writes() {
     let (backend, storage) = storage();
@@ -1823,9 +1867,11 @@ async fn literal_old_layout_restore_plans_are_superseded_without_writes() {
     for fixture in [
         include_str!("fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"),
         include_str!("fixtures/control_mvp_restore_plans/v2_current.json"),
+        // Current layout, but the last plan shape written on authority format 7.
+        include_str!("fixtures/control_mvp_restore_plans/v6_last_before_format9.json"),
     ] {
         let plan: PersistedRestoreParticipantPlan =
-            serde_json::from_str(fixture).expect("decode old-layout plan fixture");
+            serde_json::from_str(fixture).expect("decode superseded plan fixture");
         assert!(matches!(
             adapter
                 .inspect_restore(&plan)
@@ -1891,6 +1937,7 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     object.remove("observed_reclamation_generation");
     object.remove("checkpoint_interval");
     object.remove("transaction_ref");
+    object.remove("committed_at_ms");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
@@ -1955,6 +2002,130 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     assert!(matches!(
         adapter
             .apply_restore(&plan, Utc::now())
+            .await
+            .expect("apply current-version plan"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        store.get(b"catalog/default").await.expect("restored value")
+    );
+}
+
+/// R6: restore plan 7 pins the `committed_at_ms` stamp its candidate bytes
+/// carry, so a version-6 plan (the last shape written on authority format 7)
+/// can never reproduce format-9 candidate bytes. It is supersession-only: it
+/// reaches a defined terminal outcome and writes nothing, while the plan-7
+/// rendering of the same lineage still applies.
+#[tokio::test]
+async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000007", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan restore");
+
+    // Positive control: at the current version this exact plan is Ready.
+    assert!(
+        matches!(
+            adapter
+                .inspect_restore(&plan)
+                .await
+                .expect("inspect current-version plan"),
+            RestoreParticipantInspection::Ready
+        ),
+        "the fixture harness must be able to reach Ready, or Superseded proves nothing"
+    );
+
+    // Downgrade it to the checked-in version 6 shape: same fields minus the
+    // stamp plan 7 introduced.
+    let mut wire = serde_json::to_value(&plan).expect("plan json");
+    assert_eq!(
+        Value::from(7_u64),
+        wire["version"],
+        "the current restore plan version is 7"
+    );
+    assert!(
+        wire["committed_at_ms"].as_i64().is_some_and(|ms| ms > 0),
+        "a current plan pins a positive committed_at_ms"
+    );
+    let object = wire.as_object_mut().expect("plan object");
+    object.remove("committed_at_ms");
+    object.insert("version".to_string(), Value::from(6_u64));
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/control_mvp_restore_plans/v6_last_before_format9.json"
+    ))
+    .expect("v6 fixture json");
+    let names = |value: &Value| {
+        let mut names = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(&fixture),
+        names(&wire),
+        "the downgrade must reproduce the checked-in v6 field set exactly"
+    );
+    let legacy: PersistedRestoreParticipantPlan =
+        serde_json::from_value(wire).expect("the downgraded plan must remain decodable");
+    let PersistedRestoreParticipantPlan::ControlMvp(decoded) = &legacy;
+    assert_eq!(6, decoded.version());
+    assert!(decoded.is_legacy_version());
+
+    let inventory_before = backend.list("").await.expect("inventory before").len();
+    assert!(
+        matches!(
+            adapter
+                .inspect_restore(&legacy)
+                .await
+                .expect("inspect v6 plan"),
+            RestoreParticipantInspection::Superseded
+        ),
+        "a v6 plan must reach a defined terminal outcome, not an error"
+    );
+    assert!(
+        matches!(
+            adapter
+                .apply_restore(&legacy, Utc::now())
+                .await
+                .expect("apply v6 plan"),
+            RestoreParticipantInspection::Superseded
+        ),
+        "a v6 plan must never be applied"
+    );
+    assert_eq!(
+        inventory_before,
+        backend.list("").await.expect("inventory after").len(),
+        "a v6 plan must not write anything"
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("current authority is untouched")
+    );
+
+    // The version-7 plan, round-tripped through its durable JSON, still applies.
+    let current: PersistedRestoreParticipantPlan =
+        serde_json::from_str(&serde_json::to_string(&plan).expect("plan json"))
+            .expect("a v7 plan round-trips");
+    assert!(matches!(
+        adapter
+            .apply_restore(&current, Utc::now())
             .await
             .expect("apply current-version plan"),
         RestoreParticipantInspection::Visible { .. }
@@ -2397,6 +2568,10 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
         .as_object_mut()
         .expect("plan object")
         .remove("checkpoint_interval");
+    value
+        .as_object_mut()
+        .expect("plan object")
+        .remove("committed_at_ms");
     let legacy: PersistedRestoreParticipantPlan =
         serde_json::from_value(value).expect("legacy plan remains decodable");
     assert_eq!(

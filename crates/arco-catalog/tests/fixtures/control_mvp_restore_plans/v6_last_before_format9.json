@@ -1,0 +1,64 @@
+{
+  "plan_kind": "control_mvp",
+  "transaction_ref": {
+    "size_bytes": 1347,
+    "history": {
+      "preceding_root": "48173cd1ea0940fc313ae5cad6117330ceaf5212faa2a1d7fc79ec3e3bc3824b",
+      "mutation_sha256": "6a38213629e0c0044c087d33485b6f9205369e3f37c15ddd96962addf3c618d9",
+      "resulting_root": "94233a08a63cfbe872dec6091abed9a901af33a73f138e5376c8b010ce41a2ea"
+    },
+    "tx_id": "tx-restore-00000000000000000003-601f064c3965671478e989cc410bc1ca-rg-00000000000000000000",
+    "sequence": 3,
+    "checksum_sha256": "30698d49f90a4a64a335bc1d5cbc68f634a8c3919e70154e1b845d75fc6cb389"
+  },
+  "record_type": "control_mvp_restore_plan",
+  "version": 6,
+  "implementation": "arco-state-control-mvp",
+  "scope": {
+    "scope_version": 2,
+    "root_kind": "workspace",
+    "tenant_id": "tenant",
+    "workspace_id": "workspace",
+    "domain": "catalog"
+  },
+  "identity": {
+    "restore_id": "rst_00000000000000000000000006",
+    "attempt": 1,
+    "domain": "catalog"
+  },
+  "source": {
+    "implementation": "arco-state-control-mvp",
+    "scope": {
+      "scope_version": 2,
+      "root_kind": "workspace",
+      "tenant_id": "tenant",
+      "workspace_id": "workspace",
+      "domain": "catalog"
+    },
+    "reference_kind": "checkpoint",
+    "manifest_id": "manifest-00000000000000000001-01m3fabgktkpcxyx7y76b14ma3-head-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-rg-00000000000000000000",
+    "logical_sequence": 1,
+    "manifest_path": "control/v1/domains/catalog/manifests/manifest-00000000000000000001-01m3fabgktkpcxyx7y76b14ma3-head-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-rg-00000000000000000000.json",
+    "manifest_sha256": "sha256:ce5c1eb6e2f911887a571b5281bd0a92de445c34d60b5becfb10dbf9db589a71",
+    "checkpoint_path": "control/v1/domains/catalog/checkpoints/checkpoint-00000000000000000001-rg-00000000000000000000-01m3fabgm32f21x0gjys56svmw.json",
+    "checkpoint_sha256": "sha256:b599a7903e3f1582d8a6df822b7124ab28f4fd14325bdbd9135c96b08894a879",
+    "retention_deadline": "2026-09-26T17:56:40.325346Z"
+  },
+  "current_base_kind": "pointer",
+  "base_pointer_version": "18",
+  "observed_base_pointer_sha256": "sha256:69213273a0b98fa0d8842f74281d6be882c4547482b5def82819628c5efafa97",
+  "observed_writer_epoch": 0,
+  "observed_reclamation_generation": 0,
+  "checkpoint_interval": 32,
+  "base_manifest_id": "manifest-00000000000000000002-01m3fabgm6047f0a3brhywte65-head-ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d-rg-00000000000000000000",
+  "base_logical_sequence": 2,
+  "transaction_id": "tx-restore-00000000000000000003-601f064c3965671478e989cc410bc1ca-rg-00000000000000000000",
+  "transaction_path": "control/v1/domains/catalog/transactions/tx-restore-00000000000000000003-601f064c3965671478e989cc410bc1ca-rg-00000000000000000000.json",
+  "transaction_sha256": "sha256:30698d49f90a4a64a335bc1d5cbc68f634a8c3919e70154e1b845d75fc6cb389",
+  "candidate_manifest_id": "manifest-00000000000000000003-restore-601f064c3965671478e989cc410bc1ca-rg-00000000000000000000",
+  "candidate_manifest_path": "control/v1/domains/catalog/manifests/manifest-00000000000000000003-restore-601f064c3965671478e989cc410bc1ca-rg-00000000000000000000.json",
+  "candidate_manifest_sha256": "sha256:27aa26df7ac4465dcabb8c57347303da89c191ac044af19457b6f4874ac525d8",
+  "candidate_pointer_sha256": "sha256:692db9baba85c8ceac5f88a58b1f00bc098492080127d5b424398dad4b46555e",
+  "result_logical_sequence": 3,
+  "restore_outbox_record_id": "restore:rst_00000000000000000000000006:1:catalog"
+}

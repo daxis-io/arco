@@ -54,7 +54,14 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
         RestoreAttemptIdentity::new("rst_00000000000000000000000001", 1, "catalog").unwrap();
     let stable = store.load_stable_restore_base(&source).await.unwrap();
     let rendered = store
-        .render_restore_candidate(&source, &source_values, &identity, &stable, 1)
+        .render_restore_candidate(
+            &source,
+            &source_values,
+            &identity,
+            &stable,
+            1,
+            Utc::now().timestamp_millis(),
+        )
         .unwrap();
     assert!(rendered.transaction_bytes.len() < 16 * 1024);
     assert!(rendered.l0_segment_bytes.len() > decoded_bytes);

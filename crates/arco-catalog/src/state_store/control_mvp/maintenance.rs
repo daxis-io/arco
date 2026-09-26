@@ -2210,6 +2210,10 @@ impl DurableMaintenanceWorker {
             .layout_generation
             .checked_add(1)
             .ok_or_else(|| invariant_violation("maintenance layout generation overflow"))?;
+        // A pending publication must reconstruct this candidate byte for byte,
+        // so the stamp is the job-bound preparation clock, never the wall
+        // clock at publication.
+        candidate.committed_at_ms = job.descriptor.created_at.timestamp_millis();
         candidate.base_states = job.pages.iter().map(|page| page.output.clone()).collect();
         candidate.anchor_states.clear();
         candidate.tx_refs = suffix;

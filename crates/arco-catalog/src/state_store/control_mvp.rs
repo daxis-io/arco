@@ -1,6 +1,6 @@
 //! Object-store-backed control-state MVP.
 //!
-//! # Replay model (format version 7)
+//! # Replay model (format version 9)
 //!
 //! Every manifest anchors replay on an ordered set of checksummed, non-overlapping
 //! immutable Arrow IPC L1 segments and carries only the transaction suffix
@@ -57,11 +57,13 @@
 //!
 //! # Format versioning
 //!
-//! Format version 7 is the only supported on-disk format and is rooted beneath
-//! `control/v1/` on fresh roots. There is deliberately no migration path from
-//! version 6 without integrity roots, version 5 without authenticated blocks,
-//! unfenced version 4, or older JSON-anchor
-//! formats: unknown and old `format_version` values fail closed.
+//! Format version 9 is the only supported on-disk format and is rooted beneath
+//! `control/v1/` on fresh roots. It is format 7 plus the wall-clock
+//! `committed_at_ms` stamp on manifests and transactions (format 8 is the
+//! test-only bounded-directory authority). There is deliberately no migration
+//! path from version 7 without stamps, version 6 without integrity roots,
+//! version 5 without authenticated blocks, unfenced version 4, or older
+//! JSON-anchor formats: unknown and old `format_version` values fail closed.
 //!
 //! Before active GC deletes a candidate page, it advances HEAD's checked
 //! reclamation generation by exact-version CAS under retention coordination.
@@ -165,7 +167,11 @@ pub use maintenance::{
     MaintenanceStatus, PreparedMaintenance,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 6;
+const RESTORE_PLAN_VERSION: u32 = 7;
+/// Restore plan 6 is the last shape written on authority format 7. It predates
+/// the `committed_at_ms` stamp plan 7 pins, so it can never reproduce format-9
+/// candidate bytes and is supersession-only.
+const RESTORE_PLAN_VERSION_V6: u32 = 6;
 const RESTORE_PLAN_VERSION_V5: u32 = 5;
 const RESTORE_PLAN_VERSION_V4: u32 = 4;
 const RESTORE_PLAN_VERSION_V3: u32 = 3;
@@ -174,7 +180,7 @@ const RESTORE_PLAN_VERSION_V3: u32 = 3;
 /// dereferencing paths from the retired layout.
 const RESTORE_PLAN_VERSION_V1: u32 = 1;
 const RESTORE_PLAN_VERSION_V2: u32 = 2;
-const CONTROL_MVP_FORMAT_VERSION: u32 = 7;
+const CONTROL_MVP_FORMAT_VERSION: u32 = 9;
 const SEGMENT_FORMAT_VERSION: u32 = 1;
 const BLOCK_TARGET_BYTES: usize = 64 * 1024;
 const MAX_BLOCK_BYTES: usize = 256 * 1024;
@@ -268,7 +274,7 @@ impl ControlMvpStateStore {
             "retained manifest format witness",
         )?;
         let header: Format = decode_json(&bytes, "retained manifest format")?;
-        if !matches!(header.format_version, 7 | 8) {
+        if !matches!(header.format_version, CONTROL_MVP_FORMAT_VERSION | 8) {
             return Err(CatalogError::UnsupportedAuthorityFormat {
                 message: "unsupported retained authority format".into(),
             });
@@ -848,7 +854,7 @@ impl ControlMvpStateStore {
             return Ok(Some((pointer, before.version, bytes)));
         }
         if self.authority_format == CONTROL_MVP_FORMAT_VERSION {
-            // Preserve the format-7 restore preflight conflict classification.
+            // Preserve the current-format restore preflight conflict classification.
             return Err(CatalogError::CasFailed {
                 message: "HEAD pin retry budget exhausted".into(),
             });
@@ -2299,6 +2305,7 @@ impl ControlMvpStateStore {
         identity: &RestoreAttemptIdentity,
         stable: &StableRestoreBase,
         checkpoint_interval: u64,
+        committed_at_ms: i64,
     ) -> Result<RenderedControlMvpRestore> {
         let base_manifest_id = stable
             .candidate_parent
@@ -2358,6 +2365,7 @@ impl ControlMvpStateStore {
             base_manifest_id: Some(base_manifest_id.to_string()),
             sequence: result_sequence,
             writer_epoch: stable.writer_epoch,
+            committed_at_ms,
             request_id: Some(format!(
                 "restore:{}:{}:{}",
                 identity.restore_id(),
@@ -2446,6 +2454,7 @@ impl ControlMvpStateStore {
             base_manifest_id: Some(base_manifest_id.to_string()),
             writer_epoch: stable.writer_epoch,
             layout_generation: stable.candidate_parent.layout_generation,
+            committed_at_ms,
             base_states: stable.candidate_parent.base_states.clone(),
             anchor_states: rendered_l1
                 .iter()
@@ -2503,6 +2512,7 @@ impl ControlMvpStateStore {
         if identity.domain() != self.scope.domain() {
             return Err(validation_failed("restore identity domain mismatch"));
         }
+        let committed_at_ms = restore_commit_stamp(now)?;
         let source_values = self.restore_source_values(source, now).await?;
         let stable = self.load_stable_restore_base(source).await?;
         let rendered = self.render_restore_candidate(
@@ -2511,6 +2521,7 @@ impl ControlMvpStateStore {
             identity,
             &stable,
             self.checkpoint_interval,
+            committed_at_ms,
         )?;
         let plan = ControlMvpRestorePlan {
             transaction_ref: Some(rendered.transaction_ref.clone()),
@@ -2526,6 +2537,7 @@ impl ControlMvpStateStore {
             observed_writer_epoch: stable.writer_epoch,
             observed_reclamation_generation: stable.current.reclamation_generation,
             checkpoint_interval: Some(self.checkpoint_interval),
+            committed_at_ms: Some(committed_at_ms),
             base_manifest_id: stable
                 .candidate_parent
                 .manifest_id
@@ -2641,6 +2653,57 @@ fn validate_control_mvp_authority_format(
             source.checkpoint_path(),
         ),
     })
+}
+
+/// Returns whether `version` is a decodable but supersession-only plan version.
+const fn legacy_restore_plan_version(version: u32) -> bool {
+    matches!(
+        version,
+        RESTORE_PLAN_VERSION_V1
+            | RESTORE_PLAN_VERSION_V2
+            | RESTORE_PLAN_VERSION_V3
+            | RESTORE_PLAN_VERSION_V4
+            | RESTORE_PLAN_VERSION_V5
+            | RESTORE_PLAN_VERSION_V6
+    )
+}
+
+/// Decodes the plan-7 `committed_at_ms` field per plan version: required and
+/// positive on the current version, forbidden on supersession-only versions
+/// (no older writer ever wrote it), and passed through for unknown versions,
+/// which plan validation rejects.
+fn restore_plan_committed_at_ms<E: serde::de::Error>(
+    version: u32,
+    stamp: Option<i64>,
+) -> std::result::Result<Option<i64>, E> {
+    if version == RESTORE_PLAN_VERSION {
+        return match stamp {
+            Some(stamp) if stamp > 0 => Ok(Some(stamp)),
+            Some(_) => Err(E::custom(
+                "Control MVP restore plan committed_at_ms must be positive",
+            )),
+            None => Err(E::custom(
+                "Control MVP restore plan is missing committed_at_ms",
+            )),
+        };
+    }
+    if legacy_restore_plan_version(version) && stamp.is_some() {
+        return Err(E::custom(
+            "legacy Control MVP restore plans must not carry committed_at_ms",
+        ));
+    }
+    Ok(stamp)
+}
+
+/// Returns the wall-clock stamp a restore plan pins for its candidate bytes.
+fn restore_commit_stamp(now: DateTime<Utc>) -> Result<i64> {
+    let stamp = now.timestamp_millis();
+    if stamp <= 0 {
+        return Err(validation_failed(
+            "Control MVP restore clock precedes the Unix epoch",
+        ));
+    }
+    Ok(stamp)
 }
 
 /// Returns the deterministic state-snapshot id anchored to a manifest.
@@ -3601,9 +3664,10 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 6 binds the exact transaction/history reference, observed reclamation
-/// generation and exact HEAD identity. Versions 1 through 5 are supersession-only;
-/// recovery must replan them before writing any artifacts.
+/// Version 7 pins the `committed_at_ms` stamp its format-9 candidate bytes
+/// carry, on top of version 6's exact transaction/history reference, observed
+/// reclamation generation and exact HEAD identity. Versions 1 through 6 are
+/// supersession-only; recovery must replan them before writing any artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3621,6 +3685,10 @@ pub struct ControlMvpRestorePlan {
     observed_reclamation_generation: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint_interval: Option<u64>,
+    /// Wall-clock stamp the candidate transaction and manifest carry. Plan 7
+    /// pins it so inspection and apply re-render byte-identical candidates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    committed_at_ms: Option<i64>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -3658,6 +3726,8 @@ struct ControlMvpRestorePlanWire {
     observed_reclamation_generation: Option<u64>,
     #[serde(default)]
     checkpoint_interval: Option<u64>,
+    #[serde(default)]
+    committed_at_ms: Option<i64>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -3720,6 +3790,8 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             },
             _ => wire.checkpoint_interval,
         };
+        let committed_at_ms =
+            restore_plan_committed_at_ms::<D::Error>(wire.version, wire.committed_at_ms)?;
         Ok(Self {
             transaction_ref: if wire.version == RESTORE_PLAN_VERSION {
                 Some(wire.transaction_ref.ok_or_else(|| {
@@ -3748,6 +3820,7 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
                 wire.observed_reclamation_generation.unwrap_or(0)
             },
             checkpoint_interval,
+            committed_at_ms,
             base_manifest_id: wire.base_manifest_id,
             base_logical_sequence: wire.base_logical_sequence,
             transaction_id: wire.transaction_id,
@@ -3794,14 +3867,7 @@ impl ControlMvpRestorePlan {
     /// therefore may only be superseded, never applied.
     #[must_use]
     pub const fn is_legacy_version(&self) -> bool {
-        matches!(
-            self.version,
-            RESTORE_PLAN_VERSION_V1
-                | RESTORE_PLAN_VERSION_V2
-                | RESTORE_PLAN_VERSION_V3
-                | RESTORE_PLAN_VERSION_V4
-                | RESTORE_PLAN_VERSION_V5
-        )
+        legacy_restore_plan_version(self.version)
     }
 
     /// Returns the exact source authority reference.
@@ -3883,6 +3949,16 @@ impl ControlMvpRestorePlan {
         self.result_logical_sequence
     }
 
+    fn required_committed_at_ms(&self) -> Result<i64> {
+        self.committed_at_ms
+            .filter(|stamp| *stamp > 0)
+            .ok_or_else(|| {
+                validation_failed(
+                    "Control MVP restore plan committed_at_ms is missing or not positive",
+                )
+            })
+    }
+
     fn required_checkpoint_interval(&self) -> Result<u64> {
         self.checkpoint_interval
             .filter(|interval| *interval > 0)
@@ -3915,6 +3991,7 @@ impl ControlMvpRestorePlan {
                 .is_some_and(|version| !version.is_empty()),
         };
         let checkpoint_interval = self.required_checkpoint_interval()?;
+        self.required_committed_at_ms()?;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || self.version != RESTORE_PLAN_VERSION
             || self.implementation != IMPLEMENTATION
@@ -4013,6 +4090,7 @@ impl ControlMvpRestorePlan {
             || !self.is_legacy_version()
             || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
             || (self.version < RESTORE_PLAN_VERSION_V3 && self.checkpoint_interval.is_some())
+            || self.committed_at_ms.is_some()
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -4758,6 +4836,7 @@ impl ControlMvpTxn {
                 encoded,
             ));
         }
+        let committed_at_ms = cost::now().timestamp_millis();
         let mut tx = ControlMvpTxObject {
             history: HistoryLink::default(),
             reclamation_generation: base.reclamation_generation,
@@ -4767,6 +4846,7 @@ impl ControlMvpTxn {
             base_manifest_id: base.manifest_id.clone(),
             sequence: next_sequence,
             writer_epoch: self.store.writer_epoch,
+            committed_at_ms,
             request_id: self.request_id.clone(),
             l0_segment: unwritten_l0_segment_ref(&self.tx_id, next_sequence),
             writes: self
@@ -4863,6 +4943,7 @@ impl ControlMvpTxn {
             base_manifest_id: base.manifest_id,
             writer_epoch: self.store.writer_epoch,
             layout_generation: base.layout_generation,
+            committed_at_ms,
             base_states: base.base_states,
             anchor_states,
             tx_refs,
@@ -5576,6 +5657,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
                 &plan.identity,
                 &stable,
                 plan.required_checkpoint_interval()?,
+                plan.required_committed_at_ms()?,
             )?;
             if plan.base_logical_sequence != stable.candidate_parent.state.logical_sequence
                 || rendered.transaction_id != plan.transaction_id
@@ -5629,6 +5711,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             &plan.identity,
             &stable,
             plan.required_checkpoint_interval()?,
+            plan.required_committed_at_ms()?,
         )?;
         if rendered.transaction_id != plan.transaction_id
             || prefixed_sha256(&rendered.transaction_bytes) != plan.transaction_sha256
@@ -6468,6 +6551,10 @@ struct ControlMvpManifest {
     base_manifest_id: Option<String>,
     writer_epoch: u64,
     layout_generation: u64,
+    /// Wall-clock milliseconds since the Unix epoch when this manifest was
+    /// rendered. Informational for ordering (logical order is the sequence);
+    /// retention reads it as the sequence-to-time mapping. Always positive.
+    committed_at_ms: i64,
     base_states: Vec<ControlMvpStateRef>,
     anchor_states: Vec<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
@@ -6491,6 +6578,11 @@ impl ControlMvpManifest {
         if self.format_version != CONTROL_MVP_FORMAT_VERSION {
             return Err(invariant_violation(
                 "control MVP manifest format version mismatch",
+            ));
+        }
+        if self.committed_at_ms <= 0 {
+            return Err(invariant_violation(
+                "control MVP manifest committed_at stamp is not positive",
             ));
         }
         if self.implementation != IMPLEMENTATION {
@@ -6666,6 +6758,9 @@ struct ControlMvpTxObject {
     base_manifest_id: Option<String>,
     sequence: u64,
     writer_epoch: u64,
+    /// Wall-clock milliseconds since the Unix epoch when this transaction was
+    /// rendered for commit. Informational; the sequence orders history.
+    committed_at_ms: i64,
     request_id: Option<String>,
     l0_segment: ControlMvpSegmentRef,
     /// Hydrated only from the checksummed Arrow L0 segment. Transaction JSON
@@ -6710,6 +6805,11 @@ impl ControlMvpTxObject {
         if self.implementation != IMPLEMENTATION {
             return Err(invariant_violation(
                 "control MVP transaction implementation mismatch",
+            ));
+        }
+        if self.committed_at_ms <= 0 {
+            return Err(invariant_violation(
+                "control MVP transaction committed_at stamp is not positive",
             ));
         }
         if &self.scope != scope {
@@ -9571,6 +9671,174 @@ mod tests {
         );
     }
 
+    /// Format 9 stamps every committed manifest and transaction with the
+    /// wall clock at rendering. The stamp is durable in the envelope payload
+    /// (never a decode default) and a non-positive stamp fails closed.
+    #[tokio::test]
+    async fn committed_manifest_and_transaction_carry_wall_clock_stamps() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let staged_at_ms = cost::now().timestamp_millis();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(b"key", Bytes::from_static(b"value")).await.unwrap();
+        tx.commit().await.unwrap();
+        let now_ms = cost::now().timestamp_millis();
+        let pointer = store.load_pointer().await.unwrap();
+        let manifest = store.load_manifest_for_pointer(&pointer).await.unwrap();
+        let tx_ref = manifest.tx_refs.last().unwrap().clone();
+        let transaction = store.load_tx_metadata(&tx_ref).await.unwrap();
+        for (artifact, stamp) in [
+            ("manifest", manifest.committed_at_ms),
+            ("transaction", transaction.committed_at_ms),
+        ] {
+            assert!(
+                (staged_at_ms..=now_ms).contains(&stamp),
+                "{artifact} stamp {stamp} is outside [{staged_at_ms}, {now_ms}]"
+            );
+        }
+        let manifest_doc: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(&store.paths.manifest_object(&manifest.manifest_id))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_doc["payload"]["committed_at_ms"].as_i64(),
+            Some(manifest.committed_at_ms)
+        );
+        let tx_doc: serde_json::Value = serde_json::from_slice(
+            &storage
+                .get_raw(&store.paths.tx_object(&tx_ref.tx_id))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            tx_doc["payload"]["committed_at_ms"].as_i64(),
+            Some(transaction.committed_at_ms)
+        );
+        let mut unstamped_manifest = manifest.clone();
+        unstamped_manifest.committed_at_ms = 0;
+        assert!(matches!(
+            unstamped_manifest.validate(&store.scope, &manifest.manifest_id),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+        let mut unstamped_tx = transaction.clone();
+        unstamped_tx.committed_at_ms = 0;
+        assert!(matches!(
+            unstamped_tx.validate(&store.scope, &tx_ref),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+    }
+
+    /// Authority format 9 replaces format 7 with no migration: a HEAD, manifest
+    /// envelope, or transaction envelope that still says `format_version: 7`
+    /// must fail closed at every load boundary, and the payload validators must
+    /// refuse the retired number outright.
+    #[tokio::test]
+    async fn format_seven_authority_artifacts_fail_closed() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        tx.put(b"key", Bytes::from_static(b"value")).await.unwrap();
+        tx.commit().await.unwrap();
+        let mut pointer = store.load_pointer().await.unwrap();
+        let manifest = store.load_manifest_for_pointer(&pointer).await.unwrap();
+        let tx_ref = manifest.tx_refs.last().unwrap().clone();
+
+        // Payload validators refuse the retired format number.
+        pointer.format_version = 7;
+        assert!(matches!(
+            pointer.validate(&store.scope),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+        let mut stale_manifest = manifest.clone();
+        stale_manifest.format_version = 7;
+        assert!(matches!(
+            stale_manifest.validate(&store.scope, &stale_manifest.manifest_id),
+            Err(CatalogError::InvariantViolation { .. })
+        ));
+
+        // A format-7 envelope header is refused before any payload is decoded.
+        let downgrade_header = |bytes: &Bytes| -> Bytes {
+            let text = std::str::from_utf8(bytes).unwrap();
+            let current = format!("\"format_version\":{CONTROL_MVP_FORMAT_VERSION}");
+            assert!(
+                text.contains(&current),
+                "artifact carries the current format"
+            );
+            Bytes::from(text.replacen(&current, "\"format_version\":7", 1))
+        };
+        let tx_path = store.paths.tx_object(&tx_ref.tx_id);
+        let stale_tx = downgrade_header(&storage.get_raw(&tx_path).await.unwrap());
+        storage
+            .put_raw(&tx_path, stale_tx.clone(), WritePrecondition::None)
+            .await
+            .unwrap();
+        let stale_tx_ref = ControlMvpTxRef {
+            size_bytes: stale_tx.len() as u64,
+            checksum_sha256: sha256_hex(&stale_tx),
+            ..tx_ref.clone()
+        };
+        assert!(matches!(
+            store.load_tx_metadata_direct(&stale_tx_ref).await,
+            Err(CatalogError::UnsupportedAuthorityFormat { .. })
+        ));
+
+        let manifest_path = store.paths.manifest_object(&manifest.manifest_id);
+        let stale_manifest_bytes =
+            downgrade_header(&storage.get_raw(&manifest_path).await.unwrap());
+        storage
+            .put_raw(
+                &manifest_path,
+                stale_manifest_bytes.clone(),
+                WritePrecondition::None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .load_manifest_with_expected_checksum(
+                    &manifest.manifest_id,
+                    Some(&sha256_hex(&stale_manifest_bytes)),
+                )
+                .await,
+            Err(CatalogError::UnsupportedAuthorityFormat { .. })
+        ));
+
+        let head_path = store.paths.current_pointer();
+        let stale_head = downgrade_header(&storage.get_raw(&head_path).await.unwrap());
+        storage
+            .put_raw(&head_path, stale_head, WritePrecondition::None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.load_pinned_pointer().await,
+            Err(CatalogError::UnsupportedAuthorityFormat { .. })
+        ));
+        assert!(matches!(
+            store.get(b"key").await,
+            Err(CatalogError::UnsupportedAuthorityFormat { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn retained_tokens_reject_coherently_replaced_roots() {
         let storage =
@@ -11777,6 +12045,7 @@ mod tests {
             base_manifest_id: None,
             sequence: 1,
             writer_epoch: 0,
+            committed_at_ms: 1,
             request_id: None,
             l0_segment: unwritten_l0_segment_ref("tx-1", 1),
             writes: Vec::new(),
@@ -11852,6 +12121,7 @@ mod tests {
             base_manifest_id: Some("manifest-terminal".to_string()),
             sequence: 0,
             writer_epoch: 0,
+            committed_at_ms: 1,
             request_id: None,
             l0_segment: unwritten_l0_segment_ref("tx-zero", 0),
             writes: Vec::new(),

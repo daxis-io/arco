@@ -183,7 +183,7 @@ historical audit rows.
 | Horizon rewrite loses its head CAS | Regenerates under the new generation, like consolidation. |
 | A pin is published between horizon computation and CAS | A new pin references the current head, whose sequence is at or above the computed horizon, so it cannot lower the bound; the exact-version CAS still regenerates the job if the head moved. |
 | Pin inventory unreadable or malformed | Job fails closed; nothing rendered. |
-| Anchor object collected while its stamp is still above the floor | Cannot happen: GC holds manifests for the token retention plus the skew margin, one margin longer than tokens, so any collected anchor is at or below the floor and decides by its record. |
+| Anchor object collected while its stamp is still above the floor | Cannot happen while writer stamps do not run ahead of object-store time: GC holds manifests for the token retention plus the skew margin, one margin longer than tokens, so any collected anchor is at or below the floor and decides by its record. A writer clock ahead of the object store by δ reopens a δ-wide band, which fails closed. |
 | Worker clock ahead of artifact stamps | The horizon walk uses `committed_at_ms` from artifacts; expiry purge carries a one-hour safety margin. |
 | Expired receipt read before purge | Returned as a valid receipt (replay short-circuits). Safe. |
 | Reader pinned before the rewrite | Reads its own manifest's L1 and still sees the tombstone. |

@@ -2865,6 +2865,8 @@ const CONTROL_MVP_TOKEN_RETENTION_DAYS: i64 = 30;
 /// Token validity and GC judge age by backend object time; the horizon judges
 /// it by writer stamps, and the two clocks can disagree by up to this much
 /// without a still-valid token's manifest being treated as past the floor.
+/// GC keeps manifest objects for the token retention plus this margin, so
+/// an anchor it has collected is always at or below the floor by its record.
 /// The same margin keeps an expiry hint from being purged by a worker clock
 /// slightly ahead of the writer that set it.
 const CONTROL_MVP_RETENTION_CLOCK_SKEW_MS: i64 = 60 * 60 * 1000;
@@ -3267,6 +3269,13 @@ impl ControlMvpMaintenanceWorker {
         };
 
         let token_cutoff = now - ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS);
+        // Manifests are held one clock-skew margin longer than tokens. The
+        // retention horizon judges anchors by writer stamps against
+        // `now - 30 d - skew`; an anchor collected while still above that
+        // floor would read as corruption, so GC never collects one before
+        // its object age has cleared the floor by the same margin.
+        let manifest_cutoff =
+            token_cutoff - ChronoDuration::milliseconds(CONTROL_MVP_RETENTION_CLOCK_SKEW_MS);
         let orphan_cutoff = now - ChronoDuration::days(CONTROL_MVP_ORPHAN_MIN_AGE_DAYS);
         let manifests_prefix = format!("{base_prefix}manifests/");
         let checkpoints_prefix = format!("{base_prefix}checkpoints/");
@@ -3279,9 +3288,9 @@ impl ControlMvpMaintenanceWorker {
                 {
                     return None;
                 }
-                let cutoff = if path.starts_with(&manifests_prefix)
-                    || path.starts_with(&checkpoints_prefix)
-                {
+                let cutoff = if path.starts_with(&manifests_prefix) {
+                    manifest_cutoff
+                } else if path.starts_with(&checkpoints_prefix) {
                     token_cutoff
                 } else {
                     orphan_cutoff
@@ -3357,7 +3366,7 @@ impl ControlMvpMaintenanceWorker {
                 let path = object.path.to_string();
                 let retained_by_age = object
                     .last_modified
-                    .is_none_or(|last_modified| last_modified >= token_cutoff);
+                    .is_none_or(|last_modified| last_modified >= manifest_cutoff);
                 let mut retained_closure = BTreeSet::new();
                 if retained_by_age && path.starts_with(&manifests_prefix) {
                     let manifest_id = path

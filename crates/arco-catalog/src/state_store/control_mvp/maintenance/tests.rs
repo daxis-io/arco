@@ -2551,4 +2551,165 @@ mod horizon {
             None
         );
     }
+
+    /// Stamps every written object with the test clock, so GC's object-age
+    /// rules see the same simulated time the writer stamps do.
+    struct TimestampedBackend {
+        inner: MemoryBackend,
+        now: Mutex<DateTime<Utc>>,
+        written_at: Mutex<BTreeMap<String, DateTime<Utc>>>,
+    }
+    impl TimestampedBackend {
+        fn stamp(&self, mut meta: ObjectMeta) -> ObjectMeta {
+            if let Some(at) = self.written_at.lock().unwrap().get(&meta.path) {
+                meta.last_modified = Some(*at);
+            }
+            meta
+        }
+        fn set_now(&self, now: DateTime<Utc>) {
+            *self.now.lock().unwrap() = now;
+        }
+    }
+    #[async_trait]
+    impl StorageBackend for TimestampedBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            let result = self.inner.put(path, data, precondition).await?;
+            if matches!(result, WriteResult::Success { .. }) {
+                self.written_at
+                    .lock()
+                    .unwrap()
+                    .insert(path.to_string(), *self.now.lock().unwrap());
+            }
+            Ok(result)
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            Ok(self
+                .inner
+                .list(prefix)
+                .await?
+                .into_iter()
+                .map(|meta| self.stamp(meta))
+                .collect())
+        }
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            let mut page = self.inner.list_page(prefix, start_after, limit).await?;
+            page.objects = page
+                .objects
+                .into_iter()
+                .map(|meta| self.stamp(meta))
+                .collect();
+            Ok(page)
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            Ok(self.inner.head(path).await?.map(|meta| self.stamp(meta)))
+        }
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_manifests_one_skew_margin_past_token_retention_so_the_walk_never_sees_a_collected_anchor_above_the_floor()
+     {
+        let backend = Arc::new(TimestampedBackend {
+            inner: MemoryBackend::new(),
+            now: Mutex::new(fixture_instant()),
+            written_at: Mutex::new(BTreeMap::new()),
+        });
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage.clone(), 54);
+        let store = &worker.worker.store;
+        let start = fixture_instant();
+        // One anchor per hour: hour 0 (two commits), then one commit in each
+        // of hours 1, 2 and 3; both writer stamps and object times follow.
+        let mut last_of_hour = Vec::new();
+        for hour in 0..4 {
+            let at = start + ChronoDuration::hours(hour);
+            backend.set_now(at);
+            let _clock = FixedInputs::at(at);
+            if hour == 0 {
+                commit_put(store, b"a").await;
+            }
+            last_of_hour.push(commit_put(store, b"b").await);
+        }
+        let manifest_path = |id: &str| store.paths.manifest_object(id);
+        let evidence = |id: &str, sequence: u64| {
+            vec![PinnedSequenceV1 {
+                kind: "manifest_age".into(),
+                id: id.to_string(),
+                sequence,
+            }]
+        };
+
+        // The hour-1 anchor's object is 30 d + 30 min old: past token
+        // retention, yet its stamp is still above the horizon floor
+        // (`now - 30 d - 1 h`). GC must keep it, and the walk must read it
+        // on its way to hour 0.
+        let now = start
+            + ChronoDuration::hours(1)
+            + ChronoDuration::days(30)
+            + ChronoDuration::minutes(30);
+        backend.set_now(now);
+        super::collect_all(&worker, now).await;
+        assert!(
+            storage
+                .head_raw(&manifest_path(&last_of_hour[1]))
+                .await
+                .unwrap()
+                .is_some(),
+            "a manifest inside the skew band survives GC"
+        );
+        assert!(
+            storage
+                .head_raw(&manifest_path(&last_of_hour[0]))
+                .await
+                .unwrap()
+                .is_none(),
+            "a manifest past the band is collected"
+        );
+        let inputs = worker.worker.retention_horizon_inputs(now).await.unwrap();
+        assert_eq!(inputs.pinned_evidence, evidence(&last_of_hour[0], 2));
+
+        // An hour later the hour-1 object is past the band: GC collects it,
+        // and the walk decides by its record, which is now at the floor.
+        let later = now + ChronoDuration::hours(1);
+        backend.set_now(later);
+        super::collect_all(&worker, later).await;
+        assert!(
+            storage
+                .head_raw(&manifest_path(&last_of_hour[1]))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .head_raw(&manifest_path(&last_of_hour[2]))
+                .await
+                .unwrap()
+                .is_some(),
+            "the hour-2 anchor is inside the band and still readable"
+        );
+        let inputs = worker.worker.retention_horizon_inputs(later).await.unwrap();
+        assert_eq!(inputs.pinned_evidence, evidence(&last_of_hour[1], 3));
+    }
 }

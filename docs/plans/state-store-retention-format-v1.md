@@ -203,7 +203,11 @@ is an error and nothing is rendered.
 1. `manifest_age`, the age bound. The floor is `now - 30 d - 1 h`: token
    validity and GC judge age by backend object time, the walk by writer
    stamps, and the margin keeps a still-valid token's manifest from being
-   treated as past the floor. If the head's stamp is at or below the floor
+   treated as past the floor. GC in turn holds `manifests/` objects for the
+   token retention plus the same margin (30 d + 1 h), one margin longer than
+   tokens, so an anchor GC has collected is always at or below the floor by
+   its record and the walk never meets a collected anchor above the floor.
+   If the head's stamp is at or below the floor
    the bound is the head's sequence. Otherwise the walk follows `age_anchor`
    links from the head under a hop budget of 1,024 and a byte budget of
    1,024 x 1 MiB. Each anchor is loaded with its recorded digest as the

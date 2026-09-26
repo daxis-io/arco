@@ -94,10 +94,11 @@ The deterministic local UAT gate is:
 scripts/run_user_acceptance_pipeline_uat.sh --deterministic
 ```
 
-That command runs the first-class local user-acceptance pipeline suite together
+That command runs the Arco-owned local pipeline UAT together
 with the focused Batch 0 reconciliation checks. It is CI-safe and does not run
-live GCP, durable-storage, or deployed API/worker gates. Local branch-readiness
-checks that combine the deterministic gate with shell smoke tests, formatting,
+live GCP, durable-storage, or deployed API/worker gates. The former live SQL
+acceptance path is blocked until an external engine harness replaces it. Local
+branch-readiness checks combine the deterministic gate with shell smoke tests, formatting,
 and diff whitespace checks are available through:
 
 ```bash

@@ -30,10 +30,8 @@ Usage: $0 [OPTIONS]
 Options:
   --deterministic    Run CI-safe deterministic UAT tests.
   --with-hygiene     Also run focused local shell smoke, clippy, fmt, and diff checks.
-  --live-durable     Run ignored durable object-storage UAT gate.
-                     Validates evidence artifacts after the live run.
-  --live-deployed    Run ignored deployed API plus worker UAT gate.
-                     Validates evidence artifacts after the live run.
+  --live-durable     Run durable UAT after an external engine harness is supplied.
+  --live-deployed    Run deployed UAT after an external engine harness is supplied.
   --all              Run deterministic tests plus both live gates.
   --dry-run          Print commands without executing them.
   --preflight-only   Run live-gate preflights without tests or evidence writes.
@@ -155,6 +153,7 @@ print_status() {
 
   echo "User acceptance pipeline UAT status"
   echo "deterministic: ready"
+  echo "live-sql: blocked (external engine harness required)"
 
   if [[ -n "${ARCO_UAT_STORAGE_BUCKET:-}" ]]; then
     echo "live-durable: ready"
@@ -931,11 +930,10 @@ stop_live_deployed_proxy() {
 
 run_deterministic() {
   run_cmd cargo test -p arco-api test_parse_partition_selector
-  run_cmd cargo test -p arco-api --test system_tables_api query_exposes_system_orchestration_runs_when_state_is_only_in_l0
   run_cmd cargo test -p arco-flow --test orchestration_rebuild_dr rebuild_orders_replay_by_event_id_when_event_timestamps_are_skewed
   run_cmd cargo test -p arco-api test_trigger_run_reemits_when_reservation_exists
   run_cmd cargo test -p arco-flow test_handle_task_completed_failure
-  run_cmd cargo test -p arco-integration-tests --test user_acceptance_pipeline
+  run_cmd cargo test -p arco-integration-tests --test local_pipeline_uat
   run_cmd cargo test -p arco-integration-tests --test orchestration_external_worker_e2e
 }
 
@@ -943,7 +941,7 @@ run_hygiene() {
   run_cmd bash tools/test_user_acceptance_uat_runner.sh
   run_cmd bash tools/test_user_acceptance_evidence_validator.sh
   run_cmd bash tools/test_actionlint_runner.sh
-  run_cmd cargo clippy -p arco-integration-tests --test user_acceptance_pipeline -- -D warnings
+  run_cmd cargo clippy -p arco-integration-tests --test local_pipeline_uat -- -D warnings
   run_cmd cargo clippy -p arco-api -- -D warnings
   run_cmd cargo fmt --check
   run_cmd git diff --check
@@ -1120,6 +1118,9 @@ if [[ "${RUN_LIVE_DEPLOYED}" == true ]]; then
 fi
 if [[ "${PREFLIGHT_ONLY}" == true ]]; then
   exit 0
+fi
+if [[ "${DRY_RUN}" != true && ("${RUN_LIVE_DURABLE}" == true || "${RUN_LIVE_DEPLOYED}" == true) ]]; then
+  die "Live SQL acceptance requires an external engine harness; Arco no longer hosts the query routes."
 fi
 if [[ "${RUN_LIVE_DURABLE}" == true || "${RUN_LIVE_DEPLOYED}" == true ]]; then
   mark_live_evidence_start

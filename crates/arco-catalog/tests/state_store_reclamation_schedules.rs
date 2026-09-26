@@ -49,7 +49,7 @@ use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
 #[path = "support/integrity_oracle.rs"]
 mod integrity_oracle;
-use integrity_oracle::LogicalOracle;
+use integrity_oracle::{LogicalOracle, OracleWrite};
 
 const RETENTION_GC_LOCK_PATH: &str = "locks/workspace-retention-gc.lock.json";
 const SNAP: &str = "snap_01ARZ3NDEKTSV4RRFFQ69G5FAV";
@@ -1135,7 +1135,7 @@ impl RootOracle {
     }
 }
 async fn compare(reader: &dyn ArcoStateReader, expected: &Contents) {
-    for key in [b"key".as_slice(), b"a", b"b", b"c"] {
+    for key in [b"key".as_slice(), b"a", b"b", b"c", b"receipt"] {
         assert_eq!(
             reader.get(key).await.unwrap(),
             expected.get(key).cloned(),
@@ -1151,7 +1151,7 @@ fn next_random(state: &mut u64) -> u64 {
 }
 // Keep operation generation and oracle updates together for schedule review.
 #[allow(clippy::cognitive_complexity)]
-async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
+async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool, steps: usize) {
     let mut f = Fixture::new().await;
     let orphan = f.store.paths().tx_object("model-orphan");
     f.storage
@@ -1179,10 +1179,12 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
     }];
     let mut checkpoints: Vec<CheckpointOracle> = Vec::new();
     let mut roots: Vec<RootOracle> = Vec::new();
-    let families = if durable { 18 } else { 12 };
+    let families = if durable { 19 } else { 12 };
+    assert!(steps >= families, "every family runs at least once");
     let mut counts = vec![0_u32; families];
     let mut job = None;
-    for step in 0..if durable { 128 } else { 64 } {
+    let mut forced_published = false;
+    for step in 0..steps {
         // Each seed exercises every operation family once, then a fixed PRNG
         // drives ordering. The oracle never calls the collector's planner.
         let op = if step < families {
@@ -1213,19 +1215,39 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
                     .begin_control_txn(TxnOptions::default())
                     .await
                     .unwrap();
-                let key = [b"a", b"b", b"c"]
-                    .get(usize::try_from(next_random(&mut random) % 3).unwrap())
-                    .unwrap()
-                    .to_vec();
+                // Family 0 writes a receipt-like row that expires one day
+                // out: reads never filter on the hint, so `contents` keeps
+                // the row until a horizon purges it. It has its own key so
+                // the plain families never overwrite the hint.
+                let key = if op == 0 {
+                    b"receipt".to_vec()
+                } else {
+                    [b"a", b"b", b"c"]
+                        .get(usize::try_from(next_random(&mut random) % 3).unwrap())
+                        .unwrap()
+                        .to_vec()
+                };
+                let expires_at_ms =
+                    (op == 0).then(|| (now + chrono::Duration::days(1)).timestamp_millis());
                 if op == 2 {
                     txn.delete(&key).await.unwrap();
                     contents.remove(&key);
                 } else {
                     let value = Bytes::from(format!("{seed}-{step}"));
-                    txn.put(&key, value.clone()).await.unwrap();
+                    match expires_at_ms {
+                        Some(expires_at_ms) => txn
+                            .put_with_expiry(&key, value.clone(), expires_at_ms)
+                            .await
+                            .unwrap(),
+                        None => txn.put(&key, value.clone()).await.unwrap(),
+                    }
                     contents.insert(key.clone(), value);
                 }
-                let write = (key.clone(), contents.get(&key).cloned());
+                let write = OracleWrite {
+                    key: key.clone(),
+                    value: contents.get(&key).cloned(),
+                    expires_at_ms,
+                };
                 let mut additions = Vec::new();
                 let mut trims = Vec::new();
                 if op == 0 && logical.outbox.is_empty() {
@@ -1250,7 +1272,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
                     trims.push((id.clone(), *origin));
                 }
                 let token = txn.commit().await.unwrap().state_token().clone();
-                logical.commit(vec![write], additions, trims);
+                logical.commit_writes(vec![write], additions, trims, None);
                 tokens.push(TokenOracle {
                     logical: logical.clone(),
                     token,
@@ -1413,10 +1435,100 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
                     .unwrap(),
                 );
             }
-            12..=15 | 17 => {
-                durable_model_step(&f, &mut job, now, op, trace).await;
+            13..=16 | 18 => {
+                durable_model_step(&f, &mut job, &mut forced_published, now, op, trace).await;
             }
-            16 => {
+            12 => {
+                // A retention horizon on the worker's schedule. Its inputs are
+                // computed by the kernel; the model independently bounds the
+                // horizon by every pin it knows about and recomputes the
+                // certificate from its own rows.
+                let worker = arco_catalog::DurableMaintenanceWorker::new(
+                    f.storage.clone(),
+                    StateScope::new("tenant", "workspace", "catalog"),
+                    arco_catalog::DurableAuthorityBinding::new([23; 32]),
+                )
+                .unwrap()
+                .with_test_segment_sizing(2, 8 * 1024)
+                .unwrap();
+                match durable_maintenance::horizon_pending(&worker, now).await {
+                    Err(arco_catalog::CatalogError::InvariantViolation { message })
+                        if forced_published
+                            && message == "invalid authenticated ancestry transition" =>
+                    {
+                        // The model's forced consolidations (test-only
+                        // admission without a parent intent) are rewrites
+                        // production never publishes. The age walk refuses
+                        // to certify a horizon across one: fail-closed is
+                        // the required outcome, not a model defect.
+                        trace.lock().unwrap().push(
+                            "horizon: fail-closed across a forced intent-less consolidation".into(),
+                        );
+                    }
+                    Err(error) => panic!("horizon model error: {error:?}"),
+                    Ok(None) => trace
+                        .lock()
+                        .unwrap()
+                        .push("horizon: nothing eligible".into()),
+                    Ok(Some(outcome)) => {
+                        let bytes = f
+                            .storage
+                            .get_raw(&format!(
+                                "control/v1/domains/catalog/manifests/{}.json",
+                                outcome.selected_token().authority_manifest_id()
+                            ))
+                            .await
+                            .unwrap();
+                        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        let certificate = doc
+                            .get("payload")
+                            .and_then(|payload| payload.get("retention_horizon"))
+                            .expect("a published horizon carries its certificate");
+                        let horizon_sequence = certificate
+                            .get("horizon_sequence")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap();
+                        let purge_cutoff_ms = certificate
+                            .get("purge_cutoff_ms")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap();
+                        assert!(purge_cutoff_ms <= now.timestamp_millis() - 60 * 60 * 1000);
+                        let pinned = roots
+                            .iter()
+                            .filter(|root| root.active(now))
+                            .map(|root| root.logical.sequence)
+                            .chain(
+                                checkpoints
+                                    .iter()
+                                    .filter(|checkpoint| now <= checkpoint.until)
+                                    .map(|checkpoint| checkpoint.logical.sequence),
+                            )
+                            .min();
+                        assert!(
+                            pinned.is_none_or(|pin| horizon_sequence <= pin),
+                            "an active pin at {pinned:?} bounds the horizon {horizon_sequence}"
+                        );
+                        trace.lock().unwrap().push(format!(
+                            "horizon published sequence={horizon_sequence} cutoff={purge_cutoff_ms} pinned={pinned:?}"
+                        ));
+                        // The oracle recomputes the certificate from its own
+                        // rows; the manifest assertion below binds it.
+                        let expected = logical.horizon(purge_cutoff_ms, horizon_sequence);
+                        assert!(
+                            expected.expired_rows + expected.tombstones > 0,
+                            "a published horizon purged something"
+                        );
+                        contents.retain(|key, _| logical.is_live(key));
+                        tokens.push(TokenOracle {
+                            logical: logical.clone(),
+                            token: f.store.current_state_token().await.unwrap(),
+                            contents: contents.clone(),
+                            until: now + chrono::Duration::days(30),
+                        });
+                    }
+                }
+            }
+            17 => {
                 use arco_catalog::{
                     ControlMvpRestoreParticipant, RestoreAttemptIdentity,
                     StateRestoreParticipant as _,
@@ -1589,6 +1701,7 @@ async fn run_model(seed: u64, trace: &Mutex<Vec<String>>, durable: bool) {
 async fn durable_model_step(
     f: &Fixture,
     job: &mut Option<(arco_catalog::MaintenanceJobId, DateTime<Utc>)>,
+    forced_published: &mut bool,
     now: DateTime<Utc>,
     op: usize,
     trace: &Mutex<Vec<String>>,
@@ -1643,17 +1756,21 @@ async fn durable_model_step(
     let operation = async {
         let progress = worker.resume_at(id, now).await?;
         trace.lock().unwrap().push(format!("job={} status={:?} completed={}", id.as_str(), progress.status, progress.completed));
-        if op == 15 && matches!(progress.status, MaintenanceStatus::Active | MaintenanceStatus::ReadyToPublish) {
+        if op == 16 && matches!(progress.status, MaintenanceStatus::Active | MaintenanceStatus::ReadyToPublish) {
             worker.abandon_at(id, now).await?;
             return Ok(true);
         }
-        if op == 17 {
+        if op == 18 {
             trace.lock().unwrap().push("INJECT LostResponse on selected.json; immutable work remains selected only after exact reconciliation".into());
             f.backend.arm("/selected.json".into(), 0, Fault::LostResponse);
         }
         match progress.status {
             MaintenanceStatus::Active => { worker.advance_at(id, now).await?; Ok(false) }
-            MaintenanceStatus::ReadyToPublish | MaintenanceStatus::Publishing => Ok(worker.publish_at(id, now).await?.is_some()),
+            MaintenanceStatus::ReadyToPublish | MaintenanceStatus::Publishing => {
+                let published = worker.publish_at(id, now).await?.is_some();
+                *forced_published |= published;
+                Ok(published)
+            }
             MaintenanceStatus::Published | MaintenanceStatus::Abandoned | MaintenanceStatus::Superseded => Ok(true),
             _ => panic!("unexpected durable model state: {:?}", progress.status),
         }
@@ -1690,7 +1807,7 @@ async fn durable_model_step(
 async fn durable_maintenance_model_32_seeds_of_128_operations() {
     for seed in 1..=32 {
         let trace = Mutex::new(Vec::new());
-        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, true)))
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, true, 128)))
             .catch_unwind()
             .await;
         assert!(
@@ -1701,11 +1818,37 @@ async fn durable_maintenance_model_32_seeds_of_128_operations() {
     }
 }
 
+/// The durable model's every family once per seed, including the retention
+/// horizon, at a size that runs inline in the ordinary lane.
+#[tokio::test]
+async fn durable_maintenance_model_reduced_two_seeds_of_thirty_two_operations() {
+    for seed in 1..=2 {
+        let trace = Mutex::new(Vec::new());
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, true, 32)))
+            .catch_unwind()
+            .await;
+        assert!(
+            result.is_ok(),
+            "reduced durable model failed seed={seed}\n{}",
+            trace.lock().unwrap().join("\n")
+        );
+        assert!(
+            trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("horizon published")),
+            "the reduced run must publish at least one horizon\n{}",
+            trace.lock().unwrap().join("\n")
+        );
+    }
+}
+
 #[tokio::test]
 async fn independent_reclamation_model_32_seeds_of_64_operations() {
     for seed in 1..=32 {
         let trace = Mutex::new(Vec::new());
-        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, false)))
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_model(seed, &trace, false, 64)))
             .catch_unwind()
             .await;
         assert!(

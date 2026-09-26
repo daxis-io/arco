@@ -102,6 +102,29 @@ pub(super) struct RetentionHorizonV1 {
     pub purged_counts: PurgedCountsV1,
 }
 
+/// The input half of a certificate, shared by the admitted job descriptor
+/// and the published certificate: the horizon is at or below the carrying
+/// sequence and every cited pinned sequence, the cutoff is a positive
+/// instant, and every evidence entry names a known kind by a followable id.
+pub(super) fn validate_horizon_inputs(
+    horizon_sequence: u64,
+    purge_cutoff_ms: i64,
+    pinned_evidence: &[PinnedSequenceV1],
+    logical_sequence: u64,
+) -> Result<()> {
+    if horizon_sequence > logical_sequence
+        || purge_cutoff_ms <= 0
+        || pinned_evidence.iter().any(|evidence| {
+            !PINNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str())
+                || !valid_immutable_id(&evidence.id)
+                || evidence.sequence < horizon_sequence
+        })
+    {
+        return Err(invariant_violation("invalid retention horizon inputs"));
+    }
+    Ok(())
+}
+
 impl RetentionHorizonV1 {
     /// Structural validation against the carrying manifest's logical
     /// sequence. It cannot prove the purged set; it proves the certificate
@@ -111,26 +134,21 @@ impl RetentionHorizonV1 {
         if self.encoding_version != 1
             || !valid_raw_digest(&self.parent_state_checksum_sha256)
             || !valid_raw_digest(&self.purged_rows_sha256)
-            || self.horizon_sequence > logical_sequence
-            || self.purge_cutoff_ms <= 0
-            || self.pinned_evidence.iter().any(|evidence| {
-                !PINNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str())
-                    || !valid_immutable_id(&evidence.id)
-                    || evidence.sequence < self.horizon_sequence
-            })
         {
             return Err(invariant_violation("invalid retention horizon certificate"));
         }
-        Ok(())
+        validate_horizon_inputs(
+            self.horizon_sequence,
+            self.purge_cutoff_ms,
+            &self.pinned_evidence,
+            logical_sequence,
+        )
+        .map_err(|_| invariant_violation("invalid retention horizon certificate"))
     }
 }
 
 /// One row a horizon rewrite dropped, in the shape the purged digest binds.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "bound by the RetentionHorizon job kind")
-)]
 pub(super) struct PurgedRow<'a> {
     pub key: &'a [u8],
     pub generation: u64,
@@ -142,10 +160,6 @@ pub(super) struct PurgedRow<'a> {
 /// count, then per row in strictly increasing key order the key, generation,
 /// tombstone flag and expiry hint. Rows out of key order (or duplicated) are
 /// an invariant violation rather than silently reordered.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "bound by the RetentionHorizon job kind")
-)]
 pub(super) fn purged_rows_digest(scope: &StateScope, rows: &[PurgedRow<'_>]) -> Result<String> {
     let mut out = Canonical::new(b"arco/control-v1/retention-purge", scope)?;
     out.u64(rows.len() as u64);

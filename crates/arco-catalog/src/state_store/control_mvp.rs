@@ -163,7 +163,8 @@ pub use read_cache::{
 };
 pub(crate) mod maintenance;
 use integrity::{
-    CheckpointValidation, HistoryAnchor, HistoryLink, RetentionHorizonV1, RewriteEquivalence,
+    CheckpointValidation, HistoryAnchor, HistoryLink, PinnedSequenceV1, PurgedCountsV1, PurgedRow,
+    RetentionHorizonV1, RewriteEquivalence, purged_rows_digest, validate_horizon_inputs,
 };
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
@@ -2006,10 +2007,24 @@ impl ControlMvpStateStore {
         digest: &str,
         select: impl FnMut(&ControlMvpManifest, &str) -> Option<T>,
     ) -> Result<Option<T>> {
-        self.resolve_ancestor_bounded(id, digest, select, 4096, 64 * 1024 * 1024)
-            .await
+        self.resolve_ancestor_bounded(
+            id,
+            digest,
+            select,
+            4096,
+            64 * 1024 * 1024,
+            AncestryGap::FailClosed,
+        )
+        .await
     }
 
+    /// Walks authenticated ancestry from `id`/`digest` toward genesis,
+    /// validating every parent→child transition, until `select` answers,
+    /// genesis is reached (`Ok(None)`), or a budget is exhausted (error).
+    /// `gap` decides what a parent that no longer exists means: every
+    /// lineage witness fails closed, while the retention-age walk ends at
+    /// the youngest retained manifest because GC collects ancestors past
+    /// the token floor.
     #[allow(clippy::too_many_lines)]
     async fn resolve_ancestor_bounded<T>(
         &self,
@@ -2018,6 +2033,7 @@ impl ControlMvpStateStore {
         mut select: impl FnMut(&ControlMvpManifest, &str) -> Option<T>,
         max_manifests: usize,
         max_bytes: usize,
+        gap: AncestryGap,
     ) -> Result<Option<T>> {
         let mut next = Some((id.to_string(), digest.to_string()));
         let mut visited = BTreeSet::new();
@@ -2138,6 +2154,16 @@ impl ControlMvpStateStore {
             next = manifest
                 .base_manifest_id
                 .zip(manifest.parent_manifest_sha256);
+            if gap == AncestryGap::EndWalk
+                && let Some((parent_id, _)) = &next
+                && self
+                    .storage
+                    .head(&self.paths.manifest_object(parent_id))
+                    .await?
+                    .is_none()
+            {
+                return Ok(None);
+            }
         }
         Ok(None)
     }
@@ -2744,6 +2770,29 @@ fn state_segment_id_for_manifest(manifest_id: &str, ordinal: usize) -> String {
     }
 }
 
+/// The checkpoint retention rule GC and the retention horizon share: a
+/// checkpoint is retained while its object age is within
+/// `max(min_retention_seconds, token floor)`, and an object without a
+/// timestamp is always retained.
+fn checkpoint_retained_at(
+    min_retention_seconds: Option<u64>,
+    last_modified: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let minimum_seconds =
+        u64::try_from(ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS).num_seconds())
+            .map_err(|error| {
+                invariant_violation(format!("convert checkpoint retention floor: {error}"))
+            })?;
+    let retention_seconds = min_retention_seconds.unwrap_or(0).max(minimum_seconds);
+    let retention_seconds = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
+    Ok(last_modified.is_none_or(|last_modified| {
+        last_modified
+            .checked_add_signed(ChronoDuration::seconds(retention_seconds))
+            .is_none_or(|deadline| deadline >= now)
+    }))
+}
+
 fn layout_maintenance_intent_for_manifest(
     scope: &StateScope,
     manifest_id: &str,
@@ -3309,22 +3358,11 @@ impl ControlMvpMaintenanceWorker {
                         "control MVP checkpoint",
                     )?;
                     checkpoint.validate(&self.store.scope, checkpoint_id)?;
-                    let minimum_seconds = u64::try_from(
-                        ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS).num_seconds(),
-                    )
-                    .map_err(|error| {
-                        invariant_violation(format!("convert checkpoint retention floor: {error}"))
-                    })?;
-                    let retention_seconds = checkpoint
-                        .min_retention_seconds
-                        .unwrap_or(0)
-                        .max(minimum_seconds);
-                    let retention_seconds = i64::try_from(retention_seconds).unwrap_or(i64::MAX);
-                    let retained_checkpoint = object.last_modified.is_none_or(|last_modified| {
-                        last_modified
-                            .checked_add_signed(ChronoDuration::seconds(retention_seconds))
-                            .is_none_or(|deadline| deadline >= now)
-                    });
+                    let retained_checkpoint = checkpoint_retained_at(
+                        checkpoint.min_retention_seconds,
+                        object.last_modified,
+                        now,
+                    )?;
                     if retained_checkpoint {
                         let source = self
                             .store
@@ -5843,6 +5881,18 @@ struct ControlMvpBase {
     state: ReplayState,
     base_states: Vec<ControlMvpStateRef>,
     tx_refs: Vec<ControlMvpTxRef>,
+}
+
+/// What an ancestry walk does when a manifest's parent object is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AncestryGap {
+    /// The parent is required: an absent object is an unavailable lineage.
+    FailClosed,
+    /// The walk ends at the last manifest that could be read, as if it
+    /// were genesis. Only the retention-age walk uses this: GC legitimately
+    /// collects ancestors older than the token floor, and the caller treats
+    /// the youngest retained manifest as the age boundary.
+    EndWalk,
 }
 
 struct AncestorTransition {
@@ -12476,6 +12526,7 @@ mod tests {
                     |_, _| None::<()>,
                     count,
                     bytes,
+                    AncestryGap::FailClosed,
                 )
                 .await
                 .unwrap_err();

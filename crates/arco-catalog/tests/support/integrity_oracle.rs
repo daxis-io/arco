@@ -20,6 +20,18 @@ pub struct OracleWrite {
     pub expires_at_ms: Option<i64>,
 }
 
+/// The oracle's independent expectation of one published retention-horizon
+/// certificate: what the manifest that a `horizon` call explains must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HorizonCertificate {
+    pub horizon_sequence: u64,
+    pub purge_cutoff_ms: i64,
+    pub parent_state_checksum_sha256: String,
+    pub purged_rows_sha256: String,
+    pub expired_rows: u64,
+    pub tombstones: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct LogicalOracle {
     pub sequence: u64,
@@ -27,6 +39,10 @@ pub struct LogicalOracle {
     last_mutation: String,
     kv: BTreeMap<Vec<u8>, OracleRow>,
     pub outbox: Vec<(String, Bytes, u64)>,
+    /// The last horizon this oracle applied; the manifest it explains must
+    /// carry exactly this certificate, and no other manifest may carry one
+    /// the oracle never applied.
+    last_horizon: Option<HorizonCertificate>,
 }
 
 fn field(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -56,7 +72,118 @@ impl LogicalOracle {
             last_mutation: String::new(),
             kv: BTreeMap::new(),
             outbox: Vec::new(),
+            last_horizon: None,
         }
+    }
+
+    /// Whether `key` currently holds a live value (not absent, not a tombstone).
+    #[allow(dead_code)] // Shared by several independently compiled contract suites.
+    pub fn is_live(&self, key: &[u8]) -> bool {
+        self.kv
+            .get(key)
+            .is_some_and(|(_, value, _)| value.is_some())
+    }
+
+    /// Applies a retention horizon: drops every tombstone at or below
+    /// `horizon_sequence` and every live row whose expiry hint precedes
+    /// `purge_cutoff_ms`, leaving sequence and history untouched, and returns
+    /// the certificate the published manifest must carry. The purged digest
+    /// is recomputed here from first principles (tag, count, then per row in
+    /// key order: key, generation, tombstone flag, optional expiry).
+    #[allow(dead_code)] // Shared by several independently compiled contract suites.
+    pub fn horizon(&mut self, purge_cutoff_ms: i64, horizon_sequence: u64) -> HorizonCertificate {
+        assert!(horizon_sequence <= self.sequence);
+        assert!(purge_cutoff_ms > 0);
+        let parent_state_checksum_sha256 = self.state_checksum();
+        let purged = self
+            .kv
+            .iter()
+            .filter(|(_, (generation, value, expires_at_ms))| {
+                if value.is_none() {
+                    *generation <= horizon_sequence
+                } else {
+                    expires_at_ms.is_some_and(|expiry| expiry < purge_cutoff_ms)
+                }
+            })
+            .map(|(key, (generation, value, expires_at_ms))| {
+                (key.clone(), *generation, value.is_none(), *expires_at_ms)
+            })
+            .collect::<Vec<_>>();
+        let mut purge = prefix("retention-purge");
+        purge.extend_from_slice(&(purged.len() as u64).to_be_bytes());
+        let (mut expired_rows, mut tombstones) = (0, 0);
+        for (key, generation, tombstone, expires_at_ms) in &purged {
+            field(&mut purge, key);
+            purge.extend_from_slice(&generation.to_be_bytes());
+            purge.push(u8::from(*tombstone));
+            purge.push(u8::from(expires_at_ms.is_some()));
+            if let Some(expiry) = expires_at_ms {
+                purge.extend_from_slice(&expiry.to_be_bytes());
+            }
+            if *tombstone {
+                tombstones += 1;
+            } else {
+                expired_rows += 1;
+            }
+            self.kv.remove(key).unwrap();
+        }
+        let certificate = HorizonCertificate {
+            horizon_sequence,
+            purge_cutoff_ms,
+            parent_state_checksum_sha256,
+            purged_rows_sha256: digest(&purge),
+            expired_rows,
+            tombstones,
+        };
+        self.last_horizon = Some(certificate.clone());
+        certificate
+    }
+
+    /// The full-state checksum exactly as the kernel serializes it.
+    pub fn state_checksum(&self) -> String {
+        #[derive(Serialize)]
+        struct Entry<'a> {
+            key: &'a Vec<u8>,
+            generation: u64,
+            value: &'a Option<Vec<u8>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            expires_at_ms: Option<i64>,
+        }
+        #[derive(Serialize)]
+        struct Outbox<'a> {
+            record_id: &'a str,
+            payload: Vec<u8>,
+            origin_sequence: Option<u64>,
+        }
+        #[derive(Serialize)]
+        struct State<'a> {
+            logical_sequence: u64,
+            entries: Vec<Entry<'a>>,
+            outbox: Vec<Outbox<'a>>,
+        }
+        let state = State {
+            logical_sequence: self.sequence,
+            entries: self
+                .kv
+                .iter()
+                .map(|(key, (generation, value, expires_at_ms))| Entry {
+                    key,
+                    generation: *generation,
+                    value,
+                    expires_at_ms: *expires_at_ms,
+                })
+                .collect(),
+            outbox: self
+                .outbox
+                .iter()
+                .map(|(id, payload, origin)| Outbox {
+                    record_id: id,
+                    payload: payload.to_vec(),
+                    origin_sequence: Some(*origin),
+                })
+                .collect(),
+        };
+        digest(&serde_json::to_vec(&state).unwrap())
     }
 
     pub fn commit(
@@ -171,48 +298,6 @@ impl LogicalOracle {
     }
 
     pub async fn assert_manifest(&self, storage: &ScopedStorage, id: &str) {
-        #[derive(Serialize)]
-        struct Entry<'a> {
-            key: &'a Vec<u8>,
-            generation: u64,
-            value: &'a Option<Vec<u8>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            expires_at_ms: Option<i64>,
-        }
-        #[derive(Serialize)]
-        struct Outbox<'a> {
-            record_id: &'a str,
-            payload: Vec<u8>,
-            origin_sequence: Option<u64>,
-        }
-        #[derive(Serialize)]
-        struct State<'a> {
-            logical_sequence: u64,
-            entries: Vec<Entry<'a>>,
-            outbox: Vec<Outbox<'a>>,
-        }
-        let state = State {
-            logical_sequence: self.sequence,
-            entries: self
-                .kv
-                .iter()
-                .map(|(key, (generation, value, expires_at_ms))| Entry {
-                    key,
-                    generation: *generation,
-                    value,
-                    expires_at_ms: *expires_at_ms,
-                })
-                .collect(),
-            outbox: self
-                .outbox
-                .iter()
-                .map(|(id, payload, origin)| Outbox {
-                    record_id: id,
-                    payload: payload.to_vec(),
-                    origin_sequence: Some(*origin),
-                })
-                .collect(),
-        };
         let bytes = storage
             .get_raw(&format!("control/v1/domains/catalog/manifests/{id}.json"))
             .await
@@ -222,9 +307,61 @@ impl LogicalOracle {
         assert_eq!(doc["payload"]["history_root"], self.root);
         assert_eq!(
             doc["payload"]["state_checksum_sha256"],
-            digest(&serde_json::to_vec(&state).unwrap())
+            self.state_checksum()
         );
+        self.assert_certificate(&doc["payload"]);
         self.assert_physical(storage, &doc["payload"]).await;
+    }
+
+    /// A manifest carries a retention-horizon certificate exactly when this
+    /// oracle explains it: the fields must match the last applied horizon,
+    /// its evidence must use known kinds, and the horizon must be the
+    /// minimum of every cited pinned sequence.
+    fn assert_certificate(&self, manifest: &serde_json::Value) {
+        let certificate = &manifest["retention_horizon"];
+        if certificate.is_null() {
+            return;
+        }
+        let expected = self
+            .last_horizon
+            .as_ref()
+            .expect("manifest carries a retention horizon certificate the oracle never applied");
+        assert_eq!(certificate["encoding_version"], 1);
+        assert_eq!(certificate["horizon_sequence"], expected.horizon_sequence);
+        assert_eq!(certificate["purge_cutoff_ms"], expected.purge_cutoff_ms);
+        assert_eq!(
+            certificate["parent_state_checksum_sha256"],
+            expected.parent_state_checksum_sha256
+        );
+        assert_eq!(
+            certificate["purged_rows_sha256"],
+            expected.purged_rows_sha256
+        );
+        assert_eq!(
+            certificate["purged_counts"]["expired_rows"],
+            expected.expired_rows
+        );
+        assert_eq!(
+            certificate["purged_counts"]["tombstones"],
+            expected.tombstones
+        );
+        assert!(manifest["equivalence"].is_object());
+        let evidence = certificate["pinned_evidence"].as_array().unwrap();
+        assert!(!evidence.is_empty(), "every horizon cites its age bound");
+        for entry in evidence {
+            assert!(
+                ["manifest_age", "snapshot", "export", "checkpoint"]
+                    .contains(&entry["kind"].as_str().unwrap())
+            );
+            assert!(!entry["id"].as_str().unwrap().is_empty());
+        }
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|entry| entry["sequence"].as_u64().unwrap())
+                .min(),
+            Some(expected.horizon_sequence)
+        );
     }
 
     /// Independently decodes every owning artifact and recomputes both histories

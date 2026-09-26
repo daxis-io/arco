@@ -1163,6 +1163,8 @@ fn next_random(state: &mut u64) -> u64 {
 #[derive(Debug, Default)]
 struct ModelSummary {
     horizons_published: usize,
+    /// Horizon admissions the planner deferred with backpressure.
+    horizons_deferred: usize,
     tombstones_purged: u64,
     /// A published horizon's age bound was established by an anchor that is
     /// itself a previously published horizon manifest.
@@ -1240,10 +1242,26 @@ async fn head_carries_intent(f: &Fixture) -> bool {
         .is_some_and(|intent| !intent.is_null())
 }
 
+/// Which segment sizing a horizon step's worker uses.
+#[derive(Clone, Copy, Debug)]
+enum HorizonSizing {
+    /// The model's tiny two-row shards, for multi-page plan coverage. Right
+    /// after a consolidation with few L0 bytes, every tiny unit re-selects
+    /// the same source blocks and the planner defers with backpressure
+    /// ("planned construction exceeds two source reads"), exactly as a
+    /// same-sized consolidation would on that state.
+    TinyShards,
+    /// Production sizing: one unit per row kind, so selection never exceeds
+    /// the source and admission cannot defer. The age-cycle family uses it
+    /// because its horizons must publish.
+    Production,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn horizon_step(
     f: &Fixture,
     now: DateTime<Utc>,
+    sizing: HorizonSizing,
     logical: &mut LogicalOracle,
     contents: &mut Contents,
     tokens: &mut Vec<TokenOracle>,
@@ -1252,6 +1270,7 @@ async fn horizon_step(
     summary: &mut ModelSummary,
     trace: &Mutex<Vec<String>>,
 ) {
+    use arco_catalog::CatalogError;
     // A retention horizon on the worker's schedule. Its inputs are computed
     // by the kernel; the model independently bounds the horizon by every
     // pin it knows about and recomputes the certificate from its own rows.
@@ -1260,13 +1279,48 @@ async fn horizon_step(
         StateScope::new("tenant", "workspace", "catalog"),
         arco_catalog::DurableAuthorityBinding::new([23; 32]),
     )
-    .unwrap()
-    .with_test_segment_sizing(2, 8 * 1024)
     .unwrap();
-    let Some(outcome) = durable_maintenance::horizon_pending(&worker, now)
-        .await
-        .unwrap()
-    else {
+    let worker = match sizing {
+        HorizonSizing::TinyShards => worker.with_test_segment_sizing(2, 8 * 1024).unwrap(),
+        HorizonSizing::Production => worker,
+    };
+    let attempt = match durable_maintenance::horizon_pending(&worker, now).await {
+        Err(CatalogError::MaintenanceBackpressure { message }) => {
+            // Deferral, as the consolidation step treats it: consolidate
+            // first when the head declares an intent, then retry once.
+            summary.horizons_deferred += 1;
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("horizon deferred: {message}"));
+            if head_carries_intent(f).await {
+                match durable_maintenance::consolidate_pending(&worker).await {
+                    Ok(_) => trace
+                        .lock()
+                        .unwrap()
+                        .push("horizon retry: consolidated first".into()),
+                    Err(CatalogError::MaintenanceBackpressure { message }) => {
+                        trace.lock().unwrap().push(format!(
+                            "horizon retry: consolidation deferred too: {message}"
+                        ));
+                    }
+                    Err(error) => panic!("consolidation before horizon retry: {error:?}"),
+                }
+            }
+            match durable_maintenance::horizon_pending(&worker, now).await {
+                Err(CatalogError::MaintenanceBackpressure { message }) => {
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(format!("horizon deferred again: {message}"));
+                    return;
+                }
+                other => other.unwrap(),
+            }
+        }
+        other => other.unwrap(),
+    };
+    let Some(outcome) = attempt else {
         trace
             .lock()
             .unwrap()
@@ -1653,6 +1707,7 @@ async fn run_model(
                 horizon_step(
                     &f,
                     now,
+                    HorizonSizing::TinyShards,
                     &mut logical,
                     &mut contents,
                     &mut tokens,
@@ -1670,6 +1725,8 @@ async fn run_model(
                 // recorded and purges the tombstone; the second reaches it
                 // through the first horizon's manifest and purges the
                 // receipt. Active pins may legitimately hold either bound.
+                // Both horizons run with production sizing so admission
+                // cannot defer: every seed must observe both.
                 let value = Bytes::from(format!("{seed}-{step}"));
                 commit_tracked(
                     &f,
@@ -1707,6 +1764,7 @@ async fn run_model(
                     horizon_step(
                         &f,
                         now,
+                        HorizonSizing::Production,
                         &mut logical,
                         &mut contents,
                         &mut tokens,

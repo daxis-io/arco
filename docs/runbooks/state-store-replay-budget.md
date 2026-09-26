@@ -102,9 +102,9 @@ and is abandoned. For a horizon job:
   what it means for consolidation: the head moved past the job's source and
   the 24 h descriptor lifetime expired before a regenerated publication
   landed. Before expiry a consumed attempt returns to `ReadyToPublish` and
-  the next `publish_at` regenerates over the new head. A horizon job is also
-  superseded, with `PreconditionFailed` from `publish_at`, when a commit after
-  preparation rewrote a key the admitted plan purges; abandon it and call
+  the next `publish_at` regenerates over the new head. `publish_at` also refuses
+  a horizon job with `PreconditionFailed` (the persisted status is not changed)
+  when a commit after preparation rewrote a key the admitted plan purges; abandon it and call
   `prepare_horizon_at` again.
 - A stuck retention epoch (`stuck_epoch` in the worker's epoch phase, see
   `docs/runbooks/control-store-worker.md`) blocks horizon activation exactly

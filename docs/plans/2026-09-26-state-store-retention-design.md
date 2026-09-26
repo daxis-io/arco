@@ -54,7 +54,7 @@ Stamps are monotone along ancestry on every render path (commit, restore,
 maintenance): a child's stamp is `max(render clock, parent stamp)`, and the
 ancestry walker rejects a child stamped before its parent.
 
-*Amendment (2026-09-27, after Package C review):* one manifest per commit means
+*Amendment (2026-09-26, after Package C review):* one manifest per commit means
 a plain ancestry walk cannot span 30 days at the pilot rate (millions of
 manifests against a 4,096-hop budget). Every format-9 manifest therefore also
 carries `age_anchor: Option<{ manifest_id, manifest_sha256, sequence,

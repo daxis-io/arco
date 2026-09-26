@@ -99,7 +99,7 @@ cargo fmt --all -- --check && git diff --check && cargo xtask repo-hygiene-check
 ## As implemented (2026-09-26)
 
 Packages A through D landed on this branch (bf3694da, f526db45, f0702f29,
-7e8f326a, 6484e5dc, 7c9aae9b, e8eee31e, 16587f2d, then the Package D docs
+7e8f326a, 6484e5dc, 7c9aae9b, e8eee31e, 16587f2d, d589ec82, then the Package D docs
 commit). The resulting contract is `state-store-retention-format-v1.md`.
 Deviations from the plan above:
 
@@ -108,6 +108,10 @@ Deviations from the plan above:
   pending restore reconstructs its format-9 candidate bytes exactly, instead
   of stamping at apply time. `render_restore_candidate` rejects a stamp before
   the candidate parent.
+- **No `v7_current.json` restore-plan fixture.** The fixture convention is
+  "last shape an older revision wrote", so Package A added
+  `v6_last_before_format9.json` (captured from pre-bump code) instead; the
+  current field set is pinned by `a_v6_plan_over_a_matching_source_is_superseded_and_never_applied`.
 - **Maintenance stamps are `max(descriptor.created_at, parent stamp)`**, and
   commit and restore stamps are `max(clock, parent stamp)`; the ancestry
   walker rejects a child stamped before its parent. The plan only said "set

@@ -6,11 +6,12 @@ restore-plan format 7. Format 9 is format 7 (see
 [block format 1](state-store-block-format-v1.md)) plus wall-clock stamps, a
 per-row expiry hint, an age-anchor chain and a certified `RetentionHorizon`
 maintenance transition. Layout, exact-version HEAD CAS, writer-epoch fencing,
-reclamation generation, the history root, the hash domain tags, the retention
+reclamation generation, the history root, the existing hash domain tags (one
+tag, `arco/control-v1/retention-purge`, is added), the retention
 floors (7-day orphan, 30-day token and checkpoint) and the 16/32 L0 thresholds
 are unchanged. Point reads, scans and witnesses are unchanged. The design is
 `2026-09-26-state-store-retention-design.md` (accepted, including the
-2026-09-27 age-anchor amendment).
+2026-09-26 age-anchor amendment).
 
 ## Versions
 
@@ -183,8 +184,9 @@ authenticated ancestry transition".
 horizon descriptor additionally binds the admitted `HorizonInputs {
 horizon_sequence, purge_cutoff_ms, pinned_evidence }` and the plan's purge
 summary (the pruned render-cut checksum, the purged digest and the counts).
-Both are part of the job identity and render seed, and their presence must
-agree with the kind. `DurableMaintenanceWorker::prepare_horizon_at(now)`
+The kind and the inputs are bound into the render seed; the purge summary is
+bound into the job identity (the descriptor digest) but not the seed. Their
+presence must agree with the kind. `DurableMaintenanceWorker::prepare_horizon_at(now)`
 computes the inputs, replays the head and admits a plan; it returns no plan
 when the root has no head or nothing is eligible (zero purged counts), and it
 needs no maintenance intent. The prepared job then uses the same `start_at`,
@@ -241,14 +243,17 @@ cut's sequence; the suffix transactions after the cut are then applied. The
 publisher replays the current head afresh, recomputes the purge with the
 admitted inputs bounded to the cut's sequence, and requires the recomputed
 purged digest and counts to equal the admitted plan's. Otherwise the job is
-superseded with `PreconditionFailed` ("retention horizon purged set was
+refused by `publish_at` with `PreconditionFailed` ("retention horizon purged set was
 superseded by later commits"), because a suffix rewrote a purged key since
 preparation; the driver abandons it and prepares again. The candidate state
 must then equal the pruned parent exactly, by value and by checksum.
 
 ### Published evidence
 
-The candidate keeps the parent's logical sequence, history anchor and history
+The candidate keeps the parent's logical sequence and history root; its
+history anchor moves to the render cut (`HistoryAnchor { sequence:
+render.logical_sequence, root: render.history_root }`), as for consolidation.
+The candidate keeps the parent's logical sequence and history
 root, advances the layout generation, sets `state_checksum_sha256` to the
 pruned state's checksum, binds the certificate with
 `parent_state_checksum_sha256` equal to the parent's checksum, and carries

@@ -1,8 +1,9 @@
 //! Scheduled `control/` maintenance worker.
 //!
 //! One invocation inspects the workspace retention epoch, then for every
-//! control domain runs durable layout maintenance (L0 consolidation), then
-//! drains the catalog projection outbox, then runs one bounded pass of
+//! control domain runs durable layout maintenance (L0 consolidation, then the
+//! retention horizon that purges expired rows and unobservable tombstones),
+//! then drains the catalog projection outbox, then runs one bounded pass of
 //! conservative garbage collection per domain. The process exits `0` when
 //! every phase either completed or deferred to the next run, and non-zero when
 //! any phase failed with a typed error or the retention epoch is stuck.
@@ -30,7 +31,7 @@ use arco_catalog::state_store::projection_outbox_acks::{
 use arco_catalog::{
     CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogError, CatalogProjectionMaterializer,
     ControlMvpMaintenanceWorker, DurableAuthorityBinding, DurableMaintenanceWorker,
-    MaintenanceJobId, MaintenanceProgress, MaintenanceStatus, StateScope,
+    MaintenanceJobId, MaintenanceKind, MaintenanceProgress, MaintenanceStatus, StateScope,
 };
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::{ScopedStorage, WritePrecondition};
@@ -263,7 +264,9 @@ async fn inspect_retention_epoch(storage: &ScopedStorage) -> Result<EpochSummary
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MaintenanceOutcome {
-    /// The current manifest selects no maintenance intent.
+    /// The kernel admitted no plan: the current manifest selects no
+    /// maintenance intent (consolidation) or no row is purge-eligible
+    /// (retention horizon).
     Idle,
     /// A layout was published by exact head CAS.
     Published,
@@ -359,9 +362,16 @@ impl DrainSummary {
     }
 }
 
+/// One maintenance job a run drove for a domain, or the kernel's refusal to
+/// admit one (`idle`). A run records, per domain, the replayed job when a
+/// persisted identity existed, then up to one consolidation and one
+/// retention horizon entry (see [`maintain_domain`]).
 #[derive(Debug, Serialize)]
 struct DomainMaintenanceSummary {
     domain: String,
+    /// Which physical rewrite the job performs: `consolidation` or
+    /// `retention_horizon` ([`MaintenanceKind::as_str`]).
+    kind: &'static str,
     outcome: MaintenanceOutcome,
     job_id: Option<String>,
     /// The job was replayed from the persisted identity of an earlier run.
@@ -370,13 +380,24 @@ struct DomainMaintenanceSummary {
     completed: usize,
     total: usize,
     layout_generation: Option<u64>,
+    /// Rows a published retention horizon purged by expiry; `None` for a
+    /// consolidation or when nothing was published.
+    purged_expired_rows: Option<u64>,
+    /// Tombstones a published retention horizon purged as unobservable;
+    /// `None` for a consolidation or when nothing was published.
+    purged_tombstones: Option<u64>,
     elapsed_ms: u64,
+    /// When this entry's job was first considered; `elapsed_ms` is measured
+    /// from it by [`Self::finished`].
+    #[serde(skip)]
+    started: Instant,
 }
 
 impl DomainMaintenanceSummary {
-    fn idle(domain: &str) -> Self {
+    fn idle(domain: &str, kind: MaintenanceKind) -> Self {
         Self {
             domain: domain.to_owned(),
+            kind: kind.as_str(),
             outcome: MaintenanceOutcome::Idle,
             job_id: None,
             recovered: false,
@@ -384,14 +405,25 @@ impl DomainMaintenanceSummary {
             completed: 0,
             total: 0,
             layout_generation: None,
+            purged_expired_rows: None,
+            purged_tombstones: None,
             elapsed_ms: 0,
+            started: Instant::now(),
         }
+    }
+
+    /// Seals the entry with its outcome and elapsed time.
+    fn finished(mut self, outcome: MaintenanceOutcome) -> Self {
+        self.outcome = outcome;
+        self.elapsed_ms = elapsed_ms(self.started);
+        self
     }
 
     fn log(&self) {
         tracing::info!(
             phase = "maintenance",
             domain = %self.domain,
+            kind = self.kind,
             outcome = self.outcome.as_str(),
             job_id = self.job_id.as_deref(),
             recovered = self.recovered,
@@ -399,6 +431,8 @@ impl DomainMaintenanceSummary {
             completed = self.completed,
             total = self.total,
             layout_generation = self.layout_generation,
+            purged_expired_rows = self.purged_expired_rows,
+            purged_tombstones = self.purged_tombstones,
             elapsed_ms = self.elapsed_ms,
             "control-store worker phase complete"
         );
@@ -642,9 +676,10 @@ async fn advance_until_ready(
                 tracing::warn!(
                     phase = "maintenance",
                     domain = %summary.domain,
+                    kind = summary.kind,
                     job_id = job_id.as_str(),
                     status = ?progress.status,
-                    "maintenance job is terminal; a fresh plan is prepared next run"
+                    "maintenance job is terminal; its persisted identity is cleared and a fresh plan is prepared"
                 );
                 return Ok(Advance::Stopped(MaintenanceOutcome::Terminal));
             }
@@ -654,6 +689,7 @@ async fn advance_until_ready(
             tracing::warn!(
                 phase = "maintenance",
                 domain = %summary.domain,
+                kind = summary.kind,
                 job_id = job_id.as_str(),
                 advances = summary.advances,
                 completed = summary.completed,
@@ -686,12 +722,17 @@ async fn publish_job(
     )? {
         Step::Ready(Some(outcome)) => {
             summary.layout_generation = Some(outcome.layout_generation());
+            if let Some(purged) = outcome.purged_counts() {
+                summary.purged_expired_rows = Some(purged.expired_rows);
+                summary.purged_tombstones = Some(purged.tombstones);
+            }
             Ok(MaintenanceOutcome::Published)
         }
         Step::Ready(None) => {
             tracing::warn!(
                 phase = "maintenance",
                 domain = %summary.domain,
+                kind = summary.kind,
                 job_id = job_id.as_str(),
                 "maintenance publication was consumed by another publication; retry next run"
             );
@@ -867,31 +908,22 @@ async fn apply_recovery_disposition(
     }
 }
 
-/// Replays a persisted job if one exists, otherwise prepares, persists, starts
-/// and drives at most one new maintenance job.
-async fn drive_maintenance(
+/// Prepares one new job of `kind` against the current head, persists its
+/// identity, activates it and drives it to publication. `Idle` when the
+/// kernel admits no plan. The caller guarantees no persisted identity remains
+/// for the domain: a second live job would orphan the first one's record.
+async fn drive_fresh_job(
     storage: &ScopedStorage,
     worker: &DurableMaintenanceWorker,
+    kind: MaintenanceKind,
     max_advances: usize,
     summary: &mut DomainMaintenanceSummary,
 ) -> Result<MaintenanceOutcome> {
-    if let Some(record) = load_selected_job(storage, &summary.domain).await? {
-        match recover_selected_job(storage, worker, &record, summary).await? {
-            Recovery::Resume(job_id, progress) => {
-                return finish_job(storage, worker, &job_id, progress, max_advances, summary).await;
-            }
-            Recovery::Deferred => return Ok(MaintenanceOutcome::Deferred),
-            Recovery::Fresh => {
-                summary.recovered = false;
-                summary.job_id = None;
-            }
-        }
-    }
-    let plan = match classify_step(
-        &summary.domain,
-        "prepare",
-        worker.prepare_at(Utc::now()).await,
-    )? {
+    let prepared = match kind {
+        MaintenanceKind::Consolidation => worker.prepare_at(Utc::now()).await,
+        MaintenanceKind::RetentionHorizon => worker.prepare_horizon_at(Utc::now()).await,
+    };
+    let plan = match classify_step(&summary.domain, "prepare", prepared)? {
         Step::Ready(Some(plan)) => plan,
         Step::Ready(None) => return Ok(MaintenanceOutcome::Idle),
         Step::Deferred => return Ok(MaintenanceOutcome::Deferred),
@@ -912,6 +944,7 @@ async fn drive_maintenance(
     tracing::info!(
         phase = "maintenance",
         domain = %summary.domain,
+        kind = summary.kind,
         job_id = job_id.as_str(),
         "maintenance job prepared and its identity persisted"
     );
@@ -926,6 +959,23 @@ async fn drive_maintenance(
     finish_job(storage, worker, &job_id, progress, max_advances, summary).await
 }
 
+/// Runs one domain's maintenance phase and returns one entry per job
+/// considered, in order:
+///
+/// 1. A persisted job identity is replayed first, whatever its kind. The
+///    domain's phase ends here unless the job finished (`published` or
+///    `terminal`, which clears the record); a `deferred` or `exhausted` job
+///    keeps its record and is replayed next run, and nothing else may start
+///    while it exists.
+/// 2. A consolidation is prepared and driven (`idle` when no intent is
+///    pending).
+/// 3. When that consolidation ended `idle` or `published`, a retention
+///    horizon is prepared and driven over the consolidated head (`idle` when
+///    no row is purge-eligible). A replayed job that was itself a horizon is
+///    this run's horizon: a second one never starts in the same run.
+///
+/// An abandoned record (expired, or never activated) is cleared during
+/// recovery and reported on the consolidation entry it gives way to.
 async fn maintain_domain(
     storage: ScopedStorage,
     tenant: &str,
@@ -933,16 +983,79 @@ async fn maintain_domain(
     domain: &str,
     binding: DurableAuthorityBinding,
     max_advances: usize,
-) -> Result<DomainMaintenanceSummary> {
-    let started = Instant::now();
+) -> Result<Vec<DomainMaintenanceSummary>> {
     let scope = StateScope::new(tenant, workspace, domain);
     let worker = DurableMaintenanceWorker::new(storage.clone(), scope, binding)
         .with_context(|| format!("construct maintenance worker for domain {domain}"))?;
-    let mut summary = DomainMaintenanceSummary::idle(domain);
-    let outcome = drive_maintenance(&storage, &worker, max_advances, &mut summary).await?;
-    summary.outcome = outcome;
-    summary.elapsed_ms = elapsed_ms(started);
-    Ok(summary)
+    let mut entries = Vec::with_capacity(2);
+    let mut horizon_ran = false;
+    let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
+
+    if let Some(record) = load_selected_job(&storage, domain).await? {
+        match recover_selected_job(&storage, &worker, &record, &mut summary).await? {
+            Recovery::Resume(job_id, progress) => {
+                summary.kind = progress.kind.as_str();
+                horizon_ran = progress.kind == MaintenanceKind::RetentionHorizon;
+                let outcome = finish_job(
+                    &storage,
+                    &worker,
+                    &job_id,
+                    progress,
+                    max_advances,
+                    &mut summary,
+                )
+                .await?;
+                let record_cleared = matches!(
+                    outcome,
+                    MaintenanceOutcome::Published | MaintenanceOutcome::Terminal
+                );
+                entries.push(summary.finished(outcome));
+                if !record_cleared {
+                    return Ok(entries);
+                }
+                summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
+            }
+            Recovery::Deferred => {
+                entries.push(summary.finished(MaintenanceOutcome::Deferred));
+                return Ok(entries);
+            }
+            Recovery::Fresh => {
+                summary.recovered = false;
+                summary.job_id = None;
+            }
+        }
+    }
+
+    let outcome = drive_fresh_job(
+        &storage,
+        &worker,
+        MaintenanceKind::Consolidation,
+        max_advances,
+        &mut summary,
+    )
+    .await?;
+    // `published` cleared the record in `finish_job`; `idle` never persisted
+    // one. Every other outcome leaves a record the horizon must not overwrite.
+    let horizon_may_follow = matches!(
+        outcome,
+        MaintenanceOutcome::Idle | MaintenanceOutcome::Published
+    );
+    entries.push(summary.finished(outcome));
+    if horizon_ran || !horizon_may_follow {
+        return Ok(entries);
+    }
+
+    let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::RetentionHorizon);
+    let outcome = drive_fresh_job(
+        &storage,
+        &worker,
+        MaintenanceKind::RetentionHorizon,
+        max_advances,
+        &mut summary,
+    )
+    .await?;
+    entries.push(summary.finished(outcome));
+    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -1006,8 +1119,9 @@ async fn collect_domain(
 // Run
 // ---------------------------------------------------------------------------
 
-/// Runs every phase once: epoch inspection, maintenance per domain, catalog
-/// projection drain, GC per domain. Phases are independent: a failure is
+/// Runs every phase once: epoch inspection, maintenance per domain
+/// (consolidation, then retention horizon), catalog projection drain, GC per
+/// domain. Phases are independent: a failure is
 /// recorded and the remaining phases still run, so one wedged domain never
 /// starves another. The returned summary carries every failure; callers exit
 /// non-zero through [`RunSummary::exit_error`].
@@ -1053,9 +1167,11 @@ async fn run_once(
         )
         .await
         {
-            Ok(result) => {
-                result.log();
-                summary.maintenance.push(result);
+            Ok(entries) => {
+                for entry in entries {
+                    entry.log();
+                    summary.maintenance.push(entry);
+                }
             }
             Err(error) => summary.fail("maintenance", domain, &error),
         }
@@ -1185,8 +1301,9 @@ mod tests {
     use std::sync::Arc;
 
     use arco_catalog::{
-        ArcoStateTxn as _, CatalogProjectionNotifier, ControlCatalogAuthority,
-        ControlMvpStateStore, ProjectionIntentV1, TxnOptions, WriteOptions,
+        ArcoStateReader as _, ArcoStateTxn as _, CatalogProjectionNotifier,
+        ControlCatalogAuthority, ControlMvpStateStore, ProjectionIntentV1, TxnOptions,
+        WriteOptions,
     };
     use arco_core::MemoryBackend;
     use chrono::Duration;
@@ -1200,6 +1317,8 @@ mod tests {
     };
     const TENANT: &str = "tenant";
     const WORKSPACE: &str = "workspace";
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+    const DAY_MS: i64 = 24 * HOUR_MS;
 
     /// The API's default notifier spawns a drain after every commit; tests
     /// need the backlog to stay put until the worker drains it.
@@ -1239,6 +1358,22 @@ mod tests {
         for generation in 0..count {
             commit_generation(&store, generation).await?;
         }
+        Ok(store)
+    }
+
+    /// Commits one catalog row whose expiry stamp is two hours old: past the
+    /// horizon's purge cutoff of now minus one hour, so the next horizon job
+    /// purges it.
+    async fn seed_expired_row(storage: &ScopedStorage) -> Result<ControlMvpStateStore> {
+        let store = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        let mut tx = store.begin_control_txn(TxnOptions::default()).await?;
+        tx.put_with_expiry(
+            b"expired",
+            Bytes::from_static(b"expired"),
+            Utc::now().timestamp_millis() - 2 * HOUR_MS,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(store)
     }
 
@@ -1300,15 +1435,31 @@ mod tests {
         )
     }
 
+    /// The first maintenance entry a run recorded for `domain` with `kind`.
     fn domain_summary<'a>(
         summary: &'a RunSummary,
         domain: &str,
+        kind: &str,
     ) -> Result<&'a DomainMaintenanceSummary> {
         summary
             .maintenance
             .iter()
-            .find(|entry| entry.domain == domain)
-            .ok_or_else(|| anyhow!("missing maintenance summary for {domain}"))
+            .find(|entry| entry.domain == domain && entry.kind == kind)
+            .ok_or_else(|| anyhow!("missing {kind} maintenance summary for {domain}"))
+    }
+
+    /// Every maintenance entry a run recorded for `domain`, as `(kind, outcome)`
+    /// in the order the jobs were driven.
+    fn domain_entries(
+        summary: &RunSummary,
+        domain: &str,
+    ) -> Vec<(&'static str, MaintenanceOutcome)> {
+        summary
+            .maintenance
+            .iter()
+            .filter(|entry| entry.domain == domain)
+            .map(|entry| (entry.kind, entry.outcome))
+            .collect()
     }
 
     fn epoch_record(kind: &str, operation_id: &str, age: Duration) -> Result<Bytes> {
@@ -1338,13 +1489,20 @@ mod tests {
         let summary = run(&storage).await?;
 
         assert!(summary.failures.is_empty(), "{:?}", summary.failures);
-        let catalog = domain_summary(&summary, "catalog")?;
+        let catalog = domain_summary(&summary, "catalog", "consolidation")?;
         assert_eq!(catalog.outcome, MaintenanceOutcome::Published);
         assert!(!catalog.recovered);
         assert!(catalog.job_id.is_some());
         assert!(catalog.layout_generation.is_some());
         assert_eq!(catalog.completed, catalog.total);
-        let acks = domain_summary(&summary, PROJECTION_OUTBOX_ACK_DOMAIN)?;
+        assert_eq!(catalog.purged_expired_rows, None);
+        assert_eq!(catalog.purged_tombstones, None);
+        assert_eq!(
+            domain_summary(&summary, "catalog", "retention_horizon")?.outcome,
+            MaintenanceOutcome::Idle,
+            "no row is purge-eligible after plain commits"
+        );
+        let acks = domain_summary(&summary, PROJECTION_OUTBOX_ACK_DOMAIN, "consolidation")?;
         assert_eq!(acks.outcome, MaintenanceOutcome::Idle);
         assert_eq!(
             summary.epoch.as_ref().map(|e| e.outcome),
@@ -1374,10 +1532,178 @@ mod tests {
         assert!(summary.failures.is_empty(), "{:?}", summary.failures);
         for domain in CONTROL_DOMAINS {
             assert_eq!(
-                domain_summary(&summary, domain)?.outcome,
-                MaintenanceOutcome::Idle
+                domain_entries(&summary, domain),
+                vec![
+                    ("consolidation", MaintenanceOutcome::Idle),
+                    ("retention_horizon", MaintenanceOutcome::Idle),
+                ],
+                "{domain}: a consolidation and a horizon run, both idle"
             );
         }
+        assert_eq!(summary.maintenance.len(), 2 * CONTROL_DOMAINS.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_publishes_a_horizon_that_drops_expired_rows() -> Result<()> {
+        let storage = test_storage()?;
+        let store = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut tx = store.begin_control_txn(TxnOptions::default()).await?;
+        tx.put(b"live", Bytes::from_static(b"live")).await?;
+        tx.put_with_expiry(
+            b"expired",
+            Bytes::from_static(b"expired"),
+            now_ms - 2 * HOUR_MS,
+        )
+        .await?;
+        tx.put_with_expiry(b"fresh", Bytes::from_static(b"fresh"), now_ms + DAY_MS)
+            .await?;
+        tx.commit().await?;
+        // An expiry stamp is a hint: the row reads normally until purged.
+        assert_eq!(
+            store.get(b"expired").await?,
+            Some(Bytes::from_static(b"expired"))
+        );
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("consolidation", MaintenanceOutcome::Idle),
+                ("retention_horizon", MaintenanceOutcome::Published),
+            ]
+        );
+        let horizon = domain_summary(&summary, "catalog", "retention_horizon")?;
+        assert!(!horizon.recovered);
+        assert!(horizon.job_id.is_some());
+        assert!(horizon.layout_generation.is_some());
+        assert_eq!(horizon.completed, horizon.total);
+        assert_eq!(horizon.purged_expired_rows, Some(1));
+        assert_eq!(horizon.purged_tombstones, Some(0));
+        let consolidation = domain_summary(&summary, "catalog", "consolidation")?;
+        assert_eq!(consolidation.purged_expired_rows, None);
+        assert_eq!(consolidation.purged_tombstones, None);
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "a published horizon leaves no persisted identity behind"
+        );
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(
+            reader.get(b"expired").await?,
+            None,
+            "the expired row is purged"
+        );
+        assert_eq!(
+            reader.get(b"live").await?,
+            Some(Bytes::from_static(b"live"))
+        );
+        assert_eq!(
+            reader.get(b"fresh").await?,
+            Some(Bytes::from_static(b"fresh"))
+        );
+
+        let second = run(&storage).await?;
+
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+        assert_eq!(
+            domain_summary(&second, "catalog", "retention_horizon")?.outcome,
+            MaintenanceOutcome::Idle,
+            "nothing is purge-eligible once the horizon published"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_runs_consolidation_then_horizon_in_one_run() -> Result<()> {
+        let storage = test_storage()?;
+        seed_plain_commits(&storage, 16).await?;
+        seed_expired_row(&storage).await?;
+        assert!(
+            pending_intent(&storage).await?,
+            "17 L0 segments must select a maintenance intent"
+        );
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("consolidation", MaintenanceOutcome::Published),
+                ("retention_horizon", MaintenanceOutcome::Published),
+            ],
+            "the consolidation publishes first, then the horizon over the consolidated head"
+        );
+        let consolidation = domain_summary(&summary, "catalog", "consolidation")?;
+        let horizon = domain_summary(&summary, "catalog", "retention_horizon")?;
+        assert!(consolidation.layout_generation < horizon.layout_generation);
+        assert_eq!(horizon.purged_expired_rows, Some(1));
+        assert_eq!(horizon.purged_tombstones, Some(0));
+        assert_ne!(consolidation.job_id, horizon.job_id);
+        assert!(load_selected_job(&storage, "catalog").await?.is_none());
+        assert!(
+            !pending_intent(&storage).await?,
+            "published maintenance clears the pending intent"
+        );
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(reader.get(b"expired").await?, None);
+        assert_eq!(
+            reader.get(b"key").await?,
+            Some(Bytes::from_static(b"generation-15"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_resumes_a_persisted_horizon_job() -> Result<()> {
+        let storage = test_storage()?;
+        seed_expired_row(&storage).await?;
+        // A previous run prepared, persisted and activated a horizon job, then died.
+        let dead = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
+        let now = Utc::now();
+        let plan = dead
+            .prepare_horizon_at(now)
+            .await?
+            .ok_or_else(|| anyhow!("an expired row must admit a horizon plan"))?;
+        assert_eq!(plan.kind(), MaintenanceKind::RetentionHorizon);
+        let persisted = plan.job_id().as_str().to_owned();
+        persist_selected_job(
+            &storage,
+            &SelectedJobRecord {
+                job_id: persisted.clone(),
+                domain: "catalog".to_owned(),
+                prepared_at_ms: now.timestamp_millis(),
+            },
+        )
+        .await?;
+        dead.start_at(&plan, now).await?;
+        drop(dead);
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("retention_horizon", MaintenanceOutcome::Published),
+                ("consolidation", MaintenanceOutcome::Idle),
+            ],
+            "the recovered horizon is this run's horizon; a consolidation still follows"
+        );
+        let horizon = domain_summary(&summary, "catalog", "retention_horizon")?;
+        assert!(horizon.recovered, "the persisted identity must be replayed");
+        assert_eq!(horizon.job_id.as_deref(), Some(persisted.as_str()));
+        assert_eq!(horizon.purged_expired_rows, Some(1));
+        assert_eq!(horizon.purged_tombstones, Some(0));
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "a finished job must clear its persisted record"
+        );
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(reader.get(b"expired").await?, None);
         Ok(())
     }
 
@@ -1408,7 +1734,16 @@ mod tests {
         let summary = run(&storage).await?;
 
         assert!(summary.failures.is_empty(), "{:?}", summary.failures);
-        let catalog = domain_summary(&summary, "catalog")?;
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("consolidation", MaintenanceOutcome::Published),
+                ("consolidation", MaintenanceOutcome::Idle),
+                ("retention_horizon", MaintenanceOutcome::Idle),
+            ],
+            "the replayed job finishes, then a fresh consolidation check and the horizon follow"
+        );
+        let catalog = domain_summary(&summary, "catalog", "consolidation")?;
         assert_eq!(catalog.outcome, MaintenanceOutcome::Published);
         assert!(catalog.recovered, "the persisted identity must be replayed");
         assert_eq!(catalog.job_id.as_deref(), Some(persisted.as_str()));
@@ -1456,7 +1791,15 @@ mod tests {
         let summary = run(&storage).await?;
 
         assert!(summary.failures.is_empty(), "{:?}", summary.failures);
-        let catalog = domain_summary(&summary, "catalog")?;
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("consolidation", MaintenanceOutcome::Published),
+                ("consolidation", MaintenanceOutcome::Idle),
+                ("retention_horizon", MaintenanceOutcome::Idle),
+            ]
+        );
+        let catalog = domain_summary(&summary, "catalog", "consolidation")?;
         assert_eq!(catalog.outcome, MaintenanceOutcome::Published);
         assert!(catalog.recovered, "the persisted identity must be resumed");
         assert_eq!(catalog.job_id.as_deref(), Some(persisted.as_str()));
@@ -1502,7 +1845,7 @@ mod tests {
         assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
         assert!(summary.failures[0].contains("recover_stale_retention_epoch"));
         // The other phases still ran and deferred rather than wedging silently.
-        assert_eq!(summary.maintenance.len(), CONTROL_DOMAINS.len());
+        assert_eq!(summary.maintenance.len(), 2 * CONTROL_DOMAINS.len());
         assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len());
         assert!(summary.gc.iter().all(|gc| gc.pages == 0));
         Ok(())

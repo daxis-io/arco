@@ -1306,8 +1306,8 @@ async fn idempotency_replay_is_exact_and_mismatched_reuse_conflicts() {
 }
 
 /// Decodes the catalog audit record carried by a V1 projection intent in the
-/// outbox and returns its `operationFamily`.
-fn intent_audit_family(record: &ControlMvpProjectionOutboxRecord) -> String {
+/// outbox.
+fn intent_audit_record(record: &ControlMvpProjectionOutboxRecord) -> serde_json::Value {
     let intent: ProjectionIntentV1 =
         serde_json::from_slice(record.payload()).expect("projection intent envelope");
     assert_eq!(
@@ -1318,6 +1318,12 @@ fn intent_audit_family(record: &ControlMvpProjectionOutboxRecord) -> String {
         serde_json::from_slice(intent.payload()).expect("audit record json");
     assert_eq!(audit.get("version"), Some(&serde_json::json!(1)));
     audit
+}
+
+/// Returns the `operationFamily` of the audit record a V1 projection intent
+/// in the outbox carries.
+fn intent_audit_family(record: &ControlMvpProjectionOutboxRecord) -> String {
+    intent_audit_record(record)
         .get("operationFamily")
         .and_then(serde_json::Value::as_str)
         .expect("operation family")
@@ -1325,8 +1331,7 @@ fn intent_audit_family(record: &ControlMvpProjectionOutboxRecord) -> String {
 }
 
 #[tokio::test]
-async fn reusing_an_idempotency_key_across_operation_families_keeps_every_intent_and_writes_no_audit_row()
- {
+async fn shared_idempotency_key_across_families_keeps_every_intent_and_no_audit_row() {
     let storage = scoped_storage();
     let authority =
         ControlCatalogAuthority::new(storage.clone(), scope()).expect("control authority");
@@ -1413,6 +1418,9 @@ async fn publish_retention_horizon_at(
 /// Observation used after the purge: with no receipt left, the keyed replay
 /// is no longer short-circuited and the adapter re-executes `create_catalog`,
 /// which now collides with the catalog the first application created. The
+/// first application's intent is still retained (nothing trims it here), but
+/// the command's name check runs before the commit records are staged, so the
+/// catalog conflict fires before the projection-intent id could collide. The
 /// failed re-execution commits nothing, so the receipt prefix stays empty.
 #[tokio::test]
 async fn receipts_expire_after_the_retention_window_and_the_replay_reapplies() {
@@ -1468,8 +1476,12 @@ async fn receipts_expire_after_the_retention_window_and_the_replay_reapplies() {
         .await
         .expect_err("without a receipt the same request re-executes and collides");
     assert!(
-        matches!(reapplied, CatalogError::AlreadyExists { .. }),
-        "expected the non-idempotent conflict, got {reapplied:?}"
+        matches!(
+            &reapplied,
+            CatalogError::AlreadyExists { entity, name }
+                if entity == "catalog" && name == "analytics"
+        ),
+        "expected the non-idempotent catalog name conflict, got {reapplied:?}"
     );
     let receipts = store
         .scan(arco_catalog::ScanRequest::new(b"\x03"))
@@ -1480,6 +1492,182 @@ async fn receipts_expire_after_the_retention_window_and_the_replay_reapplies() {
         "a failed re-execution commits no receipt"
     );
     assert_eq!(1, authority.list_catalogs().await.expect("catalogs").len());
+}
+
+/// Keyed operation ids are deterministic per (family, idempotency key), and
+/// the projection intent id is the operation id. Once the receipt is purged,
+/// a keyed replay re-executes under the same id: while the first intent is
+/// still retained in the outbox, staging fails closed with a projection-intent
+/// conflict before anything commits; once the materializer drains and trims
+/// that intent, the replay commits and stages a fresh outbox incarnation of
+/// the same id at a higher origin sequence.
+#[tokio::test]
+async fn a_purged_receipt_lets_a_keyed_patch_reapply_once_its_intent_is_trimmed() {
+    let storage = scoped_storage();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    authority
+        .create_catalog("c", None, WriteOptions::default())
+        .await
+        .expect("unkeyed create");
+    let patch = || {
+        authority.patch_catalog(
+            "c",
+            CatalogPatch {
+                description: Some(Some("patched".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("k"),
+        )
+    };
+    let first = patch().await.expect("keyed patch");
+
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let receipt_count = || async {
+        store
+            .scan(arco_catalog::ScanRequest::new(b"\x03"))
+            .await
+            .expect("receipt scan")
+            .entries()
+            .len()
+    };
+    assert_eq!(
+        2,
+        receipt_count().await,
+        "unkeyed mutations write a receipt too (keyed by their random operation id)"
+    );
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents");
+    assert_eq!(2, outbox.len());
+    let first_intent = outbox
+        .iter()
+        .find(|record| intent_audit_family(record) == "patch_catalog")
+        .expect("the keyed patch's intent");
+    let operation_id = first_intent.record_id().to_string();
+    let first_origin = first_intent
+        .origin_sequence()
+        .expect("committed intent carries its origin sequence");
+
+    let after_retention = chrono::Utc::now() + chrono::Duration::hours(26);
+    let outcome = publish_retention_horizon_at(storage.clone(), after_retention).await;
+    assert_eq!(
+        outcome.purged_counts(),
+        Some(PurgedCounts {
+            expired_rows: 2,
+            tombstones: 0,
+        }),
+        "the horizon purges both receipts: every receipt carries the expiry hint"
+    );
+    assert_eq!(0, receipt_count().await);
+
+    let blocked = patch()
+        .await
+        .expect_err("the retained intent blocks a re-execution under the same id");
+    assert!(
+        matches!(
+            &blocked,
+            CatalogError::AlreadyExists { entity, name }
+                if entity == "projection intent" && name == &operation_id
+        ),
+        "expected the projection-intent id conflict, got {blocked:?}"
+    );
+    assert_eq!(
+        0,
+        receipt_count().await,
+        "a replay that fails closed commits no receipt"
+    );
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let drained = materializer.drain_once().await.expect("drain");
+    assert_eq!(2, drained.drained_record_ids.len());
+    let trimmed = materializer.trim_once().await.expect("trim");
+    assert_eq!(drained.drained_record_ids, trimmed.trimmed_record_ids);
+    assert!(
+        store
+            .current_projection_outbox()
+            .await
+            .expect("outbox after trim")
+            .is_empty()
+    );
+
+    let reapplied = patch()
+        .await
+        .expect("once the intent is trimmed the keyed patch re-executes");
+    assert_eq!(first.id, reapplied.id);
+    assert_eq!(Some("patched".to_string()), reapplied.description);
+    assert_eq!(
+        1,
+        receipt_count().await,
+        "the re-execution writes one receipt"
+    );
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("outbox after the re-execution");
+    assert_eq!(1, outbox.len());
+    assert_eq!(operation_id, outbox[0].record_id());
+    assert_eq!("patch_catalog", intent_audit_family(&outbox[0]));
+    let second_origin = outbox[0]
+        .origin_sequence()
+        .expect("committed intent carries its origin sequence");
+    assert!(
+        second_origin > first_origin,
+        "the re-staged intent is a fresh incarnation: {second_origin} > {first_origin}"
+    );
+}
+
+/// The horizon purges a receipt only when its expiry (`occurredAtMs` + 24 h)
+/// lies strictly before the horizon clock minus the one-hour skew margin:
+/// not at `occurredAtMs` + 25 h, but one millisecond later.
+#[tokio::test]
+async fn a_receipt_becomes_purge_eligible_strictly_after_twenty_five_hours() {
+    let storage = scoped_storage();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    authority
+        .create_catalog("analytics", None, WriteOptions::with_idempotency("k"))
+        .await
+        .expect("keyed create");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents");
+    assert_eq!(1, outbox.len());
+    let occurred_at_ms = intent_audit_record(&outbox[0])
+        .get("occurredAtMs")
+        .and_then(serde_json::Value::as_i64)
+        .expect("audit occurredAtMs");
+    let occurred_at =
+        chrono::DateTime::from_timestamp_millis(occurred_at_ms).expect("valid occurredAtMs");
+    let boundary = occurred_at + chrono::Duration::hours(25);
+
+    let worker = DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        DurableAuthorityBinding::new([7; 32]),
+    )
+    .expect("maintenance worker");
+    assert!(
+        worker
+            .prepare_horizon_at(boundary)
+            .await
+            .expect("horizon preflight at the boundary")
+            .is_none(),
+        "expiry == cutoff is not strictly before it: nothing is eligible"
+    );
+    assert!(
+        worker
+            .prepare_horizon_at(boundary + chrono::Duration::milliseconds(1))
+            .await
+            .expect("horizon preflight past the boundary")
+            .is_some(),
+        "one millisecond past the boundary the receipt is eligible"
+    );
 }
 
 #[tokio::test]

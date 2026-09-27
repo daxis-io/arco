@@ -207,6 +207,10 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
     let receipt = sample.iter().find(|r| r.key().first() == Some(&3)).unwrap();
     assert!(sample.iter().all(|r| r.key().first() != Some(&4)));
     let mutations = 1_209_600_u64;
+    // Fixed synthetic acceptance clock: receipt `ordinal` is accepted 500 ms
+    // after the previous one and carries the production 24 h expiry hint, so
+    // the nullable expiry column is populated (monotone) like real receipts.
+    let base_occurred_at_ms: i64 = 1_800_000_000_000;
     let limits = half_segment_limits(PRODUCTION_SEGMENT_LIMITS);
     let started = Instant::now();
     let mut batch = Vec::new();
@@ -250,7 +254,11 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
             logical_sequence: mutations,
             logical_ordinal: index,
             origin_sequence: None,
-            expires_at_ms: None,
+            expires_at_ms: Some(
+                base_occurred_at_ms
+                    + i64::try_from(ordinal).unwrap() * 500
+                    + crate::catalog_authority::CATALOG_RECEIPT_RETENTION_MS,
+            ),
         });
     }
     if !batch.is_empty() {

@@ -49,7 +49,9 @@ const IDEMPOTENCY_KEY_TAG: u8 = 3;
 /// Retired key tag. Audit records left the authority KV in retention step 3
 /// (they are projection-only now); production never writes this tag again,
 /// and only fixtures that model historical authority-8 predecessor rows and
-/// the tests that assert the tag stays empty still name it.
+/// the tests that assert the tag stays empty still name it. Tag 4 is reserved
+/// forever: format-9 roots written before step 3 may still hold tag-4 rows,
+/// and nothing expires or deletes them.
 #[cfg(any(test, feature = "test-utils"))]
 const AUDIT_KEY_TAG: u8 = 4;
 const CATALOG_KIND: u8 = 1;
@@ -70,14 +72,24 @@ fn conflict_backoff(attempt: u32) -> Duration {
 pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
 
 /// How long a keyed catalog request stays replayable with its original
-/// response: 24 hours from the mutation's `occurred_at_ms`.
+/// response: at least 24 hours from when the adapter accepted the request
+/// (the audit record's `occurredAtMs`).
 ///
-/// Every idempotency receipt is written with this expiry as its
-/// purge-eligibility hint. The hint is never a read filter, so a receipt
-/// stays visible (and keeps short-circuiting replays) until a
+/// On format 9 every idempotency receipt is written with this expiry as its
+/// purge-eligibility hint; the test-only bounded format 8 refuses expiry
+/// hints and writes plain receipts. The hint is never a read filter, so a
+/// receipt stays visible (and keeps short-circuiting replays) until a
 /// `RetentionHorizon` maintenance job purges it, and that job only purges
 /// rows whose expiry lies more than one hour before its clock, adding a
 /// clock-skew margin on top of this window.
+///
+/// Once a receipt is purged its key is free again: a different request of the
+/// same operation family under the same key is no longer an idempotency
+/// conflict, and an identical one re-executes instead of returning the
+/// original response. Either re-execution reuses the deterministic operation
+/// id of its (operation family, idempotency key) pair, so while the earlier
+/// projection intent is still retained in the outbox it fails closed with an
+/// `AlreadyExists` projection-intent conflict and commits nothing.
 pub const CATALOG_RECEIPT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Non-blocking wake-up seam invoked after a catalog authority commit.
@@ -2716,7 +2728,10 @@ fn freeze_mutation(
     // The projection intent id is derived from the operation id alone, while
     // the receipt key is scoped by family. Folding the family into a keyed
     // operation id keeps one idempotency key reusable across families
-    // without colliding on that family-agnostic identity.
+    // without colliding on that family-agnostic identity. A keyed retry after
+    // its receipt was purged re-executes under the same operation id. While
+    // the earlier intent is still retained, staging fails closed with a
+    // projection-intent conflict until the worker drains and trims it.
     let operation_id = opts.idempotency_key.as_ref().map_or_else(
         || format!("op-{}", Ulid::new().to_string().to_ascii_lowercase()),
         |key| {
@@ -2936,11 +2951,11 @@ async fn stage_commit_records_v2(
     .await
 }
 
-/// Stages the receipt and the audit projection intent of one committed
-/// mutation. The receipt is the only commit record in the authority KV and
-/// carries [`CATALOG_RECEIPT_RETENTION_MS`] from the mutation's frozen
-/// `occurred_at_ms` as its purge-eligibility hint; the audit record is the
-/// intent payload and is never written as a KV row.
+/// Stages the receipt and the audit projection intent of the mutation this
+/// transaction will commit. The receipt is the only commit record in the
+/// authority KV and carries [`CATALOG_RECEIPT_RETENTION_MS`] from the
+/// mutation's frozen `occurred_at_ms` as its purge-eligibility hint; the audit
+/// record is the intent payload and is never written as a KV row.
 async fn stage_commit_records(
     txn: &mut ControlMvpTxn,
     frozen: &FrozenMutation,

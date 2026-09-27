@@ -1,4 +1,4 @@
-//! Capacity prerequisite using catalog-emitted receipt/audit bytes and the restore scanner.
+//! Capacity prerequisite using catalog-emitted receipt bytes and the restore scanner.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 use super::*;
 use crate::{CatalogPatch, ControlCatalogAuthority, WriteOptions};
@@ -135,7 +135,8 @@ async fn pilot_retained_catalog_inventory_exceeds_unchanged_restore_capacity() {
         CatalogError::MaintenanceBackpressure { .. }
     ));
     let report = serde_json::json!({
-        "status": "pilot-blocked", "successful_sample_mutations": 2,
+        "status": "pilot-blocked-without-retention-horizon",
+        "retention_horizon_modelled": false, "successful_sample_mutations": 2,
         "actual_receipt_rows": receipts.len(), "actual_audit_rows": audits.len(),
         "sample_key_value_bytes": sample_bytes, "required_mutations": mutations,
         "required_retained_rows": retained_rows, "restore_max_rows": MAX_SEGMENT_ROWS,

@@ -81,14 +81,9 @@ async fn observe_inner(
                 message: "prepared restore requires read-only candidate reconciliation".into(),
             });
         }
-        if !matches!(f.target, Target::Present { .. }) {
-            return Err(CatalogError::UnsupportedOperation {
-                message: "absent restore requires an authenticated target fence floor".into(),
-            });
-        }
         Ok(())
     })?);
-    let Target::Present {
+    if let Target::Present {
         current_pointer_raw_b64,
         current_pointer_version,
         writer_epoch,
@@ -96,82 +91,94 @@ async fn observe_inner(
         manifest: target_manifest,
         ..
     } = &f.target
-    else {
-        unreachable!("admitted target presence check returned an error");
-    };
-    let found = read_restore_gate_record(io, route, RestoreGateRecord::Head).await?;
-    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
-        if found.is_none() {
-            return Err(CatalogError::AmbiguousAuthorityOutcome {
-                message: "present restore target HEAD disappeared".into(),
-            });
-        }
-        Ok(())
-    })?);
-    let Some((head, metadata)) = found else {
-        unreachable!("admitted HEAD presence check returned an error");
-    };
-    let same = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
-        Ok(metadata.value().version == *current_pointer_version
-            && head.as_slice() == binary(current_pointer_raw_b64)?)
-    })?;
-    if !*same.value() {
-        return Ok(Observation::Superseded);
-    }
-    let pointer = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
-        let pointer: control::ControlMvpPointer =
-            control::decode_json(head.as_slice(), "restore admission HEAD")?;
-        pointer.validate_versioned(&store.scope, 8)?;
-        Ok(pointer)
-    })?;
-    let p = pointer.value();
-    let (current, size) =
-        read_manifest(io, route, &p.manifest_id, &p.manifest_checksum_sha256).await?;
-    drop(decode_with_reservation(
-        io,
-        route,
-        Some(2 * 1024 * 1024),
-        || {
-            let m = current.value();
-            if m.logical_sequence != p.logical_sequence
-                || p.writer_epoch < m.writer_epoch
-                || p.reclamation_generation < m.reclamation_generation
-            {
-                return Err(invariant_violation(
-                    "restore admission HEAD manifest binding differs",
-                ));
+    {
+        let found = read_restore_gate_record(io, route, RestoreGateRecord::Head).await?;
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if found.is_none() {
+                return Err(CatalogError::AmbiguousAuthorityOutcome {
+                    message: "present restore target HEAD disappeared".into(),
+                });
             }
             Ok(())
-        },
-    )?);
-    drop(decode_with_reservation(
-        io,
-        route,
-        Some(2 * 1024 * 1024),
-        || {
-            control::validate_publication_epoch(store.writer_epoch, *writer_epoch)?;
-            if size != target_manifest.byte_size
-                || p.writer_epoch != *writer_epoch
-                || p.reclamation_generation != *reclamation_generation
-            {
-                return Err(invariant_violation(
-                    "restore admission target size or fences differ",
-                ));
-            }
-            verify_roots(
-                store,
-                current.value(),
-                f.base_logical_sequence,
-                &f.base_history_sha256,
-                [
-                    &f.base_kv_root_b64,
-                    &f.base_active_id_root_b64,
-                    &f.base_delivery_order_root_b64,
-                ],
+        })?);
+        let Some((head, metadata)) = found else {
+            unreachable!("admitted HEAD presence check returned an error");
+        };
+        let same = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
+            Ok(metadata.value().version == *current_pointer_version
+                && head.as_slice() == binary(current_pointer_raw_b64)?)
+        })?;
+        if !*same.value() {
+            return Ok(Observation::Superseded);
+        }
+        let pointer = decode_with_reservation(io, route, Some(2 * 1024 * 1024), || {
+            let pointer: control::ControlMvpPointer =
+                control::decode_json(head.as_slice(), "restore admission HEAD")?;
+            pointer.validate_versioned(&store.scope, 8)?;
+            Ok(pointer)
+        })?;
+        let p = pointer.value();
+        let (current, size) =
+            read_manifest(io, route, &p.manifest_id, &p.manifest_checksum_sha256).await?;
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(2 * 1024 * 1024),
+            || {
+                let m = current.value();
+                if m.logical_sequence != p.logical_sequence
+                    || p.writer_epoch < m.writer_epoch
+                    || p.reclamation_generation < m.reclamation_generation
+                {
+                    return Err(invariant_violation(
+                        "restore admission HEAD manifest binding differs",
+                    ));
+                }
+                Ok(())
+            },
+        )?);
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(2 * 1024 * 1024),
+            || {
+                control::validate_publication_epoch(store.writer_epoch, *writer_epoch)?;
+                if size != target_manifest.byte_size
+                    || p.writer_epoch != *writer_epoch
+                    || p.reclamation_generation != *reclamation_generation
+                {
+                    return Err(invariant_violation(
+                        "restore admission target size or fences differ",
+                    ));
+                }
+                verify_roots(
+                    store,
+                    current.value(),
+                    f.base_logical_sequence,
+                    &f.base_history_sha256,
+                    [
+                        &f.base_kv_root_b64,
+                        &f.base_active_id_root_b64,
+                        &f.base_delivery_order_root_b64,
+                    ],
+                )
+            },
+        )?);
+        drop((same, current, pointer, head, metadata));
+    } else {
+        let Some(floors) = super::super::fence::observe(io, route).await? else {
+            return Ok(Observation::Superseded);
+        };
+        let matches = decode_with_reservation(io, route, Some(64 * 1024), || {
+            Ok(
+                matches!(&f.target, Target::Absent { observed_writer_epoch, observed_reclamation_generation, .. }
+                if *observed_writer_epoch == floors.writer && *observed_reclamation_generation == floors.reclamation),
             )
-        },
-    )?);
-    drop((same, current, pointer, head, metadata));
+        })?;
+        if !*matches.value() {
+            return Ok(Observation::Superseded);
+        }
+    }
     let (source, size) = read_manifest(
         io,
         route,
@@ -186,6 +193,13 @@ async fn observe_inner(
         || {
             if size != f.source_manifest.byte_size {
                 return Err(invariant_violation("restore admission source size differs"));
+            }
+            if matches!(f.target, Target::Absent { .. }) {
+                super::super::fence::verify_source(
+                    &f.target,
+                    source.value().writer_epoch,
+                    source.value().reclamation_generation,
+                )?;
             }
             verify_roots(
                 store,
@@ -304,6 +318,50 @@ mod tests {
         drop(selected);
         assert_eq!(io.live_ownership_evidence(), (0, 0));
     }
+    #[tokio::test]
+    async fn restore_admission_absent_proof_is_required_and_sticky() {
+        for missing in [false, true] {
+            let (store, plan) = super::super::super::tests::absent_inspection_fixture().await;
+            if missing {
+                store
+                    .retention
+                    .delete(&store.absent_restore_fence.as_ref().expect("pin").path)
+                    .await
+                    .expect("remove proof");
+            }
+            let now = plan.fields.requested_at.datetime().expect("time");
+            let digest = prefixed_sha256(&jcs(&plan).expect("plan"));
+            let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 128 * 1024 * 1024);
+            let mut workspace = WorkspaceIoBudget::new();
+            let mut payload = UnitPayloadAdmission::new();
+            let mut route = RestorePhysicalRoute::OrdinaryUnit {
+                workspace: &mut workspace,
+                payload: &mut payload,
+            };
+            let selected = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
+                Ok(OwnedSelectedPlan {
+                    plan,
+                    plan_sha256: digest,
+                })
+            })
+            .expect("selected");
+            let result = observe(&mut io, &mut route, &selected, now).await;
+            if missing {
+                assert!(result.is_err());
+                let reads = io.reading_evidence();
+                assert!(observe(&mut io, &mut route, &selected, now).await.is_err());
+                assert_eq!(io.reading_evidence(), reads);
+            } else {
+                assert_eq!(
+                    result.expect("authenticated absent source"),
+                    Observation::Unchanged
+                );
+            }
+            assert_eq!(io.writing_evidence(), (0, 0));
+            assert_eq!(io.allocation_underestimates(), 0);
+        }
+    }
+
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,

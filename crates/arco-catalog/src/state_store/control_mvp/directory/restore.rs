@@ -1,17 +1,401 @@
 //! Native restore traversal of a caller-authenticated directory root.
 use super::super::physical::restore_io::{
     AccountedBytes, DIRECTORY_FIXED_ALLOCATION_BYTES, RestorePhysicalIo, RestorePhysicalRoute,
-    WorkingValue, decode_with_reservation, directory_scope_reservation,
+    WorkingValue, decode_with_reservation, directory_scope_reservation, encode_with_reservation,
+    write_directory_output,
 };
 use super::{
-    DEPTH, Directory, FANOUT, INLINE_KEY_BYTES, KeyRef, Leaf, MAX_BLOCK_BYTES, Node,
-    PAGE_PROBE_LIMIT, Result, Root, decode_page, invariant_violation, page_probe_bytes,
+    DEPTH, Directory, FANOUT, HEADER_BYTES, INLINE_KEY_BYTES, KeyRef, Leaf, MAX_BLOCK_BYTES, Node,
+    PAGE_LIMIT, PAGE_PROBE_LIMIT, Result, Root, decode_page, invariant_violation, page_probe_bytes,
     validate_key_shape, validate_node,
 };
 
 pub(in super::super) struct Position {
     pub leaf: Leaf,
     pub path: Vec<([u8; 32], u32)>,
+}
+
+pub(in super::super) struct NativePathCopy {
+    directory: Directory,
+    root: Root,
+    selected: Option<Position>,
+    replacements: Vec<Leaf>,
+    pages: [Vec<Node>; DEPTH],
+    scratch: Vec<Node>,
+    page: Vec<Node>,
+    pending: Vec<Node>,
+    cursor: Node,
+    read_index: usize,
+    write_index: usize,
+    phase: CopyPhase,
+}
+
+#[derive(Clone, Copy)]
+enum CopyPhase {
+    Read,
+    Write,
+    Root,
+    Done,
+}
+
+impl NativePathCopy {
+    pub(in super::super) const fn reservation() -> usize {
+        4 * 1024 * 1024
+    }
+
+    pub(in super::super) fn new(
+        directory: Directory,
+        root: &Root,
+        selected: Option<&Position>,
+        replacements: &[Leaf],
+    ) -> Result<Self> {
+        if root.scope != directory.scope || root.node.depth == 0 || root.node.depth as usize > DEPTH
+        {
+            return Err(invariant_violation("notice path copy root differs"));
+        }
+        validate_node(&root.node, true)?;
+        if replacements.is_empty() || replacements.len() > 2 {
+            return Err(super::capacity("notice path copy replacement limit"));
+        }
+        for leaf in replacements {
+            if leaf.first > leaf.last
+                || leaf.first.len() > MAX_BLOCK_BYTES
+                || leaf.last.len() > MAX_BLOCK_BYTES
+                || leaf.rows == 0
+                || leaf.bytes == 0
+                || leaf.bytes as usize > MAX_BLOCK_BYTES
+            {
+                return Err(invariant_violation("invalid notice replacement leaf"));
+            }
+        }
+        let (phase, write_index) = if let Some(position) = selected {
+            if position.path.len() != root.node.depth as usize
+                || position.path.first().map(|entry| entry.0) != Some(root.node.digest)
+            {
+                return Err(invariant_violation("notice path copy position differs"));
+            }
+            (CopyPhase::Read, 0)
+        } else if *root == directory.empty_root_reference()? {
+            (CopyPhase::Write, 1)
+        } else {
+            return Err(invariant_violation("notice path copy lost selected leaf"));
+        };
+        Ok(Self {
+            directory,
+            root: root.clone(),
+            selected: selected.map(|position| Position {
+                leaf: position.leaf.clone(),
+                path: position.path.clone(),
+            }),
+            replacements: replacements.to_vec(),
+            pages: std::array::from_fn(|_| Vec::with_capacity(FANOUT)),
+            scratch: Vec::with_capacity(FANOUT + 2),
+            page: Vec::with_capacity(FANOUT),
+            pending: Vec::with_capacity(2),
+            cursor: root.node,
+            read_index: 0,
+            write_index,
+            phase,
+        })
+    }
+
+    pub(in super::super) async fn advance(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> Result<Option<Root>> {
+        let result = match self.phase {
+            CopyPhase::Read => self.read_one(io, route).await,
+            CopyPhase::Write => self.write_one(io, route).await,
+            CopyPhase::Root => {
+                let depth = self
+                    .root
+                    .node
+                    .depth
+                    .checked_add(1)
+                    .ok_or_else(|| super::capacity("notice directory depth overflow"))?;
+                let node =
+                    write_page_native(&self.directory, io, route, depth, &self.pending).await?;
+                self.phase = CopyPhase::Done;
+                Ok(Some(Root {
+                    scope: self.directory.scope,
+                    node,
+                }))
+            }
+            CopyPhase::Done => Err(invariant_violation("directory path copy already finished")),
+        };
+        if result.is_err() {
+            self.phase = CopyPhase::Done;
+        }
+        result
+    }
+
+    async fn read_one(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> Result<Option<Root>> {
+        let selected = self
+            .selected
+            .as_ref()
+            .ok_or_else(|| invariant_violation("notice selected path is absent"))?;
+        let (digest, slot) = *selected
+            .path
+            .get(self.read_index)
+            .ok_or_else(|| invariant_violation("notice path ended early"))?;
+        if self.cursor.digest != digest {
+            return Err(invariant_violation("notice selected page digest differs"));
+        }
+        let bytes = io
+            .directory_object(
+                route,
+                false,
+                &self.cursor.digest,
+                self.cursor.bytes as usize,
+            )
+            .await?;
+        let children = decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES + FANOUT * size_of::<Node>()),
+            || decode_children(&self.directory, self.cursor, bytes.as_slice()),
+        )?;
+        drop(bytes);
+        check_order_native(&self.directory, io, route, children.value()).await?;
+        let child = *children
+            .value()
+            .get(slot as usize)
+            .ok_or_else(|| invariant_violation("notice path child is absent"))?;
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
+            || {
+                let page = self
+                    .pages
+                    .get_mut(self.read_index)
+                    .ok_or_else(|| super::capacity("notice path depth exceeded"))?;
+                page.extend_from_slice(children.value());
+                self.cursor = child;
+                self.read_index += 1;
+                Ok(())
+            },
+        )?);
+        if self.read_index == selected.path.len() {
+            let leaf = &selected.leaf;
+            let expected = Node {
+                depth: 0,
+                first: self.directory.key_ref(&leaf.first)?,
+                last: self.directory.key_ref(&leaf.last)?,
+                rows: leaf.rows,
+                bytes: leaf.bytes,
+                digest: leaf.digest,
+            };
+            if self.cursor != expected {
+                return Err(invariant_violation("notice selected leaf differs"));
+            }
+            self.write_index = self.read_index;
+            self.phase = CopyPhase::Write;
+        }
+        Ok(None)
+    }
+
+    async fn seed_replacements(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> Result<()> {
+        for leaf in &self.replacements {
+            let first = write_key_native(&self.directory, io, route, &leaf.first).await?;
+            let last = write_key_native(&self.directory, io, route, &leaf.last).await?;
+            self.pending.push(Node {
+                depth: 0,
+                first,
+                last,
+                rows: leaf.rows,
+                bytes: leaf.bytes,
+                digest: leaf.digest,
+            });
+        }
+        Ok(())
+    }
+
+    async fn write_one(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> Result<Option<Root>> {
+        if self.pending.is_empty() {
+            self.seed_replacements(io, route).await?;
+        }
+        let level = self
+            .write_index
+            .checked_sub(1)
+            .ok_or_else(|| invariant_violation("notice path write depth underflow"))?;
+        let old = self
+            .pages
+            .get(level)
+            .ok_or_else(|| super::capacity("notice path write depth exceeded"))?;
+        let slot = self.selected.as_ref().map_or(Ok(0), |position| {
+            position
+                .path
+                .get(level)
+                .map(|entry| entry.1 as usize)
+                .ok_or_else(|| invariant_violation("notice path replacement level is absent"))
+        })?;
+        let skip = usize::from(self.selected.is_some());
+        let end = slot
+            .checked_add(skip)
+            .filter(|end| *end <= old.len())
+            .ok_or_else(|| invariant_violation("notice path replacement slot differs"))?;
+        let before = old
+            .get(..slot)
+            .ok_or_else(|| invariant_violation("notice path prefix is absent"))?;
+        let after = old
+            .get(end..)
+            .ok_or_else(|| invariant_violation("notice path suffix is absent"))?;
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
+            || {
+                self.scratch.clear();
+                self.scratch.extend_from_slice(before);
+                self.scratch.extend_from_slice(&self.pending);
+                self.scratch.extend_from_slice(after);
+                self.pending.clear();
+                Ok(())
+            },
+        )?);
+        check_order_native(&self.directory, io, route, &self.scratch).await?;
+        self.page.clear();
+        let depth_offset =
+            u8::try_from(level).map_err(|_| super::capacity("notice path page depth overflow"))?;
+        let depth = self
+            .root
+            .node
+            .depth
+            .checked_sub(depth_offset)
+            .ok_or_else(|| super::capacity("notice path page depth underflow"))?;
+        for index in 0..self.scratch.len() {
+            let node = *self
+                .scratch
+                .get(index)
+                .ok_or_else(|| invariant_violation("notice path child is absent"))?;
+            let added = page_probe_bytes(std::slice::from_ref(&node))? - HEADER_BYTES - 1;
+            if !self.page.is_empty()
+                && (self.page.len() == FANOUT
+                    || page_probe_bytes(&self.page)? + added > PAGE_PROBE_LIMIT)
+            {
+                let parent =
+                    write_page_native(&self.directory, io, route, depth, &self.page).await?;
+                self.push_pending(parent)?;
+                self.page.clear();
+            }
+            self.page.push(node);
+        }
+        if !self.page.is_empty() {
+            let parent = write_page_native(&self.directory, io, route, depth, &self.page).await?;
+            self.push_pending(parent)?;
+        }
+        self.write_index = level;
+        if level != 0 {
+            return Ok(None);
+        }
+        match self.pending.as_slice() {
+            [node] => {
+                self.phase = CopyPhase::Done;
+                Ok(Some(Root {
+                    scope: self.directory.scope,
+                    node: *node,
+                }))
+            }
+            [_, _] => {
+                self.phase = CopyPhase::Root;
+                Ok(None)
+            }
+            _ => Err(super::capacity("notice path root fanout differs")),
+        }
+    }
+
+    fn push_pending(&mut self, node: Node) -> Result<()> {
+        if self.pending.len() == 2 {
+            return Err(super::capacity("notice path page split exceeds two pages"));
+        }
+        self.pending.push(node);
+        Ok(())
+    }
+}
+
+async fn check_order_native(
+    directory: &Directory,
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    nodes: &[Node],
+) -> Result<()> {
+    let mut previous: Option<Fence<'_>> = None;
+    for node in nodes {
+        let first = read_fence(io, route, directory, &node.first).await?;
+        let last = read_fence(io, route, directory, &node.last).await?;
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
+            || {
+                if first.as_slice() > last.as_slice()
+                    || previous
+                        .as_ref()
+                        .is_some_and(|prior| prior.as_slice() >= first.as_slice())
+                {
+                    return Err(invariant_violation(
+                        "overlapping notice directory boundaries",
+                    ));
+                }
+                Ok(())
+            },
+        )?);
+        previous = Some(last);
+    }
+    Ok(())
+}
+
+async fn write_key_native(
+    directory: &Directory,
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    bytes: &[u8],
+) -> Result<KeyRef> {
+    let key = decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+        directory.key_ref(bytes)
+    })?;
+    if bytes.len() > INLINE_KEY_BYTES {
+        write_directory_output(io, route, true, &key.value().digest, bytes).await?;
+    }
+    Ok(*key.value())
+}
+
+async fn write_page_native(
+    directory: &Directory,
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    depth: u8,
+    children: &[Node],
+) -> Result<Node> {
+    let encoded = encode_with_reservation(
+        io,
+        route,
+        DIRECTORY_FIXED_ALLOCATION_BYTES + PAGE_LIMIT,
+        || directory.page_node(depth, children),
+    )?;
+    write_directory_output(
+        io,
+        route,
+        false,
+        &encoded.value().0.digest,
+        &encoded.value().1,
+    )
+    .await?;
+    Ok(encoded.value().0)
 }
 
 /// The caller supplies the exact root authenticated by its selected Plan7 role.
@@ -23,7 +407,7 @@ pub(in super::super) async fn first_after(
     root: &Root,
     after: Option<&[u8]>,
 ) -> Result<WorkingValue<Option<Position>>> {
-    let result = first_after_inner(io, route, root, after, false).await;
+    let result = first_after_inner(io, route, root, after, false, false).await;
     if result.is_err() {
         io.stop(route);
     }
@@ -37,7 +421,20 @@ pub(in super::super) async fn first_at_or_after(
     root: &Root,
     key: &[u8],
 ) -> Result<WorkingValue<Option<Position>>> {
-    let result = first_after_inner(io, route, root, Some(key), true).await;
+    let result = first_after_inner(io, route, root, Some(key), true, false).await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+pub(in super::super) async fn floor_at_or_before(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    root: &Root,
+    key: &[u8],
+) -> Result<WorkingValue<Option<Position>>> {
+    let result = first_after_inner(io, route, root, Some(key), true, true).await;
     if result.is_err() {
         io.stop(route);
     }
@@ -54,6 +451,7 @@ async fn first_after_inner(
     root: &Root,
     after: Option<&[u8]>,
     inclusive: bool,
+    floor: bool,
 ) -> Result<WorkingValue<Option<Position>>> {
     let store = io.store();
     let reservation = directory_scope_reservation(store)?;
@@ -107,9 +505,14 @@ async fn first_after_inner(
                     Ok(())
                 })?;
             drop(checked);
-            if selected.is_none()
-                && after.is_none_or(|a| last.as_slice() > a || (inclusive && last.as_slice() == a))
-            {
+            let choose = if floor {
+                selected.is_none() || after.is_some_and(|a| first.as_slice() <= a)
+            } else {
+                selected.is_none()
+                    && after
+                        .is_none_or(|a| last.as_slice() > a || (inclusive && last.as_slice() == a))
+            };
+            if choose {
                 let index = u32::try_from(index)
                     .map_err(|_| invariant_violation("directory child index overflow"))?;
                 selected = Some((index, *child));
@@ -448,21 +851,7 @@ impl NativeBuilder {
         route: &mut RestorePhysicalRoute<'_, '_>,
         bytes: &[u8],
     ) -> Result<KeyRef> {
-        let key =
-            decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
-                self.directory.key_ref(bytes)
-            })?;
-        if bytes.len() > INLINE_KEY_BYTES {
-            super::super::physical::restore_io::write_directory_output(
-                io,
-                route,
-                true,
-                &key.value().digest,
-                bytes,
-            )
-            .await?;
-        }
-        Ok(*key.value())
+        write_key_native(&self.directory, io, route, bytes).await
     }
 
     async fn push_node(
@@ -475,8 +864,7 @@ impl NativeBuilder {
             let level = usize::from(node.depth);
             let flush =
                 decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
-                    let added =
-                        page_probe_bytes(std::slice::from_ref(&node))? - super::HEADER_BYTES - 1;
+                    let added = page_probe_bytes(std::slice::from_ref(&node))? - HEADER_BYTES - 1;
                     let page = self
                         .levels
                         .get_mut(level)
@@ -577,21 +965,6 @@ impl NativeBuilder {
         depth: u8,
         children: &[Node],
     ) -> Result<Node> {
-        use super::super::physical::restore_io::{encode_with_reservation, write_directory_output};
-        let encoded = encode_with_reservation(
-            io,
-            route,
-            DIRECTORY_FIXED_ALLOCATION_BYTES + super::PAGE_LIMIT,
-            || self.directory.page_node(depth, children),
-        )?;
-        write_directory_output(
-            io,
-            route,
-            false,
-            &encoded.value().0.digest,
-            &encoded.value().1,
-        )
-        .await?;
-        Ok(encoded.value().0)
+        write_page_native(&self.directory, io, route, depth, children).await
     }
 }

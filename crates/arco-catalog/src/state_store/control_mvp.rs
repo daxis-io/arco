@@ -156,7 +156,7 @@ mod physical;
 mod retained;
 #[cfg(feature = "test-utils")]
 pub use bounded::SyntheticKvEntry;
-pub use bounded::restore::ControlMvpRestorePlanV7;
+pub use bounded::restore::{ControlMvpRestoreFenceWitness, ControlMvpRestorePlanV7};
 pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
 pub(crate) use retained::{RetainedSourcePublication, VerifiedRetainedPointer};
 #[cfg(test)]
@@ -245,6 +245,7 @@ pub struct ControlMvpStateStore {
     read_cache: Option<ControlMvpReadCache>,
     cache_namespace: Option<DurableAuthorityBinding>,
     durable_authority_binding: Option<Arc<DurableAuthorityBinding>>,
+    absent_restore_fence: Option<Arc<ControlMvpRestoreFenceWitness>>,
     bounded_recovery_bytes: Option<Arc<std::sync::Mutex<usize>>>,
 }
 
@@ -609,6 +610,7 @@ impl ControlMvpStateStore {
             read_cache: None,
             cache_namespace: None,
             durable_authority_binding: None,
+            absent_restore_fence: None,
             bounded_recovery_bytes: None,
         };
         store.with_read_cache_config(ControlMvpReadCacheConfig::default())
@@ -632,6 +634,14 @@ impl ControlMvpStateStore {
     #[must_use]
     pub fn with_durable_authority_binding(mut self, binding: DurableAuthorityBinding) -> Self {
         self.durable_authority_binding = Some(Arc::new(binding));
+        self
+    }
+
+    /// Supplies an externally pinned fence witness for absent authority-8 restore.
+    /// The caller must obtain this pin from trusted composition, never restore records.
+    #[must_use]
+    pub fn with_absent_restore_fence(mut self, witness: ControlMvpRestoreFenceWitness) -> Self {
+        self.absent_restore_fence = Some(Arc::new(witness));
         self
     }
 

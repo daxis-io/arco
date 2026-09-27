@@ -103,9 +103,9 @@ enum ManifestKind8 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ArtifactRef {
-    path: String,
-    sha256: String,
+pub(super) struct ArtifactRef {
+    pub(super) path: String,
+    pub(super) sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1867,18 +1867,7 @@ async fn write_projection_source(
     logical_commit_id: &str,
     kv_root: &directory::Root,
 ) -> Result<ArtifactRef> {
-    let source = ProjectionSource8 {
-        encoding_version: 1,
-        scope: store.scope.clone(),
-        logical_sequence: sequence,
-        logical_commit_id: logical_commit_id.to_owned(),
-        kv_root_hex: hex::encode(kv_root.encode()),
-    };
-    let bytes = encode_json_limited(
-        &source,
-        super::MAX_CONTROL_JSON_BYTES,
-        "bounded projection source",
-    )?;
+    let bytes = projection_source_bytes(store, sequence, logical_commit_id, kv_root)?;
     let sha256 = sha256_hex(&bytes);
     let path = format!(
         "{}/projection-sources/{sha256}.json",
@@ -1892,6 +1881,45 @@ async fn write_projection_source(
     )
     .await?;
     Ok(ArtifactRef { path, sha256 })
+}
+
+fn projection_source_bytes(
+    store: &ControlMvpStateStore,
+    sequence: u64,
+    logical_commit_id: &str,
+    kv_root: &directory::Root,
+) -> Result<Bytes> {
+    let source = ProjectionSource8 {
+        encoding_version: 1,
+        scope: store.scope.clone(),
+        logical_sequence: sequence,
+        logical_commit_id: logical_commit_id.to_owned(),
+        kv_root_hex: hex::encode(kv_root.encode()),
+    };
+    encode_json_limited(
+        &source,
+        super::MAX_CONTROL_JSON_BYTES,
+        "bounded projection source",
+    )
+}
+
+async fn write_restore_projection_source(
+    io: &mut physical::restore_io::RestorePhysicalIo<'_>,
+    route: &mut physical::restore_io::RestorePhysicalRoute<'_, '_>,
+    sequence: u64,
+    logical_commit_id: &str,
+    kv_root: &directory::Root,
+) -> Result<physical::restore_io::WorkingValue<ArtifactRef>> {
+    let store = io.store();
+    let bytes = physical::restore_io::encode_with_reservation(io, route, 8 * 1024 * 1024, || {
+        if sequence == 0 || !valid_raw_digest(logical_commit_id) {
+            return Err(invariant_violation(
+                "restore projection source identity is invalid",
+            ));
+        }
+        projection_source_bytes(store, sequence, logical_commit_id, kv_root)
+    })?;
+    physical::restore_io::write_restore_projection_source_output(io, route, &bytes).await
 }
 
 fn outbox_mutations(
@@ -3635,6 +3663,405 @@ mod tests {
 
     use super::*;
     use crate::state_store::{ArcoStateTxn, StateScope, TxnOptions};
+
+    #[tokio::test]
+    async fn restore_notice_outputs_are_readable_in_both_outbox_roles() {
+        use physical::restore_io::{
+            FinalMicrochunk, FinalStreamTotals, RestorePhysicalIo, RestorePhysicalRoute,
+            UnitPayloadAdmission, decode_with_reservation, write_restore_outbox_output,
+        };
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let notice = logical_v2::ProjectionIntentV2::new(
+            "notice-id",
+            "restore",
+            store.scope.clone(),
+            2,
+            "ac".repeat(32),
+            0,
+            b"notice",
+        )
+        .expect("notice");
+        let source = ArtifactRef {
+            path: "unused".into(),
+            sha256: "bb".repeat(32),
+        };
+        let (active, delivery) =
+            outbox_mutations(&[notice], &[], 2, Some(&source)).expect("paired notice rows");
+        for (role, mutation, id) in [
+            (physical::Role::ActiveId, active, "81".repeat(32)),
+            (physical::Role::DeliveryOrder, delivery, "82".repeat(32)),
+        ] {
+            let (_, row) = mutation.into_iter().next().expect("one notice row");
+            let row = row.expect("addition");
+            for final_stream in [false, true] {
+                let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+                let mut totals = FinalStreamTotals::new();
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
+                let mut workspace = crate::workspace_io_budget::WorkspaceIoBudget::new();
+                let mut payload = UnitPayloadAdmission::new();
+                let mut route = if final_stream {
+                    RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+                } else {
+                    RestorePhysicalRoute::OrdinaryUnit {
+                        workspace: &mut workspace,
+                        payload: &mut payload,
+                    }
+                };
+                let rows = decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+                    Ok(vec![row.clone()])
+                })
+                .expect("owned notice row");
+                let output = write_restore_outbox_output(&mut io, &mut route, role, &id, 2, &rows)
+                    .await
+                    .expect("outbox output");
+                assert_eq!(output.descriptor.value().role, role);
+                let leaf = directory::Leaf {
+                    first: rows.value()[0].key.clone(),
+                    last: rows.value()[0].key.clone(),
+                    rows: 1,
+                    bytes: u32::try_from(output.descriptor.value().block.length).expect("length"),
+                    digest: output.digest,
+                };
+                assert_eq!(
+                    store
+                        .resolve_physical_block(role, &leaf)
+                        .await
+                        .expect("read back"),
+                    *rows.value()
+                );
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated role fixture checks insertion and directory read-back"
+    )]
+    async fn assert_restore_notice_splice(role: physical::Role, old_id: &str, new_id: &str) {
+        use physical::restore_io::{
+            FinalMicrochunk, FinalStreamTotals, RestorePhysicalIo, RestorePhysicalRoute,
+            decode_with_reservation, splice_restore_notice_role,
+        };
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let source = ArtifactRef {
+            path: "unused".into(),
+            sha256: "bb".repeat(32),
+        };
+        let notice = |id, sequence| {
+            logical_v2::ProjectionIntentV2::new(
+                id,
+                "restore",
+                store.scope.clone(),
+                sequence,
+                "ac".repeat(32),
+                0,
+                b"notice",
+            )
+            .expect("notice")
+        };
+        let notice_row = |id, sequence| {
+            let (active, delivery) =
+                outbox_mutations(&[notice(id, sequence)], &[], sequence, Some(&source))
+                    .expect("paired rows");
+            let rows = if role == physical::Role::ActiveId {
+                active
+            } else {
+                delivery
+            };
+            rows.into_values()
+                .next()
+                .expect("outbox row")
+                .expect("addition")
+        };
+        let old_row = notice_row(old_id, 1);
+        let next_row = notice_row(new_id, 2);
+        let mut expected_keys = [old_row.key.clone(), next_row.key.clone()];
+        expected_keys.sort();
+        let old_leaf = persist_role_rows(&store, role, &"81".repeat(32), 0, 1, &[old_row])
+            .await
+            .expect("inherited output")
+            .pop()
+            .expect("inherited leaf");
+        let directory =
+            directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let mut builder = directory.builder();
+        builder
+            .push(old_leaf.clone())
+            .await
+            .expect("inherited leaf");
+        let root = builder.finish().await.expect("inherited root");
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut totals = FinalStreamTotals::new();
+        let (selected, row) = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("selection");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let selected =
+                directory::restore::floor_at_or_before(&mut io, &mut route, &root, &next_row.key)
+                    .await
+                    .expect("inherited selection");
+            let row = decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+                Ok(next_row)
+            })
+            .expect("owned notice");
+            (selected, row)
+        };
+        let first_id = "82".repeat(32);
+        let second_id = "83".repeat(32);
+        let edit = splice_restore_notice_role(
+            &mut io,
+            &mut totals,
+            role,
+            &root,
+            &selected,
+            &row,
+            [&first_id, &second_id],
+        )
+        .await
+        .expect("metered inherited splice");
+        assert_eq!(edit.value().old, Some(old_leaf.clone()));
+        let expected = directory
+            .update(
+                &root,
+                &[directory::update::Edit {
+                    old: Some(old_leaf),
+                    new: edit.value().new.clone(),
+                }],
+                &mut directory::ReadBudget::default(),
+            )
+            .await
+            .expect("ordinary root oracle");
+        assert_eq!(edit.value().root, expected);
+        let rows = store
+            .resolve_physical_block(role, edit.value().new.first().expect("replacement leaf"))
+            .await
+            .expect("notice read-back");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.first().expect("first row").key, expected_keys[0]);
+        assert_eq!(rows.last().expect("last row").key, expected_keys[1]);
+        assert!(rows.iter().all(|row| row.logical_sequence == 2));
+        drop(edit);
+        drop(selected);
+        drop(row);
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn restore_notice_splice_preserves_inherited_roles() {
+        assert_restore_notice_splice(physical::Role::ActiveId, "notice-a", "notice-b").await;
+        assert_restore_notice_splice(physical::Role::ActiveId, "notice-b", "notice-a").await;
+        assert_restore_notice_splice(physical::Role::DeliveryOrder, "notice-a", "notice-b").await;
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one near-limit fixture checks both written partitions and copied root"
+    )]
+    async fn restore_notice_splice_splits_full_active_leaf() {
+        use physical::restore_io::{
+            FinalMicrochunk, FinalStreamTotals, RestorePhysicalIo, RestorePhysicalRoute,
+            decode_with_reservation, splice_restore_notice_role, standard_output_reservation,
+            write_restore_outbox_output,
+        };
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let source = ArtifactRef {
+            path: "unused".into(),
+            sha256: "bb".repeat(32),
+        };
+        let active = |id: &str, sequence| {
+            let notice = logical_v2::ProjectionIntentV2::new(
+                id,
+                "restore",
+                store.scope.clone(),
+                sequence,
+                "ac".repeat(32),
+                0,
+                b"notice",
+            )
+            .expect("notice");
+            let (active, _) =
+                outbox_mutations(&[notice], &[], sequence, Some(&source)).expect("paired rows");
+            active
+                .into_values()
+                .next()
+                .expect("active row")
+                .expect("addition")
+        };
+        let mut inherited = Vec::new();
+        let mut ordinal = 0;
+        let next_row = loop {
+            let id = format!("notice-{ordinal:04}");
+            inherited.push(active(&id, 1));
+            if standard_output_reservation(&inherited).is_err() {
+                inherited.pop();
+                break active(&id, 2);
+            }
+            ordinal += 1;
+            assert!(ordinal < 2000, "fixture must reach one block admission");
+        };
+        assert!(inherited.len() > 1);
+        let mut overflow = inherited.clone();
+        overflow.push(next_row.clone());
+        assert!(standard_output_reservation(&overflow).is_err());
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut totals = FinalStreamTotals::new();
+        let old_leaf = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("old output");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let rows = decode_with_reservation(&mut io, &mut route, Some(4 * 1024 * 1024), || {
+                Ok(inherited.clone())
+            })
+            .expect("owned inherited rows");
+            let output = write_restore_outbox_output(
+                &mut io,
+                &mut route,
+                physical::Role::ActiveId,
+                &"81".repeat(32),
+                1,
+                &rows,
+            )
+            .await
+            .expect("single inherited output");
+            let leaf = directory::Leaf {
+                first: inherited.first().expect("first row").key.clone(),
+                last: inherited.last().expect("last row").key.clone(),
+                rows: output.descriptor.value().block.row_count,
+                bytes: u32::try_from(output.descriptor.value().block.length).expect("length"),
+                digest: output.digest,
+            };
+            drop(output);
+            drop(rows);
+            let _ = chunk.finish();
+            leaf
+        };
+        let directory =
+            directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let mut builder = directory.builder();
+        builder
+            .push(old_leaf.clone())
+            .await
+            .expect("inherited leaf");
+        let root = builder.finish().await.expect("inherited root");
+        let (selected, row) = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("selection");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let selected =
+                directory::restore::floor_at_or_before(&mut io, &mut route, &root, &next_row.key)
+                    .await
+                    .expect("inherited selection");
+            let row = decode_with_reservation(&mut io, &mut route, Some(2 * 1024 * 1024), || {
+                Ok(next_row)
+            })
+            .expect("owned notice");
+            (selected, row)
+        };
+        let first_id = "82".repeat(32);
+        let second_id = "83".repeat(32);
+        let edit = splice_restore_notice_role(
+            &mut io,
+            &mut totals,
+            physical::Role::ActiveId,
+            &root,
+            &selected,
+            &row,
+            [&first_id, &second_id],
+        )
+        .await
+        .expect("metered split splice");
+        assert_eq!(edit.value().new.len(), 2);
+        let expected = directory
+            .update(
+                &root,
+                &[directory::update::Edit {
+                    old: Some(old_leaf),
+                    new: edit.value().new.clone(),
+                }],
+                &mut directory::ReadBudget::default(),
+            )
+            .await
+            .expect("ordinary root oracle");
+        assert_eq!(edit.value().root, expected);
+        let mut recovered = Vec::new();
+        for leaf in &edit.value().new {
+            recovered.extend(
+                store
+                    .resolve_physical_block(physical::Role::ActiveId, leaf)
+                    .await
+                    .expect("split output read-back"),
+            );
+        }
+        assert_eq!(recovered.len(), inherited.len() + 1);
+        assert!(recovered.windows(2).all(|pair| pair[0].key < pair[1].key));
+        assert!(recovered.iter().all(|row| row.logical_sequence == 2));
+        drop(edit);
+        drop(selected);
+        drop(row);
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn restore_projection_source_matches_ordinary_bytes() {
+        use physical::restore_io::{
+            FinalMicrochunk, FinalStreamTotals, RestorePhysicalIo, RestorePhysicalRoute,
+        };
+
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let directory =
+            directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let root = directory.empty_root_reference().expect("KV root");
+        let commit_id = "ac".repeat(32);
+        let mut io = RestorePhysicalIo::new(&store, 64 * 1024 * 1024, 64 * 1024 * 1024);
+        let mut totals = FinalStreamTotals::new();
+        let output = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("source chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let output = write_restore_projection_source(&mut io, &mut route, 2, &commit_id, &root)
+                .await
+                .expect("metered projection source");
+            let _ = chunk.finish();
+            output
+        };
+        let ordinary = write_projection_source(&store, 2, &commit_id, &root)
+            .await
+            .expect("same ordinary bytes");
+        assert_eq!(*output.value(), ordinary);
+        let source = load_projection_source(&store, &ordinary.sha256)
+            .await
+            .expect("readable source");
+        assert_eq!(source.logical_sequence, 2);
+        assert_eq!(source.logical_commit_id, commit_id);
+        assert_eq!(source.kv_root_hex, hex::encode(root.encode()));
+        assert!(io.writing_evidence().0 > 0);
+        drop(output);
+        assert_eq!(io.live_ownership_evidence(), (0, 0));
+    }
 
     #[tokio::test]
     async fn retained_outbox_proof_cannot_read_projection_source_after_budget_exhaustion() {

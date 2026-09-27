@@ -2052,7 +2052,7 @@ fn validate_persisted_output_fields(
     let actual_bounds = super::super::super::block_key_bounds(block)?;
     let descriptor_hash = format!("sha256:{}", hex::encode(output.digest));
     if descriptor.encoding_version != 1
-        || !descriptor.scope.matches_scope(&store.scope)
+        || descriptor.scope != store.scope
         || descriptor.role != physical::Role::Kv
         || descriptor.segment.level != ControlMvpSegmentLevel::L1
         || descriptor.segment.segment_id != id

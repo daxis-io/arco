@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use arco_core::storage::{BytesBackingOwnership, ClassifiedBytes, ObjectMeta};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccountedBytesClass {
@@ -491,6 +492,7 @@ pub(in super::super) enum RestoreGateRecord<'a> {
     Head,
     Manifest(&'a str),
     Prepared(&'a str),
+    AbsentFence(&'a str),
 }
 
 pub(in super::super) async fn read_restore_gate_record(
@@ -499,50 +501,81 @@ pub(in super::super) async fn read_restore_gate_record(
     record: RestoreGateRecord<'_>,
 ) -> CatalogResult<Option<(AccountedBytes, AccountedMeta)>> {
     let result = async {
-        let store = io.store();
-        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
-        let cap = match record {
-            RestoreGateRecord::Head => super::super::MAX_HEAD_JSON_BYTES,
-            RestoreGateRecord::Manifest(_) => MAX_CONTROL_JSON_BYTES,
-            RestoreGateRecord::Prepared(_) => 1024 * 1024,
-        };
-        let declared =
-            decode_with_reservation(io, route, Some(directory_scope_reservation(store)?), || {
-                if final_stream {
-                    return Err(physical_backpressure(
-                        "restore gate records require the control ledger",
-                    ));
-                }
-                let path = match record {
-                    RestoreGateRecord::Head => store.paths.current_pointer(),
-                    RestoreGateRecord::Manifest(id) => {
-                        if !super::super::integrity::valid_immutable_id(id) {
-                            return Err(physical_backpressure("invalid restore gate manifest ID"));
-                        }
-                        store.paths.manifest_object(id)
-                    }
-                    RestoreGateRecord::Prepared(candidate) => {
-                        if !valid_raw_digest(candidate) {
-                            return Err(physical_backpressure("invalid restore gate candidate ID"));
-                        }
-                        format!(
-                            "{}/restore/v7/{candidate}/prepared.json",
-                            store.paths.base_prefix()
-                        )
-                    }
-                };
-                Ok(DeclaredPhysicalRange {
-                    scope: store.scope.clone(),
-                    final_stream,
-                    payload: false,
-                    path,
-                    range: 0..(cap + 1) as u64,
-                    reservation_bytes: cap + 1,
-                    min_response_bytes: 1,
-                    max_response_bytes: cap,
-                })
-            })?;
+        let (declared, cap) = declare_restore_gate_record(io, route, record)?;
         read_stable_restore_metadata(io, route, declared, cap).await
+    }
+    .await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+fn declare_restore_gate_record(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    record: RestoreGateRecord<'_>,
+) -> CatalogResult<(WorkingValue<DeclaredPhysicalRange>, usize)> {
+    let store = io.store();
+    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    let cap = match record {
+        RestoreGateRecord::Head => super::super::MAX_HEAD_JSON_BYTES,
+        RestoreGateRecord::Manifest(_) => MAX_CONTROL_JSON_BYTES,
+        RestoreGateRecord::Prepared(_) => 1024 * 1024,
+        RestoreGateRecord::AbsentFence(_) => 4096,
+    };
+    let declared =
+        decode_with_reservation(io, route, Some(directory_scope_reservation(store)?), || {
+            if final_stream {
+                return Err(physical_backpressure(
+                    "restore gate records require the control ledger",
+                ));
+            }
+            let path = match record {
+                RestoreGateRecord::AbsentFence(path) => {
+                    arco_core::ScopedStorage::validate_path(path)?;
+                    path.to_owned()
+                }
+                RestoreGateRecord::Head => store.paths.current_pointer(),
+                RestoreGateRecord::Manifest(id) => {
+                    if !super::super::integrity::valid_immutable_id(id) {
+                        return Err(physical_backpressure("invalid restore gate manifest ID"));
+                    }
+                    store.paths.manifest_object(id)
+                }
+                RestoreGateRecord::Prepared(candidate) => {
+                    if !valid_raw_digest(candidate) {
+                        return Err(physical_backpressure("invalid restore gate candidate ID"));
+                    }
+                    format!(
+                        "{}/restore/v7/{candidate}/prepared.json",
+                        store.paths.base_prefix()
+                    )
+                }
+            };
+            Ok(DeclaredPhysicalRange {
+                scope: store.scope.clone(),
+                final_stream,
+                payload: false,
+                path,
+                range: 0..(cap + 1) as u64,
+                reservation_bytes: cap + 1,
+                min_response_bytes: 1,
+                max_response_bytes: cap,
+            })
+        })?;
+    Ok((declared, cap))
+}
+
+/// Control-budget metadata probe; existence does not require a valid object body.
+pub(in super::super) async fn head_restore_gate_record(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    record: RestoreGateRecord<'_>,
+) -> CatalogResult<Option<AccountedMeta>> {
+    let result = async {
+        let (declared, _) = declare_restore_gate_record(io, route, record)?;
+        head_optional_declared_physical(io, route, declared.value()).await
     }
     .await;
     if result.is_err() {
@@ -1202,6 +1235,9 @@ impl UnitPayloadAdmission {
 /// Monotonic evidence for the one final traversal.  Its microchunk admission
 /// is independent from, and cannot reset or borrow, `WorkspaceIoBudget`.
 pub(in super::super) struct FinalStreamTotals {
+    deadline: Option<DateTime<Utc>>,
+    #[cfg(feature = "test-utils")]
+    clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
     microchunks: u64,
     total_operations: u64,
     total_io_reservation_bytes: u64,
@@ -1229,6 +1265,9 @@ impl FinalStreamTotals {
     }
     pub(in super::super) const fn new() -> Self {
         Self {
+            deadline: None,
+            #[cfg(feature = "test-utils")]
+            clock: None,
             microchunks: 0,
             total_operations: 0,
             total_io_reservation_bytes: 0,
@@ -1238,6 +1277,32 @@ impl FinalStreamTotals {
             peak_chunk_owned_upper_bound_bytes: 0,
             stopped: false,
         }
+    }
+
+    pub(in super::super) fn with_deadline(deadline: DateTime<Utc>) -> Self {
+        let mut totals = Self::new();
+        totals.deadline = Some(deadline);
+        totals
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(in super::super) fn with_clock(
+        mut self,
+        clock: Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>>,
+    ) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn deadline_expired(&self) -> bool {
+        let Some(deadline) = self.deadline.as_ref() else {
+            return false;
+        };
+        #[cfg(feature = "test-utils")]
+        let now = self.clock.as_ref().map_or_else(Utc::now, |clock| clock());
+        #[cfg(not(feature = "test-utils"))]
+        let now = Utc::now();
+        now >= *deadline
     }
 
     fn record_io(&mut self, bytes: usize) -> CatalogResult<()> {
@@ -1373,6 +1438,9 @@ impl<'a> FinalMicrochunk<'a> {
             payload_reads: 0,
         };
         let admitted = (|| {
+            if chunk.totals.deadline_expired() {
+                return Err(physical_backpressure("final stream deadline expired"));
+            }
             checked_ownership_ledger(&io.ledger)?.request_owned_limit =
                 if singleton_payload_bytes.is_some() {
                     owned_byte_limit
@@ -2573,12 +2641,20 @@ pub(in super::super) fn unit_publication_barrier_store() -> ControlMvpStateStore
 }
 
 #[cfg(test)]
+pub(in super::super) fn absent_fence_race_store()
+-> (ControlMvpStateStore, Arc<std::sync::atomic::AtomicUsize>) {
+    range_tests::absent_fence_race_store()
+}
+
+#[cfg(test)]
 mod range_tests {
     use super::*;
     use arco_core::{
         AuthorityWritePrecondition, ScopedStorage,
         storage::{ObjectMeta, StorageBackend},
     };
+    #[cfg(feature = "test-utils")]
+    use std::sync::atomic::AtomicBool;
     use std::{
         future::{Future, pending},
         sync::atomic::{AtomicUsize, Ordering},
@@ -2589,6 +2665,7 @@ mod range_tests {
     enum Response {
         Shared,
         WindowPending(Arc<AtomicUsize>),
+        FenceHead(Arc<AtomicUsize>),
         WriteOwned(usize),
         WriteError(usize),
         WriteOpaqueError,
@@ -2661,6 +2738,19 @@ mod range_tests {
             range: Range<u64>,
         ) -> arco_core::Result<ClassifiedBytes> {
             self.window_boundary().await;
+            if let Response::FenceHead(armed) = &self.response {
+                if let Some(prefix) = path.strip_suffix("external-restore-fence.json") {
+                    if armed.swap(0, Ordering::SeqCst) != 0 {
+                        self.inner
+                            .put(
+                                &format!("{prefix}head/current.json"),
+                                Bytes::from_static(b"{}"),
+                                arco_core::WritePrecondition::DoesNotExist,
+                            )
+                            .await?;
+                    }
+                }
+            }
             let ordinal = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
             if matches!(self.response, Response::CollisionPending(at) if at % 3 == 2 && ordinal == at / 3 + 1)
             {
@@ -2670,6 +2760,7 @@ mod range_tests {
                 Response::Pending => pending().await,
                 Response::Shared
                 | Response::WindowPending(_)
+                | Response::FenceHead(_)
                 | Response::WriteOwned(_)
                 | Response::WriteError(_)
                 | Response::WriteOpaqueError
@@ -2879,6 +2970,7 @@ mod range_tests {
             RestoreGateRecord::Head,
             RestoreGateRecord::Manifest(&candidate),
             RestoreGateRecord::Prepared(&candidate),
+            RestoreGateRecord::AbsentFence("external-restore-fence.json"),
         ] {
             let store = store(backend(Response::Shared), "catalog", true);
             let mut io =
@@ -3021,6 +3113,14 @@ mod range_tests {
             backend(Response::CollisionPending(boundary)),
             "catalog",
             true,
+        )
+    }
+
+    pub(super) fn absent_fence_race_store() -> (ControlMvpStateStore, Arc<AtomicUsize>) {
+        let armed = Arc::new(AtomicUsize::new(0));
+        (
+            store(backend(Response::FenceHead(armed.clone())), "catalog", true),
+            armed,
         )
     }
 
@@ -4790,6 +4890,60 @@ mod range_tests {
         );
     }
 
+    #[test]
+    fn restore_final_deadline_stops_before_a_microchunk_operation() {
+        let backend = backend(Response::Shared);
+        let store = store(backend.clone(), "catalog", true);
+        let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
+        let mut totals =
+            FinalStreamTotals::with_deadline(Utc::now() - chrono::Duration::seconds(1));
+        assert!(matches!(
+            FinalMicrochunk::begin(&mut totals, 0, &mut io),
+            Err(CatalogError::MaintenanceBackpressure { message })
+                if message.contains("final stream deadline expired")
+        ));
+        assert!(io.stopped && totals.stopped);
+        assert_eq!(totals.evidence().0, 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn restore_final_deadline_stops_the_next_microchunk_after_time_advances() {
+        let backend = backend(Response::Shared);
+        let store = store(backend.clone(), "catalog", true);
+        let mut io = RestorePhysicalIo::new(&store, 1024, 1024);
+        let deadline = Utc::now();
+        let expired = Arc::new(AtomicBool::new(false));
+        let clock = {
+            let expired = expired.clone();
+            Arc::new(move || {
+                deadline
+                    + if expired.load(Ordering::SeqCst) {
+                        chrono::Duration::seconds(1)
+                    } else {
+                        chrono::Duration::seconds(-1)
+                    }
+            })
+        };
+        let mut totals = FinalStreamTotals::with_deadline(deadline).with_clock(Some(clock));
+        let totals = FinalMicrochunk::begin(&mut totals, 0, &mut io)
+            .expect("first microchunk is inside the deadline")
+            .finish();
+        expired.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            FinalMicrochunk::begin(totals, 0, &mut io),
+            Err(CatalogError::MaintenanceBackpressure { message })
+                if message.contains("final stream deadline expired")
+        ));
+        assert!(io.stopped && totals.stopped);
+        assert_eq!(totals.microchunks(), 1);
+        assert_eq!(totals.evidence().0, 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn restore_physical_invalid_accounting_stops_both_routes_before_io() {
         for (head, final_stream) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -6392,6 +6546,70 @@ impl WorkingValue<super::super::directory::restore::NativeBuilder> {
     }
 }
 
+pub(in super::super) fn new_directory_path_copy(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    root: &super::super::directory::Root,
+    position: &WorkingValue<Option<super::super::directory::restore::Position>>,
+    replacements: &WorkingValue<Vec<super::super::directory::Leaf>>,
+) -> CatalogResult<WorkingValue<super::super::directory::restore::NativePathCopy>> {
+    let owned = position.is_owned_by(io) && replacements.is_owned_by(io);
+    let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+    let store = io.store;
+    let reservation = directory_scope_reservation(store)?
+        .checked_add(super::super::directory::restore::NativePathCopy::reservation())
+        .ok_or_else(|| physical_backpressure("notice path copy reservation overflow"))?;
+    decode_with_reservation(io, route, Some(reservation), || {
+        if !owned || !final_stream {
+            return Err(physical_backpressure(
+                "notice path copy owner or phase differs",
+            ));
+        }
+        super::super::directory::restore::NativePathCopy::new(
+            super::super::directory::Directory::new(store.retention.clone(), &store.scope)?,
+            root,
+            position.value().as_ref(),
+            replacements.value(),
+        )
+    })
+}
+
+impl WorkingValue<super::super::directory::restore::NativePathCopy> {
+    pub(in super::super) async fn advance_directory_path_copy(
+        &mut self,
+        io: &mut RestorePhysicalIo<'_>,
+        route: &mut RestorePhysicalRoute<'_, '_>,
+    ) -> CatalogResult<Option<WorkingValue<super::super::directory::Root>>> {
+        let owned = self.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        drop(decode_with_reservation(
+            io,
+            route,
+            Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
+            || {
+                if !owned || !final_stream {
+                    return Err(physical_backpressure(
+                        "notice path copy owner or phase differs",
+                    ));
+                }
+                Ok(())
+            },
+        )?);
+        let result = self.value.advance(io, route).await;
+        if result.is_err() {
+            io.stop(route);
+        }
+        let result = result?;
+        result
+            .map(|root| {
+                decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
+                    Ok(root)
+                })
+            })
+            .transpose()
+    }
+}
+
 /// Closed directory namespace only; all bodies originate in admitted builder codecs.
 pub(in super::super) async fn write_directory_output(
     io: &mut RestorePhysicalIo<'_>,
@@ -6847,6 +7065,7 @@ enum RestoreOutputObject<'a> {
     Segment(&'a str),
     Index(&'a str),
     Descriptor(&'a [u8; 32]),
+    ProjectionSource(&'a [u8; 32]),
 }
 
 fn declare_restore_output(
@@ -6873,7 +7092,9 @@ fn declare_restore_output(
                 true,
             ),
             RestoreOutputObject::Index(_) => (MAX_SEGMENT_INDEX_BYTES, false),
-            RestoreOutputObject::Descriptor(_) => (MAX_CONTROL_JSON_BYTES, false),
+            RestoreOutputObject::Descriptor(_) | RestoreOutputObject::ProjectionSource(_) => {
+                (MAX_CONTROL_JSON_BYTES, false)
+            }
         };
         admitted_physical_length(length, cap)?;
         let probe = length
@@ -6891,6 +7112,11 @@ fn declare_restore_output(
                     store.paths.base_prefix(),
                     hex::encode(digest)
                 ),
+                RestoreOutputObject::ProjectionSource(digest) => format!(
+                    "{}/projection-sources/{}.json",
+                    store.paths.base_prefix(),
+                    hex::encode(digest)
+                ),
             };
             Ok(DeclaredPhysicalRange {
                 scope: store.scope.clone(),
@@ -6904,6 +7130,53 @@ fn declare_restore_output(
             })
         })
     })();
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+pub(in super::super) async fn write_restore_projection_source_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    bytes: &WorkingValue<Bytes>,
+) -> CatalogResult<WorkingValue<super::super::bounded::ArtifactRef>> {
+    let result = async {
+        let owned = bytes.is_owned_by(io);
+        let final_stream = matches!(route, RestorePhysicalRoute::FinalMicrochunk(_));
+        drop(decode_with_reservation(io, route, Some(64 * 1024), || {
+            if !owned || !final_stream {
+                return Err(physical_backpressure(
+                    "projection source requires final phase-owned bytes",
+                ));
+            }
+            Ok(())
+        })?);
+        let digest = hash_with_reservation(io, route, 64 * 1024, bytes.value().len(), || {
+            Ok(super::super::sha256_hex(bytes.value()))
+        })?;
+        let raw = decode_with_reservation(io, route, Some(64 * 1024), || {
+            let mut raw = [0; 32];
+            hex::decode_to_slice(digest.value(), &mut raw)
+                .map_err(|_| super::invariant_violation("projection source digest is invalid"))?;
+            Ok(raw)
+        })?;
+        let declared = declare_restore_output(
+            io,
+            route,
+            RestoreOutputObject::ProjectionSource(raw.value()),
+            bytes.value().len(),
+        )?;
+        drop(put_restore_output(io, route, declared.value(), bytes).await?);
+        let reservation = directory_scope_reservation(io.store())?;
+        decode_with_reservation(io, route, Some(reservation), || {
+            Ok(super::super::bounded::ArtifactRef {
+                path: declared.value().path.clone(),
+                sha256: digest.value().clone(),
+            })
+        })
+    }
+    .await;
     if result.is_err() {
         io.stop(route);
     }
@@ -6940,6 +7213,7 @@ pub(in super::super) fn preflight_standard_restore_output(
         let index = build_restore_output_index(
             io,
             route,
+            super::Role::Kv,
             output_id,
             logical_sequence,
             rows.value(),
@@ -6967,6 +7241,25 @@ pub(in super::super) async fn write_standard_restore_output(
     logical_sequence: u64,
     rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
 ) -> CatalogResult<StandardRestoreOutput> {
+    write_restore_role_output(
+        io,
+        route,
+        super::Role::Kv,
+        output_id,
+        logical_sequence,
+        rows,
+    )
+    .await
+}
+
+async fn write_restore_role_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    output_id: &str,
+    logical_sequence: u64,
+    rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+) -> CatalogResult<StandardRestoreOutput> {
     let result = async {
         let ordinary = matches!(route, RestorePhysicalRoute::OrdinaryUnit { .. });
         let owned = rows.is_owned_by(io);
@@ -6977,18 +7270,27 @@ pub(in super::super) async fn write_standard_restore_output(
             Some(DIRECTORY_FIXED_ALLOCATION_BYTES),
             || {
                 let scoped_id_matches = scoped_id.is_none_or(|id| hex::encode(id) == output_id);
-                if !ordinary || !owned || !valid_raw_digest(output_id) || !scoped_id_matches {
+                if (role == super::Role::Kv && !ordinary)
+                    || !owned
+                    || !valid_raw_digest(output_id)
+                    || !scoped_id_matches
+                    || (scoped_id.is_some() && role != super::Role::Kv)
+                {
                     return Err(physical_backpressure(
-                        "restore output requires ordinary owned rows and a frozen identity",
+                        "restore output requires phase-owned rows and a frozen identity",
                     ));
                 }
                 Ok(())
             },
         )?);
+        if role != super::Role::Kv {
+            validate_restore_outbox_rows(io, route, role, rows.value())?;
+        }
         let segment = encode_standard_restore_output(io, route, rows.value())?;
         let index = build_restore_output_index(
             io,
             route,
+            role,
             output_id,
             logical_sequence,
             rows.value(),
@@ -7013,6 +7315,7 @@ pub(in super::super) async fn write_standard_restore_output(
         let descriptor = build_restore_output_descriptor(
             io,
             route,
+            role,
             index.value(),
             index_bytes.value(),
             restore_output_version(&segment_version.value),
@@ -7057,9 +7360,328 @@ pub(in super::super) async fn write_standard_restore_output(
     result
 }
 
+pub(in super::super) async fn write_restore_outbox_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    output_id: &str,
+    logical_sequence: u64,
+    rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+) -> CatalogResult<StandardRestoreOutput> {
+    if role == super::Role::Kv {
+        io.stop(route);
+        return Err(physical_backpressure(
+            "notice output requires an outbox role",
+        ));
+    }
+    write_restore_role_output(io, route, role, output_id, logical_sequence, rows).await
+}
+
+pub(in super::super) struct NoticeRoleEdit {
+    pub(in super::super) root: super::super::directory::Root,
+    pub(in super::super) old: Option<super::super::directory::Leaf>,
+    pub(in super::super) new: Vec<super::super::directory::Leaf>,
+}
+
+/// Insert one notice row into its authenticated predecessor leaf. The caller
+/// supplies the frozen output identities; no candidate authority is published.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the caller owns the selected root and output identities"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one metered final stream carries preflight, immutable writes and path copy"
+)]
+pub(in super::super) async fn splice_restore_notice_role(
+    io: &mut RestorePhysicalIo<'_>,
+    totals: &mut FinalStreamTotals,
+    role: super::Role,
+    root: &super::super::directory::Root,
+    selected: &WorkingValue<Option<super::super::directory::restore::Position>>,
+    row: &WorkingValue<super::ControlMvpSegmentRow>,
+    output_ids: [&str; 2],
+) -> CatalogResult<WorkingValue<NoticeRoleEdit>> {
+    let result = async {
+        if role == super::Role::Kv || !selected.is_owned_by(io) || !row.is_owned_by(io) {
+            return Err(physical_backpressure(
+                "notice role, selection or row owner differs",
+            ));
+        }
+        let old = selected.value().as_ref().map(|position| &position.leaf);
+        if old.is_none() {
+            let store = io.store();
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            drop(decode_with_reservation(
+                io,
+                &mut route,
+                Some(directory_scope_reservation(store)?),
+                || {
+                    let directory = super::super::directory::Directory::new(
+                        store.retention.clone(),
+                        &store.scope,
+                    )?;
+                    if *root != directory.empty_root_reference()? {
+                        return Err(physical_backpressure(
+                            "notice insertion has no predecessor in a nonempty root",
+                        ));
+                    }
+                    Ok(())
+                },
+            )?);
+            let _ = chunk.finish();
+        }
+        let inherited = if let Some(leaf) = old {
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let (descriptor, rows) = read_restore_leaf(io, &mut route, role, leaf).await?;
+            drop(descriptor);
+            let _ = chunk.finish();
+            Some(rows)
+        } else {
+            None
+        };
+        let sequence = row.value().logical_sequence;
+        let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let rows = decode_with_reservation(io, &mut route, Some(4 * 1024 * 1024), || {
+            let mut rows = inherited
+                .as_ref()
+                .map_or_else(Vec::new, |prior| prior.value().clone());
+            let at = match rows.binary_search_by(|prior| prior.key.cmp(&row.value().key)) {
+                Ok(_) => return Err(physical_backpressure("restore notice row already exists")),
+                Err(at) => at,
+            };
+            rows.insert(at, row.value().clone());
+            for prior in &mut rows {
+                prior.logical_sequence = sequence;
+            }
+            Ok(rows)
+        })?;
+        drop(inherited);
+        let split = decode_with_reservation(io, &mut route, Some(64 * 1024), || {
+            let rows = rows.value();
+            if standard_output_reservation(rows).is_ok() {
+                return Ok(rows.len());
+            }
+            if rows.len() < 2
+                || standard_output_reservation(
+                    rows.get(..1)
+                        .ok_or_else(|| physical_backpressure("notice first row is absent"))?,
+                )
+                .is_err()
+            {
+                return Err(physical_backpressure(
+                    "notice row cannot fit an output block",
+                ));
+            }
+            let (mut low, mut high) = (1, rows.len() - 1);
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if standard_output_reservation(
+                    rows.get(..middle)
+                        .ok_or_else(|| physical_backpressure("notice split prefix is absent"))?,
+                )
+                .is_ok()
+                {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            standard_output_reservation(
+                rows.get(low..)
+                    .ok_or_else(|| physical_backpressure("notice split suffix is absent"))?,
+            )?;
+            Ok(low)
+        })?;
+        let split = *split.value();
+        let _ = chunk.finish();
+        let parts = if split == rows.value().len() { 1 } else { 2 };
+
+        // Check both encodings before the first immutable write.
+        for (part, output_id) in output_ids.iter().copied().take(parts).enumerate() {
+            let range = if part == 0 {
+                0..split
+            } else {
+                split..rows.value().len()
+            };
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let partition = decode_with_reservation(io, &mut route, Some(4 * 1024 * 1024), || {
+                Ok(rows
+                    .value()
+                    .get(range)
+                    .ok_or_else(|| physical_backpressure("notice preflight partition is absent"))?
+                    .to_vec())
+            })?;
+            preflight_restore_outbox_output(io, &mut route, role, output_id, sequence, &partition)?;
+            drop(partition);
+            let _ = chunk.finish();
+        }
+
+        let mut output_leaves: [Option<WorkingValue<super::super::directory::Leaf>>; 2] =
+            [None, None];
+        for (part, (output_id, leaf_slot)) in output_ids
+            .iter()
+            .copied()
+            .zip(output_leaves.iter_mut())
+            .take(parts)
+            .enumerate()
+        {
+            let range = if part == 0 {
+                0..split
+            } else {
+                split..rows.value().len()
+            };
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let partition = decode_with_reservation(io, &mut route, Some(4 * 1024 * 1024), || {
+                Ok(rows
+                    .value()
+                    .get(range)
+                    .ok_or_else(|| physical_backpressure("notice output partition is absent"))?
+                    .to_vec())
+            })?;
+            let output =
+                write_restore_outbox_output(io, &mut route, role, output_id, sequence, &partition)
+                    .await?;
+            let leaf = decode_with_reservation(io, &mut route, Some(2 * 1024 * 1024), || {
+                Ok(super::super::directory::Leaf {
+                    first: partition
+                        .value()
+                        .first()
+                        .ok_or_else(|| physical_backpressure("notice output has no first row"))?
+                        .key
+                        .clone(),
+                    last: partition
+                        .value()
+                        .last()
+                        .ok_or_else(|| physical_backpressure("notice output has no last row"))?
+                        .key
+                        .clone(),
+                    rows: output.descriptor.value().block.row_count,
+                    bytes: u32::try_from(output.descriptor.value().block.length)
+                        .map_err(|_| physical_backpressure("notice output length exceeds u32"))?,
+                    digest: output.digest,
+                })
+            })?;
+            *leaf_slot = Some(leaf);
+            drop(output);
+            drop(partition);
+            let _ = chunk.finish();
+        }
+        drop(rows);
+        let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+        let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+        let replacements = decode_with_reservation(io, &mut route, Some(2 * 1024 * 1024), || {
+            output_leaves
+                .iter()
+                .take(parts)
+                .map(|leaf| leaf.as_ref().map(|leaf| leaf.value().clone()))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| physical_backpressure("notice output leaf is absent"))
+        })?;
+        drop(output_leaves);
+        let mut copy = new_directory_path_copy(io, &mut route, root, selected, &replacements)?;
+        let _ = chunk.finish();
+        loop {
+            let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            if let Some(updated) = copy.advance_directory_path_copy(io, &mut route).await? {
+                let edit = decode_with_reservation(io, &mut route, Some(2 * 1024 * 1024), || {
+                    Ok(NoticeRoleEdit {
+                        root: updated.value().clone(),
+                        old: old.cloned(),
+                        new: replacements.value().clone(),
+                    })
+                })?;
+                drop(updated);
+                drop(copy);
+                drop(replacements);
+                let _ = chunk.finish();
+                return Ok(edit);
+            }
+            let _ = chunk.finish();
+        }
+    }
+    .await;
+    if result.is_err() {
+        io.stop_final(totals);
+    }
+    result
+}
+
+fn preflight_restore_outbox_output(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    output_id: &str,
+    logical_sequence: u64,
+    rows: &WorkingValue<Vec<super::ControlMvpSegmentRow>>,
+) -> CatalogResult<()> {
+    if !rows.is_owned_by(io) || !valid_raw_digest(output_id) {
+        return Err(physical_backpressure(
+            "notice output preflight owner or identity differs",
+        ));
+    }
+    validate_restore_outbox_rows(io, route, role, rows.value())?;
+    let segment = encode_standard_restore_output(io, route, rows.value())?;
+    let index = build_restore_output_index(
+        io,
+        route,
+        role,
+        output_id,
+        logical_sequence,
+        rows.value(),
+        segment.value(),
+    )?;
+    drop(encode_restore_output_metadata(
+        io,
+        route,
+        RestoreOutputMetadata::Index(index.value()),
+    )?);
+    Ok(())
+}
+
+fn validate_restore_outbox_rows(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
+    rows: &[super::ControlMvpSegmentRow],
+) -> CatalogResult<()> {
+    let store = io.store();
+    let reservation = rows
+        .iter()
+        .try_fold(2 * 1024 * 1024_usize, |total, row| {
+            total
+                .checked_add(row.key.len().checked_mul(4)?)?
+                .checked_add(
+                    row.value
+                        .as_ref()
+                        .map_or(Some(0), |value| value.len().checked_mul(24))?,
+                )
+        })
+        .ok_or_else(|| physical_backpressure("notice row validation reservation overflow"))?;
+    drop(decode_with_reservation(
+        io,
+        route,
+        Some(reservation),
+        || {
+            for row in rows {
+                super::super::bounded::validate_outbox_row(role, row, &store.scope)?;
+            }
+            Ok(())
+        },
+    )?);
+    Ok(())
+}
+
 fn build_restore_output_index(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
     segment_id: &str,
     logical_sequence: u64,
     rows: &[super::ControlMvpSegmentRow],
@@ -7077,13 +7699,19 @@ fn build_restore_output_index(
             || !super::super::integrity::valid_immutable_id(segment_id)
             || bytes.is_empty()
             || bytes.len() > envelope
-            || rows
-                .iter()
-                .any(|row| row.record_kind != super::super::SEGMENT_RECORD_KV)
+            || rows.iter().any(|row| {
+                row.record_kind
+                    != if role == super::Role::Kv {
+                        super::super::SEGMENT_RECORD_KV
+                    } else {
+                        super::super::SEGMENT_RECORD_OUTBOX
+                    }
+            })
             || rows.windows(2).any(|pair| match pair {
                 [first, last] => {
                     first.key >= last.key
-                        || first.logical_ordinal.checked_add(1) != Some(last.logical_ordinal)
+                        || (role == super::Role::Kv
+                            && first.logical_ordinal.checked_add(1) != Some(last.logical_ordinal))
                 }
                 _ => true,
             })
@@ -7147,6 +7775,7 @@ fn build_restore_output_index(
 fn build_restore_output_descriptor(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
+    role: super::Role,
     index: &super::ControlMvpSegmentIndex,
     index_bytes: &[u8],
     segment_version: &str,
@@ -7164,7 +7793,12 @@ fn build_restore_output_descriptor(
             || size_of::<ControlMvpBlock>() > 192
             || index.scope != io.store.scope
             || index.level != ControlMvpSegmentLevel::L1
-            || block.record_kind != Some(super::super::SEGMENT_RECORD_KV)
+            || block.record_kind
+                != Some(if role == super::Role::Kv {
+                    super::super::SEGMENT_RECORD_KV
+                } else {
+                    super::super::SEGMENT_RECORD_OUTBOX
+                })
             || block.row_count == 0
             || block.row_count != index.row_count
             || block.offset != 0
@@ -7206,7 +7840,7 @@ fn build_restore_output_descriptor(
             Ok(super::Descriptor {
                 encoding_version: 1,
                 scope: index.scope.clone(),
-                role: super::Role::Kv,
+                role,
                 segment: ControlMvpSegmentRef {
                     segment_size_bytes: index.segment_size_bytes,
                     index_size_bytes: u64::try_from(index_bytes.len()).map_err(|_| {
@@ -7448,6 +8082,7 @@ mod output_metadata_tests {
                 let index = build_restore_output_index(
                     &mut io,
                     &mut route,
+                    super::super::Role::Kv,
                     &existing.segment.segment_id,
                     2,
                     &rows,
@@ -7478,6 +8113,7 @@ mod output_metadata_tests {
                 let descriptor = build_restore_output_descriptor(
                     &mut io,
                     &mut route,
+                    super::super::Role::Kv,
                     index.value(),
                     encoded.value(),
                     &segment_version,
@@ -7593,6 +8229,7 @@ mod output_metadata_tests {
             let result = build_restore_output_descriptor(
                 &mut io,
                 &mut route,
+                super::super::Role::Kv,
                 &index,
                 &raw,
                 &descriptor.segment_version,
@@ -7667,6 +8304,7 @@ mod output_metadata_tests {
             let result = build_restore_output_index(
                 &mut io,
                 &mut route,
+                super::super::Role::Kv,
                 &descriptor.segment.segment_id,
                 descriptor.segment.logical_sequence,
                 &rows,
@@ -10932,6 +11570,119 @@ mod native_directory_tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "three directory cases share one metered path-copy assertion"
+    )]
+    async fn restore_notice_path_copy_matches_ordinary_split_empty_and_dense_path() {
+        let (store, _) = native_counter_fixture().await;
+        let directory = Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let mut builder = directory.builder();
+        for n in 0..129 {
+            builder.push(leaf(n)).await.expect("leaf");
+        }
+        let old = builder.finish().await.expect("old root");
+        let mut left = leaf(127);
+        left.last = (127_u64 * 4).to_be_bytes().to_vec();
+        left.digest = [42; 32];
+        let mut right = leaf(127);
+        right.first = (127_u64 * 4 + 1).to_be_bytes().to_vec();
+        right.rows = 1;
+        right.digest = [43; 32];
+        let mut dense_last = vec![0; 16_260];
+        dense_last[..8].copy_from_slice(&1_u64.to_be_bytes());
+        let dense_leaf = Leaf {
+            first: vec![0; 16_260],
+            last: dense_last,
+            ..leaf(0)
+        };
+        let mut dense_replacement = dense_leaf.clone();
+        dense_replacement.digest = [42; 32];
+        let cases = [
+            (old, Some(leaf(127)), vec![left, right]),
+            (
+                directory.empty_root().await.expect("empty root"),
+                None,
+                vec![leaf(0)],
+            ),
+            (
+                restore::dense_eight_level_path(&directory).await,
+                Some(dense_leaf),
+                vec![dense_replacement],
+            ),
+        ];
+        for (old, prior, leaves) in cases {
+            let key = leaves[0].first.clone();
+            let edit = super::super::directory::update::Edit {
+                old: prior,
+                new: leaves.clone(),
+            };
+            let mut io =
+                RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+            let mut totals = FinalStreamTotals::new();
+            let mut copy = {
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("selection chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let position = restore::floor_at_or_before(&mut io, &mut route, &old, &key)
+                    .await
+                    .expect("selected leaf");
+                let replacements =
+                    decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaves))
+                        .expect("owned replacements");
+                new_directory_path_copy(&mut io, &mut route, &old, &position, &replacements)
+                    .expect("admitted path copy")
+            };
+            let result = loop {
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("path chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let step = copy
+                    .advance_directory_path_copy(&mut io, &mut route)
+                    .await
+                    .expect("path step");
+                let totals = chunk.finish();
+                if let Some(root) = step {
+                    break root;
+                }
+                assert!(totals.microchunks() <= 2 * u64::from(old.depth()) + 3);
+            };
+            drop(copy);
+            if old.depth() < 8 {
+                let expected = directory
+                    .update(
+                        &old,
+                        &[edit],
+                        &mut super::super::directory::ReadBudget::default(),
+                    )
+                    .await
+                    .expect("ordinary path copy");
+                assert_eq!(*result.value(), expected);
+                assert!(io.work.range_reads <= 2 * u64::from(old.depth()));
+                assert_eq!(io.work.metadata_heads, 0);
+            } else {
+                let mut chunk =
+                    FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("read-back chunk");
+                let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+                let selected = restore::first_after(&mut io, &mut route, result.value(), None)
+                    .await
+                    .expect("copied deep root membership");
+                assert_eq!(
+                    selected.value().as_ref().expect("deep leaf").leaf,
+                    edit.new[0]
+                );
+                drop(selected);
+                chunk.finish();
+                assert!(io.work.range_reads > 2 * u64::from(old.depth()));
+                assert_eq!(io.work.metadata_heads, 4);
+            }
+            assert!(io.work.write_attempts > 0);
+            drop(result);
+            assert!(io.ledger.lock().expect("ledger").report().passing());
+        }
+    }
+
+    #[tokio::test]
     async fn restore_native_directory_pins_paths_and_insertion_gaps_on_both_routes() {
         let (fixture, _, _) = super::super::tests::fixture().await;
         let store = ControlMvpStateStore::new_synthetic_bounded(
@@ -11003,6 +11754,67 @@ mod native_directory_tests {
                 assert!(io.ledger.lock().expect("ledger").report().passing());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn restore_native_directory_selects_notice_insertion_predecessor() {
+        let (fixture, _, _) = super::super::tests::fixture().await;
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            fixture.retention.clone(),
+            fixture.scope.clone(),
+        )
+        .expect("store");
+        let directory = Directory::new(store.retention.clone(), &store.scope).expect("directory");
+        let mut builder = directory.builder();
+        for n in 0..257 {
+            builder.push(leaf(n)).await.expect("leaf");
+        }
+        let root = builder.finish().await.expect("root");
+        for (key, expected) in [
+            (Vec::new(), 0),
+            ((127_u64 * 4 + 2).to_be_bytes().to_vec(), 127),
+            ((128_u64 * 4).to_be_bytes().to_vec(), 128),
+            (u64::MAX.to_be_bytes().to_vec(), 256),
+        ] {
+            for final_stream in [false, true] {
+                let mut io =
+                    RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+                let mut workspace = WorkspaceIoBudget::new();
+                let mut payload = UnitPayloadAdmission::new();
+                let mut totals = FinalStreamTotals::new();
+                let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
+                let mut route = if final_stream {
+                    RestorePhysicalRoute::FinalMicrochunk(&mut chunk)
+                } else {
+                    RestorePhysicalRoute::OrdinaryUnit {
+                        workspace: &mut workspace,
+                        payload: &mut payload,
+                    }
+                };
+                let found = restore::floor_at_or_before(&mut io, &mut route, &root, &key)
+                    .await
+                    .expect("authenticated predecessor");
+                assert_eq!(found.value.as_ref().expect("leaf").leaf, leaf(expected));
+                assert_eq!(io.work.range_reads, u64::from(root.depth()));
+                assert_eq!(io.work.metadata_heads, 0);
+                drop(found);
+                assert!(io.ledger.lock().expect("ledger").report().passing());
+            }
+        }
+        let root = restore::overlapping_root(&directory).await;
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        assert!(
+            restore::floor_at_or_before(&mut io, &mut route, &root, b"a")
+                .await
+                .is_err()
+        );
+        assert!(io.stopped);
     }
 
     #[tokio::test]

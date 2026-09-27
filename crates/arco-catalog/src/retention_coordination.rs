@@ -1,7 +1,9 @@
 //! Durable exclusion between retained-root publication and mutating GC runs.
 
 mod bounded;
+mod restore_intent;
 pub(crate) use bounded::{BoundedMutation, RetainedPointerSend};
+use restore_intent::ArmedRestorePublicationIntent;
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -22,6 +24,7 @@ use crate::workspace_snapshot::{
 
 const RECORD_TYPE: &str = "arco.retention_mutation_epoch";
 const VERSION: u32 = 1;
+const ARMED_RESTORE_VERSION: u32 = 2;
 
 /// The one workspace-scoped durable exclusion record.
 pub const RETENTION_MUTATION_EPOCH_PATH: &str = "retention/coordination/mutation-epoch.json";
@@ -176,9 +179,15 @@ struct RetentionMutationEpochRecord {
     completed_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     armed_retained_pointer: Option<ArmedRetainedPointerIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    armed_restore_publication: Option<Box<ArmedRestorePublicationIntent>>,
 }
 
 impl RetentionMutationEpochRecord {
+    fn has_armed_intent(&self) -> bool {
+        self.armed_retained_pointer.is_some() || self.armed_restore_publication.is_some()
+    }
+
     fn in_flight(
         epoch: u64,
         holder_id: impl Into<String>,
@@ -196,15 +205,16 @@ impl RetentionMutationEpochRecord {
             started_at: wall_clock(),
             completed_at: None,
             armed_retained_pointer: None,
+            armed_restore_publication: None,
         };
         record.validate()?;
         Ok(record)
     }
 
     fn completed(&self) -> Result<Self> {
-        if self.armed_retained_pointer.is_some() {
+        if self.has_armed_intent() {
             return Err(validation(
-                "armed retained pointer requires exact publication reconciliation",
+                "armed publication requires exact publication reconciliation",
             ));
         }
         let completed_at = wall_clock().max(self.started_at);
@@ -218,11 +228,27 @@ impl RetentionMutationEpochRecord {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.record_type != RECORD_TYPE || self.version != VERSION {
+        let expected_version = if self.armed_restore_publication.is_some() {
+            ARMED_RESTORE_VERSION
+        } else {
+            VERSION
+        };
+        if self.record_type != RECORD_TYPE || self.version != expected_version {
             return Err(validation("unsupported retention mutation epoch envelope"));
         }
         if self.epoch == 0 {
             return Err(validation("retention mutation epoch must be positive"));
+        }
+        if let Some(intent) = &self.armed_restore_publication {
+            if self.state != RetentionMutationState::InFlight
+                || self.operation_kind != RetentionMutationKind::WorkspaceRestoreApply
+                || self.armed_retained_pointer.is_some()
+            {
+                return Err(validation(
+                    "restore publication intent requires an exclusive in-flight restore epoch",
+                ));
+            }
+            intent.validate()?;
         }
         if let Some(intent) = &self.armed_retained_pointer {
             if self.state != RetentionMutationState::InFlight
@@ -830,6 +856,8 @@ async fn recover_stale_epoch_while_locked(
     // independently terminal. Generic and automatic settlement cannot clear it.
     let mut terminal = record.clone();
     terminal.armed_retained_pointer = None;
+    terminal.armed_restore_publication = None;
+    terminal.version = VERSION;
     settle_stale_record(storage, &terminal, &meta.version).await?;
     let recovered = RecoveredRetentionEpoch {
         epoch: record.epoch,
@@ -965,7 +993,7 @@ fn encode_record(record: &RetentionMutationEpochRecord) -> Result<Vec<u8>> {
     let bytes = serde_jcs::to_vec(record).map_err(|error| CatalogError::Serialization {
         message: format!("failed to serialize retention mutation epoch: {error}"),
     })?;
-    if record.armed_retained_pointer.is_some() && bytes.len() > ARMED_EPOCH_LIMIT {
+    if record.has_armed_intent() && bytes.len() > ARMED_EPOCH_LIMIT {
         return Err(validation("armed retention epoch exceeds 256 KiB"));
     }
     Ok(bytes)
@@ -977,7 +1005,7 @@ fn decode_record(bytes: &[u8]) -> Result<RetentionMutationEpochRecord> {
             message: format!("failed to deserialize retention mutation epoch: {error}"),
         })?;
     record.validate()?;
-    if record.armed_retained_pointer.is_some() && bytes.len() > ARMED_EPOCH_LIMIT {
+    if record.has_armed_intent() && bytes.len() > ARMED_EPOCH_LIMIT {
         return Err(validation("armed retention epoch exceeds 256 KiB"));
     }
     Ok(record)
@@ -1026,6 +1054,75 @@ mod tests {
 
     use super::*;
     use crate::workspace_snapshot::RETENTION_GC_LOCK_PATH;
+
+    #[test]
+    fn armed_restore_intent_survives_decode_and_blocks_generic_settlement() {
+        let record = RetentionMutationEpochRecord::in_flight(
+            1,
+            "holder",
+            RetentionMutationKind::WorkspaceRestoreApply,
+            "restore",
+        )
+        .expect("record");
+        let plain = encode_record(&record).expect("plain record");
+        let mut value: Value = serde_json::from_slice(&plain).expect("JSON");
+        assert!(value.get("armed_restore_publication").is_none());
+        value["armed_restore_publication"] = serde_json::json!({
+            "intent_type": "arco.restore.publication-intent", "version": 1,
+            "domain": "catalog", "plan_sha256": "11".repeat(32),
+            "owner_generation": 1, "candidate_id": "22".repeat(32),
+            "prepared_path": format!("control/v1/domains/catalog/restore/v7/{}/prepared.json", "22".repeat(32)),
+            "prepared_sha256": "33".repeat(32),
+            "precondition": {"kind": "does_not_exist"}
+        });
+        value["version"] = ARMED_RESTORE_VERSION.into();
+        let bytes = serde_jcs::to_vec(&value).expect("armed JSON");
+        let armed = decode_record(&bytes).expect("valid restore intent");
+        assert_eq!(
+            encode_record(&armed).expect("roundtrip"),
+            bytes,
+            "restore publication intent must not disappear on decode"
+        );
+        assert!(
+            armed.completed().is_err(),
+            "generic settlement cannot clear intent"
+        );
+        assert_eq!(
+            encode_record(&decode_record(&plain).unwrap()).unwrap(),
+            plain
+        );
+        for (field, replacement) in [
+            ("domain", Value::from("../catalog")),
+            ("plan_sha256", Value::from("AA".repeat(32))),
+            ("owner_generation", Value::from(0)),
+            ("candidate_id", Value::from("../candidate")),
+            (
+                "prepared_path",
+                Value::from("control/v1/domains/catalog/head/current.json"),
+            ),
+            ("prepared_sha256", Value::from("")),
+            (
+                "precondition",
+                serde_json::json!({"kind":"matches_version","version":""}),
+            ),
+            (
+                "precondition",
+                serde_json::json!({"kind":"does_not_exist","extra":true}),
+            ),
+        ] {
+            let mut changed = value.clone();
+            changed["armed_restore_publication"][field] = replacement;
+            assert!(
+                decode_record(&serde_jcs::to_vec(&changed).unwrap()).is_err(),
+                "accepted {field}"
+            );
+        }
+        for kind in ["workspace_snapshot_finalize", "control_gc"] {
+            let mut changed = value.clone();
+            changed["operation_kind"] = Value::from(kind);
+            assert!(decode_record(&serde_jcs::to_vec(&changed).unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn armed_retained_pointer_survives_decode_and_blocks_generic_settlement() {
@@ -1603,6 +1700,7 @@ mod tests {
             started_at: Utc::now() - in_flight_for,
             completed_at: None,
             armed_retained_pointer: None,
+            armed_restore_publication: None,
         };
         let result = storage
             .put_raw(

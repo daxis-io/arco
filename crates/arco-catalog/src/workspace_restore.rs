@@ -945,6 +945,29 @@ impl RestoreAdvanceContext<'_> {
         matches!(self.mode, RestoreAdvanceMode::Bounded(_))
     }
 
+    pub(crate) fn final_deadline(&self) -> Result<DateTime<Utc>> {
+        let RestoreAdvanceMode::Bounded(fence) = &self.mode else {
+            return Err(validation("legacy restore has no final stream deadline"));
+        };
+        fence.validate_deadlines()?;
+        let execution = fence
+            .request
+            .requested_at
+            .checked_add_signed(ChronoDuration::hours(24))
+            .ok_or_else(|| validation("restore execution deadline overflow"))?;
+        Ok(execution
+            .min(fence.attempt.active_retention_deadline)
+            .min(fence.participant.plan.source().retention_deadline()))
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn final_clock(&self) -> Option<Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>> {
+        match &self.mode {
+            RestoreAdvanceMode::Bounded(fence) => fence.service.clock.clone(),
+            RestoreAdvanceMode::Legacy(_) => None,
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "native bounded advance integration remains disabled"
@@ -6852,6 +6875,166 @@ mod plan7_tests {
             .settle_bounded(&mut fixture.guard, &mut fixture.budget)
             .await
             .expect("settle");
+    }
+
+    #[tokio::test]
+    async fn plan7_native_advance_selects_one_unit_without_publishing_authority() {
+        let mut fixture = live_fence_fixture().await;
+        let head_path =
+            crate::state_store::control_mvp::ControlMvpPaths::new("catalog").current_pointer();
+        let head_before = fixture
+            .service
+            .storage
+            .get_raw(&head_path)
+            .await
+            .expect("original HEAD");
+        let plan = fixture.attempt.participants[0].plan.clone();
+        let adapter = fixture
+            .service
+            .snapshots
+            .registry()
+            .get("catalog")
+            .expect("catalog")
+            .restore_participant()
+            .expect("adapter")
+            .clone();
+        let advanced = adapter.advance_restore(&plan, &mut fixture.context()).await;
+        assert_eq!(
+            advanced.expect("one native unit"),
+            RestoreParticipantAdvance::InProgress { completed_units: 1 }
+        );
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .get_raw(&head_path)
+                .await
+                .expect("same HEAD"),
+            head_before
+        );
+        fixture
+            .epoch
+            .settle_bounded(&mut fixture.guard, &mut fixture.budget)
+            .await
+            .expect("settle unit epoch");
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the terminal check crosses two separately fenced workspace invocations"
+    )]
+    async fn plan7_native_terminal_stages_notice_before_publication_guard() {
+        let mut fixture = live_fence_fixture().await;
+        let head_path =
+            crate::state_store::control_mvp::ControlMvpPaths::new("catalog").current_pointer();
+        let head_before = fixture
+            .service
+            .storage
+            .get_raw(&head_path)
+            .await
+            .expect("original HEAD");
+        let plan = fixture.attempt.participants[0].plan.clone();
+        let adapter = fixture
+            .service
+            .snapshots
+            .registry()
+            .get("catalog")
+            .expect("catalog")
+            .restore_participant()
+            .expect("adapter")
+            .clone();
+        assert_eq!(
+            adapter
+                .advance_restore(&plan, &mut fixture.context())
+                .await
+                .expect("first unit"),
+            RestoreParticipantAdvance::InProgress { completed_units: 1 }
+        );
+        let LiveFenceFixture {
+            service,
+            request,
+            attempt,
+            journal,
+            journal_version,
+            mut budget,
+            guard,
+            epoch,
+        } = fixture;
+        WorkspaceRestoreService::finish_apply_coordination(
+            guard,
+            epoch,
+            Ok(()),
+            &mut RestoreInvocationIo::Bounded(&mut budget),
+        )
+        .await
+        .expect("finish first invocation");
+        let before_terminal = plan7_inventory(&service).await;
+        let participant = &attempt.participants[0];
+        for expected_units in 2..=32 {
+            let mut next_budget = WorkspaceIoBudget::new();
+            let (mut guard, epoch) = service
+                .acquire_apply_coordination(
+                    request.restore_id(),
+                    participant.participant_attempt,
+                    &participant.domain,
+                    &participant.plan_sha256,
+                    &mut RestoreInvocationIo::Bounded(&mut next_budget),
+                )
+                .await
+                .expect("next invocation coordination");
+            let advanced = {
+                let mut context = RestoreAdvanceContext {
+                    mode: RestoreAdvanceMode::Bounded(RestoreAdvanceFence {
+                        service: &service,
+                        request: &request,
+                        attempt: &attempt,
+                        participant,
+                        journal: &journal,
+                        journal_version: &journal_version,
+                        adapter: adapter.as_ref(),
+                        epoch: &epoch,
+                        guard: &mut guard,
+                        budget: &mut next_budget,
+                    }),
+                };
+                adapter.advance_restore(&plan, &mut context).await
+            };
+            match advanced {
+                Ok(RestoreParticipantAdvance::InProgress { completed_units }) => {
+                    assert_eq!(completed_units, expected_units);
+                    WorkspaceRestoreService::finish_apply_coordination(
+                        guard,
+                        epoch,
+                        Ok(()),
+                        &mut RestoreInvocationIo::Bounded(&mut next_budget),
+                    )
+                    .await
+                    .expect("finish selected unit invocation");
+                }
+                Err(CatalogError::UnsupportedOperation { message })
+                    if message == "terminal restore candidate publication is not implemented" =>
+                {
+                    assert_eq!(
+                        service
+                            .storage
+                            .get_raw(&head_path)
+                            .await
+                            .expect("same HEAD"),
+                        head_before
+                    );
+                    let after_terminal = plan7_inventory(&service).await;
+                    assert!(
+                        after_terminal
+                            .difference(&before_terminal)
+                            .any(|(path, _, _)| { path.contains("/projection-sources/") })
+                    );
+                    return;
+                }
+                other => panic!("terminal progress must stage notice then stop: {other:?}"),
+            }
+        }
+        panic!("small fixture never reached terminal progress");
     }
 
     #[tokio::test]

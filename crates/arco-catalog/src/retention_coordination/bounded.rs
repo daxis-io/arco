@@ -85,6 +85,42 @@ pub struct BoundedMutation<'a> {
 }
 
 impl BoundedMutation<'_> {
+    /// Arming is sticky even when the caller handles an error or finishes successfully.
+    /// This only records the reconciliation boundary; it cannot send authority HEAD.
+    #[allow(
+        dead_code,
+        reason = "restore publication remains disabled pending finalization qualification"
+    )]
+    pub(crate) async fn arm_restore_publication(
+        &mut self,
+        intent: super::ArmedRestorePublicationIntent,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        if self.must_remain_uncertain || self.epoch.record.has_armed_intent() {
+            return Err(validation(
+                "restore publication epoch is already uncertain or armed",
+            ));
+        }
+        let mut armed = self.epoch.record.clone();
+        armed.armed_restore_publication = Some(Box::new(intent));
+        armed.version = super::ARMED_RESTORE_VERSION;
+        armed.validate()?;
+        // Do not let an interrupted refence followed by a handled error clear
+        // the enclosing mutation's uncertainty, or admit another arming call.
+        self.mark_uncertain();
+        self.epoch.refence_bounded(guard, budget).await?;
+        self.epoch.record = armed;
+        self.epoch.claimed_version = publish_epoch(
+            self.epoch.bounded_storage()?,
+            &self.epoch.record,
+            WritePrecondition::MatchesVersion(self.epoch.claimed_version.clone()),
+            budget,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Borrows the held epoch only for fenced read/refence operations.
     pub(crate) fn epoch(&self) -> &RetentionMutationEpoch {
         &*self.epoch
@@ -149,9 +185,9 @@ impl RetentionMutationEpoch {
         {
             return Ok(false);
         }
-        if record.armed_retained_pointer.is_some() {
+        if record.has_armed_intent() {
             return Err(validation(
-                "restore settlement cannot clear an armed snapshot intent",
+                "generic settlement cannot clear an armed publication intent",
             ));
         }
         budget.extend_retention_lock(guard).await?;
@@ -170,7 +206,7 @@ impl RetentionMutationEpoch {
     }
 
     pub(crate) fn can_settle_bounded(&self) -> bool {
-        !self.uncertain_mutation && self.record.armed_retained_pointer.is_none()
+        !self.uncertain_mutation && !self.record.has_armed_intent()
     }
 
     pub(crate) fn armed_pointer(&self) -> Option<&ArmedRetainedPointerIntent> {
@@ -291,7 +327,7 @@ impl RetentionMutationEpoch {
         guard: &mut LockGuard<ScopedStorage>,
         budget: &mut WorkspaceIoBudget,
     ) -> Result<()> {
-        if self.uncertain_mutation || self.record.armed_retained_pointer.is_some() {
+        if self.uncertain_mutation || self.record.has_armed_intent() {
             return Err(validation(
                 "retention epoch already has an uncertain or armed mutation",
             ));
@@ -587,6 +623,254 @@ mod tests {
         .await
         .expect("claim");
         (storage, budget, guard, epoch)
+    }
+
+    fn restore_intent() -> super::super::ArmedRestorePublicationIntent {
+        super::super::ArmedRestorePublicationIntent {
+            intent_type: "arco.restore.publication-intent".into(),
+            version: 1,
+            domain: "catalog".into(),
+            plan_sha256: "11".repeat(32),
+            owner_generation: 1,
+            candidate_id: "22".repeat(32),
+            prepared_path: format!(
+                "control/v1/domains/catalog/restore/v7/{}/prepared.json",
+                "22".repeat(32)
+            ),
+            prepared_sha256: "33".repeat(32),
+            precondition: RetainedPointerIntentPrecondition::DoesNotExist {},
+        }
+    }
+
+    #[tokio::test]
+    async fn armed_restore_epoch_is_rejected_by_legacy_envelope_validation() {
+        #[derive(serde::Deserialize)]
+        struct LegacyEnvelope {
+            record_type: String,
+            version: u32,
+        }
+        let (storage, mut budget, mut guard, mut epoch) = claimed_epoch().await;
+        let mut mutation = epoch.begin_bounded_mutation();
+        mutation
+            .arm_restore_publication(restore_intent(), &mut guard, &mut budget)
+            .await
+            .unwrap();
+        mutation.finish(Ok(())).unwrap();
+        let bytes = storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .unwrap();
+        // The pinned b0af V1 decoder ignores new fields, then checks exactly
+        // this envelope before any completed()/settlement operation.
+        let legacy: LegacyEnvelope = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            legacy.record_type != super::super::RECORD_TYPE || legacy.version != 1,
+            "old binaries must reject before silently dropping the restore intent"
+        );
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["version"], 2);
+        value["version"] = 1.into();
+        assert!(decode_record(&serde_jcs::to_vec(&value).unwrap()).is_err());
+        value["version"] = 2.into();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("armed_restore_publication");
+        assert!(decode_record(&serde_jcs::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_intent_operator_clear_returns_to_legacy_epoch_bytes() {
+        let (storage, mut budget, mut guard, mut epoch) = claimed_epoch().await;
+        let mut mutation = epoch.begin_bounded_mutation();
+        mutation
+            .arm_restore_publication(restore_intent(), &mut guard, &mut budget)
+            .await
+            .unwrap();
+        mutation.finish(Ok(())).unwrap();
+        budget.release_retention_lock(guard).await.unwrap();
+        let recovered = super::super::recover_stale_retention_epoch(
+            &storage,
+            "test: all remote requests independently terminal",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(recovered.operator_override);
+        let selected = read_epoch(&storage, &mut budget).await.unwrap().unwrap().0;
+        assert_eq!(selected.version, 1);
+        assert_eq!(selected.state, RetentionMutationState::Idle);
+        assert!(!selected.has_armed_intent());
+        let json: serde_json::Value =
+            serde_json::from_slice(&encode_record(&selected).unwrap()).unwrap();
+        assert!(json.get("armed_restore_publication").is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_arming_rejects_prior_uncertainty_and_foreign_epoch_before_io() {
+        for prior_uncertainty in [false, true] {
+            let (backend, storage, mut budget, mut guard) = fault_fixture().await;
+            let kind = if prior_uncertainty {
+                RetentionMutationKind::WorkspaceRestoreApply
+            } else {
+                RetentionMutationKind::WorkspaceSnapshotFinalize
+            };
+            let mut epoch = RetentionMutationEpoch::claim_bounded(
+                storage,
+                &mut guard,
+                kind,
+                "operation",
+                &mut budget,
+            )
+            .await
+            .unwrap();
+            if prior_uncertainty {
+                epoch.mark_uncertain();
+            }
+            backend.set(Fault::None);
+            let mut mutation = epoch.begin_bounded_mutation();
+            assert!(
+                mutation
+                    .arm_restore_publication(restore_intent(), &mut guard, &mut budget)
+                    .await
+                    .is_err()
+            );
+            backend.counts(0, 0, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_arming_preserves_intent_and_uncertainty_without_prepared_metadata() {
+        let (storage, mut budget, mut guard, mut epoch) = claimed_epoch().await;
+        let mut mutation = epoch.begin_bounded_mutation();
+        mutation
+            .arm_restore_publication(restore_intent(), &mut guard, &mut budget)
+            .await
+            .expect("arm");
+        mutation.finish(Ok(())).expect("handled success");
+        assert!(!epoch.can_settle_bounded());
+        let selected = read_epoch(&storage, &mut budget)
+            .await
+            .expect("read")
+            .expect("epoch")
+            .0;
+        assert_eq!(
+            selected.armed_restore_publication.as_deref(),
+            Some(&restore_intent())
+        );
+        assert!(
+            storage
+                .head_raw(&restore_intent().prepared_path)
+                .await
+                .expect("HEAD")
+                .is_none()
+        );
+        let ids = std::collections::BTreeSet::from(["scoped-mutation".to_string()]);
+        assert!(
+            RetentionMutationEpoch::settle_terminal_matching_bounded(
+                &storage,
+                &mut guard,
+                RetentionMutationKind::WorkspaceRestoreApply,
+                &ids,
+                &mut budget
+            )
+            .await
+            .is_err()
+        );
+        assert_in_flight(&storage, epoch, &mut guard, &mut budget).await;
+    }
+
+    #[tokio::test]
+    async fn restore_arming_faults_cannot_rearm_or_clear_uncertainty() {
+        for fault in [
+            Fault::None,
+            Fault::CommitLost,
+            Fault::NoWrite,
+            Fault::PauseBefore,
+            Fault::PauseAfter,
+            Fault::PauseReadback,
+            Fault::PauseArmedReadback,
+        ] {
+            let (backend, storage, mut budget, mut guard) = fault_fixture().await;
+            let mut epoch = RetentionMutationEpoch::claim_bounded(
+                storage.clone(),
+                &mut guard,
+                RetentionMutationKind::WorkspaceRestoreApply,
+                "restore",
+                &mut budget,
+            )
+            .await
+            .expect("claim");
+            backend.set(fault);
+            let mut mutation = epoch.begin_bounded_mutation();
+            let mut pending = Box::pin(mutation.arm_restore_publication(
+                restore_intent(),
+                &mut guard,
+                &mut budget,
+            ));
+            if matches!(
+                fault,
+                Fault::PauseBefore
+                    | Fault::PauseAfter
+                    | Fault::PauseReadback
+                    | Fault::PauseArmedReadback
+            ) {
+                assert!(futures::poll!(pending.as_mut()).is_pending(), "{fault:?}");
+                drop(pending);
+            } else {
+                let result = pending.await;
+                assert_eq!(result.is_ok(), fault != Fault::NoWrite, "{fault:?}");
+            }
+            mutation.finish(Ok(())).expect("handled result");
+            assert!(!epoch.can_settle_bounded());
+            backend.set(Fault::None);
+            let selected = read_epoch(&storage, &mut budget).await.unwrap().unwrap().0;
+            assert_eq!(
+                selected.armed_restore_publication.is_some(),
+                matches!(
+                    fault,
+                    Fault::None | Fault::CommitLost | Fault::PauseAfter | Fault::PauseArmedReadback
+                ),
+                "{fault:?}"
+            );
+            let mut second = epoch.begin_bounded_mutation();
+            assert!(
+                second
+                    .arm_restore_publication(restore_intent(), &mut guard, &mut budget)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(backend.puts.load(SeqCst), 0, "no second arming write");
+            second.finish(Ok(())).expect("handled rejection");
+            assert_in_flight(&storage, epoch, &mut guard, &mut budget).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_arming_exhausted_control_preserves_the_epoch() {
+        let (storage, mut budget, mut guard, mut epoch) = claimed_epoch().await;
+        let original = storage
+            .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+            .await
+            .unwrap();
+        let mut exhausted = WorkspaceIoBudget::new();
+        exhausted.charge_operations(OPERATIONS).unwrap();
+        let mut mutation = epoch.begin_bounded_mutation();
+        assert!(
+            mutation
+                .arm_restore_publication(restore_intent(), &mut guard, &mut exhausted)
+                .await
+                .is_err()
+        );
+        mutation.finish(Ok(())).expect("handled exhaustion");
+        assert_eq!(
+            storage
+                .get_raw(RETENTION_MUTATION_EPOCH_PATH)
+                .await
+                .unwrap(),
+            original
+        );
+        assert_in_flight(&storage, epoch, &mut guard, &mut budget).await;
     }
 
     async fn assert_in_flight(
@@ -954,6 +1238,7 @@ mod tests {
         PauseBefore,
         PauseAfter,
         PauseReadback,
+        PauseArmedReadback,
         PauseRenewal,
         Unstable,
     }
@@ -1051,7 +1336,9 @@ mod tests {
             let bytes = self.inner.get_range(path, range.clone()).await?;
             if self.is_target(path) {
                 self.ranges.lock().expect("ranges").push(range);
-                if self.mode() == Fault::PauseReadback {
+                if self.mode() == Fault::PauseReadback
+                    || (self.mode() == Fault::PauseArmedReadback && self.puts.load(SeqCst) > 0)
+                {
                     std::future::pending::<()>().await;
                 }
             } else if path.ends_with(RETENTION_GC_LOCK_PATH) {
@@ -1086,7 +1373,10 @@ mod tests {
             if fault == Fault::PauseAfter {
                 std::future::pending::<()>().await;
             }
-            if matches!(fault, Fault::CommitLost | Fault::PauseReadback) {
+            if matches!(
+                fault,
+                Fault::CommitLost | Fault::PauseReadback | Fault::PauseArmedReadback
+            ) {
                 return Err(arco_core::Error::storage(
                     "injected committed lost response",
                 ));

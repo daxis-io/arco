@@ -1,10 +1,12 @@
 //! Bounded restore planning and the exact Plan7 wire contract.
+mod certificate;
+mod fence;
 mod units;
 use super::super::{
     CatalogError, ControlMvpPaths, ControlMvpPointer, ControlMvpStateStore,
     DurableAuthorityBinding, IMPLEMENTATION, MAX_CONTROL_JSON_BYTES, PersistedAuthorityKind,
     PersistedAuthorityReference, RestoreAttemptIdentity, Result, StateScope, decode_json,
-    encode_json, invariant_violation, prefixed_sha256, valid_raw_digest,
+    encode_json, invariant_violation, prefixed_sha256, valid_raw_digest, validation_failed,
 };
 use super::{directory, logical_v2, retained};
 use crate::state_store::RestorePlanningContext;
@@ -13,6 +15,24 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 pub(in crate::state_store::control_mvp) use units::SingletonEmitAdmission;
+
+/// Trusted external pin for an absent-target fence object. This is configuration,
+/// not a persisted restore capability; every use must authenticate the object.
+#[derive(Debug, Clone)]
+pub struct ControlMvpRestoreFenceWitness {
+    /// Exact domain scope of the external proof.
+    pub scope: StateScope,
+    /// Trusted physical location binding.
+    pub durable_authority_binding: DurableAuthorityBinding,
+    /// Relative object path under the domain control prefix.
+    pub path: String,
+    /// Exact encoded size, at most 4 KiB.
+    pub byte_size: u64,
+    /// Exact canonical prefixed SHA-256 of the object bytes.
+    pub sha256: String,
+    /// Externally observed object version.
+    pub object_version: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -506,40 +526,45 @@ pub(in super::super) async fn plan(
         retained::restore_source_with_workspace_io(store, source, context.io()).await?;
     // Source authentication pins HEAD when this source is current. Reuse that
     // exact observation rather than independently selecting a different target.
+    let mut absent_floors = None;
     let (base, target_size) = if source_base.pointer_version.is_some() {
         (source_base.clone(), source_size)
     } else {
         let mut budget = retained::ReadBudget::with_workspace(context.io().workspace_budget());
-        let Some((pointer, version, bytes)) =
-            retained::load_current_pointer(store, &mut budget).await?
-        else {
-            return Err(CatalogError::UnsupportedOperation {
-                message: "absent Plan7 target requires an observed external fence witness".into(),
-            });
-        };
-        let manifest_bytes = retained::read_bounded_json(
-            store,
-            &mut budget,
-            &store.paths.manifest_object(&pointer.manifest_id),
-            MAX_CONTROL_JSON_BYTES,
-            "Plan7 target manifest",
-        )
-        .await?;
-        let token = store
-            .token(pointer.manifest_id.clone(), pointer.logical_sequence)
-            .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
-        let size = manifest_bytes.len();
-        let base = store
-            .read_bounded_current_from_manifest(
-                &token,
-                &manifest_bytes,
-                &pointer,
-                version,
-                bytes,
+        let current = retained::load_current_pointer(store, &mut budget).await?;
+        if let Some((pointer, version, bytes)) = current {
+            let manifest_bytes = retained::read_bounded_json(
+                store,
                 &mut budget,
+                &store.paths.manifest_object(&pointer.manifest_id),
+                MAX_CONTROL_JSON_BYTES,
+                "Plan7 target manifest",
             )
             .await?;
-        (base, size)
+            let token = store
+                .token(pointer.manifest_id.clone(), pointer.logical_sequence)
+                .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
+            let size = manifest_bytes.len();
+            let base = store
+                .read_bounded_current_from_manifest(
+                    &token,
+                    &manifest_bytes,
+                    &pointer,
+                    version,
+                    bytes,
+                    &mut budget,
+                )
+                .await?;
+            (base, size)
+        } else {
+            let floors = fence::observe_workspace(store, context.io().workspace_budget())
+                .await?
+                .ok_or_else(|| CatalogError::PreconditionFailed {
+                    message: "absent restore target or fence changed during planning".into(),
+                })?;
+            absent_floors = Some(floors);
+            (source_base.clone(), source_size)
+        }
     };
     let source_manifest = source_base
         .manifest
@@ -549,17 +574,60 @@ pub(in super::super) async fn plan(
         .manifest
         .as_ref()
         .ok_or_else(|| invariant_violation("Plan7 target lacks manifest"))?;
-    let pointer_bytes = base
-        .pointer_bytes
-        .as_ref()
-        .ok_or_else(|| invariant_violation("Plan7 target lacks exact HEAD bytes"))?;
-    let version = base
-        .pointer_version
-        .clone()
-        .ok_or_else(|| invariant_violation("Plan7 target lacks exact HEAD version"))?;
+    let (mode, target) = if let Some(floors) = absent_floors {
+        let target = Target::Absent {
+            current_pointer_path: store.paths.current_pointer(),
+            absence_marker: "does_not_exist".into(),
+            observed_writer_epoch: floors.writer,
+            observed_reclamation_generation: floors.reclamation,
+            source_parent_writer_epoch: source_manifest.writer_epoch,
+            source_parent_reclamation_generation: source_manifest.reclamation_generation,
+        };
+        fence::verify_source(
+            &target,
+            source_manifest.writer_epoch,
+            source_manifest.reclamation_generation,
+        )?;
+        (Mode::Absent, target)
+    } else {
+        let pointer_bytes = base
+            .pointer_bytes
+            .as_ref()
+            .ok_or_else(|| invariant_violation("Plan7 target lacks exact HEAD bytes"))?;
+        let version = base
+            .pointer_version
+            .clone()
+            .ok_or_else(|| invariant_violation("Plan7 target lacks exact HEAD version"))?;
+        (
+            Mode::Present,
+            Target::Present {
+                current_pointer_path: store.paths.current_pointer(),
+                current_pointer_raw_b64: URL_SAFE_NO_PAD.encode(pointer_bytes),
+                current_pointer_sha256: prefixed_sha256(pointer_bytes),
+                current_pointer_version: version,
+                writer_epoch: base.writer_epoch,
+                reclamation_generation: base.reclamation_generation,
+                manifest: ImmutableObjectWitness {
+                    path: store.paths.manifest_object(&base_manifest.manifest_id),
+                    byte_size: target_size as u64,
+                    sha256: format!(
+                        "sha256:{}",
+                        base.manifest_digest
+                            .as_deref()
+                            .ok_or_else(|| invariant_violation(
+                                "Plan7 target lacks manifest digest"
+                            ))?
+                    ),
+                },
+            },
+        )
+    };
     let request = logical_v2::RestoreRequest::new(
         &store.scope,
-        logical_v2::RestoreMode::Present,
+        match mode {
+            Mode::Present => logical_v2::RestoreMode::Present,
+            Mode::Absent => logical_v2::RestoreMode::Absent,
+        },
         source_manifest.logical_sequence,
         &source_manifest.logical_history,
         base_manifest.logical_sequence,
@@ -604,27 +672,8 @@ pub(in super::super) async fn plan(
             requested_at: context.requested_at().into(),
             execution_deadline: context.execution_deadline().into(),
             source_deadline: source.retention_deadline().into(),
-            mode: Mode::Present,
-            target: Target::Present {
-                current_pointer_path: store.paths.current_pointer(),
-                current_pointer_raw_b64: URL_SAFE_NO_PAD.encode(pointer_bytes),
-                current_pointer_sha256: prefixed_sha256(pointer_bytes),
-                current_pointer_version: version,
-                writer_epoch: base.writer_epoch,
-                reclamation_generation: base.reclamation_generation,
-                manifest: ImmutableObjectWitness {
-                    path: store.paths.manifest_object(&base_manifest.manifest_id),
-                    byte_size: target_size as u64,
-                    sha256: format!(
-                        "sha256:{}",
-                        base.manifest_digest
-                            .as_deref()
-                            .ok_or_else(|| invariant_violation(
-                                "Plan7 target lacks manifest digest"
-                            ))?
-                    ),
-                },
-            },
+            mode,
+            target,
             base_logical_sequence: base_manifest.logical_sequence,
             base_history_sha256: format!("sha256:{}", base_manifest.logical_history),
             base_kv_root_b64: URL_SAFE_NO_PAD.encode(base.kv_root.encode()),
@@ -716,6 +765,51 @@ pub(in super::super) async fn inspect(
         .head(&store.retention, &format!("{prefix}/selector.json"))
         .await?
         .is_some();
+    if let Target::Absent {
+        observed_writer_epoch,
+        observed_reclamation_generation,
+        ..
+    } = &p.target
+    {
+        let Some(floors) = fence::observe_workspace(store, io).await? else {
+            return Ok(RestoreParticipantInspection::Superseded);
+        };
+        if floors.writer != *observed_writer_epoch
+            || floors.reclamation != *observed_reclamation_generation
+        {
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
+        let (source, _) = retained::restore_source_with_workspace_io(
+            store,
+            &p.source,
+            &mut crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().ok_or_else(|| {
+                    validation_failed("bounded restore requires workspace storage")
+                })?,
+                io,
+            ),
+        )
+        .await?;
+        let manifest = source
+            .manifest
+            .as_ref()
+            .ok_or_else(|| invariant_violation("absent source lacks manifest"))?;
+        fence::verify_source(
+            &p.target,
+            manifest.writer_epoch,
+            manifest.reclamation_generation,
+        )?;
+        plan.verify_inspected_manifest_roots(
+            store,
+            &source,
+            &mut retained::ReadBudget::with_workspace(io),
+        )
+        .await?;
+        if has_progress {
+            units::inspect_progress(store, plan, &selected_digest, io).await?;
+        }
+        return Ok(RestoreParticipantInspection::Ready);
+    }
     let Target::Present {
         current_pointer_raw_b64,
         current_pointer_version,
@@ -948,6 +1042,250 @@ mod tests {
         );
         let result = inspect(store, &persisted, &mut context).await;
         (result, budget.test_accounting().1)
+    }
+
+    pub(super) async fn absent_inspection_fixture()
+    -> (ControlMvpStateStore, ControlMvpRestorePlanV7) {
+        let (store, original) = inspection_fixture().await;
+        absent_fixture_from_source(store, original).await
+    }
+
+    pub(super) async fn absent_fixture_from_source(
+        mut store: ControlMvpStateStore,
+        original: ControlMvpRestorePlanV7,
+    ) -> (ControlMvpStateStore, ControlMvpRestorePlanV7) {
+        store
+            .install_test_retained_source(original.source())
+            .await
+            .expect("retained source");
+        store
+            .retention
+            .delete(&store.paths.current_pointer())
+            .await
+            .expect("absent HEAD");
+        let path = format!("{}/external-restore-fence.json", store.paths.base_prefix());
+        let binding = store.durable_authority8_binding().expect("binding");
+        let raw = jcs(&serde_json::json!({
+            "record_type": "control_mvp_restore_fence", "version": 1,
+            "scope": store.scope, "durable_authority_binding": binding,
+            "writer_epoch": 0, "reclamation_generation": 0,
+        }))
+        .expect("external bytes");
+        let written = store
+            .retention
+            .put_raw(
+                &path,
+                bytes::Bytes::from(raw.clone()),
+                arco_core::WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("external writer");
+        store = store
+            .clone()
+            .with_absent_restore_fence(ControlMvpRestoreFenceWitness {
+                scope: store.scope.clone(),
+                durable_authority_binding: binding,
+                path,
+                byte_size: raw.len() as u64,
+                sha256: prefixed_sha256(&raw),
+                object_version: match written {
+                    arco_core::WriteResult::Success { version } => version,
+                    arco_core::WriteResult::PreconditionFailed { .. } => {
+                        panic!("external collision")
+                    }
+                },
+            });
+        let now = original.fields.requested_at.datetime().expect("time");
+        let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut context = RestorePlanningContext::new(
+            original.fields.workspace_request_sha256.clone(),
+            now,
+            now + Duration::hours(24),
+            now,
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        );
+        let restored = plan(&store, original.source(), original.identity(), &mut context)
+            .await
+            .expect("authenticated absent plan");
+        (store, restored)
+    }
+
+    #[tokio::test]
+    async fn absent_plan_authenticates_external_fence_and_inherits_source() {
+        let (store, restored) = absent_inspection_fixture().await;
+        assert_eq!(restored.fields.mode, Mode::Absent);
+        assert_eq!(
+            restored.fields.base_kv_root_b64,
+            restored.fields.source_kv_root_b64
+        );
+        assert!(matches!(
+            inspect_fixture(&store, restored).await.0,
+            Ok(super::super::super::RestoreParticipantInspection::Ready)
+        ));
+    }
+
+    #[tokio::test]
+    async fn absent_plan_inspection_rejects_invalid_pins_and_supersedes_changed_objects() {
+        use std::sync::Arc;
+        for case in 0..11 {
+            let (mut store, plan) = absent_inspection_fixture().await;
+            let mut pin = store.absent_restore_fence.as_deref().expect("pin").clone();
+            match case {
+                0 => pin.byte_size += 1,
+                1 => pin.sha256 = prefixed_sha256(b"other"),
+                2 => pin.path = "outside/fence.json".into(),
+                3 => pin.scope = StateScope::new("tenant", "workspace", "other"),
+                4 => pin.durable_authority_binding = DurableAuthorityBinding::new([40; 32]),
+                5 => store
+                    .retention
+                    .delete(&pin.path)
+                    .await
+                    .expect("remove proof"),
+                6 => {
+                    let raw = store.retention.get_raw(&pin.path).await.expect("proof");
+                    store
+                        .retention
+                        .put_raw(&pin.path, raw, arco_core::WritePrecondition::None)
+                        .await
+                        .expect("changed version");
+                }
+                7 => {
+                    // Even an unreadable new HEAD defeats the absent precondition.
+                    store
+                        .retention
+                        .put_raw(
+                            &store.paths.current_pointer(),
+                            bytes::Bytes::from_static(b"{}"),
+                            arco_core::WritePrecondition::DoesNotExist,
+                        )
+                        .await
+                        .expect("competing HEAD");
+                }
+                8 => store.writer_epoch = 1,
+                9 | 10 => {
+                    let raw = if case == 9 {
+                        b"{}".to_vec()
+                    } else {
+                        let mut raw = store
+                            .retention
+                            .get_raw(&pin.path)
+                            .await
+                            .expect("proof")
+                            .to_vec();
+                        raw.push(b' ');
+                        raw
+                    };
+                    let write = store
+                        .retention
+                        .put_raw(
+                            &pin.path,
+                            bytes::Bytes::from(raw.clone()),
+                            arco_core::WritePrecondition::None,
+                        )
+                        .await
+                        .expect("external invalid proof");
+                    let arco_core::WriteResult::Success { version } = write else {
+                        panic!("write")
+                    };
+                    pin.object_version = version;
+                    pin.byte_size = raw.len() as u64;
+                    pin.sha256 = prefixed_sha256(&raw);
+                }
+                _ => unreachable!(),
+            }
+            store.absent_restore_fence = Some(Arc::new(pin));
+            let result = inspect_fixture(&store, plan).await.0;
+            if case == 6 || case == 7 {
+                assert!(
+                    matches!(
+                        result,
+                        Ok(super::super::super::RestoreParticipantInspection::Superseded)
+                    ),
+                    "case {case}: {result:?}"
+                );
+            } else {
+                assert!(result.is_err(), "case {case}: {result:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_plan_supersedes_head_created_during_fence_read() {
+        let (store, armed) = super::super::super::physical::restore_io::absent_fence_race_store();
+        let store = store.with_durable_authority_binding(DurableAuthorityBinding::new([39; 32]));
+        let (store, source) = inspection_fixture_on_store(store).await;
+        let (store, plan) = absent_fixture_from_source(store, source).await;
+        armed.store(1, std::sync::atomic::Ordering::SeqCst);
+        let result = inspect_fixture(&store, plan).await.0;
+        assert!(
+            matches!(
+                result,
+                Ok(super::super::super::RestoreParticipantInspection::Superseded)
+            ),
+            "new HEAD during fence read: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_plan_supersedes_oversized_head_and_replaced_fence_without_reading_body() {
+        for head in [true, false] {
+            let (store, plan) = absent_inspection_fixture().await;
+            let path = if head {
+                store.paths.current_pointer()
+            } else {
+                store
+                    .absent_restore_fence
+                    .as_ref()
+                    .expect("pin")
+                    .path
+                    .clone()
+            };
+            store
+                .retention
+                .put_raw(
+                    &path,
+                    bytes::Bytes::from(vec![0; 128 * 1024]),
+                    arco_core::WritePrecondition::None,
+                )
+                .await
+                .expect("competing object");
+            let result = inspect_fixture(&store, plan).await.0;
+            assert!(
+                matches!(
+                    result,
+                    Ok(super::super::super::RestoreParticipantInspection::Superseded)
+                ),
+                "head={head}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_plan_requires_external_fence_even_with_retained_source() {
+        let (store, original) = inspection_fixture().await;
+        store
+            .install_test_retained_source(original.source())
+            .await
+            .expect("retained source");
+        store
+            .retention
+            .delete(&store.paths.current_pointer())
+            .await
+            .expect("absent HEAD");
+        let now = original.fields.requested_at.datetime().expect("time");
+        let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let mut context = RestorePlanningContext::new(
+            original.fields.workspace_request_sha256.clone(),
+            now,
+            now + Duration::hours(24),
+            now,
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        );
+        let result = plan(&store, original.source(), original.identity(), &mut context).await;
+        assert!(
+            matches!(result, Err(CatalogError::UnsupportedOperation { .. })),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

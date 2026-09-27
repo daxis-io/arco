@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use arco_core::lock::{DistributedLock, LockGuard};
-use arco_core::{RootStorage, WritePrecondition, WriteResult};
+use arco_core::{AuthorityRoot, RootStorage, WritePrecondition, WriteResult};
 
 use crate::error::{CatalogError, Result};
 use crate::workspace_snapshot::{
@@ -73,6 +73,8 @@ pub enum RetentionMutationKind {
     CatalogGc,
     /// Control authority GC with a generation fence and exact-version revalidation.
     ControlGc,
+    /// Immutable reference publication in a tenant identity root.
+    IdentityReferencePublish,
     /// Activation of a descriptor-identified internal maintenance retention root.
     MaintenanceRootPublish,
     /// A reconciler repair pass deleting orphaned or superseded artifacts
@@ -638,10 +640,22 @@ impl RetentionMutationEpoch {
 ///
 /// # Errors
 ///
-/// Returns an error when `reason` is not a safe audit string, when the
+/// Returns an error for an identity root, when `reason` is not a safe audit string, when the
 /// retention lease cannot be acquired (a live holder is still running), or when
 /// the record cannot be read or settled exactly.
 pub async fn recover_stale_retention_epoch(
+    storage: &RootStorage,
+    reason: &str,
+) -> Result<Option<RecoveredRetentionEpoch>> {
+    if matches!(storage.scope().root(), AuthorityRoot::TenantIdentity) {
+        return Err(validation(
+            "identity recovery is not admitted in production",
+        ));
+    }
+    recover_stale_epoch(storage, reason).await
+}
+
+async fn recover_stale_epoch(
     storage: &RootStorage,
     reason: &str,
 ) -> Result<Option<RecoveredRetentionEpoch>> {
@@ -660,6 +674,19 @@ pub async fn recover_stale_retention_epoch(
         (Ok(recovered), Ok(())) => Ok(recovered),
         (Err(error), _) | (Ok(_), Err(error)) => Err(error),
     }
+}
+
+/// Test-only identity-root recovery after an operator has proven every remote
+/// request in the in-flight epoch terminal. A missing object alone is not proof.
+#[cfg(feature = "test-utils")]
+pub(crate) async fn recover_stale_identity_epoch(
+    storage: &RootStorage,
+    reason: &str,
+) -> Result<Option<RecoveredRetentionEpoch>> {
+    if !matches!(storage, RootStorage::Identity(_)) {
+        return Err(validation("identity recovery requires an identity root"));
+    }
+    recover_stale_epoch(storage, reason).await
 }
 
 async fn recover_stale_epoch_while_locked(

@@ -371,6 +371,15 @@ cargo xtask repo-hygiene-check
 git diff --check
 ```
 
+## Tenant identity lane after Phase 2
+
+Run the default-disabled [synthetic admission child](2026-09-23-tenant-identity-root-synthetic-admission.md)
+first, then its [physical lifecycle child](2026-09-25-tenant-identity-root-physical-lifecycle.md).
+The latter remains test-only and keeps the production constructor closed.
+Principal semantics need a separate child before Phase 8 authorization or any
+identity route. Tenant principal purge and physical state-store GC do not close
+each other's track.
+
 ## Phase 3A: Deterministic State Model
 
 **Goal:** Prove the logical authority model without object-store mechanics

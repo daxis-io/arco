@@ -28,6 +28,8 @@ public Git SHA; repository tests and ignored credentialed tests do not qualify.
 
 | Area | Accepted design | Implemented | Locally verified | Privately provider-qualified | Route-wired | Authoritative |
 |---|---|---|---|---|---|---|
+| Tenant identity physical root | Accepted ADR-044 | Partial: typed storage seam and `test-utils` synthetic commit/read, checkpoint, protected references, retained-history closure, generation-fenced GC, and controlled recovery; production guard and layout-maintenance cap remain | Partial: [integrated lifecycle receipt](../../../reports/2026-09-26-tenant-identity-lifecycle-integration.md) records the current format-9 source and verification gates | No | No | No |
+| Tenant principal authority | Accepted ADR-044 | No principal `IdentityStore`/`IdentityMutation`/event lifecycle | No | N/A | No | No |
 | Legacy catalog DDL (`CatalogWriter` -> ledger -> synchronous compaction -> Parquet manifest) | Yes, as the ADR-018 legacy path | Yes | Yes | Not recorded here | Yes through the shared adapter for every unbound root | Yes for every uncut root |
 | `ArcoStateStore` traits and `StateToken` contract | Yes (ADR-043) | Yes | Yes | N/A | Yes for an exact configured control root | No deployed authority |
 | Deterministic model store | Yes as a reference oracle | Yes | Yes | N/A | No | No |

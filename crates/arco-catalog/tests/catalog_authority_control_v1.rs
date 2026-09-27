@@ -14,18 +14,20 @@ use std::time::Duration;
 
 #[cfg(feature = "test-utils")]
 use arco_catalog::catalog_authority::{BoundedCatalogTestCommand, CatalogProjectionNotifierV2};
+use arco_catalog::parquet_util::{CatalogAuditRow, read_audit_records};
 use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, PROJECTION_OUTBOX_TRIM_BINDING_KEY, ProjectionOutboxAckWriter,
-    ProjectionOutboxWorker,
+    ProjectionOutboxBacklog, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
-    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError,
-    CatalogListRequest, CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier,
-    ColumnDefinition, ControlCatalogAuthority, ControlMvpMaintenanceOutcome,
-    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, DurableAuthorityBinding,
-    DurableMaintenanceWorker, MaintenanceStatus, ProjectionIntentV1, PurgedCounts,
-    RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions, WriteOptions,
+    ArcoStateAdmin, ArcoStateReader, CATALOG_AUDIT_PROJECTION_PREFIX,
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority, CatalogAuthorityBinding,
+    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError, CatalogListRequest, CatalogPatch,
+    CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
+    ControlCatalogAuthority, ControlMvpMaintenanceOutcome, ControlMvpProjectionOutboxRecord,
+    ControlMvpStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus,
+    ProjectionIntentV1, PurgedCounts, RegisterTableInSchemaRequest, SchemaPatch, StateScope,
+    TxnOptions, WriteOptions, catalog_audit_artifact_path,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
@@ -34,7 +36,15 @@ use bytes::Bytes;
 
 struct FailProjectionPutBackend {
     inner: MemoryBackend,
+    /// Fails every put under `control/v1/projections/`.
     fail: AtomicBool,
+    /// Fails only puts under the catalog audit projection prefix.
+    fail_audit: AtomicBool,
+    /// Fails every put to the projection-outbox ack domain, which holds both
+    /// the materialization status and the acknowledgements.
+    fail_acks: AtomicBool,
+    /// Counts put attempts under the catalog audit projection prefix.
+    audit_puts: AtomicUsize,
 }
 
 struct LoseAcceptedCatalogHeadResponseBackend {
@@ -162,6 +172,9 @@ impl FailProjectionPutBackend {
         Arc::new(Self {
             inner: MemoryBackend::new(),
             fail: AtomicBool::new(false),
+            fail_audit: AtomicBool::new(false),
+            fail_acks: AtomicBool::new(false),
+            audit_puts: AtomicUsize::new(0),
         })
     }
 }
@@ -182,9 +195,25 @@ impl StorageBackend for FailProjectionPutBackend {
         data: Bytes,
         precondition: WritePrecondition,
     ) -> arco_core::Result<WriteResult> {
+        let audit = path.contains(CATALOG_AUDIT_PROJECTION_PREFIX);
+        if audit {
+            self.audit_puts.fetch_add(1, Ordering::SeqCst);
+        }
         if self.fail.load(Ordering::SeqCst) && path.contains("control/v1/projections/") {
             return Err(arco_core::Error::storage(
                 "injected projection artifact failure with credential detail redacted",
+            ));
+        }
+        if self.fail_audit.load(Ordering::SeqCst) && audit {
+            return Err(arco_core::Error::storage("injected audit artifact failure"));
+        }
+        if self.fail_acks.load(Ordering::SeqCst)
+            && path.contains(&format!(
+                "control/v1/domains/{PROJECTION_OUTBOX_ACK_DOMAIN}/"
+            ))
+        {
+            return Err(arco_core::Error::storage(
+                "injected projection acknowledgement failure",
             ));
         }
         self.inner.put(path, data, precondition).await
@@ -1138,6 +1167,509 @@ async fn malformed_catalog_projection_intent_is_quarantined_without_blocking_lat
     assert!(retry.drained_record_ids.is_empty());
 }
 
+/// The audit artifact path of a V1 catalog intent in the outbox, derived
+/// independently of the materializer from the intent's source sequence and
+/// the UTC day of its audit record's `occurredAtMs`; also pins the public
+/// path builder to it.
+fn expected_audit_path(record: &ControlMvpProjectionOutboxRecord) -> String {
+    let intent: ProjectionIntentV1 =
+        serde_json::from_slice(record.payload()).expect("projection intent envelope");
+    let occurred_at_ms = intent_audit_record(record)
+        .get("occurredAtMs")
+        .and_then(serde_json::Value::as_i64)
+        .expect("occurredAtMs");
+    let day = chrono::DateTime::from_timestamp_millis(occurred_at_ms)
+        .expect("occurrence within chrono's range")
+        .format("%Y-%m-%d");
+    let path = format!(
+        "control/v1/projections/catalog-audit/dt={day}/{:020}-{}.parquet",
+        intent.source_logical_sequence(),
+        intent.intent_id()
+    );
+    assert_eq!(
+        catalog_audit_artifact_path(&intent).expect("audit artifact path"),
+        path
+    );
+    path
+}
+
+/// The audit row a V1 catalog intent in the outbox must project to.
+fn expected_audit_row(record: &ControlMvpProjectionOutboxRecord) -> CatalogAuditRow {
+    let intent: ProjectionIntentV1 =
+        serde_json::from_slice(record.payload()).expect("projection intent envelope");
+    let audit = intent_audit_record(record);
+    let text = |field: &str| {
+        audit
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .expect(field)
+            .to_string()
+    };
+    CatalogAuditRow {
+        record_version: 1,
+        operation_id: record.record_id().to_string(),
+        operation_family: text("operationFamily"),
+        request_digest: text("requestDigest"),
+        actor: text("actor"),
+        occurred_at_ms: audit
+            .get("occurredAtMs")
+            .and_then(serde_json::Value::as_i64)
+            .expect("occurredAtMs"),
+        logical_sequence: record.origin_sequence().expect("committed origin sequence"),
+        authority_manifest_id: Some(intent.source_authority_manifest_id().to_string()),
+        logical_commit_id: None,
+    }
+}
+
+/// Every object under the catalog audit projection prefix, sorted.
+async fn audit_artifacts(storage: &ScopedStorage) -> Vec<String> {
+    let mut paths = storage
+        .list(CATALOG_AUDIT_PROJECTION_PREFIX)
+        .await
+        .expect("list audit projection")
+        .into_iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+async fn read_audit_artifact(storage: &ScopedStorage, path: &str) -> Vec<CatalogAuditRow> {
+    read_audit_records(&storage.get_raw(path).await.expect("audit artifact bytes"))
+        .expect("audit artifact decodes")
+}
+
+fn catalog_worker(storage: &ScopedStorage) -> ProjectionOutboxWorker {
+    ProjectionOutboxWorker::new(
+        storage.clone(),
+        "catalog",
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    )
+    .expect("worker")
+}
+
+#[tokio::test]
+async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging() {
+    let storage = scoped_storage();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    authority
+        .create_catalog("c", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    authority
+        .create_schema("c", "s", None, WriteOptions::default())
+        .await
+        .expect("create schema");
+    authority
+        .patch_catalog(
+            "c",
+            CatalogPatch {
+                description: Some(Some("patched".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::default(),
+        )
+        .await
+        .expect("patch catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let outbox = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents");
+    assert_eq!(3, outbox.len());
+    assert!(
+        audit_artifacts(&storage).await.is_empty(),
+        "nothing is projected before a drain"
+    );
+
+    let drained = CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .drain_once()
+        .await
+        .expect("drain");
+    assert_eq!(3, drained.drained_record_ids.len());
+    let mut expected = outbox.iter().map(expected_audit_path).collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(
+        expected,
+        audit_artifacts(&storage).await,
+        "exactly one audit artifact per intent, in the day partition of its occurrence"
+    );
+    let mut families = Vec::new();
+    for record in &outbox {
+        let rows = read_audit_artifact(&storage, &expected_audit_path(record)).await;
+        assert_eq!(vec![expected_audit_row(record)], rows);
+        families.push(rows[0].operation_family.clone());
+    }
+    families.sort();
+    assert_eq!(
+        vec!["create_catalog", "create_schema", "patch_catalog"],
+        families
+    );
+
+    // Ordering: the artifact is durable before the acknowledgement.
+    let backend = FailProjectionPutBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("analytics", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents")
+        .into_iter()
+        .next()
+        .expect("one intent");
+    let intent: ProjectionIntentV1 =
+        serde_json::from_slice(record.payload()).expect("projection intent envelope");
+    let audit_path = expected_audit_path(&record);
+    let snapshot_directory = format!(
+        "control/v1/projections/catalog-parquet/{:020}-{}/",
+        intent.source_logical_sequence(),
+        intent.source_authority_manifest_id()
+    );
+    let worker = catalog_worker(&storage);
+    let assert_unacknowledged = |backlog: ProjectionOutboxBacklog| {
+        assert_eq!(
+            vec![record.record_id().to_string()],
+            backlog.pending_record_ids
+        );
+        assert_eq!(None, backlog.latest_projected_sequence);
+    };
+
+    // Every projection put fails: nothing is published, nothing acknowledged.
+    backend.fail.store(true, Ordering::SeqCst);
+    CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .drain_once()
+        .await
+        .expect_err("an artifact failure must prevent acknowledgement");
+    backend.fail.store(false, Ordering::SeqCst);
+    assert!(storage.head_raw(&audit_path).await.expect("head").is_none());
+    assert_unacknowledged(worker.backlog().await.expect("backlog"));
+
+    // Only the audit put fails: the snapshot files land (they are written
+    // first), but neither the snapshot manifest nor the acknowledgement does.
+    backend.fail_audit.store(true, Ordering::SeqCst);
+    let failed = CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .drain_once()
+        .await
+        .expect_err("an audit artifact failure must prevent acknowledgement");
+    backend.fail_audit.store(false, Ordering::SeqCst);
+    assert!(
+        failed.to_string().contains("audit artifact failure"),
+        "unexpected error: {failed}"
+    );
+    assert!(storage.head_raw(&audit_path).await.expect("head").is_none());
+    assert!(
+        storage
+            .head_raw(&format!("{snapshot_directory}catalogs.parquet"))
+            .await
+            .expect("head")
+            .is_some(),
+        "the snapshot files precede the audit artifact"
+    );
+    assert!(
+        storage
+            .head_raw(&format!("{snapshot_directory}manifest.json"))
+            .await
+            .expect("head")
+            .is_none(),
+        "the snapshot manifest follows the audit artifact"
+    );
+    assert_unacknowledged(worker.backlog().await.expect("backlog"));
+    let status = CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .status()
+        .await
+        .expect("status")
+        .expect("failure status");
+    assert_eq!(
+        Some("retryable:CATALOG_PROJECTION_FAILED"),
+        status.failure_state()
+    );
+
+    // The retry publishes the artifact, then acknowledges.
+    let retried = CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .drain_once()
+        .await
+        .expect("anti-entropy retry");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        retried.drained_record_ids
+    );
+    assert_eq!(vec![audit_path.clone()], audit_artifacts(&storage).await);
+    assert_eq!(
+        vec![expected_audit_row(&record)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+    let backlog = worker.backlog().await.expect("backlog");
+    assert!(backlog.pending_record_ids.is_empty());
+    assert_eq!(record.origin_sequence(), backlog.latest_projected_sequence);
+}
+
+/// At-least-once redelivery: the acknowledgement is lost after the artifacts
+/// were published, so the next drain materializes the same intent again and
+/// its does-not-exist audit write finds the identical file and accepts it.
+#[tokio::test]
+async fn redelivered_intent_rewrites_an_identical_audit_artifact() {
+    let backend = FailProjectionPutBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("analytics", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents")
+        .into_iter()
+        .next()
+        .expect("one intent");
+    let audit_path = expected_audit_path(&record);
+
+    backend.fail_acks.store(true, Ordering::SeqCst);
+    CatalogProjectionMaterializer::new(storage.clone())
+        .expect("materializer")
+        .drain_once()
+        .await
+        .expect_err("a lost acknowledgement fails the drain after publication");
+    backend.fail_acks.store(false, Ordering::SeqCst);
+    let published = storage
+        .get_raw(&audit_path)
+        .await
+        .expect("the artifact was published before the lost acknowledgement");
+    assert_eq!(1, backend.audit_puts.load(Ordering::SeqCst));
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids,
+        "the unacknowledged intent is redelivered"
+    );
+
+    let restarted = CatalogProjectionMaterializer::new(storage.clone()).expect("restart");
+    let redelivered = restarted
+        .drain_once()
+        .await
+        .expect("the redelivery accepts the identical artifact");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        redelivered.drained_record_ids
+    );
+    assert!(
+        redelivered.quarantined_record_ids.is_empty(),
+        "an identical rewrite is not a precondition failure"
+    );
+    assert_eq!(
+        2,
+        backend.audit_puts.load(Ordering::SeqCst),
+        "the redelivery attempted the does-not-exist write again"
+    );
+    assert_eq!(
+        published,
+        storage.get_raw(&audit_path).await.expect("artifact bytes")
+    );
+    assert_eq!(vec![audit_path], audit_artifacts(&storage).await);
+    let status = restarted
+        .status()
+        .await
+        .expect("status")
+        .expect("success status");
+    assert_eq!(None, status.failure_state());
+    assert!(
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids
+            .is_empty()
+    );
+}
+
+/// An existing audit artifact with different bytes is never overwritten: the
+/// materializer fails closed exactly as it does for a divergent snapshot
+/// manifest, so the intent is quarantined and the manifest is not published.
+#[tokio::test]
+async fn a_divergent_audit_artifact_fails_closed_without_acknowledging() {
+    let storage = scoped_storage();
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("analytics", None, WriteOptions::default())
+        .await
+        .expect("create catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents")
+        .into_iter()
+        .next()
+        .expect("one intent");
+    let intent: ProjectionIntentV1 =
+        serde_json::from_slice(record.payload()).expect("projection intent envelope");
+    let audit_path = expected_audit_path(&record);
+    let foreign = Bytes::from_static(b"not the projected audit record");
+    storage
+        .put_raw(
+            &audit_path,
+            foreign.clone(),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("seed a divergent artifact");
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("a quarantine is not a drain failure");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        report.quarantined_record_ids
+    );
+    assert!(report.drained_record_ids.is_empty());
+    assert_eq!(
+        foreign,
+        storage.get_raw(&audit_path).await.expect("artifact bytes"),
+        "the divergent artifact is left untouched"
+    );
+    assert!(
+        storage
+            .head_raw(&format!(
+                "control/v1/projections/catalog-parquet/{:020}-{}/manifest.json",
+                intent.source_logical_sequence(),
+                intent.source_authority_manifest_id()
+            ))
+            .await
+            .expect("head")
+            .is_none(),
+        "the snapshot manifest follows the audit artifact"
+    );
+    assert_eq!(
+        Some("terminal:INCOMPATIBLE_PROJECTION_INTENT"),
+        materializer
+            .status()
+            .await
+            .expect("status")
+            .expect("quarantine status")
+            .failure_state()
+    );
+}
+
+#[tokio::test]
+async fn an_intent_whose_payload_is_not_an_audit_record_is_quarantined_without_an_artifact() {
+    let storage = scoped_storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.stage_projection_intent(
+        "x",
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        Bytes::from_static(b"junk"),
+    )
+    .await
+    .expect("stage a well-formed intent with a junk payload");
+    let junk_sequence = txn
+        .commit()
+        .await
+        .expect("commit junk intent")
+        .into_state_token()
+        .logical_sequence();
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("a quarantine is not a drain failure");
+    assert_eq!(vec!["x"], report.quarantined_record_ids);
+    assert!(report.drained_record_ids.is_empty());
+    let failure_state = materializer
+        .status()
+        .await
+        .expect("status")
+        .expect("quarantine status")
+        .failure_state()
+        .map(str::to_string);
+    assert!(
+        failure_state
+            .as_deref()
+            .is_some_and(|state| state.starts_with("terminal:")),
+        "expected a terminal quarantine, got {failure_state:?}"
+    );
+    let quarantine = ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            "synthetic-tenant",
+            "synthetic-workspace",
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .expect("ack writer")
+    .projection_quarantine(CATALOG_PARQUET_PROJECTION_CONSUMER_ID, junk_sequence)
+    .await
+    .expect("read quarantine")
+    .expect("durable quarantine");
+    assert_eq!("x", quarantine.source_record_id());
+    assert_eq!("INCOMPATIBLE_PROJECTION_INTENT", quarantine.failure_code());
+    assert!(audit_artifacts(&storage).await.is_empty());
+    assert!(
+        storage
+            .list("control/v1/projections/")
+            .await
+            .expect("list projections")
+            .is_empty(),
+        "the payload is rejected before any snapshot file is written"
+    );
+
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("after-junk", None, WriteOptions::default())
+        .await
+        .expect("commit a real mutation after the junk intent");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("projection intents")
+        .into_iter()
+        .find(|record| record.record_id() != "x")
+        .expect("the real mutation's intent");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("the junk intent does not block later work");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        report.drained_record_ids
+    );
+    assert_eq!(vec!["x"], report.quarantined_record_ids);
+    let audit_path = expected_audit_path(&record);
+    assert_eq!(vec![audit_path.clone()], audit_artifacts(&storage).await);
+    assert_eq!(
+        vec![expected_audit_row(&record)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+}
+
 #[tokio::test]
 async fn control_authority_keeps_stable_objects_indexes_columns_and_projection_intents_atomic() {
     let storage = scoped_storage();
@@ -1500,7 +2032,9 @@ async fn receipts_expire_after_the_retention_window_and_the_replay_reapplies() {
 /// still retained in the outbox, staging fails closed with a projection-intent
 /// conflict before anything commits; once the materializer drains and trims
 /// that intent, the replay commits and stages a fresh outbox incarnation of
-/// the same id at a higher origin sequence.
+/// the same id at a higher origin sequence. Each incarnation gets its own
+/// audit artifact: the projection identity is `(operation_id,
+/// logical_sequence)`, not the operation id alone.
 #[tokio::test]
 async fn a_purged_receipt_lets_a_keyed_patch_reapply_once_its_intent_is_trimmed() {
     let storage = scoped_storage();
@@ -1550,6 +2084,8 @@ async fn a_purged_receipt_lets_a_keyed_patch_reapply_once_its_intent_is_trimmed(
     let first_origin = first_intent
         .origin_sequence()
         .expect("committed intent carries its origin sequence");
+    let first_audit_path = expected_audit_path(first_intent);
+    let first_audit_row = expected_audit_row(first_intent);
 
     let after_retention = chrono::Utc::now() + chrono::Duration::hours(26);
     let outcome = publish_retention_horizon_at(storage.clone(), after_retention).await;
@@ -1626,6 +2162,35 @@ async fn a_purged_receipt_lets_a_keyed_patch_reapply_once_its_intent_is_trimmed(
         "the re-staged intent is a fresh incarnation at the re-execution's sequence"
     );
     assert_eq!(4, second_origin);
+
+    // Both incarnations are audited, each under its own sequence (and the day
+    // partition of its own occurrence).
+    let second_audit_path = expected_audit_path(&outbox[0]);
+    let second_audit_row = expected_audit_row(&outbox[0]);
+    let redrained = materializer.drain_once().await.expect("drain re-execution");
+    assert_eq!(vec![operation_id.clone()], redrained.drained_record_ids);
+    let suffix = format!("-{operation_id}.parquet");
+    let operation_artifacts = audit_artifacts(&storage)
+        .await
+        .into_iter()
+        .filter(|path| path.ends_with(&suffix))
+        .collect::<Vec<_>>();
+    let mut expected_paths = vec![first_audit_path.clone(), second_audit_path.clone()];
+    expected_paths.sort();
+    assert_eq!(
+        expected_paths, operation_artifacts,
+        "one audit artifact per (operation_id, logical_sequence)"
+    );
+    assert_eq!(2, first_audit_row.logical_sequence);
+    assert_eq!(4, second_audit_row.logical_sequence);
+    assert_eq!(
+        vec![first_audit_row],
+        read_audit_artifact(&storage, &first_audit_path).await
+    );
+    assert_eq!(
+        vec![second_audit_row],
+        read_audit_artifact(&storage, &second_audit_path).await
+    );
 }
 
 /// The horizon purges a receipt only when its expiry (`occurredAtMs` + 24 h)

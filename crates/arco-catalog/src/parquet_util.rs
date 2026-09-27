@@ -8,6 +8,10 @@
 //! - `commits.parquet`
 //! - `lineage_edges.parquet`
 //!
+//! It also defines the one-row-per-file schema of the `system.catalog.audit`
+//! projection, of which the catalog projection materializer writes one file
+//! per catalog mutation it materializes (see [`write_audit_records`]).
+//!
 //! The schemas here are the contract for Parquet readers and API clients.
 //! Keep changes backwards-compatible and gated by snapshot versioning.
 
@@ -182,6 +186,42 @@ pub struct CatalogCommitRecord {
     pub object_id: Option<String>,
     /// Object name affected by the commit.
     pub object_name: Option<String>,
+}
+
+/// One catalog audit record as stored in the `system.catalog.audit`
+/// projection: the audit record a `control/v1` catalog mutation carries in its
+/// projection intent, flattened to one row.
+///
+/// Production (authority format 9) records carry `authority_manifest_id`;
+/// records of the test-only bounded format 8 carry `logical_commit_id`
+/// instead. The downstream identity of a row is
+/// `(operation_id, logical_sequence)`: keyed operation ids are deterministic,
+/// so the same id recurs once its idempotency receipt has been purged and the
+/// request re-executes at a later logical sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogAuditRow {
+    /// Version of the source audit record (`1` for format 9, `2` for the
+    /// bounded format 8).
+    pub record_version: u32,
+    /// Operation identifier; also the projection intent identifier.
+    pub operation_id: String,
+    /// Operation family, for example `create_catalog`.
+    pub operation_family: String,
+    /// Canonical digest of the request.
+    pub request_digest: String,
+    /// Actor that issued the mutation.
+    pub actor: String,
+    /// When the adapter accepted the mutation, in milliseconds since the Unix
+    /// epoch (UTC).
+    pub occurred_at_ms: i64,
+    /// Committed logical sequence of the mutation. Stored as `Int64`, so
+    /// values above `i64::MAX` are rejected on write.
+    pub logical_sequence: u64,
+    /// Authority manifest that committed the mutation (format 9 only).
+    pub authority_manifest_id: Option<String>,
+    /// Physical-layout-independent logical commit identity (bounded format 8
+    /// only).
+    pub logical_commit_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +737,20 @@ fn transaction_handles_schema() -> Arc<Schema> {
     ]))
 }
 
+fn audit_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("record_version", DataType::UInt32, false),
+        Field::new("operation_id", DataType::Utf8, false),
+        Field::new("operation_family", DataType::Utf8, false),
+        Field::new("request_digest", DataType::Utf8, false),
+        Field::new("actor", DataType::Utf8, false),
+        Field::new("occurred_at_ms", DataType::Int64, false),
+        Field::new("logical_sequence", DataType::Int64, false),
+        Field::new("authority_manifest_id", DataType::Utf8, true),
+        Field::new("logical_commit_id", DataType::Utf8, true),
+    ]))
+}
+
 // ============================================================================
 // Public Schema Accessors (for tests and external consumers)
 // ============================================================================
@@ -753,6 +807,12 @@ pub fn workspace_snapshot_schema() -> Schema {
 #[must_use]
 pub fn transaction_handle_schema() -> Schema {
     (*transaction_handles_schema()).clone()
+}
+
+/// Returns the exact schema of `system.catalog.audit` projection files.
+#[must_use]
+pub fn catalog_audit_schema() -> Schema {
+    (*audit_schema()).clone()
 }
 
 fn writer_properties() -> WriterProperties {
@@ -1329,6 +1389,91 @@ pub fn write_transaction_handles(rows: &[TransactionHandleCatalogRecord]) -> Res
     write_single_batch(schema, &batch)
 }
 
+/// Writes one `system.catalog.audit` projection file.
+///
+/// Rows are written in the given order with the module's fixed writer
+/// properties and no timestamps, so identical rows always produce identical
+/// bytes; the projection materializer relies on that to accept an
+/// at-least-once rewrite of an existing file.
+///
+/// # Errors
+///
+/// Returns a validation error when a row's `logical_sequence` exceeds
+/// `i64::MAX`, or an error if the record batch or Parquet file cannot be
+/// built.
+pub fn write_audit_records(rows: &[CatalogAuditRow]) -> Result<Bytes> {
+    let schema = audit_schema();
+    let logical_sequences = rows
+        .iter()
+        .map(|row| {
+            i64::try_from(row.logical_sequence).map_err(|_| CatalogError::Validation {
+                message: format!(
+                    "catalog audit logical_sequence {} exceeds the Int64 column",
+                    row.logical_sequence
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let record_versions = UInt32Array::from(
+        rows.iter()
+            .map(|row| row.record_version)
+            .collect::<Vec<_>>(),
+    );
+    let operation_ids = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.operation_id.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let operation_families = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.operation_family.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let request_digests = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.request_digest.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let actors = StringArray::from(
+        rows.iter()
+            .map(|row| Some(row.actor.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let occurred_at = Int64Array::from(
+        rows.iter()
+            .map(|row| row.occurred_at_ms)
+            .collect::<Vec<_>>(),
+    );
+    let authority_manifest_ids = StringArray::from(
+        rows.iter()
+            .map(|row| row.authority_manifest_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let logical_commit_ids = StringArray::from(
+        rows.iter()
+            .map(|row| row.logical_commit_id.as_deref())
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(record_versions),
+            Arc::new(operation_ids),
+            Arc::new(operation_families),
+            Arc::new(request_digests),
+            Arc::new(actors),
+            Arc::new(occurred_at),
+            Arc::new(Int64Array::from(logical_sequences)),
+            Arc::new(authority_manifest_ids),
+            Arc::new(logical_commit_ids),
+        ],
+    )
+    .map_err(|error| CatalogError::Parquet {
+        message: format!("catalog audit record batch build failed: {error}"),
+    })?;
+    write_single_batch(schema, &batch)
+}
+
 const fn transaction_handle_lifecycle_name(status: ControlPlaneHandleStatus) -> &'static str {
     match status {
         ControlPlaneHandleStatus::Open => "OPEN",
@@ -1408,6 +1553,23 @@ fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| CatalogError::InvariantViolation {
             message: format!("column '{name}' is not Int64Array"),
+        })
+}
+
+fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    let idx = batch
+        .schema()
+        .index_of(name)
+        .map_err(|e| CatalogError::InvariantViolation {
+            message: format!("missing column '{name}': {e}"),
+        })?;
+
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| CatalogError::InvariantViolation {
+            message: format!("column '{name}' is not UInt32Array"),
         })
 }
 
@@ -1822,6 +1984,64 @@ pub fn read_commits(bytes: &Bytes) -> Result<Vec<CatalogCommitRecord>> {
     Ok(out)
 }
 
+/// Reads one `system.catalog.audit` projection file.
+///
+/// # Errors
+///
+/// Returns an error if the Parquet payload is invalid, a column is missing or
+/// mistyped, a required column holds nulls, or a `logical_sequence` is
+/// negative.
+pub fn read_audit_records(bytes: &Bytes) -> Result<Vec<CatalogAuditRow>> {
+    let mut out = Vec::new();
+    for batch in read_batches(bytes)? {
+        let record_version = col_u32(&batch, "record_version")?;
+        let operation_id = col_string(&batch, "operation_id")?;
+        let operation_family = col_string(&batch, "operation_family")?;
+        let request_digest = col_string(&batch, "request_digest")?;
+        let actor = col_string(&batch, "actor")?;
+        let occurred_at_ms = col_i64(&batch, "occurred_at_ms")?;
+        let logical_sequence = col_i64(&batch, "logical_sequence")?;
+        let authority_manifest_id = col_string(&batch, "authority_manifest_id")?;
+        let logical_commit_id = col_string(&batch, "logical_commit_id")?;
+        let required: [&dyn arrow::array::Array; 7] = [
+            record_version,
+            operation_id,
+            operation_family,
+            request_digest,
+            actor,
+            occurred_at_ms,
+            logical_sequence,
+        ];
+        if required.iter().any(|column| column.null_count() > 0) {
+            return Err(CatalogError::InvariantViolation {
+                message: "catalog audit file holds nulls in a required column".to_string(),
+            });
+        }
+        let optional = |column: &StringArray, row: usize| {
+            (!column.is_null(row)).then(|| column.value(row).to_string())
+        };
+        for row in 0..batch.num_rows() {
+            let sequence = logical_sequence.value(row);
+            out.push(CatalogAuditRow {
+                record_version: record_version.value(row),
+                operation_id: operation_id.value(row).to_string(),
+                operation_family: operation_family.value(row).to_string(),
+                request_digest: request_digest.value(row).to_string(),
+                actor: actor.value(row).to_string(),
+                occurred_at_ms: occurred_at_ms.value(row),
+                logical_sequence: u64::try_from(sequence).map_err(|_| {
+                    CatalogError::InvariantViolation {
+                        message: format!("catalog audit logical_sequence {sequence} is negative"),
+                    }
+                })?,
+                authority_manifest_id: optional(authority_manifest_id, row),
+                logical_commit_id: optional(logical_commit_id, row),
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2105,6 +2325,92 @@ mod tests {
         assert!(
             decode_catalog_commit_event_witnesses(&reversed).is_err(),
             "stored witness order must be canonical"
+        );
+    }
+
+    fn audit_row_v1() -> CatalogAuditRow {
+        CatalogAuditRow {
+            record_version: 1,
+            operation_id: "op-v1".to_string(),
+            operation_family: "create_catalog".to_string(),
+            request_digest: "11".repeat(32),
+            actor: "api".to_string(),
+            occurred_at_ms: 1_800_000_000_000,
+            logical_sequence: 7,
+            authority_manifest_id: Some("manifest-7".to_string()),
+            logical_commit_id: None,
+        }
+    }
+
+    fn audit_row_v2() -> CatalogAuditRow {
+        CatalogAuditRow {
+            record_version: 2,
+            operation_id: "op-v2".to_string(),
+            operation_family: "delete_catalog".to_string(),
+            request_digest: "22".repeat(32),
+            actor: "api".to_string(),
+            occurred_at_ms: 1_800_000_000_001,
+            logical_sequence: u64::try_from(i64::MAX).expect("i64::MAX fits in u64"),
+            authority_manifest_id: None,
+            logical_commit_id: Some("33".repeat(32)),
+        }
+    }
+
+    #[test]
+    fn audit_records_round_trip_both_row_shapes_under_the_published_schema() {
+        let rows = vec![audit_row_v1(), audit_row_v2()];
+        let bytes = write_audit_records(&rows).expect("write audit records");
+        assert_eq!(
+            read_audit_records(&bytes).expect("read audit records"),
+            rows
+        );
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).expect("parquet reader");
+        assert_eq!(reader.schema().fields(), catalog_audit_schema().fields());
+        let expected = [
+            ("record_version", DataType::UInt32, false),
+            ("operation_id", DataType::Utf8, false),
+            ("operation_family", DataType::Utf8, false),
+            ("request_digest", DataType::Utf8, false),
+            ("actor", DataType::Utf8, false),
+            ("occurred_at_ms", DataType::Int64, false),
+            ("logical_sequence", DataType::Int64, false),
+            ("authority_manifest_id", DataType::Utf8, true),
+            ("logical_commit_id", DataType::Utf8, true),
+        ];
+        let schema = catalog_audit_schema();
+        assert_eq!(schema.fields().len(), expected.len());
+        for (field, (name, data_type, nullable)) in schema.fields().iter().zip(expected) {
+            assert_eq!(field.name(), name);
+            assert_eq!(field.data_type(), &data_type);
+            assert_eq!(field.is_nullable(), nullable, "{name} nullability");
+        }
+    }
+
+    #[test]
+    fn audit_record_files_are_byte_identical_for_identical_rows() {
+        let rows = [audit_row_v1()];
+        let first = write_audit_records(&rows).expect("first write");
+        let second = write_audit_records(&rows).expect("second write");
+        assert_eq!(
+            first, second,
+            "an at-least-once rewrite must reproduce the bytes"
+        );
+        assert_ne!(
+            first,
+            write_audit_records(&[audit_row_v2()]).expect("different rows"),
+            "different rows produce a different file"
+        );
+    }
+
+    #[test]
+    fn audit_records_reject_a_logical_sequence_beyond_the_int64_column() {
+        let mut row = audit_row_v1();
+        row.logical_sequence = u64::try_from(i64::MAX).expect("i64::MAX fits in u64") + 1;
+        let error = write_audit_records(&[row]).expect_err("the sequence overflows Int64");
+        assert!(
+            matches!(error, CatalogError::Validation { ref message } if message.contains("logical_sequence")),
+            "unexpected error: {error}"
         );
     }
 }

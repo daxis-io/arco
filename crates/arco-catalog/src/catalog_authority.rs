@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
@@ -17,7 +17,9 @@ use arco_core::{AuthorityRoot, ScopedStorage, TableFormat, WritePrecondition, Wr
 
 use crate::error::{CatalogError, Result};
 use crate::idempotency::validate_uuidv7;
-use crate::parquet_util::{CatalogRecord, ColumnRecord, NamespaceRecord, TableRecord};
+use crate::parquet_util::{
+    CatalogAuditRow, CatalogRecord, ColumnRecord, NamespaceRecord, TableRecord, write_audit_records,
+};
 use crate::state::CatalogState;
 use crate::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionMaterializationStatus, ProjectionOutboxAckWriter,
@@ -987,7 +989,157 @@ pub struct ControlCatalogAuthority {
     projection_notifier_v2: Option<Arc<dyn CatalogProjectionNotifierV2>>,
 }
 
+/// Object prefix of the `system.catalog.audit` projection, relative to an
+/// exact catalog authority root.
+///
+/// The catalog projection materializer writes one immutable single-row
+/// Parquet file beneath it for every catalog projection intent it
+/// materializes (see [`catalog_audit_artifact_path`]), before it acknowledges
+/// that intent; a quarantined intent gets none. The files are not listed in
+/// any snapshot manifest.
+pub const CATALOG_AUDIT_PROJECTION_PREFIX: &str = "control/v1/projections/catalog-audit/";
+
+/// The last millisecond whose UTC date has a four-digit year,
+/// 9999-12-31T23:59:59.999Z. Bounding partitions to four-digit years keeps
+/// their lexicographic order chronological.
+const LAST_AUDIT_PARTITION_MS: i64 = 253_402_300_799_999;
+
+/// Returns the day partition, `dt=YYYY-MM-DD/`, of an audit record that
+/// occurred at `occurred_at_ms` milliseconds since the Unix epoch.
+///
+/// The day is the UTC calendar day, so partition names sort chronologically.
+///
+/// # Errors
+///
+/// Returns a validation error when `occurred_at_ms` lies before the Unix
+/// epoch or after the last millisecond of the year 9999 (UTC).
+pub fn catalog_audit_partition(occurred_at_ms: i64) -> Result<String> {
+    let day = if (0..=LAST_AUDIT_PARTITION_MS).contains(&occurred_at_ms) {
+        DateTime::from_timestamp_millis(occurred_at_ms)
+    } else {
+        None
+    };
+    let day = day.ok_or_else(|| CatalogError::Validation {
+        message: format!(
+            "catalog audit occurrence {occurred_at_ms} ms has no day partition between 1970-01-01 and 9999-12-31 UTC"
+        ),
+    })?;
+    Ok(format!("dt={}/", day.format("%Y-%m-%d")))
+}
+
+/// Returns the `system.catalog.audit` artifact path of one committed catalog
+/// projection intent.
+///
+/// The path is relative to the catalog authority root:
+/// `control/v1/projections/catalog-audit/dt=YYYY-MM-DD/{source_logical_sequence:020}-{intent_id}.parquet`.
+///
+/// The day is the UTC day of the audit record's `occurredAtMs` (see
+/// [`catalog_audit_partition`]). The file name pairs the intent's source
+/// logical sequence with its id because keyed operation ids are
+/// deterministic and recur once their idempotency receipt is purged and the
+/// request re-executes: the audit identity is `(operation_id,
+/// logical_sequence)`. Intent ids are validated path-safe components (no
+/// `/`, `\`, `%`, dot segments, or control characters), so the file never
+/// leaves its partition.
+///
+/// # Errors
+///
+/// Returns a validation error when the intent's payload is not the catalog
+/// audit record of this intent (a version-1 record, or a version-2 record of
+/// the test-only bounded format, whose operation id is the intent id and
+/// whose logical sequence is the intent's source sequence), or when its
+/// occurrence has no day partition.
+pub fn catalog_audit_artifact_path(intent: &ProjectionIntentV1) -> Result<String> {
+    let row = catalog_audit_row(intent)?;
+    audit_artifact_path(intent, &row)
+}
+
+/// Decodes the audit row an intent's payload carries; see
+/// [`decode_catalog_audit_row`].
+fn catalog_audit_row(intent: &ProjectionIntentV1) -> Result<CatalogAuditRow> {
+    decode_catalog_audit_row(
+        intent.payload(),
+        intent.intent_id(),
+        intent.source_logical_sequence(),
+    )
+}
+
+fn audit_artifact_path(intent: &ProjectionIntentV1, row: &CatalogAuditRow) -> Result<String> {
+    Ok(format!(
+        "{CATALOG_AUDIT_PROJECTION_PREFIX}{}{:020}-{}.parquet",
+        catalog_audit_partition(row.occurred_at_ms)?,
+        intent.source_logical_sequence(),
+        intent.intent_id()
+    ))
+}
+
+/// Decodes a catalog projection intent payload into its audit row, trying the
+/// production `CatalogAuditRecordV1` first and the bounded
+/// `CatalogAuditRecordV2` second, and requires the record to belong to the
+/// intent that carries it. Every failure is a validation error, which the
+/// materializer quarantines instead of retrying forever.
+fn decode_catalog_audit_row(
+    payload: &[u8],
+    intent_id: &str,
+    source_logical_sequence: u64,
+) -> Result<CatalogAuditRow> {
+    let row = if let Ok(record) = serde_json::from_slice::<CatalogAuditRecordV1>(payload) {
+        CatalogAuditRow {
+            record_version: record.version,
+            operation_id: record.operation_id,
+            operation_family: record.operation_family,
+            request_digest: record.request_digest,
+            actor: record.actor,
+            occurred_at_ms: record.occurred_at_ms,
+            logical_sequence: record.logical_sequence,
+            authority_manifest_id: Some(record.authority_manifest_id),
+            logical_commit_id: None,
+        }
+    } else {
+        let record = serde_json::from_slice::<CatalogAuditRecordV2>(payload).map_err(|error| {
+            CatalogError::Validation {
+                message: format!(
+                    "catalog projection intent payload is not a catalog audit record: {error}"
+                ),
+            }
+        })?;
+        CatalogAuditRow {
+            record_version: record.version,
+            operation_id: record.operation_id,
+            operation_family: record.operation_family,
+            request_digest: record.request_digest,
+            actor: record.actor,
+            occurred_at_ms: record.occurred_at_ms,
+            logical_sequence: record.logical_sequence,
+            authority_manifest_id: None,
+            logical_commit_id: Some(record.logical_commit_id),
+        }
+    };
+    if row.operation_id != intent_id {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names operation {} but rides projection intent {intent_id}",
+                row.operation_id
+            ),
+        });
+    }
+    if row.logical_sequence != source_logical_sequence {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names logical sequence {} but its intent was committed at {source_logical_sequence}",
+                row.logical_sequence
+            ),
+        });
+    }
+    Ok(row)
+}
+
 /// Restart-safe anti-entropy worker for catalog Parquet projections.
+///
+/// For every committed catalog projection intent it publishes the catalog
+/// snapshot under `control/v1/projections/catalog-parquet/` and the intent's
+/// audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only then
+/// acknowledges the intent.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1088,6 +1240,12 @@ impl CatalogProjectionMaterializer {
                     .to_string(),
             });
         }
+        // Decode and encode the audit row before anything is written: a
+        // payload that is not this intent's audit record is a validation
+        // error, quarantined without leaving snapshot files behind.
+        let audit_row = catalog_audit_row(intent)?;
+        let audit_path = audit_artifact_path(intent, &audit_row)?;
+        let audit_bytes = write_audit_records(std::slice::from_ref(&audit_row))?;
         let state = projection_measurement::phase("projection-source", async {
             let token = self
                 .source
@@ -1111,6 +1269,30 @@ impl CatalogProjectionMaterializer {
                 &state,
             )
             .await?;
+            // The audit artifact is immutable and lands before the snapshot
+            // manifest, so an acknowledged intent always has it.
+            match self
+                .storage
+                .put_raw(
+                    &audit_path,
+                    audit_bytes.clone(),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await?
+            {
+                WriteResult::Success { .. } => {}
+                WriteResult::PreconditionFailed { .. } => {
+                    // At-least-once delivery rewrites the same deterministic
+                    // bytes; anything else at this path fails closed.
+                    let existing = self.storage.get_raw(&audit_path).await?;
+                    if existing != audit_bytes {
+                        return Err(CatalogError::PreconditionFailed {
+                            message: "catalog audit artifact already exists with different bytes"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
             let manifest_path = format!("{directory}manifest.json");
             let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
                 CatalogError::Serialization {
@@ -4721,6 +4903,203 @@ mod receipt_expiry_tests {
                     expires_at_ms: None
                 }
             )]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod audit_projection_tests {
+    use super::*;
+
+    use arco_core::MemoryBackend;
+
+    /// 2027-01-15T08:00:00Z.
+    const OCCURRED_AT_MS: i64 = 1_800_000_000_000;
+    /// 2027-01-15T00:00:00Z.
+    const DAY_START_MS: i64 = 1_799_971_200_000;
+    /// 9999-12-31T23:59:59.999Z, the last millisecond with a four-digit year.
+    const LAST_PARTITIONABLE_MS: i64 = 253_402_300_799_999;
+
+    fn v1_payload(operation_id: &str, logical_sequence: u64) -> Bytes {
+        encode_json(
+            &CatalogAuditRecordV1 {
+                version: RECORD_VERSION,
+                operation_id: operation_id.to_string(),
+                operation_family: "create_catalog".to_string(),
+                request_digest: "11".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                authority_manifest_id: "manifest-7".to_string(),
+                logical_sequence,
+            },
+            "v1 audit",
+        )
+        .unwrap()
+    }
+
+    fn v2_payload(operation_id: &str, logical_sequence: u64) -> Bytes {
+        encode_json(
+            &CatalogAuditRecordV2 {
+                version: 2,
+                operation_id: operation_id.to_string(),
+                operation_family: "delete_catalog".to_string(),
+                request_digest: "22".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                logical_commit_id: "33".repeat(32),
+                logical_sequence,
+            },
+            "v2 audit",
+        )
+        .unwrap()
+    }
+
+    fn is_validation(result: &Result<CatalogAuditRow>) -> bool {
+        matches!(result, Err(CatalogError::Validation { .. }))
+    }
+
+    #[test]
+    fn audit_partition_is_the_utc_day_of_the_occurrence() {
+        assert_eq!(
+            catalog_audit_partition(OCCURRED_AT_MS).unwrap(),
+            "dt=2027-01-15/"
+        );
+        assert_eq!(
+            catalog_audit_partition(DAY_START_MS - 1).unwrap(),
+            "dt=2027-01-14/",
+            "the last millisecond of a day stays in that day"
+        );
+        assert_eq!(
+            catalog_audit_partition(DAY_START_MS).unwrap(),
+            "dt=2027-01-15/",
+            "the first millisecond of the next day starts a new partition"
+        );
+        assert_eq!(catalog_audit_partition(0).unwrap(), "dt=1970-01-01/");
+        assert_eq!(
+            catalog_audit_partition(LAST_PARTITIONABLE_MS).unwrap(),
+            "dt=9999-12-31/"
+        );
+    }
+
+    #[test]
+    fn audit_partition_rejects_instants_without_a_four_digit_utc_date() {
+        for occurred_at_ms in [-1, i64::MIN, LAST_PARTITIONABLE_MS + 1, i64::MAX] {
+            assert!(
+                matches!(
+                    catalog_audit_partition(occurred_at_ms),
+                    Err(CatalogError::Validation { .. })
+                ),
+                "{occurred_at_ms} must not map to a partition"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_decoder_accepts_both_record_versions() {
+        let v1 = decode_catalog_audit_row(&v1_payload("op-1", 7), "op-1", 7).unwrap();
+        assert_eq!(
+            v1,
+            CatalogAuditRow {
+                record_version: RECORD_VERSION,
+                operation_id: "op-1".to_string(),
+                operation_family: "create_catalog".to_string(),
+                request_digest: "11".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                logical_sequence: 7,
+                authority_manifest_id: Some("manifest-7".to_string()),
+                logical_commit_id: None,
+            }
+        );
+        let v2 = decode_catalog_audit_row(&v2_payload("op-2", 9), "op-2", 9).unwrap();
+        assert_eq!(
+            v2,
+            CatalogAuditRow {
+                record_version: 2,
+                operation_id: "op-2".to_string(),
+                operation_family: "delete_catalog".to_string(),
+                request_digest: "22".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                logical_sequence: 9,
+                authority_manifest_id: None,
+                logical_commit_id: Some("33".repeat(32)),
+            }
+        );
+    }
+
+    #[test]
+    fn audit_decoder_rejects_junk_and_records_of_another_intent() {
+        assert!(is_validation(&decode_catalog_audit_row(b"junk", "op-1", 7)));
+        assert!(is_validation(&decode_catalog_audit_row(b"{}", "op-1", 7)));
+        let mut unknown_field: serde_json::Value =
+            serde_json::from_slice(&v1_payload("op-1", 7)).unwrap();
+        unknown_field["extra"] = serde_json::json!(true);
+        assert!(is_validation(&decode_catalog_audit_row(
+            &serde_json::to_vec(&unknown_field).unwrap(),
+            "op-1",
+            7
+        )));
+        assert!(
+            is_validation(&decode_catalog_audit_row(&v1_payload("op-1", 7), "op-2", 7)),
+            "the record must name the intent's operation"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(&v2_payload("op-1", 7), "op-2", 7)),
+            "the record must name the intent's operation"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(&v1_payload("op-1", 7), "op-1", 8)),
+            "the record must carry the intent's source sequence"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(&v2_payload("op-1", 7), "op-1", 8)),
+            "the record must carry the intent's source sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_artifact_path_names_the_day_sequence_and_intent() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        let predicted = txn.predicted_state_token().unwrap();
+        let frozen = FrozenMutation {
+            operation_id: "op-fixed".into(),
+            family: "delete_catalog",
+            digest: "11".repeat(32),
+            actor: "api".into(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            receipt_key: receipt_key("delete_catalog", &"22".repeat(32)),
+            request_id: None,
+            command: FrozenCommand::DeleteCatalog {
+                name: "catalog".into(),
+                force: false,
+            },
+        };
+        stage_commit_records(&mut txn, &frozen, &MutationResponseV1::Deleted, &predicted)
+            .await
+            .unwrap();
+        let outcome = txn.commit().await.unwrap();
+        let intent = &outcome.projection_intents()[0];
+        assert_eq!(
+            catalog_audit_artifact_path(intent).unwrap(),
+            format!(
+                "control/v1/projections/catalog-audit/dt=2027-01-15/{:020}-op-fixed.parquet",
+                predicted.logical_sequence()
+            )
+        );
+        assert!(
+            catalog_audit_artifact_path(intent)
+                .unwrap()
+                .starts_with(CATALOG_AUDIT_PROJECTION_PREFIX)
         );
     }
 }

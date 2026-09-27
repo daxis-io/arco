@@ -1249,7 +1249,7 @@ fn catalog_worker(storage: &ScopedStorage) -> ProjectionOutboxWorker {
 }
 
 #[tokio::test]
-async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging() {
+async fn materializer_writes_one_audit_artifact_per_intent() {
     let storage = scoped_storage();
     let authority = ControlCatalogAuthority::new(storage.clone(), scope())
         .expect("control authority")
@@ -1308,8 +1308,13 @@ async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging(
         vec!["create_catalog", "create_schema", "patch_catalog"],
         families
     );
+}
 
-    // Ordering: the artifact is durable before the acknowledgement.
+/// The audit artifact is durable before the acknowledgement: a failed
+/// artifact put leaves the intent pending, and the snapshot manifest (written
+/// after the audit artifact) is not published either.
+#[tokio::test]
+async fn audit_artifact_is_written_before_acknowledgement() {
     let backend = FailProjectionPutBackend::new();
     let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
         .expect("storage");
@@ -1344,7 +1349,8 @@ async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging(
         assert_eq!(None, backlog.latest_projected_sequence);
     };
 
-    // Every projection put fails: nothing is published, nothing acknowledged.
+    // Every projection put fails: the first snapshot file fails, so the audit
+    // put is never attempted, and nothing is acknowledged.
     backend.fail.store(true, Ordering::SeqCst);
     CatalogProjectionMaterializer::new(storage.clone())
         .expect("materializer")
@@ -1352,6 +1358,7 @@ async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging(
         .await
         .expect_err("an artifact failure must prevent acknowledgement");
     backend.fail.store(false, Ordering::SeqCst);
+    assert_eq!(0, backend.audit_puts.load(Ordering::SeqCst));
     assert!(storage.head_raw(&audit_path).await.expect("head").is_none());
     assert_unacknowledged(worker.backlog().await.expect("backlog"));
 
@@ -1368,6 +1375,7 @@ async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging(
         failed.to_string().contains("audit artifact failure"),
         "unexpected error: {failed}"
     );
+    assert_eq!(1, backend.audit_puts.load(Ordering::SeqCst));
     assert!(storage.head_raw(&audit_path).await.expect("head").is_none());
     assert!(
         storage
@@ -1407,6 +1415,7 @@ async fn materializer_writes_one_audit_artifact_per_intent_before_acknowledging(
         vec![record.record_id().to_string()],
         retried.drained_record_ids
     );
+    assert_eq!(2, backend.audit_puts.load(Ordering::SeqCst));
     assert_eq!(vec![audit_path.clone()], audit_artifacts(&storage).await);
     assert_eq!(
         vec![expected_audit_row(&record)],
@@ -1525,6 +1534,11 @@ async fn a_divergent_audit_artifact_fails_closed_without_acknowledging() {
     let intent: ProjectionIntentV1 =
         serde_json::from_slice(record.payload()).expect("projection intent envelope");
     let audit_path = expected_audit_path(&record);
+    let snapshot_directory = format!(
+        "control/v1/projections/catalog-parquet/{:020}-{}/",
+        intent.source_logical_sequence(),
+        intent.source_authority_manifest_id()
+    );
     let foreign = Bytes::from_static(b"not the projected audit record");
     storage
         .put_raw(
@@ -1552,11 +1566,15 @@ async fn a_divergent_audit_artifact_fails_closed_without_acknowledging() {
     );
     assert!(
         storage
-            .head_raw(&format!(
-                "control/v1/projections/catalog-parquet/{:020}-{}/manifest.json",
-                intent.source_logical_sequence(),
-                intent.source_authority_manifest_id()
-            ))
+            .head_raw(&format!("{snapshot_directory}catalogs.parquet"))
+            .await
+            .expect("head")
+            .is_some(),
+        "the snapshot files landed, so the quarantine came from the audit step"
+    );
+    assert!(
+        storage
+            .head_raw(&format!("{snapshot_directory}manifest.json"))
             .await
             .expect("head")
             .is_none(),
@@ -1570,6 +1588,33 @@ async fn a_divergent_audit_artifact_fails_closed_without_acknowledging() {
             .expect("status")
             .expect("quarantine status")
             .failure_state()
+    );
+    let quarantine = ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            "synthetic-tenant",
+            "synthetic-workspace",
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .expect("ack writer")
+    .projection_quarantine(
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        record.origin_sequence().expect("committed origin sequence"),
+    )
+    .await
+    .expect("read quarantine")
+    .expect("durable quarantine");
+    assert_eq!(record.record_id(), quarantine.source_record_id());
+    assert_eq!("INCOMPATIBLE_PROJECTION_INTENT", quarantine.failure_code());
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids,
+        "a quarantined intent is never acknowledged"
     );
 }
 

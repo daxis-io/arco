@@ -404,9 +404,8 @@ pub async fn projection(tables: usize, backlog: usize, interrupt: bool) -> serde
     let mut stages = BTreeMap::new();
     let mut published_before_retry = None;
     if interrupt {
-        // Publish five Parquet objects, the audit artifact and the manifest, then fail
-        // the first status PUT. This exercises recovery after immutable publication
-        // but before acknowledgement.
+        // 8 = 5 snapshot files + audit artifact + manifest + the failing status PUT.
+        // This exercises recovery after immutable publication but before acknowledgement.
         backend.fail_put_countdown.store(8, Ordering::SeqCst);
         projection_measurement::start();
         let failed = recorder
@@ -639,8 +638,7 @@ pub async fn conflicting_publication_is_still_quarantined() {
     let backend = Arc::new(CountingBackend::new(1));
     let fixture = Box::pin(fixture(&backend, 8, 1)).await;
     let storage = storage(backend.clone());
-    // Publish the five snapshot files, the audit artifact and the manifest, then
-    // fail the first status PUT.
+    // 8 = 5 snapshot files + audit artifact + manifest + the failing status PUT.
     backend.fail_put_countdown.store(8, Ordering::SeqCst);
     assert!(
         CatalogProjectionMaterializer::new(storage.clone())

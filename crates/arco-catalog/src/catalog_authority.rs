@@ -992,11 +992,13 @@ pub struct ControlCatalogAuthority {
 /// Object prefix of the `system.catalog.audit` projection, relative to an
 /// exact catalog authority root.
 ///
-/// The catalog projection materializer writes one immutable single-row
-/// Parquet file beneath it for every catalog projection intent it
-/// materializes (see [`catalog_audit_artifact_path`]), before it acknowledges
-/// that intent; a quarantined intent gets none. The files are not listed in
-/// any snapshot manifest.
+/// The catalog projection materializer writes immutable single-row Parquet
+/// files beneath it (see [`catalog_audit_artifact_path`]). Every acknowledged
+/// intent has exactly one file here, written before the acknowledgement. A
+/// quarantined intent may or may not have one (for example, one quarantined
+/// for a divergent snapshot manifest after its audit file landed); a present
+/// file still describes a committed mutation. The files are not listed in any
+/// snapshot manifest.
 pub const CATALOG_AUDIT_PROJECTION_PREFIX: &str = "control/v1/projections/catalog-audit/";
 
 /// The last millisecond whose UTC date has a four-digit year,
@@ -1044,14 +1046,12 @@ pub fn catalog_audit_partition(occurred_at_ms: i64) -> Result<String> {
 ///
 /// # Errors
 ///
-/// Returns a validation error when the intent's payload is not the catalog
-/// audit record of this intent (a version-1 record, or a version-2 record of
-/// the test-only bounded format, whose operation id is the intent id and
-/// whose logical sequence is the intent's source sequence), or when its
-/// occurrence has no day partition.
+/// Returns a validation error unless the payload decodes as the catalog audit
+/// record of this intent (a version-1 record with operation id = intent id,
+/// logical sequence = source sequence, authority manifest id = source
+/// manifest id), or when the record's occurrence has no day partition.
 pub fn catalog_audit_artifact_path(intent: &ProjectionIntentV1) -> Result<String> {
-    let row = catalog_audit_row(intent)?;
-    audit_artifact_path(intent, &row)
+    audit_artifact_path(&catalog_audit_row(intent)?)
 }
 
 /// Decodes the audit row an intent's payload carries; see
@@ -1061,85 +1061,93 @@ fn catalog_audit_row(intent: &ProjectionIntentV1) -> Result<CatalogAuditRow> {
         intent.payload(),
         intent.intent_id(),
         intent.source_logical_sequence(),
+        intent.source_authority_manifest_id(),
     )
 }
 
-fn audit_artifact_path(intent: &ProjectionIntentV1, row: &CatalogAuditRow) -> Result<String> {
+/// The artifact path of a decoded row, whose operation id and logical
+/// sequence [`decode_catalog_audit_row`] has checked against its intent.
+fn audit_artifact_path(row: &CatalogAuditRow) -> Result<String> {
     Ok(format!(
         "{CATALOG_AUDIT_PROJECTION_PREFIX}{}{:020}-{}.parquet",
         catalog_audit_partition(row.occurred_at_ms)?,
-        intent.source_logical_sequence(),
-        intent.intent_id()
+        row.logical_sequence,
+        row.operation_id
     ))
 }
 
-/// Decodes a catalog projection intent payload into its audit row, trying the
-/// production `CatalogAuditRecordV1` first and the bounded
-/// `CatalogAuditRecordV2` second, and requires the record to belong to the
-/// intent that carries it. Every failure is a validation error, which the
-/// materializer quarantines instead of retrying forever.
+/// Decodes a V1 catalog projection intent's payload into its audit row and
+/// requires the record to belong to the intent that carries it.
+///
+/// Only the production `CatalogAuditRecordV1` shape is accepted. Bounded
+/// `CatalogAuditRecordV2` records ride only `ProjectionIntentV2` envelopes on
+/// format-8 roots, which refuse V1 outbox staging and reads, so a V2 record
+/// inside a V1 envelope is malformed. Every failure is a validation error,
+/// which the materializer quarantines instead of retrying forever.
 fn decode_catalog_audit_row(
     payload: &[u8],
     intent_id: &str,
     source_logical_sequence: u64,
+    source_authority_manifest_id: &str,
 ) -> Result<CatalogAuditRow> {
-    let row = if let Ok(record) = serde_json::from_slice::<CatalogAuditRecordV1>(payload) {
-        CatalogAuditRow {
-            record_version: record.version,
-            operation_id: record.operation_id,
-            operation_family: record.operation_family,
-            request_digest: record.request_digest,
-            actor: record.actor,
-            occurred_at_ms: record.occurred_at_ms,
-            logical_sequence: record.logical_sequence,
-            authority_manifest_id: Some(record.authority_manifest_id),
-            logical_commit_id: None,
+    let record = serde_json::from_slice::<CatalogAuditRecordV1>(payload).map_err(|error| {
+        CatalogError::Validation {
+            message: format!(
+                "catalog projection intent payload is not a catalog audit record: {error}"
+            ),
         }
-    } else {
-        let record = serde_json::from_slice::<CatalogAuditRecordV2>(payload).map_err(|error| {
-            CatalogError::Validation {
-                message: format!(
-                    "catalog projection intent payload is not a catalog audit record: {error}"
-                ),
-            }
-        })?;
-        CatalogAuditRow {
-            record_version: record.version,
-            operation_id: record.operation_id,
-            operation_family: record.operation_family,
-            request_digest: record.request_digest,
-            actor: record.actor,
-            occurred_at_ms: record.occurred_at_ms,
-            logical_sequence: record.logical_sequence,
-            authority_manifest_id: None,
-            logical_commit_id: Some(record.logical_commit_id),
-        }
-    };
-    if row.operation_id != intent_id {
+    })?;
+    if record.version != RECORD_VERSION {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record version {} is unsupported",
+                record.version
+            ),
+        });
+    }
+    if record.operation_id != intent_id {
         return Err(CatalogError::Validation {
             message: format!(
                 "catalog audit record names operation {} but rides projection intent {intent_id}",
-                row.operation_id
+                record.operation_id
             ),
         });
     }
-    if row.logical_sequence != source_logical_sequence {
+    if record.logical_sequence != source_logical_sequence {
         return Err(CatalogError::Validation {
             message: format!(
                 "catalog audit record names logical sequence {} but its intent was committed at {source_logical_sequence}",
-                row.logical_sequence
+                record.logical_sequence
             ),
         });
     }
-    Ok(row)
+    if record.authority_manifest_id != source_authority_manifest_id {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names authority manifest {} but its intent was committed by {source_authority_manifest_id}",
+                record.authority_manifest_id
+            ),
+        });
+    }
+    Ok(CatalogAuditRow {
+        record_version: record.version,
+        operation_id: record.operation_id,
+        operation_family: record.operation_family,
+        request_digest: record.request_digest,
+        actor: record.actor,
+        occurred_at_ms: record.occurred_at_ms,
+        logical_sequence: record.logical_sequence,
+        authority_manifest_id: Some(record.authority_manifest_id),
+        logical_commit_id: None,
+    })
 }
 
 /// Restart-safe anti-entropy worker for catalog Parquet projections.
 ///
-/// For every committed catalog projection intent it publishes the catalog
-/// snapshot under `control/v1/projections/catalog-parquet/` and the intent's
-/// audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only then
-/// acknowledges the intent.
+/// For every catalog projection intent it materializes it publishes the
+/// catalog snapshot under `control/v1/projections/catalog-parquet/` and the
+/// intent's audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only
+/// then acknowledges the intent.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1244,7 +1252,7 @@ impl CatalogProjectionMaterializer {
         // payload that is not this intent's audit record is a validation
         // error, quarantined without leaving snapshot files behind.
         let audit_row = catalog_audit_row(intent)?;
-        let audit_path = audit_artifact_path(intent, &audit_row)?;
+        let audit_path = audit_artifact_path(&audit_row)?;
         let audit_bytes = write_audit_records(std::slice::from_ref(&audit_row))?;
         let state = projection_measurement::phase("projection-source", async {
             let token = self
@@ -1269,30 +1277,13 @@ impl CatalogProjectionMaterializer {
                 &state,
             )
             .await?;
-            // The audit artifact is immutable and lands before the snapshot
-            // manifest, so an acknowledged intent always has it.
-            match self
-                .storage
-                .put_raw(
-                    &audit_path,
-                    audit_bytes.clone(),
-                    WritePrecondition::DoesNotExist,
-                )
-                .await?
-            {
-                WriteResult::Success { .. } => {}
-                WriteResult::PreconditionFailed { .. } => {
-                    // At-least-once delivery rewrites the same deterministic
-                    // bytes; anything else at this path fails closed.
-                    let existing = self.storage.get_raw(&audit_path).await?;
-                    if existing != audit_bytes {
-                        return Err(CatalogError::PreconditionFailed {
-                            message: "catalog audit artifact already exists with different bytes"
-                                .to_string(),
-                        });
-                    }
-                }
-            }
+            // The immutable audit artifact lands after the snapshot files and
+            // before the snapshot manifest. `materialize` returns Ok, and so
+            // lets the intent be acknowledged, only after this put succeeds;
+            // writing it before the manifest also makes a published manifest
+            // imply an audit file.
+            self.publish_audit_artifact(&audit_path, audit_bytes)
+                .await?;
             let manifest_path = format!("{directory}manifest.json");
             let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
                 CatalogError::Serialization {
@@ -1339,6 +1330,30 @@ impl CatalogProjectionMaterializer {
             Ok(manifest_path)
         })
         .await
+    }
+
+    /// Writes one immutable audit artifact under a does-not-exist
+    /// precondition. At-least-once delivery rewrites the same deterministic
+    /// bytes, which are accepted; anything else at the path fails closed.
+    async fn publish_audit_artifact(&self, path: &str, bytes: Bytes) -> Result<()> {
+        match self
+            .storage
+            .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(()),
+            WriteResult::PreconditionFailed { current_version } => {
+                if self.storage.get_raw(path).await? == bytes {
+                    Ok(())
+                } else {
+                    Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "catalog audit artifact already exists with different content at {path} with version {current_version}"
+                        ),
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -1409,6 +1424,12 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                     .await?;
                     Err(error)
                 } else {
+                    warn!(
+                        record_id = record.record_id(),
+                        source_sequence,
+                        error = %error,
+                        "catalog projection intent quarantined"
+                    );
                     projection_measurement::phase(
                         "projection-status-ack",
                         self.status.record_projection_quarantine(
@@ -4921,23 +4942,27 @@ mod audit_projection_tests {
     /// 9999-12-31T23:59:59.999Z, the last millisecond with a four-digit year.
     const LAST_PARTITIONABLE_MS: i64 = 253_402_300_799_999;
 
-    fn v1_payload(operation_id: &str, logical_sequence: u64) -> Bytes {
-        encode_json(
-            &CatalogAuditRecordV1 {
-                version: RECORD_VERSION,
-                operation_id: operation_id.to_string(),
-                operation_family: "create_catalog".to_string(),
-                request_digest: "11".repeat(32),
-                actor: "api".to_string(),
-                occurred_at_ms: OCCURRED_AT_MS,
-                authority_manifest_id: "manifest-7".to_string(),
-                logical_sequence,
-            },
-            "v1 audit",
-        )
-        .unwrap()
+    const MANIFEST_ID: &str = "manifest-7";
+
+    fn v1_record() -> CatalogAuditRecordV1 {
+        CatalogAuditRecordV1 {
+            version: RECORD_VERSION,
+            operation_id: "op-1".to_string(),
+            operation_family: "create_catalog".to_string(),
+            request_digest: "11".repeat(32),
+            actor: "api".to_string(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            authority_manifest_id: MANIFEST_ID.to_string(),
+            logical_sequence: 7,
+        }
     }
 
+    fn v1_payload(record: &CatalogAuditRecordV1) -> Bytes {
+        encode_json(record, "v1 audit").unwrap()
+    }
+
+    /// A bounded (format 8) audit record, which only ever rides a
+    /// `ProjectionIntentV2` envelope.
     fn v2_payload(operation_id: &str, logical_sequence: u64) -> Bytes {
         encode_json(
             &CatalogAuditRecordV2 {
@@ -4996,10 +5021,11 @@ mod audit_projection_tests {
     }
 
     #[test]
-    fn audit_decoder_accepts_both_record_versions() {
-        let v1 = decode_catalog_audit_row(&v1_payload("op-1", 7), "op-1", 7).unwrap();
+    fn audit_decoder_accepts_the_production_record_of_its_intent() {
+        let row =
+            decode_catalog_audit_row(&v1_payload(&v1_record()), "op-1", 7, MANIFEST_ID).unwrap();
         assert_eq!(
-            v1,
+            row,
             CatalogAuditRow {
                 record_version: RECORD_VERSION,
                 operation_id: "op-1".to_string(),
@@ -5008,54 +5034,61 @@ mod audit_projection_tests {
                 actor: "api".to_string(),
                 occurred_at_ms: OCCURRED_AT_MS,
                 logical_sequence: 7,
-                authority_manifest_id: Some("manifest-7".to_string()),
+                authority_manifest_id: Some(MANIFEST_ID.to_string()),
                 logical_commit_id: None,
-            }
-        );
-        let v2 = decode_catalog_audit_row(&v2_payload("op-2", 9), "op-2", 9).unwrap();
-        assert_eq!(
-            v2,
-            CatalogAuditRow {
-                record_version: 2,
-                operation_id: "op-2".to_string(),
-                operation_family: "delete_catalog".to_string(),
-                request_digest: "22".repeat(32),
-                actor: "api".to_string(),
-                occurred_at_ms: OCCURRED_AT_MS,
-                logical_sequence: 9,
-                authority_manifest_id: None,
-                logical_commit_id: Some("33".repeat(32)),
             }
         );
     }
 
     #[test]
     fn audit_decoder_rejects_junk_and_records_of_another_intent() {
-        assert!(is_validation(&decode_catalog_audit_row(b"junk", "op-1", 7)));
-        assert!(is_validation(&decode_catalog_audit_row(b"{}", "op-1", 7)));
+        let decode = |payload: &[u8]| decode_catalog_audit_row(payload, "op-1", 7, MANIFEST_ID);
+        assert!(is_validation(&decode(b"junk")));
+        assert!(is_validation(&decode(b"{}")));
         let mut unknown_field: serde_json::Value =
-            serde_json::from_slice(&v1_payload("op-1", 7)).unwrap();
+            serde_json::from_slice(&v1_payload(&v1_record())).unwrap();
         unknown_field["extra"] = serde_json::json!(true);
-        assert!(is_validation(&decode_catalog_audit_row(
-            &serde_json::to_vec(&unknown_field).unwrap(),
-            "op-1",
-            7
+        assert!(is_validation(&decode(
+            &serde_json::to_vec(&unknown_field).unwrap()
         )));
         assert!(
-            is_validation(&decode_catalog_audit_row(&v1_payload("op-1", 7), "op-2", 7)),
+            is_validation(&decode(&v2_payload("op-1", 7))),
+            "a bounded V2 record inside a V1 envelope is malformed"
+        );
+        let wrong_version = CatalogAuditRecordV1 {
+            version: RECORD_VERSION + 1,
+            ..v1_record()
+        };
+        assert!(
+            is_validation(&decode(&v1_payload(&wrong_version))),
+            "only the production record version is materialized"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-2",
+                7,
+                MANIFEST_ID
+            )),
             "the record must name the intent's operation"
         );
         assert!(
-            is_validation(&decode_catalog_audit_row(&v2_payload("op-1", 7), "op-2", 7)),
-            "the record must name the intent's operation"
-        );
-        assert!(
-            is_validation(&decode_catalog_audit_row(&v1_payload("op-1", 7), "op-1", 8)),
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-1",
+                8,
+                MANIFEST_ID
+            )),
             "the record must carry the intent's source sequence"
         );
         assert!(
-            is_validation(&decode_catalog_audit_row(&v2_payload("op-1", 7), "op-1", 8)),
-            "the record must carry the intent's source sequence"
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-1",
+                7,
+                "manifest-8"
+            )),
+            "the record must name the intent's source authority manifest"
         );
     }
 

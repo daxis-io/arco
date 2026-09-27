@@ -192,16 +192,17 @@ pub struct CatalogCommitRecord {
 /// projection: the audit record a `control/v1` catalog mutation carries in its
 /// projection intent, flattened to one row.
 ///
-/// Production (authority format 9) records carry `authority_manifest_id`;
-/// records of the test-only bounded format 8 carry `logical_commit_id`
-/// instead. The downstream identity of a row is
+/// Every row materialized today comes from a production (authority format 9)
+/// record and carries `authority_manifest_id`; `logical_commit_id` is
+/// reserved for a future materializer of the test-only bounded format 8's
+/// intents and is always null today. The downstream identity of a row is
 /// `(operation_id, logical_sequence)`: keyed operation ids are deterministic,
 /// so the same id recurs once its idempotency receipt has been purged and the
 /// request re-executes at a later logical sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogAuditRow {
-    /// Version of the source audit record (`1` for format 9, `2` for the
-    /// bounded format 8).
+    /// Version of the source audit record; always `1`, the production record,
+    /// today.
     pub record_version: u32,
     /// Operation identifier; also the projection intent identifier.
     pub operation_id: String,
@@ -217,10 +218,12 @@ pub struct CatalogAuditRow {
     /// Committed logical sequence of the mutation. Stored as `Int64`, so
     /// values above `i64::MAX` are rejected on write.
     pub logical_sequence: u64,
-    /// Authority manifest that committed the mutation (format 9 only).
+    /// Authority manifest that committed the mutation; set on every row
+    /// materialized today.
     pub authority_manifest_id: Option<String>,
-    /// Physical-layout-independent logical commit identity (bounded format 8
-    /// only).
+    /// Physical-layout-independent logical commit identity of a bounded
+    /// format 8 mutation. Reserved for a future materializer of those intents;
+    /// always null today.
     pub logical_commit_id: Option<String>,
 }
 
@@ -1392,9 +1395,13 @@ pub fn write_transaction_handles(rows: &[TransactionHandleCatalogRecord]) -> Res
 /// Writes one `system.catalog.audit` projection file.
 ///
 /// Rows are written in the given order with the module's fixed writer
-/// properties and no timestamps, so identical rows always produce identical
-/// bytes; the projection materializer relies on that to accept an
-/// at-least-once rewrite of an existing file.
+/// properties and no timestamps, so within one build of the `parquet` crate
+/// identical rows always produce identical bytes; the projection materializer
+/// relies on that to accept an at-least-once rewrite of an existing file. The
+/// footer's `created_by` is the `parquet` crate's version string and its
+/// writer defaults can change between releases, so a redelivery across such
+/// a version change finds different bytes and fails closed (the intent is
+/// quarantined), as the snapshot files already do.
 ///
 /// # Errors
 ///
@@ -2342,6 +2349,8 @@ mod tests {
         }
     }
 
+    /// A bounded-format row. Nothing materializes one today, but the
+    /// reserved `logical_commit_id` column must still round-trip.
     fn audit_row_v2() -> CatalogAuditRow {
         CatalogAuditRow {
             record_version: 2,

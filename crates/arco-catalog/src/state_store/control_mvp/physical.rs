@@ -198,6 +198,7 @@ mod tests {
             logical_sequence: 2,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         }])
         .await
     }
@@ -365,6 +366,7 @@ mod tests {
                 logical_sequence: 2,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             };
             let (store, _, leaf) = fixture_with_rows(vec![row.clone()]).await;
             assert!(leaf.bytes as usize > MAX_BLOCK_BYTES);

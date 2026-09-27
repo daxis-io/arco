@@ -6,11 +6,24 @@ use ulid::Ulid;
 
 thread_local! {
     static INPUTS: Cell<Option<(DateTime<Utc>, u128)>> = const { Cell::new(None) };
+    /// The highest serial any `FixedInputs::at` scope on this thread reached,
+    /// so successive scopes keep issuing distinct identifiers.
+    static SERIAL_FLOOR: Cell<u128> = const { Cell::new(0) };
 }
 
 /// Restores the previous fixture inputs when dropped on its originating thread.
+///
+/// Guards nest and must be dropped in LIFO order: dropping a guard while a
+/// later one is still installed would restore the earlier prior underneath
+/// it, which debug builds assert against.
 pub struct FixedInputs {
     prior: Option<(DateTime<Utc>, u128)>,
+    /// The instant this guard installed; the clock must still read it when
+    /// the guard drops.
+    pinned: DateTime<Utc>,
+    /// `at` scopes carry their identifier serial forward on drop; `scoped`
+    /// restores it so nested repeatable scopes replay the same identifiers.
+    keep_serial: bool,
     thread_bound: PhantomData<Rc<()>>,
 }
 impl FixedInputs {
@@ -21,13 +34,48 @@ impl FixedInputs {
         let now = DateTime::from_timestamp(1_893_456_000, 0).expect("fixed fixture timestamp");
         Self {
             prior: INPUTS.with(|state| state.replace(Some((now, 0)))),
+            pinned: now,
+            keep_serial: false,
+            thread_bound: PhantomData,
+        }
+    }
+
+    /// Pins the fixture clock to `now` while keeping identifiers unique:
+    /// the identifier serial continues from wherever this thread's previous
+    /// `at` scope (or an enclosing scope) left it, and is carried forward on
+    /// drop. Use successive `at` scopes to simulate time passing. To move an
+    /// existing guard's clock, drop it before creating the next one:
+    /// assigning over a live guard installs the new instant and then lets
+    /// the old guard's drop restore its own prior underneath it.
+    #[must_use]
+    pub fn at(now: DateTime<Utc>) -> Self {
+        let serial = INPUTS
+            .with(|state| state.get().map_or(0, |(_, serial)| serial))
+            .max(SERIAL_FLOOR.with(Cell::get));
+        Self {
+            prior: INPUTS.with(|state| state.replace(Some((now, serial)))),
+            pinned: now,
+            keep_serial: true,
             thread_bound: PhantomData,
         }
     }
 }
 impl Drop for FixedInputs {
     fn drop(&mut self) {
-        INPUTS.with(|state| state.set(self.prior));
+        INPUTS.with(|state| {
+            debug_assert_eq!(
+                state.get().map(|(now, _)| now),
+                Some(self.pinned),
+                "FixedInputs guards must be dropped in LIFO order"
+            );
+            if self.keep_serial {
+                let serial = state.get().map_or(0, |(_, serial)| serial);
+                SERIAL_FLOOR.with(|floor| floor.set(floor.get().max(serial)));
+                state.set(self.prior.map(|(now, prior)| (now, prior.max(serial))));
+            } else {
+                state.set(self.prior);
+            }
+        });
     }
 }
 
@@ -73,5 +121,32 @@ mod tests {
         let _repeat = FixedInputs::scoped();
         assert_eq!(nonce(), first);
         assert_eq!(nonce(), second);
+    }
+
+    #[test]
+    fn at_scopes_move_the_clock_and_never_repeat_identifiers() {
+        let t1 = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let t2 = t1 + chrono::Duration::hours(2);
+        let mut issued = std::collections::BTreeSet::new();
+        {
+            let _first = FixedInputs::at(t1);
+            assert_eq!(now(), t1);
+            assert!(issued.insert(nonce()));
+            assert!(issued.insert(nonce()));
+        }
+        assert!(INPUTS.with(|state| state.get().is_none()));
+        {
+            let _second = FixedInputs::at(t2);
+            assert_eq!(now(), t2);
+            assert!(issued.insert(nonce()), "a later scope continues the serial");
+            {
+                let _nested = FixedInputs::at(t1);
+                assert_eq!(now(), t1);
+                assert!(issued.insert(nonce()));
+            }
+            assert_eq!(now(), t2, "dropping a nested scope restores the clock");
+            assert!(issued.insert(nonce()), "and keeps the serial moving");
+        }
+        assert_eq!(issued.len(), 5);
     }
 }

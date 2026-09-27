@@ -7,13 +7,42 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+/// One folded row: `(generation, value, expires_at_ms)`. The hint is part of
+/// the state (it feeds the checksum and the mutation digest) but never a
+/// read filter.
+type OracleRow = (u64, Option<Vec<u8>>, Option<i64>);
+
+/// A staged write as the oracle encodes it into the mutation.
+#[derive(Clone, Debug)]
+pub struct OracleWrite {
+    pub key: Vec<u8>,
+    pub value: Option<Bytes>,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// The oracle's independent expectation of one published retention-horizon
+/// certificate: what the manifest that a `horizon` call explains must carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HorizonCertificate {
+    pub horizon_sequence: u64,
+    pub purge_cutoff_ms: i64,
+    pub parent_state_checksum_sha256: String,
+    pub purged_rows_sha256: String,
+    pub expired_rows: u64,
+    pub tombstones: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct LogicalOracle {
     pub sequence: u64,
     pub root: String,
     last_mutation: String,
-    kv: BTreeMap<Vec<u8>, (u64, Option<Vec<u8>>)>,
+    kv: BTreeMap<Vec<u8>, OracleRow>,
     pub outbox: Vec<(String, Bytes, u64)>,
+    /// The last horizon this oracle applied; the manifest it explains must
+    /// carry exactly this certificate, and no other manifest may carry one
+    /// the oracle never applied.
+    last_horizon: Option<HorizonCertificate>,
 }
 
 fn field(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -25,7 +54,7 @@ fn prefix(name: &str) -> Vec<u8> {
     field(&mut out, format!("arco/control-v1/{name}").as_bytes());
     out.extend_from_slice(&1_u32.to_be_bytes());
     field(&mut out, b"arco-state-control-mvp");
-    out.extend_from_slice(&7_u32.to_be_bytes());
+    out.extend_from_slice(&9_u32.to_be_bytes());
     for scope in [b"tenant".as_slice(), b"workspace", b"catalog"] {
         field(&mut out, scope);
     }
@@ -43,7 +72,118 @@ impl LogicalOracle {
             last_mutation: String::new(),
             kv: BTreeMap::new(),
             outbox: Vec::new(),
+            last_horizon: None,
         }
+    }
+
+    /// Whether `key` currently holds a live value (not absent, not a tombstone).
+    #[allow(dead_code)] // Shared by several independently compiled contract suites.
+    pub fn is_live(&self, key: &[u8]) -> bool {
+        self.kv
+            .get(key)
+            .is_some_and(|(_, value, _)| value.is_some())
+    }
+
+    /// Applies a retention horizon: drops every tombstone at or below
+    /// `horizon_sequence` and every live row whose expiry hint precedes
+    /// `purge_cutoff_ms`, leaving sequence and history untouched, and returns
+    /// the certificate the published manifest must carry. The purged digest
+    /// is recomputed here from first principles (tag, count, then per row in
+    /// key order: key, generation, tombstone flag, optional expiry).
+    #[allow(dead_code)] // Shared by several independently compiled contract suites.
+    pub fn horizon(&mut self, purge_cutoff_ms: i64, horizon_sequence: u64) -> HorizonCertificate {
+        assert!(horizon_sequence <= self.sequence);
+        assert!(purge_cutoff_ms > 0);
+        let parent_state_checksum_sha256 = self.state_checksum();
+        let purged = self
+            .kv
+            .iter()
+            .filter(|(_, (generation, value, expires_at_ms))| {
+                if value.is_none() {
+                    *generation <= horizon_sequence
+                } else {
+                    expires_at_ms.is_some_and(|expiry| expiry < purge_cutoff_ms)
+                }
+            })
+            .map(|(key, (generation, value, expires_at_ms))| {
+                (key.clone(), *generation, value.is_none(), *expires_at_ms)
+            })
+            .collect::<Vec<_>>();
+        let mut purge = prefix("retention-purge");
+        purge.extend_from_slice(&(purged.len() as u64).to_be_bytes());
+        let (mut expired_rows, mut tombstones) = (0, 0);
+        for (key, generation, tombstone, expires_at_ms) in &purged {
+            field(&mut purge, key);
+            purge.extend_from_slice(&generation.to_be_bytes());
+            purge.push(u8::from(*tombstone));
+            purge.push(u8::from(expires_at_ms.is_some()));
+            if let Some(expiry) = expires_at_ms {
+                purge.extend_from_slice(&expiry.to_be_bytes());
+            }
+            if *tombstone {
+                tombstones += 1;
+            } else {
+                expired_rows += 1;
+            }
+            self.kv.remove(key).unwrap();
+        }
+        let certificate = HorizonCertificate {
+            horizon_sequence,
+            purge_cutoff_ms,
+            parent_state_checksum_sha256,
+            purged_rows_sha256: digest(&purge),
+            expired_rows,
+            tombstones,
+        };
+        self.last_horizon = Some(certificate.clone());
+        certificate
+    }
+
+    /// The full-state checksum exactly as the kernel serializes it.
+    pub fn state_checksum(&self) -> String {
+        #[derive(Serialize)]
+        struct Entry<'a> {
+            key: &'a Vec<u8>,
+            generation: u64,
+            value: &'a Option<Vec<u8>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            expires_at_ms: Option<i64>,
+        }
+        #[derive(Serialize)]
+        struct Outbox<'a> {
+            record_id: &'a str,
+            payload: Vec<u8>,
+            origin_sequence: Option<u64>,
+        }
+        #[derive(Serialize)]
+        struct State<'a> {
+            logical_sequence: u64,
+            entries: Vec<Entry<'a>>,
+            outbox: Vec<Outbox<'a>>,
+        }
+        let state = State {
+            logical_sequence: self.sequence,
+            entries: self
+                .kv
+                .iter()
+                .map(|(key, (generation, value, expires_at_ms))| Entry {
+                    key,
+                    generation: *generation,
+                    value,
+                    expires_at_ms: *expires_at_ms,
+                })
+                .collect(),
+            outbox: self
+                .outbox
+                .iter()
+                .map(|(id, payload, origin)| Outbox {
+                    record_id: id,
+                    payload: payload.to_vec(),
+                    origin_sequence: Some(*origin),
+                })
+                .collect(),
+        };
+        digest(&serde_json::to_vec(&state).unwrap())
     }
 
     pub fn commit(
@@ -57,7 +197,29 @@ impl LogicalOracle {
 
     pub fn commit_with_request(
         &mut self,
-        mut writes: Vec<(Vec<u8>, Option<Bytes>)>,
+        writes: Vec<(Vec<u8>, Option<Bytes>)>,
+        additions: Vec<(String, Bytes)>,
+        trims: Vec<(String, u64)>,
+        request: Option<&str>,
+    ) {
+        self.commit_writes(
+            writes
+                .into_iter()
+                .map(|(key, value)| OracleWrite {
+                    key,
+                    value,
+                    expires_at_ms: None,
+                })
+                .collect(),
+            additions,
+            trims,
+            request,
+        );
+    }
+
+    pub fn commit_writes(
+        &mut self,
+        mut writes: Vec<OracleWrite>,
         additions: Vec<(String, Bytes)>,
         mut trims: Vec<(String, u64)>,
         request: Option<&str>,
@@ -67,23 +229,43 @@ impl LogicalOracle {
                 .iter()
                 .all(|(id, _)| !additions.iter().any(|(added, _)| added == id))
         );
+        assert!(
+            writes.iter().all(|write| {
+                write
+                    .expires_at_ms
+                    .is_none_or(|expiry| expiry > 0 && write.value.is_some())
+            }),
+            "an expiry hint is positive and rides only on a live value"
+        );
         self.sequence += 1;
         let mut mutation = prefix("mutation");
         mutation.push(u8::from(request.is_some()));
         if let Some(request) = request {
             field(&mut mutation, request.as_bytes());
         }
-        writes.sort_by(|a, b| a.0.cmp(&b.0));
+        writes.sort_by(|a, b| a.key.cmp(&b.key));
         mutation.extend_from_slice(&(writes.len() as u64).to_be_bytes());
-        for (key, value) in writes {
-            field(&mut mutation, &key);
+        for write in writes {
+            field(&mut mutation, &write.key);
             mutation.extend_from_slice(&self.sequence.to_be_bytes());
-            mutation.push(u8::from(value.is_some()));
-            if let Some(value) = &value {
+            mutation.push(u8::from(write.value.is_some()));
+            if let Some(value) = &write.value {
                 field(&mut mutation, value);
             }
-            self.kv
-                .insert(key, (self.sequence, value.map(|value| value.to_vec())));
+            // Segment format 2: optional i64 expiry, discriminant then
+            // big-endian payload.
+            mutation.push(u8::from(write.expires_at_ms.is_some()));
+            if let Some(expires_at_ms) = write.expires_at_ms {
+                mutation.extend_from_slice(&expires_at_ms.to_be_bytes());
+            }
+            self.kv.insert(
+                write.key,
+                (
+                    self.sequence,
+                    write.value.map(|value| value.to_vec()),
+                    write.expires_at_ms,
+                ),
+            );
         }
         mutation.extend_from_slice(&(additions.len() as u64).to_be_bytes());
         for (id, payload) in &additions {
@@ -116,45 +298,6 @@ impl LogicalOracle {
     }
 
     pub async fn assert_manifest(&self, storage: &ScopedStorage, id: &str) {
-        #[derive(Serialize)]
-        struct Entry<'a> {
-            key: &'a Vec<u8>,
-            generation: u64,
-            value: &'a Option<Vec<u8>>,
-        }
-        #[derive(Serialize)]
-        struct Outbox<'a> {
-            record_id: &'a str,
-            payload: Vec<u8>,
-            origin_sequence: Option<u64>,
-        }
-        #[derive(Serialize)]
-        struct State<'a> {
-            logical_sequence: u64,
-            entries: Vec<Entry<'a>>,
-            outbox: Vec<Outbox<'a>>,
-        }
-        let state = State {
-            logical_sequence: self.sequence,
-            entries: self
-                .kv
-                .iter()
-                .map(|(key, (generation, value))| Entry {
-                    key,
-                    generation: *generation,
-                    value,
-                })
-                .collect(),
-            outbox: self
-                .outbox
-                .iter()
-                .map(|(id, payload, origin)| Outbox {
-                    record_id: id,
-                    payload: payload.to_vec(),
-                    origin_sequence: Some(*origin),
-                })
-                .collect(),
-        };
         let bytes = storage
             .get_raw(&format!("control/v1/domains/catalog/manifests/{id}.json"))
             .await
@@ -164,9 +307,61 @@ impl LogicalOracle {
         assert_eq!(doc["payload"]["history_root"], self.root);
         assert_eq!(
             doc["payload"]["state_checksum_sha256"],
-            digest(&serde_json::to_vec(&state).unwrap())
+            self.state_checksum()
         );
+        self.assert_certificate(&doc["payload"]);
         self.assert_physical(storage, &doc["payload"]).await;
+    }
+
+    /// A manifest carries a retention-horizon certificate exactly when this
+    /// oracle explains it: the fields must match the last applied horizon,
+    /// its evidence must use known kinds, and the horizon must be the
+    /// minimum of every cited pinned sequence.
+    fn assert_certificate(&self, manifest: &serde_json::Value) {
+        let certificate = &manifest["retention_horizon"];
+        if certificate.is_null() {
+            return;
+        }
+        let expected = self
+            .last_horizon
+            .as_ref()
+            .expect("manifest carries a retention horizon certificate the oracle never applied");
+        assert_eq!(certificate["encoding_version"], 1);
+        assert_eq!(certificate["horizon_sequence"], expected.horizon_sequence);
+        assert_eq!(certificate["purge_cutoff_ms"], expected.purge_cutoff_ms);
+        assert_eq!(
+            certificate["parent_state_checksum_sha256"],
+            expected.parent_state_checksum_sha256
+        );
+        assert_eq!(
+            certificate["purged_rows_sha256"],
+            expected.purged_rows_sha256
+        );
+        assert_eq!(
+            certificate["purged_counts"]["expired_rows"],
+            expected.expired_rows
+        );
+        assert_eq!(
+            certificate["purged_counts"]["tombstones"],
+            expected.tombstones
+        );
+        assert!(manifest["equivalence"].is_object());
+        let evidence = certificate["pinned_evidence"].as_array().unwrap();
+        assert!(!evidence.is_empty(), "every horizon cites its age bound");
+        for entry in evidence {
+            assert!(
+                ["manifest_age", "snapshot", "export", "checkpoint"]
+                    .contains(&entry["kind"].as_str().unwrap())
+            );
+            assert!(!entry["id"].as_str().unwrap().is_empty());
+        }
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|entry| entry["sequence"].as_u64().unwrap())
+                .min(),
+            Some(expected.horizon_sequence)
+        );
     }
 
     /// Independently decodes every owning artifact and recomputes both histories
@@ -183,8 +378,9 @@ impl LogicalOracle {
                 for name in ["logical_sequence", "segment_size_bytes", "index_size_bytes"] {
                     physical.extend_from_slice(&r[name].as_u64().unwrap().to_be_bytes());
                 }
-                physical.extend_from_slice(&1_u32.to_be_bytes());
-                physical.extend_from_slice(&1_u32.to_be_bytes());
+                // Segment format 2, bound for the segment and for its index.
+                physical.extend_from_slice(&2_u32.to_be_bytes());
+                physical.extend_from_slice(&2_u32.to_be_bytes());
                 for name in ["min_key_hex", "max_key_hex"] {
                     physical.push(u8::from(!r[name].is_null()));
                     if let Some(value) = r[name].as_str() {
@@ -203,7 +399,7 @@ impl LogicalOracle {
             field(&mut physical, r["tx_id"].as_str().unwrap().as_bytes());
             physical.extend_from_slice(&r["sequence"].as_u64().unwrap().to_be_bytes());
             physical.extend_from_slice(&r["size_bytes"].as_u64().unwrap().to_be_bytes());
-            physical.extend_from_slice(&7_u32.to_be_bytes());
+            physical.extend_from_slice(&9_u32.to_be_bytes());
             physical
                 .extend_from_slice(&hex::decode(r["checksum_sha256"].as_str().unwrap()).unwrap());
         }
@@ -238,7 +434,11 @@ impl LogicalOracle {
                     0 => {
                         assert_eq!(row.generation, row.sequence);
                         assert_eq!(row.tombstone, row.value.is_none());
-                        writes.push((row.key, row.value.map(Bytes::from)));
+                        writes.push(OracleWrite {
+                            key: row.key,
+                            value: row.value.map(Bytes::from),
+                            expires_at_ms: row.expires,
+                        });
                     }
                     1 => additions.push((
                         row.ordinal,
@@ -251,7 +451,7 @@ impl LogicalOracle {
             }
             additions.sort_by_key(|r| r.0);
             let preceding = actual.root.clone();
-            actual.commit_with_request(
+            actual.commit_writes(
                 writes,
                 additions
                     .into_iter()
@@ -289,7 +489,7 @@ impl LogicalOracle {
                         assert_eq!(row.tombstone, row.value.is_none());
                         assert!(
                             self.kv
-                                .insert(row.key, (row.generation, row.value))
+                                .insert(row.key, (row.generation, row.value, row.expires))
                                 .is_none()
                         );
                     }
@@ -310,7 +510,7 @@ impl LogicalOracle {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct PhysicalRow {
     kind: u8,
     key: Vec<u8>,
@@ -320,10 +520,17 @@ struct PhysicalRow {
     sequence: u64,
     ordinal: u64,
     origin: Option<u64>,
+    expires: Option<i64>,
 }
 
 fn assert_physical_row(row: &PhysicalRow, l1: bool) {
     assert_eq!(row.tombstone, row.value.is_none());
+    // Segment format 2: the hint rides only on live KV rows and is positive.
+    assert!(
+        row.expires
+            .is_none_or(|expiry| expiry > 0 && row.kind == 0 && !row.tombstone),
+        "expiry hint on an ineligible row: {row:?}"
+    );
     match row.kind {
         0 => {
             assert!(row.origin.is_none());
@@ -362,6 +569,7 @@ fn assert_physical_schema(schema: &arrow::datatypes::Schema) {
             Field::new("logical_sequence", DataType::UInt64, false),
             Field::new("logical_ordinal", DataType::UInt64, false),
             Field::new("origin_sequence", DataType::UInt64, true),
+            Field::new("expires_at_ms", DataType::Int64, true),
         ])
     );
 }
@@ -403,7 +611,7 @@ fn assert_envelope(bytes: &[u8], artifact: &str) -> serde_json::Value {
             }
     );
     let doc: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(doc["format_version"], 7);
+    assert_eq!(doc["format_version"], 9);
     assert_eq!(doc["artifact_type"], artifact);
     let checksum = doc["checksum_sha256"].as_str().unwrap();
     assert!(
@@ -413,7 +621,7 @@ fn assert_envelope(bytes: &[u8], artifact: &str) -> serde_json::Value {
                 .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     );
     let prefix = format!(
-        "{{\"format_version\":7,\"artifact_type\":\"{artifact}\",\"checksum_sha256\":\"{checksum}\",\"payload\":"
+        "{{\"format_version\":9,\"artifact_type\":\"{artifact}\",\"checksum_sha256\":\"{checksum}\",\"payload\":"
     );
     let payload = bytes
         .strip_prefix(prefix.as_bytes())
@@ -454,7 +662,7 @@ fn decode_physical_rows(
     data: &Bytes,
     directory: &Bytes,
 ) -> Vec<PhysicalRow> {
-    use arrow::array::{Array, BinaryArray, BooleanArray, UInt8Array, UInt64Array};
+    use arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array};
     use arrow::ipc::reader::FileReader;
     assert!(data.len() <= 64 * 1024 * 1024);
     assert!(directory.len() <= 512 * 1024);
@@ -466,7 +674,7 @@ fn decode_physical_rows(
     assert_eq!(digest(data), r["checksum_sha256"]);
     assert_eq!(digest(directory), r["index_checksum_sha256"]);
     let index: serde_json::Value = serde_json::from_slice(directory).unwrap();
-    assert_eq!(index["formatVersion"], 1);
+    assert_eq!(index["formatVersion"], 2);
     assert_eq!(index["implementation"], "arco-state-control-mvp");
     assert_eq!(
         index["scope"],
@@ -529,6 +737,10 @@ fn decode_physical_rows(
                 let values = column(name).as_any().downcast_ref::<UInt64Array>().unwrap();
                 (!values.is_null(ordinal)).then(|| values.value(ordinal))
             };
+            let expires = column("expires_at_ms")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
             for ordinal in 0..batch.num_rows() {
                 assert!(
                     !kind.is_null(ordinal) && !key.is_null(ordinal) && !tombstone.is_null(ordinal)
@@ -542,6 +754,7 @@ fn decode_physical_rows(
                     sequence: number("logical_sequence", ordinal).unwrap(),
                     ordinal: number("logical_ordinal", ordinal).unwrap(),
                     origin: number("origin_sequence", ordinal),
+                    expires: (!expires.is_null(ordinal)).then(|| expires.value(ordinal)),
                 });
             }
         }
@@ -609,8 +822,37 @@ fn oracle_rejects_row_metadata_and_schema_drift() {
         sequence: 2,
         ordinal: 0,
         origin: Some(2),
+        expires: None,
     };
     assert_physical_row(&row, false);
+    // An expiry hint is rejected on outbox rows, on tombstones, and when it
+    // is not a positive instant.
+    let expiring_outbox = PhysicalRow {
+        expires: Some(1),
+        ..row.clone()
+    };
+    assert!(std::panic::catch_unwind(|| assert_physical_row(&expiring_outbox, false)).is_err());
+    let kv = PhysicalRow {
+        kind: 0,
+        generation: 2,
+        origin: None,
+        expires: Some(1),
+        ..row.clone()
+    };
+    assert_physical_row(&kv, false);
+    for expires in [Some(0), Some(-1)] {
+        let forged = PhysicalRow {
+            expires,
+            ..kv.clone()
+        };
+        assert!(std::panic::catch_unwind(|| assert_physical_row(&forged, false)).is_err());
+    }
+    let expiring_tombstone = PhysicalRow {
+        value: None,
+        tombstone: true,
+        ..kv
+    };
+    assert!(std::panic::catch_unwind(|| assert_physical_row(&expiring_tombstone, false)).is_err());
     for (generation, origin, tombstone) in [
         (1, Some(2), false),
         (0, Some(1), false),
@@ -816,7 +1058,8 @@ async fn oracle_rejects_checksum_coherent_directory_and_history_corruption() {
     for (field, value) in [
         ("recordBatchOffsets", serde_json::json!([1])),
         ("segmentId", serde_json::json!("wrong-id")),
-        ("formatVersion", serde_json::json!(2)),
+        // Segment format 1 is retired; forging it must still be rejected.
+        ("formatVersion", serde_json::json!(1)),
         ("logicalSequence", serde_json::json!(2)),
         ("bloomBitsHex", serde_json::json!("0000")),
         ("minKeyHex", serde_json::json!("ff")),
@@ -849,7 +1092,7 @@ async fn oracle_rejects_checksum_coherent_directory_and_history_corruption() {
     }
 }
 
-type VersionObservation = Option<(u64, Option<Vec<u8>>)>;
+type VersionObservation = Option<OracleRow>;
 
 /// Independent pinned transaction model; no production readers or witnesses.
 #[allow(dead_code)] // Shared by several independently compiled contract suites.
@@ -858,6 +1101,9 @@ pub struct LogicalTransaction {
     pub pinned: LogicalOracle,
     pub captured_head: u64,
     pub writes: BTreeMap<Vec<u8>, Option<Bytes>>,
+    /// Expiry hints staged alongside `writes`; a later plain put or delete
+    /// of the same key clears the hint, as it does in the control store.
+    pub expiries: BTreeMap<Vec<u8>, i64>,
     pub observations: BTreeMap<Vec<u8>, VersionObservation>,
     pub overlay_reads: Vec<Vec<u8>>,
 }
@@ -868,9 +1114,23 @@ impl LogicalTransaction {
             pinned: state.clone(),
             captured_head: head,
             writes: BTreeMap::new(),
+            expiries: BTreeMap::new(),
             observations: BTreeMap::new(),
             overlay_reads: Vec::new(),
         }
+    }
+    pub fn put(&mut self, key: &[u8], value: Bytes) {
+        self.writes.insert(key.to_vec(), Some(value));
+        self.expiries.remove(key);
+    }
+    pub fn put_with_expiry(&mut self, key: &[u8], value: Bytes, expires_at_ms: i64) {
+        assert!(expires_at_ms > 0);
+        self.writes.insert(key.to_vec(), Some(value));
+        self.expiries.insert(key.to_vec(), expires_at_ms);
+    }
+    pub fn delete(&mut self, key: &[u8]) {
+        self.writes.insert(key.to_vec(), None);
+        self.expiries.remove(key);
     }
     pub fn get(&mut self, key: &[u8]) -> Option<(Bytes, Option<u64>)> {
         if let Some(value) = self.writes.get(key) {
@@ -879,16 +1139,16 @@ impl LogicalTransaction {
         }
         let value = self.pinned.kv.get(key).cloned();
         self.observations.insert(key.to_vec(), value.clone());
-        value.and_then(|(g, v)| v.map(|v| (Bytes::from(v), Some(g))))
+        value.and_then(|(g, v, _)| v.map(|v| (Bytes::from(v), Some(g))))
     }
     pub fn assert_absent(&self, key: &[u8]) -> bool {
-        self.pinned.kv.get(key).is_none_or(|(_, v)| v.is_none())
+        self.pinned.kv.get(key).is_none_or(|(_, v, _)| v.is_none())
     }
     pub fn assert_generation(&self, key: &[u8], generation: u64) -> bool {
         self.pinned
             .kv
             .get(key)
-            .is_some_and(|(g, v)| *g == generation && v.is_some())
+            .is_some_and(|(g, v, _)| *g == generation && v.is_some())
     }
     pub fn range_empty(&self, start: &[u8], end: &[u8]) -> bool {
         // Tombstones are not entries; `range_witness` still covers them.
@@ -896,13 +1156,15 @@ impl LogicalTransaction {
             .pinned
             .kv
             .iter()
-            .any(|(k, (_, v))| v.is_some() && k.as_slice() >= start && k.as_slice() < end)
+            .any(|(k, (_, v, _))| v.is_some() && k.as_slice() >= start && k.as_slice() < end)
     }
     pub fn range_witness(&self, start: &[u8], end: &[u8]) -> u64 {
+        // The witness binds key, generation and tombstone only: an expiry
+        // hint never changes what a range precondition observes.
         let mut encoded = Vec::new();
         field(&mut encoded, start);
         field(&mut encoded, end);
-        for (key, (generation, value)) in &self.pinned.kv {
+        for (key, (generation, value, _)) in &self.pinned.kv {
             if key.as_slice() >= start && key.as_slice() < end {
                 field(&mut encoded, key);
                 encoded.extend_from_slice(&generation.to_be_bytes());
@@ -916,7 +1178,7 @@ impl LogicalTransaction {
             .pinned
             .kv
             .iter()
-            .map(|(k, (g, v))| (k.clone(), v.clone().map(|v| (Bytes::from(v), Some(*g)))))
+            .map(|(k, (g, v, _))| (k.clone(), v.clone().map(|v| (Bytes::from(v), Some(*g)))))
             .collect::<BTreeMap<_, _>>();
         for (k, v) in &self.writes {
             values.insert(k.clone(), v.clone().map(|v| (v, None)));
@@ -932,7 +1194,16 @@ impl LogicalTransaction {
             return false;
         }
         assert_eq!(self.pinned.root, state.root);
-        state.commit(self.writes.into_iter().collect(), Vec::new(), Vec::new());
+        let writes = self
+            .writes
+            .into_iter()
+            .map(|(key, value)| OracleWrite {
+                expires_at_ms: self.expiries.get(&key).copied(),
+                key,
+                value,
+            })
+            .collect();
+        state.commit_writes(writes, Vec::new(), Vec::new(), None);
         *head += 1;
         true
     }

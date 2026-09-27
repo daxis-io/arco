@@ -44,7 +44,8 @@ history.
 4. **Garbage collection** (`phase="gc"`), for each control domain: up to
    `ARCO_CONTROL_STORE_GC_MAX_PAGES` pages of `collect_gc_page_at`, the
    conservative active collector (unreachable candidates older than seven days;
-   maintenance retention pins last eight days, token/checkpoint pins 30 days).
+   maintenance retention pins last eight days, token/checkpoint pins 30 days,
+   manifests 30 days plus a one-hour clock-skew margin).
 
 The job runs under the **API service account**. That account is the sole
 writer of the `control/` prefix; do not rebind the job to a compactor service

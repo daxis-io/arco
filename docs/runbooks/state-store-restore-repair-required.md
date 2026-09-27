@@ -56,18 +56,20 @@ visible bytes match the plan.
    - artifacts absent: the participant never became durable and can be
      re-applied from the plan.
 4. The restore participant validates every plan it loads (restore-plan
-   version 6 with its pinned `observed_writer_epoch` and checkpoint interval,
-   scope, checksums, and shape) and fails closed with
+   version 7 with its pinned `observed_writer_epoch`, checkpoint interval,
+   `committed_at_ms` stamp, scope, checksums, and shape) and fails closed with
    `invalid Control MVP restore plan` before touching storage — a plan that no
-   longer validates must not be re-applied. Restore-plan versions 1 through 5
-   are supersession-only: a version-6 plan may supersede them, but they are
-   never re-applied. A plan whose authority reference does not have the
-   canonical `control/v1` manifest and checkpoint path shape returns
-   `UnsupportedAuthorityFormat` with hard-cut recovery direction; separately,
-   the head and manifest validators fail closed on any `format_version` other
-   than the current on-disk authority format 7, and retained-token reads
-   accept formats 7 and 8 only (8 being the synthetic authority-8 bounded
-   roots that exist under test-utils).
+   longer validates must not be re-applied. Restore-plan versions 1 through 6
+   are supersession-only: a version-7 plan may supersede them, but they are
+   never re-applied (version 6 is the last shape written on authority format
+   7; it cannot reproduce format-9 candidate bytes). A plan whose authority
+   reference does not have the canonical `control/v1` manifest and checkpoint
+   path shape returns `UnsupportedAuthorityFormat` with hard-cut recovery
+   direction; separately, the head and manifest validators fail closed on any
+   `format_version` other than the current on-disk authority format 9, and
+   retained-token reads accept formats 9 and 8 only (8 being the synthetic
+   authority-8 bounded roots that exist under test-utils). There is no
+   conversion from format 7: a format-7 root is unreadable and is re-seeded.
 
 ## Remediation
 

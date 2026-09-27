@@ -69,6 +69,20 @@ impl ControlMvpMaintenanceWorker {
                 .iter()
                 .map(|segment| segment.reference.clone())
                 .collect::<Vec<_>>();
+            // Stamps are monotone along ancestry; the anchor follows the render rule.
+            let committed_at_ms = super::cost::now()
+                .timestamp_millis()
+                .max(source_manifest.committed_at_ms);
+            let age_anchor = super::integrity::age_anchor_for_child(
+                committed_at_ms,
+                Some(super::integrity::AnchorParent {
+                    manifest_id: &source_manifest.manifest_id,
+                    manifest_sha256: &pointer.manifest_checksum_sha256,
+                    sequence: source_manifest.logical_sequence,
+                    committed_at_ms: source_manifest.committed_at_ms,
+                    age_anchor: &source_manifest.age_anchor,
+                }),
+            );
             let mut candidate_manifest = ControlMvpManifest {
                 history_anchor: HistoryAnchor {
                     sequence: state.logical_sequence,
@@ -96,11 +110,14 @@ impl ControlMvpMaintenanceWorker {
                 base_manifest_id: Some(source_manifest.manifest_id.clone()),
                 writer_epoch: pointer.writer_epoch,
                 layout_generation: intent.layout_generation(),
+                committed_at_ms,
                 base_states,
                 anchor_states: Vec::new(),
                 tx_refs: Vec::new(),
                 state_checksum_sha256: source_manifest.state_checksum_sha256.clone(),
                 maintenance_intent: None,
+                retention_horizon: None,
+                age_anchor,
             };
             candidate_manifest.physical_root = candidate_manifest.physical_digest()?;
             candidate_manifest.validate(&self.store.scope, &candidate_manifest_id)?;

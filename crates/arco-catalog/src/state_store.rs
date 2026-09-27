@@ -1680,6 +1680,15 @@ impl ScanPage {
     }
 }
 
+/// The one rule every committed expiry hint satisfies, shared by transaction
+/// replay, segment decoding and the deterministic model: a hint is a positive
+/// Unix-millisecond instant and rides only on a live KV row. Tombstones,
+/// outbox rows and trims never carry one.
+#[must_use]
+pub(crate) fn expiry_hint_is_valid(expires_at_ms: Option<i64>, live_kv_row: bool) -> bool {
+    expires_at_ms.is_none_or(|expiry| expiry > 0 && live_kv_row)
+}
+
 pub(crate) fn build_scan_page(
     scope: &StateScope,
     request: ScanRequest,
@@ -2873,6 +2882,25 @@ pub trait ArcoStateTxn: Send + Sync {
     ///
     /// Returns an error when the backend cannot stage the write.
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()>;
+
+    /// Stages a value write that also carries a purge-eligibility hint.
+    ///
+    /// `expires_at_ms` (milliseconds since the Unix epoch, must be positive)
+    /// is recorded on the committed row and nowhere else. It is never a read
+    /// filter: point reads, scans, witnesses, range preconditions and
+    /// predicate inputs see the row exactly as a plain [`put`](Self::put)
+    /// would leave it, so an expired row stays visible until a retention
+    /// rewrite drops it. Only the committed mutation digest and the
+    /// full-state checksum bind the hint. A later plain `put` or `delete`
+    /// of the same key clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::Validation`] when `expires_at_ms` is not
+    /// positive or the backend authority cannot carry the hint, and any
+    /// error staging a plain write would return.
+    async fn put_with_expiry(&mut self, key: &[u8], value: Bytes, expires_at_ms: i64)
+    -> Result<()>;
 
     /// Stages a value delete.
     ///

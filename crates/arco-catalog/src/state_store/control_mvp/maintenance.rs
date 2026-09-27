@@ -3,31 +3,159 @@
 use arco_core::RootStorage;
 
 use super::{
-    Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
-    CONTROL_MVP_FORMAT_VERSION, CatalogError, ChronoDuration, ControlMvpBlock,
-    ControlMvpGcCandidate, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
+    AnchorParent, Arc, AuthorityWritePrecondition, BTreeMap, BTreeSet, BlockScanBudget, Bytes,
+    CONTROL_MVP_FORMAT_VERSION, CONTROL_MVP_GC_PAGE_SIZE, CONTROL_MVP_RETENTION_CLOCK_SKEW_MS,
+    CONTROL_MVP_TOKEN_RETENTION_DAYS, CatalogError, ChronoDuration, ControlMvpBlock,
+    ControlMvpCheckpoint, ControlMvpGcCandidate, ControlMvpGcPlan, ControlMvpMaintenanceOutcome,
     ControlMvpMaintenanceWorker, ControlMvpManifest, ControlMvpPointer, ControlMvpSegmentIndex,
     ControlMvpSegmentLevel, ControlMvpSegmentRef, ControlMvpSegmentRow, ControlMvpStateRef,
     ControlMvpStateStore, DateTime, Deserialize, Digest, DistributedLock, HistoryAnchor,
     IMPLEMENTATION, KeyRange, MAX_BLOCK_BYTES, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES,
-    MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS, RETENTION_GC_LOCK_MAX_RETRIES,
-    RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, RenderedControlMvpStateSegment, ReplayState,
-    Result, RetainedAuthorityRoots, RetentionMutationEpoch, RewriteEquivalence,
-    SEGMENT_FORMAT_VERSION, SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256,
-    StateScope, Ulid, Utc, WriteResult, ambiguous_authority_outcome, block_key_bounds, cost,
-    decode_json, decode_json_limited, decode_segment_rows, encode_envelope_limited, encode_json,
-    encode_json_limited, encode_segment, half_segment_limits, hash_bytes, hash_tag, hash_u64,
-    integrity, invariant_violation, layout_maintenance_intent_for_manifest, lazy,
-    precondition_failed, put_immutable_matching, segment_row_key_bounds_hex, sha256_hex,
-    sort_segment_rows, state_segment_reference, valid_raw_digest, validate_raw_checksum,
-    validation_failed,
+    MAX_SCAN_ARROW_BYTES, MAX_SEGMENT_BYTES, MAX_SEGMENT_ROWS, PinnedSequenceV1, PurgedCountsV1,
+    PurgedRow, RETENTION_GC_LOCK_MAX_RETRIES, RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL,
+    RenderedControlMvpStateSegment, ReplayState, Result, RetainedAuthorityRoots,
+    RetentionHorizonV1, RetentionMutationEpoch, RewriteEquivalence, SEGMENT_FORMAT_VERSION,
+    SEGMENT_RECORD_KV, SEGMENT_RECORD_OUTBOX, Serialize, Sha256, StateScope, StoredValue, Ulid,
+    Utc, WriteResult, age_anchor_for_child, ambiguous_authority_outcome, block_key_bounds,
+    checkpoint_retained_at, cost, decode_envelope_limited, decode_json, decode_json_limited,
+    decode_segment_rows, encode_envelope_limited, encode_json, encode_json_limited, encode_segment,
+    half_segment_limits, hash_bytes, hash_tag, hash_u64, integrity, invariant_violation,
+    layout_maintenance_intent_for_manifest, lazy, precondition_failed, purged_rows_digest,
+    put_immutable_matching, segment_row_key_bounds_hex, sha256_hex, sort_segment_rows,
+    state_segment_reference, valid_raw_digest, validate_control_mvp_authority_format,
+    validate_horizon_inputs, validate_raw_checksum, validation_failed,
 };
+use crate::gc::reachability::RetainedRootKind;
 
 const MAINTENANCE_VERSION: u32 = 1;
 const MAINTENANCE_POLICY_VERSION: u32 = 1;
 const MAX_UNITS: usize = 256;
 const MAX_PLAN_PAGE_BYTES: usize = 64 * 1024;
 const MAX_PLAN_BYTES: usize = 8 * 1024 * 1024;
+/// Anchor hops the retention-age walk may follow. Each hop steps back at
+/// least one hour bucket, so the 30-day floor needs about 721; exhaustion
+/// is corruption of the chain and fails closed.
+const HORIZON_ANCHOR_HOP_BUDGET: usize = 1024;
+/// Total manifest bytes the anchor walk may read: every hop is one manifest.
+const HORIZON_ANCHOR_BYTE_BUDGET: u64 =
+    HORIZON_ANCHOR_HOP_BUDGET as u64 * MAX_CONTROL_JSON_BYTES as u64;
+
+/// Which physical rewrite a durable job performs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MaintenanceKind {
+    /// Consolidates the L0 suffix into fresh L1 shards; the state is unchanged.
+    #[default]
+    Consolidation,
+    /// Renders L1 without expired rows and unobservable tombstones under a
+    /// `RetentionHorizonV1` certificate; the logical sequence is unchanged.
+    RetentionHorizon,
+}
+
+/// The inputs a horizon job was admitted with. They are fixed at
+/// preparation and bound into the descriptor (hence the job identity), the
+/// render seed and the published certificate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HorizonInputs {
+    pub horizon_sequence: u64,
+    pub purge_cutoff_ms: i64,
+    pub pinned_evidence: Vec<PinnedSequenceV1>,
+}
+
+/// What an admitted horizon plan drops from its render cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HorizonPurge {
+    /// Full-state checksum of the render cut with the purged rows removed:
+    /// what the rendered L1 shards must reproduce.
+    pruned_state_checksum_sha256: String,
+    purged_rows_sha256: String,
+    purged_counts: PurgedCountsV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PurgeReason {
+    Expired,
+    Tombstone,
+}
+
+impl HorizonInputs {
+    fn validate(&self, logical_sequence: u64) -> Result<()> {
+        validate_horizon_inputs(
+            self.horizon_sequence,
+            self.purge_cutoff_ms,
+            &self.pinned_evidence,
+            logical_sequence,
+        )
+    }
+
+    /// The purge predicate. Live rows are never purged; an expiry hint below
+    /// the cutoff or a tombstone at or below the horizon is. `generation_bound`
+    /// restricts candidates to rows the render cut already held: rows a later
+    /// retained suffix wrote are never candidates, so the certified purged set
+    /// is exactly "parent state minus child state".
+    fn purges(&self, value: &StoredValue, generation_bound: u64) -> Option<PurgeReason> {
+        if value.generation > generation_bound {
+            return None;
+        }
+        if value.tombstone {
+            (value.generation <= self.horizon_sequence).then_some(PurgeReason::Tombstone)
+        } else {
+            value
+                .expires_at_ms
+                .is_some_and(|expiry| expiry < self.purge_cutoff_ms)
+                .then_some(PurgeReason::Expired)
+        }
+    }
+}
+
+/// Splits `state` into the pruned state and the digest and counts of what
+/// the horizon inputs purge from it. Outbox rows are never candidates.
+fn partition_purge(
+    scope: &StateScope,
+    state: &ReplayState,
+    inputs: &HorizonInputs,
+    generation_bound: u64,
+) -> Result<(ReplayState, HorizonPurge)> {
+    let mut pruned = ReplayState {
+        history_root: state.history_root.clone(),
+        logical_sequence: state.logical_sequence,
+        kv: BTreeMap::new(),
+        outbox: state.outbox.clone(),
+    };
+    let mut purged = Vec::new();
+    let mut purged_counts = PurgedCountsV1::default();
+    for (key, value) in &state.kv {
+        match inputs.purges(value, generation_bound) {
+            Some(reason) => {
+                match reason {
+                    PurgeReason::Expired => purged_counts.expired_rows += 1,
+                    PurgeReason::Tombstone => purged_counts.tombstones += 1,
+                }
+                purged.push(PurgedRow {
+                    key,
+                    generation: value.generation,
+                    tombstone: value.tombstone,
+                    expires_at_ms: value.expires_at_ms,
+                });
+            }
+            None => {
+                pruned.kv.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let purged_rows_sha256 = purged_rows_digest(scope, &purged)?;
+    let pruned_state_checksum_sha256 = pruned.checksum()?;
+    Ok((
+        pruned,
+        HorizonPurge {
+            pruned_state_checksum_sha256,
+            purged_rows_sha256,
+            purged_counts,
+        },
+    ))
+}
 
 /// Stable identity assigned by the trusted durable-location composition layer.
 ///
@@ -92,6 +220,7 @@ struct PreparedPlan {
     selected_bytes: u64,
     source_bytes: u64,
     sequence: u64,
+    purge: Option<HorizonPurge>,
 }
 
 fn maintenance_capacity(message: &str) -> CatalogError {
@@ -189,12 +318,23 @@ impl PreparedPlan {
         store: &ControlMvpStateStore,
         source: &ControlMvpManifest,
         seed: &str,
+        horizon: Option<&HorizonInputs>,
     ) -> Result<Self> {
         let state = cost::phase(
             "maintenance-preflight-reconstruction",
             store.replay_for_successor(source),
         )
         .await?;
+        // A horizon plan renders the render cut minus the certified purged
+        // set; consolidation renders it whole.
+        let (state, purge) = match horizon {
+            Some(inputs) => {
+                let (pruned, purge) =
+                    partition_purge(&store.scope, &state, inputs, source.logical_sequence)?;
+                (pruned, Some(purge))
+            }
+            None => (state, None),
+        };
         let (sources, source_bytes) = cost::phase("maintenance-source-metadata", async {
             let mut sources = Vec::new();
             let mut source_bytes = source
@@ -224,6 +364,7 @@ impl PreparedPlan {
             selected_bytes: 0,
             source_bytes,
             sequence: source.logical_sequence,
+            purge,
         };
         let mut candidate = Vec::new();
         let row_limit = store
@@ -236,16 +377,12 @@ impl PreparedPlan {
                 .saturating_add(key.len())
                 .saturating_add(value.bytes.len())
                 .saturating_add(128);
-            candidate.push(ControlMvpSegmentRow {
-                record_kind: SEGMENT_RECORD_KV,
-                key: key.clone(),
-                value: (!value.tombstone).then(|| value.bytes.to_vec()),
-                generation: value.generation,
-                tombstone: value.tombstone,
-                logical_sequence: state.logical_sequence,
-                logical_ordinal: ordinal as u64,
-                origin_sequence: None,
-            });
+            candidate.push(kv_segment_row(
+                key.clone(),
+                value,
+                state.logical_sequence,
+                ordinal as u64,
+            ));
             if candidate.len() >= row_limit || candidate_bytes >= MAX_SEGMENT_BYTES / 2 {
                 plan.add_chunk(store, seed, &sources, &mut candidate)?;
                 candidate.clear();
@@ -262,16 +399,11 @@ impl PreparedPlan {
                 .saturating_add(record.record_id.len())
                 .saturating_add(record.payload.len())
                 .saturating_add(128);
-            candidate.push(ControlMvpSegmentRow {
-                record_kind: SEGMENT_RECORD_OUTBOX,
-                key: record.record_id.as_bytes().to_vec(),
-                value: Some(record.payload.to_vec()),
-                generation: 0,
-                tombstone: false,
-                logical_sequence: state.logical_sequence,
-                logical_ordinal: ordinal as u64,
-                origin_sequence: record.origin_sequence,
-            });
+            candidate.push(outbox_segment_row(
+                record,
+                state.logical_sequence,
+                ordinal as u64,
+            ));
             if candidate.len() >= row_limit || candidate_bytes >= MAX_SEGMENT_BYTES / 2 {
                 plan.add_chunk(store, seed, &sources, &mut candidate)?;
                 candidate.clear();
@@ -423,10 +555,15 @@ fn render_unit(
 
 impl PlanPage {
     #[allow(clippy::too_many_lines)] // Keep the ordered validation boundary together.
+    /// Constructs this unit's output from the authenticated source blocks.
+    /// A horizon job passes its admitted inputs: rows they purge are skipped
+    /// exactly as the plan skipped them, so ordinals and the logical digest
+    /// line up with the admitted page.
     async fn construct(
         &self,
         store: &ControlMvpStateStore,
         source: &ControlMvpManifest,
+        horizon: Option<&HorizonInputs>,
     ) -> Result<RenderedControlMvpStateSegment> {
         cost::phase("maintenance-selection", async {
             if self.version != MAINTENANCE_VERSION
@@ -476,19 +613,20 @@ impl PlanPage {
                         let value = merge.take(&key).ok_or_else(|| {
                             invariant_violation("selected maintenance row absent")
                         })?;
+                        if horizon.is_some_and(|inputs| {
+                            inputs.purges(&value, source.logical_sequence).is_some()
+                        }) {
+                            continue;
+                        }
                         let logical_ordinal = ordinal
                             .checked_add(rows.len() as u64)
                             .ok_or_else(|| invariant_violation("maintenance ordinal overflow"))?;
-                        rows.push(ControlMvpSegmentRow {
-                            record_kind: SEGMENT_RECORD_KV,
+                        rows.push(kv_segment_row(
                             key,
-                            value: (!value.tombstone).then(|| value.bytes.to_vec()),
-                            generation: value.generation,
-                            tombstone: value.tombstone,
-                            logical_sequence: source.logical_sequence,
+                            &value,
+                            source.logical_sequence,
                             logical_ordinal,
-                            origin_sequence: None,
-                        });
+                        ));
                         if rows.len() > self.rows {
                             return Err(invariant_violation(
                                 "maintenance range contains excess rows",
@@ -633,6 +771,14 @@ struct Descriptor {
     seed: String,
     block_target: usize,
     pages: Vec<String>,
+    #[serde(default)]
+    kind: MaintenanceKind,
+    /// Present exactly for `RetentionHorizon` jobs: the admitted inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    horizon: Option<HorizonInputs>,
+    /// Present exactly for `RetentionHorizon` jobs: what the plan purges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    purge: Option<HorizonPurge>,
 }
 
 impl Descriptor {
@@ -683,6 +829,21 @@ impl Descriptor {
             return Err(invariant_violation(
                 "maintenance render seed is not scope bound",
             ));
+        }
+        let horizon = self.kind == MaintenanceKind::RetentionHorizon;
+        if self.horizon.is_some() != horizon || self.purge.is_some() != horizon {
+            return Err(invariant_violation(
+                "maintenance descriptor kind and horizon inputs disagree",
+            ));
+        }
+        if let Some(inputs) = &self.horizon {
+            inputs.validate(self.source_sequence)?;
+        }
+        if let Some(purge) = &self.purge
+            && (!valid_raw_digest(&purge.pruned_state_checksum_sha256)
+                || !valid_raw_digest(&purge.purged_rows_sha256))
+        {
+            return Err(invariant_violation("invalid maintenance purge summary"));
         }
         Ok(())
     }
@@ -1130,12 +1291,272 @@ pub async fn retention_root(
         required_paths.insert(retention_pin_latest_path(&descriptor.pin_id())?);
         required_paths.insert(retention_pin_revision_path(&descriptor.pin_id(), 1)?);
         Ok(crate::gc::reachability::RetainedAuthorityRoot {
+            kind: RetainedRootKind::Maintenance,
+            id: id.as_str().to_string(),
             authorities: Vec::new(),
             required_paths,
             protected_prefixes: vec![format!("{}/", job_prefix(&worker.store, id.as_str()))],
         })
     })
     .await
+}
+
+impl ControlMvpMaintenanceWorker {
+    /// Computes the inputs of a `RetentionHorizon` job at `now`:
+    ///
+    /// 1. the age bound: the sequence of the newest manifest whose stamp is
+    ///    at or before the token-retention floor plus the clock-skew margin
+    ///    (`now - 30 d - 1 h`), found by following `age_anchor` links from
+    ///    the head. Each anchor is authenticated by its recorded digest,
+    ///    sequence and stamp. An anchor GC already collected still decides
+    ///    by its record when the record is at or below the floor; a missing
+    ///    anchor recorded above the floor, a chain longer than the hop
+    ///    budget, or a record its manifest contradicts fails closed. A chain
+    ///    that ends above the floor yields zero (nothing purgeable by age);
+    /// 2. every active snapshot or export pin naming this scope, streamed by
+    ///    the same retained-root inventory GC uses, contributes its manifest's
+    ///    authenticated sequence;
+    /// 3. every checkpoint still inside its own retention
+    ///    (`max(min_retention_seconds, 30 d)` from the object's age)
+    ///    contributes its sequence.
+    ///
+    /// The certificate cites one entry per evidence kind (its lowest
+    /// sequence); `horizon_sequence` is the minimum of them. `purge_cutoff_ms`
+    /// is `now` minus the same skew margin. Any unreadable or invalid input
+    /// is an error: the job never renders on a guess. Returns the head the
+    /// inputs were computed against so admission binds the same manifest.
+    pub(super) async fn retention_horizon_inputs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(ControlMvpPointer, ControlMvpManifest, HorizonInputs)> {
+        cost::phase("maintenance-horizon-inputs", async {
+            let pointer = self.store.load_pointer().await?;
+            let head = self.store.load_manifest_for_pointer(&pointer).await?;
+            let purge_cutoff_ms = now
+                .timestamp_millis()
+                .checked_sub(CONTROL_MVP_RETENTION_CLOCK_SKEW_MS)
+                .filter(|cutoff| *cutoff > 0)
+                .ok_or_else(|| {
+                    validation_failed("retention horizon clock precedes the Unix epoch")
+                })?;
+            let mut gathered = vec![Box::pin(self.age_bound_evidence(&head, now)).await?];
+            Box::pin(self.pin_evidence(now, &mut gathered)).await?;
+            Box::pin(self.checkpoint_evidence(now, &mut gathered)).await?;
+            // One entry per kind: the lowest pinned sequence of that kind.
+            let pinned_evidence = integrity::PINNED_EVIDENCE_KINDS
+                .iter()
+                .filter_map(|kind| {
+                    gathered
+                        .iter()
+                        .filter(|evidence| evidence.kind == *kind)
+                        .min_by_key(|evidence| evidence.sequence)
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            let horizon_sequence = pinned_evidence
+                .iter()
+                .map(|evidence| evidence.sequence)
+                .min()
+                .unwrap_or(0);
+            let inputs = HorizonInputs {
+                horizon_sequence,
+                purge_cutoff_ms,
+                pinned_evidence,
+            };
+            inputs.validate(pointer.logical_sequence)?;
+            Ok((pointer, head, inputs))
+        })
+        .await
+    }
+
+    /// Input 1: the token-retention age bound, as `manifest_age` evidence
+    /// citing the manifest that established it (or, for a bound of zero, the
+    /// last manifest examined, i.e. the oldest one the chain reached).
+    async fn age_bound_evidence(
+        &self,
+        head: &ControlMvpManifest,
+        now: DateTime<Utc>,
+    ) -> Result<PinnedSequenceV1> {
+        let store = &self.store;
+        let floor_ms = now
+            .checked_sub_signed(ChronoDuration::days(CONTROL_MVP_TOKEN_RETENTION_DAYS))
+            .ok_or_else(|| validation_failed("retention horizon clock underflow"))?
+            .timestamp_millis()
+            .checked_sub(CONTROL_MVP_RETENTION_CLOCK_SKEW_MS)
+            .ok_or_else(|| validation_failed("retention horizon clock underflow"))?;
+        let evidence = |id: &str, sequence: u64| PinnedSequenceV1 {
+            kind: "manifest_age".into(),
+            id: id.to_string(),
+            sequence,
+        };
+        if head.committed_at_ms <= floor_ms {
+            return Ok(evidence(&head.manifest_id, head.logical_sequence));
+        }
+        let mut last_examined = head.manifest_id.clone();
+        let mut next = head.age_anchor.clone();
+        let mut hops = 0_usize;
+        let mut bytes = 0_u64;
+        while let Some(record) = next {
+            hops += 1;
+            if hops > HORIZON_ANCHOR_HOP_BUDGET {
+                return Err(invariant_violation(
+                    "retention horizon anchor chain exceeds the hop budget",
+                ));
+            }
+            let Some(meta) = store
+                .storage
+                .head(&store.paths.manifest_object(&record.manifest_id))
+                .await?
+            else {
+                // GC collected the anchor. Its record still decides, in the
+                // only direction that cannot purge too much: at or below the
+                // floor it is the bound; above the floor the chain is corrupt.
+                if record.committed_at_ms <= floor_ms {
+                    return Ok(evidence(&record.manifest_id, record.sequence));
+                }
+                return Err(invariant_violation(
+                    "retention horizon anchor is missing while stamped above the floor",
+                ));
+            };
+            bytes = bytes
+                .checked_add(meta.size)
+                .filter(|total| *total <= HORIZON_ANCHOR_BYTE_BUDGET)
+                .ok_or_else(|| {
+                    invariant_violation("retention horizon anchor chain exceeds the byte budget")
+                })?;
+            let manifest = store
+                .load_manifest_with_expected_checksum(
+                    &record.manifest_id,
+                    Some(&record.manifest_sha256),
+                )
+                .await?;
+            let recorded = (record.sequence, record.committed_at_ms);
+            if (manifest.logical_sequence, manifest.committed_at_ms) != recorded {
+                return Err(invariant_violation(
+                    "retention horizon anchor record does not match its manifest",
+                ));
+            }
+            if manifest.committed_at_ms <= floor_ms {
+                return Ok(evidence(&record.manifest_id, record.sequence));
+            }
+            last_examined = record.manifest_id;
+            next = manifest.age_anchor;
+        }
+        // The whole chain is younger than the floor: nothing is purgeable by age.
+        Ok(evidence(&last_examined, 0))
+    }
+
+    /// Input 2: every active snapshot or export pin naming this scope, with
+    /// its manifest's authenticated sequence.
+    async fn pin_evidence(
+        &self,
+        now: DateTime<Utc>,
+        pinned_evidence: &mut Vec<PinnedSequenceV1>,
+    ) -> Result<()> {
+        let store = &self.store;
+        let mut roots = RetainedAuthorityRoots::new(&self.lifecycle, now);
+        while let Some(root) = roots.next().await? {
+            let kind = match root.kind {
+                RetainedRootKind::Snapshot => "snapshot",
+                RetainedRootKind::Export => "export",
+                // A job's own source protection is not a reader pin.
+                RetainedRootKind::Maintenance => continue,
+            };
+            for reference in root.authorities {
+                if reference.scope() != &store.scope {
+                    continue;
+                }
+                if reference.implementation() != IMPLEMENTATION {
+                    return Err(validation_failed(
+                        "retained authority implementation does not match control store",
+                    ));
+                }
+                validate_control_mvp_authority_format(&store.paths, &reference)?;
+                let checksum = reference
+                    .manifest_sha256()
+                    .strip_prefix("sha256:")
+                    .ok_or_else(|| validation_failed("retained manifest digest is malformed"))?;
+                let manifest = store
+                    .load_manifest_with_expected_checksum(reference.manifest_id(), Some(checksum))
+                    .await?;
+                if manifest.logical_sequence != reference.logical_sequence() {
+                    return Err(invariant_violation(
+                        "retained manifest logical sequence mismatch",
+                    ));
+                }
+                pinned_evidence.push(PinnedSequenceV1 {
+                    kind: kind.into(),
+                    id: root.id.clone(),
+                    sequence: manifest.logical_sequence,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Input 3: every checkpoint still inside its own retention, paged like
+    /// GC's inventory, with its source manifest authenticated.
+    async fn checkpoint_evidence(
+        &self,
+        now: DateTime<Utc>,
+        pinned_evidence: &mut Vec<PinnedSequenceV1>,
+    ) -> Result<()> {
+        let store = &self.store;
+        let checkpoints_prefix = format!("{}/checkpoints/", store.paths.base_prefix());
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .lifecycle
+                .list_page_meta(
+                    &checkpoints_prefix,
+                    cursor.as_deref(),
+                    CONTROL_MVP_GC_PAGE_SIZE,
+                )
+                .await?;
+            for object in page.objects {
+                let path = object.path.to_string();
+                let checkpoint_id = path
+                    .strip_prefix(&checkpoints_prefix)
+                    .and_then(|suffix| suffix.strip_suffix(".json"))
+                    .filter(|id| !id.is_empty() && !id.contains('/'))
+                    .ok_or_else(|| {
+                        invariant_violation("noncanonical control MVP checkpoint path")
+                    })?;
+                let bytes = store.get_json(&path, MAX_CONTROL_JSON_BYTES).await?;
+                let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+                    &bytes,
+                    "control-mvp-checkpoint",
+                    MAX_CONTROL_JSON_BYTES,
+                    "control MVP checkpoint",
+                )?;
+                checkpoint.validate(&store.scope, checkpoint_id)?;
+                if !checkpoint_retained_at(
+                    checkpoint.min_retention_seconds,
+                    object.last_modified,
+                    now,
+                )? {
+                    continue;
+                }
+                let source = store
+                    .load_manifest_with_expected_checksum(
+                        &checkpoint.manifest_id,
+                        Some(&checkpoint.manifest_checksum_sha256),
+                    )
+                    .await?;
+                checkpoint.validate_source(&source)?;
+                pinned_evidence.push(PinnedSequenceV1 {
+                    kind: "checkpoint".into(),
+                    id: checkpoint_id.to_string(),
+                    sequence: checkpoint.logical_sequence,
+                });
+            }
+            match page.next_start_after {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// An admitted, read-only maintenance plan. Its identity is available before any
@@ -1209,6 +1630,8 @@ impl Descriptor {
                 self.block_target,
                 self.policy_version,
                 self.encoder_version,
+                self.kind,
+                &self.horizon,
             ),
             "maintenance render seed",
         )?))
@@ -1308,19 +1731,18 @@ impl DurableMaintenanceWorker {
                     "maintenance source ownership or reclamation generation was consumed",
                 ));
             }
-            let found = store
-                .resolve_ancestor_bounded(
-                    &current.manifest_id,
-                    &pointer.manifest_checksum_sha256,
-                    |manifest, digest| {
-                        (manifest.manifest_id == source.manifest_id
-                            && digest == descriptor.source_digest)
-                            .then_some(())
-                    },
-                    32,
-                    64 * 1024 * 1024,
-                )
-                .await?;
+            let found = Box::pin(store.resolve_ancestor_bounded(
+                &current.manifest_id,
+                &pointer.manifest_checksum_sha256,
+                |manifest, digest| {
+                    (manifest.manifest_id == source.manifest_id
+                        && digest == descriptor.source_digest)
+                        .then_some(())
+                },
+                32,
+                64 * 1024 * 1024,
+            ))
+            .await?;
             if found.is_none() {
                 return Err(precondition_failed(
                     "maintenance source is not an authenticated ancestor",
@@ -1371,6 +1793,39 @@ impl DurableMaintenanceWorker {
         force: bool,
     ) -> Result<Option<PreparedMaintenance>> {
         cost::phase("maintenance-start-preflight", async {
+            let Some((pointer, source)) = self.admission_source().await? else {
+                return Ok(None);
+            };
+            if source.maintenance_intent.is_none() && !force {
+                return Ok(None);
+            }
+            self.admit(now, &pointer, &source, MaintenanceKind::Consolidation, None)
+                .await
+                .map(Some)
+        })
+        .await
+    }
+
+    /// Prepares a `RetentionHorizon` job: computes the horizon inputs from
+    /// the current head's ancestry, the active snapshot/export pins and the
+    /// retained checkpoints, replays the head, and admits a plan that
+    /// renders L1 without the purge-eligible rows. No maintenance intent is
+    /// required. Returns no plan when nothing is eligible, so a scheduled
+    /// invocation on a quiet root writes nothing.
+    ///
+    /// A horizon job and a consolidation share the head's layout generation,
+    /// so at most one of two concurrently running jobs publishes; the other
+    /// fails its compatibility check with a precondition error and is
+    /// abandoned like any consumed job.
+    ///
+    /// # Errors
+    /// Fails closed when any horizon input is unavailable or invalid, and
+    /// returns the same preflight and admission failures as `prepare_at`.
+    pub async fn prepare_horizon_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Option<PreparedMaintenance>> {
+        cost::phase("maintenance-horizon-preflight", async {
             let store = &self.worker.store;
             if store
                 .storage
@@ -1380,57 +1835,101 @@ impl DurableMaintenanceWorker {
             {
                 return Ok(None);
             }
-            let pointer = store.load_pointer().await?;
-            let source = store.load_manifest_for_pointer(&pointer).await?;
-            if source.maintenance_intent.is_none() && !force {
-                return Ok(None);
-            }
-            let mut descriptor = Descriptor {
-                version: MAINTENANCE_VERSION,
-                policy_version: MAINTENANCE_POLICY_VERSION,
-                authority_version: CONTROL_MVP_FORMAT_VERSION,
-                segment_version: SEGMENT_FORMAT_VERSION,
-                directory_version: SEGMENT_FORMAT_VERSION,
-                encoder_version: 1,
-                scope: store.scope.clone(),
-                binding: self.binding,
-                source_id: source.manifest_id.clone(),
-                source_digest: pointer.manifest_checksum_sha256,
-                source_sequence: source.logical_sequence,
-                source_history: source.history_root.clone(),
-                source_physical: source.physical_root.clone(),
-                source_checksum: source.state_checksum_sha256.clone(),
-                layout_generation: source.layout_generation,
-                reclamation_generation: pointer.reclamation_generation,
-                created_at: now,
-                expires_at: now
-                    .checked_add_signed(ChronoDuration::hours(24))
-                    .ok_or_else(|| invariant_violation("expiry overflow"))?,
-                retained_until: now
-                    .checked_add_signed(ChronoDuration::days(8))
-                    .ok_or_else(|| invariant_violation("retention overflow"))?,
-                nonce: cost::nonce().to_string(),
-                seed: String::new(),
-                block_target: store.segment_limits.block_target,
-                pages: Vec::new(),
-            };
-            descriptor.seed = descriptor.render_seed()?;
-            let plan = PreparedPlan::build(store, &source, &descriptor.seed).await?;
-            descriptor.pages.clone_from(&plan.hashes);
-            descriptor.validate(&store.scope, self.binding)?;
-            let bytes =
-                encode_json_limited(&descriptor, MAX_PLAN_PAGE_BYTES, "maintenance descriptor")?;
-            let id = MaintenanceJobId::parse(sha256_hex(&bytes))?;
-            // All admission serialization is checked while prepare remains read-only.
-            activation_bytes(&descriptor, &id)?;
-            Ok(Some(PreparedMaintenance {
-                id,
-                descriptor,
-                bytes,
-                pages: plan.pages,
-            }))
+            // The inputs and the descriptor bind the same head: one load.
+            let (pointer, head, inputs) =
+                Box::pin(self.worker.retention_horizon_inputs(now)).await?;
+            let prepared = Box::pin(self.admit(
+                now,
+                &pointer,
+                &head,
+                MaintenanceKind::RetentionHorizon,
+                Some(inputs),
+            ))
+            .await?;
+            let eligible = prepared
+                .descriptor
+                .purge
+                .as_ref()
+                .is_some_and(|purge| purge.purged_counts != PurgedCountsV1::default());
+            Ok(eligible.then_some(prepared))
         })
         .await
+    }
+
+    async fn admission_source(&self) -> Result<Option<(ControlMvpPointer, ControlMvpManifest)>> {
+        let store = &self.worker.store;
+        if store
+            .storage
+            .head(&store.paths.current_pointer())
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let pointer = store.load_pointer().await?;
+        let source = store.load_manifest_for_pointer(&pointer).await?;
+        Ok(Some((pointer, source)))
+    }
+
+    async fn admit(
+        &self,
+        now: DateTime<Utc>,
+        pointer: &ControlMvpPointer,
+        source: &ControlMvpManifest,
+        kind: MaintenanceKind,
+        horizon: Option<HorizonInputs>,
+    ) -> Result<PreparedMaintenance> {
+        let store = &self.worker.store;
+        let mut descriptor = Descriptor {
+            version: MAINTENANCE_VERSION,
+            policy_version: MAINTENANCE_POLICY_VERSION,
+            authority_version: CONTROL_MVP_FORMAT_VERSION,
+            segment_version: SEGMENT_FORMAT_VERSION,
+            directory_version: SEGMENT_FORMAT_VERSION,
+            encoder_version: 1,
+            scope: store.scope.clone(),
+            binding: self.binding,
+            source_id: source.manifest_id.clone(),
+            source_digest: pointer.manifest_checksum_sha256.clone(),
+            source_sequence: source.logical_sequence,
+            source_history: source.history_root.clone(),
+            source_physical: source.physical_root.clone(),
+            source_checksum: source.state_checksum_sha256.clone(),
+            layout_generation: source.layout_generation,
+            reclamation_generation: pointer.reclamation_generation,
+            created_at: now,
+            expires_at: now
+                .checked_add_signed(ChronoDuration::hours(24))
+                .ok_or_else(|| invariant_violation("expiry overflow"))?,
+            retained_until: now
+                .checked_add_signed(ChronoDuration::days(8))
+                .ok_or_else(|| invariant_violation("retention overflow"))?,
+            nonce: cost::nonce().to_string(),
+            seed: String::new(),
+            block_target: store.segment_limits.block_target,
+            pages: Vec::new(),
+            kind,
+            horizon,
+            purge: None,
+        };
+        descriptor.seed = descriptor.render_seed()?;
+        let plan =
+            PreparedPlan::build(store, source, &descriptor.seed, descriptor.horizon.as_ref())
+                .await?;
+        descriptor.pages.clone_from(&plan.hashes);
+        descriptor.purge = plan.purge;
+        descriptor.validate(&store.scope, self.binding)?;
+        let bytes =
+            encode_json_limited(&descriptor, MAX_PLAN_PAGE_BYTES, "maintenance descriptor")?;
+        let id = MaintenanceJobId::parse(sha256_hex(&bytes))?;
+        // All admission serialization is checked while prepare remains read-only.
+        activation_bytes(&descriptor, &id)?;
+        Ok(PreparedMaintenance {
+            id,
+            descriptor,
+            bytes,
+            pages: plan.pages,
+        })
     }
 
     /// Publishes and activates a prepared job whose identity the caller already knows.
@@ -1828,7 +2327,7 @@ impl DurableMaintenanceWorker {
             render_store.segment_limits.block_target = job.descriptor.block_target;
             let rendered = cost::phase(
                 "maintenance-construction",
-                page.construct(&render_store, &source),
+                page.construct(&render_store, &source, job.descriptor.horizon.as_ref()),
             )
             .await?;
             job.descriptor.live(now.max(cost::now()))?;
@@ -2140,6 +2639,20 @@ impl DurableMaintenanceWorker {
         }
         let store = &self.worker.store;
         let (head_version, pointer, current, render) = self.compatible(&job.descriptor).await?;
+        // What the rendered L1 shards must reproduce at the render cut: the
+        // whole cut for consolidation, the cut minus the admitted purged set
+        // for a horizon job.
+        let render_checksum = match (job.descriptor.kind, &job.descriptor.purge) {
+            (MaintenanceKind::Consolidation, None) => render.state_checksum_sha256.clone(),
+            (MaintenanceKind::RetentionHorizon, Some(purge)) => {
+                purge.pruned_state_checksum_sha256.clone()
+            }
+            _ => {
+                return Err(invariant_violation(
+                    "maintenance descriptor kind and purge summary disagree",
+                ));
+            }
+        };
         let expected = cost::phase(
             "maintenance-publish-source-reconstruction",
             store.replay_for_successor(&current),
@@ -2167,7 +2680,7 @@ impl DurableMaintenanceWorker {
                     Ok::<_, CatalogError>(())
                 })
                 .await?;
-                if candidate_state.checksum()? != render.state_checksum_sha256
+                if candidate_state.checksum()? != render_checksum
                     || candidate_state.logical_sequence != render.logical_sequence
                 {
                     return Err(invariant_violation(
@@ -2185,11 +2698,56 @@ impl DurableMaintenanceWorker {
                 Ok::<_, CatalogError>((candidate_state, suffix))
             })
             .await?;
+        // The state the candidate must equal, and the certificate that
+        // explains the difference from `current`. Consolidation reproduces
+        // the parent exactly. A horizon job recomputes the purge over a fresh
+        // replay of the parent (bounded to rows the render cut held) and
+        // requires the purged digest and counts to equal the admitted plan's:
+        // a suffix that rewrote a purged key since preparation makes the
+        // admitted set stale, and the job is superseded rather than
+        // certified against the wrong parent.
+        let (final_state, final_checksum, certificate) = {
+            let _phase = cost::PhaseGuard::enter("maintenance-final-equivalence");
+            match (
+                job.descriptor.kind,
+                &job.descriptor.horizon,
+                &job.descriptor.purge,
+            ) {
+                (MaintenanceKind::Consolidation, None, None) => {
+                    (expected, current.state_checksum_sha256.clone(), None)
+                }
+                (MaintenanceKind::RetentionHorizon, Some(inputs), Some(purge)) => {
+                    let (pruned, recomputed) =
+                        partition_purge(&store.scope, &expected, inputs, render.logical_sequence)?;
+                    if recomputed.purged_rows_sha256 != purge.purged_rows_sha256
+                        || recomputed.purged_counts != purge.purged_counts
+                    {
+                        return Err(precondition_failed(
+                            "retention horizon purged set was superseded by later commits",
+                        ));
+                    }
+                    let checksum = pruned.checksum()?;
+                    let certificate = RetentionHorizonV1 {
+                        encoding_version: 1,
+                        horizon_sequence: inputs.horizon_sequence,
+                        purge_cutoff_ms: inputs.purge_cutoff_ms,
+                        pinned_evidence: inputs.pinned_evidence.clone(),
+                        parent_state_checksum_sha256: current.state_checksum_sha256.clone(),
+                        purged_rows_sha256: recomputed.purged_rows_sha256,
+                        purged_counts: recomputed.purged_counts,
+                    };
+                    (pruned, checksum, Some(certificate))
+                }
+                _ => {
+                    return Err(invariant_violation(
+                        "maintenance descriptor kind and horizon inputs disagree",
+                    ));
+                }
+            }
+        };
         {
             let _phase = cost::PhaseGuard::enter("maintenance-final-equivalence");
-            if candidate_state != expected
-                || candidate_state.checksum()? != current.state_checksum_sha256
-            {
+            if candidate_state != final_state || candidate_state.checksum()? != final_checksum {
                 return Err(invariant_violation(
                     "complete maintenance candidate is not semantically equivalent",
                 ));
@@ -2210,9 +2768,36 @@ impl DurableMaintenanceWorker {
             .layout_generation
             .checked_add(1)
             .ok_or_else(|| invariant_violation("maintenance layout generation overflow"))?;
+        // A pending publication must reconstruct this candidate byte for byte,
+        // so the stamp is job-bound: the preparation clock, never the wall
+        // clock at publication. It also never runs backwards along ancestry:
+        // `created_at` can be up to 24 h older than the parent HEAD (`current`,
+        // fixed by the pending attempt's source digest) and the suffix
+        // transactions it carries, so take the later of the two.
+        candidate.committed_at_ms = job
+            .descriptor
+            .created_at
+            .timestamp_millis()
+            .max(current.committed_at_ms);
+        candidate.age_anchor = age_anchor_for_child(
+            candidate.committed_at_ms,
+            Some(AnchorParent {
+                manifest_id: &current.manifest_id,
+                manifest_sha256: &pointer.manifest_checksum_sha256,
+                sequence: current.logical_sequence,
+                committed_at_ms: current.committed_at_ms,
+                age_anchor: &current.age_anchor,
+            }),
+        );
         candidate.base_states = job.pages.iter().map(|page| page.output.clone()).collect();
         candidate.anchor_states.clear();
         candidate.tx_refs = suffix;
+        // The candidate starts as a clone of `current`; a parent's horizon
+        // certificate is never inherited. A horizon job binds its own and
+        // publishes the pruned state's checksum; consolidation keeps the
+        // parent's.
+        candidate.retention_horizon = certificate;
+        candidate.state_checksum_sha256.clone_from(&final_checksum);
         candidate.history_anchor = HistoryAnchor {
             sequence: render.logical_sequence,
             root: render.history_root.clone(),
@@ -2226,7 +2811,7 @@ impl DurableMaintenanceWorker {
             source_history_root: current.history_root.clone(),
             source_physical_root: current.physical_root.clone(),
             logical_sequence: current.logical_sequence,
-            state_checksum_sha256: current.state_checksum_sha256.clone(),
+            state_checksum_sha256: final_checksum,
             render_source: Some(integrity::RenderSource {
                 manifest_id: render.manifest_id.clone(),
                 manifest_sha256: job.descriptor.source_digest.clone(),
@@ -2234,7 +2819,7 @@ impl DurableMaintenanceWorker {
                 history_anchor: render.history_anchor.clone(),
                 history_root: render.history_root.clone(),
                 physical_root: render.physical_root.clone(),
-                state_checksum_sha256: render.state_checksum_sha256.clone(),
+                state_checksum_sha256: render_checksum,
                 base_states: render.base_states.clone(),
                 anchor_states: render.anchor_states.clone(),
                 tx_refs: render.tx_refs.clone(),
@@ -2314,34 +2899,33 @@ impl DurableMaintenanceWorker {
                 .await?
                 .ok_or_else(|| ambiguous_authority_outcome("maintenance HEAD unavailable"))?;
             let pointer = store.load_pointer().await?;
-            let observation = store
-                .resolve_ancestor_bounded(
-                    &pointer.manifest_id,
-                    &pointer.manifest_checksum_sha256,
-                    |manifest, digest| {
-                        if manifest.manifest_id == attempt.candidate_id
-                            && digest == attempt.candidate_digest
-                        {
-                            Some(PublicationObservation::Selected)
-                        } else if manifest.manifest_id == attempt.source_id
-                            && digest == attempt.source_digest
-                        {
-                            Some(if before.version == attempt.head_version {
-                                PublicationObservation::Pending
-                            } else {
-                                PublicationObservation::Consumed
-                            })
+            let observation = Box::pin(store.resolve_ancestor_bounded(
+                &pointer.manifest_id,
+                &pointer.manifest_checksum_sha256,
+                |manifest, digest| {
+                    if manifest.manifest_id == attempt.candidate_id
+                        && digest == attempt.candidate_digest
+                    {
+                        Some(PublicationObservation::Selected)
+                    } else if manifest.manifest_id == attempt.source_id
+                        && digest == attempt.source_digest
+                    {
+                        Some(if before.version == attempt.head_version {
+                            PublicationObservation::Pending
                         } else {
-                            None
-                        }
-                    },
-                    64,
-                    64 * 1024 * 1024,
-                )
-                .await?
-                .ok_or_else(|| {
-                    ambiguous_authority_outcome("maintenance publication ancestry unavailable")
-                })?;
+                            PublicationObservation::Consumed
+                        })
+                    } else {
+                        None
+                    }
+                },
+                64,
+                64 * 1024 * 1024,
+            ))
+            .await?
+            .ok_or_else(|| {
+                ambiguous_authority_outcome("maintenance publication ancestry unavailable")
+            })?;
             let after = store
                 .storage
                 .head(&store.paths.current_pointer())
@@ -2847,4 +3431,46 @@ pub(super) async fn expired_pin_page(
         }))
     }))
     .await
+}
+
+/// Renders one replayed outbox record as an L1 segment row. Outbox rows are
+/// never purge candidates and carry no expiry hint.
+fn outbox_segment_row(
+    record: &super::ControlMvpProjectionOutboxRecord,
+    logical_sequence: u64,
+    logical_ordinal: u64,
+) -> ControlMvpSegmentRow {
+    ControlMvpSegmentRow {
+        record_kind: SEGMENT_RECORD_OUTBOX,
+        key: record.record_id.as_bytes().to_vec(),
+        value: Some(record.payload.to_vec()),
+        generation: 0,
+        tombstone: false,
+        logical_sequence,
+        logical_ordinal,
+        origin_sequence: record.origin_sequence,
+        expires_at_ms: None,
+    }
+}
+
+/// Renders one replayed KV entry as an L1 segment row. The expiry hint is
+/// carried row for row so consolidation never flattens a purge-eligible row
+/// into a permanent one.
+fn kv_segment_row(
+    key: Vec<u8>,
+    value: &StoredValue,
+    logical_sequence: u64,
+    logical_ordinal: u64,
+) -> ControlMvpSegmentRow {
+    ControlMvpSegmentRow {
+        record_kind: SEGMENT_RECORD_KV,
+        key,
+        value: (!value.tombstone).then(|| value.bytes.to_vec()),
+        generation: value.generation,
+        tombstone: value.tombstone,
+        logical_sequence,
+        logical_ordinal,
+        origin_sequence: None,
+        expires_at_ms: value.expires_at_ms,
+    }
 }

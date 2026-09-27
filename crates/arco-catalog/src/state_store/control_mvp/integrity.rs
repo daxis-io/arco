@@ -1,4 +1,4 @@
-//! Canonical authority-format-7 integrity commitments. No storage I/O lives here.
+//! Canonical authority-format-9 integrity commitments. No storage I/O lives here.
 use arco_core::AuthorityRoot;
 
 use crate::StateScope;
@@ -57,6 +57,209 @@ pub(super) struct RenderSource {
     pub base_states: Vec<ControlMvpStateRef>,
     pub anchor_states: Vec<ControlMvpStateRef>,
     pub tx_refs: Vec<super::ControlMvpTxRef>,
+}
+
+/// Width of the wall-clock bucket the age-anchor chain steps by: one hour.
+/// Following anchors therefore steps back at least one hour per hop, so the
+/// 30-day retention floor is reached in at most about 721 authenticated
+/// reads regardless of the commit rate.
+pub(super) const AGE_ANCHOR_BUCKET_MS: i64 = 60 * 60 * 1000;
+
+/// The hour bucket a `committed_at_ms` stamp falls in.
+pub(super) fn age_bucket(committed_at_ms: i64) -> i64 {
+    committed_at_ms.div_euclid(AGE_ANCHOR_BUCKET_MS)
+}
+
+/// One link of the age-anchor chain: the last manifest of the hour bucket
+/// before the one this manifest's chain crossed into. Authenticated at use by
+/// the recorded digest, sequence and stamp; never part of a canonical digest
+/// (the manifest envelope authenticates it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct AgeAnchorV1 {
+    pub manifest_id: String,
+    pub manifest_sha256: String,
+    pub sequence: u64,
+    pub committed_at_ms: i64,
+}
+
+impl AgeAnchorV1 {
+    pub(super) fn validate(&self) -> Result<()> {
+        if !valid_immutable_id(&self.manifest_id)
+            || !valid_raw_digest(&self.manifest_sha256)
+            || self.committed_at_ms <= 0
+        {
+            return Err(invariant_violation("invalid age anchor"));
+        }
+        Ok(())
+    }
+}
+
+/// What the render rule needs to know about a child's parent.
+#[derive(Debug, Clone)]
+pub(super) struct AnchorParent<'a> {
+    pub manifest_id: &'a str,
+    pub manifest_sha256: &'a str,
+    pub sequence: u64,
+    pub committed_at_ms: i64,
+    pub age_anchor: &'a Option<AgeAnchorV1>,
+}
+
+/// The age-anchor render rule, applied on every manifest render and checked
+/// by the ancestry walker as a transition invariant: a child stamped in a
+/// later hour bucket than its parent records the parent; otherwise it
+/// inherits the parent's anchor. Genesis (no parent) has none.
+pub(super) fn age_anchor_for_child(
+    committed_at_ms: i64,
+    parent: Option<AnchorParent<'_>>,
+) -> Option<AgeAnchorV1> {
+    let parent = parent?;
+    if age_bucket(committed_at_ms) > age_bucket(parent.committed_at_ms) {
+        Some(AgeAnchorV1 {
+            manifest_id: parent.manifest_id.to_string(),
+            manifest_sha256: parent.manifest_sha256.to_string(),
+            sequence: parent.sequence,
+            committed_at_ms: parent.committed_at_ms,
+        })
+    } else {
+        parent.age_anchor.clone()
+    }
+}
+
+/// Evidence kinds a retention-horizon certificate may cite. `manifest_age`
+/// names the ancestor that established the token-retention age bound; the
+/// other three name active pins whose sequence held the horizon.
+pub(super) const PINNED_EVIDENCE_KINDS: [&str; 4] =
+    ["manifest_age", "snapshot", "export", "checkpoint"];
+
+/// One retained root that bounded `horizon_sequence` when the certificate was
+/// computed. `sequence` is that root's logical sequence; the horizon is never
+/// above any cited sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PinnedSequenceV1 {
+    pub kind: String,
+    pub id: String,
+    pub sequence: u64,
+}
+
+/// How many rows a horizon rewrite dropped, by purge reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct PurgedCountsV1 {
+    pub expired_rows: u64,
+    pub tombstones: u64,
+}
+
+/// Certificate a `RetentionHorizon` maintenance transition binds into its
+/// manifest. Logical sequence and history root are unchanged by the
+/// transition; the equivalence rule is "parent state minus the certified
+/// purged set equals the new state". The worker verifies that identity
+/// against a fresh parent replay before its head CAS; ancestry walkers bind
+/// `parent_state_checksum_sha256` to the immediate parent. Readers cannot
+/// recompute the purged digest after the rows are gone, so this is
+/// verification by independent code at rewrite time, as consolidation
+/// evidence is today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RetentionHorizonV1 {
+    pub encoding_version: u32,
+    pub horizon_sequence: u64,
+    pub purge_cutoff_ms: i64,
+    pub pinned_evidence: Vec<PinnedSequenceV1>,
+    pub parent_state_checksum_sha256: String,
+    pub purged_rows_sha256: String,
+    pub purged_counts: PurgedCountsV1,
+}
+
+/// The input half of a certificate, shared by the admitted job descriptor
+/// and the published certificate: the horizon is at or below the carrying
+/// sequence and every cited pinned sequence, the cutoff is a positive
+/// instant, and every evidence entry names a known kind by a followable id.
+pub(super) fn validate_horizon_inputs(
+    horizon_sequence: u64,
+    purge_cutoff_ms: i64,
+    pinned_evidence: &[PinnedSequenceV1],
+    logical_sequence: u64,
+) -> Result<()> {
+    if horizon_sequence > logical_sequence
+        || purge_cutoff_ms <= 0
+        || pinned_evidence.iter().any(|evidence| {
+            !PINNED_EVIDENCE_KINDS.contains(&evidence.kind.as_str())
+                || !valid_immutable_id(&evidence.id)
+                || evidence.sequence < horizon_sequence
+        })
+    {
+        return Err(invariant_violation("invalid retention horizon inputs"));
+    }
+    Ok(())
+}
+
+impl RetentionHorizonV1 {
+    /// Structural validation against the carrying manifest's logical
+    /// sequence. It cannot prove the purged set; it proves the certificate
+    /// is well formed and internally consistent (the horizon is at or below
+    /// every cited pinned sequence and the manifest's own sequence).
+    pub(super) fn validate(&self, logical_sequence: u64) -> Result<()> {
+        if self.encoding_version != 1
+            || !valid_raw_digest(&self.parent_state_checksum_sha256)
+            || !valid_raw_digest(&self.purged_rows_sha256)
+        {
+            return Err(invariant_violation("invalid retention horizon certificate"));
+        }
+        validate_horizon_inputs(
+            self.horizon_sequence,
+            self.purge_cutoff_ms,
+            &self.pinned_evidence,
+            logical_sequence,
+        )
+        .map_err(|_| invariant_violation("invalid retention horizon certificate"))
+    }
+
+    /// Validation for the manifest that carries the certificate: the
+    /// structural rules plus "the purge cutoff precedes the manifest's own
+    /// stamp", which every genuine render satisfies (the cutoff is the
+    /// preparation clock minus the skew margin; the stamp is at or after the
+    /// preparation clock).
+    pub(super) fn validate_for_manifest(
+        &self,
+        logical_sequence: u64,
+        committed_at_ms: i64,
+    ) -> Result<()> {
+        self.validate(logical_sequence)?;
+        if self.purge_cutoff_ms >= committed_at_ms {
+            return Err(invariant_violation(
+                "retention horizon purge cutoff is not before the manifest stamp",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One row a horizon rewrite dropped, in the shape the purged digest binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PurgedRow<'a> {
+    pub key: &'a [u8],
+    pub generation: u64,
+    pub tombstone: bool,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// Digest over the ordered purged rows of one horizon rewrite: the row
+/// count, then per row in strictly increasing key order the key, generation,
+/// tombstone flag and expiry hint. Rows out of key order (or duplicated) are
+/// an invariant violation rather than silently reordered.
+pub(super) fn purged_rows_digest(scope: &StateScope, rows: &[PurgedRow<'_>]) -> Result<String> {
+    let mut out = Canonical::new(b"arco/control-v1/retention-purge", scope)?;
+    out.u64(rows.len() as u64);
+    let mut previous: Option<&[u8]> = None;
+    for row in rows {
+        if previous.is_some_and(|prior| prior >= row.key) {
+            return Err(invariant_violation("purged rows are not in key order"));
+        }
+        previous = Some(row.key);
+        out.bytes(row.key);
+        out.u64(row.generation);
+        out.u8(u8::from(row.tombstone));
+        out.optional_i64(row.expires_at_ms);
+    }
+    Ok(out.finish())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +326,15 @@ impl Canonical {
             }
         }
     }
+    fn optional_i64(&mut self, value: Option<i64>) {
+        match value {
+            None => self.u8(0),
+            Some(value) => {
+                self.u8(1);
+                self.0.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+    }
     fn digest(&mut self, value: &str) -> Result<()> {
         if !valid_raw_digest(value) {
             return Err(invariant_violation("invalid canonical digest"));
@@ -138,13 +350,35 @@ impl Canonical {
         record_integrity_work(0, self.0.len());
         sha256_hex(&self.0)
     }
+    /// The exact bytes `finish` hashes; the vector generator records them.
+    #[cfg(test)]
+    fn preimage(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+fn genesis_canonical(scope: &StateScope) -> Result<Canonical> {
+    Canonical::new(b"arco/control-v1/history-genesis", scope)
 }
 
 pub(super) fn genesis(scope: &StateScope) -> Result<HistoryAnchor> {
     Ok(HistoryAnchor {
         sequence: 0,
-        root: Canonical::new(b"arco/control-v1/history-genesis", scope)?.finish(),
+        root: genesis_canonical(scope)?.finish(),
     })
+}
+
+fn history_step_canonical(
+    scope: &StateScope,
+    preceding: &str,
+    sequence: u64,
+    mutation: &str,
+) -> Result<Canonical> {
+    let mut out = Canonical::new(b"arco/control-v1/history-step", scope)?;
+    out.digest(preceding)?;
+    out.u64(sequence);
+    out.digest(mutation)?;
+    Ok(out)
 }
 
 pub(super) fn history_step(
@@ -153,14 +387,14 @@ pub(super) fn history_step(
     sequence: u64,
     mutation: &str,
 ) -> Result<String> {
-    let mut out = Canonical::new(b"arco/control-v1/history-step", scope)?;
-    out.digest(preceding)?;
-    out.u64(sequence);
-    out.digest(mutation)?;
-    Ok(out.finish())
+    Ok(history_step_canonical(scope, preceding, sequence, mutation)?.finish())
 }
 
 pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
+    Ok(mutation_canonical(tx)?.finish())
+}
+
+fn mutation_canonical(tx: &ControlMvpTxObject) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/mutation", &tx.scope)?;
     out.optional_bytes(tx.request_id.as_deref().map(str::as_bytes));
     let mut writes = tx.writes.iter().collect::<Vec<_>>();
@@ -170,6 +404,10 @@ pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
         out.bytes(&write.key);
         out.u64(write.generation);
         out.optional_bytes(write.value.as_deref());
+        // Format 9 / segment format 2: the expiry hint is part of the
+        // mutation. The absent case is the one-byte `0` discriminant, the
+        // same shape `optional_bytes` uses.
+        out.optional_i64(write.expires_at_ms);
     }
     out.u64(tx.outbox.len() as u64);
     for entry in &tx.outbox {
@@ -184,7 +422,7 @@ pub(super) fn mutation_digest(tx: &ControlMvpTxObject) -> Result<String> {
         out.bytes(trim.record_id.as_bytes());
         out.u64(trim.origin_sequence);
     }
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl HistoryLink {
@@ -323,6 +561,26 @@ impl ControlMvpManifest {
         if preceding != self.history_root || self.physical_digest()? != self.physical_root {
             return Err(invariant_violation("manifest integrity root mismatch"));
         }
+        if let Some(anchor) = &self.age_anchor {
+            anchor.validate()?;
+            if self.base_manifest_id.is_none()
+                || anchor.sequence > self.logical_sequence
+                || anchor.committed_at_ms > self.committed_at_ms
+                || age_bucket(anchor.committed_at_ms) >= age_bucket(self.committed_at_ms)
+            {
+                return Err(invariant_violation(
+                    "age anchor is not from an earlier bucket of this manifest's ancestry",
+                ));
+            }
+        }
+        if let Some(certificate) = &self.retention_horizon {
+            if self.equivalence.is_none() {
+                return Err(invariant_violation(
+                    "retention horizon certificate requires rewrite equivalence evidence",
+                ));
+            }
+            certificate.validate_for_manifest(self.logical_sequence, self.committed_at_ms)?;
+        }
         if let Some(evidence) = &self.equivalence {
             if self.base_manifest_id.as_deref() != Some(&evidence.source_manifest_id)
                 || self.parent_manifest_sha256.as_deref() != Some(&evidence.source_manifest_sha256)
@@ -359,6 +617,16 @@ fn physical_digest(
     transactions: &[super::ControlMvpTxRef],
     suffix: &[super::ControlMvpTxRef],
 ) -> Result<String> {
+    Ok(physical_canonical(scope, states, anchors, transactions, suffix)?.finish())
+}
+
+fn physical_canonical(
+    scope: &StateScope,
+    states: &[ControlMvpStateRef],
+    anchors: &[ControlMvpStateRef],
+    transactions: &[super::ControlMvpTxRef],
+    suffix: &[super::ControlMvpTxRef],
+) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/manifest-layout", scope)?;
     encode_states(&mut out, 1, states)?;
     encode_states(&mut out, 2, anchors)?;
@@ -371,7 +639,7 @@ fn physical_digest(
         out.u32(CONTROL_MVP_FORMAT_VERSION);
         out.digest(&reference.checksum_sha256)?;
     }
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl RenderSource {
@@ -459,9 +727,16 @@ pub(super) fn checkpoint_physical_digest(
     scope: &StateScope,
     states: &[ControlMvpStateRef],
 ) -> Result<String> {
+    Ok(checkpoint_physical_canonical(scope, states)?.finish())
+}
+
+fn checkpoint_physical_canonical(
+    scope: &StateScope,
+    states: &[ControlMvpStateRef],
+) -> Result<Canonical> {
     let mut out = Canonical::new(b"arco/control-v1/checkpoint-layout", scope)?;
     encode_states(&mut out, 4, states)?;
-    Ok(out.finish())
+    Ok(out)
 }
 
 impl ControlMvpCheckpoint {
@@ -475,6 +750,7 @@ impl ControlMvpCheckpoint {
             || evidence.source_history_root != manifest.history_root
             || evidence.source_physical_root != manifest.physical_root
             || evidence.state_checksum_sha256 != manifest.state_checksum_sha256
+            || self.retention_horizon != manifest.retention_horizon
         {
             return Err(invariant_violation(
                 "checkpoint source validation evidence mismatch",

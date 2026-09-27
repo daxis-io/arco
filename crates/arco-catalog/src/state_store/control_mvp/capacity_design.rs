@@ -38,7 +38,7 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
     assert_eq!(source_values.len(), 8);
     let decoded_bytes = source_values
         .iter()
-        .map(|(k, v)| k.len() + v.len())
+        .map(|(k, v)| k.len() + v.bytes.len())
         .sum::<usize>();
     assert!(decoded_bytes < MAX_SEGMENT_BYTES);
     let mut txn = store
@@ -54,7 +54,14 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
         RestoreAttemptIdentity::new("rst_00000000000000000000000001", 1, "catalog").unwrap();
     let stable = store.load_stable_restore_base(&source).await.unwrap();
     let rendered = store
-        .render_restore_candidate(&source, &source_values, &identity, &stable, 1)
+        .render_restore_candidate(
+            &source,
+            &source_values,
+            &identity,
+            &stable,
+            1,
+            Utc::now().timestamp_millis(),
+        )
         .unwrap();
     assert!(rendered.transaction_bytes.len() < 16 * 1024);
     assert!(rendered.l0_segment_bytes.len() > decoded_bytes);
@@ -76,7 +83,10 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
             > before.logical_sequence()
     );
     for (key, expected) in &source_values {
-        assert_eq!(store.get(key).await.unwrap().as_ref(), Some(expected));
+        assert_eq!(
+            store.get(key).await.unwrap().as_ref(),
+            Some(&expected.bytes)
+        );
     }
     println!(
         "{}",
@@ -243,6 +253,7 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
             logical_sequence: mutations,
             logical_ordinal: index,
             origin_sequence: None,
+            expires_at_ms: None,
         });
     }
     if !batch.is_empty() {
@@ -330,4 +341,183 @@ fn round_trip_batch(
         "first_key_hex":hex::encode(&rows.first().unwrap().key),
         "last_key_hex":hex::encode(&rows.last().unwrap().key),
         "encode_decode_seconds":started.elapsed().as_secs_f64()})
+}
+
+/// Retention smoke at pilot shape: 2,000 receipt-like rows with a 24 h expiry
+/// hint and 500 deletes of other keys, consolidated, then one
+/// `RetentionHorizon` cycle 31 days later. Every receipt and tombstone is
+/// purged, the live non-receipt rows survive, the certificate counts match,
+/// and the logical sequence is unchanged. The fixture clock stamps every
+/// render at the first instant, so the age bound is the head itself.
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn retention_horizon_purges_expired_receipts_and_tombstones_at_pilot_shape() {
+    use crate::{
+        DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus, PreparedMaintenance,
+    };
+    use arco_core::test_inputs::FixedInputs;
+
+    const RECEIPTS: usize = 2_000;
+    const RECEIPT_COMMITS: usize = 16;
+    const DOOMED: usize = 500;
+    const LIVE: usize = 100;
+
+    async fn publish(
+        worker: &DurableMaintenanceWorker,
+        plan: PreparedMaintenance,
+        now: DateTime<Utc>,
+    ) -> ControlMvpMaintenanceOutcome {
+        let id = plan.job_id().clone();
+        let mut progress = worker.start_at(&plan, now).await.unwrap();
+        while progress.status == MaintenanceStatus::Active {
+            progress = worker.advance_at(&id, now).await.unwrap();
+        }
+        assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
+        worker
+            .publish_at(&id, now)
+            .await
+            .unwrap()
+            .expect("the only writer publishes on its first attempt")
+    }
+
+    // 2030-01-01T00:00:00Z, the instant `FixedInputs::scoped` also uses.
+    let start = DateTime::from_timestamp(1_893_456_000, 0).unwrap();
+    let clock = FixedInputs::at(start);
+    let storage =
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).unwrap();
+    let worker =
+        DurableMaintenanceWorker::new(storage, scope, DurableAuthorityBinding::new([5; 32]))
+            .unwrap();
+
+    let live_keys = (0..LIVE)
+        .map(|n| format!("catalog/{n:04}").into_bytes())
+        .collect::<BTreeSet<_>>();
+    let doomed_keys = (0..DOOMED)
+        .map(|n| format!("doomed/{n:04}").into_bytes())
+        .collect::<Vec<_>>();
+    let expires_at_ms = (start + ChronoDuration::hours(24)).timestamp_millis();
+
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    for key in &live_keys {
+        txn.put(key, Bytes::from_static(b"catalog row"))
+            .await
+            .unwrap();
+    }
+    for key in &doomed_keys {
+        txn.put(key, Bytes::from_static(b"doomed row"))
+            .await
+            .unwrap();
+    }
+    txn.commit().await.unwrap();
+    let per_commit = RECEIPTS / RECEIPT_COMMITS;
+    for commit in 0..RECEIPT_COMMITS {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        for n in commit * per_commit..(commit + 1) * per_commit {
+            txn.put_with_expiry(
+                format!("receipt/{n:05}").as_bytes(),
+                Bytes::from_static(b"receipt"),
+                expires_at_ms,
+            )
+            .await
+            .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    for key in &doomed_keys {
+        txn.delete(key).await.unwrap();
+    }
+    txn.commit().await.unwrap();
+
+    // Eighteen L0 segments carry a maintenance intent; consolidate them so the
+    // horizon renders from L1 like a pilot root would.
+    let plan = worker
+        .prepare_at(start)
+        .await
+        .unwrap()
+        .expect("the head selects a maintenance intent");
+    publish(&worker, plan, start).await;
+    let pointer = store.load_pointer().await.unwrap();
+    let before = store.load_manifest_for_pointer(&pointer).await.unwrap();
+    assert!(before.tx_refs.is_empty() && before.retention_horizon.is_none());
+    let before_state = store.replay_for_successor(&before).await.unwrap();
+    assert_eq!(before_state.kv.len(), LIVE + DOOMED + RECEIPTS);
+
+    // Thirty-one days later the floor (now - 30 d - 1 h) is past every stamp,
+    // so the age bound is the head and every tombstone is at or below it, and
+    // every receipt expired a month before the purge cutoff.
+    drop(clock);
+    let later = start + ChronoDuration::days(31);
+    let _clock = FixedInputs::at(later);
+    let plan = worker
+        .prepare_horizon_at(later)
+        .await
+        .unwrap()
+        .expect("expired receipts and tombstones are eligible");
+    let outcome = publish(&worker, plan, later).await;
+
+    let pointer = store.load_pointer().await.unwrap();
+    let after = store.load_manifest_for_pointer(&pointer).await.unwrap();
+    assert_eq!(
+        outcome.selected_token().authority_manifest_id(),
+        after.manifest_id
+    );
+    assert_eq!(after.logical_sequence, before.logical_sequence);
+    assert_eq!(after.history_root, before.history_root);
+    assert_eq!(after.layout_generation, before.layout_generation + 1);
+    let certificate = after.retention_horizon.as_ref().expect("certificate");
+    assert_eq!(certificate.horizon_sequence, before.logical_sequence);
+    assert_eq!(
+        certificate.pinned_evidence,
+        vec![PinnedSequenceV1 {
+            kind: "manifest_age".into(),
+            id: before.manifest_id.clone(),
+            sequence: before.logical_sequence,
+        }]
+    );
+    assert_eq!(
+        certificate.purged_counts,
+        PurgedCountsV1 {
+            expired_rows: u64::try_from(RECEIPTS).unwrap(),
+            tombstones: u64::try_from(DOOMED).unwrap(),
+        }
+    );
+    assert_eq!(
+        certificate.parent_state_checksum_sha256,
+        before.state_checksum_sha256
+    );
+
+    let state = store.replay_for_successor(&after).await.unwrap();
+    assert_eq!(state.kv.keys().cloned().collect::<BTreeSet<_>>(), live_keys);
+    assert!(
+        state
+            .kv
+            .values()
+            .all(|value| !value.tombstone && value.expires_at_ms.is_none()),
+        "only live rows without a hint remain"
+    );
+    assert_eq!(state.checksum().unwrap(), after.state_checksum_sha256);
+    assert_eq!(
+        store.get(b"catalog/0000").await.unwrap(),
+        Some(Bytes::from_static(b"catalog row"))
+    );
+    assert_eq!(store.get(b"receipt/00000").await.unwrap(), None);
+    assert_eq!(store.get(b"doomed/0000").await.unwrap(), None);
+    println!(
+        "{}",
+        serde_json::json!({"case":"retention-horizon-pilot-shape", "receipts":RECEIPTS,
+        "deletes":DOOMED, "live":LIVE, "retained_rows":state.kv.len(),
+        "logical_sequence":after.logical_sequence, "layout_generation":after.layout_generation})
+    );
 }

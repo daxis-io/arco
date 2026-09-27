@@ -11,6 +11,7 @@ use super::{
     ArcoStateAdmin, ArcoStateReader, ArcoStateStore, ArcoStateTxn, CheckpointOptions,
     CheckpointToken, CommitOutcome, KeyRange, KvPair, PredicateInputSet, ScanPage, ScanRequest,
     StateScope, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue, build_scan_page,
+    expiry_hint_is_valid,
 };
 use crate::error::{CatalogError, Result};
 
@@ -42,7 +43,7 @@ impl ModelStateStore {
 
     /// Returns deterministic folded entries, including tombstoned keys.
     #[must_use]
-    pub fn folded_entries(&self) -> Vec<(Vec<u8>, Option<Bytes>, u64)> {
+    pub fn folded_entries(&self) -> Vec<FoldedEntry> {
         lock_model_state(&self.inner).folded_entries()
     }
 
@@ -112,6 +113,11 @@ impl ModelStateStore {
     }
 }
 
+/// One folded model row: `(key, value, generation, expires_at_ms)`. `value`
+/// is `None` for a tombstone; `expires_at_ms` is the purge-eligibility hint,
+/// which the model never uses as a read filter.
+pub type FoldedEntry = (Vec<u8>, Option<Bytes>, u64, Option<i64>);
+
 /// Deterministic committed model record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCommitRecord {
@@ -167,6 +173,7 @@ pub struct ModelWrite {
     key: Vec<u8>,
     generation: u64,
     value: Option<Bytes>,
+    expires_at_ms: Option<i64>,
 }
 
 impl ModelWrite {
@@ -188,12 +195,25 @@ impl ModelWrite {
         self.value.as_ref()
     }
 
+    /// Returns the purge-eligibility hint carried by this write, if any.
+    ///
+    /// The model, like the control store, never filters reads on it.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> Option<i64> {
+        self.expires_at_ms
+    }
+
     fn explain(&self) -> String {
         let key = String::from_utf8_lossy(&self.key);
-        if self.value.is_some() {
-            format!("put({key}@{})", self.generation)
-        } else {
-            format!("delete({key}@{})", self.generation)
+        match (self.value.is_some(), self.expires_at_ms) {
+            (true, Some(expires_at_ms)) => {
+                format!(
+                    "put({key}@{} expires_at_ms={expires_at_ms})",
+                    self.generation
+                )
+            }
+            (true, None) => format!("put({key}@{})", self.generation),
+            (false, _) => format!("delete({key}@{})", self.generation),
         }
     }
 }
@@ -210,6 +230,7 @@ struct StoredValue {
     bytes: Bytes,
     generation: u64,
     tombstone: bool,
+    expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -223,7 +244,10 @@ struct ModelTxn {
 
 #[derive(Debug)]
 enum StagedWrite {
-    Put(Bytes),
+    Put {
+        value: Bytes,
+        expires_at_ms: Option<i64>,
+    },
     Delete,
 }
 
@@ -259,7 +283,7 @@ enum PointWitness {
 }
 
 impl ModelState {
-    fn folded_entries(&self) -> Vec<(Vec<u8>, Option<Bytes>, u64)> {
+    fn folded_entries(&self) -> Vec<FoldedEntry> {
         self.kv
             .iter()
             .map(|(key, value)| {
@@ -267,6 +291,7 @@ impl ModelState {
                     key.clone(),
                     (!value.tombstone).then(|| value.bytes.clone()),
                     value.generation,
+                    value.expires_at_ms,
                 )
             })
             .collect()
@@ -287,12 +312,19 @@ impl ModelState {
                     write.generation, record.sequence
                 )));
             }
+            if !expiry_hint_is_valid(write.expires_at_ms, write.value.is_some()) {
+                return Err(invariant_violation(format!(
+                    "model write for sequence {} carries an invalid expiry hint",
+                    record.sequence
+                )));
+            }
             self.kv.insert(
                 write.key.clone(),
                 StoredValue {
                     bytes: write.value.clone().unwrap_or_default(),
                     generation: write.generation,
                     tombstone: write.value.is_none(),
+                    expires_at_ms: write.expires_at_ms,
                 },
             );
         }
@@ -585,7 +617,7 @@ impl ArcoStateTxn for ModelTxn {
     async fn get(&mut self, key: &[u8]) -> Result<Option<VersionedValue>> {
         if let Some(write) = self.writes.get(key) {
             return Ok(match write {
-                StagedWrite::Put(bytes) => Some(VersionedValue::new(bytes.clone(), None)),
+                StagedWrite::Put { value, .. } => Some(VersionedValue::new(value.clone(), None)),
                 StagedWrite::Delete => None,
             });
         }
@@ -636,8 +668,8 @@ impl ArcoStateTxn for ModelTxn {
         for (key, write) in &self.writes {
             if key.starts_with(request.prefix()) {
                 match write {
-                    StagedWrite::Put(bytes) => {
-                        entries.insert(key.clone(), VersionedValue::new(bytes.clone(), None));
+                    StagedWrite::Put { value, .. } => {
+                        entries.insert(key.clone(), VersionedValue::new(value.clone(), None));
                     }
                     StagedWrite::Delete => {
                         entries.remove(key);
@@ -659,7 +691,34 @@ impl ArcoStateTxn for ModelTxn {
     }
 
     async fn put(&mut self, key: &[u8], value: Bytes) -> Result<()> {
-        self.writes.insert(key.to_vec(), StagedWrite::Put(value));
+        self.writes.insert(
+            key.to_vec(),
+            StagedWrite::Put {
+                value,
+                expires_at_ms: None,
+            },
+        );
+        Ok(())
+    }
+
+    async fn put_with_expiry(
+        &mut self,
+        key: &[u8],
+        value: Bytes,
+        expires_at_ms: i64,
+    ) -> Result<()> {
+        if expires_at_ms <= 0 {
+            return Err(validation_failed(
+                "expires_at_ms must be a positive Unix millisecond timestamp",
+            ));
+        }
+        self.writes.insert(
+            key.to_vec(),
+            StagedWrite::Put {
+                value,
+                expires_at_ms: Some(expires_at_ms),
+            },
+        );
         Ok(())
     }
 
@@ -780,19 +839,24 @@ impl ArcoStateTxn for ModelTxn {
             let mut writes = Vec::with_capacity(self.writes.len());
             for (key, write) in self.writes {
                 match write {
-                    StagedWrite::Put(bytes) => {
+                    StagedWrite::Put {
+                        value,
+                        expires_at_ms,
+                    } => {
                         inner.kv.insert(
                             key.clone(),
                             StoredValue {
-                                bytes: bytes.clone(),
+                                bytes: value.clone(),
                                 generation: next_sequence,
                                 tombstone: false,
+                                expires_at_ms,
                             },
                         );
                         writes.push(ModelWrite {
                             key,
                             generation: next_sequence,
-                            value: Some(bytes),
+                            value: Some(value),
+                            expires_at_ms,
                         });
                     }
                     StagedWrite::Delete => {
@@ -802,12 +866,14 @@ impl ArcoStateTxn for ModelTxn {
                                 bytes: Bytes::new(),
                                 generation: next_sequence,
                                 tombstone: true,
+                                expires_at_ms: None,
                             },
                         );
                         writes.push(ModelWrite {
                             key,
                             generation: next_sequence,
                             value: None,
+                            expires_at_ms: None,
                         });
                     }
                 }
@@ -868,8 +934,13 @@ fn logical_events_for_writes(writes: &[ModelWrite]) -> Vec<String> {
             write.value.as_ref().map_or_else(
                 || format!("delete {key} generation={}", write.generation),
                 |bytes| {
+                    let hint = write
+                        .expires_at_ms
+                        .map_or_else(String::new, |expires_at_ms| {
+                            format!(" expires_at_ms={expires_at_ms}")
+                        });
                     format!(
-                        "put {key} generation={} bytes={}",
+                        "put {key} generation={} bytes={}{hint}",
                         write.generation,
                         bytes.len()
                     )
@@ -905,6 +976,7 @@ mod tests {
             key: key.to_vec(),
             generation: 1,
             value: Some(Bytes::from_static(bytes)),
+            expires_at_ms: None,
         };
         ModelCommitRecord {
             sequence: 1,
@@ -934,6 +1006,7 @@ mod tests {
             key: b"catalog/default".to_vec(),
             generation: 1,
             value: Some(Bytes::from_static(b"v1")),
+            expires_at_ms: None,
         };
         let record = ModelCommitRecord {
             sequence: 1,

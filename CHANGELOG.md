@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Workspace snapshot export, roll-forward restore with REPAIR_REQUIRED journaling, and durable control-plane transaction handles with review-token workflow (#322).
 - State-store metric emitters for the `arco_state_store_cas_publish_*`, replay, read-integrity, and projection-watermark series, plus new `arco_state_store_maintenance_backpressure_total`, `arco_state_store_ambiguous_outcomes_total`, and `arco_state_store_l0_segments`.
 - Scheduled `arco-control-store-worker` Cloud Run job that runs the catalog projection drain, durable layout maintenance, and conservative GC for the `catalog` and `projection-outbox-acks` domains under the API service account (`docs/runbooks/control-store-worker.md`).
+- State-store authority format 9: `committed_at_ms` stamps on manifests and transactions, monotone along ancestry, and restore plan 7 (plans 1 through 6 are supersession-only).
+- Per-row expiry hint on state-store writes: segment format 2 adds a nullable `expires_at_ms` column set by `ArcoStateTxn::put_with_expiry`; reads, scans and witnesses ignore it.
+- Age-anchor chain on every format-9 manifest, so the retention horizon reaches the 30-day floor in a bounded number of authenticated manifest reads.
+- `RetentionHorizon` durable-maintenance job kind and `retention_horizon` manifest certificate: purges expired rows and tombstones no retained reader can observe without advancing logical sequence; the ancestry walker accepts it as a third transition. Control GC now holds `manifests/` for the token retention plus a one-hour clock-skew margin so the horizon's age walk never meets a collected anchor above its floor.
 
 All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: the `control/v1` catalog authority is route-wired for exactly one root configured through `ARCO_CATALOG_CONTROL_V1_*` (default-disabled; every other root stays legacy), it is not authoritative on any deployed root, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
 
@@ -26,6 +30,7 @@ All state-store program surfaces above are landed with CI-run test suites but ar
   custom adapters must depend on `arco-storage-object-store` and provide an
   explicit single-attempt conditional-write client.
 - deps(rust): bumped `serde_with` from 3.16.1 to 3.21.0 (#321).
+- **Breaking for `control/v1` roots:** authority format 9 is a hard cut from format 7. Every canonical digest frames the new format number, format-7 artifacts and eight-column format-1 segments fail closed, and there is no conversion or dual reader (no production root existed on format 7; format 8 remains the test-only bounded authority).
 
 ### Fixed
 - Writer-authority claims are fenced by claim id, so an ambiguous claim adopts only its exact claimed bytes.

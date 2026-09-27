@@ -287,9 +287,23 @@ pub async fn load_selected_retention_pin(
     Ok(selected)
 }
 
+/// Which retention target published a retained root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedRootKind {
+    /// A workspace snapshot record.
+    Snapshot,
+    /// A workspace export manifest.
+    Export,
+    /// A durable-maintenance job's own source protection.
+    Maintenance,
+}
+
 /// One active retained root, including provider objects outside its authority closure.
 #[derive(Debug, Clone)]
 pub struct RetainedAuthorityRoot {
+    pub(crate) kind: RetainedRootKind,
+    /// The snapshot, export or maintenance-job identity behind the pin.
+    pub(crate) id: String,
     pub(crate) authorities: Vec<PersistedAuthorityReference>,
     pub(crate) required_paths: BTreeSet<String>,
     pub(crate) protected_prefixes: Vec<String>,
@@ -337,52 +351,57 @@ impl<'a> RetainedAuthorityRoots<'a> {
                 if selected.status_at(self.now)? != RetentionStatus::Active {
                     continue;
                 }
-                let (scope, domains, required_paths) = match selected.latest_revision()?.target() {
-                    RetentionTarget::Snapshot(id) => {
-                        let bytes = self.storage.get_raw(&snapshot_record_path(id)?).await?;
-                        let snapshot =
-                            crate::workspace_snapshot::decode_workspace_snapshot(&bytes)?;
-                        validate_snapshot_pin_binding(&selected, &snapshot)?;
-                        (
-                            snapshot.scope().clone(),
-                            snapshot.domains().to_vec(),
-                            snapshot
-                                .required_objects()
-                                .iter()
-                                .map(|object| object.relative_path().to_owned())
-                                .chain(
-                                    snapshot
-                                        .compatibility_artifacts()
-                                        .iter()
-                                        .map(|artifact| artifact.relative_path().to_owned()),
-                                )
-                                .collect(),
-                        )
-                    }
-                    RetentionTarget::Export(id) => {
-                        let bytes = self.storage.get_raw(&export_record_path(id)?).await?;
-                        let export = crate::workspace_snapshot::decode_export_manifest(&bytes)?;
-                        validate_export_pin_binding(&selected, &export)?;
-                        (
-                            export.scope().clone(),
-                            export.domains().to_vec(),
-                            export
-                                .required_objects()
-                                .iter()
-                                .map(|object| object.relative_path().to_owned())
-                                .chain(
-                                    export
-                                        .compatibility_artifacts()
-                                        .iter()
-                                        .map(|artifact| artifact.relative_path().to_owned()),
-                                )
-                                .collect(),
-                        )
-                    }
-                    RetentionTarget::Maintenance(_) => {
-                        return Err(validation("maintenance target dispatch mismatch"));
-                    }
-                };
+                let (kind, id, scope, domains, required_paths) =
+                    match selected.latest_revision()?.target() {
+                        RetentionTarget::Snapshot(id) => {
+                            let bytes = self.storage.get_raw(&snapshot_record_path(id)?).await?;
+                            let snapshot =
+                                crate::workspace_snapshot::decode_workspace_snapshot(&bytes)?;
+                            validate_snapshot_pin_binding(&selected, &snapshot)?;
+                            (
+                                RetainedRootKind::Snapshot,
+                                id.clone(),
+                                snapshot.scope().clone(),
+                                snapshot.domains().to_vec(),
+                                snapshot
+                                    .required_objects()
+                                    .iter()
+                                    .map(|object| object.relative_path().to_owned())
+                                    .chain(
+                                        snapshot
+                                            .compatibility_artifacts()
+                                            .iter()
+                                            .map(|artifact| artifact.relative_path().to_owned()),
+                                    )
+                                    .collect(),
+                            )
+                        }
+                        RetentionTarget::Export(id) => {
+                            let bytes = self.storage.get_raw(&export_record_path(id)?).await?;
+                            let export = crate::workspace_snapshot::decode_export_manifest(&bytes)?;
+                            validate_export_pin_binding(&selected, &export)?;
+                            (
+                                RetainedRootKind::Export,
+                                id.clone(),
+                                export.scope().clone(),
+                                export.domains().to_vec(),
+                                export
+                                    .required_objects()
+                                    .iter()
+                                    .map(|object| object.relative_path().to_owned())
+                                    .chain(
+                                        export
+                                            .compatibility_artifacts()
+                                            .iter()
+                                            .map(|artifact| artifact.relative_path().to_owned()),
+                                    )
+                                    .collect(),
+                            )
+                        }
+                        RetentionTarget::Maintenance(_) => {
+                            return Err(validation("maintenance target dispatch mismatch"));
+                        }
+                    };
                 // Retained snapshot/export cuts are workspace-owned records. They
                 // are only meaningful under the exact workspace root that produced
                 // them; any other root fails closed rather than aliasing a
@@ -397,6 +416,8 @@ impl<'a> RetainedAuthorityRoots<'a> {
                     ));
                 }
                 return Ok(Some(RetainedAuthorityRoot {
+                    kind,
+                    id,
                     authorities: domains
                         .into_iter()
                         .map(|domain| domain.authority().clone())

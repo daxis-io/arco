@@ -81,6 +81,36 @@ reads but do not shorten current-head replay.
 - Record breaches in the domain's promotion evidence: the Phase 3C gate
   (`promotion_gate.rs`) treats these measurements as required inputs.
 
+## Retention horizon (second maintenance kind)
+
+As of 2026-09-26 `DurableMaintenanceWorker` has a second job kind beside
+consolidation: `prepare_horizon_at` admits a `RetentionHorizon` job that
+renders the current head into fresh L1 shards without expired rows (expiry
+hint older than one hour before the job's clock) and tombstones at or below
+the certified horizon, then runs the same `start_at`/`advance_at`/`publish_at`
+cycle. It needs no maintenance intent, returns no plan when nothing is
+eligible, and bounds retained rows rather than the L0 suffix; it is not a
+mitigation for this alert, and the scheduled worker job does not invoke it
+yet (retention design step 2). Contract: `../plans/state-store-retention-format-v1.md`.
+
+The two kinds share the head's layout generation and claim the workspace
+retention epoch at activation, so at most one of two concurrent jobs
+publishes; the other fails its compatibility check with `PreconditionFailed`
+and is abandoned. For a horizon job:
+
+- `Superseded` (`MaintenanceStatus::Superseded` in `maintenance.rs`) means
+  what it means for consolidation: the head moved past the job's source and
+  the 24 h descriptor lifetime expired before a regenerated publication
+  landed. Before expiry a consumed attempt returns to `ReadyToPublish` and
+  the next `publish_at` regenerates over the new head. `publish_at` also refuses
+  a horizon job with `PreconditionFailed` (the persisted status is not changed)
+  when a commit after preparation rewrote a key the admitted plan purges; abandon it and call
+  `prepare_horizon_at` again.
+- A stuck retention epoch (`stuck_epoch` in the worker's epoch phase, see
+  `docs/runbooks/control-store-worker.md`) blocks horizon activation exactly
+  as it blocks consolidation: `start_at` claims the epoch under the retention
+  lock and fails closed while a foreign epoch is in flight.
+
 ## Current Wiring Status
 
 Status as of 2026-09-23: the `arco_state_store_replay_duration_seconds` and

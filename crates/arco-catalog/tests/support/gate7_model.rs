@@ -211,6 +211,10 @@ async fn seed_layout(
     clippy::cognitive_complexity,
     reason = "keep generated transition assertions beside their oracle updates"
 )]
+#[allow(
+    clippy::large_stack_frames,
+    reason = "the single caller boxes this future; authority-9 manifests carry the optional retention certificate"
+)]
 async fn run(seed: u64, mode: usize, block: usize, trace: &Mutex<Vec<String>>) {
     let mut f = Fixture::new().await;
     f.store = Arc::new(configured(&f, mode, block));

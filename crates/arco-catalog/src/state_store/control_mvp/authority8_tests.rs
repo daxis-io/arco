@@ -589,3 +589,41 @@ async fn authority8_delivery_continuation_retains_exact_incarnations_across_trim
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn authority8_rejects_put_with_expiry_before_staging() {
+    let store = store();
+    let mut seed = transaction(&store, "seed").await;
+    seed.put(b"key", Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    seed.commit_v2().await.unwrap();
+
+    let mut txn = transaction(&store, "expiring").await;
+    let error = txn
+        .put_with_expiry(b"key", Bytes::from_static(b"second"), 1_900_000_000_000)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, CatalogError::Validation { .. }),
+        "bounded authority must reject expiring writes with Validation, got {error:?}"
+    );
+    // Nothing was staged: the overlay still shows the committed value and a
+    // following commit changes no key.
+    let observed = txn.get(b"key").await.unwrap().unwrap();
+    assert_eq!(observed.bytes(), &Bytes::from_static(b"first"));
+    assert_eq!(observed.generation(), Some(1));
+    assert!(
+        txn.writes.is_empty(),
+        "rejected expiry must not stage a write"
+    );
+    txn.commit_v2().await.unwrap();
+    let after = transaction(&store, "observe")
+        .await
+        .get(b"key")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.bytes(), &Bytes::from_static(b"first"));
+    assert_eq!(after.generation(), Some(1));
+}

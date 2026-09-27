@@ -252,6 +252,7 @@ async fn existing_arrow_block_references_preserve_bytes_and_key_ranges() {
             logical_sequence: 3,
             logical_ordinal: n,
             origin_sequence: None,
+            expires_at_ms: None,
         })
         .collect::<Vec<_>>();
     let (bytes, index, reference) = encode_segment(
@@ -828,6 +829,7 @@ async fn existing_oversized_singleton_block_remains_representable() {
         logical_sequence: 1,
         logical_ordinal: 0,
         origin_sequence: None,
+        expires_at_ms: None,
     };
     let (bytes, index, reference) = encode_segment(
         "oversized-directory-vector",
@@ -878,6 +880,7 @@ fn legacy_l1_index_rejects_keys_larger_than_directory_fence_limit() {
         logical_sequence: 1,
         logical_ordinal: 0,
         origin_sequence: None,
+        expires_at_ms: None,
     };
     let error = encode_segment(
         "large-key-directory-vector",

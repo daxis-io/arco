@@ -580,6 +580,7 @@ mod tests {
             key: key.to_vec(),
             generation,
             value: value.map(ToOwned::to_owned),
+            expires_at_ms: None,
         }
     }
 

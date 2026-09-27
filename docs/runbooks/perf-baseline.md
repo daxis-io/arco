@@ -4,7 +4,7 @@
 Deferred (requires staging environment)
 
 ## Overview
-Define and capture baseline performance for catalog lookup and query endpoints before a production release.
+Define and capture baseline performance for catalog lookup and signed-URL endpoints before a production release.
 
 ## Preconditions
 - Staging environment with representative catalog data
@@ -12,7 +12,7 @@ Define and capture baseline performance for catalog lookup and query endpoints b
 - Observability stack enabled (metrics + logs)
 
 ## Procedure
-1. Warm caches with a single end-to-end run of catalog reads and SQL queries.
+1. Warm caches with a single end-to-end run of catalog reads and signed-URL minting.
 2. Run `cargo bench -p arco-catalog --bench catalog_lookup`.
 3. Run the focused regression suite:
 
@@ -24,7 +24,7 @@ Define and capture baseline performance for catalog lookup and query endpoints b
    cargo test -p arco-uc --test storage_governance_authoritative -- --nocapture
    ```
 
-4. Run a query load test against `/api/v1/query` with a fixed set of SQL statements.
+4. Run a signed-URL minting and byte-range read load test with fixed published files.
 5. Record P50/P95 latency and throughput.
 
 ## Local Release Signal

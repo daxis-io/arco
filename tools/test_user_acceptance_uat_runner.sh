@@ -53,7 +53,11 @@ if ! grep -Fq "scripts/run_user_acceptance_pipeline_uat.sh --deterministic" "${C
 fi
 
 deterministic_output="$(bash "${RUNNER}" --deterministic --dry-run)"
-grep -Fq "cargo test -p arco-integration-tests --test user_acceptance_pipeline" <<<"${deterministic_output}"
+grep -Fq "cargo test -p arco-integration-tests --test local_pipeline_uat" <<<"${deterministic_output}"
+if grep -Fq "system_tables_api" <<<"${deterministic_output}"; then
+  echo "deterministic UAT must not invoke the removed SQL system-table target" >&2
+  exit 1
+fi
 if grep -Fq "tools/validate_user_acceptance_evidence.sh" <<<"${deterministic_output}"; then
   echo "deterministic dry-run should not validate live evidence artifacts" >&2
   exit 1
@@ -72,8 +76,8 @@ if grep -Fq "git diff --check" <<<"${deterministic_output}"; then
 fi
 
 hygiene_output="$(bash "${RUNNER}" --deterministic --with-hygiene --dry-run)"
-grep -Fq "cargo test -p arco-integration-tests --test user_acceptance_pipeline" <<<"${hygiene_output}"
-grep -Fq "cargo clippy -p arco-integration-tests --test user_acceptance_pipeline -- -D warnings" <<<"${hygiene_output}"
+grep -Fq "cargo test -p arco-integration-tests --test local_pipeline_uat" <<<"${hygiene_output}"
+grep -Fq "cargo clippy -p arco-integration-tests --test local_pipeline_uat -- -D warnings" <<<"${hygiene_output}"
 grep -Fq "bash tools/test_user_acceptance_uat_runner.sh" <<<"${hygiene_output}"
 grep -Fq "bash tools/test_user_acceptance_evidence_validator.sh" <<<"${hygiene_output}"
 grep -Fq "bash tools/test_actionlint_runner.sh" <<<"${hygiene_output}"
@@ -82,6 +86,12 @@ grep -Fq "git diff --check" <<<"${hygiene_output}"
 
 status_output="$(bash "${RUNNER}" --status)"
 grep -Fq "deterministic: ready" <<<"${status_output}"
+grep -Fq "live-sql: blocked (external engine harness required)" <<<"${status_output}"
+if blocked_live_output="$(ARCO_UAT_STORAGE_BUCKET=gs://arco-uat bash "${RUNNER}" --live-durable 2>&1)"; then
+  echo "legacy live SQL UAT must fail closed" >&2
+  exit 1
+fi
+grep -Fq "external engine harness" <<<"${blocked_live_output}"
 grep -Fq "live-durable: missing ARCO_UAT_STORAGE_BUCKET" <<<"${status_output}"
 grep -Fq "live-deployed: missing ARCO_UAT_API_URL or ARCO_UAT_CLOUD_RUN_SERVICE/PROJECT_ID" <<<"${status_output}"
 grep -Fq "live-deployed-scheduler: not checked (set PROJECT_ID or ARCO_UAT_CLOUD_SCHEDULER_PROJECT for Cloud Run deployed UAT)" <<<"${status_output}"

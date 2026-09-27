@@ -295,17 +295,18 @@ The minted credential scope must be no broader than the authorized object/path
 and no broader than the workspace binding permits. Deny decisions must be
 auditable without exposing secret material or internal policy payloads.
 
-## System Tables
+## Engine-Facing Projections
 
-System tables should expose both metastore and workspace dimensions where useful:
+Published projections should expose both metastore and workspace dimensions
+where useful. Clients choose their own table names:
 
 ```text
-system.catalog.tables
-system.access.grants
-system.access.compiled_permissions
-system.storage.workspace_bindings
-system.storage.external_locations
-system.governance.attachments
+catalog tables
+access grants
+access compiled permissions
+storage workspace bindings
+storage external locations
+governance attachments
 ```
 
 Rows must be scoped by request tenant, authorized metastore, and workspace

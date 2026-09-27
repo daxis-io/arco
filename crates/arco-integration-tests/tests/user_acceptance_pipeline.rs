@@ -1,7 +1,8 @@
-//! User acceptance coverage for a cataloged, orchestrated pipeline workflow.
+//! Historical SQL acceptance harness for a cataloged pipeline workflow.
 //!
-//! The default tests are deterministic and in-process. The ignored live gate
-//! runs the same acceptance flows against durable object storage:
+//! The executable Arco boundary proof is `local_pipeline_uat`. The live SQL
+//! gates below require an external engine harness since Arco no longer serves
+//! `/api/v1/query`:
 //!
 //! ```bash
 //! ARCO_UAT_STORAGE_BUCKET=gs://arco-uat \
@@ -43,7 +44,7 @@ use tower::ServiceExt as _;
 use ulid::Ulid;
 
 use arco_api::server::ServerBuilder;
-use arco_core::storage::{MemoryBackend, StorageBackend, WritePrecondition};
+use arco_core::storage::{StorageBackend, WritePrecondition};
 use arco_core::{ScopedStorage, TaskTokenConfig, mint_task_token_for_attempt};
 use arco_flow::orchestration::LedgerWriter;
 use arco_flow::orchestration::callbacks::{
@@ -68,79 +69,8 @@ use arco_flow::orchestration::worker_contract::{
 use arco_flow::orchestration_manifest_pointer_path;
 use arco_storage::from_bucket;
 
-const DEFAULT_TENANT: &str = "acceptance-tenant";
-const DEFAULT_WORKSPACE: &str = "analytics-workspace";
-const DEFAULT_OTHER_WORKSPACE: &str = "other-workspace";
 const DEFAULT_RUN_ID: &str = "uat_run_01";
 const DEFAULT_PLAN_ID: &str = "uat_plan_01";
-
-#[tokio::test]
-async fn user_acceptance_pipeline_runs_to_queryable_catalog_state() {
-    assert_cataloged_pipeline_workflow(AcceptanceHarness::new()).await;
-}
-
-#[tokio::test]
-async fn user_acceptance_schedule_tick_is_queryable_after_manifest_deploy() {
-    assert_schedule_tick_workflow(AcceptanceHarness::new()).await;
-}
-
-#[tokio::test]
-async fn user_acceptance_backfill_request_is_queryable_after_chunk_planning() {
-    Box::pin(assert_backfill_workflow(AcceptanceHarness::new())).await;
-}
-
-#[tokio::test]
-async fn user_acceptance_sensor_evaluate_is_queryable_after_run_bridge() {
-    assert_sensor_workflow(AcceptanceHarness::with_sensor_evaluator(Arc::new(
-        AcceptanceSensorEvaluator,
-    )))
-    .await;
-}
-
-#[tokio::test]
-async fn user_acceptance_failed_task_retry_state_is_queryable() {
-    assert_retry_workflow(AcceptanceHarness::new()).await;
-}
-
-#[tokio::test]
-async fn user_acceptance_worker_callback_routes_execute_task_to_queryable_state() {
-    let harness = AcceptanceHarness::new();
-    harness
-        .create_catalog_table("analytics", "daily_orders")
-        .await;
-    let task = PipelineTask::new("analytics.daily_orders", "analytics.daily_orders", vec![]);
-    let run = harness
-        .deploy_and_trigger_pipeline_run(std::slice::from_ref(&task))
-        .await;
-    let dispatch = harness.request_ready_dispatch(&run.run_id, &task).await;
-    let worker_dispatch = harness
-        .enqueue_dispatch(&run.run_id, &task, &dispatch)
-        .await;
-
-    let evidence = harness
-        .complete_worker_task_through_public_api(
-            &task,
-            worker_dispatch,
-            TaskCompletion::Succeeded { delta_version: 1 },
-        )
-        .await;
-
-    assert_eq!(evidence.started_status, StatusCode::OK);
-    assert_eq!(evidence.completed_status, StatusCode::OK);
-
-    let task_rows = harness
-        .query(json!({
-            "sql": format!(
-                "SELECT task_key, state FROM system.orchestration.tasks WHERE run_id = '{}'",
-                run.run_id
-            )
-        }))
-        .await;
-    assert_eq!(
-        task_rows,
-        json!([{ "task_key": "analytics.daily_orders", "state": "SUCCEEDED" }])
-    );
-}
 
 #[test]
 fn live_acceptance_config_builds_isolated_identity_from_env() {
@@ -618,7 +548,7 @@ fn deployed_failure_exit_error_includes_artifact_path() {
 }
 
 #[tokio::test]
-#[ignore = "requires ARCO_UAT_STORAGE_BUCKET and cloud credentials"]
+#[ignore = "requires an external engine harness; Arco SQL routes were removed"]
 async fn live_user_acceptance_pipeline_runs_against_durable_storage() {
     let config = LiveAcceptanceConfig::from_env().expect("live UAT config");
     let backend = from_bucket(&config.bucket).expect("configure durable storage backend");
@@ -716,7 +646,7 @@ async fn live_user_acceptance_pipeline_runs_against_durable_storage() {
 }
 
 #[tokio::test]
-#[ignore = "requires ARCO_UAT_API_URL, deployed task dispatch, workers, and catalog storage"]
+#[ignore = "requires an external engine harness; Arco SQL routes were removed"]
 async fn live_deployed_user_acceptance_pipeline_runs_through_api_and_workers() -> Result<(), String>
 {
     let config = DeployedAcceptanceConfig::from_env().expect("deployed UAT config");
@@ -1890,17 +1820,6 @@ struct AcceptanceIdentity {
 }
 
 impl AcceptanceIdentity {
-    fn deterministic() -> Self {
-        Self {
-            tenant_id: DEFAULT_TENANT.to_string(),
-            workspace_id: DEFAULT_WORKSPACE.to_string(),
-            other_workspace_id: DEFAULT_OTHER_WORKSPACE.to_string(),
-            run_id: DEFAULT_RUN_ID.to_string(),
-            plan_id: DEFAULT_PLAN_ID.to_string(),
-            callback_base_url: "https://api.acceptance.arco.dev".to_string(),
-        }
-    }
-
     fn isolated(base_tenant: &str, base_workspace: &str, scenario: &str) -> Self {
         let scenario = normalize_identity_segment(scenario);
         let suffix = Ulid::new().to_string().to_ascii_lowercase();
@@ -2970,20 +2889,6 @@ struct AcceptanceHarness {
 }
 
 impl AcceptanceHarness {
-    fn new() -> Self {
-        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        Self::with_backend(backend, AcceptanceIdentity::deterministic())
-    }
-
-    fn with_sensor_evaluator(evaluator: Arc<dyn SensorEvaluator>) -> Self {
-        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        Self::with_backend_and_sensor_evaluator(
-            backend,
-            AcceptanceIdentity::deterministic(),
-            evaluator,
-        )
-    }
-
     fn with_backend(backend: Arc<dyn StorageBackend>, identity: AcceptanceIdentity) -> Self {
         Self::build(backend, identity, None)
     }

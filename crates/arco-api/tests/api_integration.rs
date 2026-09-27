@@ -2853,127 +2853,8 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
     }
 }
 
-mod query {
+mod audit {
     use super::*;
-    use arrow::ipc::reader::StreamReader;
-    use std::io::Cursor;
-
-    async fn seed_catalog(router: axum::Router) -> Result<axum::Router> {
-        let (status, _): (_, serde_json::Value) = helpers::post_json(
-            router.clone(),
-            "/api/v1/namespaces",
-            serde_json::json!({
-                "name": "analytics",
-                "description": "Analytics namespace"
-            }),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::CREATED);
-
-        let (status, _): (_, serde_json::Value) = helpers::post_json(
-            router.clone(),
-            "/api/v1/namespaces/analytics/tables",
-            serde_json::json!({
-                "name": "events",
-                "description": "Event stream",
-                "columns": [
-                    {"name": "event_id", "data_type": "STRING", "nullable": false},
-                    {"name": "event_type", "data_type": "STRING", "nullable": false}
-                ]
-            }),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::CREATED);
-
-        Ok(router)
-    }
-
-    #[tokio::test]
-    async fn test_query_returns_arrow_stream() -> Result<()> {
-        let router = seed_catalog(test_router()).await?;
-
-        let request = helpers::make_request_with_headers(
-            Method::POST,
-            "/api/v1/query",
-            Some(serde_json::json!({
-                "sql": "SELECT name FROM catalog.namespaces"
-            })),
-            &[("Accept", "application/vnd.apache.arrow.stream")],
-        )?;
-
-        let response = router.oneshot(request).await.map_err(|err| match err {})?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        assert_eq!(content_type, Some("application/vnd.apache.arrow.stream"));
-
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .context("read response body")?;
-        let cursor = Cursor::new(body.to_vec());
-        let mut reader = StreamReader::try_new(cursor, None).context("open arrow stream reader")?;
-        let mut rows = 0;
-        for batch in &mut reader {
-            let batch = batch.context("read arrow batch")?;
-            rows += batch.num_rows();
-        }
-        assert!(rows >= 1, "expected at least one namespace row");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_query_returns_json_format() -> Result<()> {
-        let router = seed_catalog(test_router()).await?;
-
-        let request = helpers::make_request(
-            Method::POST,
-            "/api/v1/query?format=json",
-            Some(serde_json::json!({
-                "sql": "SELECT name FROM catalog.namespaces"
-            })),
-        )?;
-
-        let response = router.oneshot(request).await.map_err(|err| match err {})?;
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok());
-        assert_eq!(content_type, Some("application/json"));
-
-        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .context("read response body")?;
-        let rows: Vec<serde_json::Value> =
-            serde_json::from_slice(&body).context("parse JSON response")?;
-        assert!(
-            rows.iter()
-                .any(|row| row.get("name") == Some(&"analytics".into()))
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_query_rejects_non_select() -> Result<()> {
-        let router = test_router();
-
-        let request = helpers::make_request(
-            Method::POST,
-            "/api/v1/query",
-            Some(serde_json::json!({
-                "sql": "DELETE FROM catalog.namespaces"
-            })),
-        )?;
-
-        let response = router.oneshot(request).await.map_err(|err| match err {})?;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_audit_emits_auth_allow_on_success() -> Result<()> {
@@ -3233,70 +3114,25 @@ mod idempotency {
     }
 }
 
-mod query_read_only {
+mod retired_query_routes {
     use super::*;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize)]
-    struct QueryError {
-        message: String,
-    }
 
     #[tokio::test]
-    async fn test_query_endpoint_rejects_write_statements() -> Result<()> {
+    async fn sql_execution_routes_are_not_registered() -> Result<()> {
         let router = test_router();
-        let statements = [
-            "INSERT INTO catalog.tables VALUES (1)",
-            "UPDATE catalog.tables SET name = 'x'",
-            "DELETE FROM catalog.tables",
-            "CREATE TABLE t(id INT)",
-        ];
-
-        for statement in statements {
-            let (status, error): (_, QueryError) = helpers::post_json(
-                router.clone(),
-                "/api/v1/query?format=json",
-                serde_json::json!({ "sql": statement }),
-            )
-            .await?;
-
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert!(
-                error
-                    .message
-                    .contains("Only SELECT/CTE queries are supported")
-            );
+        for path in ["/api/v1/query", "/api/v1/query-data"] {
+            let request = helpers::make_request(
+                Method::POST,
+                path,
+                Some(serde_json::json!({ "sql": "SELECT 1" })),
+            )?;
+            let response = router
+                .clone()
+                .oneshot(request)
+                .await
+                .map_err(|err| match err {})?;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_query_data_endpoint_rejects_write_statements() -> Result<()> {
-        let router = test_router();
-        let statements = [
-            "INSERT INTO analytics.sales.orders VALUES (1)",
-            "UPDATE analytics.sales.orders SET id = 2",
-            "DELETE FROM analytics.sales.orders",
-            "DROP TABLE analytics.sales.orders",
-        ];
-
-        for statement in statements {
-            let (status, error): (_, QueryError) = helpers::post_json(
-                router.clone(),
-                "/api/v1/query-data?format=json",
-                serde_json::json!({ "sql": statement }),
-            )
-            .await?;
-
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert!(
-                error
-                    .message
-                    .contains("Only SELECT/CTE queries are supported")
-            );
-        }
-
         Ok(())
     }
 }

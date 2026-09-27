@@ -25,12 +25,10 @@ what this cycle does not include.
 - **Orchestrator control plane (`arco-api`, `arco-flow`)**:
   event APIs, run/task state transitions, callback validation, and dispatch intent.
   No direct state Parquet writes.
-- **DataFusion (`/api/v1/query`, `/api/v1/query-data`)**:
-  read-only query execution (`SELECT`/`CTE` only).
 - **Compactors (`arco-compactor`, `arco_flow_compactor`)**:
   sole writers for materialized state/snapshot Parquet paths.
-- **DuckDB-WASM (browser)**:
-  browser-side read path only via signed URLs minted by API.
+- **Client query engines**:
+  choose their own runtime for reads through Arco's scoped, signed URLs.
 - **ETL compute runtime (external workers)**:
   executes task payloads and reports lifecycle callbacks to API.
 
@@ -64,12 +62,12 @@ Workers must parse `WorkerDispatchEnvelope`.
 
 - No in-process ETL engine inside API or orchestration services.
 - No Spark/dbt/Flink adapter implementation.
-- No endpoint removals for `/api/v1/query`, `/api/v1/query-data`, `/api/v1/browser/urls`,
-  or task callback endpoints.
+- No endpoint removals for `/api/v1/browser/urls` or task callback endpoints.
 
 ## Consequences
 
 - Engine ownership is auditable and CI-enforced.
+- Arco does not host SQL execution. Clients supply their own query runtime.
 - Production behavior is less ambiguous (ADR-020 path by default).
 - Dispatch payload migration requires coordinated worker + dispatcher/sweeper rollout.
 - Split-service operations require explicit environment contract management.

@@ -1,7 +1,7 @@
 //! Local UAT proof for a realistic data-pipeline path.
 //!
 //! This test intentionally uses no cloud services. It exercises the same API,
-//! catalog, Delta commit, object-storage, query, and orchestration callback
+//! catalog, Delta commit, object-storage, and orchestration callback
 //! contracts that the Cloud Run smoke path uses, backed by in-memory storage.
 
 #![allow(clippy::expect_used, clippy::too_many_lines, clippy::unwrap_used)]
@@ -107,7 +107,7 @@ struct TestApp {
 }
 
 #[tokio::test]
-async fn local_pipeline_uat_writes_delta_catalogs_queries_data_and_completes_run() {
+async fn local_pipeline_uat_writes_delta_catalogs_and_completes_run() {
     let app = TestApp::new();
     let rows = sample_rows();
     let parquet = build_orders_parquet(&rows);
@@ -134,15 +134,13 @@ async fn local_pipeline_uat_writes_delta_catalogs_queries_data_and_completes_run
     assert_eq!(raw_table.format, "parquet");
     assert_eq!(raw_table.location.as_deref(), Some(RAW_PARQUET_PATH));
 
-    let raw_rows = query_json(
-        &app,
-        "/api/v1/query-data?format=json",
-        "SELECT order_id, customer FROM analytics.sales.raw_orders WHERE order_id >= 1002 ORDER BY order_id",
+    let raw_table_read: Value = get_json(
+        &app.router,
+        "/api/v1/catalogs/analytics/schemas/sales/tables/raw_orders",
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(raw_rows.len(), 2);
-    assert_eq!(raw_rows[0]["order_id"], 1002);
-    assert_eq!(raw_rows[1]["customer"], "local-west");
+    assert_eq!(raw_table_read["location"], RAW_PARQUET_PATH);
 
     let delta_table = register_table(
         &app,
@@ -194,18 +192,14 @@ async fn local_pipeline_uat_writes_delta_catalogs_queries_data_and_completes_run
     assert!(delta_log_text.contains(r#""add""#));
     assert!(delta_log_text.contains(r#""operation":"WRITE""#));
 
-    let catalog_rows = query_json(
-        &app,
-        "/api/v1/query?format=json",
-        "SELECT name, format, location FROM system.catalog.tables WHERE name IN ('orders_delta', 'raw_orders') ORDER BY name",
+    let delta_table_read: Value = get_json(
+        &app.router,
+        "/api/v1/catalogs/analytics/schemas/sales/tables/orders_delta",
+        StatusCode::OK,
     )
     .await;
-    assert_eq!(catalog_rows.len(), 2);
-    assert_eq!(catalog_rows[0]["name"], DELTA_TABLE);
-    assert_eq!(catalog_rows[0]["format"], "delta");
-    assert_eq!(catalog_rows[0]["location"], DELTA_LOCATION);
-    assert_eq!(catalog_rows[1]["name"], PARQUET_TABLE);
-    assert_eq!(catalog_rows[1]["format"], "parquet");
+    assert_eq!(delta_table_read["format"], "delta");
+    assert_eq!(delta_table_read["location"], DELTA_LOCATION);
 
     let deploy = deploy_manifest(&app).await;
     assert!(!deploy.manifest_id.is_empty());
@@ -501,10 +495,6 @@ async fn post_task_completed(
     )
     .await;
     assert!(response.acknowledged);
-}
-
-async fn query_json(app: &TestApp, uri: &str, sql: &str) -> Vec<Value> {
-    post_json(&app.router, uri, json!({ "sql": sql }), &[], StatusCode::OK).await
 }
 
 async fn post_json<T: DeserializeOwned>(

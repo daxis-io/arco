@@ -82,13 +82,11 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "FORBIDDEN", message)
     }
 
-    /// Returns an error response for internal artifacts that are only
-    /// readable through their redacted system-table projection.
+    /// Returns an error response for internal artifacts with private columns.
     ///
     /// Raw artifacts carrying private columns (for example `commits.parquet`
     /// with its commit-authority witness columns) must never be handed out as
-    /// signed URLs; the redacted `system.*` projection is their only public
-    /// surface.
+    /// signed URLs.
     pub fn projection_only_artifact(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, "PROJECTION_ONLY_ARTIFACT", message)
     }

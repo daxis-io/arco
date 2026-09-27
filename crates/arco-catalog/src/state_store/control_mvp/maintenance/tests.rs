@@ -2916,11 +2916,13 @@ mod horizon {
         Fail,
     }
 
-    /// Wraps the memory backend and injects one armed [`SelectorFault`].
+    /// Wraps the memory backend and injects one armed [`SelectorFault`] into
+    /// the armed job's progress selector only.
     struct SelectorFaultBackend {
         inner: MemoryBackend,
         head_landed: std::sync::atomic::AtomicBool,
-        fault: Mutex<Option<SelectorFault>>,
+        /// The armed job's id and its fault, until the fault is taken.
+        fault: Mutex<Option<(String, SelectorFault)>>,
     }
     impl SelectorFaultBackend {
         fn new() -> Arc<Self> {
@@ -2930,18 +2932,21 @@ mod horizon {
                 fault: Mutex::new(None),
             })
         }
-        /// Arms the fault for the selector PUT after the next head CAS;
-        /// head PUTs made by earlier commits are forgotten.
-        fn arm(&self, fault: SelectorFault) {
+        /// Arms the fault for job `id`'s selector PUT after the next head
+        /// CAS; head PUTs made by earlier commits are forgotten.
+        fn arm(&self, id: &MaintenanceJobId, fault: SelectorFault) {
             self.head_landed
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            *self.fault.lock().unwrap() = Some(fault);
+            *self.fault.lock().unwrap() = Some((id.as_str().to_string(), fault));
         }
-        fn arm_pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        fn arm_pause(&self, id: &MaintenanceJobId) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
             let (reached_tx, reached_rx) = oneshot::channel();
             let (release_tx, release_rx) = oneshot::channel();
-            self.arm(SelectorFault::Pause(reached_tx, release_rx));
+            self.arm(id, SelectorFault::Pause(reached_tx, release_rx));
             (reached_rx, release_tx)
+        }
+        fn is_armed(&self) -> bool {
+            self.fault.lock().unwrap().is_some()
         }
     }
     #[async_trait]
@@ -2967,7 +2972,15 @@ mod horizon {
             let fault = if self.head_landed.load(std::sync::atomic::Ordering::SeqCst)
                 && path.ends_with("/selected.json")
             {
-                self.fault.lock().unwrap().take()
+                let mut armed = self.fault.lock().unwrap();
+                let targeted = armed
+                    .as_ref()
+                    .is_some_and(|(job, _)| path.contains(job.as_str()));
+                if targeted {
+                    armed.take().map(|(_, fault)| fault)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -3027,7 +3040,7 @@ mod horizon {
                 let (_fixture, _) = aged_mixed_state(&first.worker.store).await;
                 let now = horizon_now();
                 let id = ready_to_publish(&first, now).await;
-                let (reached, release) = backend.arm_pause();
+                let (reached, release) = backend.arm_pause(&id);
                 let peer_finishes = async {
                     reached.await.unwrap();
                     let outcome = peer
@@ -3038,7 +3051,12 @@ mod horizon {
                     release.send(()).unwrap();
                     outcome
                 };
-                let (paused, finished) = tokio::join!(first.publish_at(&id, now), peer_finishes);
+                let (paused, finished) = tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::join!(first.publish_at(&id, now), peer_finishes)
+                })
+                .await
+                .expect("the armed selector fault is taken during the publication");
+                assert!(!backend.is_armed(), "the armed fault was consumed");
                 assert_eq!(
                     paused.unwrap().expect("already visible"),
                     finished,
@@ -3072,9 +3090,10 @@ mod horizon {
                 let (_fixture, _) = aged_mixed_state(store).await;
                 let now = horizon_now();
                 let id = ready_to_publish(&worker, now).await;
-                backend.arm(SelectorFault::Fail);
+                backend.arm(&id, SelectorFault::Fail);
                 let failed = worker.publish_at(&id, now).await;
                 assert!(failed.is_err(), "{failed:?}");
+                assert!(!backend.is_armed(), "the armed fault was consumed");
                 let (_, landed) = head(store).await;
                 assert!(
                     landed.retention_horizon.is_some(),

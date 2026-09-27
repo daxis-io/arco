@@ -2410,8 +2410,10 @@ impl DurableMaintenanceWorker {
     }
 
     /// Selects `revision` as the job's progress. `Ok` means the intended
-    /// selector bytes are visible; the value says whether this call put them
-    /// there or a same-binding peer already had.
+    /// selector bytes are visible; the value says whether this call's CAS
+    /// put them there, or they were already visible because a same-binding
+    /// peer selected the identical revision first or this call's own PUT
+    /// landed but reported an error.
     async fn select_revision(
         &self,
         id: &MaintenanceJobId,
@@ -3234,9 +3236,11 @@ impl DurableMaintenanceWorker {
     /// selector CAS advanced the job to `Published`, so overlapping
     /// same-binding workers that both observe the landed head count it at
     /// most once, and re-observing published evidence counts nothing. Known
-    /// loss residual: a `finish_publication` whose selector PUT persisted
-    /// but returned an error leaves the publication uncounted, because the
-    /// resume then observes `Published` and finishes nothing.
+    /// loss residual: a selector PUT that persisted but reported an error is
+    /// reconciled by readback as `AlreadyVisible`, indistinguishable from a
+    /// peer's identical selection, and is not counted; only if that readback
+    /// also fails does the invocation error, and the resume then observes
+    /// `Published` and finishes nothing, which is likewise uncounted.
     fn record_publication(&self, job: &LoadedJob) {
         let domain = self.worker.store.scope.domain();
         crate::metrics::record_maintenance_published(domain, job.descriptor.kind);
@@ -3251,8 +3255,10 @@ impl DurableMaintenanceWorker {
 enum Selection {
     /// This call's CAS moved the selector to the intended revision.
     Advanced,
-    /// The intended bytes were already visible: a same-binding peer selected
-    /// the identical revision first, so this call changed nothing.
+    /// The intended bytes were already visible, so this call changed
+    /// nothing: either a same-binding peer selected the identical revision
+    /// first, or this call's own PUT landed but reported an error and the
+    /// readback reconciled it. The two are indistinguishable here.
     AlreadyVisible,
 }
 

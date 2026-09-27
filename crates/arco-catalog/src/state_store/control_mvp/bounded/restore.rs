@@ -1014,7 +1014,10 @@ mod tests {
             now,
             now + Duration::hours(24),
             now,
-            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().expect("workspace root"),
+                &mut budget,
+            ),
         );
         let plan = plan(&store, &source, &identity, &mut context)
             .await
@@ -1038,7 +1041,10 @@ mod tests {
             identity.attempt(),
             identity.domain().into(),
             prefixed_sha256(&jcs(&persisted).expect("JCS")),
-            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().expect("workspace root"),
+                &mut budget,
+            ),
         );
         let result = inspect(store, &persisted, &mut context).await;
         (result, budget.test_accounting().1)
@@ -1102,7 +1108,10 @@ mod tests {
             now,
             now + Duration::hours(24),
             now,
-            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().expect("workspace root"),
+                &mut budget,
+            ),
         );
         let restored = plan(&store, original.source(), original.identity(), &mut context)
             .await
@@ -1279,7 +1288,10 @@ mod tests {
             now,
             now + Duration::hours(24),
             now,
-            crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().expect("workspace root"),
+                &mut budget,
+            ),
         );
         let result = plan(&store, original.source(), original.identity(), &mut context).await;
         assert!(

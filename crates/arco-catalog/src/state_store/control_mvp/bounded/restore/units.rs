@@ -234,7 +234,7 @@ fn standard_kv_merge_reservation(
     current: &[ControlMvpSegmentRow],
 ) -> Option<usize> {
     if usize::BITS != 64
-        || size_of::<ControlMvpSegmentRow>() > 96
+        || size_of::<ControlMvpSegmentRow>() > 112
         || source.len() > MAX_BLOCK_BYTES / 41
         || current.len() > MAX_BLOCK_BYTES / 41
     {
@@ -625,6 +625,7 @@ mod kv_merge_tests {
             logical_sequence: generation + 1,
             logical_ordinal: ordinal,
             origin_sequence: None,
+            expires_at_ms: None,
         }
     }
 
@@ -692,6 +693,7 @@ mod kv_merge_tests {
                 logical_sequence: result_sequence,
                 logical_ordinal: 17 + u64::try_from(output.len()).expect("ordinal"),
                 origin_sequence: None,
+                expires_at_ms: None,
             });
         }
         output
@@ -3828,6 +3830,7 @@ mod behavioral_tests {
                 logical_sequence: 1,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             }])
         })
         .expect("rows");
@@ -4043,7 +4046,7 @@ mod behavioral_tests {
     async fn durable_unit_preflight_preserves_no_effect_on_foreign_or_exhausted_owners() {
         for final_route in [false, true] {
             for case in 0..3 {
-                durable_unit_admission_case(final_route, case).await;
+                Box::pin(durable_unit_admission_case(final_route, case)).await;
             }
         }
     }
@@ -4298,6 +4301,7 @@ mod behavioral_tests {
                     logical_sequence: 1,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }])
             },
         )

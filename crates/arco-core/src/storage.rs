@@ -560,7 +560,7 @@ mod tests {
                 WritePrecondition::DoesNotExist,
             )
             .await?;
-        let authority = crate::ScopedAuthorityStore::new(scoped);
+        let authority = crate::ScopedAuthorityStore::new(scoped.into());
         let result = authority.get_range_with_ownership("value", 1..9).await?;
         assert_eq!(result.bytes.as_ref(), b"bc");
         assert_eq!(result.ownership, BytesBackingOwnership::Unknown);

@@ -856,14 +856,26 @@ async fn authority8_bounded_restore_plans_the_authenticated_source_without_write
             .map(|o| (o.path, o.version, o.size))
             .collect::<BTreeSet<_>>()
     };
-    let before = inventory(store.retention.backend().list("").await.unwrap());
+    let before = inventory(
+        store
+            .retention
+            .as_legacy_scoped()
+            .expect("workspace root")
+            .backend()
+            .list("")
+            .await
+            .unwrap(),
+    );
     let mut budget = WorkspaceIoBudget::new();
     let mut context = RestorePlanningContext::new(
         prefixed_sha256(b"workspace-request"),
         now,
         now + ChronoDuration::hours(24),
         now,
-        WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        WorkspaceCaptureIo::new(
+            store.retention.as_legacy_scoped().expect("workspace root"),
+            &mut budget,
+        ),
     );
     let plan = ControlMvpRestoreParticipant::new(store.clone())
         .plan_restore_bounded(&source, &identity, &mut context)
@@ -880,7 +892,10 @@ async fn authority8_bounded_restore_plans_the_authenticated_source_without_write
         identity.attempt(),
         identity.domain().into(),
         prefixed_sha256(&serde_jcs::to_vec(&plan).unwrap()),
-        WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        WorkspaceCaptureIo::new(
+            store.retention.as_legacy_scoped().expect("workspace root"),
+            &mut budget,
+        ),
     );
     assert!(matches!(
         ControlMvpRestoreParticipant::new(store.clone())
@@ -891,7 +906,16 @@ async fn authority8_bounded_restore_plans_the_authenticated_source_without_write
     ));
     assert_eq!(
         before,
-        inventory(store.retention.backend().list("").await.unwrap()),
+        inventory(
+            store
+                .retention
+                .as_legacy_scoped()
+                .expect("workspace root")
+                .backend()
+                .list("")
+                .await
+                .unwrap()
+        ),
         "planning wrote artifacts"
     );
 }
@@ -928,7 +952,10 @@ async fn authority8_plan7_retries_keep_original_logical_identity_and_reject_tamp
             now,
             now + ChronoDuration::hours(24),
             now + ChronoDuration::seconds(elapsed),
-            WorkspaceCaptureIo::new(&store.retention, &mut budget),
+            WorkspaceCaptureIo::new(
+                store.retention.as_legacy_scoped().expect("workspace root"),
+                &mut budget,
+            ),
         );
         let plan = adapter
             .plan_restore_bounded(&source, &identity, &mut context)

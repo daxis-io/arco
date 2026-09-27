@@ -23,6 +23,7 @@ fn row(key: &[u8], value: Option<&[u8]>, sequence: u64) -> ControlMvpSegmentRow 
         logical_sequence: sequence,
         logical_ordinal: 0,
         origin_sequence: None,
+        expires_at_ms: None,
     }
 }
 
@@ -72,7 +73,7 @@ async fn root(
         for block in decoded.blocks {
             let descriptor = physical::Descriptor {
                 encoding_version: 1,
-                scope: control::ControlMvpScopeDoc::from(&store.scope),
+                scope: store.scope.clone(),
                 role: physical::Role::Kv,
                 segment: reference.clone(),
                 segment_version: store.storage.head(&sp).await.unwrap().unwrap().version,
@@ -2064,7 +2065,10 @@ async fn standard_final_assembly_matches_actual_restore_roots_and_history() {
                 plan.fields.requested_at.datetime().unwrap(),
                 plan.fields.execution_deadline.datetime().unwrap(),
                 plan.fields.requested_at.datetime().unwrap(),
-                crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+                crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                    store.retention.as_legacy_scoped().expect("workspace root"),
+                    &mut budget,
+                ),
             );
             plan = super::super::super::plan(&store, &source, &plan.fields.identity, &mut context)
                 .await
@@ -2098,7 +2102,10 @@ async fn standard_final_assembly_matches_actual_restore_roots_and_history() {
                 // Keep the fixture's fixed-nanosecond logical clock. Wall time
                 // can still precede that instant within the same second.
                 plan.fields.requested_at.datetime().unwrap(),
-                crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+                crate::workspace_io_budget::WorkspaceCaptureIo::new(
+                    store.retention.as_legacy_scoped().expect("workspace root"),
+                    &mut budget,
+                ),
             );
             plan = super::super::super::plan(
                 &store,
@@ -3370,7 +3377,10 @@ async fn valid_sequenced_data_fixture(
         now,
         now + chrono::Duration::hours(24),
         now,
-        crate::workspace_io_budget::WorkspaceCaptureIo::new(&store.retention, &mut budget),
+        crate::workspace_io_budget::WorkspaceCaptureIo::new(
+            store.retention.as_legacy_scoped().expect("workspace root"),
+            &mut budget,
+        ),
     );
     let mut plan = super::super::super::plan(
         &store,

@@ -81,6 +81,7 @@ mod tests {
                     logical_sequence: sequence,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }])
             })
             .unwrap();
@@ -147,6 +148,7 @@ mod tests {
                     logical_sequence: if case == 6 { sequence + 1 } else { sequence },
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }])
             };
             let rows = decode_with_reservation(&mut io, &mut ordinary, Some(64 * 1024), make_rows)
@@ -374,6 +376,7 @@ mod tests {
                     logical_sequence: sequence,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }])
             })
             .unwrap();

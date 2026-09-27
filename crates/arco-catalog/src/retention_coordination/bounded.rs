@@ -690,7 +690,7 @@ mod tests {
         mutation.finish(Ok(())).unwrap();
         budget.release_retention_lock(guard).await.unwrap();
         let recovered = super::super::recover_stale_retention_epoch(
-            &storage,
+            &storage.clone().into(),
             "test: all remote requests independently terminal",
         )
         .await

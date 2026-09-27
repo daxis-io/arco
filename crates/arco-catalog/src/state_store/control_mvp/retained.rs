@@ -1446,7 +1446,7 @@ mod tests {
         let backend = Arc::new(ObservedBackend::default());
         let store = ControlMvpStateStore::new_synthetic_bounded(
             ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap(),
-            super::super::StateScope::new("tenant", "workspace", "catalog"),
+            StateScope::new("tenant", "workspace", "catalog"),
         )
         .unwrap()
         .with_durable_authority_binding(DurableAuthorityBinding::new([22; 32]));
@@ -1494,11 +1494,22 @@ mod tests {
             .unwrap();
         let mut budget = WorkspaceIoBudget::new();
         let mut guard = budget
-            .acquire_retention_lock(store.retention.clone(), "proof-epoch")
+            .acquire_retention_lock(
+                store
+                    .retention
+                    .as_legacy_scoped()
+                    .expect("workspace root")
+                    .clone(),
+                "proof-epoch",
+            )
             .await
             .unwrap();
         let mut first = RetentionMutationEpoch::claim_bounded(
-            store.retention.clone(),
+            store
+                .retention
+                .as_legacy_scoped()
+                .expect("workspace root")
+                .clone(),
             &mut guard,
             RetentionMutationKind::WorkspaceSnapshotFinalize,
             "first",
@@ -1520,7 +1531,11 @@ mod tests {
         .unwrap();
         first.settle_bounded(&mut guard, &mut budget).await.unwrap();
         let mut second = RetentionMutationEpoch::claim_bounded(
-            store.retention.clone(),
+            store
+                .retention
+                .as_legacy_scoped()
+                .expect("workspace root")
+                .clone(),
             &mut guard,
             RetentionMutationKind::WorkspaceSnapshotFinalize,
             "second",

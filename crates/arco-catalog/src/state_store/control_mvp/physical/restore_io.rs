@@ -2538,7 +2538,7 @@ mod tests {
         };
         let scoped = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
             .expect("scope");
-        let authority = ScopedAuthorityStore::new(scoped.clone());
+        let authority = ScopedAuthorityStore::new(scoped.clone().into());
         let row = ControlMvpSegmentRow {
             record_kind: SEGMENT_RECORD_KV,
             key: b"key".to_vec(),
@@ -2548,6 +2548,7 @@ mod tests {
             logical_sequence: 1,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         };
         let (encoded, index, _) = encode_segment(
             "00000000000000000000000000000001",
@@ -5775,7 +5776,7 @@ fn validate_restore_arrow_schema(schema: arrow::ipc::Schema<'_>) -> super::Resul
         || schema
             .features()
             .is_some_and(|features| !features.is_empty())
-        || fields.len() != 8
+        || fields.len() != 9
     {
         return Err(super::invariant_violation(
             "unsupported restore Arrow schema shape",
@@ -5790,11 +5791,15 @@ fn validate_restore_arrow_schema(schema: arrow::ipc::Schema<'_>) -> super::Resul
         ("logical_sequence", false, 64),
         ("logical_ordinal", false, 64),
         ("origin_sequence", true, 64),
+        ("expires_at_ms", true, -64),
     ];
     for (field, (name, nullable, width)) in fields.iter().zip(expected) {
         let type_matches = match width {
             0 => field.type_as_binary().is_some(),
             -1 => field.type_as_bool().is_some(),
+            -64 => field
+                .type_as_int()
+                .is_some_and(|int| int.bitWidth() == 64 && int.is_signed()),
             width => field
                 .type_as_int()
                 .is_some_and(|int| int.bitWidth() == width && !int.is_signed()),
@@ -5931,15 +5936,15 @@ fn validate_restore_arrow_message(message: arrow::ipc::Message<'_>) -> super::Re
     let buffers = batch
         .buffers()
         .ok_or_else(|| super::invariant_violation("restore Arrow buffers are absent"))?;
-    // Six fixed-width primitive fields use two buffers each; two Binary
+    // Seven fixed-width primitive fields use two buffers each; two Binary
     // fields use three each. This schema has no variadic buffer collections.
     if batch.variadicBufferCounts().is_some()
-        || nodes.len() != 8
-        || buffers.len() != 18
+        || nodes.len() != 9
+        || buffers.len() != 20
         || nodes
             .iter()
             .enumerate()
-            .any(|(index, node)| !matches!(index, 2 | 7) && node.null_count() != 0)
+            .any(|(index, node)| !matches!(index, 2 | 7 | 8) && node.null_count() != 0)
     {
         return Err(super::invariant_violation(
             "restore Arrow fixed buffer or nullability grammar differs",
@@ -5969,11 +5974,14 @@ fn validate_restore_buffer_spans(
     // validity/offsets/data for Binary. Body offsets themselves may be unordered.
     let mut minima = [
         0, rows, 0, offsets, 0, 0, offsets, 0, 0, integers, 0, bitmap, 0, integers, 0, integers, 0,
-        integers,
+        integers, 0, integers,
     ];
     let nodes = batch.nodes().ok_or_else(invalid)?;
     let buffers = batch.buffers().ok_or_else(invalid)?;
-    for (index, node) in [0_usize, 2, 5, 8, 10, 12, 14, 16].into_iter().zip(nodes) {
+    for (index, node) in [0_usize, 2, 5, 8, 10, 12, 14, 16, 18]
+        .into_iter()
+        .zip(nodes)
+    {
         if node.length() != batch.length()
             || node.null_count() < 0
             || node.null_count() > batch.length()
@@ -5994,7 +6002,7 @@ fn validate_restore_buffer_spans(
         if length == 0 {
             continue;
         }
-        // Eighteen descriptors bound this pairwise check; no collection or sort.
+        // Twenty descriptors bound this pairwise check; no collection or sort.
         for previous in buffers
             .iter()
             .take(index)
@@ -6026,7 +6034,7 @@ mod restore_preflight_tests {
     #[ignore = "Rust 1.88 64-bit decoder qualification; requires separate pinned-source evidence"]
     fn restore_decoder_fixed_layout_qualification() {
         use arrow::{
-            array::{ArrayRef, BinaryArray, BooleanArray, UInt8Array, UInt64Array},
+            array::{ArrayRef, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array},
             buffer::Buffer,
             datatypes::{Field, FieldRef, Fields, Schema},
             ipc::Block,
@@ -6050,18 +6058,18 @@ mod restore_preflight_tests {
         assert_eq!(size_of::<Fields>(), 16);
         assert!(size_of::<flatbuffers::ErrorTraceDetail>() <= 32);
         let row = size_of::<ControlMvpSegmentRow>();
-        assert!(row <= 96);
+        assert_eq!(row, 112);
         let schema = control_mvp_segment_schema();
-        assert_eq!(schema.fields().len(), 8);
+        assert_eq!(schema.fields().len(), 9);
         let names: usize = schema.fields().iter().map(|field| field.name().len()).sum();
-        // Four owned schemas, with two additional 4 -> 8 Field Vec growth steps.
+        // Four owned schemas, with two additional Field Vec growth steps.
         let schemas = 4
-            * (array::<Field>(8).size()
+            * (array::<Field>(9).size()
                 + 2 * names
-                + 8 * arc(Layout::new::<Field>())
-                + array::<FieldRef>(8).size()
-                + arc(array::<FieldRef>(8)))
-            + 2 * array::<Field>(4).size();
+                + 9 * arc(Layout::new::<Field>())
+                + array::<FieldRef>(9).size()
+                + arc(array::<FieldRef>(9)))
+            + 2 * array::<Field>(8).size();
         // Pinned Arrow private Bytes is five words; Arc adds two counters.
         let private_owner = arc(array::<usize>(5));
         assert_eq!(private_owner, 56);
@@ -6069,13 +6077,14 @@ mod restore_preflight_tests {
             + array::<Block>(4).size()
             + array::<RecordBatch>(4).size()
             + array::<ArrayRef>(4).size()
-            + array::<ArrayRef>(8).size()
+            + array::<ArrayRef>(9).size()
             + arc(Layout::new::<UInt8Array>())
             + 4 * arc(Layout::new::<UInt64Array>())
+            + arc(Layout::new::<Int64Array>())
             + 2 * arc(Layout::new::<BinaryArray>())
             + arc(Layout::new::<BooleanArray>())
-            + 8 * array::<Buffer>(4).size()
-            + 7 * private_owner
+            + 9 * array::<Buffer>(4).size()
+            + 8 * private_owner
             + array::<u64>(1).size();
         let rendered = (192 * (96 + 256 + 2 * 20) + 1024 + 63) & !63;
         let error_live = 2 * rendered
@@ -6112,6 +6121,7 @@ mod restore_preflight_tests {
             logical_sequence: 1,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         }])
         .expect("production block")
     }
@@ -6128,6 +6138,7 @@ mod restore_preflight_tests {
                 logical_sequence: 1,
                 logical_ordinal: u64::from(ordinal),
                 origin_sequence: None,
+                expires_at_ms: None,
             })
             .collect();
         for (index, offsets) in [(3, [0_i32, 2, 1, 3]), (6, [0, 10, 5, 15])] {
@@ -6299,10 +6310,10 @@ mod restore_preflight_tests {
         null_count: i64,
     ) -> Vec<u8> {
         let mut builder = flatbuffers::FlatBufferBuilder::new();
-        let mut raw_nodes = [arrow::ipc::FieldNode::new(1, 0); 8];
+        let mut raw_nodes = [arrow::ipc::FieldNode::new(1, 0); 9];
         raw_nodes[0] = arrow::ipc::FieldNode::new(1, null_count);
         let nodes = builder.create_vector(&raw_nodes);
-        let lengths = [0, 1, 0, 8, 0, 0, 8, 0, 0, 8, 0, 1, 0, 8, 0, 8, 0, 8];
+        let lengths = [0, 1, 0, 8, 0, 0, 8, 0, 0, 8, 0, 1, 0, 8, 0, 8, 0, 8, 0, 8];
         let raw_buffers: Vec<_> = (0..buffer_count)
             .map(|index| {
                 arrow::ipc::Buffer::new(
@@ -6329,7 +6340,7 @@ mod restore_preflight_tests {
         let message = arrow::ipc::Message::create(
             &mut builder,
             &arrow::ipc::MessageArgs {
-                bodyLength: 18 * 64,
+                bodyLength: 20 * 64,
                 version,
                 header_type: arrow::ipc::MessageHeader::RecordBatch,
                 header: Some(batch.as_union_value()),
@@ -6342,10 +6353,10 @@ mod restore_preflight_tests {
 
     #[test]
     fn restore_preflight_rejects_record_message_metadata() {
-        let production = record_message(false, false, 18, arrow::ipc::MetadataVersion::V5, 0);
+        let production = record_message(false, false, 20, arrow::ipc::MetadataVersion::V5, 0);
         validate_restore_arrow_message(arrow::ipc::root_as_message(&production).expect("message"))
             .expect("supported record message shape");
-        let bytes = record_message(true, false, 18, arrow::ipc::MetadataVersion::V5, 0);
+        let bytes = record_message(true, false, 20, arrow::ipc::MetadataVersion::V5, 0);
         let message = arrow::ipc::root_as_message(&bytes).expect("message");
         assert!(
             validate_restore_arrow_message(message).is_err(),
@@ -6355,7 +6366,7 @@ mod restore_preflight_tests {
 
     #[test]
     fn restore_preflight_rejects_variadic_and_extra_buffer_metadata() {
-        for (variadic, count) in [(true, 18), (false, 19), (false, 17)] {
+        for (variadic, count) in [(true, 20), (false, 21), (false, 19)] {
             let bytes = record_message(false, variadic, count, arrow::ipc::MetadataVersion::V5, 0);
             let message = arrow::ipc::root_as_message(&bytes).expect("message");
             assert!(
@@ -6366,7 +6377,7 @@ mod restore_preflight_tests {
     }
     #[test]
     fn restore_preflight_rejects_record_message_version_before_body_decode() {
-        let bytes = record_message(false, false, 18, arrow::ipc::MetadataVersion::V4, 0);
+        let bytes = record_message(false, false, 20, arrow::ipc::MetadataVersion::V4, 0);
         let message = arrow::ipc::root_as_message(&bytes).expect("message");
         assert!(
             validate_restore_arrow_message(message).is_err(),
@@ -6376,7 +6387,7 @@ mod restore_preflight_tests {
 
     #[test]
     fn restore_preflight_rejects_null_count_for_required_field() {
-        let bytes = record_message(false, false, 18, arrow::ipc::MetadataVersion::V5, 1);
+        let bytes = record_message(false, false, 20, arrow::ipc::MetadataVersion::V5, 1);
         let message = arrow::ipc::root_as_message(&bytes).expect("message");
         assert!(
             validate_restore_arrow_message(message).is_err(),
@@ -8028,7 +8039,7 @@ mod output_metadata_tests {
                 .expect("store");
         for (count, key_len, value_len) in [
             (1_usize, 8, 200_000),
-            (4096, 8, 0),
+            (3072, 8, 0),
             (1, 50_000, 0),
             (1, 80_000, 0),
         ] {
@@ -8045,6 +8056,7 @@ mod output_metadata_tests {
                         logical_sequence: 2,
                         logical_ordinal: i as u64,
                         origin_sequence: None,
+                        expires_at_ms: None,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -8609,9 +8621,9 @@ fn one_row_output_reservation(
     };
     let capacity = || physical_backpressure("singleton output exceeds encoded admission");
     let align = |n: usize| n.checked_add(63).map(|n| n / 64 * 64).ok_or_else(capacity);
-    // Pinned metadata-free V5 IPC: 8 nodes, 18 buffers; all fixed buffers
-    // occupy 896 padded bytes, framing/schema/messages/footer occupy 1858.
-    let envelope = 2754_usize
+    // Pinned metadata-free V5 IPC: 9 nodes, 20 buffers; the nullable expiry
+    // adds 328 bytes to the prior eight-field one-row envelope.
+    let envelope = 3082_usize
         .checked_add(align(row.key.len())?)
         .and_then(|n| n.checked_add(align(row.value.as_ref().map_or(0, Vec::len)).ok()?))
         .ok_or_else(capacity)?;
@@ -8704,7 +8716,7 @@ pub(in super::super) fn standard_output_reservation(
     }
     // Bound the metadata-only scan before examining any row, including invalid
     // caller slices. The file envelope rejects more tightly below.
-    if usize::BITS != 64 || row_count == 0 || row_count > MAX_BLOCK_BYTES / 41 {
+    if usize::BITS != 64 || row_count == 0 || row_count > MAX_BLOCK_BYTES / 49 {
         return Err(capacity());
     }
     let bitmap_bytes = row_count.checked_add(7).ok_or_else(capacity)? / 8;
@@ -8730,10 +8742,10 @@ pub(in super::super) fn standard_output_reservation(
     let envelope = sum(&[
         key_bytes,
         value_bytes,
-        row_count.checked_mul(41).ok_or_else(capacity)?,
+        row_count.checked_mul(49).ok_or_else(capacity)?,
         8,
-        bitmap_bytes.checked_mul(9).ok_or_else(capacity)?,
-        18 * 63,
+        bitmap_bytes.checked_mul(10).ok_or_else(capacity)?,
+        20 * 63,
         49_376,
     ])?;
     if envelope > MAX_BLOCK_BYTES {
@@ -8790,6 +8802,7 @@ mod owned_encode_tests {
                     logical_sequence: 1,
                     logical_ordinal: i as u64,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }
             })
             .collect()
@@ -8902,7 +8915,7 @@ mod owned_encode_tests {
         for input in [
             rows(1, 8, 211_568, None),
             rows(1, 200_000, 0, None),
-            rows(4096, 8, 0, None),
+            rows(3072, 8, 0, None),
             rows(9, 8, 128, Some(0)),
             rows(9, 8, 128, Some(8)),
             origin_pattern(0),
@@ -8965,12 +8978,12 @@ mod owned_encode_tests {
             drop(output);
             assert!(io.ledger.lock().expect("ledger").report().passing());
         }
-        let exact = rows(1, 8, 259_264, None);
+        let exact = rows(1, 8, 258_944, None);
         let encoded = encode_arrow_block(&exact).expect("production boundary");
         let (envelope, _) = standard_output_reservation(&exact).expect("exact");
         assert_eq!(envelope, encoded.len());
         assert!(encoded.len() <= MAX_BLOCK_BYTES);
-        let invalid = rows(1, 8, 259_265, None);
+        let invalid = rows(1, 8, 258_945, None);
         assert!(encode_arrow_block(&invalid).expect("next alignment").len() > MAX_BLOCK_BYTES);
         assert!(standard_output_reservation(&invalid).is_err());
         assert!(standard_output_reservation(&[]).is_err());
@@ -9105,6 +9118,7 @@ mod owned_encode_tests {
                 logical_sequence: 1,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             }];
             let mut io = RestorePhysicalIo::new(&store, limit, FINAL_MICROCHUNK_BYTES);
             let mut workspace = WorkspaceIoBudget::new();
@@ -9434,7 +9448,7 @@ fn payload_decode_reservation(descriptor: &super::Descriptor) -> CatalogResult<u
     let rows = usize::try_from(descriptor.block.row_count).map_err(|_| invalid())?;
     let row_size = size_of::<super::ControlMvpSegmentRow>();
     if size_of::<usize>() != 8
-        || row_size > 96
+        || row_size > 112
         || bytes == 0
         || bytes > MAX_SEGMENT_BYTES
         || rows == 0
@@ -9517,6 +9531,11 @@ async fn read_restore_payload(
                 preflight_restore_arrow_segment,
             )?;
             read_cache::validate_rows(&descriptor.segment, &rows)?;
+            if rows.iter().any(|row| row.expires_at_ms.is_some()) {
+                return Err(CatalogError::UnsupportedOperation {
+                    message: "bounded restore does not admit expiry hints".into(),
+                });
+            }
             if descriptor.role == super::Role::Kv {
                 if rows
                     .iter()
@@ -9588,6 +9607,42 @@ mod native_payload_tests {
     use super::*;
 
     #[tokio::test]
+    async fn restore_payload_rejects_expiry_hints_before_output() {
+        let (fixture, descriptor, _) =
+            super::super::tests::fixture_with_rows(vec![super::super::ControlMvpSegmentRow {
+                record_kind: super::super::SEGMENT_RECORD_KV,
+                key: b"expiring".to_vec(),
+                value: Some(b"value".to_vec()),
+                generation: 1,
+                tombstone: false,
+                logical_sequence: 2,
+                logical_ordinal: 0,
+                origin_sequence: None,
+                expires_at_ms: Some(123),
+            }])
+            .await;
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            fixture.retention.clone(),
+            fixture.scope.clone(),
+        )
+        .expect("store");
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut workspace = WorkspaceIoBudget::new();
+        let mut payload = UnitPayloadAdmission::new();
+        let mut route = RestorePhysicalRoute::OrdinaryUnit {
+            workspace: &mut workspace,
+            payload: &mut payload,
+        };
+        let result = read_restore_payload(&mut io, &mut route, &descriptor).await;
+        assert!(matches!(
+            result,
+            Err(CatalogError::UnsupportedOperation { .. })
+        ));
+        assert_eq!(io.work.payload_writes, 0);
+        assert!(io.stopped);
+    }
+
+    #[tokio::test]
     async fn restore_payload_rejects_insufficient_proven_reservation_before_decoder() {
         for (final_stream, limit, carry) in [(false, 1, 0), (true, 1, 0), (true, 64, 60)] {
             let (fixture, descriptor, _) = super::super::tests::fixture().await;
@@ -9643,13 +9698,13 @@ mod native_payload_tests {
     async fn restore_payload_reservation_matches_role_vectors_and_rejects_invalid_shapes() {
         let (_, mut descriptor, _) = super::super::tests::fixture().await;
         for (role, rows, bytes, expected) in [
-            (super::super::Role::Kv, 1, 4096, 8_417_754),
-            (super::super::Role::Kv, 8, 4096, 8_410_234),
-            (super::super::Role::ActiveId, 1, 4096, 8_488_410),
-            (super::super::Role::ActiveId, 8, 4096, 8_488_058),
-            (super::super::Role::DeliveryOrder, 8, 4096, 8_410_234),
-            (super::super::Role::ActiveId, 32_768, 262_144, 50_598_266),
-            (super::super::Role::ActiveId, 1, 67_108_864, 1_551_898_074),
+            (super::super::Role::Kv, 1, 4096, 8_417_770),
+            (super::super::Role::Kv, 8, 4096, 8_410_362),
+            (super::super::Role::ActiveId, 1, 4096, 8_488_426),
+            (super::super::Role::ActiveId, 8, 4096, 8_488_186),
+            (super::super::Role::DeliveryOrder, 8, 4096, 8_410_362),
+            (super::super::Role::ActiveId, 32_768, 262_144, 51_122_554),
+            (super::super::Role::ActiveId, 1, 67_108_864, 1_551_898_090),
         ] {
             descriptor.role = role;
             descriptor.block.row_count = rows;
@@ -9698,7 +9753,7 @@ mod native_payload_tests {
                     (format!("{:020}/{ordinal:020}/{id}", 2).into_bytes(), "ab".repeat(32).into_bytes())
                 };
                 ControlMvpSegmentRow { record_kind: SEGMENT_RECORD_OUTBOX, key, value: Some(value),
-                    generation: 0, tombstone: false, logical_sequence: 2, logical_ordinal: ordinal, origin_sequence: Some(2) }
+                    generation: 0, tombstone: false, logical_sequence: 2, logical_ordinal: ordinal, origin_sequence: Some(2), expires_at_ms: None }
             }).collect();
             let (fixture, mut descriptor, _) = super::super::tests::fixture_with_rows(rows).await;
             descriptor.role = role;
@@ -11331,7 +11386,7 @@ mod native_directory_tests {
                 b"arco.directory.scope.v1\0".len()
                     + 24
                     + store.scope.tenant_id().len()
-                    + store.scope.workspace_id().len()
+                    + store.scope.workspace_id().expect("workspace root").len()
                     + store.scope.domain().len()
             )
             .expect("scope work")
@@ -11530,8 +11585,11 @@ mod native_directory_tests {
             let directory =
                 Directory::new(store.retention.clone(), &store.scope).expect("directory");
             let root = directory.empty_root_reference().expect("root");
-            store.scope =
-                StateScope::new(store.scope.tenant_id(), store.scope.workspace_id(), domain);
+            store.scope = StateScope::new(
+                store.scope.tenant_id(),
+                store.scope.workspace_id().expect("workspace root"),
+                domain,
+            );
             let mut io =
                 RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
             let mut workspace = WorkspaceIoBudget::new();
@@ -12308,6 +12366,7 @@ mod singleton_read_tests {
                     logical_sequence: 2,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 }])
                 .await;
             let store = ControlMvpStateStore::new_synthetic_bounded(
@@ -12391,6 +12450,7 @@ mod singleton_read_tests {
                             logical_sequence: 2,
                             logical_ordinal: ordinal,
                             origin_sequence: None,
+                            expires_at_ms: None,
                         })
                         .collect(),
                 )
@@ -12527,6 +12587,7 @@ mod singleton_read_tests {
                 logical_sequence: 2,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             }])
             .await;
         let mut boundaries = 0;
@@ -12689,6 +12750,7 @@ mod singleton_read_tests {
             logical_sequence: 2,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         };
         let scope = StateScope::new("tenant", "workspace", "catalog");
         // Fixture construction finds the actual production codec ceiling;
@@ -12797,6 +12859,7 @@ mod singleton_read_tests {
                 logical_sequence: 2,
                 logical_ordinal: 0,
                 origin_sequence: None,
+                expires_at_ms: None,
             }])
             .await;
         assert_eq!(owned.value().bytes, second.bytes);
@@ -12860,6 +12923,7 @@ mod singleton_output_size_tests {
             logical_sequence: 2,
             logical_ordinal: 0,
             origin_sequence: None,
+            expires_at_ms: None,
         };
         let overhead = super::super::super::encode_arrow_block(std::slice::from_ref(&row))
             .unwrap()
@@ -12886,7 +12950,7 @@ mod singleton_output_size_tests {
     #[test]
     fn singleton_output_grammar_matches_production_and_standard_boundary() {
         for k in [1, 63, 64, 65, 4096] {
-            for v in [0, 1, 63, 64, 65, MAX_BLOCK_BYTES - 2818] {
+            for v in [0, 1, 63, 64, 65, MAX_BLOCK_BYTES - 3146] {
                 let row = super::super::ControlMvpSegmentRow {
                     record_kind: 0,
                     key: vec![0xff; k],
@@ -12896,6 +12960,7 @@ mod singleton_output_size_tests {
                     logical_sequence: 10,
                     logical_ordinal: 0,
                     origin_sequence: None,
+                    expires_at_ms: None,
                 };
                 let (length, _) =
                     one_row_output_reservation(std::slice::from_ref(&row), MAX_SEGMENT_BYTES)

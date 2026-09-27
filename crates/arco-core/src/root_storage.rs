@@ -11,7 +11,9 @@ use crate::authority_root::AuthorityScope;
 use crate::error::Result;
 use crate::identity_storage::IdentityStorage;
 use crate::scoped_storage::{ScopedListPage, ScopedObjectMeta, ScopedPath, ScopedStorage};
-use crate::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use crate::storage::{
+    ClassifiedBytes, ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 
 /// Typed storage roots shared kernel can operate over.
 ///
@@ -200,6 +202,15 @@ impl From<IdentityStorage> for RootStorage {
 
 #[async_trait]
 impl StorageBackend for RootStorage {
+    async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> Result<ClassifiedBytes> {
+        <ScopedStorage as StorageBackend>::get_range_with_ownership(self.storage(), path, range)
+            .await
+    }
+
     async fn get(&self, path: &str) -> Result<Bytes> {
         <ScopedStorage as StorageBackend>::get(self.storage(), path).await
     }
@@ -307,6 +318,8 @@ mod tests {
 
     #[tokio::test]
     async fn storage_backend_operations_keep_both_roots_scoped() {
+        use crate::storage::BytesBackingOwnership;
+
         let backend = Arc::new(MemoryBackend::new());
         let roots = [
             RootStorage::from(ScopedStorage::new(backend.clone(), "acme", "prod").unwrap()),
@@ -324,6 +337,12 @@ mod tests {
             assert_eq!(
                 root.get_range("dir/a", 1..4).await.unwrap(),
                 Bytes::from_static(b"irs")
+            );
+            let classified = root.get_range_with_ownership("dir/a", 1..4).await.unwrap();
+            assert_eq!(classified.bytes, Bytes::from_static(b"irs"));
+            assert_eq!(
+                classified.ownership,
+                BytesBackingOwnership::BackendOriginShared { held_len: 3 }
             );
             assert_eq!(
                 StorageBackend::list(&root, "dir/").await.unwrap()[0].path,

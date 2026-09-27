@@ -141,7 +141,7 @@ mod tests {
         use crate::storage::{BytesBackingOwnership, StorageBackend};
         let backend = Arc::new(MemoryBackend::new());
         let scoped = ScopedStorage::new(backend.clone(), "tenant", "workspace")?;
-        let authority = ScopedAuthorityStore::new(scoped.clone());
+        let authority = ScopedAuthorityStore::new(scoped.clone().into());
         let mut data = Vec::with_capacity(4096);
         data.extend_from_slice(b"abcdef");
         assert!(data.capacity() > data.len());

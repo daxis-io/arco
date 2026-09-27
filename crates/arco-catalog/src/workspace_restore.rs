@@ -1715,18 +1715,17 @@ impl WorkspaceRestoreService {
                 return self.outcome(&winner, io).await;
             }
             let prior_aggregate_attempt = attempt.aggregate_attempt;
-            let (attempt, journal, version) = self
-                .replace_superseded_participants(
-                    request,
-                    attempt,
-                    existing_journal,
-                    version,
-                    &cut,
-                    inspections,
-                    now,
-                    io,
-                )
-                .await?;
+            let (attempt, journal, version) = Box::pin(self.replace_superseded_participants(
+                request,
+                attempt,
+                existing_journal,
+                version,
+                &cut,
+                inspections,
+                now,
+                io,
+            ))
+            .await?;
             if replacement_requested
                 && (journal.status == WorkspaceRestoreStatus::RepairRequired
                     || attempt.aggregate_attempt == prior_aggregate_attempt)

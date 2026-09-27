@@ -1929,7 +1929,10 @@ fn literal_v6_restore_plan_fixture_is_supersession_only_and_pins_the_stamp_polic
     assert_eq!(Value::from(6_u64), v6_value["version"]);
     assert!(v6_value.get("committed_at_ms").is_none());
     let PersistedRestoreParticipantPlan::ControlMvp(last_format7) =
-        serde_json::from_str(v6).expect("v6 fixture must decode");
+        serde_json::from_str(v6).expect("v6 fixture must decode")
+    else {
+        panic!("v6 fixture decoded as a different plan kind")
+    };
     assert_eq!(6, last_format7.version());
     assert!(
         last_format7.is_legacy_version(),
@@ -2177,7 +2180,9 @@ async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
     );
     let legacy: PersistedRestoreParticipantPlan =
         serde_json::from_value(wire).expect("the downgraded plan must remain decodable");
-    let PersistedRestoreParticipantPlan::ControlMvp(decoded) = &legacy;
+    let PersistedRestoreParticipantPlan::ControlMvp(decoded) = &legacy else {
+        panic!("downgraded v6 plan decoded as a different plan kind")
+    };
     assert_eq!(6, decoded.version());
     assert!(decoded.is_legacy_version());
 

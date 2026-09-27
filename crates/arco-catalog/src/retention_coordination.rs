@@ -612,6 +612,7 @@ impl RetentionMutationEpoch {
     /// This is intentionally not an adoption path: an in-flight epoch for any
     /// other operation remains in flight and fails closed. The caller must prove
     /// the supplied identities terminal before invoking this method.
+    #[cfg(test)]
     pub(crate) async fn settle_terminal_matching(
         storage: RootStorage,
         guard: &mut LockGuard<RootStorage>,
@@ -1313,7 +1314,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl arco_core::StorageBackend for PausedReadbackBackend {
+    impl StorageBackend for PausedReadbackBackend {
         async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
             if path.ends_with("retention/exact.json") {
                 self.reached.notify_one();

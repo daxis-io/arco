@@ -3118,13 +3118,11 @@ impl DurableMaintenanceWorker {
     ) -> Result<PublicationCandidate> {
         let candidate = match self.prepare_publication(id, job, attempt.ordinal).await? {
             Preparation::Candidate(candidate) => *candidate,
-            // Unreachable by construction: the pending attempt fixes the head
-            // at the source the attempt was validated against (a head that
-            // moved since observes as `Consumed`), and the purge recomputation
-            // over that same parent is deterministic. Were it ever reached,
-            // the attempt is still in flight and must be reconciled
-            // (`Selected` or `Consumed`) before the job may move, so the
-            // status is left unchanged here.
+            // Unreachable unless HEAD moves between the attempt observation
+            // and the compatibility read: then the refusal is transient, the
+            // status is left unchanged, and the next publish observes the
+            // attempt `Consumed`, returns the job to `ReadyToPublish`, and
+            // the fresh path records `Superseded`.
             Preparation::PurgedSetSuperseded => return Err(purged_set_superseded()),
         };
         if candidate.attempt != *attempt {

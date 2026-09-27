@@ -915,7 +915,7 @@ async fn publish_job(
         // Boxed: the kernel re-read would otherwise push `run_once` past the
         // large-futures threshold.
         Step::Deferred => {
-            Ok(Box::pin(outcome_after_deferred_publication(worker, job_id, summary)).await)
+            Box::pin(outcome_after_deferred_publication(worker, job_id, summary)).await
         }
     }
 }
@@ -926,21 +926,35 @@ async fn publish_job(
 /// permanent for the job. One re-read lets such a job end this run
 /// (`terminal` clears its record, so consolidation proceeds and a fresh plan
 /// is prepared next run) instead of being replayed into the same refusal on
-/// every run until its record expires. Any other status, and a re-read that
-/// is itself deferred or fails, keeps the deferral: the record stays and the
-/// next run replays the job.
+/// every run until its record expires. Any other status keeps the deferral,
+/// as does a re-read that is itself deferred (another actor holds or
+/// consumed the source) or fenced as ambiguous (HEAD moved during the
+/// re-read): the record stays and the next run replays the job. Any other
+/// re-read error fails the phase.
+///
+/// # Errors
+/// A re-read error that is neither deferrable nor an ambiguous outcome.
 async fn outcome_after_deferred_publication(
     worker: &DurableMaintenanceWorker,
     job_id: &MaintenanceJobId,
     summary: &DomainMaintenanceSummary,
-) -> MaintenanceOutcome {
-    match classify_step(
-        &summary.domain,
-        summary.kind,
-        "resume",
-        worker.resume_at(job_id, Utc::now()).await,
-    ) {
-        Ok(Step::Ready(progress))
+) -> Result<MaintenanceOutcome> {
+    let result = match worker.resume_at(job_id, Utc::now()).await {
+        Err(error @ CatalogError::AmbiguousAuthorityOutcome { .. }) => {
+            tracing::warn!(
+                phase = "maintenance",
+                domain = %summary.domain,
+                kind = summary.kind,
+                job_id = job_id.as_str(),
+                error = %error,
+                "maintenance job re-read after its deferred publication was fenced; the deferral stands"
+            );
+            return Ok(MaintenanceOutcome::Deferred);
+        }
+        result => result,
+    };
+    match classify_step(&summary.domain, summary.kind, "resume", result)? {
+        Step::Ready(progress)
             if matches!(
                 progress.status,
                 MaintenanceStatus::Failed
@@ -956,20 +970,9 @@ async fn outcome_after_deferred_publication(
                 status = ?progress.status,
                 "maintenance job is terminal; its persisted identity is cleared and a fresh plan is prepared"
             );
-            MaintenanceOutcome::Terminal
+            Ok(MaintenanceOutcome::Terminal)
         }
-        Ok(Step::Ready(_) | Step::Deferred) => MaintenanceOutcome::Deferred,
-        Err(error) => {
-            tracing::warn!(
-                phase = "maintenance",
-                domain = %summary.domain,
-                kind = summary.kind,
-                job_id = job_id.as_str(),
-                error = format!("{error:#}"),
-                "maintenance job could not be re-read after its deferred publication; the deferral stands"
-            );
-            MaintenanceOutcome::Deferred
-        }
+        Step::Ready(_) | Step::Deferred => Ok(MaintenanceOutcome::Deferred),
     }
 }
 

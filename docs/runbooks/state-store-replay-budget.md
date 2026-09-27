@@ -100,17 +100,21 @@ retention epoch at activation, so at most one of two concurrent jobs
 publishes; the other fails its compatibility check with `PreconditionFailed`
 and is abandoned. For a horizon job:
 
-- `Superseded` (`MaintenanceStatus::Superseded` in `maintenance.rs`) means
-  what it means for consolidation: the head moved past the job's source and
-  the 24 h descriptor lifetime expired before a regenerated publication
-  landed. Before expiry a consumed attempt returns to `ReadyToPublish` and
-  the next `publish_at` regenerates over the new head. `publish_at` also refuses
-  a horizon job with `PreconditionFailed` (the persisted status is not changed)
-  when a commit after preparation rewrote a key the admitted plan purges; abandon it and call
-  `prepare_horizon_at` again. The worker reports this refusal as `deferred`
-  and replays the same job on every run until its persisted record is
-  older than the 24 h descriptor lifetime; see the worker runbook's known
-  limitations.
+- `Superseded` (`MaintenanceStatus::Superseded` in `maintenance.rs`) has
+  two meanings for a horizon job. The first is what it means for
+  consolidation: the head moved past the job's source and the 24 h
+  descriptor lifetime expired before a regenerated publication landed
+  (before expiry a consumed attempt returns to `ReadyToPublish` and the
+  next `publish_at` regenerates over the new head). The second is specific
+  to horizons: when a commit after preparation rewrote a key the admitted
+  plan purges, `publish_at` records the job `Superseded` and refuses with
+  `PreconditionFailed`. That refusal is permanent for the job (its purged
+  set is fixed by the job identity), so there is nothing to abandon; call
+  `prepare_horizon_at` again for a fresh job. The worker re-reads the job
+  and reports it `terminal` in the run that observes the refusal, clears
+  its record, runs consolidation in that same run, and prepares a fresh
+  horizon on the next run; no operator action is needed (see the worker
+  runbook's known limitations).
 - A stuck retention epoch (`stuck_epoch` in the worker's epoch phase, see
   `docs/runbooks/control-store-worker.md`) blocks horizon activation exactly
   as it blocks consolidation: `start_at` claims the epoch under the retention

@@ -120,7 +120,7 @@ Steps:
   and `drain_fixed_consumer` (the path behind
   `CatalogProjectionMaterializer::drain_once`) refuses any root carrying
   that key, so the phase exactly as written above broke every later
-  catalog drain (wip commit 451f5add). The kernel gained a fixed-consumer
+  catalog drain (interim commit 451f5add). The kernel gained a fixed-consumer
   trim (`ProjectionOutboxWorker::trim_fixed_consumer`, exposed as
   `CatalogProjectionMaterializer::trim_once`; commit b4bfaa6a) that runs
   the same retire-then-trim saga at the first binding incarnation, refuses

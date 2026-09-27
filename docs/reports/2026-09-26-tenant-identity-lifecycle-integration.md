@@ -26,8 +26,8 @@ revocation, purge, provider qualification, authorization, or production routing.
 | Core/catalog suite and rustdoc except long Gate 7 case | Passed: 1,517 tests, 0 failed, 35 ignored, 1 filtered. Local log SHA-256: `f0128770aac65683925f1e2ccc3cbe4f0baa0ece7e90e0f2251764c1bea06306`. |
 | Core/catalog all-target/all-feature Clippy | Passed with `-D warnings`. Log SHA-256: `836f233b590ed4c05b2a8531d8e26f2009e291edbb38941999d5f05c71e192cc`. |
 | Formatting and diff whitespace | Passed: `cargo fmt --all -- --check` and `git diff --check`. |
-| Final-source Gate 7 model | Running against rebuilt test binary SHA-256 `59e6e4f588afa0114c285f2ba8f6dca48d0415b48427949109674d222863e4d8`. |
-| Workspace all-target/all-feature Clippy | Pending; the preserved earlier attempt ran out of disk while compiling DuckDB. |
+| Final-source Gate 7 model | Incomplete: stopped at 37/192 cases when filesystem free space reached 2.5 GiB. Test binary SHA-256: `59e6e4f588afa0114c285f2ba8f6dca48d0415b48427949109674d222863e4d8`. All 37 completed model and live traces are hash-verified and compressed; the interrupted live trace is retained separately. The two compression manifests have SHA-256 `3022d80753d8570be890e47fb32b652072bcb03226c74c09d04cceaf3eb5ea3d` and `cc3d0d9350a4c6c531b11584fd0e831dd8972cb574b057b9fd49b5c8bab16d7f`. No final Gate 7 pass is claimed. |
+| Workspace all-target/all-feature Clippy | Passed in PR #441 CI on the first source commit and the hygiene-only follow-up. Local full-workspace run remains untested due disk capacity. |
 | Provider and principal authority | Untested and not admitted. |
 
 The first broad integration run failed three existing tests that expected the
@@ -35,3 +35,6 @@ production constructor to admit identity and metastore roots. The metastore
 admission remains, while identity admission is limited to the test-only probe;
 that probe retains the physical namespace and checkpoint coverage. The failed log is preserved at
 `/private/tmp/arco-tenant-identity-integrated-20260926/core-catalog.log`.
+The first Gate 7 attempt was interrupted after the metastore-admission correction;
+its partial traces remain separate from the final-source 37-case run. PR #441
+remains draft until the long model and remaining CI checks have terminal results.

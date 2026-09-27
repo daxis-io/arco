@@ -77,10 +77,10 @@ struct SelectedJobRecord {
 }
 
 impl SelectedJobRecord {
-    /// The persisted kind's log name, or `unknown` for a record written
-    /// before the field existed.
+    /// The persisted kind's log name; a record written before the field
+    /// existed is a consolidation.
     fn kind_label(&self) -> &'static str {
-        self.kind.map_or("unknown", MaintenanceKind::as_str)
+        self.kind.unwrap_or(MaintenanceKind::Consolidation).as_str()
     }
 }
 
@@ -501,11 +501,12 @@ impl DomainMaintenanceSummary {
         }
     }
 
-    /// Seals the entry with its outcome and elapsed time, logs it, records it
-    /// in `entries`, and then clears the job's persisted identity when the
-    /// outcome finished the job. Recording happens as each job finishes, and
-    /// before the clear, so a typed error in a later step, the clear itself
-    /// included, never hides an earlier publication.
+    /// Seals the entry with its outcome and elapsed time, logs it, clears the
+    /// job's persisted identity when the outcome finished the job, then
+    /// records the entry in `entries` and returns the clear's result. The
+    /// entry is pushed even when the clear fails, and as each job finishes,
+    /// so a typed error in a later step, the clear itself included, never
+    /// hides an earlier publication.
     async fn finish_into(
         mut self,
         storage: &ScopedStorage,
@@ -753,14 +754,18 @@ async fn trim_catalog_outbox(storage: ScopedStorage) -> Result<TrimSummary> {
     let materializer = CatalogProjectionMaterializer::new(storage)
         .context("construct catalog projection materializer")?;
     let (outcome, trimmed_records, trim_sequence) = match materializer.trim_once().await {
-        Ok(report) => match report.trim_sequence {
-            Some(sequence) => (
-                TrimOutcome::Ok,
+        Ok(report) => {
+            let outcome = if report.trim_sequence.is_some() {
+                TrimOutcome::Ok
+            } else {
+                TrimOutcome::Idle
+            };
+            (
+                outcome,
                 report.trimmed_record_ids.len(),
-                Some(sequence),
-            ),
-            None => (TrimOutcome::Idle, 0, None),
-        },
+                report.trim_sequence,
+            )
+        }
         Err(error) if is_trim_deferrable(&error) => {
             tracing::warn!(
                 phase = "trim",
@@ -952,14 +957,11 @@ async fn recover_selected_job(
     })?;
     summary.job_id = Some(record.job_id.clone());
     summary.recovered = true;
-    // A record written by this binary names its kind; label the entry before
-    // any kernel call so even a deferred replay, which yields no progress,
-    // reports it. A record without one predates horizon jobs, so it is a
-    // consolidation: the entry's default label is already right, and the
-    // kernel confirms it once the replay yields progress.
-    if let Some(kind) = record.kind {
-        summary.kind = kind.as_str();
-    }
+    // Label the entry before any kernel call so even a deferred replay, which
+    // yields no progress, reports the persisted kind (`kind_label` resolves a
+    // record written before the field existed to a consolidation); the kernel
+    // confirms it once the replay yields progress.
+    summary.kind = record.kind_label();
     let now = Utc::now();
     let age_ms = now.timestamp_millis().saturating_sub(record.prepared_at_ms);
     let expired = age_ms >= MAINTENANCE_JOB_LIFETIME_MS;
@@ -2530,6 +2532,11 @@ mod tests {
             3,
             "the refused trim commit removed nothing"
         );
+        assert_eq!(
+            pending_records(&storage).await?,
+            3,
+            "the deferred trim retired the acks; the next run re-drains"
+        );
         assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len(), "GC still ran");
         Ok(())
     }
@@ -2654,7 +2661,11 @@ mod tests {
             .ok_or_else(|| anyhow!("a record without a kind must still load"))?;
         assert_eq!(loaded.job_id, "a".repeat(64));
         assert_eq!(loaded.kind, None);
-        assert_eq!(loaded.kind_label(), "unknown");
+        assert_eq!(
+            loaded.kind_label(),
+            "consolidation",
+            "a record without a kind predates horizon jobs"
+        );
 
         let record = catalog_job_record(
             &"b".repeat(64),

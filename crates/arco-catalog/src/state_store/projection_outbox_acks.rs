@@ -78,8 +78,8 @@
 //! A source domain whose consumer is fixed at compile time (the catalog
 //! projection) never carries binding metadata: installing it would advance the
 //! source domain's logical sequence without a domain mutation. The
-//! crate-private [`ProjectionOutboxWorker::drain_fixed_consumer`] and
-//! [`ProjectionOutboxWorker::trim_fixed_consumer`] run the same drain and
+//! crate-private `ProjectionOutboxWorker::drain_fixed_consumer` and
+//! `ProjectionOutboxWorker::trim_fixed_consumer` run the same drain and
 //! retire-then-trim saga as the generic operations, always at incarnation 1,
 //! but never write the binding key and fail closed with an invariant violation
 //! when a generic drain or trim has installed it. The fixed trim checks this
@@ -90,7 +90,8 @@
 //! operator endpoints): `arco_control_store_outbox_backlog_records`,
 //! `arco_control_store_outbox_watermark_lag_sequences`,
 //! `arco_control_store_outbox_drained_records_total`.
-//! [`ProjectionOutboxWorker::trim_acked`] itself emits
+//! The trim saga shared by [`ProjectionOutboxWorker::trim_acked`] and
+//! `ProjectionOutboxWorker::trim_fixed_consumer` itself emits
 //! `arco_control_store_outbox_trimmed_records_total` (labels `domain`,
 //! `consumer`) once its source-domain trim commit succeeds.
 
@@ -1209,8 +1210,8 @@ enum TrimBinding {
 /// acknowledgement namespace without deleting anything.
 ///
 /// A source domain with a compile-time consumer identity is served by the
-/// crate-private [`Self::drain_fixed_consumer`] and
-/// [`Self::trim_fixed_consumer`] instead: they run at incarnation 1, never
+/// crate-private `Self::drain_fixed_consumer` and `Self::trim_fixed_consumer`
+/// instead: they run at incarnation 1, never
 /// write the binding, and refuse a root that carries one.
 ///
 /// # Fencing
@@ -1717,7 +1718,11 @@ impl ProjectionOutboxWorker {
     /// every later fixed drain. This path fails closed with an invariant
     /// violation, before retiring any acknowledgement, when the source root
     /// already carries generic binding metadata, and asserts the key is still
-    /// absent inside the trim commit itself.
+    /// absent inside the trim commit itself. When that in-commit check fails
+    /// the acknowledgements are already retired: the records are retained
+    /// unacknowledged, every fixed drain and trim refuses the root while the
+    /// binding is present, and the fixed drain redelivers them once the root
+    /// is unbound.
     ///
     /// Everything else matches [`Self::trim_acked`]: ack-domain retirement
     /// first, exact-incarnation source-domain trim second, idle return without
@@ -1826,8 +1831,14 @@ impl ProjectionOutboxWorker {
             }
             // A generic binding landed between the up-front check and this
             // transaction: the fixed identity never inherits it, so fail
-            // closed. The acknowledgements are already retired, so the next
-            // fixed drain redelivers the records (at-least-once).
+            // closed. The acknowledgements are already retired, so the
+            // records are retained unacknowledged; every fixed drain and trim
+            // refuses the root while the binding is present, and the fixed
+            // drain redelivers them (at-least-once) once the root is unbound.
+            // This arm exists beside `assert_absent` because the worker treats
+            // `PreconditionFailed` as deferrable: a misbound root must surface
+            // as a non-deferrable invariant violation rather than be retried,
+            // re-retiring acknowledgements, every run.
             (TrimBinding::Fixed, Some(_)) => {
                 return Err(invariant_violation(
                     "fixed projection consumer cannot use a source root with generic binding \
@@ -3583,6 +3594,12 @@ mod tests {
         );
     }
 
+    // Fixed-consumer trim coverage. The in-flight `(TrimBinding::Fixed,
+    // Some(_))` arm (a generic binding landing between the up-front check and
+    // the source transaction) has no test: exercising it needs a hook between
+    // the ack-domain retirement and the source transaction, which the fault
+    // backends in this module do not provide.
+
     /// The fixed-consumer trim mirrors the fixed-consumer drain: it trims
     /// exactly what that identity acknowledged at the first incarnation and
     /// never installs generic binding metadata in the source root, so the
@@ -3813,12 +3830,14 @@ mod tests {
         );
     }
 
-    /// Mirror of the delayed-observation test for the fixed path: a trim pass
-    /// whose observation was overtaken by a completed fixed trim and a re-stage
-    /// of the same record id fails closed inside the source transaction, and
-    /// the fixed drain then delivers the fresh incarnation normally.
+    /// After a fixed trim has removed an incarnation and the record id was
+    /// re-staged, a delayed transaction-level trim naming the old incarnation
+    /// fails closed inside the source transaction (mirror of the generic
+    /// delayed-observation test), the fixed drain then delivers the fresh
+    /// incarnation normally, and the root stays unbound throughout.
     #[tokio::test]
-    async fn fixed_consumer_trim_refuses_a_restaged_incarnation() {
+    async fn delayed_trim_of_the_old_incarnation_fails_closed_after_a_fixed_trim_and_the_root_stays_unbound()
+     {
         let storage = storage();
         let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
             .expect("worker");

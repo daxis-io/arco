@@ -742,15 +742,17 @@ impl ProjectionFreshness {
 // ---------------------------------------------------------------------------
 
 /// Retires the catalog consumer's acknowledgements and trims the records they
-/// cover out of the catalog outbox. The kernel commits the ack domain first and
-/// the catalog second, by exact event incarnation, so no acknowledgement
-/// outlives its record and an interrupted pass redelivers rather than loses.
+/// cover out of the catalog outbox through the materializer's fixed-consumer
+/// path, which installs no binding metadata in the catalog root (a generic
+/// trim's binding would make every later drain refuse the root). The kernel
+/// commits the ack domain first and the catalog second, by exact event
+/// incarnation, so no acknowledgement outlives its record and an interrupted
+/// pass redelivers rather than loses.
 async fn trim_catalog_outbox(storage: ScopedStorage) -> Result<TrimSummary> {
     let started = Instant::now();
-    let worker =
-        ProjectionOutboxWorker::new(storage, "catalog", CATALOG_PARQUET_PROJECTION_CONSUMER_ID)
-            .context("construct catalog outbox trim worker")?;
-    let (outcome, trimmed_records, trim_sequence) = match worker.trim_acked().await {
+    let materializer = CatalogProjectionMaterializer::new(storage)
+        .context("construct catalog projection materializer")?;
+    let (outcome, trimmed_records, trim_sequence) = match materializer.trim_once().await {
         Ok(report) => match report.trim_sequence {
             Some(sequence) => (
                 TrimOutcome::Ok,

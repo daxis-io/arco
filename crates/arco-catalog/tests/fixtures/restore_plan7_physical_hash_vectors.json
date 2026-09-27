@@ -1,0 +1,275 @@
+{
+  "artifact": "plan7-physical-hash-codec-vectors-v1",
+  "canonicalization": {
+    "fixture_subset": "ASCII strings, safe integers, arrays, and objects only",
+    "jcs_equivalent_python": "json.dumps(sort_keys=True,separators=(',',':'),ensure_ascii=False)",
+    "tag_rule": "ASCII tag bytes followed by one literal 0x00 byte"
+  },
+  "contract_sha256": "6f6d7dc81f70ab07d1183f16306331b81f3dc5dbec6e33366f20700fd974960b",
+  "scope": "Hash-codec vectors only. They are not an authenticated Plan7, retained-source, merge, provenance, budget, or publication proof.",
+  "sensitivity": {
+    "nul_vs_literal_backslash_zero": {
+      "literal_backslash_zero_sha256_hex": "7b0850f8da55a142ccc1fbf42502f439be2b843a0c5a9a06bf0200dd6c1d99c9",
+      "literal_backslash_zero_tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d63616e6469646174652d76315c30",
+      "literal_nul_sha256_hex": "b1f8090149bec586973279971bf3bb808cbfd786ee9f93ca6d21767f1b96a9e0",
+      "literal_nul_tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d63616e6469646174652d763100"
+    },
+    "output_ordinal_change": {
+      "baseline_sha256_hex": "ea645ac6c1fddb5ea8921eb5fc60231de634af50ab3330d38e2257116e00ffcf",
+      "changed_ordinal": 1,
+      "changed_sha256_hex": "be13f987d369851636d2656dc1e79af74c28891116675071a51436eaba315e43"
+    },
+    "output_part_change": {
+      "baseline_sha256_hex": "ea645ac6c1fddb5ea8921eb5fc60231de634af50ab3330d38e2257116e00ffcf",
+      "changed_part": 1,
+      "changed_sha256_hex": "9fcade805f271071d78a6e9bd71b74ebb086b9bcded2804134375d1f786ef90c"
+    },
+    "predecessor_chain_change": {
+      "baseline_sha256_hex": "61e2f1811d3698275c322d985bf8494a41656109d23d57dfcf2cc38f05ffdf63",
+      "changed_sha256_hex": "c268cc782b3dfb1c7813fccd83eca97629985fda8350607a69b323058e493544"
+    },
+    "prefix_cumulative_count_change": {
+      "baseline_sha256_hex": "8489300f06858519cdec8252976e87f0a4347b04df532d84ec100db1a0f403c4",
+      "changed_mutations": 5,
+      "changed_sha256_hex": "7caa8587774ce60d54be95d6ff03c4a097d33fd3fccc8832d987d2e1070a06e0"
+    },
+    "tag_separation": {
+      "candidate_tag_sha256_hex": "b1f8090149bec586973279971bf3bb808cbfd786ee9f93ca6d21767f1b96a9e0",
+      "different_tag": "arco/control-v2/restore-candidate-v1-other",
+      "different_tag_sha256_hex": "129627066e00723dfab62c9083a9725f494081a8a74c8ddf1d568a44457b3b17"
+    }
+  },
+  "vectors": {
+    "candidate_seed": {
+      "body": {
+        "base_active_id_root_b64": "YmFzZS1hY3RpdmUtaWQ=",
+        "base_delivery_order_root_b64": "YmFzZS1kZWxpdmVyeQ",
+        "base_history_sha256": "sha256:edc76adc7ddb489bf924ed7575688847e2d9c6302a708358825c3efabcb5fea1",
+        "base_kv_root_b64": "YmFzZS1rdi1yb290",
+        "base_logical_sequence": 41,
+        "durable_authority_binding": "fixture-durable-binding-v1",
+        "execution_deadline": {
+          "nanoseconds": 0,
+          "seconds": 1700086400
+        },
+        "identity": "fixture-restore-attempt-0001",
+        "logical_commit_id": "sha256:0ede824bdf9116de05ed828708582e06792c92255120bf4ee9f51ca230ddebd4",
+        "mode": "present",
+        "owner_generation": 7,
+        "requested_at": {
+          "nanoseconds": 0,
+          "seconds": 1700000000
+        },
+        "restore_notice_intent_id": "fixture-notice-0001",
+        "restore_notice_payload_sha256": "sha256:0060ef71dc77c7fbc82e9a60be68c11b37323a58241e0b5ddc92a6587d5dcd19",
+        "restore_request_digest": "sha256:e19f39d4fd834e47b21040264d33ec75d0ea537607036b8b6a4bf5bc5bae3a51",
+        "result_logical_sequence": 42,
+        "scope": "fixture-scope",
+        "source_active_id_root_b64": "c291cmNlLWFjdGl2ZS1pZA",
+        "source_deadline": {
+          "nanoseconds": 0,
+          "seconds": 1700172800
+        },
+        "source_delivery_order_root_b64": "c291cmNlLWRlbGl2ZXJ5",
+        "source_history_sha256": "sha256:8f24931a0478e4efc3eb76d571c2101ac04098b626d3f700217bd6cef563cbc4",
+        "source_kv_root_b64": "c291cmNlLWt2LXJvb3Q",
+        "source_logical_sequence": 40,
+        "source_manifest_sha256": "sha256:24ff1dc62da2ac5f4113e2a0e32de618ba3ef29eb53312acb2b54ece667205a9",
+        "source_reference_sha256": "sha256:60117f1dd0512330fc87bd282adcc01de22d6969b3fb010aeb61feb7391b97fc",
+        "target_witness_digest": "sha256:f5f200090fa6d0b648a3baaf57f72675667b2a2046246ea3ba8a5976355787d9",
+        "workspace_request_sha256": "sha256:dfb94aa74c9ae9d882d12c7f19db27b9a8484bf0059627f89f4df1554d9b0800"
+      },
+      "jcs_utf8": "{\"base_active_id_root_b64\":\"YmFzZS1hY3RpdmUtaWQ=\",\"base_delivery_order_root_b64\":\"YmFzZS1kZWxpdmVyeQ\",\"base_history_sha256\":\"sha256:edc76adc7ddb489bf924ed7575688847e2d9c6302a708358825c3efabcb5fea1\",\"base_kv_root_b64\":\"YmFzZS1rdi1yb290\",\"base_logical_sequence\":41,\"durable_authority_binding\":\"fixture-durable-binding-v1\",\"execution_deadline\":{\"nanoseconds\":0,\"seconds\":1700086400},\"identity\":\"fixture-restore-attempt-0001\",\"logical_commit_id\":\"sha256:0ede824bdf9116de05ed828708582e06792c92255120bf4ee9f51ca230ddebd4\",\"mode\":\"present\",\"owner_generation\":7,\"requested_at\":{\"nanoseconds\":0,\"seconds\":1700000000},\"restore_notice_intent_id\":\"fixture-notice-0001\",\"restore_notice_payload_sha256\":\"sha256:0060ef71dc77c7fbc82e9a60be68c11b37323a58241e0b5ddc92a6587d5dcd19\",\"restore_request_digest\":\"sha256:e19f39d4fd834e47b21040264d33ec75d0ea537607036b8b6a4bf5bc5bae3a51\",\"result_logical_sequence\":42,\"scope\":\"fixture-scope\",\"source_active_id_root_b64\":\"c291cmNlLWFjdGl2ZS1pZA\",\"source_deadline\":{\"nanoseconds\":0,\"seconds\":1700172800},\"source_delivery_order_root_b64\":\"c291cmNlLWRlbGl2ZXJ5\",\"source_history_sha256\":\"sha256:8f24931a0478e4efc3eb76d571c2101ac04098b626d3f700217bd6cef563cbc4\",\"source_kv_root_b64\":\"c291cmNlLWt2LXJvb3Q\",\"source_logical_sequence\":40,\"source_manifest_sha256\":\"sha256:24ff1dc62da2ac5f4113e2a0e32de618ba3ef29eb53312acb2b54ece667205a9\",\"source_reference_sha256\":\"sha256:60117f1dd0512330fc87bd282adcc01de22d6969b3fb010aeb61feb7391b97fc\",\"target_witness_digest\":\"sha256:f5f200090fa6d0b648a3baaf57f72675667b2a2046246ea3ba8a5976355787d9\",\"workspace_request_sha256\":\"sha256:dfb94aa74c9ae9d882d12c7f19db27b9a8484bf0059627f89f4df1554d9b0800\"}",
+      "sha256_hex": "b1f8090149bec586973279971bf3bb808cbfd786ee9f93ca6d21767f1b96a9e0",
+      "tag": "arco/control-v2/restore-candidate-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d63616e6469646174652d763100"
+    },
+    "coverage": {
+      "body": {
+        "candidate": {
+          "manifest": {
+            "byte_size": 256,
+            "path": "control/state/fixture/candidates/manifest.json",
+            "sha256": "sha256:216ce7f842a88c45c2ab693303496ea84950df1807dfeb559ec7543b3ad21fbf"
+          },
+          "transaction": {
+            "byte_size": 192,
+            "path": "control/state/fixture/candidates/transaction.json",
+            "sha256": "sha256:b131376152afb6c0194f27974c9e9acf69215b664f2933b909a592e741d3f707"
+          }
+        },
+        "cumulative_counts": {
+          "current_leaves": 1,
+          "decoded_blocks": 2,
+          "decoded_rows": 3,
+          "input_encoded_bytes": 144,
+          "mutations": 5,
+          "output_blocks": 1,
+          "output_encoded_bytes": 89,
+          "source_leaves": 1
+        },
+        "logical": {
+          "logical_commit_id": "sha256:0ede824bdf9116de05ed828708582e06792c92255120bf4ee9f51ca230ddebd4",
+          "restore_history_sha256": "sha256:3f78cb6b351381d0f19b51ced5552d0fe043ffef3850acdb7452a2bd5cbff26d",
+          "restore_notice_payload_sha256": "sha256:0060ef71dc77c7fbc82e9a60be68c11b37323a58241e0b5ddc92a6587d5dcd19",
+          "restore_request_digest": "sha256:e19f39d4fd834e47b21040264d33ec75d0ea537607036b8b6a4bf5bc5bae3a51",
+          "result_sequence": 42
+        },
+        "output_kv_root_b64": "ZmluYWwtb3V0cHV0LXJvb3Q",
+        "plan_sha256": "sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8",
+        "source_witness_digest": "sha256:2f1de67b8128b9be53460e40a0aeee357bd38408e1ddc3c8ad27926d672ea626",
+        "target_witness_digest": "sha256:f5f200090fa6d0b648a3baaf57f72675667b2a2046246ea3ba8a5976355787d9",
+        "terminal": {
+          "chain_sha256": "sha256:61e2f1811d3698275c322d985bf8494a41656109d23d57dfcf2cc38f05ffdf63",
+          "next_ordinal": 1,
+          "receipt_count": 1
+        }
+      },
+      "jcs_utf8": "{\"candidate\":{\"manifest\":{\"byte_size\":256,\"path\":\"control/state/fixture/candidates/manifest.json\",\"sha256\":\"sha256:216ce7f842a88c45c2ab693303496ea84950df1807dfeb559ec7543b3ad21fbf\"},\"transaction\":{\"byte_size\":192,\"path\":\"control/state/fixture/candidates/transaction.json\",\"sha256\":\"sha256:b131376152afb6c0194f27974c9e9acf69215b664f2933b909a592e741d3f707\"}},\"cumulative_counts\":{\"current_leaves\":1,\"decoded_blocks\":2,\"decoded_rows\":3,\"input_encoded_bytes\":144,\"mutations\":5,\"output_blocks\":1,\"output_encoded_bytes\":89,\"source_leaves\":1},\"logical\":{\"logical_commit_id\":\"sha256:0ede824bdf9116de05ed828708582e06792c92255120bf4ee9f51ca230ddebd4\",\"restore_history_sha256\":\"sha256:3f78cb6b351381d0f19b51ced5552d0fe043ffef3850acdb7452a2bd5cbff26d\",\"restore_notice_payload_sha256\":\"sha256:0060ef71dc77c7fbc82e9a60be68c11b37323a58241e0b5ddc92a6587d5dcd19\",\"restore_request_digest\":\"sha256:e19f39d4fd834e47b21040264d33ec75d0ea537607036b8b6a4bf5bc5bae3a51\",\"result_sequence\":42},\"output_kv_root_b64\":\"ZmluYWwtb3V0cHV0LXJvb3Q\",\"plan_sha256\":\"sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8\",\"source_witness_digest\":\"sha256:2f1de67b8128b9be53460e40a0aeee357bd38408e1ddc3c8ad27926d672ea626\",\"target_witness_digest\":\"sha256:f5f200090fa6d0b648a3baaf57f72675667b2a2046246ea3ba8a5976355787d9\",\"terminal\":{\"chain_sha256\":\"sha256:61e2f1811d3698275c322d985bf8494a41656109d23d57dfcf2cc38f05ffdf63\",\"next_ordinal\":1,\"receipt_count\":1}}",
+      "sha256_hex": "a28a188481a24a7b04a8b9c6bc95107765f81dfb5badfd6b582796caa74cbcd8",
+      "tag": "arco/control-v2/restore-coverage-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d636f7665726167652d763100"
+    },
+    "genesis_chain": {
+      "body": {
+        "genesis_receipt_raw_sha256": "sha256:a68201dbf38032e4cb436f9bd17cd992fbb6de2382a7c4e2b1827ffd5a331b71",
+        "identity": "fixture-restore-attempt-0001",
+        "owner_generation": 7,
+        "plan_sha256": "sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8"
+      },
+      "jcs_utf8": "{\"genesis_receipt_raw_sha256\":\"sha256:a68201dbf38032e4cb436f9bd17cd992fbb6de2382a7c4e2b1827ffd5a331b71\",\"identity\":\"fixture-restore-attempt-0001\",\"owner_generation\":7,\"plan_sha256\":\"sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8\"}",
+      "sha256_hex": "f2f4b4b76f3c3902997708d3054e2f0acee5151d13c57394dff85ecbd6b14dcc",
+      "tag": "arco/control-v2/restore-receipt-genesis-chain-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d726563656970742d67656e657369732d636861696e2d763100"
+    },
+    "genesis_none": {
+      "body": {
+        "identity": "fixture-restore-attempt-0001",
+        "owner_generation": 7,
+        "plan_sha256": "sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8"
+      },
+      "jcs_utf8": "{\"identity\":\"fixture-restore-attempt-0001\",\"owner_generation\":7,\"plan_sha256\":\"sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8\"}",
+      "sha256_hex": "a68201dbf38032e4cb436f9bd17cd992fbb6de2382a7c4e2b1827ffd5a331b71",
+      "tag": "arco/control-v2/restore-receipt-none-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d726563656970742d6e6f6e652d763100"
+    },
+    "output_id": {
+      "body": {
+        "candidate_seed_sha256": "sha256:b1f8090149bec586973279971bf3bb808cbfd786ee9f93ca6d21767f1b96a9e0",
+        "ordinal": 0,
+        "part": 0,
+        "role": 107
+      },
+      "jcs_utf8": "{\"candidate_seed_sha256\":\"sha256:b1f8090149bec586973279971bf3bb808cbfd786ee9f93ca6d21767f1b96a9e0\",\"ordinal\":0,\"part\":0,\"role\":107}",
+      "sha256_hex": "ea645ac6c1fddb5ea8921eb5fc60231de634af50ab3330d38e2257116e00ffcf",
+      "tag": "arco/control-v2/restore-output-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d6f75747075742d763100"
+    },
+    "receipt_body": {
+      "body": {
+        "after": {
+          "current": {
+            "kind": "end"
+          },
+          "global": {
+            "key_b64url": "aw",
+            "kind": "after"
+          },
+          "source": {
+            "kind": "end"
+          }
+        },
+        "before": {
+          "current": {
+            "kind": "start"
+          },
+          "global": {
+            "kind": "start"
+          },
+          "source": {
+            "kind": "start"
+          }
+        },
+        "counts": {
+          "current_leaves": 1,
+          "decoded_blocks": 2,
+          "decoded_rows": 3,
+          "input_encoded_bytes": 144,
+          "mutations": 1,
+          "output_blocks": 1,
+          "output_encoded_bytes": 89,
+          "reservation": {
+            "combined_leaf_limit": 16,
+            "decode_limit": 64,
+            "input_byte_limit": 67108864,
+            "kind": "standard",
+            "output_block_limit": 32,
+            "packed_output_byte_limit": 33554432
+          },
+          "source_leaves": 1
+        },
+        "current_inputs": [],
+        "identity": "fixture-restore-attempt-0001",
+        "ordinal": 0,
+        "outputs": [],
+        "owner_generation": 7,
+        "plan_sha256": "sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8",
+        "predecessor_chain_sha256": "sha256:f2f4b4b76f3c3902997708d3054e2f0acee5151d13c57394dff85ecbd6b14dcc",
+        "predecessor_receipt_sha256": "sha256:a68201dbf38032e4cb436f9bd17cd992fbb6de2382a7c4e2b1827ffd5a331b71",
+        "prefix_cumulative_counts": {
+          "current_leaves": 1,
+          "decoded_blocks": 2,
+          "decoded_rows": 3,
+          "input_encoded_bytes": 144,
+          "mutations": 4,
+          "output_blocks": 1,
+          "output_encoded_bytes": 89,
+          "source_leaves": 1
+        },
+        "singleton_after": {
+          "kind": "none"
+        },
+        "singleton_before": {
+          "kind": "none"
+        },
+        "source_inputs": []
+      },
+      "jcs_utf8": "{\"after\":{\"current\":{\"kind\":\"end\"},\"global\":{\"key_b64url\":\"aw\",\"kind\":\"after\"},\"source\":{\"kind\":\"end\"}},\"before\":{\"current\":{\"kind\":\"start\"},\"global\":{\"kind\":\"start\"},\"source\":{\"kind\":\"start\"}},\"counts\":{\"current_leaves\":1,\"decoded_blocks\":2,\"decoded_rows\":3,\"input_encoded_bytes\":144,\"mutations\":1,\"output_blocks\":1,\"output_encoded_bytes\":89,\"reservation\":{\"combined_leaf_limit\":16,\"decode_limit\":64,\"input_byte_limit\":67108864,\"kind\":\"standard\",\"output_block_limit\":32,\"packed_output_byte_limit\":33554432},\"source_leaves\":1},\"current_inputs\":[],\"identity\":\"fixture-restore-attempt-0001\",\"ordinal\":0,\"outputs\":[],\"owner_generation\":7,\"plan_sha256\":\"sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8\",\"predecessor_chain_sha256\":\"sha256:f2f4b4b76f3c3902997708d3054e2f0acee5151d13c57394dff85ecbd6b14dcc\",\"predecessor_receipt_sha256\":\"sha256:a68201dbf38032e4cb436f9bd17cd992fbb6de2382a7c4e2b1827ffd5a331b71\",\"prefix_cumulative_counts\":{\"current_leaves\":1,\"decoded_blocks\":2,\"decoded_rows\":3,\"input_encoded_bytes\":144,\"mutations\":4,\"output_blocks\":1,\"output_encoded_bytes\":89,\"source_leaves\":1},\"singleton_after\":{\"kind\":\"none\"},\"singleton_before\":{\"kind\":\"none\"},\"source_inputs\":[]}",
+      "sha256_hex": "8489300f06858519cdec8252976e87f0a4347b04df532d84ec100db1a0f403c4",
+      "tag": "arco/control-v2/restore-receipt-body-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d726563656970742d626f64792d763100"
+    },
+    "receipt_chain": {
+      "body": {
+        "ordinal": 0,
+        "owner_generation": 7,
+        "plan_sha256": "sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8",
+        "predecessor_chain_sha256": "sha256:f2f4b4b76f3c3902997708d3054e2f0acee5151d13c57394dff85ecbd6b14dcc",
+        "receipt_body_sha256": "sha256:8489300f06858519cdec8252976e87f0a4347b04df532d84ec100db1a0f403c4"
+      },
+      "jcs_utf8": "{\"ordinal\":0,\"owner_generation\":7,\"plan_sha256\":\"sha256:a423d549cb6ed3a7d51c453ad69fee28217b1c8970adad2b452d058368f5e7e8\",\"predecessor_chain_sha256\":\"sha256:f2f4b4b76f3c3902997708d3054e2f0acee5151d13c57394dff85ecbd6b14dcc\",\"receipt_body_sha256\":\"sha256:8489300f06858519cdec8252976e87f0a4347b04df532d84ec100db1a0f403c4\"}",
+      "sha256_hex": "61e2f1811d3698275c322d985bf8494a41656109d23d57dfcf2cc38f05ffdf63",
+      "tag": "arco/control-v2/restore-receipt-chain-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d726563656970742d636861696e2d763100"
+    },
+    "target_witness": {
+      "body": {
+        "current_pointer_path": "control/state/tenant-a/current.json",
+        "current_pointer_raw_b64": "eyJmaXh0dXJlIjoicHJlc2VudCJ9",
+        "current_pointer_sha256": "sha256:f2c7cf20aa67d2a3ceb86ae134df62e78b43a02caa98500acb757c9d8ad9c1da",
+        "current_pointer_version": "v0000000000000007",
+        "manifest": {
+          "byte_size": 128,
+          "path": "control/state/tenant-a/manifests/base.json",
+          "sha256": "sha256:e3f46be910828a0f97f12875435c49fa87989b9ea8539569515133a00a4eb066"
+        },
+        "reclamation_generation": 9,
+        "writer_epoch": 11
+      },
+      "jcs_utf8": "{\"current_pointer_path\":\"control/state/tenant-a/current.json\",\"current_pointer_raw_b64\":\"eyJmaXh0dXJlIjoicHJlc2VudCJ9\",\"current_pointer_sha256\":\"sha256:f2c7cf20aa67d2a3ceb86ae134df62e78b43a02caa98500acb757c9d8ad9c1da\",\"current_pointer_version\":\"v0000000000000007\",\"manifest\":{\"byte_size\":128,\"path\":\"control/state/tenant-a/manifests/base.json\",\"sha256\":\"sha256:e3f46be910828a0f97f12875435c49fa87989b9ea8539569515133a00a4eb066\"},\"reclamation_generation\":9,\"writer_epoch\":11}",
+      "sha256_hex": "f5f200090fa6d0b648a3baaf57f72675667b2a2046246ea3ba8a5976355787d9",
+      "tag": "arco/control-v2/restore-target-witness-v1",
+      "tag_hex": "6172636f2f636f6e74726f6c2d76322f726573746f72652d7461726765742d7769746e6573732d763100"
+    }
+  }
+}

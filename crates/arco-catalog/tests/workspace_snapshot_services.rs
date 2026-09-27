@@ -21,6 +21,10 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
+#[cfg(feature = "test-utils")]
+use arco_catalog::DurableAuthorityBinding;
+#[cfg(feature = "test-utils")]
+use arco_catalog::state_store::WorkspaceCaptureConfig;
 use arco_catalog::state_store::{PersistedAuthorityKind, PersistedAuthorityReference, StateScope};
 use arco_catalog::workspace_snapshot::{
     ChecksumReference, DomainAuthorityReference, DomainEventArchive, ExportManifest,
@@ -33,8 +37,8 @@ use arco_catalog::workspace_snapshot::{
 use arco_catalog::workspace_snapshot_service::{
     CreateWorkspaceExportRequest, CreateWorkspaceSnapshotRequest, EventArchiveCapture,
     EventArchiveProvider, ProjectionWatermarkCut, ProjectionWatermarkProvider,
-    RestorePreflightIssueKind, RestoreSource, WorkspaceDomainBinding, WorkspaceDomainRegistry,
-    WorkspaceSnapshotService,
+    RestorePreflightIssueKind, RestoreSource, WorkspaceCaptureIo, WorkspaceDomainBinding,
+    WorkspaceDomainRegistry, WorkspaceSnapshotService,
 };
 use arco_catalog::{
     ArcoStateAdmin as _, ArcoStateReader, ArcoStateTxn as _, CheckpointToken, ControlMvpStateStore,
@@ -81,8 +85,12 @@ struct RecordingBackend {
     inner: MemoryBackend,
     operations: Mutex<Vec<BackendOperation>>,
     collision: Mutex<Option<CollisionPlan>>,
+    #[cfg(feature = "test-utils")]
+    bounded_put_fault: Mutex<Option<BoundedPutFault>>,
     deny_list: AtomicBool,
     get_failure_suffix: Mutex<Option<String>>,
+    #[cfg(feature = "test-utils")]
+    rewrite_on_range_get: Mutex<Option<(String, Bytes)>>,
     put_failure_suffix: Mutex<Option<String>>,
     put_pause_suffix: Mutex<Option<String>>,
     put_reached: Notify,
@@ -93,6 +101,22 @@ struct RecordingBackend {
     resume_delete: Notify,
     stale_protected_deletes: AtomicUsize,
     take_over_lease_before_renewal: AtomicBool,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Clone, Copy, Debug)]
+enum BoundedPutMode {
+    LostCommitted,
+    NoWrite,
+    PauseBefore,
+    PauseAfter,
+}
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+struct BoundedPutFault {
+    suffix: String,
+    ordinal: usize,
+    mode: BoundedPutMode,
 }
 
 #[derive(Debug)]
@@ -133,6 +157,12 @@ impl RecordingBackend {
 
     fn fail_get(&self, path_suffix: impl Into<String>) {
         *self.get_failure_suffix.lock().expect("get failure") = Some(path_suffix.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn rewrite_on_next_range_get(&self, path_suffix: impl Into<String>, bytes: Bytes) {
+        *self.rewrite_on_range_get.lock().expect("range rewrite") =
+            Some((path_suffix.into(), bytes));
     }
 
     fn fail_put(&self, path_suffix: impl Into<String>) {
@@ -218,7 +248,24 @@ impl StorageBackend for RecordingBackend {
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> StorageResult<Bytes> {
         self.record(BackendOperation::Get(path.to_string()));
-        self.inner.get_range(path, range).await
+        let bytes = self.inner.get_range(path, range).await?;
+        #[cfg(feature = "test-utils")]
+        let rewrite = self
+            .rewrite_on_range_get
+            .lock()
+            .expect("range rewrite")
+            .take();
+        #[cfg(feature = "test-utils")]
+        if let Some((suffix, rewrite)) = rewrite {
+            if path.ends_with(&suffix) {
+                self.inner
+                    .put(path, rewrite, WritePrecondition::None)
+                    .await?;
+            } else {
+                *self.rewrite_on_range_get.lock().expect("range rewrite") = Some((suffix, rewrite));
+            }
+        }
+        Ok(bytes)
     }
 
     async fn put(
@@ -228,6 +275,43 @@ impl StorageBackend for RecordingBackend {
         precondition: WritePrecondition,
     ) -> StorageResult<WriteResult> {
         self.record(BackendOperation::Put(path.to_string()));
+        #[cfg(feature = "test-utils")]
+        let fault = {
+            let mut fault = self.bounded_put_fault.lock().expect("bounded fault");
+            if let Some(plan) = fault.as_mut().filter(|plan| path.ends_with(&plan.suffix)) {
+                plan.ordinal -= 1;
+                if plan.ordinal == 0 {
+                    fault.take().map(|plan| plan.mode)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "test-utils")]
+        if let Some(fault) = fault {
+            match fault {
+                BoundedPutMode::NoWrite => {
+                    return Err(arco_core::Error::storage("injected unsent result"));
+                }
+                BoundedPutMode::LostCommitted => {
+                    self.inner.put(path, data, precondition).await?;
+                    return Err(arco_core::Error::storage("injected lost committed result"));
+                }
+                BoundedPutMode::PauseBefore => {
+                    self.put_reached.notify_one();
+                    self.resume_put.notified().await;
+                    return self.inner.put(path, data, precondition).await;
+                }
+                BoundedPutMode::PauseAfter => {
+                    let result = self.inner.put(path, data, precondition).await?;
+                    self.put_reached.notify_one();
+                    self.resume_put.notified().await;
+                    return Ok(result);
+                }
+            }
+        }
         if self
             .put_failure_suffix
             .lock()
@@ -408,6 +492,14 @@ struct EmptyProjectionProvider;
 
 #[async_trait]
 impl ProjectionWatermarkProvider for EmptyProjectionProvider {
+    async fn capture_bounded(
+        &self,
+        _authority: &DomainAuthorityReference,
+        _io: &mut WorkspaceCaptureIo<'_>,
+    ) -> Result<ProjectionWatermarkCut> {
+        ProjectionWatermarkCut::new(Vec::new(), Vec::new(), Vec::new())
+    }
+
     async fn capture(
         &self,
         _authority: &DomainAuthorityReference,
@@ -421,8 +513,34 @@ struct EmptyArchiveProvider;
 
 #[async_trait]
 impl EventArchiveProvider for EmptyArchiveProvider {
+    async fn capture_bounded(
+        &self,
+        authority: &DomainAuthorityReference,
+        _io: &mut WorkspaceCaptureIo<'_>,
+    ) -> Result<EventArchiveCapture> {
+        EventArchiveCapture::new(DomainEventArchive::empty(authority.domain())?, Vec::new())
+    }
+
     async fn capture(&self, authority: &DomainAuthorityReference) -> Result<EventArchiveCapture> {
         EventArchiveCapture::new(DomainEventArchive::empty(authority.domain())?, Vec::new())
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+struct LegacyOnlyProjectionProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "test-utils")]
+#[async_trait]
+impl ProjectionWatermarkProvider for LegacyOnlyProjectionProvider {
+    async fn capture(
+        &self,
+        _authority: &DomainAuthorityReference,
+    ) -> Result<ProjectionWatermarkCut> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ProjectionWatermarkCut::new(Vec::new(), Vec::new(), Vec::new())
     }
 }
 
@@ -469,6 +587,12 @@ struct MismatchedImplementationAdapter {
 #[derive(Debug)]
 struct FailOnResolveAdapter;
 
+#[cfg(feature = "test-utils")]
+struct LegacyResolverTrapAdapter {
+    inner: Arc<ControlMvpStateStore>,
+    calls: Arc<AtomicUsize>,
+}
+
 #[async_trait]
 impl PersistedAuthorityAdapter for FailOnResolveAdapter {
     async fn persist_state_reference(
@@ -498,6 +622,45 @@ impl PersistedAuthorityAdapter for FailOnResolveAdapter {
     ) -> Result<Box<dyn ArcoStateReader>> {
         Err(arco_catalog::CatalogError::Storage {
             message: "mismatched adapter must not be resolved".to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[async_trait]
+impl PersistedAuthorityAdapter for LegacyResolverTrapAdapter {
+    fn workspace_capture_config(&self) -> Option<WorkspaceCaptureConfig> {
+        self.inner.workspace_capture_config()
+    }
+
+    async fn persist_state_reference(
+        &self,
+        token: &StateToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        self.inner
+            .persist_state_reference(token, retention_deadline)
+            .await
+    }
+
+    async fn persist_checkpoint_reference(
+        &self,
+        token: &CheckpointToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        self.inner
+            .persist_checkpoint_reference(token, retention_deadline)
+            .await
+    }
+
+    async fn resolve_persisted_reference_at(
+        &self,
+        _reference: &PersistedAuthorityReference,
+        _now: DateTime<Utc>,
+    ) -> Result<Box<dyn ArcoStateReader>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(arco_catalog::CatalogError::Storage {
+            message: "legacy resolver must not run in bounded preflight".into(),
         })
     }
 }
@@ -623,15 +786,21 @@ async fn read_pin_revision(
 }
 
 async fn initialized_control_store(storage: &ScopedStorage, domain: &str) -> ControlMvpStateStore {
+    initialized_control_store_with_value(storage, domain, Bytes::from_static(b"value")).await
+}
+
+async fn initialized_control_store_with_value(
+    storage: &ScopedStorage,
+    domain: &str,
+    value: Bytes,
+) -> ControlMvpStateStore {
     let scope = StateScope::new("tenant", "workspace", domain);
     let store = ControlMvpStateStore::new(storage.clone(), scope.clone()).expect("store");
     let mut txn = store
         .begin_control_txn(TxnOptions::new(Some(scope)))
         .await
         .expect("begin transaction");
-    txn.put(b"seed", Bytes::from_static(b"value"))
-        .await
-        .expect("seed write");
+    txn.put(b"seed", value).await.expect("seed write");
     txn.commit().await.expect("seed commit");
     store
 }
@@ -751,6 +920,1494 @@ fn binding(domain: &str) -> Result<WorkspaceDomainBinding> {
         Arc::new(EmptyProjectionProvider),
         Arc::new(EmptyArchiveProvider),
     )
+}
+
+#[cfg(feature = "test-utils")]
+async fn bounded_capture_fixture(
+    backend: Arc<dyn StorageBackend>,
+) -> (
+    ScopedStorage,
+    WorkspaceSnapshotService,
+    CreateWorkspaceSnapshotRequest,
+) {
+    bounded_capture_domains(backend, &["catalog"]).await
+}
+
+#[cfg(feature = "test-utils")]
+async fn bounded_capture_domains(
+    backend: Arc<dyn StorageBackend>,
+    domains: &[&str],
+) -> (
+    ScopedStorage,
+    WorkspaceSnapshotService,
+    CreateWorkspaceSnapshotRequest,
+) {
+    let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+    let mut bindings = Vec::new();
+    for domain in domains {
+        let scope = StateScope::new("tenant", "workspace", *domain);
+        let store = Arc::new(
+            ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+                .expect("bounded store")
+                .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+        );
+        store
+            .install_synthetic_genesis(
+                "capture-source",
+                1,
+                1,
+                [arco_catalog::state_store::SyntheticKvEntry {
+                    key: b"seed".to_vec(),
+                    generation: 1,
+                    value: Some(b"value".to_vec()),
+                }],
+                0,
+                std::iter::empty(),
+            )
+            .await
+            .expect("authenticated synthetic source");
+        bindings.push(
+            WorkspaceDomainBinding::new(
+                scope,
+                store.clone(),
+                store,
+                Arc::new(EmptyProjectionProvider),
+                Arc::new(EmptyArchiveProvider),
+            )
+            .expect("binding"),
+        );
+    }
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        bindings,
+    )
+    .expect("registry");
+    let service = WorkspaceSnapshotService::new(storage.clone(), registry).expect("service");
+    let now = Utc::now();
+    let request = CreateWorkspaceSnapshotRequest::new(
+        SNAPSHOT_ID,
+        PIN_ID,
+        now,
+        now + chrono::Duration::days(1),
+        None,
+    )
+    .expect("bounded source lifetime");
+    (storage, service, request)
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_stages_each_domain_only_after_the_previous_pointer_clear() {
+    for count in [2, 3] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (storage, service, request) =
+            bounded_capture_domains(backend.clone(), &["alpha", "beta", "gamma"][..count]).await;
+        backend.clear();
+        service
+            .create_snapshot(&request)
+            .await
+            .expect("multi-domain capture");
+        let operations = backend.operations();
+        let epoch_writes: Vec<_> = operations.iter().enumerate().filter_map(|(position, operation)| {
+            matches!(operation, BackendOperation::Put(path) if path.ends_with("retention/coordination/mutation-epoch.json")).then_some(position)
+        }).collect();
+        for (index, domain) in ["alpha", "beta", "gamma"][..count]
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let suffix = format!("domains/{domain}/retained/v1/current.json");
+            let first_read = operations.iter().position(|operation| matches!(operation,
+                BackendOperation::Head(path) | BackendOperation::Get(path) if path.ends_with(&suffix)))
+                .expect("selected pointer observation");
+            let previous_clear = *epoch_writes.get(index * 2).expect("preceding clear");
+            assert!(
+                first_read > previous_clear,
+                "domain {domain} inspected its retained pointer before the previous domain's intent was cleared"
+            );
+        }
+        let epoch: Value = serde_json::from_slice(
+            &storage
+                .get_raw("retention/coordination/mutation-epoch.json")
+                .await
+                .expect("epoch"),
+        )
+        .expect("epoch JSON");
+        assert_eq!(epoch["state"], "IDLE");
+        assert!(epoch.get("armed_retained_pointer").is_none());
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_multidomain_cancellation_never_observes_a_later_pointer() {
+    let epoch_path = "retention/coordination/mutation-epoch.json";
+    for count in [2, 3] {
+        let domains = &["alpha", "beta", "gamma"][..count];
+        for (stopped, domain) in domains.iter().enumerate() {
+            for boundary in ["arm", "pointer", "clear"] {
+                for mode in [BoundedPutMode::PauseBefore, BoundedPutMode::PauseAfter] {
+                    let backend = Arc::new(RecordingBackend::default());
+                    let (storage, service, request) =
+                        bounded_capture_domains(backend.clone(), domains).await;
+                    let pointer_path =
+                        format!("control/v1/domains/{domain}/retained/v1/current.json");
+                    let (suffix, ordinal) = match boundary {
+                        "arm" => (epoch_path, 2 + stopped * 2),
+                        "pointer" => (pointer_path.as_str(), 1),
+                        _ => (epoch_path, 3 + stopped * 2),
+                    };
+                    backend.clear();
+                    *backend.bounded_put_fault.lock().expect("fault") = Some(BoundedPutFault {
+                        suffix: suffix.into(),
+                        ordinal,
+                        mode,
+                    });
+                    let mut pending = Box::pin(service.create_snapshot(&request));
+                    tokio::select! {
+                        result = pending.as_mut() => panic!("{count}/{stopped}/{boundary}/{mode:?} returned before pause: {result:?}"),
+                        () = backend.wait_for_paused_put() => {}
+                    }
+                    drop(pending);
+                    for later in domains.iter().skip(stopped + 1) {
+                        let suffix = format!("domains/{later}/retained/v1/current.json");
+                        assert!(!backend.operations().iter().any(|operation| matches!(operation,
+                            BackendOperation::Head(path) | BackendOperation::Get(path) | BackendOperation::Put(path)
+                                if path.ends_with(&suffix))), "later domain {later} observed before {domain} publication finished");
+                    }
+                    let before: Value =
+                        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch"))
+                            .expect("JSON");
+                    let armed = before.get("armed_retained_pointer").is_some();
+                    let visible = storage
+                        .head_raw(&pointer_path)
+                        .await
+                        .expect("pointer")
+                        .is_some();
+                    backend.expire_lock("tenant=tenant/workspace=workspace/locks/workspace-retention-gc.lock.json").await;
+                    backend.clear();
+                    let result = service.create_snapshot(&request).await;
+                    if armed && !visible {
+                        assert!(
+                            result.is_err(),
+                            "possibly sent absent pointer cannot be retried"
+                        );
+                        let after: Value = serde_json::from_slice(
+                            &storage.get_raw(epoch_path).await.expect("epoch"),
+                        )
+                        .expect("JSON");
+                        assert_eq!(before, after);
+                    } else {
+                        result.unwrap_or_else(|error| {
+                            panic!("{count}/{stopped}/{boundary}/{mode:?}: {error}")
+                        });
+                        let after: Value = serde_json::from_slice(
+                            &storage.get_raw(epoch_path).await.expect("epoch"),
+                        )
+                        .expect("JSON");
+                        assert_eq!(after["state"], "IDLE");
+                    }
+                    for (index, earlier) in domains.iter().enumerate().take(stopped + 1) {
+                        if index < stopped || visible || armed {
+                            let suffix = format!("domains/{earlier}/retained/v1/current.json");
+                            assert!(
+                                !backend
+                                    .operations()
+                                    .iter()
+                                    .any(|operation| matches!(operation,
+                                BackendOperation::Put(path) if path.ends_with(&suffix))),
+                                "restart resent an earlier or armed pointer"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_workspace_export_rejects_before_any_storage_operation() {
+    for mixed in [false, true] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (_, service, request) = if mixed {
+            let (storage, service, request, _) = mixed_v7_capture_fixture(backend.clone()).await;
+            (storage, service, request)
+        } else {
+            bounded_capture_fixture(backend.clone()).await
+        };
+        service
+            .create_snapshot(&request)
+            .await
+            .expect("source snapshot");
+        let now = Utc::now();
+        let export = CreateWorkspaceExportRequest::new(
+            EXPORT_ID,
+            EXPORT_PIN_ID,
+            SNAPSHOT_ID,
+            PIN_ID,
+            now,
+            now + chrono::Duration::hours(1),
+        )
+        .expect("export request");
+        backend.clear();
+        assert!(
+            matches!(
+                service.export_snapshot(&export).await,
+                Err(arco_catalog::CatalogError::UnsupportedOperation { .. })
+            ),
+            "V8/mixed export remains explicitly unsupported"
+        );
+        assert!(
+            backend.operations().is_empty(),
+            "unsupported export must fail before reading any source or export record"
+        );
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_workspace_preflight_export_rejects_before_any_storage_operation() {
+    for mixed in [false, true] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (_, service, request) = if mixed {
+            let (storage, service, request, _) = mixed_v7_capture_fixture(backend.clone()).await;
+            (storage, service, request)
+        } else {
+            bounded_capture_fixture(backend.clone()).await
+        };
+        service
+            .create_snapshot(&request)
+            .await
+            .expect("source snapshot");
+        backend.clear();
+
+        assert!(
+            matches!(
+                service
+                    .preflight_restore(
+                        &RestoreSource::export(EXPORT_ID, EXPORT_PIN_ID).expect("export source"),
+                        &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+                        Utc::now(),
+                    )
+                    .await,
+                Err(arco_catalog::CatalogError::UnsupportedOperation { .. })
+            ),
+            "V8/mixed export preflight remains explicitly unsupported"
+        );
+        assert!(
+            backend.operations().is_empty(),
+            "unsupported preflight must fail before reading any source or export record"
+        );
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_workspace_preflight_classifies_a_missing_source_pin() {
+    let (storage, service, request) = bounded_capture_fixture(Arc::new(MemoryBackend::new())).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("source snapshot");
+    storage
+        .delete(&retention_pin_latest_path(PIN_ID).expect("pin selector"))
+        .await
+        .expect("delete selected pin");
+
+    let report = service
+        .preflight_restore(
+            &RestoreSource::snapshot(SNAPSHOT_ID, PIN_ID).expect("snapshot source"),
+            &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            Utc::now(),
+        )
+        .await
+        .expect("missing pin is a report issue");
+    assert!(report.issues().iter().any(|issue| {
+        issue.kind() == RestorePreflightIssueKind::Missing && issue.identifier() == "retention_pin"
+    }));
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_workspace_preflight_retries_a_source_record_rewritten_during_its_range_read() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("source snapshot");
+    let path = snapshot_record_path(SNAPSHOT_ID).expect("snapshot path");
+    let bytes = storage.get_raw(&path).await.expect("snapshot bytes");
+    backend.clear();
+    backend.rewrite_on_next_range_get(&path, bytes);
+
+    let report = service
+        .preflight_restore(
+            &RestoreSource::snapshot(SNAPSHOT_ID, PIN_ID).expect("snapshot source"),
+            &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            Utc::now(),
+        )
+        .await
+        .expect("second stable source record");
+    assert!(report.is_ready());
+    assert_eq!(
+        backend
+            .operations()
+            .iter()
+            .filter(
+                |operation| matches!(operation, BackendOperation::Get(candidate) if candidate.ends_with(&path)),
+            )
+            .count(),
+        2,
+        "the changed source version must force a fresh exact-sized range read"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_retry_reauthenticates_the_exact_ancestor_before_staging() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+    let snapshot = service
+        .create_snapshot(&request)
+        .await
+        .expect("source snapshot");
+    let store = ControlMvpStateStore::new_synthetic_bounded(
+        storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+    )
+    .expect("store")
+    .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32]));
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("transaction");
+    txn.set_logical_operation_v2("advance-after-capture", "test", &"a1".repeat(32))
+        .expect("logical identity");
+    txn.put(
+        b"catalog/nonempty-child",
+        Bytes::from_static(b"child-value"),
+    )
+    .await
+    .expect("nonempty child mutation");
+    txn.commit_v2().await.expect("new current HEAD");
+    storage
+        .delete("control/v1/domains/catalog/retained/v1/current.json")
+        .await
+        .expect("withheld retained membership");
+    backend.clear();
+    let recovered = service
+        .create_snapshot(&request)
+        .await
+        .expect("exact source must be reauthenticated from current ancestry");
+    assert_eq!(recovered, snapshot);
+    let reference = snapshot.domains().first().expect("source").authority();
+    store
+        .resolve_persisted_reference(reference)
+        .await
+        .expect("reselected original source");
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_retry_rejects_invalid_or_excessive_ancestry_before_staging() {
+    for failure in ["forged_parent", "unrelated", "budget"] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+        service
+            .create_snapshot(&request)
+            .await
+            .expect("source snapshot");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store")
+        .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32]));
+        for ordinal in 0..if failure == "budget" { 10 } else { 1 } {
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("transaction");
+            txn.set_logical_operation_v2(&format!("ancestry-{ordinal}"), "test", &"a2".repeat(32))
+                .expect("identity");
+            txn.commit_v2().await.expect("advance");
+        }
+        if failure == "forged_parent" {
+            let head_path = store.paths().current_pointer();
+            let mut head: Value =
+                serde_json::from_slice(&storage.get_raw(&head_path).await.expect("HEAD"))
+                    .expect("JSON");
+            let path = store
+                .paths()
+                .manifest_object(head["manifest_id"].as_str().expect("manifest ID"));
+            let mut manifest: Value =
+                serde_json::from_slice(&storage.get_raw(&path).await.expect("manifest"))
+                    .expect("JSON");
+            manifest["parent_manifest_sha256"] = Value::String("aa".repeat(32));
+            let bytes = serde_json::to_vec(&manifest).expect("encode");
+            head["manifest_checksum_sha256"] = Value::String(hex::encode(Sha256::digest(&bytes)));
+            storage
+                .put_raw(&path, Bytes::from(bytes), WritePrecondition::None)
+                .await
+                .expect("forged manifest fixture");
+            storage
+                .put_raw(
+                    &head_path,
+                    Bytes::from(serde_json::to_vec(&head).expect("encode")),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("forged HEAD fixture");
+        } else if failure == "unrelated" {
+            storage
+                .delete(&store.paths().current_pointer())
+                .await
+                .expect("replace fixture lineage");
+            store
+                .install_synthetic_genesis(
+                    "unrelated-source",
+                    1,
+                    1,
+                    [arco_catalog::state_store::SyntheticKvEntry {
+                        key: b"other".to_vec(),
+                        generation: 1,
+                        value: Some(b"value".to_vec()),
+                    }],
+                    0,
+                    std::iter::empty(),
+                )
+                .await
+                .expect("unrelated authenticated fixture");
+        }
+        storage
+            .delete("control/v1/domains/catalog/retained/v1/current.json")
+            .await
+            .expect("withheld membership");
+        backend.clear();
+        let result = service.create_snapshot(&request).await;
+        assert!(
+            result.is_err(),
+            "{failure} cannot authenticate the retained source"
+        );
+        if failure == "budget" {
+            assert!(
+                matches!(
+                    result,
+                    Err(arco_catalog::CatalogError::MaintenanceBackpressure { .. })
+                ),
+                "ancestry exhaustion must remain typed backpressure"
+            );
+        }
+        assert!(
+            !backend
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation,
+            BackendOperation::Put(path) if path.contains("/retained/v1/"))),
+            "{failure} staged a retained artifact before authenticating the exact source"
+        );
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_retry_rejects_locally_consistent_invalid_child_transitions() {
+    let mut accepted = Vec::new();
+    for field in [
+        "logical_history",
+        "writer_epoch",
+        "reclamation_generation",
+        "old_role_root",
+    ] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let source_store =
+            ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+                .expect("store")
+                .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32]));
+        let source_head_path = source_store.paths().current_pointer();
+        let mut source_head: Value = serde_json::from_slice(
+            &storage
+                .get_raw(&source_head_path)
+                .await
+                .expect("source HEAD"),
+        )
+        .expect("JSON");
+        let source_path = source_store.paths().manifest_object(
+            source_head["manifest_id"]
+                .as_str()
+                .expect("source manifest ID"),
+        );
+        let mut source_manifest: Value = serde_json::from_slice(
+            &storage
+                .get_raw(&source_path)
+                .await
+                .expect("source manifest"),
+        )
+        .expect("JSON");
+        source_manifest["writer_epoch"] = Value::from(1);
+        source_manifest["reclamation_generation"] = Value::from(1);
+        let source_bytes = serde_json::to_vec(&source_manifest).expect("encode");
+        source_head["manifest_checksum_sha256"] =
+            Value::String(hex::encode(Sha256::digest(&source_bytes)));
+        source_head["writer_epoch"] = Value::from(1);
+        source_head["reclamation_generation"] = Value::from(1);
+        storage
+            .put_raw(
+                &source_path,
+                Bytes::from(source_bytes),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("source fence fixture");
+        storage
+            .put_raw(
+                &source_head_path,
+                Bytes::from(serde_json::to_vec(&source_head).expect("encode")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("source HEAD fence fixture");
+        service
+            .create_snapshot(&request)
+            .await
+            .expect("source snapshot");
+        let store = source_store.with_writer_epoch(1).expect("writer fence");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("transaction");
+        txn.set_logical_operation_v2("child-forgery", "test", &"ab".repeat(32))
+            .expect("identity");
+        txn.commit_v2().await.expect("advance");
+        let head_path = store.paths().current_pointer();
+        let mut head: Value =
+            serde_json::from_slice(&storage.get_raw(&head_path).await.expect("HEAD"))
+                .expect("JSON");
+        let path = store
+            .paths()
+            .manifest_object(head["manifest_id"].as_str().expect("manifest ID"));
+        let mut manifest: Value =
+            serde_json::from_slice(&storage.get_raw(&path).await.expect("manifest")).expect("JSON");
+        if field == "logical_history" {
+            let tx_path = manifest["transaction"]["path"]
+                .as_str()
+                .expect("transaction path")
+                .to_string();
+            let mut tx: Value =
+                serde_json::from_slice(&storage.get_raw(&tx_path).await.expect("transaction"))
+                    .expect("JSON");
+            tx[field] = Value::String("bb".repeat(32));
+            manifest[field] = tx[field].clone();
+            let bytes = serde_json::to_vec(&tx).expect("encode");
+            manifest["transaction"]["sha256"] = Value::String(hex::encode(Sha256::digest(&bytes)));
+            storage
+                .put_raw(&tx_path, Bytes::from(bytes), WritePrecondition::None)
+                .await
+                .expect("forged tx fixture");
+        } else if field == "old_role_root" {
+            let transition_path = manifest["transition"]["path"]
+                .as_str()
+                .expect("transition path")
+                .to_string();
+            let mut transition: Value = serde_json::from_slice(
+                &storage.get_raw(&transition_path).await.expect("transition"),
+            )
+            .expect("JSON");
+            transition["roles"][0]["old_root_hex"] = Value::String("00".repeat(49));
+            let bytes = serde_json::to_vec(&transition).expect("encode");
+            manifest["transition"]["sha256"] = Value::String(hex::encode(Sha256::digest(&bytes)));
+            storage
+                .put_raw(
+                    &transition_path,
+                    Bytes::from(bytes),
+                    WritePrecondition::None,
+                )
+                .await
+                .expect("forged transition fixture");
+        } else {
+            manifest[field] = Value::from(0);
+            head[field] = Value::from(0);
+        }
+        let bytes = serde_json::to_vec(&manifest).expect("encode");
+        head["manifest_checksum_sha256"] = Value::String(hex::encode(Sha256::digest(&bytes)));
+        storage
+            .put_raw(&path, Bytes::from(bytes), WritePrecondition::None)
+            .await
+            .expect("forged child fixture");
+        storage
+            .put_raw(
+                &head_path,
+                Bytes::from(serde_json::to_vec(&head).expect("encode")),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("forged HEAD fixture");
+        storage
+            .delete("control/v1/domains/catalog/retained/v1/current.json")
+            .await
+            .expect("withheld membership");
+        backend.clear();
+        if service.create_snapshot(&request).await.is_ok()
+            || backend.operations().iter().any(|operation| {
+                matches!(operation,
+            BackendOperation::Put(path) if path.contains("/retained/v1/"))
+            })
+        {
+            accepted.push(field);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted locally consistent invalid ancestry edges: {accepted:?}"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_later_stage_failure_retries_only_after_fresh_authentication() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) =
+        bounded_capture_domains(backend.clone(), &["alpha", "beta"]).await;
+    let later_pointer = "control/v1/domains/beta/retained/v1/current.json";
+    *backend.get_failure_suffix.lock().expect("fault") = Some(later_pointer.into());
+    // A missing pointer needs no GET, so use an invalid selected pointer to
+    // exercise a definitive failure before this domain can arm or send.
+    storage
+        .put_raw(
+            later_pointer,
+            Bytes::from_static(b"{}"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("invalid pointer fixture");
+    backend.clear();
+    assert!(service.create_snapshot(&request).await.is_err());
+    assert!(!backend.operations().iter().any(|operation| matches!(operation, BackendOperation::Put(path) if path.ends_with(later_pointer))));
+    let epoch: Value = serde_json::from_slice(
+        &storage
+            .get_raw("retention/coordination/mutation-epoch.json")
+            .await
+            .expect("epoch"),
+    )
+    .expect("JSON");
+    assert!(epoch.get("armed_retained_pointer").is_none());
+    *backend.get_failure_suffix.lock().expect("fault") = None;
+    storage
+        .delete(later_pointer)
+        .await
+        .expect("remove invalid fixture");
+    backend.clear();
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("fresh exact-source retry");
+    assert!(
+        !backend
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation,
+        BackendOperation::Put(path) if path.ends_with("domains/alpha/retained/v1/current.json")))
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_workspace_snapshot_capture_requires_the_private_retained_source_path() {
+    let (storage, service, request) = bounded_capture_fixture(Arc::new(MemoryBackend::new())).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("configured authority-8 capture must prepare its private retained source");
+    assert!(
+        storage
+            .get_raw(&retention_pin_latest_path(PIN_ID).expect("pin path"))
+            .await
+            .is_ok(),
+        "authority-8 capture must select its immutable initial pin"
+    );
+    assert!(
+        storage
+            .get_raw("control/v1/domains/catalog/retained/v1/current.json")
+            .await
+            .is_ok(),
+        "authority-8 capture must publish its selected retained-source pointer"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_authority8_and_v7_capture_uses_a_bounded_v7_checkpoint_source() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request, v7) = mixed_v7_capture_fixture(backend).await;
+    let snapshot = service
+        .create_snapshot(&request)
+        .await
+        .expect("mixed capture must prepare a bounded V7 checkpoint source");
+    let legacy = snapshot
+        .domains()
+        .iter()
+        .find(|domain| domain.domain() == "legacy")
+        .expect("legacy domain");
+    assert_eq!(
+        legacy.authority().reference_kind(),
+        PersistedAuthorityKind::Checkpoint,
+        "mixed V7 capture must retain an ordinary checkpoint reference"
+    );
+    v7.resolve_persisted_reference(legacy.authority())
+        .await
+        .expect("published V7 checkpoint reference remains readable");
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("exact mixed snapshot retry must retain its already-published V7 checkpoint");
+    assert!(
+        storage
+            .get_raw(&retention_pin_latest_path(PIN_ID).expect("pin path"))
+            .await
+            .is_ok(),
+        "mixed capture must select its workspace pin"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_authority8_and_v7_preflight_uses_one_bounded_read_invoice() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (_, service, request, _) = mixed_v7_capture_fixture(backend.clone()).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("mixed source snapshot");
+    backend.clear();
+
+    let report = service
+        .preflight_restore(
+            &RestoreSource::snapshot(SNAPSHOT_ID, PIN_ID).expect("snapshot source"),
+            &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            Utc::now(),
+        )
+        .await
+        .expect("bounded mixed preflight");
+    assert!(report.is_ready(), "bounded mixed preflight: {report:?}");
+    assert!(backend.operations().iter().all(|operation| {
+        !matches!(
+            operation,
+            BackendOperation::Put(_) | BackendOperation::Delete(_) | BackendOperation::List(_)
+        )
+    }));
+    assert!(backend.operations().iter().any(|operation| {
+        matches!(operation, BackendOperation::Head(path) if path.contains("domains/catalog/head/current.json"))
+    }));
+    assert!(backend.operations().iter().any(|operation| {
+        matches!(operation, BackendOperation::Head(path) if path.contains("domains/legacy/checkpoints/"))
+    }));
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_bounded_preflight_does_not_forward_to_a_legacy_authority_resolver() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request, v7) = mixed_v7_capture_fixture(backend).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("mixed source snapshot");
+    let v8_scope = StateScope::new("tenant", "workspace", "catalog");
+    let v8 = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), v8_scope.clone())
+            .expect("authority-8 store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let trap = Arc::new(LegacyResolverTrapAdapter {
+        inner: v7.clone(),
+        calls: calls.clone(),
+    });
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                v8_scope,
+                v8.clone(),
+                v8,
+                Arc::new(EmptyProjectionProvider),
+                Arc::new(EmptyArchiveProvider),
+            )
+            .expect("authority-8 binding"),
+            WorkspaceDomainBinding::new(
+                StateScope::new("tenant", "workspace", "legacy"),
+                v7,
+                trap,
+                Arc::new(EmptyProjectionProvider),
+                Arc::new(EmptyArchiveProvider),
+            )
+            .expect("authority-7 binding"),
+        ],
+    )
+    .expect("registry");
+    let preflight = WorkspaceSnapshotService::new(storage, registry).expect("mixed service");
+
+    let report = preflight
+        .preflight_restore(
+            &RestoreSource::snapshot(SNAPSHOT_ID, PIN_ID).expect("snapshot source"),
+            &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            Utc::now(),
+        )
+        .await
+        .expect("default bounded adapter rejection is classified");
+    assert!(report.issues().iter().any(|issue| {
+        issue.kind() == RestorePreflightIssueKind::Incompatible
+            && issue.domain() == Some("legacy")
+            && issue.identifier() == "authority"
+    }));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "bounded preflight must reject the default hook before legacy adapter I/O"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_preflight_rejects_an_oversized_required_object_before_its_body_read() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("source snapshot");
+    let path = "preflight/oversized-required-object.bin";
+    let object = RequiredObject::new(
+        path,
+        (4 * 1024 * 1024 + 1) as u64,
+        RequiredObjectKind::Other,
+        DIGEST,
+    )
+    .expect("valid unbounded snapshot object declaration");
+    mutate_json(
+        &storage,
+        &snapshot_record_path(SNAPSHOT_ID).expect("snapshot path"),
+        |value| {
+            value["required_objects"]
+                .as_array_mut()
+                .expect("required objects")
+                .push(serde_json::to_value(&object).expect("required object JSON"));
+        },
+    )
+    .await;
+    backend.clear();
+
+    assert!(matches!(
+        service
+            .preflight_restore(
+                &RestoreSource::snapshot(SNAPSHOT_ID, PIN_ID).expect("snapshot source"),
+                &WorkspaceScope::new("tenant", "workspace").expect("scope"),
+                Utc::now(),
+            )
+            .await,
+        Err(arco_catalog::CatalogError::MaintenanceBackpressure { .. })
+    ));
+    assert!(
+        !backend.operations().iter().any(
+            |operation| matches!(operation, BackendOperation::Get(candidate) if candidate.ends_with(path))
+        ),
+        "oversized required object must be rejected before its range GET"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+async fn mixed_v7_capture_fixture(
+    backend: Arc<RecordingBackend>,
+) -> (
+    ScopedStorage,
+    WorkspaceSnapshotService,
+    CreateWorkspaceSnapshotRequest,
+    Arc<ControlMvpStateStore>,
+) {
+    mixed_v7_capture_fixture_with_projection(backend, Arc::new(EmptyProjectionProvider)).await
+}
+
+#[cfg(feature = "test-utils")]
+async fn mixed_v7_capture_fixture_with_projection(
+    backend: Arc<RecordingBackend>,
+    legacy_projection: Arc<dyn ProjectionWatermarkProvider>,
+) -> (
+    ScopedStorage,
+    WorkspaceSnapshotService,
+    CreateWorkspaceSnapshotRequest,
+    Arc<ControlMvpStateStore>,
+) {
+    mixed_v7_capture_fixture_with_value(backend, Bytes::from_static(b"value"), legacy_projection)
+        .await
+}
+
+#[cfg(feature = "test-utils")]
+async fn mixed_v7_capture_fixture_with_value(
+    backend: Arc<RecordingBackend>,
+    legacy_value: Bytes,
+    legacy_projection: Arc<dyn ProjectionWatermarkProvider>,
+) -> (
+    ScopedStorage,
+    WorkspaceSnapshotService,
+    CreateWorkspaceSnapshotRequest,
+    Arc<ControlMvpStateStore>,
+) {
+    let storage = ScopedStorage::new(backend, "tenant", "workspace").expect("storage");
+    let v8_scope = StateScope::new("tenant", "workspace", "catalog");
+    let v8 = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), v8_scope.clone())
+            .expect("authority-8 store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+    );
+    v8.install_synthetic_genesis(
+        "mixed-source",
+        1,
+        1,
+        [arco_catalog::state_store::SyntheticKvEntry {
+            key: b"seed".to_vec(),
+            generation: 1,
+            value: Some(b"value".to_vec()),
+        }],
+        0,
+        std::iter::empty(),
+    )
+    .await
+    .expect("authority-8 source");
+    let v7_scope = StateScope::new("tenant", "workspace", "legacy");
+    let v7 = Arc::new(initialized_control_store_with_value(&storage, "legacy", legacy_value).await);
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                v8_scope,
+                v8.clone(),
+                v8,
+                Arc::new(EmptyProjectionProvider),
+                Arc::new(EmptyArchiveProvider),
+            )
+            .expect("authority-8 binding"),
+            WorkspaceDomainBinding::new(
+                v7_scope,
+                v7.clone(),
+                v7.clone(),
+                legacy_projection,
+                Arc::new(EmptyArchiveProvider),
+            )
+            .expect("authority-7 binding"),
+        ],
+    )
+    .expect("registry");
+    let service = WorkspaceSnapshotService::new(storage.clone(), registry).expect("mixed service");
+    let now = Utc::now();
+    let request = CreateWorkspaceSnapshotRequest::new(
+        SNAPSHOT_ID,
+        PIN_ID,
+        now,
+        now + chrono::Duration::days(1),
+        None,
+    )
+    .expect("request");
+    (storage, service, request, v7)
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_v7_capture_rejects_a_legacy_only_provider_without_calling_it() {
+    let backend = Arc::new(RecordingBackend::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (_, service, request, _) = mixed_v7_capture_fixture_with_projection(
+        backend,
+        Arc::new(LegacyOnlyProjectionProvider {
+            calls: calls.clone(),
+        }),
+    )
+    .await;
+    assert!(service.create_snapshot(&request).await.is_err());
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "mixed bounded capture must never fall back to a V7 legacy provider"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_v7_checkpoint_artifact_lost_response_reconciles_or_keeps_epoch_in_flight() {
+    for mode in [BoundedPutMode::LostCommitted, BoundedPutMode::NoWrite] {
+        let backend = Arc::new(RecordingBackend::default());
+        let (storage, service, request, _) = mixed_v7_capture_fixture(backend.clone()).await;
+        *backend.bounded_put_fault.lock().expect("fault") = Some(BoundedPutFault {
+            suffix: ".arrow".into(),
+            ordinal: 1,
+            mode,
+        });
+        let result = service.create_snapshot(&request).await;
+        assert_eq!(
+            result.is_ok(),
+            matches!(mode, BoundedPutMode::LostCommitted),
+            "V7 checkpoint artifact {mode:?}: {result:?}"
+        );
+        let epoch: Value = serde_json::from_slice(
+            &storage
+                .get_raw("retention/coordination/mutation-epoch.json")
+                .await
+                .expect("epoch"),
+        )
+        .expect("epoch JSON");
+        assert_eq!(
+            epoch["state"],
+            if matches!(mode, BoundedPutMode::LostCommitted) {
+                "IDLE"
+            } else {
+                "IN_FLIGHT"
+            },
+            "V7 checkpoint artifact {mode:?} must not settle an uncertain immutable publication"
+        );
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_v7_capture_rejects_a_valid_source_segment_that_exceeds_shared_admission_before_get()
+{
+    let backend = Arc::new(RecordingBackend::default());
+    let (_, service, request, _) = mixed_v7_capture_fixture_with_value(
+        backend.clone(),
+        Bytes::from(vec![0_u8; 33 * 1024 * 1024]),
+        Arc::new(EmptyProjectionProvider),
+    )
+    .await;
+    backend.clear();
+
+    assert!(
+        service.create_snapshot(&request).await.is_err(),
+        "a valid V7 source segment beyond the remaining 32 MiB invoice must fail closed"
+    );
+    let segment_path = "control/v1/domains/legacy/segments/l0/";
+    assert!(
+        backend.operations().iter().any(
+            |operation| matches!(operation, BackendOperation::Head(path) if path.contains(segment_path))
+        ),
+        "bounded V7 admission must charge the source segment HEAD"
+    );
+    assert!(
+        !backend.operations().iter().any(
+            |operation| matches!(operation, BackendOperation::Get(path) if path.contains(segment_path))
+        ),
+        "bounded V7 admission must reject before reading the oversized source segment"
+    );
+    assert!(
+        !backend.operations().iter().any(
+            |operation| matches!(operation, BackendOperation::Put(path) if path.ends_with("/retained/v1/current.json"))
+        ),
+        "source admission failure must precede retained-pointer publication"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+async fn bounded_capture_restart_case(pointer_visible: bool) {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+    let pointer_path = "control/v1/domains/catalog/retained/v1/current.json";
+    backend.fail_put(pointer_path);
+    assert!(service.create_snapshot(&request).await.is_err());
+    let epoch_path = "retention/coordination/mutation-epoch.json";
+    let armed: Value =
+        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("armed epoch"))
+            .expect("JSON");
+    let intent = armed
+        .get("armed_retained_pointer")
+        .expect("armed pointer intent");
+    assert!(intent.is_object());
+    *backend.put_failure_suffix.lock().expect("fault") = None;
+    if pointer_visible {
+        storage
+            .put_raw(
+                pointer_path,
+                Bytes::copy_from_slice(
+                    intent["expected_pointer_json"]
+                        .as_str()
+                        .expect("expected bytes")
+                        .as_bytes(),
+                ),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("late committed request");
+    }
+    backend.clear();
+    let result = service.create_snapshot(&request).await;
+    let selected: Value =
+        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch")).expect("JSON");
+    if pointer_visible {
+        result.expect("exact visible pointer permits recovery");
+        assert_eq!(
+            selected.get("state").expect("epoch state"),
+            "IDLE",
+            "recovery must settle exact armed intent"
+        );
+        assert!(selected.get("armed_retained_pointer").is_none());
+    } else {
+        assert!(
+            result.is_err(),
+            "snapshot and pin cannot turn a possibly pending absent pointer into success"
+        );
+        assert_eq!(selected, armed, "unresolved intent must remain unchanged");
+    }
+    assert!(!backend.operations().iter().any(|operation| matches!(operation, BackendOperation::Put(path) if path.ends_with(pointer_path))), "restart must send zero pointer CAS operations");
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_restart_does_not_resend_an_absent_armed_pointer() {
+    bounded_capture_restart_case(false).await;
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_restart_settles_only_exact_visible_armed_pointer() {
+    bounded_capture_restart_case(true).await;
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_retry_rejects_a_released_pin() {
+    let (storage, service, request) = bounded_capture_fixture(Arc::new(MemoryBackend::new())).await;
+    service.create_snapshot(&request).await.expect("capture");
+    let path = retention_pin_revision_path(PIN_ID, 1).expect("path");
+    let initial = decode_retention_pin_revision(&storage.get_raw(&path).await.expect("initial"))
+        .expect("pin");
+    let released = initial.release(2, Utc::now()).expect("release");
+    let bytes = encode_retention_pin_revision(&released).expect("encode");
+    let path = retention_pin_revision_path(PIN_ID, 2).expect("path");
+    let latest = RetentionPinLatest::new(PIN_ID, 2, &path, sha256(&bytes)).expect("selector");
+    storage
+        .put_raw(&path, Bytes::from(bytes), WritePrecondition::DoesNotExist)
+        .await
+        .expect("revision");
+    storage
+        .put_raw(
+            &retention_pin_latest_path(PIN_ID).expect("path"),
+            Bytes::from(encode_retention_pin_latest(&latest).expect("encode")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("select");
+    assert!(
+        service.create_snapshot(&request).await.is_err(),
+        "released pin cannot authorize a capture retry"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_reuses_preexisting_membership_without_pointer_writes() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (_, service, first) = bounded_capture_fixture(backend.clone()).await;
+    service
+        .create_snapshot(&first)
+        .await
+        .expect("first capture");
+    let second = CreateWorkspaceSnapshotRequest::new(
+        "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        ALT_PIN_ID,
+        first.created_at(),
+        first.retained_until(),
+        None,
+    )
+    .expect("second capture");
+    backend.clear();
+    service
+        .create_snapshot(&second)
+        .await
+        .expect("second capture");
+    assert!(!backend.operations().iter().any(|operation| matches!(operation, BackendOperation::Put(path) if path.contains("/retained/v1/"))), "preexisting exact membership must need zero retained object or pointer writes");
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_rejects_more_than_thirty_days_and_settles_unsent_epoch() {
+    let (storage, service, first) = bounded_capture_fixture(Arc::new(MemoryBackend::new())).await;
+    let request = CreateWorkspaceSnapshotRequest::new(
+        first.snapshot_id(),
+        first.pin_id(),
+        first.created_at(),
+        Utc::now() + chrono::Duration::days(31),
+        None,
+    )
+    .expect("request");
+    assert!(
+        service.create_snapshot(&request).await.is_err(),
+        "private source capture cannot mint more than thirty days"
+    );
+    let epoch: Value = serde_json::from_slice(
+        &storage
+            .get_raw("retention/coordination/mutation-epoch.json")
+            .await
+            .expect("epoch"),
+    )
+    .expect("JSON");
+    assert_eq!(
+        epoch["state"], "IDLE",
+        "a definite pre-send rejection must settle its epoch"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_definitive_foreign_pointer_conflict_clears_intent() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+    let pointer_path = "control/v1/domains/catalog/retained/v1/current.json";
+    let epoch_path = "retention/coordination/mutation-epoch.json";
+    backend.pause_put(pointer_path);
+    let (result, ()) = tokio::join!(service.create_snapshot(&request), async {
+        backend.wait_for_paused_put().await;
+        let armed: Value =
+            serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch"))
+                .expect("JSON");
+        let expected = armed["armed_retained_pointer"]["expected_pointer_json"]
+            .as_str()
+            .expect("expected pointer");
+        let foreign = expected.replace(request.snapshot_id(), "foreign-capture");
+        assert_ne!(foreign, expected);
+        storage
+            .put_raw(
+                pointer_path,
+                Bytes::from(foreign),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("competing pointer");
+        backend.resume_paused_put();
+    });
+    assert!(
+        matches!(
+            result,
+            Err(arco_catalog::CatalogError::PreconditionFailed { .. })
+        ),
+        "direct foreign precondition loss must be terminal conflict"
+    );
+    let epoch: Value =
+        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch")).expect("JSON");
+    assert_eq!(epoch["state"], "IDLE");
+    assert!(epoch.get("armed_retained_pointer").is_none());
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_armed_recovery_rejects_an_old_descriptor_incarnation() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, first) = bounded_capture_fixture(backend.clone()).await;
+    service
+        .create_snapshot(&first)
+        .await
+        .expect("first capture");
+    let second = CreateWorkspaceSnapshotRequest::new(
+        "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        ALT_PIN_ID,
+        first.created_at(),
+        first.retained_until(),
+        None,
+    )
+    .expect("second");
+    service
+        .create_snapshot(&second)
+        .await
+        .expect("preexisting member");
+    let pointer_path = "control/v1/domains/catalog/retained/v1/current.json";
+    let epoch_path = "retention/coordination/mutation-epoch.json";
+    let bytes = storage.get_raw(pointer_path).await.expect("pointer");
+    let old: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let mut epoch: Value =
+        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch")).expect("JSON");
+    let expected = std::str::from_utf8(&bytes)
+        .expect("UTF-8")
+        .replace(first.snapshot_id(), second.snapshot_id())
+        .replace(
+            "\"capture_epoch\":1",
+            &format!("\"capture_epoch\":{}", epoch["epoch"]),
+        )
+        .replace("\"previous_generation\":0", "\"previous_generation\":1")
+        .replace(
+            "\"previous_root_sha256\":null",
+            &format!("\"previous_root_sha256\":{}", old["root_sha256"]),
+        )
+        .replace("\"generation\":1", "\"generation\":2");
+    let domain = service
+        .create_snapshot(&second)
+        .await
+        .expect("valid replay")
+        .domains()[0]
+        .clone();
+    let reference_bytes = serde_json::to_vec(domain.authority()).expect("reference");
+    let mut hash = Sha256::new();
+    hash.update(b"arco.retained-reference.key.v1\0");
+    hash.update((reference_bytes.len() as u64).to_be_bytes());
+    hash.update(reference_bytes);
+    let version = storage
+        .head_raw(pointer_path)
+        .await
+        .expect("HEAD")
+        .expect("exists")
+        .version;
+    epoch["state"] = Value::from("IN_FLIGHT");
+    epoch["completed_at"] = Value::Null;
+    epoch["armed_retained_pointer"] = serde_json::json!({"intent_type":"arco.retained-source.pointer-intent","version":1,"domain":"catalog","pointer_path":pointer_path,"reference_key_hex":hex::encode(hash.finalize()),"expected_pointer_json":expected,"expected_pointer_raw_sha256":hex::encode(Sha256::digest(expected.as_bytes())),"precondition":{"kind":"matches_version","version":version}});
+    storage
+        .put_raw(pointer_path, Bytes::from(expected), WritePrecondition::None)
+        .await
+        .expect("forged pointer");
+    storage
+        .put_raw(
+            epoch_path,
+            Bytes::from(serde_jcs::to_vec(&epoch).expect("epoch JSON")),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("forged armed epoch");
+    backend.clear();
+    assert!(
+        service.create_snapshot(&second).await.is_err(),
+        "armed insertion must not use another capture incarnation's descriptor"
+    );
+    let after: Value =
+        serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch")).expect("JSON");
+    assert_eq!(after, epoch);
+    assert!(
+        !backend
+            .operations()
+            .iter()
+            .any(|op| matches!(op, BackendOperation::Put(path) if path.ends_with(pointer_path)))
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_arm_pointer_clear_faults_preserve_exact_restart_ownership() {
+    let pointer_path = "control/v1/domains/catalog/retained/v1/current.json";
+    let epoch_path = "retention/coordination/mutation-epoch.json";
+    for boundary in ["arm", "pointer", "clear"] {
+        for mode in [
+            BoundedPutMode::LostCommitted,
+            BoundedPutMode::NoWrite,
+            BoundedPutMode::PauseBefore,
+            BoundedPutMode::PauseAfter,
+        ] {
+            let backend = Arc::new(RecordingBackend::default());
+            let (storage, service, request) = bounded_capture_fixture(backend.clone()).await;
+            let (suffix, ordinal) = match boundary {
+                "arm" => (epoch_path, 2),
+                "pointer" => (pointer_path, 1),
+                _ => (epoch_path, 3),
+            };
+            *backend.bounded_put_fault.lock().expect("fault") = Some(BoundedPutFault {
+                suffix: suffix.into(),
+                ordinal,
+                mode,
+            });
+            if matches!(
+                mode,
+                BoundedPutMode::PauseBefore | BoundedPutMode::PauseAfter
+            ) {
+                let mut pending = Box::pin(service.create_snapshot(&request));
+                tokio::select! {
+                    result = pending.as_mut() => panic!("{boundary}/{mode:?} returned before pause: {result:?}"),
+                    () = backend.wait_for_paused_put() => {}
+                }
+                drop(pending);
+                backend
+                    .expire_lock(
+                        "tenant=tenant/workspace=workspace/locks/workspace-retention-gc.lock.json",
+                    )
+                    .await;
+            } else {
+                let result = service.create_snapshot(&request).await;
+                assert_eq!(
+                    result.is_ok(),
+                    matches!(mode, BoundedPutMode::LostCommitted),
+                    "{boundary}/{mode:?}: {result:?}"
+                );
+            }
+            let before: Value =
+                serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch"))
+                    .expect("JSON");
+            let armed = before.get("armed_retained_pointer").is_some();
+            let visible = storage
+                .head_raw(pointer_path)
+                .await
+                .expect("pointer HEAD")
+                .is_some();
+            backend.clear();
+            let result = service.create_snapshot(&request).await;
+            if armed && !visible {
+                assert!(
+                    result.is_err(),
+                    "{boundary}/{mode:?}: absent armed pointer must remain unresolved"
+                );
+                let after: Value =
+                    serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch"))
+                        .expect("JSON");
+                assert_eq!(after, before);
+            } else {
+                result.unwrap_or_else(|error| {
+                    panic!("{boundary}/{mode:?}: exact recovery failed: {error}")
+                });
+                let after: Value =
+                    serde_json::from_slice(&storage.get_raw(epoch_path).await.expect("epoch"))
+                        .expect("JSON");
+                assert_eq!(after["state"], "IDLE");
+            }
+            let sends = backend
+                .operations()
+                .iter()
+                .filter(
+                    |op| matches!(op, BackendOperation::Put(path) if path.ends_with(pointer_path)),
+                )
+                .count();
+            assert_eq!(
+                sends,
+                usize::from(!armed && !visible),
+                "{boundary}/{mode:?}: restart send ownership differs"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_capture_later_membership_preserves_the_older_capture() {
+    let (storage, service, first) = bounded_capture_fixture(Arc::new(MemoryBackend::new())).await;
+    service.create_snapshot(&first).await.expect("first");
+    let second = CreateWorkspaceSnapshotRequest::new(
+        "snap_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        ALT_PIN_ID,
+        first.created_at(),
+        first.retained_until() + chrono::Duration::seconds(1),
+        None,
+    )
+    .expect("second");
+    service
+        .create_snapshot(&second)
+        .await
+        .expect("second different reference");
+    let pointer: Value = serde_json::from_slice(
+        &storage
+            .get_raw("control/v1/domains/catalog/retained/v1/current.json")
+            .await
+            .expect("pointer"),
+    )
+    .expect("JSON");
+    assert_eq!(pointer["generation"], 2);
+    service
+        .create_snapshot(&first)
+        .await
+        .expect("old descriptor remains valid below newer pointer");
 }
 
 #[test]
@@ -3337,4 +4994,161 @@ async fn preflight_malformed_records_and_backend_outages_are_operation_errors() 
             .await,
         Err(arco_catalog::CatalogError::Storage { .. })
     ));
+}
+
+#[test]
+fn bounded_retention_lock_rejects_oversized_operation_before_cloning() {
+    let backend = Arc::new(MemoryBackend::new());
+    let lock =
+        arco_core::lock::DistributedLock::new(backend, "bounded.lock").with_bounded_records();
+    let operation = "x".repeat(2 * 1024 * 1024);
+    let mut result = None;
+    let allocations = allocation_counter::measure(|| {
+        result = Some(futures::executor::block_on(lock.acquire_with_operation(
+            Duration::from_secs(30),
+            5,
+            Some(operation),
+        )));
+    });
+    assert!(matches!(
+        result,
+        Some(Err(arco_core::Error::InvalidInput(_)))
+    ));
+    assert!(
+        allocations.bytes_total < 64 * 1024,
+        "reject oversized operation before cloning or encoding: {} bytes allocated",
+        allocations.bytes_total
+    );
+}
+
+#[cfg(feature = "test-utils")]
+fn bounded_capture_binding(
+    scope: StateScope,
+    store: Arc<ControlMvpStateStore>,
+    adapter: Arc<ControlMvpStateStore>,
+) -> Result<WorkspaceDomainBinding> {
+    WorkspaceDomainBinding::new(
+        scope,
+        store,
+        adapter,
+        Arc::new(EmptyProjectionProvider),
+        Arc::new(EmptyArchiveProvider),
+    )
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn bounded_capture_config_rejects_missing_or_mismatched_authority_before_io() {
+    let backend = Arc::new(RecordingBackend::default());
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+            .expect("store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+    );
+    let missing = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone()).expect("store"),
+    );
+    assert!(
+        bounded_capture_binding(scope.clone(), missing.clone(), missing).is_err(),
+        "missing durable binding"
+    );
+    let other = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage, scope.clone())
+            .expect("store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([22; 32])),
+    );
+    assert!(
+        bounded_capture_binding(scope.clone(), store.clone(), other).is_err(),
+        "different durable binding"
+    );
+    assert!(
+        bounded_capture_binding(
+            StateScope::new("tenant", "workspace", "other"),
+            store.clone(),
+            store.clone()
+        )
+        .is_err(),
+        "different domain"
+    );
+    assert!(
+        bounded_capture_binding(scope, store.clone(), store).is_ok(),
+        "shared authority"
+    );
+    assert!(backend.operations().is_empty());
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn bounded_capture_config_rejects_foreign_adapter_and_coordination_backend_before_io() {
+    let backend = Arc::new(RecordingBackend::default());
+    let other_backend = Arc::new(RecordingBackend::default());
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+    let foreign =
+        ScopedStorage::new(other_backend.clone(), "tenant", "workspace").expect("foreign storage");
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage, scope.clone())
+            .expect("store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+    );
+    let other = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(foreign.clone(), scope.clone())
+            .expect("store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+    );
+    assert!(
+        bounded_capture_binding(scope.clone(), store.clone(), other).is_err(),
+        "foreign adapter"
+    );
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        vec![bounded_capture_binding(scope, store.clone(), store).expect("binding")],
+    )
+    .expect("registry");
+    assert!(
+        WorkspaceSnapshotService::new(foreign, registry).is_err(),
+        "foreign coordination backend"
+    );
+    assert!(backend.operations().is_empty());
+    assert!(other_backend.operations().is_empty());
+}
+
+#[cfg(feature = "test-utils")]
+#[test]
+fn bounded_capture_config_checks_every_mixed_participant_and_preserves_v7_construction() {
+    for mixed in [true, false] {
+        let backend = Arc::new(RecordingBackend::default());
+        let other_backend = Arc::new(RecordingBackend::default());
+        let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("storage");
+        let foreign = ScopedStorage::new(other_backend.clone(), "tenant", "workspace")
+            .expect("foreign storage");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let old_scope = StateScope::new("tenant", "workspace", "legacy");
+        let old = Arc::new(ControlMvpStateStore::new(foreign, old_scope.clone()).expect("legacy"));
+        let mut bindings =
+            vec![bounded_capture_binding(old_scope, old.clone(), old).expect("legacy binding")];
+        if mixed {
+            let store = Arc::new(
+                ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+                    .expect("store")
+                    .with_durable_authority_binding(DurableAuthorityBinding::new([21; 32])),
+            );
+            bindings.push(
+                bounded_capture_binding(scope, store.clone(), store).expect("bounded binding"),
+            );
+        }
+        let registry = WorkspaceDomainRegistry::new(
+            WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            bindings,
+        )
+        .expect("registry");
+        assert_eq!(
+            WorkspaceSnapshotService::new(storage, registry).is_err(),
+            mixed
+        );
+        assert!(backend.operations().is_empty());
+        assert!(other_backend.operations().is_empty());
+    }
 }

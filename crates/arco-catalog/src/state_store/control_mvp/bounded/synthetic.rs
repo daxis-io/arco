@@ -400,6 +400,15 @@ pub(super) async fn validate_manifest_witness(
     manifest: &Manifest8,
     roots: (&directory::Root, &directory::Root, &directory::Root),
 ) -> Result<()> {
+    validate_manifest_witness_with_budget(store, manifest, roots, None).await
+}
+
+pub(super) async fn validate_manifest_witness_with_budget(
+    store: &ControlMvpStateStore,
+    manifest: &Manifest8,
+    roots: (&directory::Root, &directory::Root, &directory::Root),
+    budget: Option<&mut super::retained::ReadBudget<'_>>,
+) -> Result<()> {
     if manifest.kind != ManifestKind8::SyntheticGenesis {
         return Err(invariant_violation(
             "synthetic witness is attached to a transaction manifest",
@@ -423,9 +432,14 @@ pub(super) async fn validate_manifest_witness(
             "synthetic genesis witness reference is invalid",
         ));
     }
-    let bytes = store
-        .get_json(&witness_ref.path, super::super::MAX_CONTROL_JSON_BYTES)
-        .await?;
+    let bytes = super::bounded_json(
+        store,
+        budget,
+        &witness_ref.path,
+        super::super::MAX_CONTROL_JSON_BYTES,
+        "synthetic genesis witness",
+    )
+    .await?;
     validate_raw_checksum(
         &bytes,
         Some(&witness_ref.sha256),

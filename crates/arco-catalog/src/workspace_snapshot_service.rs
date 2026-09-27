@@ -15,8 +15,9 @@ use crate::gc::reachability::load_selected_retention_pin;
 use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
 use crate::state_store::{
     ArcoStateStore, CheckpointOptions, PersistedAuthorityAdapter, PersistedAuthorityKind,
-    StateRestoreParticipant, StateScope, StateStoreCapabilities,
+    RetainedSourceCaptureContext, StateRestoreParticipant, StateScope, StateStoreCapabilities,
 };
+pub use crate::workspace_io_budget::WorkspaceCaptureIo;
 use crate::workspace_snapshot::{
     DomainAuthorityReference, DomainEventArchive, EventArchiveCut, ExportManifest,
     LegacyCompatibilityArtifact, ProjectionWatermark, RETENTION_GC_LOCK_MAX_RETRIES,
@@ -498,6 +499,20 @@ impl EventArchiveCapture {
 /// Captures the complete projection cut for one retained authority.
 #[async_trait]
 pub trait ProjectionWatermarkProvider: Send + Sync {
+    /// Captures metadata through the shared bounded workspace read context.
+    ///
+    /// # Errors
+    /// Returns unsupported unless the provider explicitly implements bounded capture.
+    async fn capture_bounded(
+        &self,
+        _authority: &DomainAuthorityReference,
+        _io: &mut WorkspaceCaptureIo<'_>,
+    ) -> Result<ProjectionWatermarkCut> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "provider does not implement bounded workspace capture".into(),
+        })
+    }
+
     /// Captures validated projection metadata and explicit object references.
     ///
     /// # Errors
@@ -510,6 +525,20 @@ pub trait ProjectionWatermarkProvider: Send + Sync {
 /// Captures the explicit event archive boundary for one retained authority.
 #[async_trait]
 pub trait EventArchiveProvider: Send + Sync {
+    /// Captures metadata through the shared bounded workspace read context.
+    ///
+    /// # Errors
+    /// Returns unsupported unless the provider explicitly implements bounded capture.
+    async fn capture_bounded(
+        &self,
+        _authority: &DomainAuthorityReference,
+        _io: &mut WorkspaceCaptureIo<'_>,
+    ) -> Result<EventArchiveCapture> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "provider does not implement bounded workspace capture".into(),
+        })
+    }
+
     /// Captures one validated archive boundary and its explicit objects.
     ///
     /// # Errors
@@ -542,6 +571,26 @@ impl WorkspaceDomainBinding {
         event_archive_provider: Arc<dyn EventArchiveProvider>,
     ) -> Result<Self> {
         state_scope.validate()?;
+        let store_config = state_store.workspace_capture_config();
+        let adapter_config = authority_adapter.workspace_capture_config();
+        if state_store.capabilities().bounded_workspace_io()
+            || adapter_config
+                .as_ref()
+                .is_some_and(|config| config.authority_format == 8)
+        {
+            let config = store_config
+                .as_ref()
+                .ok_or_else(|| validation("bounded capture configuration is missing"))?;
+            if adapter_config.as_ref() != Some(config)
+                || config.scope != state_scope
+                || config.authority_format != 8
+                || config.durable_binding.is_none()
+            {
+                return Err(validation(
+                    "bounded capture store and adapter configuration disagree",
+                ));
+            }
+        }
         Ok(Self {
             state_scope,
             state_store,
@@ -564,7 +613,8 @@ impl WorkspaceDomainBinding {
         self.state_store.capabilities()
     }
 
-    /// Explicitly configures deterministic roll-forward restore for this domain.
+    /// Configures legacy restore or synthetic bounded Plan7 planning and inspection.
+    /// Bounded restore advance remains unavailable.
     ///
     /// # Errors
     ///
@@ -573,7 +623,10 @@ impl WorkspaceDomainBinding {
         mut self,
         participant: Arc<dyn StateRestoreParticipant>,
     ) -> Result<Self> {
-        if !self.capabilities().roll_forward_restore()
+        // Synthetic bounded composition registers Plan7 planning/inspection;
+        // bounded advance remains unavailable and rejects before legacy apply.
+        if !(self.capabilities().roll_forward_restore()
+            || self.capabilities().bounded_workspace_io())
             || participant.implementation() != self.capabilities().implementation()
             || participant.scope() != &self.state_scope
         {
@@ -675,6 +728,12 @@ pub struct WorkspaceSnapshotService {
 }
 
 impl WorkspaceSnapshotService {
+    pub(crate) fn bounded_workspace_io(&self) -> bool {
+        self.registry
+            .domains()
+            .any(|(_, binding)| binding.capabilities().bounded_workspace_io())
+    }
+
     /// Creates a service whose storage and registry address the same workspace.
     ///
     /// # Errors
@@ -687,6 +746,35 @@ impl WorkspaceSnapshotService {
             return Err(validation(
                 "snapshot service storage scope does not match domain registry",
             ));
+        }
+        if registry
+            .domains()
+            .any(|(_, binding)| binding.capabilities().bounded_workspace_io())
+        {
+            let backend = crate::state_store::StateStoreBindingIdentity::from_root_storage(
+                &RootStorage::from(storage.clone()),
+            );
+            for (_, binding) in registry.domains() {
+                let store_config =
+                    binding
+                        .state_store
+                        .workspace_capture_config()
+                        .ok_or_else(|| {
+                            validation("bounded workspace participant lacks capture configuration")
+                        })?;
+                if store_config.backend != backend
+                    || store_config.scope != binding.state_scope
+                    || binding
+                        .authority_adapter
+                        .workspace_capture_config()
+                        .as_ref()
+                        != Some(&store_config)
+                {
+                    return Err(validation(
+                        "bounded workspace participants must share the coordination backend",
+                    ));
+                }
+            }
         }
         Ok(Self {
             storage,
@@ -794,6 +882,117 @@ impl WorkspaceSnapshotService {
         Ok(cut)
     }
 
+    pub(crate) async fn immutable_restore_cut_bounded(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<PreflightCut> {
+        expected_scope.validate()?;
+        let cut = self.load_bounded_preflight_cut(source, budget).await?;
+        if &cut.scope != expected_scope || self.registry.scope() != expected_scope {
+            return Err(validation("restore source record is out of scope"));
+        }
+        Ok(cut)
+    }
+
+    pub(crate) async fn validated_restore_cut_for_domains_bounded(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        selected_domains: &BTreeSet<String>,
+        now: DateTime<Utc>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<PreflightCut> {
+        expected_scope.validate()?;
+        if selected_domains.is_empty() {
+            return Err(validation("restore preflight requires a selected domain"));
+        }
+        let before = self.load_bounded_preflight_cut(source, budget).await?;
+        if &before.scope != expected_scope || self.registry.scope() != expected_scope {
+            return Err(validation("restore source record is out of scope"));
+        }
+        let selected = before
+            .domains
+            .iter()
+            .filter(|authority| selected_domains.contains(authority.domain()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if selected.len() != selected_domains.len() {
+            return Err(validation("selected restore domain is absent from source"));
+        }
+        let mut issues = Vec::new();
+        self.preflight_source_pin_bounded(
+            source,
+            &before.initial_pin,
+            before.usable_retention_deadline,
+            now,
+            &mut issues,
+            budget,
+        )
+        .await?;
+        let invalid_paths = self
+            .scan_preflight_objects_bounded(&before.required_objects, &mut issues, budget)
+            .await?;
+        let required: BTreeMap<&str, &RequiredObject> = before
+            .required_objects
+            .iter()
+            .map(|object| (object.relative_path(), object))
+            .collect();
+        Self::preflight_reference_closure(
+            &before.domains,
+            &before.projections,
+            &before.archives,
+            &before.compatibility,
+            &required,
+            &mut issues,
+        );
+        self.preflight_authorities_bounded(
+            &selected,
+            expected_scope,
+            now,
+            &invalid_paths,
+            &mut issues,
+            budget,
+        )
+        .await?;
+        if !issues.is_empty() {
+            return Err(validation("restore source preflight did not pass"));
+        }
+        let after = self.load_bounded_preflight_cut(source, budget).await?;
+        if before.source_record_sha256 != after.source_record_sha256 {
+            return Err(validation("restore source record changed during preflight"));
+        }
+        Ok(after)
+    }
+
+    pub(crate) async fn require_active_restore_source_pin_bounded(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        now: DateTime<Utc>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        let cut = self
+            .immutable_restore_cut_bounded(source, expected_scope, budget)
+            .await?;
+        let mut issues = Vec::new();
+        self.preflight_source_pin_bounded(
+            source,
+            &cut.initial_pin,
+            cut.usable_retention_deadline,
+            now,
+            &mut issues,
+            budget,
+        )
+        .await?;
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(validation("restore source pin is not active"))
+        }
+    }
+
     pub(crate) async fn require_active_restore_source_pin(
         &self,
         source: &RestoreSource,
@@ -853,6 +1052,15 @@ impl WorkspaceSnapshotService {
         &self,
         request: &CreateWorkspaceExportRequest,
     ) -> Result<ExportManifest> {
+        if self
+            .registry
+            .domains()
+            .any(|(_, binding)| binding.capabilities().bounded_workspace_io())
+        {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "authority-8 workspace export is not supported".into(),
+            });
+        }
         let operation_now = self.now();
         validate_operation_retention("export", request.retained_until(), operation_now)?;
         let record_path = export_record_path(request.export_id())?;
@@ -923,7 +1131,33 @@ impl WorkspaceSnapshotService {
         now: DateTime<Utc>,
     ) -> Result<RestorePreflightReport> {
         expected_scope.validate()?;
-        let cut = self.load_preflight_cut(source).await?;
+        let bounded = self.bounded_workspace_io();
+        if bounded && source.kind == RestoreSourceKind::Export {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "authority-8 workspace export is not supported".into(),
+            });
+        }
+        if !bounded {
+            return self
+                .preflight_restore_with_budget(source, expected_scope, now, None)
+                .await;
+        }
+        let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        self.preflight_restore_with_budget(source, expected_scope, now, Some(&mut budget))
+            .await
+    }
+
+    async fn preflight_restore_with_budget(
+        &self,
+        source: &RestoreSource,
+        expected_scope: &WorkspaceScope,
+        now: DateTime<Utc>,
+        mut budget: Option<&mut crate::workspace_io_budget::WorkspaceIoBudget>,
+    ) -> Result<RestorePreflightReport> {
+        let cut = match budget.as_deref_mut() {
+            Some(budget) => self.load_bounded_preflight_cut(source, budget).await?,
+            None => self.load_preflight_cut(source).await?,
+        };
         let mut issues = Vec::new();
         if &cut.scope != expected_scope || self.registry.scope() != expected_scope {
             issues.push(RestorePreflightIssue::new(
@@ -933,17 +1167,30 @@ impl WorkspaceSnapshotService {
             ));
             return Ok(RestorePreflightReport::new(source.id(), issues));
         }
-        self.preflight_source_pin(
-            source,
-            &cut.initial_pin,
-            cut.usable_retention_deadline,
-            now,
-            &mut issues,
-        )
-        .await?;
-        let invalid_paths = self
-            .scan_preflight_objects(&cut.required_objects, &mut issues)
+        let invalid_paths = if let Some(budget) = budget.as_deref_mut() {
+            self.preflight_source_pin_bounded(
+                source,
+                &cut.initial_pin,
+                cut.usable_retention_deadline,
+                now,
+                &mut issues,
+                budget,
+            )
             .await?;
+            self.scan_preflight_objects_bounded(&cut.required_objects, &mut issues, budget)
+                .await?
+        } else {
+            self.preflight_source_pin(
+                source,
+                &cut.initial_pin,
+                cut.usable_retention_deadline,
+                now,
+                &mut issues,
+            )
+            .await?;
+            self.scan_preflight_objects(&cut.required_objects, &mut issues)
+                .await?
+        };
 
         let required: BTreeMap<&str, &RequiredObject> = cut
             .required_objects
@@ -959,14 +1206,29 @@ impl WorkspaceSnapshotService {
             &mut issues,
         );
 
-        self.preflight_authorities(
-            &cut.domains,
-            expected_scope,
-            now,
-            &invalid_paths,
-            &mut issues,
-        )
-        .await?;
+        match budget {
+            Some(budget) => {
+                self.preflight_authorities_bounded(
+                    &cut.domains,
+                    expected_scope,
+                    now,
+                    &invalid_paths,
+                    &mut issues,
+                    budget,
+                )
+                .await?;
+            }
+            None => {
+                self.preflight_authorities(
+                    &cut.domains,
+                    expected_scope,
+                    now,
+                    &invalid_paths,
+                    &mut issues,
+                )
+                .await?;
+            }
+        }
         Ok(RestorePreflightReport::new(source.id(), issues))
     }
 
@@ -1062,6 +1324,63 @@ impl WorkspaceSnapshotService {
         Ok(())
     }
 
+    async fn preflight_source_pin_bounded(
+        &self,
+        source: &RestoreSource,
+        expected_initial: &RetentionPinRevision,
+        usable_retention_deadline: DateTime<Utc>,
+        now: DateTime<Utc>,
+        issues: &mut Vec<RestorePreflightIssue>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        if source.pin_id() != expected_initial.pin_id() {
+            issues.push(RestorePreflightIssue::new(
+                RestorePreflightIssueKind::Corrupt,
+                None,
+                "retention_pin",
+            ));
+            return Ok(());
+        }
+        let (initial, latest) = match budget.read_pin(&self.storage, source.pin_id()).await {
+            Ok(pin) => pin,
+            Err(error) => return Self::classify_preflight_pin_error(error, issues),
+        };
+        if &initial != expected_initial
+            || latest.target() != expected_initial.target()
+            || latest.retained_until() > usable_retention_deadline
+        {
+            issues.push(RestorePreflightIssue::new(
+                RestorePreflightIssueKind::Corrupt,
+                None,
+                "retention_pin",
+            ));
+            return Ok(());
+        }
+        if latest.status_at(now)? != crate::workspace_snapshot::RetentionStatus::Active {
+            issues.push(RestorePreflightIssue::new(
+                RestorePreflightIssueKind::Expired,
+                None,
+                "retention_pin",
+            ));
+        }
+        Ok(())
+    }
+
+    fn classify_preflight_pin_error(
+        error: CatalogError,
+        issues: &mut Vec<RestorePreflightIssue>,
+    ) -> Result<()> {
+        let kind = match error {
+            CatalogError::NotFound { .. } => RestorePreflightIssueKind::Missing,
+            CatalogError::Validation { .. }
+            | CatalogError::Serialization { .. }
+            | CatalogError::InvariantViolation { .. } => RestorePreflightIssueKind::Corrupt,
+            error => return Err(error),
+        };
+        issues.push(RestorePreflightIssue::new(kind, None, "retention_pin"));
+        Ok(())
+    }
+
     async fn scan_preflight_objects(
         &self,
         objects: &[RequiredObject],
@@ -1091,6 +1410,45 @@ impl WorkspaceSnapshotService {
                     ));
                 }
                 Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(invalid_paths)
+    }
+
+    async fn scan_preflight_objects_bounded(
+        &self,
+        objects: &[RequiredObject],
+        issues: &mut Vec<RestorePreflightIssue>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<BTreeSet<String>> {
+        let mut invalid_paths = BTreeSet::new();
+        for object in objects {
+            match WorkspaceCaptureIo::new(&self.storage, budget)
+                .read_required_object(object)
+                .await
+            {
+                Ok(_) => {}
+                Err(CatalogError::NotFound { .. }) => {
+                    invalid_paths.insert(object.relative_path().to_string());
+                    issues.push(RestorePreflightIssue::new(
+                        RestorePreflightIssueKind::Missing,
+                        None,
+                        safe_object_kind(object.kind()),
+                    ));
+                }
+                Err(
+                    CatalogError::Validation { .. }
+                    | CatalogError::Serialization { .. }
+                    | CatalogError::InvariantViolation { .. },
+                ) => {
+                    invalid_paths.insert(object.relative_path().to_string());
+                    issues.push(RestorePreflightIssue::new(
+                        RestorePreflightIssueKind::Corrupt,
+                        None,
+                        safe_object_kind(object.kind()),
+                    ));
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(invalid_paths)
@@ -1151,6 +1509,63 @@ impl WorkspaceSnapshotService {
         Ok(())
     }
 
+    async fn preflight_authorities_bounded(
+        &self,
+        domains: &[DomainAuthorityReference],
+        expected_scope: &WorkspaceScope,
+        now: DateTime<Utc>,
+        invalid_paths: &BTreeSet<String>,
+        issues: &mut Vec<RestorePreflightIssue>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        for domain in domains {
+            let Some(binding) = self.registry.get(domain.domain()) else {
+                issues.push(RestorePreflightIssue::new(
+                    RestorePreflightIssueKind::Incompatible,
+                    Some(domain.domain()),
+                    "domain",
+                ));
+                continue;
+            };
+            if domain.scope() != expected_scope
+                || domain.authority().scope() != binding.state_scope()
+            {
+                issues.push(RestorePreflightIssue::new(
+                    RestorePreflightIssueKind::OutOfScope,
+                    Some(domain.domain()),
+                    "authority",
+                ));
+                continue;
+            }
+            if domain.authority().retention_deadline() <= now {
+                issues.push(RestorePreflightIssue::new(
+                    RestorePreflightIssueKind::Expired,
+                    Some(domain.domain()),
+                    "authority",
+                ));
+                continue;
+            }
+            if domain.authority().implementation() != binding.capabilities().implementation() {
+                issues.push(RestorePreflightIssue::new(
+                    RestorePreflightIssueKind::Incompatible,
+                    Some(domain.domain()),
+                    "authority_implementation",
+                ));
+                continue;
+            }
+            let authority_paths_valid = !invalid_paths.contains(domain.authority().manifest_path())
+                && domain
+                    .authority()
+                    .checkpoint_path()
+                    .is_none_or(|path| !invalid_paths.contains(path));
+            if authority_paths_valid {
+                self.resolve_preflight_authority_bounded(binding, domain, now, issues, budget)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn resolve_preflight_authority(
         binding: &WorkspaceDomainBinding,
         domain: &DomainAuthorityReference,
@@ -1163,6 +1578,43 @@ impl WorkspaceSnapshotService {
             .await
         {
             Ok(_) => None,
+            Err(CatalogError::NotFound { .. }) => Some(RestorePreflightIssueKind::Missing),
+            Err(CatalogError::InvariantViolation { .. } | CatalogError::Serialization { .. }) => {
+                Some(RestorePreflightIssueKind::Corrupt)
+            }
+            Err(CatalogError::Validation { .. } | CatalogError::UnsupportedOperation { .. }) => {
+                Some(RestorePreflightIssueKind::Incompatible)
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(kind) = issue {
+            issues.push(RestorePreflightIssue::new(
+                kind,
+                Some(domain.domain()),
+                "authority",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn resolve_preflight_authority_bounded(
+        &self,
+        binding: &WorkspaceDomainBinding,
+        domain: &DomainAuthorityReference,
+        now: DateTime<Utc>,
+        issues: &mut Vec<RestorePreflightIssue>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        let issue = match binding
+            .authority_adapter
+            .preflight_persisted_reference_bounded(
+                domain.authority(),
+                now,
+                &mut WorkspaceCaptureIo::new(&self.storage, budget),
+            )
+            .await
+        {
+            Ok(()) => None,
             Err(CatalogError::NotFound { .. }) => Some(RestorePreflightIssueKind::Missing),
             Err(CatalogError::InvariantViolation { .. } | CatalogError::Serialization { .. }) => {
                 Some(RestorePreflightIssueKind::Corrupt)
@@ -1224,6 +1676,37 @@ impl WorkspaceSnapshotService {
                 })
             }
         }
+    }
+
+    async fn load_bounded_preflight_cut(
+        &self,
+        source: &RestoreSource,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<PreflightCut> {
+        if source.kind != RestoreSourceKind::Snapshot {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "authority-8 workspace export is not supported".into(),
+            });
+        }
+        let (bytes, _version) = budget
+            .read_exact_stable_record(
+                &self.storage,
+                &snapshot_record_path(source.id())?,
+                crate::workspace_io_budget::RECORD_BYTES,
+            )
+            .await?;
+        let snapshot = decode_workspace_snapshot(&bytes)?;
+        Ok(PreflightCut {
+            source_record_sha256: prefixed_sha256(&bytes),
+            initial_pin: Self::snapshot_initial_pin(&snapshot)?,
+            usable_retention_deadline: snapshot.usable_retention_deadline(),
+            scope: snapshot.scope().clone(),
+            domains: snapshot.domains().to_vec(),
+            projections: snapshot.projection_watermarks().to_vec(),
+            archives: snapshot.event_archives().to_vec(),
+            required_objects: snapshot.required_objects().to_vec(),
+            compatibility: snapshot.compatibility_artifacts().to_vec(),
+        })
     }
 
     fn preflight_reference_closure(
@@ -1324,10 +1807,21 @@ impl WorkspaceSnapshotService {
     ///
     /// Returns an error without publishing a retained root when any capability,
     /// checkpoint, provider, object, or immutable-write precondition fails.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preserve the legacy capture flow after bounded dispatch"
+    )]
     pub async fn create_snapshot(
         &self,
         request: &CreateWorkspaceSnapshotRequest,
     ) -> Result<WorkspaceSnapshot> {
+        if self
+            .registry
+            .domains()
+            .any(|(_, binding)| binding.capabilities().bounded_workspace_io())
+        {
+            return Box::pin(self.create_bounded_snapshot(request)).await;
+        }
         let operation_now = self.now();
         validate_operation_retention("snapshot", request.retained_until(), operation_now)?;
         let record_path = snapshot_record_path(request.snapshot_id())?;
@@ -1423,6 +1917,241 @@ impl WorkspaceSnapshotService {
         }
         .await;
         Self::finish_retention_coordination(guard, epoch, publication).await
+    }
+
+    async fn create_bounded_snapshot(
+        &self,
+        request: &CreateWorkspaceSnapshotRequest,
+    ) -> Result<WorkspaceSnapshot> {
+        let operation_now = self.now();
+        validate_operation_retention("snapshot", request.retained_until(), operation_now)?;
+        self.validate_capture_capabilities()?;
+        let record_path = snapshot_record_path(request.snapshot_id())?;
+        let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        if let Some((bytes, _)) = budget
+            .read_stable(
+                &self.storage,
+                &record_path,
+                crate::workspace_io_budget::RECORD_BYTES,
+            )
+            .await?
+        {
+            let snapshot = self.validate_snapshot_retry(request, &bytes)?;
+            return self
+                .retry_bounded_snapshot(request, snapshot, &mut budget)
+                .await;
+        }
+        let mut guard = budget
+            .acquire_retention_lock(self.storage.clone(), "workspace-snapshot-finalize")
+            .await?;
+        let mut epoch = RetentionMutationEpoch::claim_bounded(
+            self.storage.clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            request.snapshot_id(),
+            &mut budget,
+        )
+        .await?;
+        let publication = async {
+            let (captured, prepared) = self
+                .capture_workspace_cut_bounded(request, &mut epoch, &mut budget)
+                .await?;
+            let snapshot = WorkspaceSnapshot::new(
+                request.snapshot_id(),
+                request.pin_id(),
+                self.registry.scope().clone(),
+                request.created_at(),
+                request.retained_until(),
+                request.parent_snapshot_id().map(ToOwned::to_owned),
+                captured.domains,
+                captured.projections,
+                captured.archives,
+                captured.required_objects.into_values().collect(),
+                captured.compatibility.into_values().collect(),
+            )?;
+            let bytes = Bytes::from(encode_workspace_snapshot(&snapshot)?);
+            epoch
+                .put_immutable_bounded(&record_path, bytes, &mut budget)
+                .await?;
+            self.publish_initial_pin_bounded(
+                &mut epoch,
+                &Self::snapshot_initial_pin(&snapshot)?,
+                &mut budget,
+            )
+            .await?;
+            for source in prepared {
+                source.publish(&mut epoch, &mut guard, &mut budget).await?;
+            }
+            Ok(snapshot)
+        }
+        .await;
+        let settled = match publication {
+            Ok(snapshot) => {
+                epoch.settle_bounded(&mut guard, &mut budget).await?;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if epoch.can_settle_bounded() {
+                    epoch.settle_bounded(&mut guard, &mut budget).await?;
+                }
+                Err(error)
+            }
+        };
+        let release = budget.release_retention_lock(guard).await;
+        match (settled, release) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    async fn retry_bounded_snapshot(
+        &self,
+        request: &CreateWorkspaceSnapshotRequest,
+        snapshot: WorkspaceSnapshot,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<WorkspaceSnapshot> {
+        let mut guard = budget
+            .acquire_retention_lock(self.storage.clone(), "workspace-snapshot-retry")
+            .await?;
+        let result = async {
+            let (initial, latest) = budget.read_pin(&self.storage, snapshot.target_pin_id()).await?;
+            if initial != Self::snapshot_initial_pin(&snapshot)?
+                || latest.retained_until() > snapshot.usable_retention_deadline()
+                || latest.status_at(self.now())? != crate::workspace_snapshot::RetentionStatus::Active {
+                return Err(precondition_failed("snapshot retry requires its exact active selected pin"));
+            }
+            for object in snapshot.required_objects() {
+                WorkspaceCaptureIo::new(&self.storage, budget).read_required_object(object).await?;
+            }
+            if let Some(mut previous) = RetentionMutationEpoch::load_snapshot_bounded(self.storage.clone(), request.snapshot_id(), budget).await? {
+                let proof = if let Some(intent) = previous.armed_pointer() {
+                    let domain = intent.domain.clone();
+                    let binding = self.registry.get(&domain).ok_or_else(|| validation("armed snapshot domain is not configured"))?;
+                    let source = snapshot.domains().iter().find(|source| source.domain() == domain)
+                        .ok_or_else(|| validation("armed snapshot domain is absent from the exact snapshot"))?;
+                    let mut context = RetainedSourceCaptureContext::new(binding.state_scope.clone(), request.snapshot_id().into(), &mut previous, budget);
+                    Some(binding.authority_adapter.verify_retained_source(&mut context, source.authority()).await?
+                        .ok_or_else(|| validation("armed snapshot reference is not selected"))?)
+                } else { None };
+                previous.settle_recovered_snapshot_bounded(proof, &mut guard, budget).await?;
+            }
+            let mut epoch = RetentionMutationEpoch::claim_bounded(self.storage.clone(), &mut guard,
+                RetentionMutationKind::WorkspaceSnapshotRetry, request.snapshot_id(), budget).await?;
+            for source in snapshot.domains() {
+                let binding = self.registry.get(source.domain()).ok_or_else(|| validation("snapshot domain is not configured"))?;
+                if !binding.capabilities().bounded_workspace_io()
+                    && source.authority().reference_kind()
+                        == PersistedAuthorityKind::Checkpoint
+                {
+                    continue;
+                }
+                let mut context = RetainedSourceCaptureContext::new(binding.state_scope.clone(), request.snapshot_id().into(), &mut epoch, budget);
+                if binding.authority_adapter.verify_retained_source(&mut context, source.authority()).await?.is_some() {
+                    continue;
+                }
+                context.expected_reference = Some(source.authority());
+                let prepared = binding.authority_adapter.prepare_retained_source(&mut context, source.authority().retention_deadline()).await?
+                    .ok_or_else(|| validation("snapshot reference cannot be prepared under this authority"))?;
+                if prepared.reference() != source.authority() {
+                    return Err(CatalogError::AmbiguousAuthorityOutcome { message: "snapshot source is no longer authenticated by current HEAD; retry remains unresolved".into() });
+                }
+                prepared.publish(&mut epoch, &mut guard, budget).await?;
+            }
+            epoch.settle_bounded(&mut guard, budget).await?;
+            Ok(snapshot)
+        }.await;
+        let released = budget.release_retention_lock(guard).await;
+        match (result, released) {
+            (Ok(snapshot), Ok(())) => Ok(snapshot),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    async fn capture_workspace_cut_bounded(
+        &self,
+        request: &CreateWorkspaceSnapshotRequest,
+        epoch: &mut RetentionMutationEpoch,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<(
+        CapturedSnapshotCut,
+        Vec<crate::state_store::PreparedRetainedSource>,
+    )> {
+        let mut preparations = Vec::new();
+        let mut retained_source_prepared = false;
+        let mut captured = CapturedSnapshotCut {
+            domains: Vec::new(),
+            projections: Vec::new(),
+            archives: Vec::new(),
+            required_objects: BTreeMap::new(),
+            compatibility: BTreeMap::new(),
+        };
+        for (domain, binding) in self.registry.domains() {
+            let mut context = RetainedSourceCaptureContext::new(
+                binding.state_scope.clone(),
+                request.snapshot_id().to_string(),
+                epoch,
+                budget,
+            );
+            // Later domains must not observe their retained pointer until the
+            // preceding domain's publication intent has been cleared.
+            context.defer_retained_staging = retained_source_prepared;
+            let prepared = binding
+                .authority_adapter
+                .prepare_retained_source(&mut context, request.retained_until())
+                .await?
+                .ok_or_else(|| CatalogError::UnsupportedOperation {
+                    message: format!("domain {domain} does not prepare a bounded retained source"),
+                })?;
+            retained_source_prepared |= binding.capabilities().bounded_workspace_io();
+            let authority = prepared.reference().clone();
+            Self::validate_authority_reference(domain, binding, &authority, request)?;
+            let domain_authority =
+                DomainAuthorityReference::new(domain, self.registry.scope().clone(), authority)?;
+            self.verify_authority_objects_bounded(
+                &domain_authority,
+                &mut captured.required_objects,
+                budget,
+            )
+            .await?;
+            let projection_cut = {
+                let mut io = WorkspaceCaptureIo::new(&self.storage, budget);
+                binding
+                    .projection_provider
+                    .capture_bounded(&domain_authority, &mut io)
+                    .await?
+            };
+            self.verify_projection_cut_bounded(
+                domain,
+                &domain_authority,
+                &projection_cut,
+                &mut captured.required_objects,
+                &mut captured.compatibility,
+                budget,
+            )
+            .await?;
+            let archive_capture = {
+                let mut io = WorkspaceCaptureIo::new(&self.storage, budget);
+                binding
+                    .event_archive_provider
+                    .capture_bounded(&domain_authority, &mut io)
+                    .await?
+            };
+            self.verify_archive_capture_bounded(
+                domain,
+                &domain_authority,
+                &archive_capture,
+                &mut captured.required_objects,
+                budget,
+            )
+            .await?;
+            captured
+                .projections
+                .extend_from_slice(projection_cut.watermarks());
+            captured.archives.push(archive_capture.archive().clone());
+            captured.domains.push(domain_authority);
+            preparations.push(prepared);
+        }
+        Ok((captured, preparations))
     }
 
     async fn capture_workspace_cut(
@@ -1842,7 +2571,9 @@ impl WorkspaceSnapshotService {
     fn validate_capture_capabilities(&self) -> Result<()> {
         for (domain, binding) in self.registry.domains() {
             let capabilities = binding.capabilities();
-            if !capabilities.checkpoints() || !capabilities.read_at() {
+            if !capabilities.read_at()
+                || (!capabilities.bounded_workspace_io() && !capabilities.checkpoints())
+            {
                 return Err(CatalogError::UnsupportedOperation {
                     message: format!(
                         "domain {domain} state store {} lacks checkpoints or retained reads",
@@ -1861,14 +2592,16 @@ impl WorkspaceSnapshotService {
         request: &CreateWorkspaceSnapshotRequest,
     ) -> Result<()> {
         authority.validate()?;
-        if authority.reference_kind() != PersistedAuthorityKind::Checkpoint
-            || authority.implementation() != binding.capabilities().implementation()
+        if !matches!(
+            authority.reference_kind(),
+            PersistedAuthorityKind::Checkpoint | PersistedAuthorityKind::StateToken
+        ) || authority.implementation() != binding.capabilities().implementation()
             || authority.scope() != &binding.state_scope
             || authority.scope().domain() != domain
             || authority.retention_deadline() < request.retained_until()
         {
             return Err(validation(format!(
-                "persisted checkpoint reference mismatch for domain {domain}"
+                "persisted authority reference mismatch for domain {domain}"
             )));
         }
         Ok(())
@@ -1888,20 +2621,199 @@ impl WorkspaceSnapshotService {
             persisted.manifest_sha256(),
         )
         .await?;
-        let checkpoint_path = persisted
-            .checkpoint_path()
-            .ok_or_else(|| validation("checkpoint authority reference has no checkpoint path"))?;
-        let checkpoint_sha256 = persisted.checkpoint_sha256().ok_or_else(|| {
-            validation("checkpoint authority reference has no checkpoint checksum")
-        })?;
-        self.verify_and_insert_object(
+        if let (Some(path), Some(sha256)) =
+            (persisted.checkpoint_path(), persisted.checkpoint_sha256())
+        {
+            self.verify_and_insert_object(
+                required,
+                path,
+                None,
+                RequiredObjectKind::Checkpoint,
+                sha256,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_authority_objects_bounded(
+        &self,
+        authority: &DomainAuthorityReference,
+        required: &mut BTreeMap<String, RequiredObject>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        let persisted = authority.authority();
+        self.verify_and_insert_object_bounded(
             required,
-            checkpoint_path,
+            persisted.manifest_path(),
             None,
-            RequiredObjectKind::Checkpoint,
-            checkpoint_sha256,
+            RequiredObjectKind::AuthorityManifest,
+            persisted.manifest_sha256(),
+            budget,
         )
-        .await
+        .await?;
+        if let (Some(path), Some(sha256)) =
+            (persisted.checkpoint_path(), persisted.checkpoint_sha256())
+        {
+            self.verify_and_insert_object_bounded(
+                required,
+                path,
+                None,
+                RequiredObjectKind::Checkpoint,
+                sha256,
+                budget,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_projection_cut_bounded(
+        &self,
+        domain: &str,
+        authority: &DomainAuthorityReference,
+        cut: &ProjectionWatermarkCut,
+        required: &mut BTreeMap<String, RequiredObject>,
+        compatibility: &mut BTreeMap<String, LegacyCompatibilityArtifact>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        for watermark in cut.watermarks() {
+            if watermark.source_domain() != domain
+                || watermark.included_authority_sequence()
+                    > authority.authority().logical_sequence()
+            {
+                return Err(validation(format!(
+                    "projection watermark mismatch for domain {domain}"
+                )));
+            }
+        }
+        for object in cut.required_objects() {
+            self.verify_and_insert_object_bounded(
+                required,
+                object.relative_path(),
+                Some(object.byte_size()),
+                object.kind(),
+                object.sha256(),
+                budget,
+            )
+            .await?;
+        }
+        for watermark in cut.watermarks() {
+            let object = required
+                .get(watermark.manifest().relative_path())
+                .ok_or_else(|| validation("projection manifest is not a required object"))?;
+            if object.sha256() != watermark.manifest().sha256()
+                || object.kind() != RequiredObjectKind::ProjectionManifest
+            {
+                return Err(validation(
+                    "projection manifest required-object metadata disagrees",
+                ));
+            }
+        }
+        for artifact in cut.compatibility_artifacts() {
+            let object = required
+                .get(artifact.relative_path())
+                .ok_or_else(|| validation("compatibility artifact is not a required object"))?;
+            if object.sha256() != artifact.sha256()
+                || object.kind() != RequiredObjectKind::LegacyCompatibility
+            {
+                return Err(validation(
+                    "compatibility artifact required-object metadata disagrees",
+                ));
+            }
+            match compatibility.insert(artifact.relative_path().to_string(), artifact.clone()) {
+                Some(existing) if existing != *artifact => {
+                    return Err(validation("duplicate compatibility path disagrees"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_archive_capture_bounded(
+        &self,
+        domain: &str,
+        authority: &DomainAuthorityReference,
+        capture: &EventArchiveCapture,
+        required: &mut BTreeMap<String, RequiredObject>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        if capture.archive().source_domain() != domain {
+            return Err(validation(format!(
+                "event archive source mismatch for domain {domain}"
+            )));
+        }
+        for object in capture.required_objects() {
+            self.verify_and_insert_object_bounded(
+                required,
+                object.relative_path(),
+                Some(object.byte_size()),
+                object.kind(),
+                object.sha256(),
+                budget,
+            )
+            .await?;
+        }
+        if let EventArchiveCut::Inclusive {
+            end_sequence,
+            archive_manifest,
+            ..
+        } = capture.archive().cut()
+        {
+            if *end_sequence > authority.authority().logical_sequence() {
+                return Err(validation("event archive exceeds retained authority"));
+            }
+            let object = required
+                .get(archive_manifest.relative_path())
+                .ok_or_else(|| validation("archive manifest is not a required object"))?;
+            if object.sha256() != archive_manifest.sha256()
+                || object.kind() != RequiredObjectKind::EventArchiveManifest
+            {
+                return Err(validation(
+                    "archive manifest required-object metadata disagrees",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn verify_and_insert_object_bounded(
+        &self,
+        required: &mut BTreeMap<String, RequiredObject>,
+        path: &str,
+        expected_size: Option<u64>,
+        kind: RequiredObjectKind,
+        expected_sha256: &str,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        let expected = expected_size
+            .map(|size| {
+                usize::try_from(size).map_err(|_| validation("required object size exceeds usize"))
+            })
+            .transpose()?;
+        let bytes = budget
+            .read_immutable(
+                &self.storage,
+                path,
+                expected,
+                expected_sha256,
+                crate::workspace_io_budget::RECORD_BYTES,
+            )
+            .await?;
+        let object = RequiredObject::new(
+            path,
+            u64::try_from(bytes.len())
+                .map_err(|_| validation("required object size exceeds u64"))?,
+            kind,
+            expected_sha256,
+        )?;
+        match required.insert(path.to_string(), object.clone()) {
+            Some(existing) if existing != object => Err(validation(format!(
+                "duplicate required object {path} disagrees"
+            ))),
+            _ => Ok(()),
+        }
     }
 
     async fn verify_projection_cut(
@@ -2138,6 +3050,32 @@ impl WorkspaceSnapshotService {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn publish_initial_pin_bounded(
+        &self,
+        epoch: &mut RetentionMutationEpoch,
+        pin: &RetentionPinRevision,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        if pin.revision() != 1 || pin.predecessor().is_some() {
+            return Err(validation("initial retention pin is not revision 1"));
+        }
+        let pin_bytes = encode_retention_pin_revision(pin)?;
+        let revision_path = retention_pin_revision_path(pin.pin_id(), 1)?;
+        let selector =
+            RetentionPinLatest::new(pin.pin_id(), 1, &revision_path, prefixed_sha256(&pin_bytes))?;
+        let selector_bytes = encode_retention_pin_latest(&selector)?;
+        epoch
+            .put_immutable_bounded(&revision_path, Bytes::from(pin_bytes), budget)
+            .await?;
+        epoch
+            .put_immutable_bounded(
+                &retention_pin_latest_path(pin.pin_id())?,
+                Bytes::from(selector_bytes),
+                budget,
+            )
+            .await
     }
 
     async fn publish_initial_pin(

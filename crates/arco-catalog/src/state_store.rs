@@ -8,7 +8,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arco_core::root_storage::RootBackendIdentity;
-use arco_core::{AuthorityRoot, AuthorityScope, RootStorage};
+use arco_core::{AuthorityRoot, AuthorityScope, RootStorage, ScopedStorage};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -50,9 +50,10 @@ pub use control_mvp::{
     ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget,
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpReadCache,
     ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
-    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
-    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
-    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, PurgedCounts,
+    ControlMvpRestoreFenceWitness, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
+    ControlMvpRestorePlanV7, ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding,
+    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind, MaintenanceProgress,
+    MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, PurgedCounts,
     control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
@@ -2246,9 +2247,43 @@ impl RestoreAttemptIdentity {
 /// Typed durable plan produced by an explicitly configured restore adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "plan_kind", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "preserve the public V6 variant and its existing allocation behavior"
+)]
 pub enum PersistedRestoreParticipantPlan {
     /// Deterministic object-store Control MVP transaction plan.
     ControlMvp(ControlMvpRestorePlan),
+    /// Bounded authority-8 restore with immutable Plan7 witnesses.
+    ControlMvpV7(Box<ControlMvpRestorePlanV7>),
+}
+
+impl PersistedRestoreParticipantPlan {
+    /// Returns the selected source without changing the versioned plan bytes.
+    #[must_use]
+    pub fn source(&self) -> &PersistedAuthorityReference {
+        match self {
+            Self::ControlMvp(plan) => plan.source(),
+            Self::ControlMvpV7(plan) => plan.source(),
+        }
+    }
+    /// Returns the immutable participant identity for either supported plan format.
+    #[must_use]
+    pub fn identity(&self) -> &RestoreAttemptIdentity {
+        match self {
+            Self::ControlMvp(plan) => plan.identity(),
+            Self::ControlMvpV7(plan) => plan.identity(),
+        }
+    }
+    pub(crate) fn is_legacy_version(&self) -> bool {
+        matches!(self, Self::ControlMvp(plan) if plan.is_legacy_version())
+    }
+    pub(crate) fn validate_source_authority_format(&self) -> Result<()> {
+        match self {
+            Self::ControlMvp(plan) => plan.validate_source_authority_format(),
+            Self::ControlMvpV7(plan) => plan.validate_source_authority_format(),
+        }
+    }
 }
 
 /// Stable, serializable proof of one visible restored authority manifest.
@@ -2539,6 +2574,24 @@ impl StateStoreCapabilities {
         }
     }
 
+    pub(crate) const fn synthetic_bounded(implementation: &'static str) -> Self {
+        let base = Self::deterministic_model(implementation);
+        Self {
+            implementation,
+            flags: base
+                .flags
+                .union(StateStoreCapabilityFlags::BOUNDED_WORKSPACE_IO),
+        }
+    }
+
+    /// Returns whether workspace operations require bounded metadata admission.
+    /// This does not authorize retained-source capture by itself.
+    #[must_use]
+    pub const fn bounded_workspace_io(&self) -> bool {
+        self.flags
+            .contains(StateStoreCapabilityFlags::BOUNDED_WORKSPACE_IO)
+    }
+
     pub(crate) const fn control_mvp(implementation: &'static str) -> Self {
         Self {
             implementation,
@@ -2609,6 +2662,7 @@ impl StateStoreCapabilities {
 struct StateStoreCapabilityFlags(u8);
 
 impl StateStoreCapabilityFlags {
+    const BOUNDED_WORKSPACE_IO: Self = Self(1 << 7);
     const RETAINED_STATE_TOKENS: Self = Self(1 << 0);
     const CHECKPOINTS: Self = Self(1 << 1);
     const READ_AT: Self = Self(1 << 2);
@@ -2736,6 +2790,131 @@ pub trait ArcoStateAdmin: Send + Sync {
     async fn checkpoint(&self, opts: CheckpointOptions) -> Result<CheckpointToken>;
 }
 
+/// Opaque configuration witness for workspace capture admission.
+///
+/// This is process-local wiring evidence, not readable retained authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceCaptureConfig {
+    pub(crate) scope: StateScope,
+    pub(crate) backend: StateStoreBindingIdentity,
+    pub(crate) authority_format: u32,
+    pub(crate) durable_binding: Option<DurableAuthorityBinding>,
+}
+
+/// Context for a coordinated retained-source capture.
+///
+/// This context is intentionally nonserializable and can only be constructed by
+/// the workspace retention coordinator.
+pub struct RetainedSourceCaptureContext<'a> {
+    scope: StateScope,
+    operation_id: String,
+    epoch: &'a mut crate::retention_coordination::RetentionMutationEpoch,
+    io: &'a mut crate::workspace_io_budget::WorkspaceIoBudget,
+    pub(crate) defer_retained_staging: bool,
+    pub(crate) expected_reference: Option<&'a PersistedAuthorityReference>,
+}
+
+impl<'a> RetainedSourceCaptureContext<'a> {
+    pub(crate) fn new(
+        scope: StateScope,
+        operation_id: String,
+        epoch: &'a mut crate::retention_coordination::RetentionMutationEpoch,
+        io: &'a mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Self {
+        Self {
+            scope,
+            operation_id,
+            epoch,
+            io,
+            defer_retained_staging: false,
+            expected_reference: None,
+        }
+    }
+
+    /// Returns the authority scope being captured.
+    #[must_use]
+    pub const fn scope(&self) -> &StateScope {
+        &self.scope
+    }
+
+    #[must_use]
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.epoch.epoch()
+    }
+
+    pub(crate) fn publication_io(
+        &mut self,
+    ) -> (
+        &mut crate::retention_coordination::RetentionMutationEpoch,
+        &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) {
+        (self.epoch, self.io)
+    }
+
+    pub(crate) fn armed_pointer(
+        &self,
+    ) -> Option<&crate::retention_coordination::ArmedRetainedPointerIntent> {
+        self.epoch.armed_pointer()
+    }
+
+    #[must_use]
+    pub(crate) fn io(&mut self) -> &mut crate::workspace_io_budget::WorkspaceIoBudget {
+        self.io
+    }
+}
+
+/// One-shot private source proof prepared while the workspace retention epoch is held.
+pub struct PreparedRetainedSource {
+    reference: PersistedAuthorityReference,
+    publication: Option<Box<control_mvp::RetainedSourcePublication>>,
+}
+
+impl PreparedRetainedSource {
+    pub(crate) fn new(
+        reference: PersistedAuthorityReference,
+        publication: control_mvp::RetainedSourcePublication,
+    ) -> Self {
+        Self {
+            reference,
+            publication: Some(Box::new(publication)),
+        }
+    }
+
+    pub(crate) fn checkpoint(reference: PersistedAuthorityReference) -> Self {
+        Self {
+            reference,
+            publication: None,
+        }
+    }
+
+    pub(crate) async fn publish(
+        self,
+        epoch: &mut crate::retention_coordination::RetentionMutationEpoch,
+        guard: &mut arco_core::lock::LockGuard<ScopedStorage>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        match self.publication {
+            Some(publication) => publication.publish(epoch, guard, budget).await,
+            None => Ok(()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn reference(&self) -> &PersistedAuthorityReference {
+        &self.reference
+    }
+}
+
+/// Private proof of selected retained membership returned by a configured adapter.
+pub struct VerifiedRetainedSource {
+    pub(crate) pointer: control_mvp::VerifiedRetainedPointer,
+}
+
 /// Adapter between opaque state tokens and prepared durable-storage references.
 ///
 /// This surface is deliberately separate from [`ArcoStateAdmin`] so backends
@@ -2745,6 +2924,51 @@ pub trait ArcoStateAdmin: Send + Sync {
 /// within its durable retention-coordinated operation before publishing the pin.
 #[async_trait]
 pub trait PersistedAuthorityAdapter: Send + Sync {
+    /// Returns trusted capture configuration without reading storage.
+    fn workspace_capture_config(&self) -> Option<WorkspaceCaptureConfig> {
+        None
+    }
+
+    /// Prepares a private retained source while a workspace capture epoch is held.
+    ///
+    /// The default preserves existing adapters and does not mint a source.
+    async fn prepare_retained_source(
+        &self,
+        _context: &mut RetainedSourceCaptureContext<'_>,
+        _retention_deadline: DateTime<Utc>,
+    ) -> Result<Option<PreparedRetainedSource>> {
+        Ok(None)
+    }
+
+    /// Verifies selected retained membership within the coordinated invocation.
+    ///
+    /// Missing membership returns None; invalid or ambiguous evidence is an error.
+    async fn verify_retained_source(
+        &self,
+        _context: &mut RetainedSourceCaptureContext<'_>,
+        _reference: &PersistedAuthorityReference,
+    ) -> Result<Option<VerifiedRetainedSource>> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "adapter does not verify bounded retained sources".into(),
+        })
+    }
+
+    /// Authenticates a persisted reference through the invocation's bounded
+    /// workspace metadata context.
+    ///
+    /// The default rejects before adapter I/O so legacy adapters cannot be
+    /// silently invoked by a bounded workspace preflight.
+    async fn preflight_persisted_reference_bounded(
+        &self,
+        _reference: &PersistedAuthorityReference,
+        _now: DateTime<Utc>,
+        _io: &mut crate::workspace_snapshot_service::WorkspaceCaptureIo<'_>,
+    ) -> Result<()> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "adapter does not implement bounded workspace preflight".into(),
+        })
+    }
+
     /// Converts an opaque state token into a validated stable storage reference.
     ///
     /// # Errors
@@ -2792,10 +3016,128 @@ pub trait PersistedAuthorityAdapter: Send + Sync {
     ) -> Result<Box<dyn ArcoStateReader>>;
 }
 
+/// Opaque planning capability for one bounded restore invocation.
+pub struct RestorePlanningContext<'a> {
+    workspace_request_sha256: String,
+    requested_at: DateTime<Utc>,
+    execution_deadline: DateTime<Utc>,
+    observed_now: DateTime<Utc>,
+    io: crate::workspace_snapshot_service::WorkspaceCaptureIo<'a>,
+}
+
+impl<'a> RestorePlanningContext<'a> {
+    pub(crate) fn new(
+        workspace_request_sha256: String,
+        requested_at: DateTime<Utc>,
+        execution_deadline: DateTime<Utc>,
+        observed_now: DateTime<Utc>,
+        io: crate::workspace_snapshot_service::WorkspaceCaptureIo<'a>,
+    ) -> Self {
+        Self {
+            workspace_request_sha256,
+            requested_at,
+            execution_deadline,
+            observed_now,
+            io,
+        }
+    }
+
+    /// Returns the canonical immutable workspace request digest.
+    #[must_use]
+    pub fn workspace_request_sha256(&self) -> &str {
+        &self.workspace_request_sha256
+    }
+
+    /// Returns the immutable original request timestamp.
+    #[must_use]
+    pub const fn requested_at(&self) -> DateTime<Utc> {
+        self.requested_at
+    }
+
+    /// Returns the checked original execution deadline.
+    #[must_use]
+    pub const fn execution_deadline(&self) -> DateTime<Utc> {
+        self.execution_deadline
+    }
+
+    /// Returns the current planning observation time.
+    #[must_use]
+    pub const fn observed_now(&self) -> DateTime<Utc> {
+        self.observed_now
+    }
+
+    pub(crate) fn io(&mut self) -> &mut crate::workspace_snapshot_service::WorkspaceCaptureIo<'a> {
+        &mut self.io
+    }
+}
+
+/// Opaque read-only inspection capability for a selected bounded restore plan.
+pub struct RestoreBoundedInspectionContext<'a> {
+    restore_id: String,
+    participant_attempt: u64,
+    domain: String,
+    plan_sha256: String,
+    io: crate::workspace_snapshot_service::WorkspaceCaptureIo<'a>,
+}
+
+impl<'a> RestoreBoundedInspectionContext<'a> {
+    pub(crate) fn new(
+        restore_id: String,
+        participant_attempt: u64,
+        domain: String,
+        plan_sha256: String,
+        io: crate::workspace_snapshot_service::WorkspaceCaptureIo<'a>,
+    ) -> Self {
+        Self {
+            restore_id,
+            participant_attempt,
+            domain,
+            plan_sha256,
+            io,
+        }
+    }
+
+    /// Returns the selected workspace restore identity.
+    #[must_use]
+    pub fn restore_id(&self) -> &str {
+        &self.restore_id
+    }
+    /// Returns the immutable selected participant attempt.
+    #[must_use]
+    pub const fn participant_attempt(&self) -> u64 {
+        self.participant_attempt
+    }
+    /// Returns the selected participant domain.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+    /// Returns the exact selected participant plan digest.
+    #[must_use]
+    pub fn plan_sha256(&self) -> &str {
+        &self.plan_sha256
+    }
+    pub(crate) fn io(&mut self) -> &mut crate::workspace_snapshot_service::WorkspaceCaptureIo<'a> {
+        &mut self.io
+    }
+}
+
+pub use crate::workspace_restore::RestoreAdvanceContext;
+
+/// Result of one coordinated participant advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum RestoreParticipantAdvance {
+    /// Exact terminal or unchanged-base inspection from the participant.
+    Terminal(RestoreParticipantInspection),
+    /// One authenticated preparation unit completed without authority publication.
+    InProgress {
+        /// Number of units in the authenticated selected progress prefix.
+        completed_units: u64,
+    },
+}
+
 /// Explicit adapter for a backend that can durably plan, inspect, and apply restore.
-///
-/// This seam is separate from [`ArcoStateStore`]: generic transactions do not
-/// provide deterministic identities or crash-recovery evidence.
 #[async_trait]
 pub trait StateRestoreParticipant: Send + Sync {
     /// Returns the stable backend implementation identifier.
@@ -2821,6 +3163,21 @@ pub trait StateRestoreParticipant: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<PersistedRestoreParticipantPlan>;
 
+    /// Builds a plan using the invocation-local bounded workspace I/O capability.
+    ///
+    /// The default rejects before it can invoke a legacy participant path.
+    async fn plan_restore_bounded(
+        &self,
+        _source: &PersistedAuthorityReference,
+        _identity: &RestoreAttemptIdentity,
+        _context: &mut RestorePlanningContext<'_>,
+    ) -> Result<PersistedRestoreParticipantPlan> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "restore participant does not implement bounded workspace invocation I/O"
+                .into(),
+        })
+    }
+
     /// Inspects exact durable evidence without mutation or listing.
     ///
     /// # Errors
@@ -2830,6 +3187,48 @@ pub trait StateRestoreParticipant: Send + Sync {
         &self,
         plan: &PersistedRestoreParticipantPlan,
     ) -> Result<RestoreParticipantInspection>;
+
+    /// Inspects a selected plan through the invocation-local bounded I/O capability.
+    ///
+    /// The default rejects before it can invoke a legacy inspection path.
+    async fn inspect_restore_bounded(
+        &self,
+        _plan: &PersistedRestoreParticipantPlan,
+        _context: &mut RestoreBoundedInspectionContext<'_>,
+    ) -> Result<RestoreParticipantInspection> {
+        Err(CatalogError::UnsupportedOperation {
+            message: "restore participant does not implement bounded workspace invocation I/O"
+                .into(),
+        })
+    }
+
+    /// Whether this binding explicitly implements bounded restore advance.
+    ///
+    /// This method must be pure and stable for the binding lifetime. Planning and
+    /// inspection alone do not require opting in. The service checks this before
+    /// acquiring apply coordination; errors from an opted-in adapter remain uncertain.
+    fn supports_bounded_restore_advance(&self) -> bool {
+        false
+    }
+
+    /// Advances one invocation, preserving the legacy apply contract by default.
+    ///
+    /// Bounded invocations require an explicit implementation and never fall back
+    /// to the legacy apply entry point.
+    async fn advance_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+        context: &mut RestoreAdvanceContext<'_>,
+    ) -> Result<RestoreParticipantAdvance> {
+        if context.is_bounded() {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "restore participant does not implement bounded advance".into(),
+            });
+        }
+        self.apply_restore(plan, context.observed_now())
+            .await
+            .map(RestoreParticipantAdvance::Terminal)
+    }
 
     /// Applies only the supplied deterministic plan through the backend's existing CAS.
     ///
@@ -2846,6 +3245,11 @@ pub trait StateRestoreParticipant: Send + Sync {
 /// Combined state-store read, admin, and transaction surface.
 #[async_trait]
 pub trait ArcoStateStore: ArcoStateReader + ArcoStateAdmin {
+    /// Returns trusted capture configuration without reading storage.
+    fn workspace_capture_config(&self) -> Option<WorkspaceCaptureConfig> {
+        None
+    }
+
     /// Returns an opaque identity for the backend authority this store selects.
     ///
     /// Stores that do not support deterministic roll-forward restore may leave

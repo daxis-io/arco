@@ -21,7 +21,7 @@ impl Directory {
         &self,
         root: &Root,
         edits: &[Edit],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Root> {
         self.check_update_root(root)?;
         let changes = self.changes(edits)?;
@@ -30,14 +30,14 @@ impl Directory {
         }
         for edit in edits {
             for leaf in &edit.new {
-                self.write_key(&leaf.first).await?;
-                self.write_key(&leaf.last).await?;
+                self.write_key_budgeted(&leaf.first, budget).await?;
+                self.write_key_budgeted(&leaf.last, budget).await?;
             }
         }
         let changes = changes.iter().collect::<Vec<_>>();
         let mut nodes = self.rewrite(root.node, &changes, budget).await?;
         if nodes.is_empty() {
-            nodes.push(self.write_page(1, &[]).await?);
+            nodes.push(self.write_page_budgeted(1, &[], budget).await?);
         }
         while nodes.len() > 1 {
             let depth = nodes
@@ -67,7 +67,7 @@ impl Directory {
         old: &Root,
         new: &Root,
         edits: &[Edit],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<()> {
         self.check_update_root(old)?;
         self.check_update_root(new)?;
@@ -198,7 +198,7 @@ impl Directory {
         &self,
         children: &[Node],
         changes: &[&'a Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Vec<&'a Change>>> {
         let mut firsts = Vec::new();
         for child in children {
@@ -221,7 +221,7 @@ impl Directory {
         &self,
         leaves: Vec<Node>,
         changes: &[&Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         let mut removed = Vec::new();
         for change in changes {
@@ -256,7 +256,7 @@ impl Directory {
         Ok(nodes)
     }
 
-    async fn check_order(&self, nodes: &[Node], budget: &mut ReadBudget) -> Result<()> {
+    async fn check_order(&self, nodes: &[Node], budget: &mut ReadBudget<'_>) -> Result<()> {
         let mut last: Option<Bytes> = None;
         for node in nodes {
             let first = self.read_key(node.first, budget).await?;
@@ -273,7 +273,7 @@ impl Directory {
         &self,
         depth: u8,
         nodes: &[Node],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         self.check_order(nodes, budget).await?;
         let mut output = Vec::new();
@@ -283,13 +283,13 @@ impl Directory {
             if !page.is_empty()
                 && (page.len() == FANOUT || page_probe_bytes(&page)? + added > PAGE_PROBE_LIMIT)
             {
-                output.push(self.write_page(depth, &page).await?);
+                output.push(self.write_page_budgeted(depth, &page, budget).await?);
                 page.clear();
             }
             page.push(*node);
         }
         if !page.is_empty() {
-            output.push(self.write_page(depth, &page).await?);
+            output.push(self.write_page_budgeted(depth, &page, budget).await?);
         }
         Ok(output)
     }
@@ -298,7 +298,7 @@ impl Directory {
         &self,
         node: Node,
         changes: &[&Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         if changes.is_empty() {
             return Ok(vec![node]);
@@ -321,7 +321,7 @@ impl Directory {
         &self,
         node: Node,
         changes: &[&Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
         pages: &mut Vec<(Node, Vec<Node>)>,
     ) -> Result<Vec<Node>> {
         if changes.is_empty() {
@@ -349,7 +349,7 @@ impl Directory {
         &self,
         children: &[Node],
         changes: &[&'a Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Vec<&'a Change>>> {
         let mut firsts = Vec::new();
         for child in children {
@@ -372,7 +372,7 @@ impl Directory {
         &self,
         leaves: Vec<Node>,
         changes: &[&Change],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         let mut removed = Vec::new();
         for change in changes {
@@ -407,7 +407,7 @@ impl Directory {
         Ok(result)
     }
 
-    async fn verify_order(&self, nodes: &[Node], budget: &mut ReadBudget) -> Result<()> {
+    async fn verify_order(&self, nodes: &[Node], budget: &mut ReadBudget<'_>) -> Result<()> {
         let mut last: Option<Bytes> = None;
         for node in nodes {
             let first = self.read_key(node.first, budget).await?;
@@ -424,7 +424,7 @@ impl Directory {
         &self,
         depth: u8,
         nodes: &[Node],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
         pages: &mut Vec<(Node, Vec<Node>)>,
     ) -> Result<Vec<Node>> {
         self.verify_order(nodes, budget).await?;
@@ -472,7 +472,7 @@ impl Directory {
         &self,
         node: Node,
         pages: &[(Node, Vec<Node>)],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         if let Some((_, children)) = pages.iter().find(|(recorded, _)| *recorded == node) {
             return Ok(children.clone());

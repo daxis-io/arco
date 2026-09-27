@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "test-utils")]
+use arco_catalog::DurableAuthorityBinding;
 use arco_catalog::workspace_restore::{
     OmittedDomainPolicy, RestoreDomainToSnapshot, RestoreOperationTarget,
     RestoreWorkspaceToSnapshot, WorkspaceRestoreRequestRecord, WorkspaceRestoreService,
@@ -175,6 +177,160 @@ fn restore_record_contracts_reject_unsupported_versions_and_implicit_policy() {
     }
 }
 
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_recovery_rejects_an_oversized_request_before_reading_its_body() {
+    let inner = Arc::new(MemoryBackend::new());
+    let audit = Arc::new(RestoreAuditBackend::new(inner));
+    let storage = ScopedStorage::new(audit.clone(), "tenant", "workspace").expect("storage");
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+            .expect("bounded store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([31; 32])),
+    );
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("workspace scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                scope,
+                store.clone(),
+                store,
+                Arc::new(UnusedProjectionProvider),
+                Arc::new(UnusedArchiveProvider),
+            )
+            .expect("bounded binding"),
+        ],
+    )
+    .expect("registry");
+    let service = WorkspaceRestoreService::new(storage.clone(), registry).expect("service");
+    let restore_id = format!("rst_{}", Ulid::from(401_u128));
+    let request_path = restore_request_path(&restore_id).expect("request path");
+    storage
+        .put_raw(
+            &request_path,
+            Bytes::from(vec![0; 4 * 1024 * 1024 + 1]),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("oversized request fixture");
+
+    audit.clear();
+    assert!(matches!(
+        service.recover_restore(&restore_id).await,
+        Err(CatalogError::Validation { .. })
+    ));
+    let operations = audit.operations();
+    assert!(
+        matches!(operations.as_slice(), [AuditOperation::Head(path)] if path.ends_with(&request_path)),
+        "bounded recovery must reject encoded-cap overflow before a request body read: {operations:?}"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_get_rejects_an_oversized_journal_before_reading_its_body() {
+    let inner = Arc::new(MemoryBackend::new());
+    let audit = Arc::new(RestoreAuditBackend::new(inner));
+    let storage = ScopedStorage::new(audit.clone(), "tenant", "workspace").expect("storage");
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+            .expect("bounded store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([32; 32])),
+    );
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("workspace scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                scope,
+                store.clone(),
+                store,
+                Arc::new(UnusedProjectionProvider),
+                Arc::new(UnusedArchiveProvider),
+            )
+            .expect("bounded binding"),
+        ],
+    )
+    .expect("registry");
+    let service = WorkspaceRestoreService::new(storage.clone(), registry).expect("service");
+    let restore_id = format!("rst_{}", Ulid::from(402_u128));
+    let journal_path = restore_journal_path(&restore_id).expect("journal path");
+    storage
+        .put_raw(
+            &journal_path,
+            Bytes::from(vec![0; 4 * 1024 * 1024 + 1]),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("oversized journal fixture");
+
+    audit.clear();
+    assert!(matches!(
+        service.get_restore(&restore_id).await,
+        Err(CatalogError::Validation { .. })
+    ));
+    let operations = audit.operations();
+    assert!(
+        matches!(operations.as_slice(), [AuditOperation::Head(path)] if path.ends_with(&journal_path)),
+        "bounded get must reject encoded-cap overflow before a journal body read: {operations:?}"
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_restore_rejects_a_future_request_before_source_io() {
+    let audit = Arc::new(RestoreAuditBackend::new(Arc::new(MemoryBackend::new())));
+    let storage = ScopedStorage::new(audit.clone(), "tenant", "workspace").expect("storage");
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+            .expect("bounded store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([33; 32])),
+    );
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("workspace scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                scope,
+                store.clone(),
+                store,
+                Arc::new(UnusedProjectionProvider),
+                Arc::new(UnusedArchiveProvider),
+            )
+            .expect("bounded binding"),
+        ],
+    )
+    .expect("registry");
+    let observed_now = Utc
+        .with_ymd_and_hms(2026, 9, 13, 12, 0, 0)
+        .single()
+        .expect("time");
+    let service = WorkspaceRestoreService::new(storage, registry)
+        .expect("service")
+        .with_clock(Arc::new(move || observed_now));
+    let request = RestoreWorkspaceToSnapshot::new(
+        format!("rst_{}", Ulid::from(403_u128)),
+        RestoreSource::snapshot(format!("snap_{}", Ulid::from(404_u128)), pin_id())
+            .expect("source"),
+        WorkspaceScope::new("tenant", "workspace").expect("scope"),
+        observed_now + ChronoDuration::seconds(1),
+        OmittedDomainPolicy::Reject,
+    )
+    .expect("request");
+
+    audit.clear();
+    let error = service
+        .restore_workspace_to_snapshot(&request)
+        .await
+        .expect_err("future request must fail before source admission");
+    assert!(matches!(error, CatalogError::Validation { .. }));
+    assert!(
+        audit.operations().is_empty(),
+        "future request performed source I/O"
+    );
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PersistedRestoreRecordKind {
     Attempt,
@@ -320,6 +476,89 @@ async fn persisted_restore_fixture() -> PersistedRestoreFixture {
         storage,
         service,
         restore_id,
+    }
+}
+
+#[cfg(feature = "test-utils")]
+fn bounded_restore_reader(storage: ScopedStorage) -> WorkspaceRestoreService {
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+            .expect("bounded store")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([34; 32])),
+    );
+    let registry = WorkspaceDomainRegistry::new(
+        WorkspaceScope::new("tenant", "workspace").expect("workspace scope"),
+        vec![
+            WorkspaceDomainBinding::new(
+                scope,
+                store.clone(),
+                store,
+                Arc::new(UnusedProjectionProvider),
+                Arc::new(UnusedArchiveProvider),
+            )
+            .expect("bounded binding"),
+        ],
+    )
+    .expect("registry");
+    WorkspaceRestoreService::new(storage, registry).expect("service")
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_get_preserves_visible_restore_record_semantics() {
+    let fixture = persisted_restore_fixture().await;
+    let expected = fixture
+        .service
+        .get_restore(&fixture.restore_id)
+        .await
+        .expect("legacy read");
+    let service = bounded_restore_reader(fixture.storage.clone());
+    fixture.audit.clear();
+    fixture.audit.deny_lists();
+    let actual = service
+        .get_restore(&fixture.restore_id)
+        .await
+        .expect("bounded read");
+    assert_eq!(actual, expected);
+    assert!(
+        fixture
+            .audit
+            .operations()
+            .iter()
+            .all(|op| matches!(op, AuditOperation::Head(_) | AuditOperation::Get(_)))
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn bounded_get_shares_metadata_capacity_admission_across_records() {
+    let fixture = persisted_restore_fixture().await;
+    let service = bounded_restore_reader(fixture.storage.clone());
+    fixture
+        .audit
+        .head_version_capacity
+        .store(8 * 1024 * 1024, Ordering::SeqCst);
+    fixture.audit.clear();
+    fixture.audit.deny_lists();
+    let error = service
+        .get_restore(&fixture.restore_id)
+        .await
+        .expect_err("shared budget exhausted");
+    assert!(
+        matches!(error, CatalogError::MaintenanceBackpressure { .. }),
+        "{error:?}"
+    );
+    let operations = fixture.audit.operations();
+    assert_eq!(operations.len(), 6, "{operations:?}");
+    let journal = restore_journal_path(&fixture.restore_id).expect("journal");
+    let request = restore_request_path(&fixture.restore_id).expect("request");
+    for (chunk, path) in operations.chunks_exact(3).zip([journal, request]) {
+        assert!(
+            matches!(chunk, [AuditOperation::Head(before), AuditOperation::Get(body), AuditOperation::Head(after)]
+            if before.ends_with(&path) && body == before && after == before),
+            "{chunk:?}"
+        );
     }
 }
 
@@ -899,6 +1138,7 @@ struct RestoreAuditBackend {
     journal_at_first_restore_txlog: Mutex<Option<Bytes>>,
     churn_journal: Mutex<Option<String>>,
     churn_remaining: AtomicUsize,
+    head_version_capacity: AtomicUsize,
 }
 
 impl RestoreAuditBackend {
@@ -911,6 +1151,7 @@ impl RestoreAuditBackend {
             journal_at_first_restore_txlog: Mutex::new(None),
             churn_journal: Mutex::new(None),
             churn_remaining: AtomicUsize::new(0),
+            head_version_capacity: AtomicUsize::new(0),
         }
     }
 
@@ -1038,7 +1279,14 @@ impl StorageBackend for RestoreAuditBackend {
             let bytes = self.inner.get(path).await?;
             self.inner.put(path, bytes, WritePrecondition::None).await?;
         }
-        self.inner.head(path).await
+        let mut metadata = self.inner.head(path).await?;
+        if let Some(meta) = &mut metadata {
+            let capacity = self.head_version_capacity.load(Ordering::SeqCst);
+            if meta.version.capacity() < capacity {
+                meta.version.reserve_exact(capacity - meta.version.len());
+            }
+        }
+        Ok(metadata)
     }
 
     async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {

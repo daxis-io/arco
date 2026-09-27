@@ -130,6 +130,8 @@ use crate::workspace_snapshot::{
 
 const IMPLEMENTATION: &str = "arco-state-control-mvp";
 pub(crate) mod cost;
+#[cfg(all(test, not(feature = "test-utils")))]
+use cost::BoundedWork;
 #[cfg(feature = "test-utils")]
 pub use cost::BoundedWork;
 #[allow(
@@ -151,9 +153,12 @@ mod lazy;
     reason = "physical descriptors await authority-8 integration"
 )]
 mod physical;
+mod retained;
 #[cfg(feature = "test-utils")]
 pub use bounded::SyntheticKvEntry;
+pub use bounded::restore::{ControlMvpRestoreFenceWitness, ControlMvpRestorePlanV7};
 pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
+pub(crate) use retained::{RetainedSourcePublication, VerifiedRetainedPointer};
 #[cfg(test)]
 mod authority8_tests;
 mod read_cache;
@@ -239,10 +244,21 @@ pub struct ControlMvpStateStore {
     l1_test_rows: Option<usize>,
     read_cache: Option<ControlMvpReadCache>,
     cache_namespace: Option<DurableAuthorityBinding>,
+    durable_authority_binding: Option<Arc<DurableAuthorityBinding>>,
+    absent_restore_fence: Option<Arc<ControlMvpRestoreFenceWitness>>,
     bounded_recovery_bytes: Option<Arc<std::sync::Mutex<usize>>>,
 }
 
 impl ControlMvpStateStore {
+    fn capture_config(&self) -> super::WorkspaceCaptureConfig {
+        super::WorkspaceCaptureConfig {
+            scope: self.scope.clone(),
+            backend: self.binding_identity.clone(),
+            authority_format: self.authority_format,
+            durable_binding: self.durable_authority_binding.as_deref().copied(),
+        }
+    }
+
     fn reject_bounded_v1(&self, operation: &str) -> Result<()> {
         if self.authority_format == 8 {
             return Err(CatalogError::UnsupportedAuthorityFormat {
@@ -250,6 +266,200 @@ impl ControlMvpStateStore {
             });
         }
         Ok(())
+    }
+
+    fn durable_authority8_binding(&self) -> Result<DurableAuthorityBinding> {
+        self.durable_authority_binding
+            .as_deref()
+            .copied()
+            .ok_or_else(|| {
+                validation_failed(
+                    "authority-8 retained sources require a durable authority binding",
+                )
+            })
+    }
+
+    async fn resolve_bounded_persisted_reference(
+        &self,
+        reference: &PersistedAuthorityReference,
+    ) -> Result<ControlMvpRetainedReader> {
+        retained::resolve(self, reference).await
+    }
+
+    async fn preflight_bounded_persisted_reference(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+        io: &mut crate::workspace_io_budget::WorkspaceCaptureIo<'_>,
+    ) -> Result<()> {
+        reference.validate()?;
+        if reference.implementation() != IMPLEMENTATION {
+            return Err(validation_failed(
+                "persisted authority implementation does not match control MVP",
+            ));
+        }
+        if reference.scope() != &self.scope {
+            return Err(validation_failed(
+                "persisted authority scope does not match control MVP store",
+            ));
+        }
+        if reference.retention_deadline() <= now {
+            return Err(validation_failed(
+                "persisted authority reference is expired",
+            ));
+        }
+        if reference.manifest_path() != self.paths.manifest_object(reference.manifest_id()) {
+            return Err(validation_failed(
+                "persisted authority manifest path is not canonical for this store",
+            ));
+        }
+        if self.authority_format == 8 {
+            return retained::preflight_with_workspace_io(self, reference, io).await;
+        }
+        self.preflight_bounded_checkpoint_reference(reference, now, io.workspace_budget())
+            .await
+    }
+
+    async fn preflight_bounded_checkpoint_reference(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        if reference.reference_kind() != PersistedAuthorityKind::Checkpoint
+            || reference.checkpoint_path().is_none()
+            || reference.checkpoint_sha256().is_none()
+        {
+            return Err(validation_failed(
+                "bounded workspace preflight requires checkpoint authority evidence",
+            ));
+        }
+        let checkpoint_path = reference
+            .checkpoint_path()
+            .ok_or_else(|| validation_failed("checkpoint path is missing"))?;
+        let prefix = format!("{}/checkpoints/", self.paths.base_prefix());
+        let checkpoint_id = checkpoint_path
+            .strip_prefix(&prefix)
+            .and_then(|path| path.strip_suffix(".json"))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+            .ok_or_else(|| {
+                validation_failed("persisted checkpoint path is not canonical for this store")
+            })?;
+        if self.paths.checkpoint_object(checkpoint_id) != checkpoint_path {
+            return Err(validation_failed(
+                "persisted checkpoint path is not canonical for this store",
+            ));
+        }
+        let checkpoint_bytes = budget
+            .read_immutable(
+                &self.retention,
+                checkpoint_path,
+                None,
+                reference.checkpoint_sha256().unwrap_or_default(),
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+            &checkpoint_bytes,
+            "control-mvp-checkpoint",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
+        checkpoint.validate(&self.scope, checkpoint_id)?;
+        let meta = budget
+            .head(&self.retention, checkpoint_path)
+            .await?
+            .ok_or_else(|| validation_failed("checkpoint protection is missing"))?;
+        let created = meta
+            .last_modified
+            .ok_or_else(|| validation_failed("checkpoint protection has no creation timestamp"))?;
+        let floor = u64::try_from(CONTROL_MVP_TOKEN_RETENTION_DAYS * 24 * 60 * 60)
+            .map_err(|_| invariant_violation("invalid checkpoint retention floor"))?;
+        let seconds = i64::try_from(checkpoint.min_retention_seconds.unwrap_or(floor).max(floor))
+            .map_err(|_| validation_failed("checkpoint retention interval overflow"))?;
+        if created
+            .checked_add_signed(ChronoDuration::seconds(seconds))
+            .ok_or_else(|| validation_failed("checkpoint retention deadline overflow"))?
+            <= now
+        {
+            return Err(validation_failed("bounded checkpoint protection expired"));
+        }
+        let manifest_path = self.paths.manifest_object(reference.manifest_id());
+        let manifest_bytes = budget
+            .read_immutable(
+                &self.retention,
+                &manifest_path,
+                None,
+                reference.manifest_sha256(),
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        let manifest: ControlMvpManifest = decode_envelope_limited(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
+        manifest.validate(&self.scope, reference.manifest_id())?;
+        if manifest.logical_sequence != reference.logical_sequence() {
+            return Err(invariant_violation(
+                "persisted authority sequence does not match manifest",
+            ));
+        }
+        checkpoint.validate_source(&manifest)?;
+        if checkpoint.manifest_checksum_sha256 != sha256_hex(&manifest_bytes) {
+            return Err(invariant_violation(
+                "persisted checkpoint does not match authority manifest",
+            ));
+        }
+        let mut state = self
+            .load_bounded_checkpoint_states(&checkpoint.states, budget)
+            .await?;
+        checkpoint.validate_state(&mut state)
+    }
+
+    async fn persist_bounded_state_reference(
+        &self,
+        token: &StateToken,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<PersistedAuthorityReference> {
+        self.durable_authority8_binding()?;
+        let current = self
+            .pin_bounded_base()
+            .await?
+            .token(self)
+            .ok_or_else(|| validation_failed("authority-8 source requires a published HEAD"))?;
+        if current.authority_manifest_id() != token.authority_manifest_id()
+            || current.logical_sequence() != token.logical_sequence()
+            || current.manifest_witness()? != token.manifest_witness()?
+        {
+            return Err(validation_failed(
+                "authority-8 source token is not the authenticated current HEAD",
+            ));
+        }
+        self.read_bounded_token(token).await?;
+        let manifest_path = self.paths.manifest_object(token.authority_manifest_id());
+        let manifest_bytes = self
+            .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
+            .await?;
+        validate_raw_checksum(
+            &manifest_bytes,
+            Some(token.manifest_witness()?),
+            "authority-8 persisted state token witness",
+        )?;
+        let reference = PersistedAuthorityReference::new(
+            IMPLEMENTATION,
+            self.scope.clone(),
+            PersistedAuthorityKind::StateToken,
+            token.authority_manifest_id(),
+            token.logical_sequence(),
+            manifest_path,
+            prefixed_sha256(&manifest_bytes),
+            None,
+            None,
+            retention_deadline,
+        )?;
+        Ok(reference)
     }
 
     async fn require_legacy_lifecycle(&self, operation: &str) -> Result<()> {
@@ -430,6 +640,8 @@ impl ControlMvpStateStore {
             l1_test_rows: None,
             read_cache: None,
             cache_namespace: None,
+            durable_authority_binding: None,
+            absent_restore_fence: None,
             bounded_recovery_bytes: None,
         };
         store.with_read_cache_config(ControlMvpReadCacheConfig::default())
@@ -447,6 +659,21 @@ impl ControlMvpStateStore {
         let mut store = Self::new(storage, scope)?;
         store.authority_format = 8;
         Ok(store)
+    }
+
+    /// Supplies the trusted durable-location binding required by authority-8.
+    #[must_use]
+    pub fn with_durable_authority_binding(mut self, binding: DurableAuthorityBinding) -> Self {
+        self.durable_authority_binding = Some(Arc::new(binding));
+        self
+    }
+
+    /// Supplies an externally pinned fence witness for absent authority-8 restore.
+    /// The caller must obtain this pin from trusted composition, never restore records.
+    #[must_use]
+    pub fn with_absent_restore_fence(mut self, witness: ControlMvpRestoreFenceWitness) -> Self {
+        self.absent_restore_fence = Some(Arc::new(witness));
+        self
     }
 
     /// Sets the automatic replay-anchor interval in committed transactions.
@@ -1667,6 +1894,480 @@ impl ControlMvpStateStore {
             entries,
             if has_more { boundary } else { None },
         )
+    }
+
+    async fn load_bounded_checkpoint_pointer(
+        &self,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<ControlMvpPointer> {
+        let (bytes, _) = budget
+            .read_stable(
+                &self.retention,
+                &self.paths.current_pointer(),
+                MAX_HEAD_JSON_BYTES,
+            )
+            .await?
+            .ok_or_else(|| CatalogError::NotFound {
+                entity: "control MVP HEAD".into(),
+                name: self.paths.current_pointer(),
+            })?;
+        validate_version_header(&bytes, CONTROL_MVP_FORMAT_VERSION, "control MVP HEAD")?;
+        let pointer: ControlMvpPointer =
+            decode_json_limited(&bytes, MAX_HEAD_JSON_BYTES, "control MVP mutable head")?;
+        pointer.validate_versioned(&self.scope, CONTROL_MVP_FORMAT_VERSION)?;
+        Ok(pointer)
+    }
+
+    async fn load_bounded_checkpoint_manifest(
+        &self,
+        pointer: &ControlMvpPointer,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<ControlMvpManifest> {
+        let bytes = budget
+            .read_immutable(
+                &self.retention,
+                &self.paths.manifest_object(&pointer.manifest_id),
+                None,
+                &pointer.manifest_checksum_sha256,
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        let manifest: ControlMvpManifest = decode_envelope_limited(
+            &bytes,
+            "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
+        manifest.validate(&self.scope, &pointer.manifest_id)?;
+        if manifest.logical_sequence != pointer.logical_sequence
+            || pointer.writer_epoch < manifest.writer_epoch
+            || pointer.reclamation_generation < manifest.reclamation_generation
+        {
+            return Err(invariant_violation(
+                "bounded checkpoint HEAD and authenticated manifest differ",
+            ));
+        }
+        Ok(manifest)
+    }
+
+    async fn load_bounded_checkpoint_index(
+        &self,
+        reference: &ControlMvpSegmentRef,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<(Bytes, ControlMvpSegmentIndex)> {
+        if reference.index_size_bytes == 0
+            || reference.index_size_bytes > MAX_SEGMENT_INDEX_BYTES as u64
+        {
+            return Err(invariant_violation("invalid declared directory length"));
+        }
+        let index_bytes = budget
+            .read_immutable(
+                &self.retention,
+                &self.paths.segment_index(&reference.segment_id),
+                Some(
+                    usize::try_from(reference.index_size_bytes)
+                        .map_err(|_| invariant_violation("index length overflows usize"))?,
+                ),
+                &reference.index_checksum_sha256,
+                MAX_SEGMENT_INDEX_BYTES,
+            )
+            .await?;
+        validate_version_header(&index_bytes, SEGMENT_FORMAT_VERSION, "segment directory")?;
+        let index: ControlMvpSegmentIndex = decode_json(&index_bytes, "control MVP segment index")?;
+        validate_segment_index_identity(&index, reference, &self.scope)?;
+        validate_segment_index_key_metadata(&index)?;
+        Ok((index_bytes, index))
+    }
+
+    async fn load_bounded_checkpoint_segment(
+        &self,
+        reference: &ControlMvpSegmentRef,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<Bytes> {
+        if reference.segment_size_bytes == 0
+            || reference.segment_size_bytes > MAX_SEGMENT_BYTES as u64
+        {
+            return Err(invariant_violation("invalid declared segment length"));
+        }
+        let path = match reference.level {
+            ControlMvpSegmentLevel::L0 => self.paths.l0_segment_object(&reference.segment_id),
+            ControlMvpSegmentLevel::L1 => self.paths.state_object(&reference.segment_id),
+        };
+        budget
+            .read_immutable(
+                &self.retention,
+                &path,
+                Some(
+                    usize::try_from(reference.segment_size_bytes)
+                        .map_err(|_| invariant_violation("segment length overflows usize"))?,
+                ),
+                &reference.checksum_sha256,
+                MAX_SEGMENT_BYTES,
+            )
+            .await
+    }
+
+    async fn load_bounded_checkpoint_states(
+        &self,
+        references: &[ControlMvpStateRef],
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<ReplayState> {
+        let Some(first) = references.first() else {
+            return Ok(ReplayState::default());
+        };
+        let mut state = ReplayState {
+            logical_sequence: first.logical_sequence,
+            ..ReplayState::default()
+        };
+        let mut previous_max = None;
+        let mut saw_keyless = false;
+        let mut ids = BTreeSet::new();
+        for reference in references {
+            if !ids.insert(reference.state_id.as_str()) {
+                return Err(invariant_violation(
+                    "control MVP L1 segment set repeats a segment id",
+                ));
+            }
+            let segment = state_segment_reference(reference);
+            let (index_bytes, index) = self.load_bounded_checkpoint_index(&segment, budget).await?;
+            if index_key_bounds(&index)? != state_reference_key_bounds(reference)? {
+                return Err(invariant_violation(
+                    "L1 directory bounds differ from owning reference",
+                ));
+            }
+            match index_key_bounds(&index)? {
+                Some((minimum, maximum)) => {
+                    if saw_keyless
+                        || previous_max
+                            .as_ref()
+                            .is_some_and(|prior: &Vec<u8>| prior.as_slice() >= minimum.as_slice())
+                    {
+                        return Err(invariant_violation(
+                            "control MVP L1 segment key bounds overlap or are out of order",
+                        ));
+                    }
+                    previous_max = Some(maximum);
+                }
+                None => saw_keyless = true,
+            }
+            let bytes = self
+                .load_bounded_checkpoint_segment(&segment, budget)
+                .await?;
+            let rows = decode_segment_rows(&bytes, &index_bytes, &segment, &self.scope)?;
+            state.append_snapshot(state_object_from_segment_rows(
+                reference,
+                rows,
+                &self.scope,
+            )?)?;
+        }
+        Ok(state)
+    }
+
+    async fn load_bounded_checkpoint_tx(
+        &self,
+        reference: &ControlMvpTxRef,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<ControlMvpTxObject> {
+        if reference.size_bytes == 0 || reference.size_bytes > MAX_TRANSACTION_JSON_BYTES as u64 {
+            return Err(invariant_violation("invalid transaction reference length"));
+        }
+        let bytes = budget
+            .read_immutable(
+                &self.retention,
+                &self.paths.tx_object(&reference.tx_id),
+                Some(
+                    usize::try_from(reference.size_bytes)
+                        .map_err(|_| invariant_violation("transaction length overflows usize"))?,
+                ),
+                &reference.checksum_sha256,
+                MAX_TRANSACTION_JSON_BYTES,
+            )
+            .await?;
+        let mut tx: ControlMvpTxObject = decode_envelope_limited(
+            &bytes,
+            "control-mvp-tx",
+            MAX_TRANSACTION_JSON_BYTES,
+            "control MVP transaction",
+        )?;
+        tx.validate(&self.scope, reference)?;
+        let segment_bytes = self
+            .load_bounded_checkpoint_segment(&tx.l0_segment, budget)
+            .await?;
+        let (index_bytes, _) = self
+            .load_bounded_checkpoint_index(&tx.l0_segment, budget)
+            .await?;
+        tx.hydrate_from_segment_rows(decode_segment_rows(
+            &segment_bytes,
+            &index_bytes,
+            &tx.l0_segment,
+            &self.scope,
+        )?)?;
+        Ok(tx)
+    }
+
+    async fn replay_bounded_checkpoint_manifest(
+        &self,
+        manifest: &ControlMvpManifest,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<ReplayState> {
+        let mut state = self
+            .load_bounded_checkpoint_states(&manifest.base_states, budget)
+            .await?;
+        state.history_root.clone_from(&manifest.history_anchor.root);
+        if let Some(render) = manifest
+            .equivalence
+            .as_ref()
+            .and_then(|equivalence| equivalence.render_source.as_ref())
+            && (state.logical_sequence != render.logical_sequence
+                || state.checksum()? != render.state_checksum_sha256)
+        {
+            return Err(invariant_violation(
+                "materialized rewrite differs from its render cut",
+            ));
+        }
+        for reference in &manifest.tx_refs {
+            state.apply_tx(&self.load_bounded_checkpoint_tx(reference, budget).await?)?;
+        }
+        if state.checksum()? != manifest.state_checksum_sha256
+            || state.history_root != manifest.history_root
+        {
+            return Err(invariant_violation(
+                "control MVP manifest state checksum does not match replay",
+            ));
+        }
+        Ok(state)
+    }
+
+    async fn prepare_bounded_checkpoint(
+        &self,
+        options: &CheckpointOptions,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<(ControlMvpCheckpoint, Vec<RenderedControlMvpStateSegment>)> {
+        if options.scope().is_some_and(|scope| scope != &self.scope) {
+            return Err(validation_failed(
+                "checkpoint scope does not match control MVP store",
+            ));
+        }
+        let pointer = self.load_bounded_checkpoint_pointer(budget).await?;
+        let manifest = self
+            .load_bounded_checkpoint_manifest(&pointer, budget)
+            .await?;
+        let expected = self
+            .replay_bounded_checkpoint_manifest(&manifest, budget)
+            .await?;
+        let checkpoint_id = format!(
+            "checkpoint-{:020}-rg-{:020}-{}",
+            pointer.logical_sequence,
+            pointer.reclamation_generation,
+            cost::nonce().to_string().to_ascii_lowercase()
+        );
+        let (states, rendered) = if !manifest.anchor_states.is_empty() {
+            (manifest.anchor_states.clone(), Vec::new())
+        } else if manifest.tx_refs.is_empty() && !manifest.base_states.is_empty() {
+            (manifest.base_states.clone(), Vec::new())
+        } else {
+            let rendered = self.render_state_snapshots(&expected, &checkpoint_id)?;
+            let states = rendered
+                .iter()
+                .map(|segment| segment.reference.clone())
+                .collect();
+            (states, rendered)
+        };
+        if rendered.is_empty() {
+            let mut state = self.load_bounded_checkpoint_states(&states, budget).await?;
+            state.history_root.clone_from(&manifest.history_root);
+            if state != expected || state.checksum()? != manifest.state_checksum_sha256 {
+                return Err(invariant_violation(
+                    "checkpoint reused state differs from authority manifest",
+                ));
+            }
+        }
+        let checkpoint = ControlMvpCheckpoint {
+            validation: CheckpointValidation {
+                encoding_version: 1,
+                source_manifest_sha256: pointer.manifest_checksum_sha256.clone(),
+                source_history_root: manifest.history_root.clone(),
+                source_physical_root: manifest.physical_root.clone(),
+                state_checksum_sha256: manifest.state_checksum_sha256.clone(),
+                checkpoint_physical_root: integrity::checkpoint_physical_digest(
+                    &self.scope.clone(),
+                    &states,
+                )?,
+            },
+            reclamation_generation: pointer.reclamation_generation,
+            format_version: CONTROL_MVP_FORMAT_VERSION,
+            implementation: IMPLEMENTATION.to_string(),
+            scope: self.scope.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            manifest_id: pointer.manifest_id,
+            logical_sequence: pointer.logical_sequence,
+            manifest_checksum_sha256: pointer.manifest_checksum_sha256,
+            states,
+            min_retention_seconds: options.min_retention_seconds(),
+            retention_horizon: None,
+        };
+        checkpoint.validate(&self.scope, &checkpoint.checkpoint_id)?;
+        checkpoint.validate_source(&manifest)?;
+        encode_envelope_limited(
+            "control-mvp-checkpoint",
+            &checkpoint,
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
+        Ok((checkpoint, rendered))
+    }
+
+    async fn write_bounded_checkpoint_artifacts(
+        &self,
+        rendered: &[RenderedControlMvpStateSegment],
+        checkpoint: &ControlMvpCheckpoint,
+        context: &mut super::RetainedSourceCaptureContext<'_>,
+    ) -> Result<CheckpointToken> {
+        let (epoch, budget) = context.publication_io();
+        for segment in rendered {
+            epoch
+                .put_immutable_bounded_with_limit(
+                    &self.paths.state_object(&segment.reference.state_id),
+                    segment.bytes.clone(),
+                    MAX_SEGMENT_BYTES,
+                    budget,
+                )
+                .await?;
+            epoch
+                .put_immutable_bounded_with_limit(
+                    &self.paths.segment_index(&segment.reference.state_id),
+                    segment.index_bytes.clone(),
+                    MAX_SEGMENT_INDEX_BYTES,
+                    budget,
+                )
+                .await?;
+        }
+        let bytes = encode_envelope_limited(
+            "control-mvp-checkpoint",
+            checkpoint,
+            MAX_CONTROL_JSON_BYTES,
+            "checkpoint",
+        )?;
+        let witness = sha256_hex(&bytes);
+        epoch
+            .put_immutable_bounded(
+                &self.paths.checkpoint_object(&checkpoint.checkpoint_id),
+                bytes,
+                budget,
+            )
+            .await?;
+        Ok(self
+            .checkpoint_token(checkpoint.checkpoint_id.clone())
+            .with_checkpoint_witness(witness))
+    }
+
+    async fn persist_bounded_checkpoint_reference(
+        &self,
+        token: &CheckpointToken,
+        retention_deadline: DateTime<Utc>,
+        context: &mut super::RetainedSourceCaptureContext<'_>,
+    ) -> Result<PersistedAuthorityReference> {
+        let now = cost::now();
+        if retention_deadline <= now || token.scope() != &self.scope {
+            return Err(validation_failed(
+                "bounded checkpoint reference scope or retention deadline differs",
+            ));
+        }
+        let checkpoint_path = self.paths.checkpoint_object(token.checkpoint_id());
+        let budget = context.io();
+        let checkpoint_bytes = budget
+            .read_immutable(
+                &self.retention,
+                &checkpoint_path,
+                None,
+                token.checkpoint_witness()?,
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        let checkpoint: ControlMvpCheckpoint = decode_envelope_limited(
+            &checkpoint_bytes,
+            "control-mvp-checkpoint",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP checkpoint",
+        )?;
+        checkpoint.validate(&self.scope, token.checkpoint_id())?;
+        let meta = budget
+            .head(&self.retention, &checkpoint_path)
+            .await?
+            .ok_or_else(|| validation_failed("checkpoint protection is missing"))?;
+        let created = meta
+            .last_modified
+            .ok_or_else(|| validation_failed("checkpoint protection has no creation timestamp"))?;
+        let floor = u64::try_from(CONTROL_MVP_TOKEN_RETENTION_DAYS * 24 * 60 * 60)
+            .map_err(|_| invariant_violation("invalid checkpoint retention floor"))?;
+        let seconds = i64::try_from(checkpoint.min_retention_seconds.unwrap_or(floor).max(floor))
+            .map_err(|_| validation_failed("checkpoint retention interval overflow"))?;
+        if created
+            .checked_add_signed(ChronoDuration::seconds(seconds))
+            .ok_or_else(|| validation_failed("checkpoint retention deadline overflow"))?
+            <= now
+        {
+            return Err(validation_failed("bounded checkpoint protection expired"));
+        }
+        let manifest_path = self.paths.manifest_object(&checkpoint.manifest_id);
+        let manifest_bytes = budget
+            .read_immutable(
+                &self.retention,
+                &manifest_path,
+                None,
+                &checkpoint.manifest_checksum_sha256,
+                MAX_CONTROL_JSON_BYTES,
+            )
+            .await?;
+        let manifest: ControlMvpManifest = decode_envelope_limited(
+            &manifest_bytes,
+            "control-mvp-manifest",
+            MAX_CONTROL_JSON_BYTES,
+            "control MVP manifest",
+        )?;
+        manifest.validate(&self.scope, &checkpoint.manifest_id)?;
+        checkpoint.validate_source(&manifest)?;
+        let mut state = self
+            .load_bounded_checkpoint_states(&checkpoint.states, budget)
+            .await?;
+        checkpoint.validate_state(&mut state)?;
+        PersistedAuthorityReference::new(
+            IMPLEMENTATION,
+            self.scope.clone(),
+            PersistedAuthorityKind::Checkpoint,
+            checkpoint.manifest_id,
+            checkpoint.logical_sequence,
+            manifest_path,
+            prefixed_sha256(&manifest_bytes),
+            Some(checkpoint_path),
+            Some(prefixed_sha256(&checkpoint_bytes)),
+            retention_deadline,
+        )
+    }
+
+    async fn prepare_bounded_checkpoint_source(
+        &self,
+        context: &mut super::RetainedSourceCaptureContext<'_>,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<super::PreparedRetainedSource> {
+        let now = cost::now();
+        let seconds = u64::try_from(retention_deadline.signed_duration_since(now).num_seconds())
+            .map_err(|_| {
+                validation_failed("checkpoint retention deadline must be in the future")
+            })?;
+        let options = CheckpointOptions::new(Some(self.scope.clone()))
+            .with_min_retention_seconds(seconds)
+            .with_external_retention_coordination();
+        let (checkpoint, rendered) = self
+            .prepare_bounded_checkpoint(&options, context.io())
+            .await?;
+        let token = self
+            .write_bounded_checkpoint_artifacts(&rendered, &checkpoint, context)
+            .await?;
+        let reference = self
+            .persist_bounded_checkpoint_reference(&token, retention_deadline, context)
+            .await?;
+        Ok(super::PreparedRetainedSource::checkpoint(reference))
     }
 
     async fn write_checkpoint(
@@ -5530,7 +6231,7 @@ impl ControlMvpStateStore {
 impl ArcoStateAdmin for ControlMvpStateStore {
     fn capabilities(&self) -> StateStoreCapabilities {
         if self.authority_format == 8 {
-            StateStoreCapabilities::deterministic_model(Self::IMPLEMENTATION)
+            StateStoreCapabilities::synthetic_bounded(Self::IMPLEMENTATION)
         } else {
             StateStoreCapabilities::control_mvp(Self::IMPLEMENTATION)
         }
@@ -5627,12 +6328,68 @@ impl ArcoStateAdmin for ControlMvpStateStore {
 
 #[async_trait]
 impl PersistedAuthorityAdapter for ControlMvpStateStore {
+    fn workspace_capture_config(&self) -> Option<super::WorkspaceCaptureConfig> {
+        Some(self.capture_config())
+    }
+
+    async fn prepare_retained_source(
+        &self,
+        context: &mut super::RetainedSourceCaptureContext<'_>,
+        retention_deadline: DateTime<Utc>,
+    ) -> Result<Option<super::PreparedRetainedSource>> {
+        if self.authority_format != 8 {
+            if context.scope() != &self.scope {
+                return Err(validation_failed(
+                    "bounded checkpoint capture context does not match the configured authority",
+                ));
+            }
+            return self
+                .prepare_bounded_checkpoint_source(context, retention_deadline)
+                .await
+                .map(Some);
+        }
+        if context.scope() != &self.scope || retention_deadline <= cost::now() {
+            return Err(validation_failed(
+                "bounded retained source capture context does not match the configured authority",
+            ));
+        }
+        retained::prepare(self, context, retention_deadline)
+            .await
+            .map(Some)
+    }
+
+    async fn verify_retained_source(
+        &self,
+        context: &mut super::RetainedSourceCaptureContext<'_>,
+        reference: &PersistedAuthorityReference,
+    ) -> Result<Option<super::VerifiedRetainedSource>> {
+        if self.authority_format != 8
+            || context.scope() != &self.scope
+            || reference.scope() != &self.scope
+            || reference.retention_deadline() <= cost::now()
+        {
+            return Err(validation_failed(
+                "bounded retained verification scope, format or lifetime differs",
+            ));
+        }
+        retained::verify(self, context, reference).await
+    }
+
+    async fn preflight_persisted_reference_bounded(
+        &self,
+        reference: &PersistedAuthorityReference,
+        now: DateTime<Utc>,
+        io: &mut crate::workspace_io_budget::WorkspaceCaptureIo<'_>,
+    ) -> Result<()> {
+        self.preflight_bounded_persisted_reference(reference, now, io)
+            .await
+    }
+
     async fn persist_state_reference(
         &self,
         token: &StateToken,
         retention_deadline: DateTime<Utc>,
     ) -> Result<PersistedAuthorityReference> {
-        self.reject_bounded_v1("persist_state_reference")?;
         if retention_deadline <= cost::now() {
             return Err(validation_failed(
                 "persisted authority retention deadline must be in the future",
@@ -5642,6 +6399,11 @@ impl PersistedAuthorityAdapter for ControlMvpStateStore {
             return Err(validation_failed(
                 "StateToken scope does not match control MVP store",
             ));
+        }
+        if self.authority_format == 8 {
+            return self
+                .persist_bounded_state_reference(token, retention_deadline)
+                .await;
         }
         self.validate_state_token_protection(token, cost::now())
             .await?;
@@ -5797,6 +6559,9 @@ impl ControlMvpStateStore {
                 "persisted authority manifest path is not canonical for this store",
             ));
         }
+        if self.authority_format == 8 {
+            return self.resolve_bounded_persisted_reference(reference).await;
+        }
         let manifest_bytes = self
             .get_json(&manifest_path, MAX_CONTROL_JSON_BYTES)
             .await?;
@@ -5907,14 +6672,59 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         ))
     }
 
+    async fn plan_restore_bounded(
+        &self,
+        source: &PersistedAuthorityReference,
+        identity: &RestoreAttemptIdentity,
+        context: &mut crate::state_store::RestorePlanningContext<'_>,
+    ) -> Result<PersistedRestoreParticipantPlan> {
+        Ok(PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
+            bounded::restore::plan(&self.store, source, identity, context).await?,
+        )))
+    }
+
+    #[allow(
+        clippy::large_futures,
+        reason = "native bounded driver retains accounted fixed products on stack"
+    )]
+    async fn advance_restore(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+        context: &mut crate::state_store::RestoreAdvanceContext<'_>,
+    ) -> Result<crate::state_store::RestoreParticipantAdvance> {
+        if context.is_bounded() {
+            if self.store.authority_format != 8 {
+                return Err(CatalogError::UnsupportedOperation {
+                    message: "bounded advance requires synthetic authority 8".into(),
+                });
+            }
+            return bounded::restore::advance(&self.store, plan, context).await;
+        }
+        self.apply_restore(plan, context.observed_now())
+            .await
+            .map(crate::state_store::RestoreParticipantAdvance::Terminal)
+    }
+
+    async fn inspect_restore_bounded(
+        &self,
+        plan: &PersistedRestoreParticipantPlan,
+        context: &mut crate::state_store::RestoreBoundedInspectionContext<'_>,
+    ) -> Result<RestoreParticipantInspection> {
+        bounded::restore::inspect(&self.store, plan, context).await
+    }
+
     async fn inspect_restore(
         &self,
         plan: &PersistedRestoreParticipantPlan,
     ) -> Result<RestoreParticipantInspection> {
+        let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan else {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "Plan7 requires bounded restore inspection".into(),
+            });
+        };
         self.store
             .require_legacy_lifecycle("inspect_restore")
             .await?;
-        let PersistedRestoreParticipantPlan::ControlMvp(plan) = plan;
         if plan.is_legacy_version() {
             plan.validate_legacy_for_supersession(&self.store)?;
             return Ok(RestoreParticipantInspection::Superseded);
@@ -5976,8 +6786,12 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         persisted: &PersistedRestoreParticipantPlan,
         now: DateTime<Utc>,
     ) -> Result<RestoreParticipantInspection> {
+        let PersistedRestoreParticipantPlan::ControlMvp(plan) = persisted else {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "Plan7 requires bounded restore advance".into(),
+            });
+        };
         self.store.require_legacy_lifecycle("apply_restore").await?;
-        let PersistedRestoreParticipantPlan::ControlMvp(plan) = persisted;
         if plan.is_legacy_version() {
             plan.validate_legacy_for_supersession(&self.store)?;
             return Ok(RestoreParticipantInspection::Superseded);
@@ -6064,6 +6878,10 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
 
 #[async_trait]
 impl ArcoStateStore for ControlMvpStateStore {
+    fn workspace_capture_config(&self) -> Option<super::WorkspaceCaptureConfig> {
+        Some(self.capture_config())
+    }
+
     fn restore_binding_identity(&self) -> Option<StateStoreBindingIdentity> {
         Some(self.binding_identity.clone())
     }
@@ -8015,8 +8833,7 @@ struct ArrowSegmentPreflight {
     row_count: u64,
 }
 
-#[allow(clippy::too_many_lines)]
-fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
+fn verified_arrow_footer(bytes: &[u8]) -> Result<(arrow::ipc::Footer<'_>, usize)> {
     if bytes.len() > MAX_SEGMENT_BYTES {
         return Err(invariant_violation(
             "control MVP Arrow segment exceeds the supported byte limit",
@@ -8045,6 +8862,12 @@ fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
         arrow::ipc::root_as_footer_with_opts(&verifier_options, footer_bytes).map_err(|error| {
             invariant_violation(format!("control MVP Arrow footer is invalid: {error}"))
         })?;
+    Ok((footer, footer_start))
+}
+
+#[allow(clippy::too_many_lines)]
+fn preflight_arrow_segment(bytes: &[u8]) -> Result<ArrowSegmentPreflight> {
+    let (footer, footer_start) = verified_arrow_footer(bytes)?;
     if footer.version() != MetadataVersion::V5 {
         return Err(invariant_violation(
             "control MVP Arrow segment metadata version is unsupported",
@@ -8224,7 +9047,7 @@ fn segment_verifier_options() -> VerifierOptions {
 // SHA-256 always contains 32 bytes; probe positions are reduced to the byte-bounded filter.
 #[allow(clippy::indexing_slicing)]
 fn bloom_positions(key: &[u8], bits: usize) -> impl Iterator<Item = usize> {
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     {
         cost::record(15, 1);
         cost::record(16, key.len());
@@ -8471,11 +9294,20 @@ fn decode_block_rows(
     block: &ControlMvpBlock,
     domain: &str,
 ) -> Result<Vec<ControlMvpSegmentRow>> {
+    decode_block_rows_with_preflight(bytes, block, domain, preflight_arrow_segment)
+}
+
+fn decode_block_rows_with_preflight(
+    bytes: &[u8],
+    block: &ControlMvpBlock,
+    domain: &str,
+    preflight: fn(&[u8]) -> Result<ArrowSegmentPreflight>,
+) -> Result<Vec<ControlMvpSegmentRow>> {
     if bytes.len() as u64 != block.length {
         return Err(invariant_violation("block length mismatch"));
     }
     validate_raw_checksum_for(domain, bytes, Some(&block.checksum_sha256), "block digest")?;
-    let preflight = preflight_arrow_segment(bytes)?;
+    let preflight = preflight(bytes)?;
     if preflight.row_count != block.row_count {
         return Err(invariant_violation(
             "authenticated block row count differs from Arrow metadata",
@@ -8484,7 +9316,7 @@ fn decode_block_rows(
     if preflight.record_batch_offsets.len() != 1 {
         return Err(invariant_violation("block must contain one batch"));
     }
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     {
         cost::record(20, 1);
         cost::record(21, bytes.len());
@@ -8516,7 +9348,7 @@ fn decode_block_rows(
             "control MVP Arrow segment exceeds the supported row limit",
         ));
     }
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     cost::bounded_work(BoundedWork {
         decoded_rows: batch.num_rows() as u64,
         ..Default::default()
@@ -9242,7 +10074,7 @@ fn validate_raw_checksum_for(
     context: &str,
 ) -> Result<()> {
     if let Some(expected) = expected {
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         {
             cost::record(13, 1);
             cost::record(14, bytes.len());
@@ -9276,7 +10108,7 @@ fn decode_json<'de, T>(bytes: &'de [u8], context: &str) -> Result<T>
 where
     T: Deserialize<'de>,
 {
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     if matches!(
         context,
         "control MVP segment index" | "control MVP transaction"
@@ -9340,18 +10172,34 @@ fn record_integrity_work(kind: usize, bytes: usize) {
     });
 }
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn record_sha256_work(bytes: usize) {
     cost::record(0, 1);
     cost::record(1, bytes);
-    TEST_SHA256_WORK.with(|work| {
-        let (calls, total) = work.get();
-        work.set((calls + 1, total + bytes as u64));
-    });
+    #[cfg(feature = "test-utils")]
+    if !cost::native_capture_active() {
+        TEST_SHA256_WORK.with(|work| {
+            let (calls, total) = work.get();
+            work.set((calls + 1, total + bytes as u64));
+        });
+    }
+}
+
+/// Account bytes when a streaming hash consumes them, including unfinished streams.
+#[cfg(any(test, feature = "test-utils"))]
+fn record_sha256_update(bytes: usize) {
+    cost::record(1, bytes);
+    #[cfg(feature = "test-utils")]
+    if !cost::native_capture_active() {
+        TEST_SHA256_WORK.with(|work| {
+            let (calls, total) = work.get();
+            work.set((calls, total + bytes as u64));
+        });
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     record_sha256_work(bytes.len());
     let mut hasher = Sha256::new();
     hasher.update(bytes);

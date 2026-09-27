@@ -14,6 +14,7 @@ use arco_core::{AuthorityRoot, RootStorage, ScopedAuthorityStore, ScopedStorage}
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+pub(super) mod restore;
 pub(super) mod update;
 
 const PAGE_MAGIC: &[u8; 8] = b"ARCODIR1";
@@ -124,7 +125,9 @@ pub struct Page {
 }
 
 /// Cumulative conservative probe accounting, including failed reads and retries.
-pub struct ReadBudget {
+pub struct ReadBudget<'a> {
+    workspace: Option<&'a mut crate::workspace_io_budget::WorkspaceIoBudget>,
+    retained: Option<&'a mut (dyn ReadInvoice + Send)>,
     object_limit: usize,
     byte_limit: usize,
     pub objects: usize,
@@ -133,7 +136,15 @@ pub struct ReadBudget {
     cached_keys: Vec<CachedKey>,
     cached_key_bytes: usize,
 }
-impl Default for ReadBudget {
+
+/// Charges a directory probe to an enclosing authority-specific read budget.
+///
+/// The directory keeps its local structural ceiling while the enclosing reader
+/// owns the public invocation and retained-source accounting.
+pub(in super::super) trait ReadInvoice: Send {
+    fn charge_directory_probe(&mut self, bytes: usize) -> Result<()>;
+}
+impl Default for ReadBudget<'_> {
     fn default() -> Self {
         Self {
             object_limit: OBJECT_LIMIT,
@@ -142,10 +153,28 @@ impl Default for ReadBudget {
             bytes: 0,
             cached_keys: Vec::new(),
             cached_key_bytes: 0,
+            workspace: None,
+            retained: None,
         }
     }
 }
-impl ReadBudget {
+impl<'a> ReadBudget<'a> {
+    pub(in super::super) fn with_workspace(
+        workspace: &'a mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Self {
+        Self {
+            workspace: Some(workspace),
+            ..Self::default()
+        }
+    }
+
+    pub(in super::super) fn with_retained(retained: &'a mut (dyn ReadInvoice + Send)) -> Self {
+        Self {
+            retained: Some(retained),
+            ..Self::default()
+        }
+    }
+
     pub fn new(objects: usize, bytes: usize) -> Result<Self> {
         if objects > OBJECT_LIMIT || bytes > MAX_SEGMENT_BYTES {
             return Err(validation_failed(
@@ -159,11 +188,19 @@ impl ReadBudget {
             bytes: 0,
             cached_keys: Vec::new(),
             cached_key_bytes: 0,
+            workspace: None,
+            retained: None,
         })
     }
     fn charge(&mut self, bytes: usize) -> Result<()> {
         if self.objects >= self.object_limit || bytes > self.byte_limit.saturating_sub(self.bytes) {
             return Err(capacity("directory read budget exhausted"));
+        }
+        if let Some(retained) = &mut self.retained {
+            retained.charge_directory_probe(bytes)?;
+        } else if let Some(workspace) = &mut self.workspace {
+            workspace.reserve_bytes(bytes)?;
+            workspace.charge_operations(1)?;
         }
         self.objects += 1;
         self.bytes += bytes;
@@ -173,6 +210,37 @@ impl ReadBudget {
 
 impl Directory {
     pub fn new(storage: impl Into<RootStorage>, scope: &StateScope) -> Result<Self> {
+        Self::with_role(
+            storage,
+            scope,
+            b"arco.directory.scope.v1\0",
+            format!("control/directory/v1/domains/{}", scope.domain()),
+        )
+    }
+
+    /// Constructs the retained-reference directory role. Its roots and pages
+    /// are intentionally incompatible with ordinary physical directories.
+    pub(in super::super) fn retained_reference(
+        storage: impl Into<RootStorage>,
+        scope: &StateScope,
+    ) -> Result<Self> {
+        Self::with_role(
+            storage,
+            scope,
+            b"arco.directory.role.retained-reference.v1\0",
+            format!(
+                "control/v1/domains/{}/retained/v1/directory",
+                scope.domain()
+            ),
+        )
+    }
+
+    fn with_role(
+        storage: impl Into<RootStorage>,
+        scope: &StateScope,
+        role: &[u8],
+        prefix: String,
+    ) -> Result<Self> {
         scope.validate()?;
         let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
@@ -181,7 +249,7 @@ impl Directory {
             ));
         }
         let mut hash = Sha256::new();
-        hash.update(b"arco.directory.scope.v1\0");
+        hash.update(role);
         let mut parts: Vec<&str> = vec![scope.tenant_id()];
         match scope.root() {
             AuthorityRoot::Workspace { workspace_id } => parts.push(workspace_id.as_str()),
@@ -201,12 +269,10 @@ impl Directory {
             hash.update((part.len() as u64).to_le_bytes());
             hash.update(part.as_bytes());
         }
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         super::record_sha256_work(
-            b"arco.directory.scope.v1\0".len()
-                + parts.iter().map(|part| 8 + part.len()).sum::<usize>(),
+            role.len() + parts.iter().map(|part| 8 + part.len()).sum::<usize>(),
         );
-        let prefix = format!("control/directory/v1/domains/{}", scope.domain());
         ScopedStorage::validate_path(&prefix)?;
         Ok(Self {
             storage: ScopedAuthorityStore::new(storage),
@@ -226,6 +292,15 @@ impl Directory {
         Ok(Root {
             scope: self.scope,
             node: self.write_page(1, &[]).await?,
+        })
+    }
+    pub(in super::super) async fn empty_root_budgeted(
+        &self,
+        budget: &mut ReadBudget<'_>,
+    ) -> Result<Root> {
+        Ok(Root {
+            scope: self.scope,
+            node: self.write_page_budgeted(1, &[], budget).await?,
         })
     }
     /// Computes the canonical empty reference without persisting a page.
@@ -257,7 +332,7 @@ impl Directory {
         })
     }
     fn digest(&self, kind: &[u8], bytes: &[u8]) -> [u8; 32] {
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         super::record_sha256_work(
             b"arco.directory.object.v1\0".len() + 8 + kind.len() + 32 + 8 + bytes.len(),
         );
@@ -305,12 +380,95 @@ impl Directory {
         }
         Ok(reference)
     }
+    async fn write_key_budgeted(
+        &self,
+        bytes: &[u8],
+        budget: &mut ReadBudget<'_>,
+    ) -> Result<KeyRef> {
+        let reference = self.key_ref(bytes)?;
+        if bytes.len() > INLINE_KEY_BYTES {
+            self.write_object_budgeted(
+                "keys",
+                &reference.digest,
+                Bytes::copy_from_slice(bytes),
+                budget,
+            )
+            .await?;
+        }
+        Ok(reference)
+    }
+
+    async fn write_page_budgeted(
+        &self,
+        depth: u8,
+        children: &[Node],
+        budget: &mut ReadBudget<'_>,
+    ) -> Result<Node> {
+        let (node, bytes) = self.page_node(depth, children)?;
+        self.write_object_budgeted("pages", &node.digest, bytes.into(), budget)
+            .await?;
+        Ok(node)
+    }
+
+    async fn write_object_budgeted(
+        &self,
+        kind: &str,
+        digest: &[u8; 32],
+        bytes: Bytes,
+        budget: &mut ReadBudget<'_>,
+    ) -> Result<()> {
+        let path = self.path(kind, digest);
+        let Some(workspace) = budget.workspace.as_deref_mut() else {
+            return put_immutable_matching(
+                &self.storage,
+                &path,
+                bytes,
+                if kind == "keys" {
+                    "directory key collision"
+                } else {
+                    "directory page collision"
+                },
+            )
+            .await;
+        };
+        workspace.reserve_bytes(bytes.len())?;
+        workspace.charge_operations(1)?;
+        let result = self
+            .storage
+            .put(
+                &path,
+                bytes.clone(),
+                arco_core::AuthorityWritePrecondition::DoesNotExist,
+            )
+            .await?;
+        workspace
+            .charge_write(&result)
+            .map_err(|_| CatalogError::AmbiguousAuthorityOutcome {
+                message: "directory PUT response exceeded workspace admission".into(),
+            })?;
+        match result {
+            arco_core::WriteResult::Success { .. } => Ok(()),
+            arco_core::WriteResult::PreconditionFailed { .. } => {
+                let probe = bytes
+                    .len()
+                    .checked_add(1)
+                    .ok_or_else(|| capacity("directory collision probe overflow"))?;
+                workspace.reserve_bytes(probe)?;
+                workspace.charge_operations(1)?;
+                if self.storage.get_range(&path, 0..probe as u64).await? != bytes {
+                    return Err(invariant_violation("directory immutable collision"));
+                }
+                Ok(())
+            }
+        }
+    }
+
     async fn read_object(
         &self,
         kind: &str,
         digest: &[u8; 32],
         length: usize,
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Bytes> {
         let probe = length
             .checked_add(1)
@@ -327,7 +485,7 @@ impl Directory {
         }
         Ok(bytes)
     }
-    async fn read_key(&self, key: KeyRef, budget: &mut ReadBudget) -> Result<Bytes> {
+    async fn read_key(&self, key: KeyRef, budget: &mut ReadBudget<'_>) -> Result<Bytes> {
         validate_key_shape(key)?;
         if key.bytes as usize <= INLINE_KEY_BYTES {
             let bytes = key
@@ -426,6 +584,23 @@ impl Directory {
         };
         Ok((node, bytes))
     }
+    #[cfg(test)]
+    pub(in super::super) async fn test_root_at_depth(
+        &self,
+        root: &Root,
+        depth: u8,
+    ) -> Result<Root> {
+        self.decode_root(&root.encode())?;
+        let mut node = root.node;
+        while node.depth < depth {
+            node = self.write_page(node.depth + 1, &[node]).await?;
+        }
+        Ok(Root {
+            scope: self.scope,
+            node,
+        })
+    }
+
     async fn write_page(&self, depth: u8, children: &[Node]) -> Result<Node> {
         let (node, bytes) = self.page_node(depth, children)?;
         put_immutable_matching(
@@ -443,7 +618,7 @@ impl Directory {
         lower: &[u8],
         upper: Option<&[u8]>,
         after: Option<&[u8]>,
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
         validate_node(&node, true)?;
         let bytes = self
@@ -501,7 +676,7 @@ impl Directory {
         &self,
         root: &Root,
         key: &[u8],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Option<Leaf>> {
         if root.scope != self.scope || key.len() > MAX_BLOCK_BYTES || root.node.depth == 0 {
             return Err(validation_failed("invalid directory floor scope or key"));
@@ -535,7 +710,7 @@ impl Directory {
         &self,
         root: &Root,
         key: &[u8],
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Option<Leaf>> {
         if root.scope != self.scope || root.node.depth == 0 || key.len() > MAX_BLOCK_BYTES {
             return Err(validation_failed("invalid directory point scope or key"));
@@ -570,7 +745,7 @@ impl Directory {
         upper: Option<&[u8]>,
         limit: usize,
         cursor: Option<&Cursor>,
-        budget: &mut ReadBudget,
+        budget: &mut ReadBudget<'_>,
     ) -> Result<Page> {
         if root.scope != self.scope {
             return Err(invariant_violation("directory root scope mismatch"));
@@ -634,7 +809,7 @@ impl Directory {
 
 impl Builder {
     pub async fn push(&mut self, leaf: Leaf) -> Result<()> {
-        #[cfg(feature = "test-utils")]
+        #[cfg(any(test, feature = "test-utils"))]
         super::cost::bounded_work(super::cost::BoundedWork {
             streaming_builder_inputs: 1,
             ..Default::default()
@@ -789,7 +964,7 @@ fn page_probe_bytes(children: &[Node]) -> Result<usize> {
     Ok(total)
 }
 fn encode_node(out: &mut Vec<u8>, node: &Node) {
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     super::cost::bounded_work(super::cost::BoundedWork {
         directory_references: 1,
         ..Default::default()
@@ -814,7 +989,7 @@ fn take<const N: usize>(input: &mut &[u8]) -> Result<[u8; N]> {
     Ok(value)
 }
 fn decode_node(input: &mut &[u8]) -> Result<Node> {
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     super::cost::bounded_work(super::cost::BoundedWork {
         directory_references: 1,
         ..Default::default()

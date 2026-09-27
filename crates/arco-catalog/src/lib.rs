@@ -108,6 +108,7 @@ pub mod tier1_events;
 pub mod tier1_snapshot;
 pub mod tier1_state;
 pub mod tier1_writer;
+mod workspace_io_budget;
 pub mod workspace_restore;
 pub mod workspace_snapshot;
 pub mod workspace_snapshot_service;
@@ -152,14 +153,16 @@ pub use state_store::{
     CheckpointToken, CommitOutcome, ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker,
     ControlMvpOutboxTrimTarget, ControlMvpPaths, ControlMvpProjectionOutboxRecord,
     ControlMvpReadCache, ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics,
-    ControlMvpReadCacheStatistics, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
-    ControlMvpStateStore, ControlMvpTxn, CurrentStateStore, DurableAuthorityBinding,
-    DurableMaintenanceWorker, KeyRange, KvPair, LayoutMaintenanceIntentV1, LayoutMaintenanceReason,
-    MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_ROWS, MAX_SCAN_PAGE_SEGMENTS, MaintenanceJobId,
-    MaintenanceKind, MaintenanceProgress, MaintenanceStatus, ModelCommitRecord, ModelStateStore,
-    ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
-    PersistedRestoreParticipantPlan, PredicateInputSet, PreparedMaintenance, ProjectionIntentV1,
-    PurgedCounts, RestoreAttemptIdentity, RestoreParticipantInspection, RestoredAuthorityEvidence,
+    ControlMvpReadCacheStatistics, ControlMvpRestoreFenceWitness, ControlMvpRestoreParticipant,
+    ControlMvpRestorePlan, ControlMvpRestorePlanV7, ControlMvpStateStore, ControlMvpTxn,
+    CurrentStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, KeyRange, KvPair,
+    LayoutMaintenanceIntentV1, LayoutMaintenanceReason, MAX_SCAN_PAGE_BYTES, MAX_SCAN_PAGE_ROWS,
+    MAX_SCAN_PAGE_SEGMENTS, MaintenanceJobId, MaintenanceKind, MaintenanceProgress,
+    MaintenanceStatus, ModelCommitRecord, ModelStateStore, ModelWrite, PersistedAuthorityAdapter,
+    PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
+    PredicateInputSet, PreparedMaintenance, PreparedRetainedSource, ProjectionIntentV1,
+    PurgedCounts, RestoreAdvanceContext, RestoreAttemptIdentity, RestoreParticipantAdvance,
+    RestoreParticipantInspection, RestoredAuthorityEvidence, RetainedSourceCaptureContext,
     ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
     control_mvp_outbox_event_id,

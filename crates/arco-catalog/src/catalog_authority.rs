@@ -1144,7 +1144,7 @@ fn decode_catalog_audit_row(
 
 /// Restart-safe anti-entropy worker for catalog Parquet projections.
 ///
-/// For every catalog projection intent it materializes it publishes the
+/// For every catalog projection intent it materializes, it publishes the
 /// catalog snapshot under `control/v1/projections/catalog-parquet/` and the
 /// intent's audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only
 /// then acknowledges the intent.

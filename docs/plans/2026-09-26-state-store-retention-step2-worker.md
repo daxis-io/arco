@@ -104,3 +104,31 @@ Steps:
   at most one consolidation and one retention horizon; a replayed job fills
   the slot of its own kind, and the horizon follows a consolidation slot only
   when it ended `idle` or `published`.
+- Package A: `arco_state_store_maintenance_published_total` is counted at
+  most once per publication, by the invocation whose progress-selector CAS
+  advanced the job to `Published` (`record_publication` in
+  `maintenance.rs`); a publication whose selector PUT persisted but
+  reported an error is never counted, and the resume that then observes
+  `Published` finishes nothing and is likewise uncounted. The purged counts
+  travel as a named `PurgedCounts { expired_rows, tombstones }` struct
+  (`ControlMvpMaintenanceOutcome::purged_counts() -> Option<PurgedCounts>`,
+  re-exported with `MaintenanceKind`) rather than the `(u64, u64)` pair the
+  Package A text names, and `record_retention_purged_rows` takes it
+  directly.
+- Package C: the generic `ProjectionOutboxWorker::trim_acked` registers the
+  trim-consumer binding in the source root inside its first trim commit,
+  and `drain_fixed_consumer` (the path behind
+  `CatalogProjectionMaterializer::drain_once`) refuses any root carrying
+  that key, so the phase exactly as written above broke every later
+  catalog drain (wip commit 451f5add). The kernel gained a fixed-consumer
+  trim (`ProjectionOutboxWorker::trim_fixed_consumer`, exposed as
+  `CatalogProjectionMaterializer::trim_once`; commit b4bfaa6a) that runs
+  the same retire-then-trim saga at the first binding incarnation, refuses
+  up front with an invariant violation when binding metadata is present,
+  asserts the key still absent inside the source commit and never writes
+  it. The worker calls `trim_once` (commit eabb7660); the outcome mapping
+  is as specified. A `deferred` trim has already retired the
+  acknowledgements in the ack root, so the next drain re-materializes those
+  records (at-least-once) and the following trim removes them; the
+  backpressure deferral is covered end to end and the classifier by a unit
+  test.

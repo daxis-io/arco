@@ -142,6 +142,11 @@ of L1 at replay. The control-store worker enables it for the catalog consumer
 after each drain (retire acknowledged acks in the ack root, then commit exact
 incarnation trims in the catalog root under the cooperative writer epoch). The
 operator endpoint's refusal of catalog trims stays; only the worker trims.
+The trim goes through a fixed-consumer path
+(`ProjectionOutboxWorker::trim_fixed_consumer`, exposed as
+`CatalogProjectionMaterializer::trim_once`) that installs no binding
+metadata in the catalog root, because the fixed-consumer drain refuses a
+root carrying it.
 
 ## Catalog adapter
 
@@ -227,7 +232,9 @@ Each step is its own reviewable change, landed in order after PR #436:
 
 1. Kernel: format 9 (`committed_at_ms`, `expires_at_ms`, `put_with_expiry`), the
    `RetentionHorizon` transition, certificate validation, fixtures, oracle.
+   Landed (PR #439).
 2. Worker: the horizon job kind and the catalog outbox trim after drain.
+   Landed (this change).
 3. Adapter: receipt expiry, audit-row removal, and the `system.catalog.audit`
    projection with its retention.
 4. Restore plan 7 and checkpoint horizon.

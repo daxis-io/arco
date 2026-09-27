@@ -53,13 +53,12 @@ The broader catalog product contract is documented in:
 
 ## Query Model
 
-- Server-side querying is centered on DataFusion.
-- Browser-oriented read paths are enabled through scoped signed URL workflows.
+- Clients bring their own query engine for published Parquet files.
+- Browser-oriented read paths use scoped signed URL workflows.
 - Catalog reads are designed to remain deterministic and auditable.
 
-Catalog reads stay pointer-first: `/api/v1/query` is the initial SQL surface
-for `system.*` tables, and those tables are queryable projections over
-manifest-selected Parquet artifacts rather than the commit point for control-plane truth.
+Catalog reads stay pointer-first. Manifest-selected Parquet artifacts are
+derived read models, not the commit point for control-plane truth.
 
 ## Security and Isolation
 

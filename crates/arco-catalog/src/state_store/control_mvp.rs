@@ -174,8 +174,8 @@ use integrity::{
 };
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
-    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
-    MaintenanceStatus, PreparedMaintenance,
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
+    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, PurgedCounts,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 7;
@@ -463,9 +463,20 @@ impl ControlMvpStateStore {
     }
 
     async fn require_legacy_lifecycle(&self, operation: &str) -> Result<()> {
+        self.legacy_retention()?;
+        self.require_physical_lifecycle(operation).await
+    }
+
+    async fn require_physical_lifecycle(&self, operation: &str) -> Result<()> {
         self.reject_bounded_v1(operation)?;
         self.load_pinned_pointer().await?;
         Ok(())
+    }
+
+    fn legacy_retention(&self) -> Result<&ScopedStorage> {
+        self.retention
+            .as_legacy_scoped()
+            .ok_or_else(|| validation_failed("identity root lifecycle is not admitted"))
     }
 
     async fn authenticated_token_format(&self, token: &StateToken) -> Result<u32> {
@@ -574,7 +585,7 @@ impl ControlMvpStateStore {
     /// Default number of committed transactions between automatic replay anchors.
     pub const DEFAULT_CHECKPOINT_INTERVAL: u64 = 32;
 
-    /// Creates a control-state MVP store over supported root-scoped storage.
+    /// Creates a control-state MVP store over workspace- or metastore-rooted storage.
     ///
     /// # Errors
     ///
@@ -583,8 +594,28 @@ impl ControlMvpStateStore {
     /// be represented as a safe object path, or default cache administration that
     /// cannot fit within its byte capacity.
     pub fn new(storage: impl Into<RootStorage>, scope: StateScope) -> Result<Self> {
+        if matches!(scope.root(), AuthorityRoot::TenantIdentity) {
+            return Err(validation_failed(
+                "identity root lifecycle is not admitted in production",
+            ));
+        }
+
+        Self::new_root(storage.into(), scope)
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(super) fn new_identity_synthetic(storage: arco_core::IdentityStorage) -> Result<Self> {
+        let scope = StateScope::tenant_identity(storage.tenant_id(), "identity");
+        Self::new_root(RootStorage::Identity(storage), scope)
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(super) fn identity_lifecycle(&self) -> (&RootStorage, &StateScope) {
+        (&self.retention, &self.scope)
+    }
+
+    fn new_root(storage: RootStorage, scope: StateScope) -> Result<Self> {
         scope.validate()?;
-        let storage = storage.into();
         if storage.tenant_id() != scope.tenant_id() || storage.scope().root() != scope.root() {
             return Err(validation_failed(
                 "control MVP storage scope does not match StateScope",
@@ -2622,6 +2653,22 @@ impl ControlMvpStateStore {
         now: DateTime<Utc>,
         matches: impl Fn(&PersistedAuthorityReference) -> bool,
     ) -> Result<bool> {
+        #[cfg(feature = "test-utils")]
+        if matches!(self.retention, RootStorage::Identity(_)) {
+            let mut roots = super::identity_probe::IdentityRetainedReferences::new(
+                &self.retention,
+                &self.scope,
+                now,
+            );
+            while let Some(reference) = roots.next().await? {
+                if matches(&reference) {
+                    validate_control_mvp_authority_format(&self.paths, &reference)?;
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        self.legacy_retention()?;
         let mut roots = RetainedAuthorityRoots::new(&self.retention, now);
         while let Some(root) = roots.next().await? {
             for reference in root.authorities {
@@ -3652,12 +3699,16 @@ impl ControlMvpGcOutcome {
     }
 }
 
-/// Successful publication of an equivalent-state physical layout.
+/// Successful publication of a maintenance rewrite: a consolidation (state
+/// unchanged) or a retention horizon (certified rows purged; logical sequence
+/// unchanged).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlMvpMaintenanceOutcome {
     source_token: StateToken,
     selected_token: StateToken,
     layout_generation: u64,
+    kind: MaintenanceKind,
+    purged_counts: Option<PurgedCounts>,
 }
 
 impl ControlMvpMaintenanceOutcome {
@@ -3677,6 +3728,19 @@ impl ControlMvpMaintenanceOutcome {
     #[must_use]
     pub const fn layout_generation(&self) -> u64 {
         self.layout_generation
+    }
+
+    /// Returns which physical rewrite this publication performed.
+    #[must_use]
+    pub const fn kind(&self) -> MaintenanceKind {
+        self.kind
+    }
+
+    /// Returns the counts certified by a retention horizon publication, or
+    /// `None` for a consolidation.
+    #[must_use]
+    pub const fn purged_counts(&self) -> Option<PurgedCounts> {
+        self.purged_counts
     }
 }
 
@@ -3702,6 +3766,14 @@ impl ControlMvpMaintenanceWorker {
             store: ControlMvpStateStore::new(storage.clone(), scope)?.without_read_cache(),
             lifecycle: storage,
         })
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub(super) fn new_identity_synthetic(store: &ControlMvpStateStore) -> Self {
+        Self {
+            store: store.clone().without_read_cache(),
+            lifecycle: store.retention.clone(),
+        }
     }
 
     /// Builds a bounded, read-only GC plan at the supplied clock cut.
@@ -3745,7 +3817,7 @@ impl ControlMvpMaintenanceWorker {
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcPlan> {
         self.store
-            .require_legacy_lifecycle("plan_gc_page_at")
+            .require_physical_lifecycle("plan_gc_page_at")
             .await?;
         self.plan_gc_page_inner(now, additional_protected_paths, continuation)
             .await
@@ -3783,7 +3855,7 @@ impl ControlMvpMaintenanceWorker {
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcOutcome> {
         self.store
-            .require_legacy_lifecycle("collect_gc_page_at")
+            .require_physical_lifecycle("collect_gc_page_at")
             .await?;
         let protected = additional_protected_paths.into_iter().collect::<Vec<_>>();
         let mut guard =
@@ -3931,7 +4003,13 @@ impl ControlMvpMaintenanceWorker {
         additional_protected_paths: impl IntoIterator<Item = String>,
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcPlan> {
-        if let Some(cursor) = continuation {
+        #[cfg(feature = "test-utils")]
+        if let Some(page) = self.identity_reference_gc_page(now, continuation).await? {
+            return Ok(page);
+        }
+        if let Some(cursor) = continuation
+            && self.lifecycle.as_legacy_scoped().is_some()
+        {
             if let Some(plan) = maintenance::expired_pin_page(self, now, cursor).await? {
                 return Ok(plan);
             }
@@ -3952,10 +4030,24 @@ impl ControlMvpMaintenanceWorker {
             .lifecycle
             .list_page_meta(&base_prefix, continuation, CONTROL_MVP_GC_PAGE_SIZE)
             .await?;
-        let next_continuation = inventory_page
-            .next_start_after
-            .clone()
-            .or_else(|| Some(maintenance::pin_gc_cursor().to_string()));
+        let next_continuation = if self.lifecycle.as_legacy_scoped().is_some() {
+            inventory_page
+                .next_start_after
+                .clone()
+                .or_else(|| Some(maintenance::pin_gc_cursor().to_string()))
+        } else {
+            #[cfg(feature = "test-utils")]
+            {
+                inventory_page
+                    .next_start_after
+                    .clone()
+                    .or_else(|| Some(super::identity_probe::REFERENCE_GC_CURSOR.to_string()))
+            }
+            #[cfg(not(feature = "test-utils"))]
+            {
+                inventory_page.next_start_after.clone()
+            }
+        };
 
         let Some(head) = self
             .lifecycle
@@ -4026,28 +4118,8 @@ impl ControlMvpMaintenanceWorker {
         .await?;
         candidates.retain(|candidate| !current_closure.contains(&candidate.path));
 
-        // Inventory active external pins inside the same retention epoch as the
-        // fence. Caller-supplied paths are not a substitute for durable roots.
-        let mut roots = RetainedAuthorityRoots::new(&self.lifecycle, now);
-        while let Some(root) = roots.next().await? {
-            // Existing retained records may include provider objects that are
-            // not reachable through a domain authority. Preserve their exact
-            // paths as well, including records written by older publishers.
-            candidates.retain(|candidate| !root.required_paths.contains(&candidate.path));
-            candidates.retain(|candidate| {
-                !root
-                    .protected_prefixes
-                    .iter()
-                    .any(|prefix| candidate.path.starts_with(prefix))
-            });
-            for reference in root.authorities {
-                if reference.scope() != &self.store.scope {
-                    continue;
-                }
-                let closure = self.protected_reference_closure(&reference).await?;
-                candidates.retain(|candidate| !closure.contains(&candidate.path));
-            }
-        }
+        // Caller-supplied paths are not a substitute for durable retained roots.
+        self.exclude_retained_roots(now, &mut candidates).await?;
 
         // Stream every retained root through a page-sized inventory and a
         // single-root closure. Only the bounded candidate page survives across
@@ -4140,6 +4212,86 @@ impl ControlMvpMaintenanceWorker {
             candidates,
             continuation: next_continuation,
         })
+    }
+
+    #[cfg(feature = "test-utils")]
+    async fn identity_reference_gc_page(
+        &self,
+        now: DateTime<Utc>,
+        continuation: Option<&str>,
+    ) -> Result<Option<ControlMvpGcPlan>> {
+        let Some(cursor) = continuation else {
+            return Ok(None);
+        };
+        if !matches!(&self.lifecycle, RootStorage::Identity(_))
+            || !cursor.starts_with(super::identity_probe::REFERENCE_GC_CURSOR)
+        {
+            return Ok(None);
+        }
+        let (expired, continuation) = super::identity_probe::expired_reference_page(
+            &self.lifecycle,
+            &self.store.scope,
+            now,
+            cursor,
+        )
+        .await?;
+        let head = self
+            .lifecycle
+            .head_raw(&self.store.paths.current_pointer())
+            .await?
+            .ok_or_else(|| invariant_violation("identity authority head disappeared"))?;
+        Ok(Some(ControlMvpGcPlan {
+            head_version: head.version,
+            candidates: expired
+                .into_iter()
+                .map(|(path, version, size)| ControlMvpGcCandidate {
+                    path,
+                    version,
+                    size,
+                })
+                .collect(),
+            continuation,
+        }))
+    }
+
+    async fn exclude_retained_roots(
+        &self,
+        now: DateTime<Utc>,
+        candidates: &mut Vec<ControlMvpGcCandidate>,
+    ) -> Result<()> {
+        if self.lifecycle.as_legacy_scoped().is_some() {
+            let mut roots = RetainedAuthorityRoots::new(&self.lifecycle, now);
+            while let Some(root) = roots.next().await? {
+                // Workspace roots may include provider objects beyond authority.
+                candidates.retain(|candidate| !root.required_paths.contains(&candidate.path));
+                candidates.retain(|candidate| {
+                    !root
+                        .protected_prefixes
+                        .iter()
+                        .any(|prefix| candidate.path.starts_with(prefix))
+                });
+                for reference in root.authorities {
+                    if reference.scope() != &self.store.scope {
+                        continue;
+                    }
+                    let closure = self.protected_reference_closure(&reference).await?;
+                    candidates.retain(|candidate| !closure.contains(&candidate.path));
+                }
+            }
+        }
+        #[cfg(feature = "test-utils")]
+        if matches!(&self.lifecycle, RootStorage::Identity(_)) {
+            let mut roots = super::identity_probe::IdentityRetainedReferences::new(
+                &self.lifecycle,
+                &self.store.scope,
+                now,
+            );
+            while let Some(reference) = roots.next().await? {
+                let closure = self.protected_reference_closure(&reference).await?;
+                candidates.retain(|candidate| !closure.contains(&candidate.path));
+            }
+        }
+        Ok(())
     }
 
     async fn protect_manifest_closure(
@@ -4283,7 +4435,10 @@ impl ControlMvpMaintenanceWorker {
         binding: DurableAuthorityBinding,
     ) -> Result<Option<ControlMvpMaintenanceOutcome>> {
         let worker = DurableMaintenanceWorker::new(
-            self.lifecycle.clone(),
+            self.lifecycle
+                .as_legacy_scoped()
+                .ok_or_else(|| validation_failed("identity root maintenance is not admitted"))?
+                .clone(),
             self.store.scope.clone(),
             binding,
         )?
@@ -5694,6 +5849,16 @@ impl ControlMvpTxn {
             u64::try_from(tx_refs.len()).unwrap_or(u64::MAX),
         );
 
+        // ponytail: the synthetic identity probe stops before it would publish
+        // a maintenance intent; lift this cap with identity-root lifecycle proof.
+        if self.store.retention.as_legacy_scoped().is_none()
+            && tx_refs.len() >= L0_MAINTENANCE_INTENT_THRESHOLD
+        {
+            return Err(CatalogError::MaintenanceBackpressure {
+                message: "identity root maintenance is not admitted".to_string(),
+            });
+        }
+
         let production_async_layout =
             self.store.checkpoint_interval == ControlMvpStateStore::DEFAULT_CHECKPOINT_INTERVAL;
         if production_async_layout && tx_refs.len() >= L0_MAINTENANCE_BACKPRESSURE_THRESHOLD {
@@ -6089,7 +6254,7 @@ impl ArcoStateAdmin for ControlMvpStateStore {
     }
 
     async fn checkpoint(&self, opts: CheckpointOptions) -> Result<CheckpointToken> {
-        self.require_legacy_lifecycle("checkpoint publication")
+        self.require_physical_lifecycle("checkpoint publication")
             .await?;
         if let Some(scope) = opts.scope()
             && scope != &self.scope

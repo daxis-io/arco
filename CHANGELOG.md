@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-row expiry hint on state-store writes: segment format 2 adds a nullable `expires_at_ms` column set by `ArcoStateTxn::put_with_expiry`; reads, scans and witnesses ignore it.
 - Age-anchor chain on every format-9 manifest, so the retention horizon reaches the 30-day floor in a bounded number of authenticated manifest reads.
 - `RetentionHorizon` durable-maintenance job kind and `retention_horizon` manifest certificate: purges expired rows and tombstones no retained reader can observe without advancing logical sequence; the ancestry walker accepts it as a third transition. Control GC now holds `manifests/` for the token retention plus a one-hour clock-skew margin so the horizon's age walk never meets a collected anchor above its floor.
+- Control-store worker retention: every run drives a `RetentionHorizon` job per domain after the consolidation slot, through the same persisted-identity path, and a `trim` phase after the catalog projection drain that removes acknowledged catalog outbox records through a fixed-consumer path (`CatalogProjectionMaterializer::trim_once`) that installs no binding metadata in the catalog root; the operator endpoint still refuses catalog trims (`docs/runbooks/control-store-worker.md`).
+- Metric emitters `arco_state_store_maintenance_published_total{domain,kind}`, `arco_state_store_retention_purged_rows_total{domain,reason}` and `arco_control_store_outbox_trimmed_records_total{domain,consumer}`.
 
 All state-store program surfaces above are landed with CI-run test suites but are deliberately non-authoritative: the `control/v1` catalog authority is route-wired for exactly one root configured through `ARCO_CATALOG_CONTROL_V1_*` (default-disabled; every other root stays legacy), it is not authoritative on any deployed root, and the control-store prototype has not passed its Phase 3C promotion gate (see `docs/guide/src/reference/control-plane-scope.md`).
 
@@ -56,6 +58,13 @@ All state-store program surfaces above are landed with CI-run test suites but ar
 - Closed catalog and Iceberg correctness gaps around idempotency markers, stale-marker takeover, credential-vending scope, orphaned snapshot recovery, and public protocol compatibility.
 - Applied shared public-route rate limiting, internal-error redaction, thrift allocation bounds, and JWT feature-provider compatibility for Iceberg and Unity Catalog protocol surfaces.
 - Preserved deployed UAT as an explicit live-proof gate instead of claiming completion from local or readiness-only evidence.
+
+### Removed
+- Removed the server-side SQL query endpoints and DataFusion runtime from Arco.
+- Removed the catalog inventory `query_handle` field; inventory response version is now 2.
+
+### Changed
+- Signed-URL tests now cover Arco's HTTP and Parquet publication contract without a query engine.
 
 ## [0.2.0] - 2026-05-31
 ### Added

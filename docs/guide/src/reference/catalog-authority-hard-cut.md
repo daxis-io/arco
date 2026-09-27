@@ -24,9 +24,9 @@ Iceberg namespaces/tables --+          |
 The candidate implementation commits durable catalog projection intents,
 materializes real Parquet artifacts through a restart-safe operator-invoked
 anti-entropy drain, acknowledges only after the artifact manifest is visible,
-and exposes durable redacted success/failure state through
-`system.catalog.projection_status`. A malformed durable intent receives an
-exact terminal quarantine record; it remains outside the materialized
+and records durable redacted success/failure state for operator reads. A
+malformed durable intent receives an exact terminal quarantine record; it
+remains outside the materialized
 watermark and visible as unresolved backlog while later valid intents continue.
 The catalog consumer never installs generic binding or trim metadata in the
 authority root. Control-bound projection-only inventory and browser routes

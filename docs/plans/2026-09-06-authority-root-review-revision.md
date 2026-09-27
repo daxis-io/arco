@@ -16,10 +16,18 @@
 
 ## Follow-up: Versioned AuthorityScope in StateScope and control/v1
 
-This PR does not change persisted token encoding. Before enabling tenant identity or metastore-rooted `control/v1`, a dedicated change must:
+Versioned `StateScope` representation is implemented by PR #428. PR #435 provides
+a root-storage seam, and the default-disabled identity probe is integrated on
+the format-9 kernel. Identity mutation/event semantics and identity-root
+checkpoint, retention, protected-reference, GC, and recovery contracts have a
+default-disabled [physical lifecycle child](2026-09-25-tenant-identity-root-physical-lifecycle.md)
+over the memory backend; production admission and provider qualification remain
+open. The earlier [synthetic admission child](2026-09-23-tenant-identity-root-synthetic-admission.md)
+tested scoped commit/read only. The checklist separates completed representation
+work from open admission gates:
 
-- Carry root kind and its IDs in `StateScope`, `StateToken`, transaction and checkpoint envelopes, manifests, projection intents, continuation tokens, retained references, restore/GC comparisons, and catalog bindings.
-- Version the serialized authority representation explicitly. Decode existing workspace-shaped records only as workspace roots; never infer root kind by substituting IDs. Specify unsupported-version rejection, migration qualification, and rollback behavior.
-- Prove identity/workspace and metastore/workspace roots with equal textual IDs cannot share tokens, continuations, restore references, or caches; preserve old workspace encoding fixtures and reject cross-root reads before I/O.
-- Introduce separate `IdentityMutation` and identity-event provenance with optional originating workspace/metastore dimensions, plus an identity store that cannot accept grants or storage-governance mutations.
-- Implement and qualify the cross-root authorization and lifecycle contracts in ADR-044 before production routing. Table authority layout remains a separate decision; the root enum permits future families.
+- Done: carry root kind and its IDs in `StateScope`, `StateToken`, transaction and checkpoint envelopes, manifests, projection intents, continuation tokens, retained references, restore/GC comparisons, and catalog bindings.
+- Done: version the serialized authority representation explicitly. Decode existing workspace-shaped records only as workspace roots; never infer root kind by substituting IDs. Unsupported-version rejection is implemented; migration qualification and rollback remain open.
+- Done for representation: prove identity/workspace and metastore/workspace roots with equal textual IDs cannot share tokens, continuations, restore references, or caches; preserve old workspace encoding fixtures and reject cross-root reads before I/O. Identity-root runtime admission remains open.
+- Open: introduce separate `IdentityMutation` and identity-event provenance with optional originating workspace/metastore dimensions, plus a principal identity store that cannot accept grants or storage-governance mutations.
+- Open: implement and qualify the cross-root authorization and lifecycle contracts in ADR-044 before production routing. Table authority layout remains a separate decision; the root enum permits future families.

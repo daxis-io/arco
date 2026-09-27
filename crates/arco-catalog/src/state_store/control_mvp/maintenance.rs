@@ -52,6 +52,27 @@ pub enum MaintenanceKind {
     RetentionHorizon,
 }
 
+impl MaintenanceKind {
+    /// The `snake_case` name logs and metric labels use: `consolidation` or
+    /// `retention_horizon`. The wire form stays `SCREAMING_SNAKE_CASE`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consolidation => "consolidation",
+            Self::RetentionHorizon => "retention_horizon",
+        }
+    }
+}
+
+/// Rows a published retention horizon certificate purged, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgedCounts {
+    /// Rows whose expiry stamp fell before the purge cutoff.
+    pub expired_rows: u64,
+    /// Tombstones no retained reader can observe.
+    pub tombstones: u64,
+}
+
 /// The inputs a horizon job was admitted with. They are fixed at
 /// preparation and bound into the descriptor (hence the job identity), the
 /// render seed and the published certificate.
@@ -893,7 +914,9 @@ pub enum MaintenanceStatus {
     Publishing,
     /// Exact publication evidence confirms selection.
     Published,
-    /// Source compatibility was consumed by a different publication.
+    /// Source compatibility was consumed by a different publication, or a
+    /// horizon job's admitted purged set was rewritten by a later commit
+    /// before any attempt was submitted.
     Superseded,
     /// The job was abandoned before any unresolved publication.
     Abandoned,
@@ -1574,6 +1597,12 @@ impl PreparedMaintenance {
     pub fn job_id(&self) -> &MaintenanceJobId {
         &self.id
     }
+
+    /// Which physical rewrite the admitted plan performs.
+    #[must_use]
+    pub const fn kind(&self) -> MaintenanceKind {
+        self.descriptor.kind
+    }
 }
 
 /// Explicit durable maintenance capability. Trusted composition must provide
@@ -1591,6 +1620,8 @@ pub struct MaintenanceProgress {
     pub job: MaintenanceJobId,
     /// Selected durable state.
     pub status: MaintenanceStatus,
+    /// Which physical rewrite the job performs.
+    pub kind: MaintenanceKind,
     /// Contiguous completed output units.
     pub completed: usize,
     /// Admitted output units.
@@ -1608,6 +1639,7 @@ impl LoadedJob {
         Ok(MaintenanceProgress {
             job: id.clone(),
             status: last.status,
+            kind: self.descriptor.kind,
             completed: last.completed,
             total: self.pages.len(),
         })
@@ -1615,6 +1647,16 @@ impl LoadedJob {
 }
 
 impl Descriptor {
+    /// The counts the admitted purge certifies; `None` for consolidation.
+    /// Publication refuses a candidate whose recomputed certificate differs,
+    /// so these equal the selected manifest's counts.
+    fn purged_counts(&self) -> Option<PurgedCounts> {
+        self.purge.as_ref().map(|purge| PurgedCounts {
+            expired_rows: purge.purged_counts.expired_rows,
+            tombstones: purge.purged_counts.tombstones,
+        })
+    }
+
     fn render_seed(&self) -> Result<String> {
         Ok(sha256_hex(&encode_json(
             &(
@@ -1999,6 +2041,11 @@ impl DurableMaintenanceWorker {
         now: DateTime<Utc>,
     ) -> Result<()> {
         use crate::workspace_snapshot::{retention_pin_latest_path, retention_pin_revision_path};
+        if self.worker.lifecycle.as_legacy_scoped().is_none() {
+            return Err(validation_failed(
+                "identity root layout maintenance is not admitted",
+            ));
+        }
         let storage = &self.worker.lifecycle;
         let store = &self.worker.store;
         load_pages(store, id, descriptor).await?;
@@ -2361,6 +2408,7 @@ impl DurableMaintenanceWorker {
             Ok(MaintenanceProgress {
                 job: id.clone(),
                 status: revision.status,
+                kind: job.descriptor.kind,
                 completed: revision.completed,
                 total: job.pages.len(),
             })
@@ -2368,6 +2416,11 @@ impl DurableMaintenanceWorker {
         .await
     }
 
+    /// Selects `revision` as the job's progress. `Ok` means the intended
+    /// selector bytes are visible; the value says whether this call's CAS
+    /// put them there, or they were already visible because a same-binding
+    /// peer selected the identical revision first or this call's own PUT
+    /// landed but reported an error.
     async fn select_revision(
         &self,
         id: &MaintenanceJobId,
@@ -2375,7 +2428,7 @@ impl DurableMaintenanceWorker {
         revision: Bytes,
         selector: Bytes,
         deadline: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<Selection> {
         let check_deadline = || {
             if deadline.is_some_and(|expiry| cost::now() >= expiry) {
                 Err(precondition_failed(
@@ -2405,7 +2458,7 @@ impl DurableMaintenanceWorker {
         )
         .await;
         match result {
-            Ok(WriteResult::Success { .. }) => Ok(()),
+            Ok(WriteResult::Success { .. }) => Ok(Selection::Advanced),
             result => {
                 if store
                     .storage
@@ -2413,7 +2466,7 @@ impl DurableMaintenanceWorker {
                     .await
                     .is_ok_and(|visible| visible == selector)
                 {
-                    return Ok(());
+                    return Ok(Selection::AlreadyVisible);
                 }
                 match result {
                     Ok(_) => Err(CatalogError::CasFailed {
@@ -2480,6 +2533,7 @@ impl DurableMaintenanceWorker {
             Ok(MaintenanceProgress {
                 job: id.clone(),
                 status: revision.status,
+                kind: job.descriptor.kind,
                 completed: revision.completed,
                 total: job.pages.len(),
             })
@@ -2550,6 +2604,24 @@ struct PublicationAttempt {
 struct PublicationCandidate {
     attempt: PublicationAttempt,
     manifest: Bytes,
+}
+
+/// What validating a complete job against the current head produced.
+enum Preparation {
+    /// A candidate whose fenced head CAS may be submitted.
+    Candidate(Box<PublicationCandidate>),
+    /// A horizon job whose admitted purged set no longer describes "parent
+    /// minus child": a suffix commit rewrote a purged key. The purged set is
+    /// fixed by the job identity and a rewritten key can never re-enter it,
+    /// so no attempt of this job can ever be certified; the refusal is
+    /// permanent for the job, unlike the transient refusals that share
+    /// `PreconditionFailed`.
+    PurgedSetSuperseded,
+}
+
+/// The refusal reported for [`Preparation::PurgedSetSuperseded`].
+fn purged_set_superseded() -> CatalogError {
+    precondition_failed("retention horizon purged set was superseded by later commits")
 }
 
 async fn read_attempt(
@@ -2626,7 +2698,7 @@ impl DurableMaintenanceWorker {
         id: &MaintenanceJobId,
         job: &LoadedJob,
         ordinal: usize,
-    ) -> Result<PublicationCandidate> {
+    ) -> Result<Preparation> {
         if ordinal >= 16 {
             return Err(maintenance_capacity(
                 "maintenance publication attempt limit",
@@ -2704,8 +2776,8 @@ impl DurableMaintenanceWorker {
         // replay of the parent (bounded to rows the render cut held) and
         // requires the purged digest and counts to equal the admitted plan's:
         // a suffix that rewrote a purged key since preparation makes the
-        // admitted set stale, and the job is superseded rather than
-        // certified against the wrong parent.
+        // admitted set stale for good, and the job is reported superseded
+        // rather than certified against the wrong parent.
         let (final_state, final_checksum, certificate) = {
             let _phase = cost::PhaseGuard::enter("maintenance-final-equivalence");
             match (
@@ -2722,9 +2794,7 @@ impl DurableMaintenanceWorker {
                     if recomputed.purged_rows_sha256 != purge.purged_rows_sha256
                         || recomputed.purged_counts != purge.purged_counts
                     {
-                        return Err(precondition_failed(
-                            "retention horizon purged set was superseded by later commits",
-                        ));
+                        return Ok(Preparation::PurgedSetSuperseded);
                     }
                     let checksum = pruned.checksum()?;
                     let certificate = RetentionHorizonV1 {
@@ -2871,7 +2941,10 @@ impl DurableMaintenanceWorker {
             candidate_digest,
             pointer: pointer_bytes.to_vec(),
         };
-        Ok(PublicationCandidate { attempt, manifest })
+        Ok(Preparation::Candidate(Box::new(PublicationCandidate {
+            attempt,
+            manifest,
+        })))
     }
 
     fn load_attempt(job: &LoadedJob) -> Result<PublicationAttempt> {
@@ -2943,7 +3016,10 @@ impl DurableMaintenanceWorker {
 
     /// Fully validates and submits at most one fenced HEAD CAS. A selected
     /// pending attempt is reconciled or identically resubmitted; completed L1
-    /// objects are never rendered or PUT again.
+    /// objects are never rendered or PUT again. A horizon job whose admitted
+    /// purged set a later commit rewrote is recorded `Superseded` before its
+    /// first attempt and refused with `PreconditionFailed`: the refusal is
+    /// permanent for the job, and a resume then reports the terminal status.
     ///
     /// # Errors
     /// Returns typed validation, capacity, fencing, CAS or ambiguous outcomes.
@@ -2963,8 +3039,7 @@ impl DurableMaintenanceWorker {
                 match self.observe_attempt(&attempt).await? {
                     PublicationObservation::Selected => {
                         if last.status == MaintenanceStatus::Publishing {
-                            self.finish_publication(id, &job, MaintenanceStatus::Published)
-                                .await?;
+                            self.finish_published(id, &job).await?;
                         }
                         return Ok(Some(self.publication_outcome(&job, &attempt)));
                     }
@@ -2990,12 +3065,7 @@ impl DurableMaintenanceWorker {
                         }
                         job.descriptor.live(now)?;
                         self.verify_pin(&job.descriptor, id, now).await?;
-                        let candidate = self.prepare_publication(id, &job, attempt.ordinal).await?;
-                        if candidate.attempt != attempt {
-                            return Err(ambiguous_authority_outcome(
-                                "pending maintenance candidate cannot be identically reconstructed",
-                            ));
-                        }
+                        let candidate = self.reprepare_pending(id, &job, &attempt).await?;
                         job.descriptor.live(now.max(cost::now()))?;
                         let digest = job
                             .last()?
@@ -3021,8 +3091,7 @@ impl DurableMaintenanceWorker {
                     "publication requires two progress revisions",
                 ));
             }
-            let ordinal = job.attempts.len();
-            let candidate = self.prepare_publication(id, &job, ordinal).await?;
+            let candidate = self.prepare_fresh_attempt(id, &job).await?;
             let attempt_bytes = encode_json_limited(
                 &candidate.attempt,
                 MAX_PLAN_PAGE_BYTES,
@@ -3042,6 +3111,57 @@ impl DurableMaintenanceWorker {
             self.submit_publication(id, &job, candidate, now).await
         }))
         .await
+    }
+
+    /// Reconstructs the candidate of a selected attempt whose source is
+    /// still at HEAD; it must reproduce the attempt byte for byte.
+    async fn reprepare_pending(
+        &self,
+        id: &MaintenanceJobId,
+        job: &LoadedJob,
+        attempt: &PublicationAttempt,
+    ) -> Result<PublicationCandidate> {
+        let candidate = match self.prepare_publication(id, job, attempt.ordinal).await? {
+            Preparation::Candidate(candidate) => *candidate,
+            // Unreachable unless HEAD moves between the attempt observation
+            // and the compatibility read: then the refusal is transient, the
+            // status is left unchanged, and the next publish observes the
+            // attempt `Consumed`, returns the job to `ReadyToPublish`, and
+            // the fresh path records `Superseded`.
+            Preparation::PurgedSetSuperseded => return Err(purged_set_superseded()),
+        };
+        if candidate.attempt != *attempt {
+            return Err(ambiguous_authority_outcome(
+                "pending maintenance candidate cannot be identically reconstructed",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    /// Prepares the next attempt of a `ReadyToPublish` job that has none
+    /// selected. A superseded purged set is permanent for the job: no attempt
+    /// was submitted and none ever can be, so the job is recorded
+    /// `Superseded` from the revision the caller loaded (a peer that moved
+    /// the job first surfaces as a lost selector CAS, or as the identical
+    /// revision already visible, never as a second transition) and the
+    /// refusal is still reported, so callers keep treating the job as
+    /// unpublished and the next resume observes `Superseded`.
+    async fn prepare_fresh_attempt(
+        &self,
+        id: &MaintenanceJobId,
+        job: &LoadedJob,
+    ) -> Result<PublicationCandidate> {
+        match self
+            .prepare_publication(id, job, job.attempts.len())
+            .await?
+        {
+            Preparation::Candidate(candidate) => Ok(*candidate),
+            Preparation::PurgedSetSuperseded => {
+                self.finish_publication(id, job, MaintenanceStatus::Superseded)
+                    .await?;
+                Err(purged_set_superseded())
+            }
+        }
     }
 
     async fn begin_submission(
@@ -3095,14 +3215,12 @@ impl DurableMaintenanceWorker {
         .await;
         match result {
             Ok(WriteResult::Success { .. }) => {
-                self.finish_publication(id, job, MaintenanceStatus::Published)
-                    .await?;
+                self.finish_published(id, job).await?;
                 Ok(Some(self.publication_outcome(job, &candidate.attempt)))
             }
             result => match self.observe_attempt(&candidate.attempt).await {
                 Ok(PublicationObservation::Selected) => {
-                    self.finish_publication(id, job, MaintenanceStatus::Published)
-                        .await?;
+                    self.finish_published(id, job).await?;
                     Ok(Some(self.publication_outcome(job, &candidate.attempt)))
                 }
                 Ok(PublicationObservation::Consumed) => {
@@ -3126,11 +3244,17 @@ impl DurableMaintenanceWorker {
         id: &MaintenanceJobId,
         job: &LoadedJob,
         status: MaintenanceStatus,
-    ) -> Result<()> {
+    ) -> Result<Selection> {
         let (digest, last) = job.last()?;
-        if last.status != MaintenanceStatus::Publishing {
-            return Err(invariant_violation("maintenance attempt is not selected"));
-        }
+        // A selected attempt resolves to `Published`, back to `ReadyToPublish`
+        // or to `Superseded` and keeps its attempt digest. A job that never
+        // submitted an attempt can only be superseded here (its purged set
+        // no longer describes the parent) and carries none.
+        let attempt = match (last.status, status) {
+            (MaintenanceStatus::Publishing, _) => last.attempt.clone(),
+            (MaintenanceStatus::ReadyToPublish, MaintenanceStatus::Superseded) => None,
+            _ => return Err(invariant_violation("maintenance attempt is not selected")),
+        };
         let revision = Revision {
             version: MAINTENANCE_VERSION,
             job: id.as_str().into(),
@@ -3142,7 +3266,7 @@ impl DurableMaintenanceWorker {
             status,
             predecessor: Some(digest.clone()),
             receipt: None,
-            attempt: last.attempt.clone(),
+            attempt,
             submissions: last.submissions,
             submission_nonce: None,
         };
@@ -3168,8 +3292,54 @@ impl DurableMaintenanceWorker {
                 .token(attempt.candidate_id.clone(), attempt.source_sequence)
                 .with_manifest_witness(attempt.candidate_digest.clone()),
             layout_generation: job.descriptor.layout_generation + 1,
+            kind: job.descriptor.kind,
+            purged_counts: job.descriptor.purged_counts(),
         }
     }
+
+    /// Selects the `Published` revision for a job whose head CAS is confirmed
+    /// selected, and counts the publication only when this invocation is the
+    /// one that advanced the selector.
+    async fn finish_published(&self, id: &MaintenanceJobId, job: &LoadedJob) -> Result<()> {
+        if self
+            .finish_publication(id, job, MaintenanceStatus::Published)
+            .await?
+            == Selection::Advanced
+        {
+            self.record_publication(job);
+        }
+        Ok(())
+    }
+
+    /// Counts one publication of the job's kind and, for a horizon job, the
+    /// rows its certificate purged. Called only by the invocation whose
+    /// selector CAS advanced the job to `Published`, so overlapping
+    /// same-binding workers that both observe the landed head count it at
+    /// most once, and re-observing published evidence counts nothing. Known
+    /// loss residual: a selector PUT that persisted but reported an error is
+    /// reconciled by readback as `AlreadyVisible`, indistinguishable from a
+    /// peer's identical selection, and is not counted; only if that readback
+    /// also fails does the invocation error, and the resume then observes
+    /// `Published` and finishes nothing, which is likewise uncounted.
+    fn record_publication(&self, job: &LoadedJob) {
+        let domain = self.worker.store.scope.domain();
+        crate::metrics::record_maintenance_published(domain, job.descriptor.kind);
+        if let Some(counts) = job.descriptor.purged_counts() {
+            crate::metrics::record_retention_purged_rows(domain, counts);
+        }
+    }
+}
+
+/// What a progress-selector CAS did for the calling invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// This call's CAS moved the selector to the intended revision.
+    Advanced,
+    /// The intended bytes were already visible, so this call changed
+    /// nothing: either a same-binding peer selected the identical revision
+    /// first, or this call's own PUT landed but reported an error and the
+    /// readback reconciled it. The two are indistinguishable here.
+    AlreadyVisible,
 }
 
 fn validate_progress_transition(
@@ -3289,6 +3459,11 @@ pub(super) async fn expired_pin_page(
     now: DateTime<Utc>,
     cursor: &str,
 ) -> Result<Option<ControlMvpGcPlan>> {
+    if worker.lifecycle.as_legacy_scoped().is_none() {
+        return Err(validation_failed(
+            "identity root workspace pins are not admitted",
+        ));
+    }
     Box::pin(cost::phase("maintenance-GC-pins", async {
         use crate::workspace_snapshot::{RetentionTarget, retention_pin_revision_path};
         let Some(cursor) = cursor.strip_prefix(PIN_GC_CURSOR) else {

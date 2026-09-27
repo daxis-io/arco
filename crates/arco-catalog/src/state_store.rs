@@ -27,6 +27,8 @@ pub mod control_mvp;
     reason = "Phase 6 metadata stays crate-internal until its public activation gate"
 )]
 pub(crate) mod external_location_metadata;
+#[cfg(feature = "test-utils")]
+pub mod identity_probe;
 pub mod model;
 pub(crate) mod path_governance_metadata;
 pub mod projection_outbox_acks;
@@ -50,8 +52,9 @@ pub use control_mvp::{
     ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
     ControlMvpRestoreFenceWitness, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
     ControlMvpRestorePlanV7, ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding,
-    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress, MaintenanceStatus,
-    PreparedMaintenance, ProjectionIntentV2, control_mvp_outbox_event_id,
+    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind, MaintenanceProgress,
+    MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, PurgedCounts,
+    control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

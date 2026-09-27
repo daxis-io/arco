@@ -2,7 +2,7 @@
 //!
 //! Production deployments should use cloud-native signed URLs (GCS/S3).
 //! For integration tests, we need URLs that are:
-//! - Real `http://` URLs (DuckDB-WASM / `DuckDB` engines can fetch them)
+//! - Real `http://` URLs that HTTP clients can fetch
 //! - Time-bounded
 //! - Protected by a signature (bearer-token semantics)
 //! - Range-capable (`Range: bytes=...`) for Parquet readers

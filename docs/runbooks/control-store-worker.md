@@ -8,7 +8,7 @@ task timeout 1800 s, no Cloud Run task retries)
 
 ## What it does
 
-One invocation is single-shot and runs four phases against the `control/v1`
+One invocation is single-shot and runs five phases against the `control/v1`
 root selected by the configured tenant and workspace. Phases are independent:
 a failure in one is logged and recorded, and the remaining phases still run. The
 process exits `0` only when every phase completed or deferred to the next run,
@@ -21,18 +21,49 @@ history.
    `stuck_epoch` below). This is the backstop for the one failure mode the
    worker cannot heal on its own.
 2. **Layout maintenance** (`phase="maintenance"`), for each control domain in
-   order: `catalog`, `projection-outbox-acks`. When the current manifest
-   selects a maintenance intent (after 16 unconsolidated L0 segments), the
-   worker prepares a durable maintenance job, **persists its identity** at
-   `locks/control-store-worker/<domain>/selected-job.json`, then starts,
-   advances and publishes it through `DurableMaintenanceWorker`. If a persisted
-   identity already exists from an earlier run, the worker resumes that exact
-   job first (`resume_at` → advance → publish, which also finishes a job whose
-   publication already reached HEAD before the record was cleared) and only
-   replays activation (`recover_activation_at` → `resume_at`) when the job is
-   not directly resumable, for example because its selector never landed. It
-   never prepares a new plan while a record exists. Commits refuse at 32
-   unconsolidated L0 segments, so a domain that never sees this phase wedges.
+   order: `catalog`, `projection-outbox-acks`. A domain gets at most two jobs
+   per run, a consolidation (`kind="consolidation"`) and then a retention
+   horizon (`kind="retention_horizon"`); each job logs its own summary line.
+   - *Consolidation.* When the current manifest selects a maintenance intent
+     (after 16 unconsolidated L0 segments), the worker prepares a durable
+     maintenance job, **persists its identity** at
+     `locks/control-store-worker/<domain>/selected-job.json`, then starts,
+     advances and publishes it through `DurableMaintenanceWorker`. Commits
+     refuse at 32 unconsolidated L0 segments, so a domain that never sees
+     this phase wedges.
+   - *Retention horizon.* Once the consolidation slot ended `idle` or
+     `published`, the worker prepares a `RetentionHorizon` job
+     (`prepare_horizon_at`) over the consolidated head and drives it through
+     the same persisted-identity path. The kernel computes the horizon from
+     three inputs: the age bound (the newest manifest stamped at or before
+     `now - 30 d - 1 h`, the token-retention floor plus a one-hour clock-skew
+     margin, found by following `age_anchor` links from the head), the
+     active snapshot and export pins naming the scope, and the checkpoints
+     still inside their retention; the horizon is the minimum of them. The
+     job purges only rows whose `expires_at_ms` is older than `now - 1 h`
+     and tombstones at or below the horizon; live rows and outbox rows are
+     never purged. It admits no plan (`idle`) when no row is purge-eligible.
+     Before the head CAS the kernel recomputes the purge over a fresh replay
+     of the parent; when a later commit rewrote a purged key it records the
+     job `Superseded` (the refusal is permanent for the job) and refuses
+     with `PreconditionFailed`. The worker re-reads the job once and reports
+     it as `terminal` in the same run: the record is cleared, consolidation
+     proceeds, and a fresh horizon recomputes the purge next run (see
+     "Known limitations").
+   - *Recovery.* If a persisted identity already exists from an earlier run,
+     the worker resumes that exact job first, whatever its kind (`resume_at`
+     → advance → publish, which also finishes a job whose publication already
+     reached HEAD before the record was cleared) and only replays activation
+     (`recover_activation_at` → `resume_at`) when the job is not directly
+     resumable, for example because its selector never landed. It never
+     prepares a new plan while a record exists. The replayed job fills this
+     run's slot for its kind: after a replayed consolidation that `published`
+     the horizon runs; after a replayed horizon a fresh consolidation runs and
+     no second horizon. A `deferred` or `exhausted` job keeps its record and
+     ends the domain's phase for this run; a `terminal` consolidation clears
+     its record but withholds the horizon until the next run. The record
+     carries an optional `kind`; a record written before the field existed
+     is a consolidation.
 3. **Catalog projection drain** (`phase="drain"`, `domain="catalog"`).
    `CatalogProjectionMaterializer::drain_once` materializes every pending
    catalog projection outbox record and acknowledges it, then reads the durable
@@ -41,7 +72,20 @@ history.
    `projection-outbox-acks` L0 segments (status + ack), which is why
    maintenance runs first: it consolidates the ack domain before the drain
    needs the commit headroom.
-4. **Garbage collection** (`phase="gc"`), for each control domain: up to
+4. **Catalog outbox trim** (`phase="trim"`, `domain="catalog"`). After the
+   drain, whatever its outcome, `CatalogProjectionMaterializer::trim_once`
+   removes the records the catalog consumer has acknowledged from the catalog
+   projection outbox. Ordering contract: the kernel first retires this
+   consumer's acknowledgements in the `projection-outbox-acks` root, then
+   commits an exact-incarnation trim in the catalog root under the
+   cooperative writer epoch, so no acknowledgement outlives its record and an
+   interrupted pass redelivers rather than loses. The trim goes through the
+   fixed-consumer path (`ProjectionOutboxWorker::trim_fixed_consumer`), which
+   never installs the generic trim-binding key in the catalog root; the
+   operator endpoint keeps refusing catalog trims. A trim commit is one
+   catalog L0 segment and advances the catalog logical sequence without a
+   projection intent.
+5. **Garbage collection** (`phase="gc"`), for each control domain: up to
    `ARCO_CONTROL_STORE_GC_MAX_PAGES` pages of `collect_gc_page_at`, the
    conservative active collector (unreachable candidates older than seven days;
    maintenance retention pins last eight days, token/checkpoint pins 30 days,
@@ -142,8 +186,9 @@ exact field path depends on how the JSON layer nests `tracing` fields).
 | Phase | Key fields |
 | --- | --- |
 | `epoch` | `outcome`, `epoch`, `operation_kind`, `operation_id`, `holder_id`, `in_flight_for_secs`, `elapsed_ms` |
-| `maintenance` | `domain`, `outcome`, `job_id`, `recovered`, `advances`, `completed`, `total`, `layout_generation`, `elapsed_ms` |
+| `maintenance` | `domain`, `kind`, `outcome`, `job_id`, `recovered`, `advances`, `completed`, `total`, `layout_generation`, `purged_expired_rows`, `purged_tombstones`, `elapsed_ms` |
 | `drain` | `outcome`, `drained_records`, `quarantined_records`, `already_acknowledged`, `pending_records`, `latest_projected_sequence`, `applied_authority_sequence`, `observed_authority_sequence`, `lag` (observed - applied), `age_secs` (since last successful materialization), `elapsed_ms` |
+| `trim` | `outcome`, `trimmed_records`, `trim_sequence` (catalog logical sequence of the trim commit, when one landed), `elapsed_ms` |
 | `gc` | `domain`, `pages`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
 | `run` | `outcome` (`ok`/`error`), `failures`, `elapsed_ms` |
 
@@ -164,10 +209,22 @@ Epoch `outcome` values:
   "a retention mutation epoch is already in flight" until an operator settles
   it; see "Stuck retention epoch" below.
 
+Maintenance `kind` values (one summary line per job, at most two per domain
+per run):
+
+- `consolidation`: folds the L0 suffix into an equivalent L1 anchor.
+  `purged_expired_rows` and `purged_tombstones` are absent.
+- `retention_horizon`: renders L1 without expired rows and unobservable
+  tombstones. A `published` entry reports `purged_expired_rows` and
+  `purged_tombstones` from the certificate; both are absent unless the job
+  published.
+
 Maintenance `outcome` values:
 
-- `idle`: the manifest selects no maintenance intent. Normal steady state.
-- `published`: a consolidated layout was published by exact head CAS;
+- `idle`: the kernel admitted no plan: the manifest selects no maintenance
+  intent (`consolidation`) or no row is purge-eligible (`retention_horizon`).
+  Normal steady state.
+- `published`: a layout was published by exact head CAS;
   `layout_generation` is the new generation. `recovered=true` means the job
   was replayed from an earlier run's persisted identity.
 - `deferred`: another actor holds or consumed the source (a
@@ -179,8 +236,11 @@ Maintenance `outcome` values:
   first), a manual `gcloud run jobs execute` overlapping the scheduled run, or
   a restore/snapshot workflow holding the workspace retention lock.
 - `terminal`: the job reached `Failed`, `Superseded` or `Abandoned`; its
-  persisted identity is cleared and the next run prepares a fresh plan.
-  Investigate if it repeats.
+  persisted identity is cleared and the next run prepares a fresh plan. A
+  `retention_horizon` whose purged set a later commit rewrote ends here in
+  the run that observes the refusal (the worker re-reads a job whose
+  publication was deferred and finds it `Superseded`), and consolidation
+  still runs in that run. Investigate if it repeats without such a commit.
 - `exhausted`: the advance budget ran out before `ReadyToPublish`. Raise
   `ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES` or run the job again; the job
   resumes from durable progress via its persisted identity.
@@ -195,11 +255,44 @@ Drain `outcome` values:
   backlog; if it does not fall between runs, the maintenance phase for
   `projection-outbox-acks` is not publishing (check its `outcome`).
 
+Trim `outcome` values:
+
+- `ok`: a trim commit landed; `trimmed_records` records left the catalog
+  outbox and `trim_sequence` is the commit's catalog logical sequence.
+- `idle`: no acknowledged record remained in the outbox; nothing was
+  committed and the catalog sequence is unchanged.
+- `deferred`: catalog commit backpressure (`MaintenanceBackpressure`),
+  `PreconditionFailed` or `CasFailed` stopped the trim; logged at warn with
+  the error. The acknowledgements were already retired in the ack root
+  before the catalog commit, so the next drain re-materializes those records
+  (at-least-once) and the following trim removes them.
+
 A `phase failed` line with `outcome="error"` carries the typed error and makes
-the execution exit non-zero. Storage, integrity, ambiguous-outcome and
+the execution exit non-zero. Maintenance failures name the job kind, for
+example `maintenance[catalog]: maintenance prepare (retention_horizon) for
+domain catalog: ...`; entries already finished in the same domain survive a
+later step's error. Storage, integrity, ambiguous-outcome and
 backpressure (outside the drain) errors are never retried silently; see
 `docs/runbooks/state-store-cas-publish-failure.md` and
 `docs/runbooks/state-store-corrupt-artifact.md`.
+
+## Metrics
+
+The kernel emits these while the worker drives it
+(`crates/arco-catalog/src/metrics.rs`):
+
+- `arco_state_store_maintenance_published_total{domain,kind}`: durable
+  maintenance publications; `kind` is `consolidation` or
+  `retention_horizon`. Counted at most once per publication, by the
+  invocation whose progress-selector CAS advanced the job to `Published`; a
+  publication whose selector PUT persisted but reported an error is never
+  counted, so the series can undercount but never overcount.
+- `arco_state_store_retention_purged_rows_total{domain,reason}`: rows purged
+  by published `retention_horizon` certificates; `reason` is `expired` or
+  `tombstone`. Same at-most-once accounting; a zero count emits nothing.
+- `arco_control_store_outbox_trimmed_records_total{domain,consumer}`:
+  acknowledged outbox records removed by trim commits, emitted after the
+  source trim commit succeeds; a zero count emits nothing.
 
 ## Stuck retention epoch
 
@@ -252,6 +345,51 @@ Remedy, in order:
   wake (a commit-fired trigger) remains cutover work; do not tighten the cron
   below what the run duration allows, because overlapping executions contend
   on the workspace retention lock.
+- **Each trimming run adds one catalog L0 segment.** A trim commit is a
+  catalog transaction, folded by the next consolidation. A catalog outbox
+  trimmed on every run accrues one segment per run toward the 16-segment
+  maintenance intent even with no application writes.
+- **A trim reads as watermark lag 1 and stale freshness until the next
+  catalog mutation.** The trim commit advances the catalog logical sequence
+  without a projection intent, so from the next run
+  `arco_state_store_projection_watermark_lag_sequences` (committed catalog
+  sequence minus latest acknowledged) reads 1 and the drain summary's
+  `age_secs` keeps growing, because an empty drain materializes nothing and
+  rewrites no status, until a catalog mutation is materialized.
+  `ArcoProjectionWatermarkLagHigh` fires at 1000 and is unaffected;
+  `pending_records` is the truthful backlog signal.
+- **A horizon superseded by a later commit recomputes one run later.** When
+  a commit after preparation rewrote a purged key, `publish_at` records the
+  job `Superseded` (the refusal is permanent: the purged set is fixed by the
+  job identity) and refuses with `PreconditionFailed`. The worker re-reads
+  the job, reports `terminal` in the run that observes the refusal, clears
+  its record, and runs consolidation in that same run; the purge is
+  recomputed by a fresh horizon prepared on the next run, because a domain
+  drives at most one horizon per run. No operator action is needed.
+- **Writer clocks more than one hour behind object-store time defeat the
+  skew margin.** The horizon's purge cutoff and age bound subtract a
+  one-hour clock-skew margin from the job's clock. A writer whose clock lags
+  by more than an hour stamps `committed_at_ms` and `expires_at_ms` values
+  the margin does not cover, so its rows can be treated as expired, and its
+  manifests as aged, up to that much earlier than it intended.
+- **The 30-day age bound is exercised only by kernel tests until a root has
+  30 days of history.** Worker tests cannot inject the kernel clock, so they
+  cover the expiry purge only; the age bound is covered by the kernel's
+  tests and the durable model. On a root younger than 30 days the
+  `age_anchor` chain ends above the floor, the age bound is zero and the
+  horizon purges no tombstones (`purged_tombstones=0`); only expired rows
+  are purged.
+- **A catalog root carrying generic trim-binding metadata fails the drain
+  and trim phases.** The fixed-consumer drain and trim refuse such a root
+  with a non-deferrable invariant violation whose message is `fixed
+  projection consumer cannot use a source root with generic binding
+  metadata`; the `phase failed` lines for `drain` and `trim` carry it and
+  the job exits non-zero on every run until the key is removed from the
+  catalog root. The worker never writes that key; it appears only if a
+  generic `ProjectionOutboxWorker::trim_acked` or rebind was run against the
+  catalog root, which the operator endpoint refuses for `catalog`.
+  Acknowledgements an in-flight trim had already retired are redelivered by
+  the next fixed drain once the root is unbound.
 - The job maintains exactly the `catalog` and `projection-outbox-acks` domains.
   Other control domains need their own entry in `CONTROL_DOMAINS`.
 

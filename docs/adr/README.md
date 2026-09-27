@@ -39,7 +39,7 @@ Each ADR follows this structure:
 | [024](adr-024-schedule-sensor-automation.md) | Schedule and sensor automation | Accepted |
 | [025](adr-025-backfill-controller.md) | Backfill controller | Accepted |
 | [026](adr-026-partition-status-tracking.md) | Partition status tracking | Accepted |
-| [027](adr-027-datafusion-query-endpoint.md) | DataFusion query endpoint | Accepted |
+| [027](adr-027-datafusion-query-endpoint.md) | DataFusion query endpoint | Superseded |
 | [028](adr-028-gcp-oidc-authentication.md) | GCP OIDC authentication | Accepted |
 | [029](adr-029-iceberg-multi-table-transactions.md) | Iceberg multi-table transactions (ICE-7) | Accepted |
 | [030](adr-030-delta-uc-metastore.md) | Delta Lake + UC-Like Metastore/Catalog (Arco-Native) | Proposed |
@@ -47,7 +47,7 @@ Each ADR follows this structure:
 | [032](adr-032-immutable-manifest-pointers.md) | Immutable Manifest Snapshots + Pointer CAS | Accepted |
 | [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |
 | [034](adr-034-fenced-head-published-control-plane-transactions.md) | Fenced Head-Published Control-Plane Transactions | Proposed |
-| [035](adr-035-system-catalog-tables.md) | System Catalog Tables | Proposed |
+| [035](adr-035-system-catalog-tables.md) | System Catalog Tables | Superseded for SQL serving |
 | [036](adr-036-engine-boundaries.md) | Engine Boundaries and Split-Service Topology | Accepted |
 | [037](adr-037-arco-catalog-product-surface.md) | Arco Catalog Product Surface | Proposed |
 | [038](adr-038-catalog-threat-model.md) | Catalog Threat Model | Proposed |

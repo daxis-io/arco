@@ -5,7 +5,7 @@ use super::{
     AuthorityWritePrecondition, CONTROL_MVP_FORMAT_VERSION, CatalogError,
     ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpManifest,
     ControlMvpPointer, HistoryAnchor, IMPLEMENTATION, LayoutMaintenanceIntentV1,
-    LayoutMaintenanceReason, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES, Result,
+    LayoutMaintenanceReason, MAX_CONTROL_JSON_BYTES, MAX_HEAD_JSON_BYTES, MaintenanceKind, Result,
     RewriteEquivalence, WriteResult, ambiguous_authority_outcome, encode_envelope_limited,
     encode_json_limited, invariant_violation, put_immutable_matching, sha256_hex,
 };
@@ -187,6 +187,8 @@ impl ControlMvpMaintenanceWorker {
                                 candidate_pointer.manifest_checksum_sha256.clone(),
                             ),
                         layout_generation: intent.layout_generation(),
+                        kind: MaintenanceKind::Consolidation,
+                        purged_counts: None,
                     }));
                 }
                 Ok(WriteResult::PreconditionFailed { .. }) => {}
@@ -206,6 +208,8 @@ impl ControlMvpMaintenanceWorker {
                                     candidate_pointer.manifest_checksum_sha256.clone(),
                                 ),
                             layout_generation: intent.layout_generation(),
+                            kind: MaintenanceKind::Consolidation,
+                            purged_counts: None,
                         }));
                     }
                     return Err(ambiguous_authority_outcome(format!(

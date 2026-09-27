@@ -75,9 +75,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
-arrow-json = { workspace = true }
 parquet = { workspace = true }
-datafusion = "46"
 
 # IDs
 ulid = { workspace = true }
@@ -114,6 +112,5 @@ metrics-exporter-prometheus = { workspace = true }
 
 [dev-dependencies]
 arco-test-utils = { path = "../arco-test-utils", default-features = false }
-duckdb = { version = "1.10502.0", features = ["parquet"] }
 tempfile = { workspace = true }
 tokio-test = { workspace = true }

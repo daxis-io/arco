@@ -28,9 +28,8 @@ skip attribution, output visibility, and rerun labels.
 
 ## Freshness
 
-`system.orchestration.*` tables are read-only evidence over published
-projections. They are useful for SQL inspection, audit, and support workflows,
-but they are not the low-latency runtime API and may lag raw event ingestion
+Published orchestration projections are read-only evidence for audit and
+support workflows. They are not the low-latency runtime API and may lag raw event ingestion
 until compaction publishes the projection.
 
 Runtime control paths should use `OrchestrationStateService` directly and treat

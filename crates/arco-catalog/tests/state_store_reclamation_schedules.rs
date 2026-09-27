@@ -2595,3 +2595,96 @@ mod gate7_model;
 
 #[path = "support/gate7_schedules.rs"]
 mod gate7_schedules;
+
+/// A horizon whose purged set a later commit rewrote is refused for good and
+/// recorded `Superseded` by the refusing publication. The shared driver must
+/// observe that instead of abandoning a terminal job, then drive a fresh
+/// horizon that recomputes the purge over the rewritten parent.
+#[tokio::test]
+async fn driver_continues_past_a_horizon_superseded_by_a_rewritten_purged_key() {
+    use arco_catalog::{
+        DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus, PurgedCounts,
+    };
+    let f = Fixture::new().await;
+    let now = Utc::now();
+    let expired_ms = now.timestamp_millis() - 2 * 60 * 60 * 1000;
+    let mut txn = f
+        .store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    txn.put_with_expiry(b"rewritten", Bytes::from_static(b"expired"), expired_ms)
+        .await
+        .unwrap();
+    txn.put_with_expiry(b"expired", Bytes::from_static(b"expired"), expired_ms)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let worker = DurableMaintenanceWorker::new(
+        f.storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+        DurableAuthorityBinding::new([29; 32]),
+    )
+    .unwrap();
+    // The first plan admits both expired rows; a commit before its activation
+    // rewrites one of them, so its purged set no longer describes the parent.
+    let first = worker
+        .prepare_horizon_at(now)
+        .await
+        .unwrap()
+        .expect("two expired rows admit a horizon");
+    let superseded = first.job_id().clone();
+    let mut txn = f
+        .store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    txn.put(b"rewritten", Bytes::from_static(b"reborn"))
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    let pending = Mutex::new(Some(first));
+    // The first job's status as the driver moves on to its next plan: after
+    // the refusal and before the fresh job publishes (once it has, the head's
+    // layout generation no longer admits a resume of the old job).
+    let observed = Arc::new(Mutex::new(None));
+
+    let outcome = durable_maintenance::drive_pending(&worker, now, |worker, now| {
+        let admitted = pending.lock().unwrap().take();
+        if let Some(plan) = admitted {
+            return Box::pin(async move { Ok(Some(plan)) });
+        }
+        let (superseded, observed) = (superseded.clone(), Arc::clone(&observed));
+        Box::pin(async move {
+            let status = worker.resume_at(&superseded, now).await?.status;
+            *observed.lock().unwrap() = Some(status);
+            worker.prepare_horizon_at(now).await
+        })
+    })
+    .await
+    .expect("the driver moves past the superseded job without abandoning it")
+    .expect("a fresh horizon publishes over the rewritten parent");
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some(MaintenanceStatus::Superseded),
+        "the refusing publication recorded the first job terminal, and the driver moved on"
+    );
+    assert_eq!(
+        outcome.purged_counts(),
+        Some(PurgedCounts {
+            expired_rows: 1,
+            tombstones: 0,
+        }),
+        "the fresh job purges only the row that is still expired"
+    );
+    assert_eq!(
+        f.store.get(b"rewritten").await.unwrap(),
+        Some(Bytes::from_static(b"reborn"))
+    );
+    assert_eq!(f.store.get(b"expired").await.unwrap(), None);
+    assert_eq!(
+        f.store.get(b"key").await.unwrap(),
+        Some(Bytes::from_static(b"value"))
+    );
+}

@@ -28,6 +28,8 @@ public Git SHA; repository tests and ignored credentialed tests do not qualify.
 
 | Area | Accepted design | Implemented | Locally verified | Privately provider-qualified | Route-wired | Authoritative |
 |---|---|---|---|---|---|---|
+| Tenant identity physical root | Accepted ADR-044 | Partial: typed storage seam and `test-utils` synthetic commit/read, checkpoint, protected references, retained-history closure, generation-fenced GC, and controlled recovery; production guard and layout-maintenance cap remain | Partial: [integrated lifecycle receipt](../../../reports/2026-09-26-tenant-identity-lifecycle-integration.md) records the current format-9 source and verification gates | No | No | No |
+| Tenant principal authority | Accepted ADR-044 | No principal `IdentityStore`/`IdentityMutation`/event lifecycle | No | N/A | No | No |
 | Legacy catalog DDL (`CatalogWriter` -> ledger -> synchronous compaction -> Parquet manifest) | Yes, as the ADR-018 legacy path | Yes | Yes | Not recorded here | Yes through the shared adapter for every unbound root | Yes for every uncut root |
 | `ArcoStateStore` traits and `StateToken` contract | Yes (ADR-043) | Yes | Yes | N/A | Yes for an exact configured control root | No deployed authority |
 | Deterministic model store | Yes as a reference oracle | Yes | Yes | N/A | No | No |
@@ -56,7 +58,8 @@ production and the cron cadence does not meet the 10 s p99 lag objective.
 | Table-format catalog records (Delta, Iceberg, Parquet) | Yes | Yes | Yes | N/A | Yes, with protocol-specific gaps | Yes on legacy catalog authority |
 | Managed Delta commits | Deferred from pilot | Yes as a separate coordinator; control pilot rejects before side effects | Yes | Not part of this gate | Existing behavior on non-pilot roots; disabled on pilot | Separate table-scoped authority |
 | Iceberg metadata commits | Deferred from pilot | Yes on existing route; control pilot rejects before legacy access | Yes | Not part of this gate | Existing behavior on non-pilot roots; disabled on pilot | Not moved to pilot authority |
-| Catalog Parquet/system-table projections | Yes, derived only | Legacy synchronous path plus control restart-safe Parquet materializer and status contract | Yes for materialization, restart recovery, redacted failures, and status-table lag | N/A | Legacy yes; control operator drain is wired, while projection-only reads still fail closed | Derived; never authorization authority |
+| Catalog Parquet projections | Yes, derived only | Legacy synchronous path plus control restart-safe Parquet materializer and status contract | Yes for materialization, restart recovery, redacted failures, and durable status | N/A | Legacy artifacts exist; control operator drain is wired, while projection-only reads still fail closed | Derived; never authorization authority |
+| Embedded SQL query runtime | No | Removed from the API | Yes for route absence and catalog publication | N/A | No | Client engines query authorized artifacts |
 | Grants/RBAC and route-wide authorization | Yes, later milestone | Partial | Partial | No | Partial | Common catalog authority exists; authorization cutover remains deferred |
 | Storage credentials and external locations | Yes, later milestone | Partial create/list/get | Partial | No | Partial | Narrow scoped metastore paths only |
 | Rich lineage observations and projections | Proposed (ADR-042), deferred | Partial legacy edge surface | Yes for existing scope | N/A | Partial | Legacy lineage domain only |

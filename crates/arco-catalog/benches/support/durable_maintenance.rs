@@ -27,7 +27,8 @@ pub async fn horizon_pending(
     .await
 }
 
-type PrepareFuture<'a> = std::pin::Pin<
+/// The admission step [`drive_pending`] repeats for each job it drives.
+pub type PrepareFuture<'a> = std::pin::Pin<
     Box<
         dyn Future<Output = Result<Option<arco_catalog::PreparedMaintenance>, CatalogError>>
             + Send
@@ -35,7 +36,11 @@ type PrepareFuture<'a> = std::pin::Pin<
     >,
 >;
 
-async fn drive_pending(
+/// Drives jobs admitted by `prepare` until one publishes: at most four jobs,
+/// each within 512 invocations. A job refused with `PreconditionFailed` is
+/// invalidated (abandoned unless the refusal itself recorded it terminal)
+/// and the next plan is prepared. `Ok(None)` when `prepare` admits nothing.
+pub async fn drive_pending(
     worker: &DurableMaintenanceWorker,
     now: chrono::DateTime<chrono::Utc>,
     prepare: impl for<'a> Fn(
@@ -63,9 +68,25 @@ async fn drive_pending(
                 Ok(Some(outcome)) => return Ok(Some(outcome)),
                 Ok(None) | Err(CatalogError::CasFailed { .. }) => {}
                 Err(CatalogError::PreconditionFailed { .. }) => {
-                    // Abandonment itself authenticates lifetime, protection and
-                    // selected status; unresolved publication cannot be abandoned.
-                    worker.abandon_at(&id, now).await?;
+                    // A refusal that is permanent for the job (a horizon whose
+                    // purged set a later commit rewrote) has already recorded
+                    // it `Superseded`; abandoning a terminal job is refused.
+                    // Every other job is abandoned exactly as before: a resume
+                    // that fails (the source was consumed) says nothing about
+                    // the status, and abandonment itself authenticates
+                    // lifetime, protection and selected status; unresolved
+                    // publication cannot be abandoned.
+                    let status = worker.resume_at(&id, now).await.ok().map(|p| p.status);
+                    if !matches!(
+                        status,
+                        Some(
+                            MaintenanceStatus::Failed
+                                | MaintenanceStatus::Superseded
+                                | MaintenanceStatus::Abandoned
+                        )
+                    ) {
+                        worker.abandon_at(&id, now).await?;
+                    }
                     invalidated = true;
                     break;
                 }

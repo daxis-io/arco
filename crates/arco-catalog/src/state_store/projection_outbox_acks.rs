@@ -73,11 +73,27 @@
 //! closed with a typed error naming the bound consumer. Operators transfer the
 //! binding deliberately with [`ProjectionOutboxWorker::rebind_consumer`].
 //!
+//! # Fixed-consumer path
+//!
+//! A source domain whose consumer is fixed at compile time (the catalog
+//! projection) never carries binding metadata: installing it would advance the
+//! source domain's logical sequence without a domain mutation. The
+//! crate-private `ProjectionOutboxWorker::drain_fixed_consumer` and
+//! `ProjectionOutboxWorker::trim_fixed_consumer` run the same drain and
+//! retire-then-trim saga as the generic operations, always at incarnation 1,
+//! but never write the binding key and fail closed with an invariant violation
+//! when a generic drain or trim has installed it. The fixed trim checks this
+//! before retiring any acknowledgement and again inside its source-domain
+//! commit, so the generic and fixed paths cannot be mixed on one root.
+//!
 //! Metric names reserved for the deployed wiring (emitters live with the
 //! operator endpoints): `arco_control_store_outbox_backlog_records`,
 //! `arco_control_store_outbox_watermark_lag_sequences`,
-//! `arco_control_store_outbox_drained_records_total`,
-//! `arco_control_store_outbox_trimmed_records_total`.
+//! `arco_control_store_outbox_drained_records_total`.
+//! The trim saga shared by [`ProjectionOutboxWorker::trim_acked`] and
+//! `ProjectionOutboxWorker::trim_fixed_consumer` itself emits
+//! `arco_control_store_outbox_trimmed_records_total` (labels `domain`,
+//! `consumer`) once its source-domain trim commit succeeds.
 
 use crate::catalog_authority::projection_measurement::phase as projection_phase;
 use std::collections::BTreeSet;
@@ -1157,6 +1173,19 @@ struct ProjectionOutboxRetiredWatermark {
     latest_source_sequence: u64,
 }
 
+/// How a trim pass treats the source root's consumer-binding key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrimBinding {
+    /// Operator path ([`ProjectionOutboxWorker::trim_acked`]): the observed
+    /// binding is validated inside the trim commit, registered there when the
+    /// root is unbound, and a tenure change mid-pass is refused.
+    Generic,
+    /// Fixed-identity path ([`ProjectionOutboxWorker::trim_fixed_consumer`]):
+    /// the binding key is asserted absent inside the trim commit and never
+    /// written.
+    Fixed,
+}
+
 /// Internal/operator-only consumer harness for a source domain's outbox.
 ///
 /// Drains records through a handler, acknowledges them durably, and trims
@@ -1179,6 +1208,11 @@ struct ProjectionOutboxRetiredWatermark {
 /// [`Self::rebind_consumer`] to transfer the binding deliberately; the
 /// transfer mints a new incarnation, which retires the previous tenure's
 /// acknowledgement namespace without deleting anything.
+///
+/// A source domain with a compile-time consumer identity is served by the
+/// crate-private `Self::drain_fixed_consumer` and `Self::trim_fixed_consumer`
+/// instead: they run at incarnation 1, never
+/// write the binding, and refuse a root that carries one.
 ///
 /// # Fencing
 ///
@@ -1668,6 +1702,60 @@ impl ProjectionOutboxWorker {
         let incarnation = observed_binding
             .as_ref()
             .map_or(FIRST_BINDING_INCARNATION, |binding| binding.incarnation);
+        self.trim_at_incarnation(incarnation, TrimBinding::Generic)
+            .await
+    }
+
+    /// Trims a statically assigned consumer's acknowledged events without
+    /// mutating the source root's binding metadata.
+    ///
+    /// This is the trim counterpart of [`Self::drain_fixed_consumer`]. The
+    /// catalog projection owns one compile-time consumer identity, always at
+    /// the first binding incarnation, and stores acknowledgements in the
+    /// separate ack domain. Its trim must not install generic trim-binding
+    /// metadata in catalog authority: [`Self::drain_fixed_consumer`] refuses
+    /// any source root carrying that metadata, so a generic trim would break
+    /// every later fixed drain. This path fails closed with an invariant
+    /// violation, before retiring any acknowledgement, when the source root
+    /// already carries generic binding metadata, and asserts the key is still
+    /// absent inside the trim commit itself. When that in-commit check fails
+    /// the acknowledgements are already retired: the records are retained
+    /// unacknowledged, every fixed drain and trim refuses the root while the
+    /// binding is present, and the fixed drain redelivers them once the root
+    /// is unbound.
+    ///
+    /// Everything else matches [`Self::trim_acked`]: ack-domain retirement
+    /// first, exact-incarnation source-domain trim second, idle return without
+    /// a commit when nothing acknowledged remains. Callers of this
+    /// crate-private path (the scheduled worker) must enforce the fixed
+    /// identity and must not expose generic rebind or source-domain trim
+    /// operations for the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or CAS errors, or an invariant violation when the
+    /// source root carries generic binding metadata.
+    pub(crate) async fn trim_fixed_consumer(&self) -> Result<ProjectionOutboxTrimReport> {
+        if self.consumer_binding().await?.is_some() {
+            return Err(invariant_violation(
+                "fixed projection consumer cannot use a source root with generic binding metadata",
+            ));
+        }
+        self.trim_at_incarnation(FIRST_BINDING_INCARNATION, TrimBinding::Fixed)
+            .await
+    }
+
+    /// The retire-then-trim saga shared by [`Self::trim_acked`] and
+    /// [`Self::trim_fixed_consumer`]: observe the acknowledged events at
+    /// `incarnation`, retire their acknowledgements (ack-domain commit first),
+    /// then trim them by exact incarnation from the source domain (source
+    /// commit second), treating the source root's binding key as `binding`
+    /// prescribes.
+    async fn trim_at_incarnation(
+        &self,
+        incarnation: u64,
+        binding: TrimBinding,
+    ) -> Result<ProjectionOutboxTrimReport> {
         let outbox = self.source.current_projection_outbox().await?;
         let acked = self
             .acks
@@ -1710,8 +1798,8 @@ impl ProjectionOutboxWorker {
             .await?
             .begin_control_txn(TxnOptions::new(Some(self.source_scope.clone())))
             .await?;
-        match txn.get(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await? {
-            Some(value) => {
+        match (binding, txn.get(PROJECTION_OUTBOX_TRIM_BINDING_KEY).await?) {
+            (TrimBinding::Generic, Some(value)) => {
                 let binding = decode_binding(value.bytes())?;
                 if binding.consumer_id != self.consumer_id {
                     return Err(trim_consumer_conflict(
@@ -1734,17 +1822,46 @@ impl ProjectionOutboxWorker {
                     });
                 }
             }
-            None => {
+            (TrimBinding::Generic, None) => {
                 txn.put(
                     PROJECTION_OUTBOX_TRIM_BINDING_KEY,
                     encode_binding(&self.consumer_id, incarnation)?,
                 )
                 .await?;
             }
+            // A generic binding landed between the up-front check and this
+            // transaction: the fixed identity never inherits it, so fail
+            // closed. The acknowledgements are already retired, so the
+            // records are retained unacknowledged; every fixed drain and trim
+            // refuses the root while the binding is present, and the fixed
+            // drain redelivers them (at-least-once) once the root is unbound.
+            // This arm exists beside `assert_absent` because the worker treats
+            // `PreconditionFailed` as deferrable: a misbound root must surface
+            // as a non-deferrable invariant violation rather than be retried,
+            // re-retiring acknowledgements, every run.
+            (TrimBinding::Fixed, Some(_)) => {
+                return Err(invariant_violation(
+                    "fixed projection consumer cannot use a source root with generic binding \
+                     metadata; the metadata appeared while the trim was in flight",
+                ));
+            }
+            // Never written by the fixed path; the commit itself refuses if a
+            // generic binding lands before the pointer CAS.
+            (TrimBinding::Fixed, None) => {
+                txn.assert_absent(PROJECTION_OUTBOX_TRIM_BINDING_KEY)
+                    .await?;
+            }
         }
         txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))
             .await?;
         let token = txn.commit().await?.into_state_token();
+        // Counted only once the commit has returned: a trim commit that
+        // persisted but propagated an error is never counted.
+        crate::metrics::record_outbox_trimmed(
+            self.source_scope.domain(),
+            &self.consumer_id,
+            u64::try_from(trimmed.len()).unwrap_or(u64::MAX),
+        );
         Ok(ProjectionOutboxTrimReport {
             trimmed_record_ids,
             trimmed_event_ids,
@@ -3090,6 +3207,50 @@ mod tests {
         assert_eq!(None, idle.trim_sequence);
     }
 
+    /// A trim commit counts the records it removed for the source domain and
+    /// the trimming consumer; an idle trim counts nothing.
+    #[test]
+    fn trim_emits_the_trimmed_records_counter_for_the_source_domain_and_consumer() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let storage = storage();
+                commit_source_record(&storage, "record-1").await;
+                commit_source_record(&storage, "record-2").await;
+                let worker =
+                    ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+                        .expect("worker");
+                worker
+                    .acks()
+                    .acknowledge(&delivery("record-1", 1))
+                    .await
+                    .expect("ack record-1");
+                worker
+                    .acks()
+                    .acknowledge(&delivery("record-2", 2))
+                    .await
+                    .expect("ack record-2");
+                let report = worker.trim_acked().await.expect("trim");
+                assert_eq!(2, report.trimmed_record_ids.len());
+                let idle = worker.trim_acked().await.expect("idle trim");
+                assert!(idle.trimmed_record_ids.is_empty());
+            });
+        });
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            Some(2.0),
+            crate::metrics::sample(
+                &rendered,
+                "arco_control_store_outbox_trimmed_records_total{domain=\"phase5-source\",consumer=\"consumer-a\"}"
+            ),
+            "{rendered}"
+        );
+    }
+
     #[tokio::test]
     async fn trim_of_record_not_in_state_fails_closed() {
         let storage = storage();
@@ -3431,6 +3592,321 @@ mod tests {
             vec![Bytes::from_static(br#"{"payload":"b"}"#)],
             handler.payloads()
         );
+    }
+
+    // Fixed-consumer trim coverage. The in-flight `(TrimBinding::Fixed,
+    // Some(_))` arm (a generic binding landing between the up-front check and
+    // the source transaction) has no test: exercising it needs a hook between
+    // the ack-domain retirement and the source transaction, which the fault
+    // backends in this module do not provide.
+
+    /// The fixed-consumer trim mirrors the fixed-consumer drain: it trims
+    /// exactly what that identity acknowledged at the first incarnation and
+    /// never installs generic binding metadata in the source root, so the
+    /// fixed drain keeps working after the trim instead of refusing the root.
+    #[tokio::test]
+    async fn fixed_consumer_trim_removes_acknowledged_records_and_installs_no_binding() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+        commit_source_record(&storage, "record-2").await;
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        let drained = worker
+            .drain_fixed_consumer(&AckOnlyProjectionHandler)
+            .await
+            .expect("fixed drain");
+        assert_eq!(
+            vec!["record-1".to_string(), "record-2".to_string()],
+            drained.drained_record_ids
+        );
+        // record-3 lands after the drain, so it is retained but unacknowledged.
+        commit_source_record(&storage, "record-3").await;
+
+        let report = worker.trim_fixed_consumer().await.expect("fixed trim");
+        assert_eq!(
+            vec!["record-1".to_string(), "record-2".to_string()],
+            report.trimmed_record_ids
+        );
+        assert_eq!(
+            vec![
+                control_mvp_outbox_event_id(1, "record-1"),
+                control_mvp_outbox_event_id(2, "record-2"),
+            ],
+            report.trimmed_event_ids
+        );
+        assert_eq!(Some(4), report.trim_sequence);
+
+        let source =
+            ControlMvpStateStore::new(storage.clone(), source_scope()).expect("source store");
+        let current = source
+            .current_projection_outbox()
+            .await
+            .expect("current outbox");
+        assert_eq!(1, current.len());
+        assert_eq!("record-3", current[0].record_id());
+        assert_eq!(
+            None,
+            source
+                .get(PROJECTION_OUTBOX_TRIM_BINDING_KEY)
+                .await
+                .expect("binding read"),
+            "the fixed trim must not install generic binding metadata"
+        );
+        assert_eq!(None, worker.bound_consumer().await.expect("bound consumer"));
+
+        // The fixed drain still works after the trim: the retired
+        // acknowledgements are gone, so nothing reads as already acknowledged,
+        // and only the unacknowledged record is delivered.
+        let drained = worker
+            .drain_fixed_consumer(&AckOnlyProjectionHandler)
+            .await
+            .expect("fixed drain after trim");
+        assert_eq!(vec!["record-3".to_string()], drained.drained_record_ids);
+        assert_eq!(0, drained.already_acknowledged);
+        let report = worker
+            .trim_fixed_consumer()
+            .await
+            .expect("second fixed trim");
+        assert_eq!(vec!["record-3".to_string()], report.trimmed_record_ids);
+        let drained = worker
+            .drain_fixed_consumer(&AckOnlyProjectionHandler)
+            .await
+            .expect("fixed drain of an empty outbox");
+        assert!(drained.drained_record_ids.is_empty());
+        assert_eq!(0, drained.already_acknowledged);
+
+        // Nothing acknowledged remains, so a further fixed trim is idle without
+        // a commit and the root is still unbound.
+        let idle = worker.trim_fixed_consumer().await.expect("idle fixed trim");
+        assert!(idle.trimmed_record_ids.is_empty());
+        assert_eq!(None, idle.trim_sequence);
+        assert_eq!(
+            None,
+            source
+                .get(PROJECTION_OUTBOX_TRIM_BINDING_KEY)
+                .await
+                .expect("binding read")
+        );
+    }
+
+    /// A root whose generic path already registered a binding is refused by
+    /// the fixed trim before any acknowledgement is retired: the fixed
+    /// identity never inherits or overwrites a generic tenure, and the refusal
+    /// leaves the generic tenure's acknowledgements and records untouched.
+    #[tokio::test]
+    async fn fixed_consumer_trim_fails_closed_on_generic_binding_metadata() {
+        let storage = storage();
+        commit_source_record(&storage, "record-1").await;
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        worker
+            .drain(&AckOnlyProjectionHandler)
+            .await
+            .expect("generic drain registers the binding");
+        assert_eq!(
+            Some("consumer-a".to_string()),
+            worker.bound_consumer().await.expect("binding")
+        );
+        let acked_before = worker
+            .acks()
+            .acknowledged_event_ids("consumer-a", FIRST_BINDING_INCARNATION)
+            .await
+            .expect("acks before the refused trim");
+        assert!(acked_before.contains(&control_mvp_outbox_event_id(1, "record-1")));
+        let sequence_before = worker
+            .backlog()
+            .await
+            .expect("backlog before")
+            .committed_sequence;
+
+        let error = worker
+            .trim_fixed_consumer()
+            .await
+            .expect_err("fixed trim must refuse generic binding metadata");
+        assert!(
+            matches!(&error, CatalogError::InvariantViolation { message }
+                if message.contains("generic binding metadata")),
+            "unexpected error: {error:?}"
+        );
+
+        // Refused before retirement: the acknowledgement and the record are
+        // both still present and nothing was committed to the source domain.
+        assert_eq!(
+            acked_before,
+            worker
+                .acks()
+                .acknowledged_event_ids("consumer-a", FIRST_BINDING_INCARNATION)
+                .await
+                .expect("acks after the refused trim")
+        );
+        let current = current_outbox(&storage).await;
+        assert_eq!(1, current.len());
+        assert_eq!("record-1", current[0].record_id());
+        assert_eq!(
+            sequence_before,
+            worker
+                .backlog()
+                .await
+                .expect("backlog after")
+                .committed_sequence
+        );
+
+        // The generic tenure keeps functioning.
+        let trim = worker.trim_acked().await.expect("generic trim");
+        assert_eq!(vec!["record-1".to_string()], trim.trimmed_record_ids);
+    }
+
+    /// Mirror of the generic crash test for the fixed path: the ack-domain
+    /// retirement commits, the source-domain trim CAS fails, and the record is
+    /// redelivered by the next fixed drain rather than lost. The retried fixed
+    /// trim converges and still installs no binding.
+    #[tokio::test]
+    async fn fixed_consumer_ack_retirement_before_trim_crash_redelivers() {
+        let backend = Arc::new(FailOncePutBackend::new(
+            Arc::new(MemoryBackend::new()),
+            SOURCE_POINTER,
+        ));
+        let storage =
+            ScopedStorage::new(backend.clone(), "tenant", "workspace").expect("scoped storage");
+        commit_source_record(&storage, "record-1").await;
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        let handler = RecordingProjectionHandler::default();
+        worker
+            .drain_fixed_consumer(&handler)
+            .await
+            .expect("first fixed drain");
+
+        // Crash window: the ack-domain retirement commits, then the
+        // source-domain trim pointer CAS fails.
+        backend.arm();
+        let error = worker
+            .trim_fixed_consumer()
+            .await
+            .expect_err("injected crash after ack retirement must interrupt the fixed trim");
+        assert!(
+            matches!(&error, CatalogError::AmbiguousAuthorityOutcome { message }
+                if message.contains("injected trim crash point")),
+            "unexpected error: {error:?}"
+        );
+
+        // At-least-once: the record is still retained, its acknowledgement is
+        // retired, so the fixed drain redelivers it rather than losing it.
+        let backlog = worker.backlog().await.expect("backlog after crash");
+        assert_eq!(vec!["record-1".to_string()], backlog.pending_record_ids);
+        let redelivery = worker
+            .drain_fixed_consumer(&handler)
+            .await
+            .expect("fixed redelivery drain");
+        assert_eq!(vec!["record-1".to_string()], redelivery.drained_record_ids);
+        assert_eq!(2, handler.payloads().len());
+        assert_eq!(
+            Some(1),
+            worker
+                .acks()
+                .latest_projected_sequence("consumer-a")
+                .await
+                .expect("watermark preserved across retirement")
+        );
+
+        // The retried fixed trim converges without binding the root.
+        let trim = worker
+            .trim_fixed_consumer()
+            .await
+            .expect("fixed trim retry");
+        assert_eq!(vec!["record-1".to_string()], trim.trimmed_record_ids);
+        assert!(
+            worker
+                .backlog()
+                .await
+                .expect("final backlog")
+                .pending_record_ids
+                .is_empty()
+        );
+        assert_eq!(
+            None,
+            worker.bound_consumer().await.expect("bound consumer"),
+            "the fixed path never binds the root"
+        );
+    }
+
+    /// After a fixed trim has removed an incarnation and the record id was
+    /// re-staged, a delayed transaction-level trim naming the old incarnation
+    /// fails closed inside the source transaction (mirror of the generic
+    /// delayed-observation test), the fixed drain then delivers the fresh
+    /// incarnation normally, and the root stays unbound throughout.
+    #[tokio::test]
+    async fn delayed_trim_of_the_old_incarnation_fails_closed_after_a_fixed_trim_and_the_root_stays_unbound()
+     {
+        let storage = storage();
+        let worker = ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+            .expect("worker");
+        commit_source_record_with_payload(&storage, "record-r", br#"{"payload":"a"}"#).await;
+        worker
+            .drain_fixed_consumer(&AckOnlyProjectionHandler)
+            .await
+            .expect("fixed drain record-r");
+
+        // Both passes observe record-r at origin sequence 1.
+        let captured = vec![ProjectionOutboxDeliveryId::new(
+            "consumer-a",
+            FIRST_BINDING_INCARNATION,
+            "record-r",
+            1,
+        )];
+        assert_eq!(
+            control_mvp_outbox_event_id(1, "record-r"),
+            retained_event_id(&storage, "record-r").await
+        );
+
+        // One fixed pass completes, and a producer re-stages the record id.
+        worker
+            .trim_fixed_consumer()
+            .await
+            .expect("completing fixed trim");
+        commit_source_record_with_payload(&storage, "record-r", br#"{"payload":"b"}"#).await;
+        let restaged_event = retained_event_id(&storage, "record-r").await;
+        assert_ne!(control_mvp_outbox_event_id(1, "record-r"), restaged_event);
+
+        // The delayed pass runs its ack-domain retirement (which converges
+        // idempotently) and opens a fresh source transaction against the new
+        // state, where the identity predicate has to hold.
+        worker
+            .acks()
+            .retire_acknowledgements(&captured)
+            .await
+            .expect("delayed retirement converges");
+        let source =
+            ControlMvpStateStore::new(storage.clone(), source_scope()).expect("source store");
+        let mut txn = source
+            .begin_control_txn(TxnOptions::new(Some(source_scope())))
+            .await
+            .expect("delayed trim opens a fresh source transaction");
+        assert_precondition_failed(
+            txn.trim_projection_outbox(
+                captured.iter().map(ProjectionOutboxDeliveryId::trim_target),
+            )
+            .await,
+            "a different incarnation of the same record id",
+        );
+
+        // The new incarnation survives untouched and the fixed drain delivers
+        // it; the root is still unbound.
+        assert_eq!(
+            restaged_event,
+            retained_event_id(&storage, "record-r").await
+        );
+        let handler = RecordingProjectionHandler::default();
+        let drained = worker
+            .drain_fixed_consumer(&handler)
+            .await
+            .expect("fixed drain of the new record");
+        assert_eq!(vec!["record-r".to_string()], drained.drained_record_ids);
+        assert_eq!(
+            vec![Bytes::from_static(br#"{"payload":"b"}"#)],
+            handler.payloads()
+        );
+        assert_eq!(None, worker.bound_consumer().await.expect("bound consumer"));
     }
 
     #[tokio::test]

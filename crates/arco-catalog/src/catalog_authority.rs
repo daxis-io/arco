@@ -89,7 +89,8 @@ pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
 /// original response. Either re-execution reuses the deterministic operation
 /// id of its (operation family, idempotency key) pair, so while the earlier
 /// projection intent is still retained in the outbox it fails closed with an
-/// `AlreadyExists` projection-intent conflict and commits nothing.
+/// `AlreadyExists` projection-intent conflict and commits nothing, unless the
+/// command itself fails first (for example a name conflict).
 pub const CATALOG_RECEIPT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Non-blocking wake-up seam invoked after a catalog authority commit.

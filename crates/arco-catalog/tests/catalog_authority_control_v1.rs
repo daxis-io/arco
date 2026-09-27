@@ -1613,10 +1613,19 @@ async fn a_purged_receipt_lets_a_keyed_patch_reapply_once_its_intent_is_trimmed(
     let second_origin = outbox[0]
         .origin_sequence()
         .expect("committed intent carries its origin sequence");
-    assert!(
-        second_origin > first_origin,
-        "the re-staged intent is a fresh incarnation: {second_origin} > {first_origin}"
+    // create (1) and patch (2) committed; the horizon publication keeps the
+    // logical sequence, the trim commits 3, and the re-execution commits 4.
+    assert_eq!(2, first_origin, "the original patch intent's incarnation");
+    assert_eq!(
+        store
+            .current_state_token()
+            .await
+            .expect("head after the re-execution")
+            .logical_sequence(),
+        second_origin,
+        "the re-staged intent is a fresh incarnation at the re-execution's sequence"
     );
+    assert_eq!(4, second_origin);
 }
 
 /// The horizon purges a receipt only when its expiry (`occurredAtMs` + 24 h)

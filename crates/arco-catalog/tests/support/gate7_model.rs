@@ -495,6 +495,20 @@ async fn run(seed: u64, mode: usize, block: usize, trace: &Mutex<Vec<String>>) {
 }
 
 #[tokio::test]
+async fn older_cut_outbox_model_one_seed_one_cache_one_layout() {
+    let trace = Mutex::new(Vec::new());
+    let result = std::panic::AssertUnwindSafe(Box::pin(run(33, 0, 32 * 1024, &trace)))
+        .catch_unwind()
+        .await;
+    assert!(
+        result.is_ok(),
+        "Gate 7 seed=33 mode=0 block=32768\n{}",
+        trace.lock().unwrap().join("\n")
+    );
+}
+
+#[tokio::test]
+#[ignore = "exhaustive model runs in the weekly scheduled suite"]
 async fn older_cut_outbox_model_32_seeds_128_operations_three_caches_two_layouts() {
     for seed in 33..=64 {
         for mode in 0..3 {

@@ -2066,6 +2066,7 @@ async fn durable_model_step(
 }
 
 #[tokio::test]
+#[ignore = "exhaustive model runs in the weekly scheduled suite"]
 async fn durable_maintenance_model_32_seeds_of_128_operations() {
     for seed in 1..=32 {
         let trace = Mutex::new(Vec::new());
@@ -2111,6 +2112,20 @@ async fn durable_maintenance_model_reduced_two_seeds_of_thirty_two_operations() 
 }
 
 #[tokio::test]
+async fn independent_reclamation_model_one_seed_of_64_operations() {
+    let trace = Mutex::new(Vec::new());
+    let result = std::panic::AssertUnwindSafe(Box::pin(run_model(1, &trace, false, 64)))
+        .catch_unwind()
+        .await;
+    assert!(
+        result.is_ok(),
+        "model failed seed=1\n{}",
+        trace.lock().unwrap().join("\n")
+    );
+}
+
+#[tokio::test]
+#[ignore = "exhaustive model runs in the weekly scheduled suite"]
 async fn independent_reclamation_model_32_seeds_of_64_operations() {
     for seed in 1..=32 {
         let trace = Mutex::new(Vec::new());

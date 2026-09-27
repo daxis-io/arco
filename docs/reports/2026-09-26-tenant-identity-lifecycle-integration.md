@@ -2,10 +2,9 @@
 
 ## Source and boundary
 
-The integration worktree is `codex/tenant-identity-lifecycle-main-20260926`,
-based on `origin/main@0240ecbe` (authority format 9). It carries the preserved
-synthetic and physical-lifecycle changes from
-`codex/tenant-identity-lifecycle-20260925` without changing that worktree.
+This child is based on `origin/main@0240ecbe` (authority format 9). It carries
+the preserved synthetic and physical-lifecycle changes from the earlier
+isolated worktree without changing that worktree.
 The current `RootStorage` retention interface is reused directly.
 The local source manifest is
 `/private/tmp/arco-tenant-identity-integrated-20260926/source.sha256`

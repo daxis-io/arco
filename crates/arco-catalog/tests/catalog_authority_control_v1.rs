@@ -15,7 +15,8 @@ use std::time::Duration;
 #[cfg(feature = "test-utils")]
 use arco_catalog::catalog_authority::{BoundedCatalogTestCommand, CatalogProjectionNotifierV2};
 use arco_catalog::state_store::projection_outbox_acks::{
-    PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionOutboxAckWriter, ProjectionOutboxWorker,
+    PROJECTION_OUTBOX_ACK_DOMAIN, PROJECTION_OUTBOX_TRIM_BINDING_KEY, ProjectionOutboxAckWriter,
+    ProjectionOutboxWorker,
 };
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
@@ -855,6 +856,96 @@ async fn materializer_publishes_parquet_before_ack_and_recovers_by_anti_entropy(
         backlog.latest_projected_sequence
     );
     assert!(backlog.pending_record_ids.is_empty());
+}
+
+/// The materializer's trim is the fixed-consumer path: it trims exactly the
+/// intents its drain acknowledged, installs no binding metadata in the catalog
+/// root (which would make every later drain refuse the root), and leaves the
+/// following drain working and empty.
+#[tokio::test]
+async fn materializer_trim_removes_drained_intents_without_binding_the_catalog_root() {
+    let storage = scoped_storage();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    for name in ["analytics", "finance", "ops"] {
+        authority
+            .create_catalog(name, None, WriteOptions::default())
+            .await
+            .expect("create catalog");
+    }
+    let source = ControlMvpStateStore::new(storage.clone(), scope()).expect("catalog store");
+    assert_eq!(
+        3,
+        source
+            .current_projection_outbox()
+            .await
+            .expect("outbox")
+            .len()
+    );
+    let worker = ProjectionOutboxWorker::new(
+        storage.clone(),
+        "catalog",
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+    )
+    .expect("worker");
+    let seeded_sequence = worker
+        .backlog()
+        .await
+        .expect("backlog")
+        .committed_sequence
+        .expect("seeded catalog has committed state");
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let drained = materializer.drain_once().await.expect("drain");
+    assert_eq!(3, drained.drained_record_ids.len());
+    assert_eq!(
+        Some(seeded_sequence),
+        worker.backlog().await.expect("backlog").committed_sequence,
+        "the fixed drain commits nothing to the catalog"
+    );
+
+    let trimmed = materializer.trim_once().await.expect("trim");
+    assert_eq!(drained.drained_record_ids, trimmed.trimmed_record_ids);
+    assert_eq!(drained.drained_event_ids, trimmed.trimmed_event_ids);
+    assert_eq!(
+        Some(seeded_sequence + 1),
+        trimmed.trim_sequence,
+        "the trim is the only catalog commit after the seed"
+    );
+    assert!(
+        source
+            .current_projection_outbox()
+            .await
+            .expect("outbox after trim")
+            .is_empty()
+    );
+    assert_eq!(
+        None,
+        source
+            .get(PROJECTION_OUTBOX_TRIM_BINDING_KEY)
+            .await
+            .expect("binding read"),
+        "the materializer's trim must not bind the catalog root"
+    );
+    assert_eq!(None, worker.bound_consumer().await.expect("bound consumer"));
+
+    let again = materializer.drain_once().await.expect("drain after trim");
+    assert!(again.drained_record_ids.is_empty());
+    assert_eq!(0, again.already_acknowledged);
+    assert_eq!(
+        Some(seeded_sequence),
+        again.latest_projected_sequence,
+        "the projection watermark survives ack retirement"
+    );
+    let idle = materializer.trim_once().await.expect("idle trim");
+    assert!(idle.trimmed_record_ids.is_empty());
+    assert_eq!(None, idle.trim_sequence);
+    assert_eq!(
+        trimmed.trim_sequence,
+        worker.backlog().await.expect("backlog").committed_sequence,
+        "an idle trim commits nothing"
+    );
 }
 
 /// A burst of commits must not fan out into concurrent drains that all

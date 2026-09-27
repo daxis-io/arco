@@ -46,6 +46,11 @@ pub mod projection_measurement;
 const OBJECT_KEY_TAG: u8 = 1;
 const NAME_INDEX_KEY_TAG: u8 = 2;
 const IDEMPOTENCY_KEY_TAG: u8 = 3;
+/// Retired key tag. Audit records left the authority KV in retention step 3
+/// (they are projection-only now); production never writes this tag again,
+/// and only fixtures that model historical authority-8 predecessor rows and
+/// the tests that assert the tag stays empty still name it.
+#[cfg(any(test, feature = "test-utils"))]
 const AUDIT_KEY_TAG: u8 = 4;
 const CATALOG_KIND: u8 = 1;
 const SCHEMA_KIND: u8 = 2;
@@ -63,6 +68,17 @@ fn conflict_backoff(attempt: u32) -> Duration {
 /// Durable outbox kind and single-consumer identity for the catalog Parquet
 /// projection worker.
 pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
+
+/// How long a keyed catalog request stays replayable with its original
+/// response: 24 hours from the mutation's `occurred_at_ms`.
+///
+/// Every idempotency receipt is written with this expiry as its
+/// purge-eligibility hint. The hint is never a read filter, so a receipt
+/// stays visible (and keeps short-circuiting replays) until a
+/// `RetentionHorizon` maintenance job purges it, and that job only purges
+/// rows whose expiry lies more than one hour before its clock, adding a
+/// clock-skew margin on top of this window.
+pub const CATALOG_RECEIPT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Non-blocking wake-up seam invoked after a catalog authority commit.
 ///
@@ -2697,10 +2713,10 @@ fn freeze_mutation(
         .idempotency_key
         .as_ref()
         .map(|key| sha256_hex(key.as_str().as_bytes()));
-    // The audit key and projection intent id are derived from the operation
-    // id alone, while the receipt key is scoped by family. Folding the family
-    // into a keyed operation id keeps one idempotency key reusable across
-    // families without colliding on those family-agnostic identities.
+    // The projection intent id is derived from the operation id alone, while
+    // the receipt key is scoped by family. Folding the family into a keyed
+    // operation id keeps one idempotency key reusable across families
+    // without colliding on that family-agnostic identity.
     let operation_id = opts.idempotency_key.as_ref().map_or_else(
         || format!("op-{}", Ulid::new().to_string().to_ascii_lowercase()),
         |key| {
@@ -2907,10 +2923,11 @@ async fn stage_commit_records_v2(
 ) -> Result<()> {
     let (receipt, audit) =
         commit_record_bytes_v2(frozen, response, logical_commit_id, logical_sequence)?;
+    // The bounded (format 8) authority is test-only and refuses expiry
+    // hints, so its receipt stays a plain put with no retention window.
     txn.put(&frozen.receipt_key, receipt).await?;
-    let audit_key = audit_key(&frozen.operation_id);
-    txn.assert_absent(&audit_key).await?;
-    txn.put(&audit_key, audit.clone()).await?;
+    // The audit record is projection-only: it rides the intent and never
+    // lands in the authority KV.
     txn.stage_projection_intent_v2(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
@@ -2919,6 +2936,11 @@ async fn stage_commit_records_v2(
     .await
 }
 
+/// Stages the receipt and the audit projection intent of one committed
+/// mutation. The receipt is the only commit record in the authority KV and
+/// carries [`CATALOG_RECEIPT_RETENTION_MS`] from the mutation's frozen
+/// `occurred_at_ms` as its purge-eligibility hint; the audit record is the
+/// intent payload and is never written as a KV row.
 async fn stage_commit_records(
     txn: &mut ControlMvpTxn,
     frozen: &FrozenMutation,
@@ -2933,9 +2955,12 @@ async fn stage_commit_records(
         authority_manifest_id: predicted.authority_manifest_id().to_string(),
         logical_sequence: predicted.logical_sequence(),
     };
-    txn.put(
+    txn.put_with_expiry(
         &frozen.receipt_key,
         encode_json(&receipt, "catalog idempotency receipt")?,
+        frozen
+            .occurred_at_ms
+            .saturating_add(CATALOG_RECEIPT_RETENTION_MS),
     )
     .await?;
     let audit = CatalogAuditRecordV1 {
@@ -2948,14 +2973,10 @@ async fn stage_commit_records(
         authority_manifest_id: predicted.authority_manifest_id().to_string(),
         logical_sequence: predicted.logical_sequence(),
     };
-    let audit_bytes = encode_json(&audit, "catalog audit record")?;
-    let audit_key = audit_key(&frozen.operation_id);
-    txn.assert_absent(&audit_key).await?;
-    txn.put(&audit_key, audit_bytes.clone()).await?;
     txn.stage_projection_intent(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
-        audit_bytes,
+        encode_json(&audit, "catalog audit record")?,
     )
     .await?;
     Ok(())
@@ -3703,6 +3724,9 @@ fn receipt_key(family: &str, idempotency_hash: &str) -> Vec<u8> {
     key
 }
 
+/// Key of a historical authority-8 audit row. Fixture-only since retention
+/// step 3: see [`AUDIT_KEY_TAG`].
+#[cfg(any(test, feature = "test-utils"))]
 fn audit_key(operation_id: &str) -> Vec<u8> {
     let mut key = vec![AUDIT_KEY_TAG];
     push_component(&mut key, operation_id.as_bytes());
@@ -4377,41 +4401,26 @@ impl ControlCatalogAuthority {
     }
 }
 
-/// Synthetic capacity inventory using the production record and key encoders.
-/// These rows are not evidence of executed catalog mutations.
+/// Synthetic capacity inventory using the production receipt record and key
+/// encoders: one receipt row per modelled mutation, since audit records are
+/// projection-only (retention step 3) and leave no KV row behind. These rows
+/// are not evidence of executed catalog mutations.
 #[cfg(test)]
-pub(crate) fn capacity_fixture_record(
-    template: &[u8],
-    receipt: bool,
-    ordinal: u64,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn capacity_fixture_record(template: &[u8], ordinal: u64) -> Result<(Vec<u8>, Vec<u8>)> {
     let identity = format!("{ordinal:064x}");
     let manifest = format!(
         "manifest-{ordinal:020}-op-{ordinal:032x}-0001-head-{ordinal:064x}-rg-{0:020}",
         0
     );
-    if receipt {
-        let mut record: IdempotencyReceiptV1 = decode_json(template, "capacity receipt")?;
-        record.logical_sequence = ordinal;
-        assert_eq!(record.authority_manifest_id.len(), manifest.len());
-        record.authority_manifest_id = manifest;
-        record.request_digest.clone_from(&identity);
-        Ok((
-            receipt_key(&record.operation_family, &identity),
-            encode_json(&record, "capacity receipt")?.to_vec(),
-        ))
-    } else {
-        let mut record: CatalogAuditRecordV1 = decode_json(template, "capacity audit")?;
-        record.logical_sequence = ordinal;
-        assert_eq!(record.authority_manifest_id.len(), manifest.len());
-        record.authority_manifest_id = manifest;
-        record.request_digest = identity;
-        record.operation_id = format!("op-{ordinal:032x}");
-        Ok((
-            audit_key(&record.operation_id),
-            encode_json(&record, "capacity audit")?.to_vec(),
-        ))
-    }
+    let mut record: IdempotencyReceiptV1 = decode_json(template, "capacity receipt")?;
+    record.logical_sequence = ordinal;
+    assert_eq!(record.authority_manifest_id.len(), manifest.len());
+    record.authority_manifest_id = manifest;
+    record.request_digest.clone_from(&identity);
+    Ok((
+        receipt_key(&record.operation_family, &identity),
+        encode_json(&record, "capacity receipt")?.to_vec(),
+    ))
 }
 
 /// Receipt and audit `(key, value)` pairs for explicit synthetic genesis.
@@ -4423,7 +4432,9 @@ pub type BoundedCapacityV2RecordPair = ((Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>));
 ///
 /// The two tuples are `(key, value)` pairs in receipt then audit order. They are
 /// fixture input for explicit synthetic genesis only, rather than evidence of a
-/// catalog command or a substitute for normal authority-8 publication.
+/// catalog command or a substitute for normal authority-8 publication. The
+/// audit row models the pre-retention-step-3 row shape the recorded bounded
+/// cost measurements were taken with; production no longer writes it.
 ///
 /// # Errors
 /// Returns validation errors for zero ordinals or record encoding failures.
@@ -4565,6 +4576,141 @@ mod bounded_record_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod receipt_expiry_tests {
+    use super::*;
+    use crate::state_store::control_mvp::StagedKvWrite;
+
+    use arco_core::MemoryBackend;
+
+    const OCCURRED_AT_MS: i64 = 1_800_000_000_000;
+
+    fn frozen_delete(receipt_identity: &str) -> FrozenMutation {
+        FrozenMutation {
+            operation_id: "op-fixed".into(),
+            family: "delete_catalog",
+            digest: "11".repeat(32),
+            actor: "api".into(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            receipt_key: receipt_key("delete_catalog", receipt_identity),
+            request_id: None,
+            command: FrozenCommand::DeleteCatalog {
+                name: "catalog".into(),
+                force: false,
+            },
+        }
+    }
+
+    #[test]
+    fn receipt_retention_is_one_day() {
+        assert_eq!(CATALOG_RECEIPT_RETENTION_MS, 86_400_000);
+    }
+
+    #[tokio::test]
+    async fn stage_commit_records_stages_one_expiring_receipt_and_one_audit_intent() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let frozen = frozen_delete(&"22".repeat(32));
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        let predicted = txn.predicted_state_token().unwrap();
+        stage_commit_records(&mut txn, &frozen, &MutationResponseV1::Deleted, &predicted)
+            .await
+            .unwrap();
+
+        // Exactly one KV write: the receipt, carrying the retention expiry.
+        assert_eq!(
+            txn.staged_kv_writes(),
+            vec![(
+                frozen.receipt_key.clone(),
+                StagedKvWrite::Put {
+                    expires_at_ms: Some(OCCURRED_AT_MS + CATALOG_RECEIPT_RETENTION_MS),
+                },
+            )]
+        );
+
+        let outcome = txn.commit().await.unwrap();
+        assert_eq!(outcome.state_token(), &predicted);
+        let intents = outcome.projection_intents();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].intent_id(), "op-fixed");
+        assert_eq!(
+            intents[0].projection_kind(),
+            CATALOG_PARQUET_PROJECTION_CONSUMER_ID
+        );
+        let audit: CatalogAuditRecordV1 =
+            decode_json(intents[0].payload(), "intent audit payload").unwrap();
+        assert_eq!(audit.version, RECORD_VERSION);
+        assert_eq!(audit.operation_id, "op-fixed");
+        assert_eq!(audit.operation_family, "delete_catalog");
+        assert_eq!(audit.request_digest, "11".repeat(32));
+        assert_eq!(audit.occurred_at_ms, OCCURRED_AT_MS);
+        assert_eq!(
+            audit.authority_manifest_id,
+            predicted.authority_manifest_id()
+        );
+        assert_eq!(audit.logical_sequence, predicted.logical_sequence());
+
+        // Committed state: the receipt is read-visible, no audit row exists.
+        let receipts = store
+            .scan(ScanRequest::new([IDEMPOTENCY_KEY_TAG]))
+            .await
+            .unwrap();
+        assert_eq!(receipts.entries().len(), 1);
+        assert_eq!(receipts.entries()[0].key(), frozen.receipt_key.as_slice());
+        let receipt: IdempotencyReceiptV1 =
+            decode_json(receipts.entries()[0].value().bytes(), "receipt").unwrap();
+        assert_eq!(receipt.request_digest, "11".repeat(32));
+        assert!(matches!(receipt.response, MutationResponseV1::Deleted));
+        let audit_rows = store.scan(ScanRequest::new([AUDIT_KEY_TAG])).await.unwrap();
+        assert!(audit_rows.entries().is_empty());
+        assert_eq!(store.current_projection_outbox().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stage_commit_records_v2_keeps_a_plain_receipt_and_no_audit_row() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let frozen = frozen_delete(&"33".repeat(32));
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation(&frozen.operation_id, frozen.family, &frozen.digest)
+            .unwrap();
+        stage_commit_records_v2(
+            &mut txn,
+            &frozen,
+            &MutationResponseV1::Deleted,
+            &"44".repeat(32),
+            1,
+        )
+        .await
+        .unwrap();
+        // The bounded format refuses expiry hints: one plain receipt put.
+        assert_eq!(
+            txn.staged_kv_writes(),
+            vec![(
+                frozen.receipt_key.clone(),
+                StagedKvWrite::Put {
+                    expires_at_ms: None
+                }
+            )]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod bounded_catalog_tests {
     use super::*;
     use crate::state_store::ArcoStateAdmin;
@@ -4575,13 +4721,48 @@ mod bounded_catalog_tests {
     #[derive(Default)]
     struct RecordingNotifierV2 {
         calls: AtomicUsize,
+        intents: Mutex<Vec<ProjectionIntentV2>>,
+    }
+
+    impl RecordingNotifierV2 {
+        /// Audit records carried by every notified intent, in commit order.
+        fn audit_history(&self) -> Vec<serde_json::Value> {
+            self.intents
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|intent| {
+                    assert_eq!(
+                        intent.projection_kind(),
+                        CATALOG_PARQUET_PROJECTION_CONSUMER_ID
+                    );
+                    serde_json::from_slice(intent.payload()).expect("V2 audit payload JSON")
+                })
+                .collect()
+        }
     }
 
     impl CatalogProjectionNotifierV2 for RecordingNotifierV2 {
-        fn notify(&self, _intent: &ProjectionIntentV2) -> Result<()> {
+        fn notify(&self, intent: &ProjectionIntentV2) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.intents.lock().unwrap().push(intent.clone());
             Ok(())
         }
+    }
+
+    /// Asserts that the bounded authority KV holds no audit row: audit
+    /// records are projection-only since retention step 3.
+    async fn assert_no_audit_rows(authority: &ControlCatalogAuthority) {
+        let page = authority
+            .store
+            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
+            .await
+            .expect("bounded audit key scan");
+        assert!(
+            page.entries().is_empty(),
+            "found {} tag-4 rows in the bounded authority KV",
+            page.entries().len()
+        );
     }
 
     fn table_request(name: &str) -> RegisterTableInSchemaRequest {
@@ -4638,15 +4819,20 @@ mod bounded_catalog_tests {
         .expect("bounded HEAD JSON");
         assert_eq!(head["format_version"], 8);
 
-        for prefix in [[IDEMPOTENCY_KEY_TAG], [AUDIT_KEY_TAG]] {
-            let page = authority
-                .store
-                .scan(ScanRequest::new(prefix).with_limits(8, 1024 * 1024, 8))
-                .await
-                .expect("bounded record scan");
-            assert_eq!(page.entries().len(), 1);
-            let record: serde_json::Value =
-                serde_json::from_slice(page.entries()[0].value().bytes()).expect("V2 record JSON");
+        // The receipt is the only commit record in the KV; the audit record
+        // rides the projection intent alone.
+        assert_no_audit_rows(&authority).await;
+        let page = authority
+            .store
+            .scan(ScanRequest::new([IDEMPOTENCY_KEY_TAG]).with_limits(8, 1024 * 1024, 8))
+            .await
+            .expect("bounded receipt scan");
+        assert_eq!(page.entries().len(), 1);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(page.entries()[0].value().bytes()).expect("V2 receipt JSON");
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 1);
+        for record in [&receipt, &history[0]] {
             assert_eq!(record["version"], 2);
             assert_eq!(record["logicalSequence"], 1);
             assert!(
@@ -4656,6 +4842,7 @@ mod bounded_catalog_tests {
             );
             assert!(record.get("authorityManifestId").is_none());
         }
+        assert_eq!(history[0]["operationFamily"], "create_catalog");
     }
 
     #[tokio::test]
@@ -4797,20 +4984,10 @@ mod bounded_catalog_tests {
         ));
         assert_eq!(2, notifier.calls.load(Ordering::SeqCst));
 
-        let page = authority
-            .store
-            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(8, 1024 * 1024, 8))
-            .await
-            .expect("bounded audit scan");
-        assert_eq!(page.entries().len(), 2);
-        let mut history = page
-            .entries()
-            .iter()
-            .map(|entry| {
-                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        // Zero audit rows in the KV; the history lives in the two intents.
+        assert_no_audit_rows(&authority).await;
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 2);
         assert_eq!(
             history
                 .iter()
@@ -4956,20 +5133,11 @@ mod bounded_catalog_tests {
         );
         assert_eq!(7, notifier.calls.load(Ordering::SeqCst));
 
-        let page = authority
-            .store
-            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
-            .await
-            .expect("bounded lifecycle audit scan");
-        assert_eq!(page.entries().len(), 7);
-        let mut history = page
-            .entries()
-            .iter()
-            .map(|entry| {
-                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        // The lifecycle history is carried by the seven intents; the KV holds
+        // receipts only.
+        assert_no_audit_rows(&authority).await;
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 7);
         assert_eq!(
             history
                 .iter()

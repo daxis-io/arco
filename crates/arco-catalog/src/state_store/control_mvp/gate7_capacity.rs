@@ -82,8 +82,8 @@ async fn pilot_retained_catalog_inventory_exceeds_unchanged_restore_capacity() {
         .collect::<Vec<_>>();
     assert_eq!(
         (receipts.len(), audits.len()),
-        (2, 2),
-        "one retained receipt/audit pair per accepted mutation"
+        (2, 0),
+        "one retained receipt per accepted mutation; audit records are projection-only since retention step 3"
     );
     let sample_bytes = receipts
         .iter()
@@ -92,11 +92,14 @@ async fn pilot_retained_catalog_inventory_exceeds_unchanged_restore_capacity() {
         .sum::<usize>();
     let mutations = 7 * (3600 * 25 + 23 * 3600);
     assert_eq!(mutations, 1_209_600);
-    let retained_rows = mutations * 2;
-    assert_eq!(retained_rows, 2_419_200);
+    // One receipt per mutation. Receipts carry a 24 h expiry hint, but this
+    // probe models no retention-horizon purge, so a week of receipts is
+    // retained and still exceeds the unchanged restore scanner.
+    let retained_rows = mutations;
+    assert_eq!(retained_rows, 1_209_600);
     assert!(retained_rows > MAX_SEGMENT_ROWS);
     // Reuse actual serialized records. Keys here are deliberately shorter than
-    // actual receipt/audit keys, so this understates aggregate decoded bytes.
+    // actual receipt keys, so this understates aggregate decoded bytes.
     let shortest = receipts
         .iter()
         .chain(audits.iter())
@@ -141,7 +144,7 @@ async fn pilot_retained_catalog_inventory_exceeds_unchanged_restore_capacity() {
         "conservative_inventory_decoded_bytes": retained_rows * (shortest.len() + size_of::<usize>()),
         "actual_restore_scanner_byte_error": error.to_string(),
         "actual_restore_scanner_row_error": row_error.to_string(),
-        "scope": "actual catalog sample plus generated reader over the production restore scanner; no full pilot root or provider measurement"
+        "scope": "actual catalog sample plus generated reader over the production restore scanner; receipts only (audit records are projection-only since retention step 3); no retention-horizon purge modelled; no full pilot root or provider measurement"
     });
     println!("{report}");
     if let Ok(path) = std::env::var("ARCO_GATE7_CAPACITY_REPORT") {

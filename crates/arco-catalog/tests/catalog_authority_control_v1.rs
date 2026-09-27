@@ -20,11 +20,12 @@ use arco_catalog::state_store::projection_outbox_acks::{
 };
 use arco_catalog::{
     ArcoStateAdmin, ArcoStateReader, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
-    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListRequest,
-    CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
-    ControlCatalogAuthority, ControlMvpProjectionOutboxRecord, ControlMvpStateStore,
-    ProjectionIntentV1, RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions,
-    WriteOptions,
+    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError,
+    CatalogListRequest, CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier,
+    ColumnDefinition, ControlCatalogAuthority, ControlMvpMaintenanceOutcome,
+    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, DurableAuthorityBinding,
+    DurableMaintenanceWorker, MaintenanceStatus, ProjectionIntentV1, PurgedCounts,
+    RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions, WriteOptions,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
@@ -69,7 +70,7 @@ impl CatalogProjectionNotifier for RecordingProjectionNotifier {
     fn notify(&self, _intent: &ProjectionIntentV1) -> arco_catalog::Result<()> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail.load(Ordering::SeqCst) {
-            Err(arco_catalog::CatalogError::Storage {
+            Err(CatalogError::Storage {
                 message: "injected post-commit projection notification failure".to_string(),
             })
         } else {
@@ -1304,8 +1305,28 @@ async fn idempotency_replay_is_exact_and_mismatched_reuse_conflicts() {
     assert!(error.to_string().contains("idempotency"));
 }
 
+/// Decodes the catalog audit record carried by a V1 projection intent in the
+/// outbox and returns its `operationFamily`.
+fn intent_audit_family(record: &ControlMvpProjectionOutboxRecord) -> String {
+    let intent: ProjectionIntentV1 =
+        serde_json::from_slice(record.payload()).expect("projection intent envelope");
+    assert_eq!(
+        intent.projection_kind(),
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID
+    );
+    let audit: serde_json::Value =
+        serde_json::from_slice(intent.payload()).expect("audit record json");
+    assert_eq!(audit.get("version"), Some(&serde_json::json!(1)));
+    audit
+        .get("operationFamily")
+        .and_then(serde_json::Value::as_str)
+        .expect("operation family")
+        .to_string()
+}
+
 #[tokio::test]
-async fn reusing_an_idempotency_key_across_operation_families_keeps_both_audit_records() {
+async fn reusing_an_idempotency_key_across_operation_families_keeps_every_intent_and_writes_no_audit_row()
+ {
     let storage = scoped_storage();
     let authority =
         ControlCatalogAuthority::new(storage.clone(), scope()).expect("control authority");
@@ -1339,30 +1360,126 @@ async fn reusing_an_idempotency_key_across_operation_families_keeps_both_audit_r
     let audit = store
         .scan(arco_catalog::ScanRequest::new(b"\x04"))
         .await
-        .expect("audit records");
-    let mut families = audit
-        .entries()
-        .iter()
-        .map(|entry| {
-            let record: serde_json::Value =
-                serde_json::from_slice(entry.value().bytes()).expect("audit record json");
-            record["operationFamily"]
-                .as_str()
-                .expect("operation family")
-                .to_string()
-        })
-        .collect::<Vec<_>>();
-    families.sort();
-    assert_eq!(
-        vec!["create_catalog", "create_schema", "register_table"],
-        families,
-        "every mutation keeps its own audit record when a key is shared across families"
+        .expect("audit key scan");
+    assert!(
+        audit.entries().is_empty(),
+        "audit records are projection-only since retention step 3; found {} tag-4 rows",
+        audit.entries().len()
     );
     let outbox = store
         .current_projection_outbox()
         .await
         .expect("projection intents");
     assert_eq!(3, outbox.len());
+    let mut families = outbox.iter().map(intent_audit_family).collect::<Vec<_>>();
+    families.sort();
+    assert_eq!(
+        vec!["create_catalog", "create_schema", "register_table"],
+        families,
+        "every mutation keeps its own audit intent when a key is shared across families"
+    );
+}
+
+/// Drives one `RetentionHorizon` job through the kernel at `now` and returns
+/// the publication outcome.
+async fn publish_retention_horizon_at(
+    storage: ScopedStorage,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ControlMvpMaintenanceOutcome {
+    let worker =
+        DurableMaintenanceWorker::new(storage, scope(), DurableAuthorityBinding::new([7; 32]))
+            .expect("maintenance worker");
+    let plan = worker
+        .prepare_horizon_at(now)
+        .await
+        .expect("horizon preflight")
+        .expect("an expired receipt makes the horizon eligible");
+    let job_id = plan.job_id().clone();
+    let mut progress = worker.start_at(&plan, now).await.expect("start horizon");
+    while progress.status == MaintenanceStatus::Active {
+        progress = worker
+            .advance_at(&job_id, now)
+            .await
+            .expect("advance horizon");
+    }
+    assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
+    worker
+        .publish_at(&job_id, now)
+        .await
+        .expect("publish horizon")
+        .expect("the horizon publishes over an uncontended head")
+}
+
+/// Observation used after the purge: with no receipt left, the keyed replay
+/// is no longer short-circuited and the adapter re-executes `create_catalog`,
+/// which now collides with the catalog the first application created. The
+/// failed re-execution commits nothing, so the receipt prefix stays empty.
+#[tokio::test]
+async fn receipts_expire_after_the_retention_window_and_the_replay_reapplies() {
+    let storage = scoped_storage();
+    let authority =
+        ControlCatalogAuthority::new(storage.clone(), scope()).expect("control authority");
+    let request = || {
+        authority.create_catalog(
+            "analytics",
+            Some("first"),
+            WriteOptions::with_idempotency("create-analytics"),
+        )
+    };
+    let first = request().await.expect("first create");
+    let replay = request()
+        .await
+        .expect("exact replay within the retention window");
+    assert_eq!(first.id, replay.id);
+    assert_eq!(first.created_at, replay.created_at);
+    assert_eq!(first.updated_at, replay.updated_at);
+
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let receipts = store
+        .scan(arco_catalog::ScanRequest::new(b"\x03"))
+        .await
+        .expect("receipt scan");
+    assert_eq!(
+        1,
+        receipts.entries().len(),
+        "one keyed mutation, one receipt"
+    );
+
+    let after_retention = chrono::Utc::now() + chrono::Duration::hours(26);
+    let outcome = publish_retention_horizon_at(storage.clone(), after_retention).await;
+    assert_eq!(
+        outcome.purged_counts(),
+        Some(PurgedCounts {
+            expired_rows: 1,
+            tombstones: 0,
+        }),
+        "the horizon purges exactly the expired receipt"
+    );
+    let receipts = store
+        .scan(arco_catalog::ScanRequest::new(b"\x03"))
+        .await
+        .expect("receipt scan after the horizon");
+    assert!(
+        receipts.entries().is_empty(),
+        "the purged receipt is no longer visible"
+    );
+
+    let reapplied = request()
+        .await
+        .expect_err("without a receipt the same request re-executes and collides");
+    assert!(
+        matches!(reapplied, CatalogError::AlreadyExists { .. }),
+        "expected the non-idempotent conflict, got {reapplied:?}"
+    );
+    let receipts = store
+        .scan(arco_catalog::ScanRequest::new(b"\x03"))
+        .await
+        .expect("receipt scan after the re-execution");
+    assert!(
+        receipts.entries().is_empty(),
+        "a failed re-execution commits no receipt"
+    );
+    assert_eq!(1, authority.list_catalogs().await.expect("catalogs").len());
 }
 
 #[tokio::test]
@@ -1405,15 +1522,19 @@ async fn accepted_head_with_lost_response_reconciles_one_logical_catalog_mutatio
     let audit = store
         .scan(arco_catalog::ScanRequest::new(b"\x04"))
         .await
-        .expect("audit records");
+        .expect("audit key scan");
     let outbox = store
         .current_projection_outbox()
         .await
         .expect("projection intents");
     assert_eq!(1, receipts.entries().len());
-    assert_eq!(1, audit.entries().len());
+    assert!(
+        audit.entries().is_empty(),
+        "audit records are projection-only since retention step 3"
+    );
     assert_eq!(1, outbox.len());
     assert_eq!(Some(1), outbox[0].origin_sequence());
+    assert_eq!("create_catalog", intent_audit_family(&outbox[0]));
 }
 
 #[tokio::test]

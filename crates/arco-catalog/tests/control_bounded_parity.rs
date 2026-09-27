@@ -231,13 +231,12 @@ async fn actual_catalog_commands_match_independent_objects_indexes_envelopes_and
         assert_eq!(token.logical_sequence(), sequence);
         let published = store.export_published_logical_v2(&token).await.unwrap();
         let logical_id = published["logicalCommitId"].as_str().unwrap();
+        // Audit records are projection-only since retention step 3: the
+        // record rides the intent (checked below) and no tag-4 row is
+        // written, which the "no undeclared writes" check enforces.
         let audit = json!({"version":2,"operationId":operation,"operationFamily":families[index],
             "requestDigest":request_digest,"actor":"api","occurredAtMs":at,
             "logicalCommitId":logical_id,"logicalSequence":sequence});
-        changes.insert(
-            key(&[4], &[&operation]),
-            Some(ExpectedValue::Json(audit.clone())),
-        );
         changes.insert(
             key(
                 &[3],

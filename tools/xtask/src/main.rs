@@ -1539,10 +1539,6 @@ fn run_flow_boundary_check() -> Result<()> {
             "crates/arco-api/src/routes/tasks.rs",
             "worker callback routes still validate task tokens against compacted task rows",
         ),
-        (
-            "crates/arco-api/src/system_tables.rs",
-            "system-table projection still materializes flow-owned rows directly",
-        ),
     ]);
 
     let mut errors = Vec::new();

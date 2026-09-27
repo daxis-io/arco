@@ -3,10 +3,11 @@
 //! One invocation inspects the workspace retention epoch, then for every
 //! control domain runs durable layout maintenance (L0 consolidation, then the
 //! retention horizon that purges expired rows and unobservable tombstones),
-//! then drains the catalog projection outbox, then runs one bounded pass of
-//! conservative garbage collection per domain. The process exits `0` when
-//! every phase either completed or deferred to the next run, and non-zero when
-//! any phase failed with a typed error or the retention epoch is stuck.
+//! then drains the catalog projection outbox, then trims the records the
+//! catalog consumer has acknowledged out of that outbox, then runs one bounded
+//! pass of conservative garbage collection per domain. The process exits `0`
+//! when every phase either completed or deferred to the next run, and non-zero
+//! when any phase failed with a typed error or the retention epoch is stuck.
 //!
 //! Maintenance runs before the drain because every drained record commits
 //! ack-domain L0 segments; consolidating first keeps a backlog from pushing the
@@ -306,6 +307,19 @@ enum DrainOutcome {
     Deferred,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TrimOutcome {
+    /// A trim commit removed every acknowledged record from the catalog outbox.
+    Ok,
+    /// No acknowledged record remained in the outbox; nothing was committed.
+    Idle,
+    /// Catalog commit backpressure or a coordination loss stopped the trim.
+    /// Nothing was lost: the records stay in the outbox, and the next run
+    /// drains or trims them again.
+    Deferred,
+}
+
 // Summary logs name outcomes by their stable snake_case serde names, which is
 // what the runbook's Logs Explorer filters match.
 impl EpochOutcome {
@@ -356,6 +370,16 @@ impl DrainOutcome {
     }
 }
 
+impl TrimOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Idle => "idle",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DrainSummary {
     outcome: DrainOutcome,
@@ -389,6 +413,30 @@ impl DrainSummary {
             observed_authority_sequence = self.observed_authority_sequence,
             lag = self.lag,
             age_secs = self.age_secs,
+            elapsed_ms = self.elapsed_ms,
+            "control-store worker phase complete"
+        );
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TrimSummary {
+    outcome: TrimOutcome,
+    /// Records the trim commit removed from the catalog outbox.
+    trimmed_records: usize,
+    /// Catalog logical sequence of the trim commit, when one landed.
+    trim_sequence: Option<u64>,
+    elapsed_ms: u64,
+}
+
+impl TrimSummary {
+    fn log(&self) {
+        tracing::info!(
+            phase = "trim",
+            domain = "catalog",
+            outcome = self.outcome.as_str(),
+            trimmed_records = self.trimmed_records,
+            trim_sequence = self.trim_sequence,
             elapsed_ms = self.elapsed_ms,
             "control-store worker phase complete"
         );
@@ -511,6 +559,7 @@ struct RunSummary {
     epoch: Option<EpochSummary>,
     maintenance: Vec<DomainMaintenanceSummary>,
     drain: Option<DrainSummary>,
+    trim: Option<TrimSummary>,
     gc: Vec<DomainGcSummary>,
     failures: Vec<String>,
 }
@@ -547,6 +596,20 @@ fn is_deferrable(error: &CatalogError) -> bool {
     matches!(
         error,
         CatalogError::PreconditionFailed { .. } | CatalogError::CasFailed { .. }
+    )
+}
+
+/// Errors that let the catalog outbox trim retry on the next run: catalog
+/// commit backpressure (the next run's maintenance consolidates first), or a
+/// binding tenure, incarnation or pointer another actor moved mid-trim.
+/// Deliberately separate from [`is_deferrable`]: backpressure defers only a
+/// trim, never a maintenance step.
+fn is_trim_deferrable(error: &CatalogError) -> bool {
+    matches!(
+        error,
+        CatalogError::MaintenanceBackpressure { .. }
+            | CatalogError::PreconditionFailed { .. }
+            | CatalogError::CasFailed { .. }
     )
 }
 
@@ -653,6 +716,47 @@ impl ProjectionFreshness {
             age_secs,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trim
+// ---------------------------------------------------------------------------
+
+/// Retires the catalog consumer's acknowledgements and trims the records they
+/// cover out of the catalog outbox. The kernel commits the ack domain first and
+/// the catalog second, by exact event incarnation, so no acknowledgement
+/// outlives its record and an interrupted pass redelivers rather than loses.
+async fn trim_catalog_outbox(storage: ScopedStorage) -> Result<TrimSummary> {
+    let started = Instant::now();
+    let worker =
+        ProjectionOutboxWorker::new(storage, "catalog", CATALOG_PARQUET_PROJECTION_CONSUMER_ID)
+            .context("construct catalog outbox trim worker")?;
+    let (outcome, trimmed_records, trim_sequence) = match worker.trim_acked().await {
+        Ok(report) => match report.trim_sequence {
+            Some(sequence) => (
+                TrimOutcome::Ok,
+                report.trimmed_record_ids.len(),
+                Some(sequence),
+            ),
+            None => (TrimOutcome::Idle, 0, None),
+        },
+        Err(error) if is_trim_deferrable(&error) => {
+            tracing::warn!(
+                phase = "trim",
+                domain = "catalog",
+                error = %error,
+                "catalog outbox trim deferred to the next run; the records stay in the outbox and are drained or trimmed again"
+            );
+            (TrimOutcome::Deferred, 0, None)
+        }
+        Err(error) => return Err(error).context("trim acknowledged catalog outbox records"),
+    };
+    Ok(TrimSummary {
+        outcome,
+        trimmed_records,
+        trim_sequence,
+        elapsed_ms: elapsed_ms(started),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,11 +1303,11 @@ async fn collect_domain(
 // ---------------------------------------------------------------------------
 
 /// Runs every phase once: epoch inspection, maintenance per domain
-/// (consolidation, then retention horizon), catalog projection drain, GC per
-/// domain. Phases are independent: a failure is recorded and the remaining
-/// phases still run, so one wedged domain never starves another. The returned
-/// summary carries every failure; callers exit non-zero through
-/// [`RunSummary::exit_error`].
+/// (consolidation, then retention horizon), catalog projection drain, catalog
+/// outbox trim, GC per domain. Phases are independent: a failure is recorded
+/// and the remaining phases still run, so one wedged domain never starves
+/// another. The returned summary carries every failure; callers exit non-zero
+/// through [`RunSummary::exit_error`].
 async fn run_once(
     storage: ScopedStorage,
     tenant: &str,
@@ -1259,6 +1363,17 @@ async fn run_once(
             summary.drain = Some(drain);
         }
         Err(error) => summary.fail("drain", "catalog", &error),
+    }
+
+    // The trim follows the drain whatever the drain's outcome: records a
+    // deferred or failed drain had already acknowledged are exact and
+    // trimmable all the same.
+    match trim_catalog_outbox(storage.clone()).await {
+        Ok(trim) => {
+            trim.log();
+            summary.trim = Some(trim);
+        }
+        Err(error) => summary.fail("trim", "catalog", &error),
     }
 
     for domain in CONTROL_DOMAINS {
@@ -1512,6 +1627,35 @@ mod tests {
                 .await?
                 .is_some(),
         )
+    }
+
+    /// The catalog head's logical sequence as the outbox worker observes it;
+    /// `None` before the domain's first commit.
+    async fn catalog_sequence(storage: &ScopedStorage) -> Result<Option<u64>> {
+        Ok(ProjectionOutboxWorker::new(
+            storage.clone(),
+            "catalog",
+            CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        )?
+        .backlog()
+        .await?
+        .committed_sequence)
+    }
+
+    /// Records the current visible catalog manifest still replays into the
+    /// projection outbox, acknowledged or not.
+    async fn catalog_outbox_len(storage: &ScopedStorage) -> Result<usize> {
+        Ok(ControlMvpStateStore::new(storage.clone(), catalog_scope())?
+            .current_projection_outbox()
+            .await?
+            .len())
+    }
+
+    fn trim_summary(summary: &RunSummary) -> Result<&TrimSummary> {
+        summary
+            .trim
+            .as_ref()
+            .ok_or_else(|| anyhow!("trim phase missing"))
     }
 
     /// The first maintenance entry a run recorded for `domain` with `kind`.
@@ -2157,10 +2301,161 @@ mod tests {
         let last = run(&storage).await?;
         assert_eq!(
             last.drain.as_ref().map(|d| d.outcome),
-            Some(DrainOutcome::Ok)
+            Some(DrainOutcome::Ok),
+            "{:?}",
+            last.failures
         );
         assert_eq!(last.drain.as_ref().and_then(|d| d.pending_records), Some(0));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_trims_acknowledged_catalog_records_after_the_drain() -> Result<()> {
+        let storage = test_storage()?;
+        seed_catalog_intents(&storage, 0..3).await?;
+        assert_eq!(pending_records(&storage).await?, 3);
+        assert_eq!(catalog_outbox_len(&storage).await?, 3);
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            summary.drain.as_ref().map(|drain| drain.drained_records),
+            Some(3)
+        );
+        let trim = trim_summary(&summary)?;
+        assert_eq!(trim.outcome, TrimOutcome::Ok);
+        assert_eq!(trim.trimmed_records, 3);
+        assert!(trim.trim_sequence.is_some());
+        assert_eq!(pending_records(&storage).await?, 0);
+        assert_eq!(
+            catalog_outbox_len(&storage).await?,
+            0,
+            "the trim commit removes every acknowledged record from the replayed outbox"
+        );
+        let sequence = catalog_sequence(&storage).await?;
+        assert_eq!(
+            sequence, trim.trim_sequence,
+            "the trim commit is the run's last catalog commit"
+        );
+        assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len());
+
+        let second = run(&storage).await?;
+
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+        let trim = trim_summary(&second)?;
+        assert_eq!(trim.outcome, TrimOutcome::Idle);
+        assert_eq!(trim.trimmed_records, 0);
+        assert_eq!(trim.trim_sequence, None);
+        assert_eq!(
+            catalog_sequence(&storage).await?,
+            sequence,
+            "an idle trim commits nothing to the catalog"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_trim_is_idle_when_nothing_is_acknowledged() -> Result<()> {
+        let storage = test_storage()?;
+        seed_plain_commits(&storage, 3).await?;
+        assert_eq!(catalog_sequence(&storage).await?, Some(3));
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        let trim = trim_summary(&summary)?;
+        assert_eq!(trim.outcome, TrimOutcome::Idle);
+        assert_eq!(trim.trimmed_records, 0);
+        assert_eq!(trim.trim_sequence, None);
+        assert_eq!(
+            catalog_sequence(&storage).await?,
+            Some(3),
+            "an idle trim commits nothing to the catalog"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_defers_the_trim_under_catalog_backpressure() -> Result<()> {
+        let storage = test_storage()?;
+        seed_catalog_intents(&storage, 0..3).await?;
+        // Acknowledge the intents without trimming them, as a run whose trim
+        // was deferred leaves them.
+        let drained = CatalogProjectionMaterializer::new(storage.clone())?
+            .drain_once()
+            .await?;
+        assert_eq!(drained.drained_record_ids.len(), 3);
+        assert_eq!(pending_records(&storage).await?, 0);
+        // Commit refuses at 32 L0 segments; fill the catalog up to the refusal.
+        let store = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        let mut refused = false;
+        for generation in 0..64 {
+            match commit_generation(&store, generation).await {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<CatalogError>(),
+                        Some(CatalogError::MaintenanceBackpressure { .. })
+                    ) =>
+                {
+                    refused = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        assert!(refused, "the catalog must reach commit backpressure");
+        // Zero advances leave the consolidation exhausted, so the catalog
+        // stays at the threshold when the trim tries to commit.
+        let limits = RunLimits {
+            maintenance_max_advances: 0,
+            ..TEST_LIMITS
+        };
+
+        let summary = run_once(storage.clone(), TENANT, WORKSPACE, BINDING, limits).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![("consolidation", MaintenanceOutcome::Exhausted)]
+        );
+        assert_eq!(
+            summary.drain.as_ref().map(|drain| drain.outcome),
+            Some(DrainOutcome::Ok),
+            "nothing is pending, so the drain commits nothing"
+        );
+        let trim = trim_summary(&summary)?;
+        assert_eq!(trim.outcome, TrimOutcome::Deferred);
+        assert_eq!(trim.trimmed_records, 0);
+        assert_eq!(trim.trim_sequence, None);
+        assert_eq!(
+            catalog_outbox_len(&storage).await?,
+            3,
+            "the refused trim commit removed nothing"
+        );
+        assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len(), "GC still ran");
+        Ok(())
+    }
+
+    #[test]
+    fn trim_defers_on_backpressure_and_coordination_losses_only() {
+        let message = || "injected".to_owned();
+        assert!(is_trim_deferrable(&CatalogError::MaintenanceBackpressure {
+            message: message()
+        }));
+        assert!(is_trim_deferrable(&CatalogError::PreconditionFailed {
+            message: message()
+        }));
+        assert!(is_trim_deferrable(&CatalogError::CasFailed {
+            message: message()
+        }));
+        assert!(!is_trim_deferrable(&CatalogError::Storage {
+            message: message()
+        }));
+        assert!(!is_trim_deferrable(&CatalogError::Validation {
+            message: message()
+        }));
     }
 
     #[test]
@@ -2235,6 +2530,9 @@ mod tests {
             assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
         }
         for outcome in [DrainOutcome::Ok, DrainOutcome::Deferred] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
+        }
+        for outcome in [TrimOutcome::Ok, TrimOutcome::Idle, TrimOutcome::Deferred] {
             assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
         }
     }

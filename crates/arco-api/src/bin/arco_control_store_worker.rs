@@ -827,13 +827,20 @@ async fn recover_selected_job(
         }
     }
     let disposition = match worker.recover_activation_at(&job_id, now).await {
-        Ok(_) if !expired => return resume_recovered_job(worker, &domain, job_id).await,
+        Ok(progress) if !expired => {
+            // Label the entry now so a resume deferred below still reports
+            // the replayed job's kind.
+            summary.kind = progress.kind.as_str();
+            return resume_recovered_job(worker, &domain, job_id).await;
+        }
         Ok(_) => RecoveryDisposition::Abandon(
             "persisted maintenance job exceeded its lifetime; its root was recovered and a fresh plan follows",
         ),
         Err(CatalogError::NotFound { .. }) => RecoveryDisposition::Abandon(
             "persisted maintenance job has no durable descriptor; activation never landed and a fresh plan follows",
         ),
+        // A deferred replay yields no progress, so the job's kind is unknown
+        // here and the entry keeps its default label.
         Err(error) if is_deferrable(&error) && !expired => RecoveryDisposition::Defer(error),
         Err(error) if is_deferrable(&error) => RecoveryDisposition::AbandonAfterError(error),
         Err(error) => {
@@ -977,7 +984,9 @@ async fn drive_fresh_job(
 /// 3. Unless a replayed horizon filled its slot, a retention horizon is
 ///    prepared and driven over the consolidated head (`idle` when no row is
 ///    purge-eligible) once the consolidation slot ended `idle` or
-///    `published`, or was filled by a replayed job that finished.
+///    `published`, or was filled by a replayed consolidation that published.
+///    A `terminal` consolidation withholds the horizon although its record
+///    is cleared; a fresh plan is prepared next run.
 ///
 /// An abandoned record (expired, or never activated) is cleared during
 /// recovery and gives way to a fresh consolidation on the same entry.
@@ -993,7 +1002,9 @@ async fn maintain_domain(
     let scope = StateScope::new(tenant, workspace, domain);
     let worker = DurableMaintenanceWorker::new(storage.clone(), scope, binding)
         .with_context(|| format!("construct maintenance worker for domain {domain}"))?;
-    let mut replayed: Option<MaintenanceKind> = None;
+    // The replayed job's kind and outcome, once it finished and cleared its
+    // record; it fills this run's slot for that kind.
+    let mut replayed: Option<(MaintenanceKind, MaintenanceOutcome)> = None;
     let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
 
     if let Some(record) = load_selected_job(&storage, domain).await? {
@@ -1018,7 +1029,7 @@ async fn maintain_domain(
                 if !record_cleared {
                     return Ok(());
                 }
-                replayed = Some(kind);
+                replayed = Some((kind, outcome));
                 summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
             }
             Recovery::Deferred => {
@@ -1032,10 +1043,10 @@ async fn maintain_domain(
         }
     }
 
-    let horizon_may_follow = if replayed == Some(MaintenanceKind::Consolidation) {
-        // The replayed consolidation filled this run's slot and cleared its
-        // record; the horizon runs over the head it published.
-        true
+    let horizon_may_follow = if let Some((MaintenanceKind::Consolidation, outcome)) = replayed {
+        // The replayed consolidation filled this run's slot; the horizon
+        // follows only the head it published, never a terminal job.
+        outcome == MaintenanceOutcome::Published
     } else {
         let outcome = drive_fresh_job(
             &storage,
@@ -1045,9 +1056,11 @@ async fn maintain_domain(
             &mut summary,
         )
         .await?;
-        // `published` cleared the record in `finish_job`; `idle` never
-        // persisted one. Every other outcome leaves a record the horizon must
-        // not overwrite.
+        // The horizon follows only `idle` (nothing was persisted) or
+        // `published` (`finish_job` cleared the record). `deferred` and
+        // `exhausted` leave a record that must be finished first; `terminal`
+        // cleared its record but withholds the horizon all the same, and a
+        // fresh plan is prepared next run.
         let may_follow = matches!(
             outcome,
             MaintenanceOutcome::Idle | MaintenanceOutcome::Published
@@ -1055,7 +1068,7 @@ async fn maintain_domain(
         summary.finish_into(outcome, entries);
         may_follow
     };
-    if replayed == Some(MaintenanceKind::RetentionHorizon) || !horizon_may_follow {
+    if matches!(replayed, Some((MaintenanceKind::RetentionHorizon, _))) || !horizon_may_follow {
         return Ok(());
     }
 
@@ -1797,6 +1810,66 @@ mod tests {
         ) -> arco_core::Result<String> {
             self.inner.signed_url(path, expiry).await
         }
+    }
+
+    #[tokio::test]
+    async fn run_once_withholds_the_horizon_after_a_terminal_recovered_consolidation() -> Result<()>
+    {
+        let storage = test_storage()?;
+        seed_plain_commits(&storage, 16).await?;
+        // An expired row makes a horizon admissible, so its absence below is
+        // the slot rule at work rather than an idle horizon.
+        seed_expired_row(&storage).await?;
+        // A previous run prepared, persisted and activated a consolidation;
+        // the job was then abandoned before that run could finish it.
+        let dead = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
+        let now = Utc::now();
+        let plan = dead
+            .prepare_at(now)
+            .await?
+            .ok_or_else(|| anyhow!("17 L0 segments must select a maintenance intent"))?;
+        let persisted = plan.job_id().as_str().to_owned();
+        persist_selected_job(
+            &storage,
+            &SelectedJobRecord {
+                job_id: persisted.clone(),
+                domain: "catalog".to_owned(),
+                prepared_at_ms: now.timestamp_millis(),
+            },
+        )
+        .await?;
+        dead.start_at(&plan, now).await?;
+        let abandoned = dead.abandon_at(plan.job_id(), now).await?;
+        assert_eq!(abandoned.status, MaintenanceStatus::Abandoned);
+        drop(dead);
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![("consolidation", MaintenanceOutcome::Terminal)],
+            "a terminal consolidation slot withholds the horizon"
+        );
+        let catalog = domain_summary(&summary, "catalog", "consolidation")?;
+        assert!(catalog.recovered, "the persisted identity must be replayed");
+        assert_eq!(catalog.job_id.as_deref(), Some(persisted.as_str()));
+        assert_eq!(catalog.layout_generation, None);
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "a terminal job clears its persisted record"
+        );
+        assert!(
+            pending_intent(&storage).await?,
+            "nothing consolidated; a fresh plan is prepared next run"
+        );
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(
+            reader.get(b"expired").await?,
+            Some(Bytes::from_static(b"expired")),
+            "no horizon ran"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -1468,6 +1468,59 @@ async fn publication_stamp_never_precedes_its_parent_or_suffix_transactions() {
     );
 }
 
+#[tokio::test]
+async fn prepare_at_reports_the_consolidation_kind() {
+    let (_worker, plan, _now) = prepared_fixture().await;
+    assert_eq!(plan.kind(), MaintenanceKind::Consolidation);
+}
+
+#[tokio::test]
+async fn consolidation_progress_carries_the_job_kind() {
+    let (worker, plan, now) = prepared_fixture().await;
+    let started = worker.start_at(&plan, now).await.unwrap();
+    assert_eq!(started.kind, MaintenanceKind::Consolidation);
+    let resumed = worker.resume_at(&plan.id, now).await.unwrap();
+    assert_eq!(resumed.kind, MaintenanceKind::Consolidation);
+    let advanced = worker.advance_at(&plan.id, now).await.unwrap();
+    assert_eq!(advanced.kind, MaintenanceKind::Consolidation);
+}
+
+#[tokio::test]
+async fn consolidation_outcome_reports_its_kind_and_no_purged_counts() {
+    let (worker, plan, now) = prepared_fixture().await;
+    let mut progress = worker.start_at(&plan, now).await.unwrap();
+    while progress.status == MaintenanceStatus::Active {
+        progress = worker.advance_at(&plan.id, now).await.unwrap();
+    }
+    assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
+    let outcome = worker.publish_at(&plan.id, now).await.unwrap().unwrap();
+    assert_eq!(outcome.kind(), MaintenanceKind::Consolidation);
+    assert_eq!(outcome.purged_counts(), None);
+    let pointer = worker.worker.store.load_pointer().await.unwrap();
+    let manifest = worker
+        .worker
+        .store
+        .load_manifest_for_pointer(&pointer)
+        .await
+        .unwrap();
+    assert!(manifest.retention_horizon.is_none());
+}
+
+/// Logs and metric labels use the `snake_case` name; the wire stays
+/// `SCREAMING_SNAKE_CASE`, so the two must differ only by case.
+#[test]
+fn maintenance_kind_as_str_is_the_snake_case_serde_name() {
+    for kind in [
+        MaintenanceKind::Consolidation,
+        MaintenanceKind::RetentionHorizon,
+    ] {
+        let wire = serde_json::to_value(kind).unwrap();
+        let wire = wire.as_str().unwrap();
+        assert_eq!(kind.as_str(), wire.to_ascii_lowercase());
+        assert_eq!(wire, wire.to_ascii_uppercase());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RetentionHorizon job kind
 // ---------------------------------------------------------------------------
@@ -2711,5 +2764,140 @@ mod horizon {
         );
         let (_, _, inputs) = worker.worker.retention_horizon_inputs(later).await.unwrap();
         assert_eq!(inputs.pinned_evidence, evidence(&last_of_hour[1], 3));
+    }
+
+    #[tokio::test]
+    async fn prepare_horizon_at_reports_the_retention_horizon_kind() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 47);
+        let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
+        let plan = worker
+            .prepare_horizon_at(horizon_now())
+            .await
+            .unwrap()
+            .expect("eligible rows");
+        assert_eq!(plan.kind(), MaintenanceKind::RetentionHorizon);
+    }
+
+    #[tokio::test]
+    async fn horizon_progress_carries_the_job_kind() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 48);
+        let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
+        let now = horizon_now();
+        let plan = worker
+            .prepare_horizon_at(now)
+            .await
+            .unwrap()
+            .expect("eligible rows");
+        let id = plan.job_id().clone();
+        let started = worker.start_at(&plan, now).await.unwrap();
+        assert_eq!(started.kind, MaintenanceKind::RetentionHorizon);
+        let resumed = worker.resume_at(&id, now).await.unwrap();
+        assert_eq!(resumed.kind, MaintenanceKind::RetentionHorizon);
+        let mut progress = worker.advance_at(&id, now).await.unwrap();
+        assert_eq!(progress.kind, MaintenanceKind::RetentionHorizon);
+        while progress.status == MaintenanceStatus::Active {
+            progress = worker.advance_at(&id, now).await.unwrap();
+            assert_eq!(progress.kind, MaintenanceKind::RetentionHorizon);
+        }
+        assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
+    }
+
+    #[tokio::test]
+    async fn horizon_outcome_reports_its_kind_and_certified_purged_counts() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 49);
+        let store = &worker.worker.store;
+        let (_fixture, _) = aged_mixed_state(store).await;
+        let now = horizon_now();
+        let id = ready_to_publish(&worker, now).await;
+        let outcome = worker
+            .publish_at(&id, now)
+            .await
+            .unwrap()
+            .expect("the only writer publishes on its first attempt");
+        assert_eq!(outcome.kind(), MaintenanceKind::RetentionHorizon);
+        let (_, after) = head(store).await;
+        let certificate = after.retention_horizon.as_ref().expect("certificate");
+        assert_eq!(
+            outcome.purged_counts(),
+            Some((
+                certificate.purged_counts.expired_rows,
+                certificate.purged_counts.tombstones
+            ))
+        );
+        assert_eq!(outcome.purged_counts(), Some((1, 2)));
+        // Re-observing the published evidence reports the same outcome.
+        assert_eq!(worker.publish_at(&id, now).await.unwrap().unwrap(), outcome);
+    }
+
+    fn sample(rendered: &str, series: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix(series)
+                .and_then(|rest| rest.trim().parse().ok())
+        })
+    }
+
+    /// One confirmed head CAS counts one publication of its kind and the
+    /// certified purged rows by reason; re-observing the published evidence
+    /// counts nothing again.
+    #[test]
+    fn horizon_publication_emits_publication_and_purge_metrics() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let storage =
+                    ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+                        .unwrap();
+                let worker = worker_on(storage, 50);
+                let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
+                let now = horizon_now();
+                let id = ready_to_publish(&worker, now).await;
+                let outcome = worker
+                    .publish_at(&id, now)
+                    .await
+                    .unwrap()
+                    .expect("published");
+                assert_eq!(outcome.purged_counts(), Some((1, 2)));
+                worker
+                    .publish_at(&id, now)
+                    .await
+                    .unwrap()
+                    .expect("re-observed");
+            });
+        });
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            Some(1.0),
+            sample(
+                &rendered,
+                "arco_state_store_maintenance_published_total{domain=\"catalog\",kind=\"retention_horizon\"}"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(
+            Some(1.0),
+            sample(
+                &rendered,
+                "arco_state_store_retention_purged_rows_total{domain=\"catalog\",reason=\"expired\"}"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(
+            Some(2.0),
+            sample(
+                &rendered,
+                "arco_state_store_retention_purged_rows_total{domain=\"catalog\",reason=\"tombstone\"}"
+            ),
+            "{rendered}"
+        );
     }
 }

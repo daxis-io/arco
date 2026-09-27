@@ -49,8 +49,9 @@ pub use control_mvp::{
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpReadCache,
     ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
     ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
-    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
-    MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, control_mvp_outbox_event_id,
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
+    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2,
+    control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

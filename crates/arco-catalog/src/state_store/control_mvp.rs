@@ -169,8 +169,8 @@ use integrity::{
 };
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
-    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
-    MaintenanceStatus, PreparedMaintenance,
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
+    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 7;
@@ -2957,6 +2957,8 @@ pub struct ControlMvpMaintenanceOutcome {
     source_token: StateToken,
     selected_token: StateToken,
     layout_generation: u64,
+    kind: MaintenanceKind,
+    purged_counts: Option<(u64, u64)>,
 }
 
 impl ControlMvpMaintenanceOutcome {
@@ -2976,6 +2978,19 @@ impl ControlMvpMaintenanceOutcome {
     #[must_use]
     pub const fn layout_generation(&self) -> u64 {
         self.layout_generation
+    }
+
+    /// Returns which physical rewrite this publication performed.
+    #[must_use]
+    pub const fn kind(&self) -> MaintenanceKind {
+        self.kind
+    }
+
+    /// Returns `(expired_rows, tombstones)` certified by a retention horizon
+    /// publication, or `None` for a consolidation.
+    #[must_use]
+    pub const fn purged_counts(&self) -> Option<(u64, u64)> {
+        self.purged_counts
     }
 }
 

@@ -95,10 +95,13 @@ pub const AUTHZ_INDEX_CANDIDATE_ROWS: &str = "arco_authz_index_candidate_rows";
 // CAS publish outcomes, L0 segment count, and maintenance backpressure;
 // replay_manifest for replay duration and bytes; validate_raw_checksum_for
 // for read integrity failures; ambiguous_authority_outcome_for for ambiguous
-// outcomes) and by the projection outbox worker
+// outcomes), by the durable maintenance worker
+// (state_store/control_mvp/maintenance.rs: record_publication, once per
+// confirmed head CAS, for publications by kind and retention-purged rows by
+// reason) and by the projection outbox worker
 // (state_store/projection_outbox_acks.rs: drain_at_incarnation for publishes,
-// backlog for watermark lag and age). Alert rules in
-// infra/monitoring/alerts.yaml reference these code-owned names.
+// backlog for watermark lag and age, trim_acked for trimmed outbox records).
+// Alert rules in infra/monitoring/alerts.yaml reference these code-owned names.
 
 /// Control-store pointer CAS publish attempts counter (label: domain).
 pub const STATE_STORE_CAS_PUBLISH: &str = "arco_state_store_cas_publish_total";
@@ -138,6 +141,19 @@ pub const STATE_STORE_AMBIGUOUS_OUTCOMES: &str = "arco_state_store_ambiguous_out
 
 /// L0 segments carried by the latest candidate manifest gauge (label: domain).
 pub const STATE_STORE_L0_SEGMENTS: &str = "arco_state_store_l0_segments";
+
+/// Durable maintenance publications confirmed by exact head CAS counter
+/// (labels: domain, kind in {`consolidation`, `retention_horizon`}).
+pub const STATE_STORE_MAINTENANCE_PUBLISHED: &str = "arco_state_store_maintenance_published_total";
+
+/// Rows purged by published retention horizon certificates counter
+/// (labels: domain, reason in {expired, tombstone}).
+pub const STATE_STORE_RETENTION_PURGED_ROWS: &str = "arco_state_store_retention_purged_rows_total";
+
+/// Acknowledged projection outbox records removed by trim commits counter
+/// (labels: domain, consumer).
+pub const STATE_STORE_OUTBOX_TRIMMED_RECORDS: &str =
+    "arco_control_store_outbox_trimmed_records_total";
 
 // ============================================================================
 // ADR-034 Repair Metrics
@@ -269,6 +285,18 @@ pub fn register_metrics() {
     describe_gauge!(
         STATE_STORE_L0_SEGMENTS,
         "L0 segments carried by the latest control-store candidate manifest by domain"
+    );
+    describe_counter!(
+        STATE_STORE_MAINTENANCE_PUBLISHED,
+        "Total durable maintenance publications confirmed by head CAS by domain and kind"
+    );
+    describe_counter!(
+        STATE_STORE_RETENTION_PURGED_ROWS,
+        "Total rows purged by published retention horizon certificates by domain and reason"
+    );
+    describe_counter!(
+        STATE_STORE_OUTBOX_TRIMMED_RECORDS,
+        "Total acknowledged projection outbox records removed by trim commits by domain and consumer"
     );
     describe_counter!(
         RECONCILER_ISSUES,
@@ -522,6 +550,50 @@ pub fn record_projection_watermark(domain: &str, consumer: &str, lag: u64, age_s
     .set(age_seconds);
 }
 
+/// Records one durable maintenance publication confirmed by exact head CAS.
+///
+/// `kind` is the job kind's `snake_case` name: `consolidation` or
+/// `retention_horizon`.
+pub fn record_maintenance_published(domain: &str, kind: &str) {
+    counter!(
+        STATE_STORE_MAINTENANCE_PUBLISHED,
+        "domain" => domain.to_string(),
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Records the rows a published retention horizon certificate purged, by
+/// reason. A zero count records nothing, so a reason with no purge has no
+/// series.
+pub fn record_retention_purged_rows(domain: &str, expired: u64, tombstones: u64) {
+    for (reason, count) in [("expired", expired), ("tombstone", tombstones)] {
+        if count == 0 {
+            continue;
+        }
+        counter!(
+            STATE_STORE_RETENTION_PURGED_ROWS,
+            "domain" => domain.to_string(),
+            "reason" => reason.to_string()
+        )
+        .increment(count);
+    }
+}
+
+/// Records the acknowledged outbox records one trim commit removed from a
+/// source domain. A zero count records nothing.
+pub fn record_outbox_trimmed(domain: &str, consumer: &str, records: u64) {
+    if records == 0 {
+        return;
+    }
+    counter!(
+        STATE_STORE_OUTBOX_TRIMMED_RECORDS,
+        "domain" => domain.to_string(),
+        "consumer" => consumer.to_string()
+    )
+    .increment(records);
+}
+
 // ============================================================================
 // ADR-034 Repair Metric Recording
 // ============================================================================
@@ -718,6 +790,52 @@ mod tests {
                 .lines()
                 .any(|line| line.starts_with("arco_state_store_cas_publish_failures_total{")),
             "a successful publish records no failure: {rendered}"
+        );
+    }
+
+    /// The maintenance, purge and trim emitters label their series and never
+    /// create a series for a zero increment.
+    #[test]
+    fn maintenance_and_trim_emitters_label_series_and_skip_zero_increments() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            super::record_maintenance_published("catalog", "consolidation");
+            super::record_retention_purged_rows("catalog", 0, 3);
+            super::record_outbox_trimmed("catalog", "idle", 0);
+            super::record_outbox_trimmed("catalog", "parquet", 4);
+        });
+        let rendered = recorder.handle().render();
+        assert_eq!(
+            Some(1.0),
+            sample(
+                &rendered,
+                "arco_state_store_maintenance_published_total{domain=\"catalog\",kind=\"consolidation\"}"
+            ),
+            "{rendered}"
+        );
+        assert_eq!(
+            Some(3.0),
+            sample(
+                &rendered,
+                "arco_state_store_retention_purged_rows_total{domain=\"catalog\",reason=\"tombstone\"}"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("reason=\"expired\""),
+            "a zero purge count records no series: {rendered}"
+        );
+        assert_eq!(
+            Some(4.0),
+            sample(
+                &rendered,
+                "arco_control_store_outbox_trimmed_records_total{domain=\"catalog\",consumer=\"parquet\"}"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("consumer=\"idle\""),
+            "a zero trim records no series: {rendered}"
         );
     }
 }

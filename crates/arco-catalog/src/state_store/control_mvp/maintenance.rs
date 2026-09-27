@@ -52,6 +52,18 @@ pub enum MaintenanceKind {
     RetentionHorizon,
 }
 
+impl MaintenanceKind {
+    /// The `snake_case` name logs and metric labels use: `consolidation` or
+    /// `retention_horizon`. The wire form stays `SCREAMING_SNAKE_CASE`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consolidation => "consolidation",
+            Self::RetentionHorizon => "retention_horizon",
+        }
+    }
+}
+
 /// The inputs a horizon job was admitted with. They are fixed at
 /// preparation and bound into the descriptor (hence the job identity), the
 /// render seed and the published certificate.
@@ -1574,6 +1586,12 @@ impl PreparedMaintenance {
     pub fn job_id(&self) -> &MaintenanceJobId {
         &self.id
     }
+
+    /// Which physical rewrite the admitted plan performs.
+    #[must_use]
+    pub const fn kind(&self) -> MaintenanceKind {
+        self.descriptor.kind
+    }
 }
 
 /// Explicit durable maintenance capability. Trusted composition must provide
@@ -1591,6 +1609,8 @@ pub struct MaintenanceProgress {
     pub job: MaintenanceJobId,
     /// Selected durable state.
     pub status: MaintenanceStatus,
+    /// Which physical rewrite the job performs.
+    pub kind: MaintenanceKind,
     /// Contiguous completed output units.
     pub completed: usize,
     /// Admitted output units.
@@ -1608,6 +1628,7 @@ impl LoadedJob {
         Ok(MaintenanceProgress {
             job: id.clone(),
             status: last.status,
+            kind: self.descriptor.kind,
             completed: last.completed,
             total: self.pages.len(),
         })
@@ -1615,6 +1636,18 @@ impl LoadedJob {
 }
 
 impl Descriptor {
+    /// `(expired_rows, tombstones)` the admitted purge certifies; `None` for
+    /// consolidation. Publication refuses a candidate whose recomputed
+    /// certificate differs, so these equal the selected manifest's counts.
+    fn purged_counts(&self) -> Option<(u64, u64)> {
+        self.purge.as_ref().map(|purge| {
+            (
+                purge.purged_counts.expired_rows,
+                purge.purged_counts.tombstones,
+            )
+        })
+    }
+
     fn render_seed(&self) -> Result<String> {
         Ok(sha256_hex(&encode_json(
             &(
@@ -2361,6 +2394,7 @@ impl DurableMaintenanceWorker {
             Ok(MaintenanceProgress {
                 job: id.clone(),
                 status: revision.status,
+                kind: job.descriptor.kind,
                 completed: revision.completed,
                 total: job.pages.len(),
             })
@@ -2480,6 +2514,7 @@ impl DurableMaintenanceWorker {
             Ok(MaintenanceProgress {
                 job: id.clone(),
                 status: revision.status,
+                kind: job.descriptor.kind,
                 completed: revision.completed,
                 total: job.pages.len(),
             })
@@ -2965,6 +3000,7 @@ impl DurableMaintenanceWorker {
                         if last.status == MaintenanceStatus::Publishing {
                             self.finish_publication(id, &job, MaintenanceStatus::Published)
                                 .await?;
+                            self.record_publication(&job);
                         }
                         return Ok(Some(self.publication_outcome(&job, &attempt)));
                     }
@@ -3097,12 +3133,14 @@ impl DurableMaintenanceWorker {
             Ok(WriteResult::Success { .. }) => {
                 self.finish_publication(id, job, MaintenanceStatus::Published)
                     .await?;
+                self.record_publication(job);
                 Ok(Some(self.publication_outcome(job, &candidate.attempt)))
             }
             result => match self.observe_attempt(&candidate.attempt).await {
                 Ok(PublicationObservation::Selected) => {
                     self.finish_publication(id, job, MaintenanceStatus::Published)
                         .await?;
+                    self.record_publication(job);
                     Ok(Some(self.publication_outcome(job, &candidate.attempt)))
                 }
                 Ok(PublicationObservation::Consumed) => {
@@ -3168,6 +3206,20 @@ impl DurableMaintenanceWorker {
                 .token(attempt.candidate_id.clone(), attempt.source_sequence)
                 .with_manifest_witness(attempt.candidate_digest.clone()),
             layout_generation: job.descriptor.layout_generation + 1,
+            kind: job.descriptor.kind,
+            purged_counts: job.descriptor.purged_counts(),
+        }
+    }
+
+    /// Counts one confirmed publication of the job's kind and, for a horizon
+    /// job, the rows its certificate purged. Called once, right after the
+    /// exact head CAS is first confirmed selected; re-observing published
+    /// evidence counts nothing.
+    fn record_publication(&self, job: &LoadedJob) {
+        let domain = self.worker.store.scope.domain();
+        crate::metrics::record_maintenance_published(domain, job.descriptor.kind.as_str());
+        if let Some((expired, tombstones)) = job.descriptor.purged_counts() {
+            crate::metrics::record_retention_purged_rows(domain, expired, tombstones);
         }
     }
 }

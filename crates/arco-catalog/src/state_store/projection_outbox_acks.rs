@@ -76,8 +76,10 @@
 //! Metric names reserved for the deployed wiring (emitters live with the
 //! operator endpoints): `arco_control_store_outbox_backlog_records`,
 //! `arco_control_store_outbox_watermark_lag_sequences`,
-//! `arco_control_store_outbox_drained_records_total`,
-//! `arco_control_store_outbox_trimmed_records_total`.
+//! `arco_control_store_outbox_drained_records_total`.
+//! [`ProjectionOutboxWorker::trim_acked`] itself emits
+//! `arco_control_store_outbox_trimmed_records_total` (labels `domain`,
+//! `consumer`) once its source-domain trim commit succeeds.
 
 use crate::catalog_authority::projection_measurement::phase as projection_phase;
 use std::collections::BTreeSet;
@@ -1745,6 +1747,11 @@ impl ProjectionOutboxWorker {
         txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))
             .await?;
         let token = txn.commit().await?.into_state_token();
+        crate::metrics::record_outbox_trimmed(
+            self.source_scope.domain(),
+            &self.consumer_id,
+            u64::try_from(trimmed.len()).unwrap_or(u64::MAX),
+        );
         Ok(ProjectionOutboxTrimReport {
             trimmed_record_ids,
             trimmed_event_ids,
@@ -3088,6 +3095,48 @@ mod tests {
         let idle = worker.trim_acked().await.expect("idle trim");
         assert!(idle.trimmed_record_ids.is_empty());
         assert_eq!(None, idle.trim_sequence);
+    }
+
+    /// A trim commit counts the records it removed for the source domain and
+    /// the trimming consumer; an idle trim counts nothing.
+    #[test]
+    fn trim_emits_the_trimmed_records_counter_for_the_source_domain_and_consumer() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let storage = storage();
+                commit_source_record(&storage, "record-1").await;
+                commit_source_record(&storage, "record-2").await;
+                let worker =
+                    ProjectionOutboxWorker::new(storage.clone(), SOURCE_DOMAIN, "consumer-a")
+                        .expect("worker");
+                worker
+                    .acks()
+                    .acknowledge(&delivery("record-1", 1))
+                    .await
+                    .expect("ack record-1");
+                worker
+                    .acks()
+                    .acknowledge(&delivery("record-2", 2))
+                    .await
+                    .expect("ack record-2");
+                let report = worker.trim_acked().await.expect("trim");
+                assert_eq!(2, report.trimmed_record_ids.len());
+                let idle = worker.trim_acked().await.expect("idle trim");
+                assert!(idle.trimmed_record_ids.is_empty());
+            });
+        });
+        let rendered = recorder.handle().render();
+        let series = "arco_control_store_outbox_trimmed_records_total{domain=\"phase5-source\",consumer=\"consumer-a\"}";
+        let value = rendered.lines().find_map(|line| {
+            line.strip_prefix(series)
+                .and_then(|rest| rest.trim().parse::<f64>().ok())
+        });
+        assert_eq!(Some(2.0), value, "{rendered}");
     }
 
     #[tokio::test]

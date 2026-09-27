@@ -1747,6 +1747,8 @@ impl ProjectionOutboxWorker {
         txn.trim_projection_outbox(trimmed.iter().map(ProjectionOutboxDeliveryId::trim_target))
             .await?;
         let token = txn.commit().await?.into_state_token();
+        // Counted only once the commit has returned: a trim commit that
+        // persisted but propagated an error is never counted.
         crate::metrics::record_outbox_trimmed(
             self.source_scope.domain(),
             &self.consumer_id,
@@ -3131,12 +3133,14 @@ mod tests {
             });
         });
         let rendered = recorder.handle().render();
-        let series = "arco_control_store_outbox_trimmed_records_total{domain=\"phase5-source\",consumer=\"consumer-a\"}";
-        let value = rendered.lines().find_map(|line| {
-            line.strip_prefix(series)
-                .and_then(|rest| rest.trim().parse::<f64>().ok())
-        });
-        assert_eq!(Some(2.0), value, "{rendered}");
+        assert_eq!(
+            Some(2.0),
+            crate::metrics::sample(
+                &rendered,
+                "arco_control_store_outbox_trimmed_records_total{domain=\"phase5-source\",consumer=\"consumer-a\"}"
+            ),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]

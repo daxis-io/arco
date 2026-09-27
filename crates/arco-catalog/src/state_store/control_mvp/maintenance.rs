@@ -64,6 +64,15 @@ impl MaintenanceKind {
     }
 }
 
+/// Rows a published retention horizon certificate purged, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgedCounts {
+    /// Rows whose expiry stamp fell before the purge cutoff.
+    pub expired_rows: u64,
+    /// Tombstones no retained reader can observe.
+    pub tombstones: u64,
+}
+
 /// The inputs a horizon job was admitted with. They are fixed at
 /// preparation and bound into the descriptor (hence the job identity), the
 /// render seed and the published certificate.
@@ -1636,15 +1645,13 @@ impl LoadedJob {
 }
 
 impl Descriptor {
-    /// `(expired_rows, tombstones)` the admitted purge certifies; `None` for
-    /// consolidation. Publication refuses a candidate whose recomputed
-    /// certificate differs, so these equal the selected manifest's counts.
-    fn purged_counts(&self) -> Option<(u64, u64)> {
-        self.purge.as_ref().map(|purge| {
-            (
-                purge.purged_counts.expired_rows,
-                purge.purged_counts.tombstones,
-            )
+    /// The counts the admitted purge certifies; `None` for consolidation.
+    /// Publication refuses a candidate whose recomputed certificate differs,
+    /// so these equal the selected manifest's counts.
+    fn purged_counts(&self) -> Option<PurgedCounts> {
+        self.purge.as_ref().map(|purge| PurgedCounts {
+            expired_rows: purge.purged_counts.expired_rows,
+            tombstones: purge.purged_counts.tombstones,
         })
     }
 
@@ -2402,6 +2409,9 @@ impl DurableMaintenanceWorker {
         .await
     }
 
+    /// Selects `revision` as the job's progress. `Ok` means the intended
+    /// selector bytes are visible; the value says whether this call put them
+    /// there or a same-binding peer already had.
     async fn select_revision(
         &self,
         id: &MaintenanceJobId,
@@ -2409,7 +2419,7 @@ impl DurableMaintenanceWorker {
         revision: Bytes,
         selector: Bytes,
         deadline: Option<DateTime<Utc>>,
-    ) -> Result<()> {
+    ) -> Result<Selection> {
         let check_deadline = || {
             if deadline.is_some_and(|expiry| cost::now() >= expiry) {
                 Err(precondition_failed(
@@ -2439,7 +2449,7 @@ impl DurableMaintenanceWorker {
         )
         .await;
         match result {
-            Ok(WriteResult::Success { .. }) => Ok(()),
+            Ok(WriteResult::Success { .. }) => Ok(Selection::Advanced),
             result => {
                 if store
                     .storage
@@ -2447,7 +2457,7 @@ impl DurableMaintenanceWorker {
                     .await
                     .is_ok_and(|visible| visible == selector)
                 {
-                    return Ok(());
+                    return Ok(Selection::AlreadyVisible);
                 }
                 match result {
                     Ok(_) => Err(CatalogError::CasFailed {
@@ -2998,9 +3008,7 @@ impl DurableMaintenanceWorker {
                 match self.observe_attempt(&attempt).await? {
                     PublicationObservation::Selected => {
                         if last.status == MaintenanceStatus::Publishing {
-                            self.finish_publication(id, &job, MaintenanceStatus::Published)
-                                .await?;
-                            self.record_publication(&job);
+                            self.finish_published(id, &job).await?;
                         }
                         return Ok(Some(self.publication_outcome(&job, &attempt)));
                     }
@@ -3131,16 +3139,12 @@ impl DurableMaintenanceWorker {
         .await;
         match result {
             Ok(WriteResult::Success { .. }) => {
-                self.finish_publication(id, job, MaintenanceStatus::Published)
-                    .await?;
-                self.record_publication(job);
+                self.finish_published(id, job).await?;
                 Ok(Some(self.publication_outcome(job, &candidate.attempt)))
             }
             result => match self.observe_attempt(&candidate.attempt).await {
                 Ok(PublicationObservation::Selected) => {
-                    self.finish_publication(id, job, MaintenanceStatus::Published)
-                        .await?;
-                    self.record_publication(job);
+                    self.finish_published(id, job).await?;
                     Ok(Some(self.publication_outcome(job, &candidate.attempt)))
                 }
                 Ok(PublicationObservation::Consumed) => {
@@ -3164,7 +3168,7 @@ impl DurableMaintenanceWorker {
         id: &MaintenanceJobId,
         job: &LoadedJob,
         status: MaintenanceStatus,
-    ) -> Result<()> {
+    ) -> Result<Selection> {
         let (digest, last) = job.last()?;
         if last.status != MaintenanceStatus::Publishing {
             return Err(invariant_violation("maintenance attempt is not selected"));
@@ -3211,17 +3215,45 @@ impl DurableMaintenanceWorker {
         }
     }
 
-    /// Counts one confirmed publication of the job's kind and, for a horizon
-    /// job, the rows its certificate purged. Called once, right after the
-    /// exact head CAS is first confirmed selected; re-observing published
-    /// evidence counts nothing.
+    /// Selects the `Published` revision for a job whose head CAS is confirmed
+    /// selected, and counts the publication only when this invocation is the
+    /// one that advanced the selector.
+    async fn finish_published(&self, id: &MaintenanceJobId, job: &LoadedJob) -> Result<()> {
+        if self
+            .finish_publication(id, job, MaintenanceStatus::Published)
+            .await?
+            == Selection::Advanced
+        {
+            self.record_publication(job);
+        }
+        Ok(())
+    }
+
+    /// Counts one publication of the job's kind and, for a horizon job, the
+    /// rows its certificate purged. Called only by the invocation whose
+    /// selector CAS advanced the job to `Published`, so overlapping
+    /// same-binding workers that both observe the landed head count it at
+    /// most once, and re-observing published evidence counts nothing. Known
+    /// loss residual: a `finish_publication` whose selector PUT persisted
+    /// but returned an error leaves the publication uncounted, because the
+    /// resume then observes `Published` and finishes nothing.
     fn record_publication(&self, job: &LoadedJob) {
         let domain = self.worker.store.scope.domain();
-        crate::metrics::record_maintenance_published(domain, job.descriptor.kind.as_str());
-        if let Some((expired, tombstones)) = job.descriptor.purged_counts() {
-            crate::metrics::record_retention_purged_rows(domain, expired, tombstones);
+        crate::metrics::record_maintenance_published(domain, job.descriptor.kind);
+        if let Some(counts) = job.descriptor.purged_counts() {
+            crate::metrics::record_retention_purged_rows(domain, counts);
         }
     }
+}
+
+/// What a progress-selector CAS did for the calling invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// This call's CAS moved the selector to the intended revision.
+    Advanced,
+    /// The intended bytes were already visible: a same-binding peer selected
+    /// the identical revision first, so this call changed nothing.
+    AlreadyVisible,
 }
 
 fn validate_progress_transition(

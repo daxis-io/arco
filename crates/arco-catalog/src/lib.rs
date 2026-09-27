@@ -159,7 +159,7 @@ pub use state_store::{
     MaintenanceKind, MaintenanceProgress, MaintenanceStatus, ModelCommitRecord, ModelStateStore,
     ModelWrite, PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
     PersistedRestoreParticipantPlan, PredicateInputSet, PreparedMaintenance, ProjectionIntentV1,
-    RestoreAttemptIdentity, RestoreParticipantInspection, RestoredAuthorityEvidence,
+    PurgedCounts, RestoreAttemptIdentity, RestoreParticipantInspection, RestoredAuthorityEvidence,
     ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
     StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
     control_mvp_outbox_event_id,

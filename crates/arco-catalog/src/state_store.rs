@@ -50,7 +50,7 @@ pub use control_mvp::{
     ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
     ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpStateStore, ControlMvpTxn,
     DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
-    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2,
+    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, PurgedCounts,
     control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};

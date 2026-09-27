@@ -1533,6 +1533,7 @@ mod horizon {
         PinnedSequenceV1, PurgedCountsV1, PurgedRow, StateToken, TxnOptions, purged_rows_digest,
     };
     use super::super::*;
+    use crate::metrics::sample;
     use crate::workspace_snapshot::{DomainAuthorityReference, DomainEventArchive, WorkspaceScope};
     use crate::workspace_snapshot_service::{
         CreateWorkspaceSnapshotRequest, EventArchiveCapture, EventArchiveProvider,
@@ -2770,7 +2771,7 @@ mod horizon {
     async fn prepare_horizon_at_reports_the_retention_horizon_kind() {
         let storage =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let worker = worker_on(storage, 47);
+        let worker = worker_on(storage, 55);
         let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
         let plan = worker
             .prepare_horizon_at(horizon_now())
@@ -2784,7 +2785,7 @@ mod horizon {
     async fn horizon_progress_carries_the_job_kind() {
         let storage =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let worker = worker_on(storage, 48);
+        let worker = worker_on(storage, 56);
         let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
         let now = horizon_now();
         let plan = worker
@@ -2810,7 +2811,7 @@ mod horizon {
     async fn horizon_outcome_reports_its_kind_and_certified_purged_counts() {
         let storage =
             ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let worker = worker_on(storage, 49);
+        let worker = worker_on(storage, 57);
         let store = &worker.worker.store;
         let (_fixture, _) = aged_mixed_state(store).await;
         let now = horizon_now();
@@ -2825,21 +2826,14 @@ mod horizon {
         let certificate = after.retention_horizon.as_ref().expect("certificate");
         assert_eq!(
             outcome.purged_counts(),
-            Some((
-                certificate.purged_counts.expired_rows,
-                certificate.purged_counts.tombstones
-            ))
+            Some(PurgedCounts {
+                expired_rows: certificate.purged_counts.expired_rows,
+                tombstones: certificate.purged_counts.tombstones,
+            })
         );
-        assert_eq!(outcome.purged_counts(), Some((1, 2)));
+        assert_eq!(outcome.purged_counts(), Some(CERTIFIED));
         // Re-observing the published evidence reports the same outcome.
         assert_eq!(worker.publish_at(&id, now).await.unwrap().unwrap(), outcome);
-    }
-
-    fn sample(rendered: &str, series: &str) -> Option<f64> {
-        rendered.lines().find_map(|line| {
-            line.strip_prefix(series)
-                .and_then(|rest| rest.trim().parse().ok())
-        })
     }
 
     /// One confirmed head CAS counts one publication of its kind and the
@@ -2857,7 +2851,7 @@ mod horizon {
                 let storage =
                     ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
                         .unwrap();
-                let worker = worker_on(storage, 50);
+                let worker = worker_on(storage, 58);
                 let (_fixture, _) = aged_mixed_state(&worker.worker.store).await;
                 let now = horizon_now();
                 let id = ready_to_publish(&worker, now).await;
@@ -2866,7 +2860,7 @@ mod horizon {
                     .await
                     .unwrap()
                     .expect("published");
-                assert_eq!(outcome.purged_counts(), Some((1, 2)));
+                assert_eq!(outcome.purged_counts(), Some(CERTIFIED));
                 worker
                     .publish_at(&id, now)
                     .await
@@ -2874,11 +2868,21 @@ mod horizon {
                     .expect("re-observed");
             });
         });
-        let rendered = recorder.handle().render();
+        assert_counted_once(&recorder.handle().render());
+    }
+
+    /// What `aged_mixed_state` lets a horizon certify: one expired receipt
+    /// and two unobservable tombstones.
+    const CERTIFIED: PurgedCounts = PurgedCounts {
+        expired_rows: 1,
+        tombstones: 2,
+    };
+
+    fn assert_counted_once(rendered: &str) {
         assert_eq!(
             Some(1.0),
             sample(
-                &rendered,
+                rendered,
                 "arco_state_store_maintenance_published_total{domain=\"catalog\",kind=\"retention_horizon\"}"
             ),
             "{rendered}"
@@ -2886,7 +2890,7 @@ mod horizon {
         assert_eq!(
             Some(1.0),
             sample(
-                &rendered,
+                rendered,
                 "arco_state_store_retention_purged_rows_total{domain=\"catalog\",reason=\"expired\"}"
             ),
             "{rendered}"
@@ -2894,10 +2898,208 @@ mod horizon {
         assert_eq!(
             Some(2.0),
             sample(
-                &rendered,
+                rendered,
                 "arco_state_store_retention_purged_rows_total{domain=\"catalog\",reason=\"tombstone\"}"
             ),
             "{rendered}"
         );
+    }
+
+    /// The fault injected into the first progress-selector PUT that follows
+    /// an exact-version head pointer PUT: the window in which a publication
+    /// has landed but its `Published` revision is not yet selected.
+    enum SelectorFault {
+        /// Pause until released, so a same-binding peer can finish first.
+        Pause(oneshot::Sender<()>, oneshot::Receiver<()>),
+        /// Return an error without persisting, leaving the selector at
+        /// `Publishing`.
+        Fail,
+    }
+
+    /// Wraps the memory backend and injects one armed [`SelectorFault`].
+    struct SelectorFaultBackend {
+        inner: MemoryBackend,
+        head_landed: std::sync::atomic::AtomicBool,
+        fault: Mutex<Option<SelectorFault>>,
+    }
+    impl SelectorFaultBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryBackend::new(),
+                head_landed: std::sync::atomic::AtomicBool::new(false),
+                fault: Mutex::new(None),
+            })
+        }
+        /// Arms the fault for the selector PUT after the next head CAS;
+        /// head PUTs made by earlier commits are forgotten.
+        fn arm(&self, fault: SelectorFault) {
+            self.head_landed
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            *self.fault.lock().unwrap() = Some(fault);
+        }
+        fn arm_pause(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            self.arm(SelectorFault::Pause(reached_tx, release_rx));
+            (reached_rx, release_tx)
+        }
+    }
+    #[async_trait]
+    impl StorageBackend for SelectorFaultBackend {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path.ends_with("/head/current.json")
+                && matches!(precondition, WritePrecondition::MatchesVersion(_))
+            {
+                self.head_landed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let fault = if self.head_landed.load(std::sync::atomic::Ordering::SeqCst)
+                && path.ends_with("/selected.json")
+            {
+                self.fault.lock().unwrap().take()
+            } else {
+                None
+            };
+            match fault {
+                Some(SelectorFault::Pause(reached, release)) => {
+                    reached.send(()).ok();
+                    release.await.ok();
+                }
+                Some(SelectorFault::Fail) => {
+                    return Err(arco_core::Error::storage(
+                        "injected: progress selector PUT failed after the head CAS".to_string(),
+                    ));
+                }
+                None => {}
+            }
+            self.inner.put(path, data, precondition).await
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    /// Two workers sharing the binding both observe the landed head and both
+    /// finish the job: the peer's selector CAS advances it and counts; the
+    /// paused worker's CAS finds identical bytes already visible and counts
+    /// nothing.
+    #[test]
+    fn overlapping_same_binding_finishes_count_one_publication() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let backend = SelectorFaultBackend::new();
+                let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+                let first = worker_on(storage.clone(), 59);
+                let peer = worker_on(storage, 59);
+                let (_fixture, _) = aged_mixed_state(&first.worker.store).await;
+                let now = horizon_now();
+                let id = ready_to_publish(&first, now).await;
+                let (reached, release) = backend.arm_pause();
+                let peer_finishes = async {
+                    reached.await.unwrap();
+                    let outcome = peer
+                        .publish_at(&id, now)
+                        .await
+                        .unwrap()
+                        .expect("the peer finishes the landed publication");
+                    release.send(()).unwrap();
+                    outcome
+                };
+                let (paused, finished) = tokio::join!(first.publish_at(&id, now), peer_finishes);
+                assert_eq!(
+                    paused.unwrap().expect("already visible"),
+                    finished,
+                    "both invocations report the one publication"
+                );
+                assert_eq!(finished.kind(), MaintenanceKind::RetentionHorizon);
+                assert_eq!(finished.purged_counts(), Some(CERTIFIED));
+                let (_, after) = head(&first.worker.store).await;
+                assert_eq!(after.layout_generation, 1);
+            });
+        });
+        assert_counted_once(&recorder.handle().render());
+    }
+
+    /// A selector PUT that fails after the head CAS leaves the job at
+    /// `Publishing` with the publication landed; the invocation that resumes
+    /// it advances the selector and counts the publication exactly once.
+    #[test]
+    fn a_failed_selector_put_after_the_head_cas_counts_the_publication_once_on_resume() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let backend = SelectorFaultBackend::new();
+                let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+                let worker = worker_on(storage, 60);
+                let store = &worker.worker.store;
+                let (_fixture, _) = aged_mixed_state(store).await;
+                let now = horizon_now();
+                let id = ready_to_publish(&worker, now).await;
+                backend.arm(SelectorFault::Fail);
+                let failed = worker.publish_at(&id, now).await;
+                assert!(failed.is_err(), "{failed:?}");
+                let (_, landed) = head(store).await;
+                assert!(
+                    landed.retention_horizon.is_some(),
+                    "the head CAS landed before the selector fault"
+                );
+                assert_eq!(landed.layout_generation, 1);
+
+                let outcome = worker
+                    .publish_at(&id, now)
+                    .await
+                    .unwrap()
+                    .expect("the resume finishes the landed publication");
+                assert_eq!(outcome.kind(), MaintenanceKind::RetentionHorizon);
+                assert_eq!(outcome.purged_counts(), Some(CERTIFIED));
+                assert_eq!(
+                    outcome.selected_token().authority_manifest_id(),
+                    landed.manifest_id,
+                    "the resume selects the landed manifest rather than publishing again"
+                );
+                let (_, after) = head(store).await;
+                assert_eq!(after.manifest_id, landed.manifest_id);
+                // Re-observing the published evidence counts nothing more.
+                assert_eq!(worker.publish_at(&id, now).await.unwrap().unwrap(), outcome);
+            });
+        });
+        assert_counted_once(&recorder.handle().render());
     }
 }

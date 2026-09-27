@@ -6,6 +6,8 @@
 use arco_core::CatalogDomain;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 
+use crate::state_store::{MaintenanceKind, PurgedCounts};
+
 // ============================================================================
 // GC Metrics
 // ============================================================================
@@ -142,12 +144,17 @@ pub const STATE_STORE_AMBIGUOUS_OUTCOMES: &str = "arco_state_store_ambiguous_out
 /// L0 segments carried by the latest candidate manifest gauge (label: domain).
 pub const STATE_STORE_L0_SEGMENTS: &str = "arco_state_store_l0_segments";
 
-/// Durable maintenance publications confirmed by exact head CAS counter
-/// (labels: domain, kind in {`consolidation`, `retention_horizon`}).
+/// Durable maintenance publications counter (labels: domain, kind in
+/// {`consolidation`, `retention_horizon`}).
+///
+/// Counted at most once per publication, by the invocation whose
+/// progress-selector CAS advanced the job to `Published`; a publication
+/// whose selector PUT persisted but reported an error is never counted.
 pub const STATE_STORE_MAINTENANCE_PUBLISHED: &str = "arco_state_store_maintenance_published_total";
 
 /// Rows purged by published retention horizon certificates counter
-/// (labels: domain, reason in {expired, tombstone}).
+/// (labels: domain, reason in {`expired`, `tombstone`}), under the same
+/// at-most-once accounting as the publications counter.
 pub const STATE_STORE_RETENTION_PURGED_ROWS: &str = "arco_state_store_retention_purged_rows_total";
 
 /// Acknowledged projection outbox records removed by trim commits counter
@@ -550,15 +557,13 @@ pub fn record_projection_watermark(domain: &str, consumer: &str, lag: u64, age_s
     .set(age_seconds);
 }
 
-/// Records one durable maintenance publication confirmed by exact head CAS.
-///
-/// `kind` is the job kind's `snake_case` name: `consolidation` or
-/// `retention_horizon`.
-pub fn record_maintenance_published(domain: &str, kind: &str) {
+/// Records one durable maintenance publication; the `kind` label is the
+/// job kind's `snake_case` name.
+pub fn record_maintenance_published(domain: &str, kind: MaintenanceKind) {
     counter!(
         STATE_STORE_MAINTENANCE_PUBLISHED,
         "domain" => domain.to_string(),
-        "kind" => kind.to_string()
+        "kind" => kind.as_str().to_string()
     )
     .increment(1);
 }
@@ -566,8 +571,11 @@ pub fn record_maintenance_published(domain: &str, kind: &str) {
 /// Records the rows a published retention horizon certificate purged, by
 /// reason. A zero count records nothing, so a reason with no purge has no
 /// series.
-pub fn record_retention_purged_rows(domain: &str, expired: u64, tombstones: u64) {
-    for (reason, count) in [("expired", expired), ("tombstone", tombstones)] {
+pub fn record_retention_purged_rows(domain: &str, counts: PurgedCounts) {
+    for (reason, count) in [
+        ("expired", counts.expired_rows),
+        ("tombstone", counts.tombstones),
+    ] {
         if count == 0 {
             continue;
         }
@@ -715,6 +723,16 @@ pub fn record_repair_repeat(
     .increment(1);
 }
 
+/// Reads one sample from a rendered Prometheus exposition by its exact
+/// series prefix (name plus label set), for recorder-backed tests.
+#[cfg(test)]
+pub(crate) fn sample(rendered: &str, series: &str) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        line.strip_prefix(series)
+            .and_then(|rest| rest.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -727,14 +745,10 @@ mod tests {
     use arco_core::{MemoryBackend, ScopedStorage};
     use metrics_exporter_prometheus::PrometheusBuilder;
 
-    use crate::state_store::{ControlMvpStateStore, StateScope, TxnOptions};
-
-    fn sample(rendered: &str, series: &str) -> Option<f64> {
-        rendered.lines().find_map(|line| {
-            line.strip_prefix(series)
-                .and_then(|rest| rest.trim().parse().ok())
-        })
-    }
+    use super::sample;
+    use crate::state_store::{
+        ControlMvpStateStore, MaintenanceKind, PurgedCounts, StateScope, TxnOptions,
+    };
 
     /// One control-store commit publishes its head once and carries one L0
     /// segment; the counters must be observable through the metrics facade.
@@ -799,8 +813,14 @@ mod tests {
     fn maintenance_and_trim_emitters_label_series_and_skip_zero_increments() {
         let recorder = PrometheusBuilder::new().build_recorder();
         metrics::with_local_recorder(&recorder, || {
-            super::record_maintenance_published("catalog", "consolidation");
-            super::record_retention_purged_rows("catalog", 0, 3);
+            super::record_maintenance_published("catalog", MaintenanceKind::Consolidation);
+            super::record_retention_purged_rows(
+                "catalog",
+                PurgedCounts {
+                    expired_rows: 0,
+                    tombstones: 3,
+                },
+            );
             super::record_outbox_trimmed("catalog", "idle", 0);
             super::record_outbox_trimmed("catalog", "parquet", 4);
         });

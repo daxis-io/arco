@@ -363,9 +363,9 @@ impl DrainSummary {
 }
 
 /// One maintenance job a run drove for a domain, or the kernel's refusal to
-/// admit one (`idle`). A run records, per domain, the replayed job when a
-/// persisted identity existed, then up to one consolidation and one
-/// retention horizon entry (see [`maintain_domain`]).
+/// admit one (`idle`). A run records at most two entries per domain: one
+/// consolidation and one retention horizon, either of which may be the
+/// replayed job of an earlier run (see [`maintain_domain`]).
 #[derive(Debug, Serialize)]
 struct DomainMaintenanceSummary {
     domain: String,
@@ -412,11 +412,14 @@ impl DomainMaintenanceSummary {
         }
     }
 
-    /// Seals the entry with its outcome and elapsed time.
-    fn finished(mut self, outcome: MaintenanceOutcome) -> Self {
+    /// Seals the entry with its outcome and elapsed time, logs it and records
+    /// it in `entries`. Recording happens as each job finishes so a typed
+    /// error in a later step never hides an earlier publication.
+    fn finish_into(mut self, outcome: MaintenanceOutcome, entries: &mut Vec<Self>) {
         self.outcome = outcome;
         self.elapsed_ms = elapsed_ms(self.started);
-        self
+        self.log();
+        entries.push(self);
     }
 
     fn log(&self) {
@@ -959,23 +962,25 @@ async fn drive_fresh_job(
     finish_job(storage, worker, &job_id, progress, max_advances, summary).await
 }
 
-/// Runs one domain's maintenance phase and returns one entry per job
-/// considered, in order:
+/// Runs one domain's maintenance phase: one consolidation slot, then one
+/// retention horizon slot. Each finished job is logged and recorded in
+/// `entries` at once (at most two per domain), so a typed error in a later
+/// step never hides an earlier publication.
 ///
-/// 1. A persisted job identity is replayed first, whatever its kind. The
-///    domain's phase ends here unless the job finished (`published` or
-///    `terminal`, which clears the record); a `deferred` or `exhausted` job
-///    keeps its record and is replayed next run, and nothing else may start
-///    while it exists.
-/// 2. A consolidation is prepared and driven (`idle` when no intent is
-///    pending).
-/// 3. When that consolidation ended `idle` or `published`, a retention
-///    horizon is prepared and driven over the consolidated head (`idle` when
-///    no row is purge-eligible). A replayed job that was itself a horizon is
-///    this run's horizon: a second one never starts in the same run.
+/// 1. A persisted job identity is replayed first, whatever its kind, and
+///    fills this run's slot for that kind. The domain's phase ends here
+///    unless the job finished (`published` or `terminal`, which clears the
+///    record); a `deferred` or `exhausted` job keeps its record and is
+///    replayed next run, and nothing else may start while it exists.
+/// 2. Unless a replayed consolidation filled its slot, a consolidation is
+///    prepared and driven (`idle` when no intent is pending).
+/// 3. Unless a replayed horizon filled its slot, a retention horizon is
+///    prepared and driven over the consolidated head (`idle` when no row is
+///    purge-eligible) once the consolidation slot ended `idle` or
+///    `published`, or was filled by a replayed job that finished.
 ///
 /// An abandoned record (expired, or never activated) is cleared during
-/// recovery and reported on the consolidation entry it gives way to.
+/// recovery and gives way to a fresh consolidation on the same entry.
 async fn maintain_domain(
     storage: ScopedStorage,
     tenant: &str,
@@ -983,19 +988,19 @@ async fn maintain_domain(
     domain: &str,
     binding: DurableAuthorityBinding,
     max_advances: usize,
-) -> Result<Vec<DomainMaintenanceSummary>> {
+    entries: &mut Vec<DomainMaintenanceSummary>,
+) -> Result<()> {
     let scope = StateScope::new(tenant, workspace, domain);
     let worker = DurableMaintenanceWorker::new(storage.clone(), scope, binding)
         .with_context(|| format!("construct maintenance worker for domain {domain}"))?;
-    let mut entries = Vec::with_capacity(2);
-    let mut horizon_ran = false;
+    let mut replayed: Option<MaintenanceKind> = None;
     let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
 
     if let Some(record) = load_selected_job(&storage, domain).await? {
         match recover_selected_job(&storage, &worker, &record, &mut summary).await? {
             Recovery::Resume(job_id, progress) => {
-                summary.kind = progress.kind.as_str();
-                horizon_ran = progress.kind == MaintenanceKind::RetentionHorizon;
+                let kind = progress.kind;
+                summary.kind = kind.as_str();
                 let outcome = finish_job(
                     &storage,
                     &worker,
@@ -1009,15 +1014,16 @@ async fn maintain_domain(
                     outcome,
                     MaintenanceOutcome::Published | MaintenanceOutcome::Terminal
                 );
-                entries.push(summary.finished(outcome));
+                summary.finish_into(outcome, entries);
                 if !record_cleared {
-                    return Ok(entries);
+                    return Ok(());
                 }
+                replayed = Some(kind);
                 summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
             }
             Recovery::Deferred => {
-                entries.push(summary.finished(MaintenanceOutcome::Deferred));
-                return Ok(entries);
+                summary.finish_into(MaintenanceOutcome::Deferred, entries);
+                return Ok(());
             }
             Recovery::Fresh => {
                 summary.recovered = false;
@@ -1026,23 +1032,31 @@ async fn maintain_domain(
         }
     }
 
-    let outcome = drive_fresh_job(
-        &storage,
-        &worker,
-        MaintenanceKind::Consolidation,
-        max_advances,
-        &mut summary,
-    )
-    .await?;
-    // `published` cleared the record in `finish_job`; `idle` never persisted
-    // one. Every other outcome leaves a record the horizon must not overwrite.
-    let horizon_may_follow = matches!(
-        outcome,
-        MaintenanceOutcome::Idle | MaintenanceOutcome::Published
-    );
-    entries.push(summary.finished(outcome));
-    if horizon_ran || !horizon_may_follow {
-        return Ok(entries);
+    let horizon_may_follow = if replayed == Some(MaintenanceKind::Consolidation) {
+        // The replayed consolidation filled this run's slot and cleared its
+        // record; the horizon runs over the head it published.
+        true
+    } else {
+        let outcome = drive_fresh_job(
+            &storage,
+            &worker,
+            MaintenanceKind::Consolidation,
+            max_advances,
+            &mut summary,
+        )
+        .await?;
+        // `published` cleared the record in `finish_job`; `idle` never
+        // persisted one. Every other outcome leaves a record the horizon must
+        // not overwrite.
+        let may_follow = matches!(
+            outcome,
+            MaintenanceOutcome::Idle | MaintenanceOutcome::Published
+        );
+        summary.finish_into(outcome, entries);
+        may_follow
+    };
+    if replayed == Some(MaintenanceKind::RetentionHorizon) || !horizon_may_follow {
+        return Ok(());
     }
 
     let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::RetentionHorizon);
@@ -1054,8 +1068,8 @@ async fn maintain_domain(
         &mut summary,
     )
     .await?;
-    entries.push(summary.finished(outcome));
-    Ok(entries)
+    summary.finish_into(outcome, entries);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,23 +1171,20 @@ async fn run_once(
     }
 
     for domain in CONTROL_DOMAINS {
-        match maintain_domain(
+        // Finished entries are logged and recorded by `maintain_domain` as
+        // they complete, so they survive a failure in a later step.
+        if let Err(error) = maintain_domain(
             storage.clone(),
             tenant,
             workspace,
             domain,
             binding,
             limits.maintenance_max_advances,
+            &mut summary.maintenance,
         )
         .await
         {
-            Ok(entries) => {
-                for entry in entries {
-                    entry.log();
-                    summary.maintenance.push(entry);
-                }
-            }
-            Err(error) => summary.fail("maintenance", domain, &error),
+            summary.fail("maintenance", domain, &error);
         }
     }
 
@@ -1299,13 +1310,16 @@ async fn main() -> Result<()> {
 mod tests {
     use std::ops::Range;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arco_catalog::{
         ArcoStateReader as _, ArcoStateTxn as _, CatalogProjectionNotifier,
         ControlCatalogAuthority, ControlMvpStateStore, ProjectionIntentV1, TxnOptions,
         WriteOptions,
     };
-    use arco_core::MemoryBackend;
+    use arco_core::storage::{ListPage, ObjectMeta, StorageBackend};
+    use arco_core::{MemoryBackend, WriteResult};
+    use async_trait::async_trait;
     use chrono::Duration;
 
     use super::*;
@@ -1707,6 +1721,133 @@ mod tests {
         Ok(())
     }
 
+    /// Wraps the memory backend and fails the `n`-th `put` of a path ending
+    /// in `suffix` with a storage error, so one worker step errors after the
+    /// steps before it succeeded.
+    struct FailNthPut {
+        inner: MemoryBackend,
+        suffix: &'static str,
+        fail_on: usize,
+        seen: AtomicUsize,
+        fired: AtomicBool,
+    }
+
+    impl FailNthPut {
+        fn new(suffix: &'static str, fail_on: usize) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                suffix,
+                fail_on,
+                seen: AtomicUsize::new(0),
+                fired: AtomicBool::new(false),
+            }
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for FailNthPut {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            precondition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            if path.ends_with(self.suffix)
+                && self.seen.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on
+            {
+                self.fired.store(true, Ordering::SeqCst);
+                return Err(arco_core::Error::Storage {
+                    message: format!("injected failure writing {path}"),
+                    source: None,
+                });
+            }
+            self.inner.put(path, data, precondition).await
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+            self.inner.list(prefix).await
+        }
+        async fn list_page(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            limit: usize,
+        ) -> arco_core::Result<ListPage> {
+            self.inner.list_page(prefix, start_after, limit).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(
+            &self,
+            path: &str,
+            expiry: std::time::Duration,
+        ) -> arco_core::Result<String> {
+            self.inner.signed_url(path, expiry).await
+        }
+    }
+
+    #[tokio::test]
+    async fn run_once_keeps_a_published_consolidation_when_the_horizon_step_fails() -> Result<()> {
+        // The catalog consolidation persists the run's first job identity and
+        // the catalog horizon the second; failing that second write is a
+        // typed (non-deferrable) error in the horizon step after a publication.
+        let backend = Arc::new(FailNthPut::new("/selected-job.json", 2));
+        let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE)?;
+        seed_plain_commits(&storage, 16).await?;
+        seed_expired_row(&storage).await?;
+
+        let summary = run(&storage).await?;
+
+        assert!(
+            backend.fired(),
+            "the injected failure must hit the horizon's identity write"
+        );
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![("consolidation", MaintenanceOutcome::Published)],
+            "the published consolidation stays recorded; the failed horizon has no entry"
+        );
+        assert!(
+            !pending_intent(&storage).await?,
+            "the consolidation really published"
+        );
+        assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
+        assert!(
+            summary.failures[0].starts_with("maintenance[catalog]:"),
+            "{}",
+            summary.failures[0]
+        );
+        assert!(summary.exit_error().is_some());
+        // The other domain and the later phases still ran.
+        assert_eq!(
+            domain_entries(&summary, PROJECTION_OUTBOX_ACK_DOMAIN),
+            vec![
+                ("consolidation", MaintenanceOutcome::Idle),
+                ("retention_horizon", MaintenanceOutcome::Idle),
+            ]
+        );
+        assert!(summary.drain.is_some());
+        assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len());
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "the failed write persisted nothing to replay"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn run_once_recovers_a_persisted_job_after_a_mid_activation_kill() -> Result<()> {
         let storage = test_storage()?;
@@ -1738,10 +1879,9 @@ mod tests {
             domain_entries(&summary, "catalog"),
             vec![
                 ("consolidation", MaintenanceOutcome::Published),
-                ("consolidation", MaintenanceOutcome::Idle),
                 ("retention_horizon", MaintenanceOutcome::Idle),
             ],
-            "the replayed job finishes, then a fresh consolidation check and the horizon follow"
+            "the replayed job fills the consolidation slot; the horizon follows it directly"
         );
         let catalog = domain_summary(&summary, "catalog", "consolidation")?;
         assert_eq!(catalog.outcome, MaintenanceOutcome::Published);
@@ -1795,7 +1935,6 @@ mod tests {
             domain_entries(&summary, "catalog"),
             vec![
                 ("consolidation", MaintenanceOutcome::Published),
-                ("consolidation", MaintenanceOutcome::Idle),
                 ("retention_horizon", MaintenanceOutcome::Idle),
             ]
         );

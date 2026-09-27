@@ -132,3 +132,16 @@ Steps:
   records (at-least-once) and the following trim removes them; the
   backpressure deferral is covered end to end and the classifier by a unit
   test.
+- Superseded horizon (fix after Package D): `publish_at` on a
+  `ReadyToPublish` horizon job whose recomputed purged set differs from the
+  admitted plan's (a later commit rewrote a purged key) records the job
+  `Superseded` before returning the `PreconditionFailed` refusal, which is
+  permanent for the job; `prepare_publication` reports the mismatch as a
+  typed `Preparation::PurgedSetSuperseded` outcome rather than an error,
+  and the pending-attempt path is unchanged because its head is fixed at
+  the source the attempt was validated against. The worker re-reads a job
+  whose publication was deferred (`resume_at`, once) and ends it
+  `terminal` when the status is `Failed`, `Superseded` or `Abandoned`, so
+  the record is cleared and consolidation proceeds in the same run; a
+  fresh horizon recomputes the purge next run. The Package D runbook text
+  describing a 24 h `deferred` block is replaced accordingly.

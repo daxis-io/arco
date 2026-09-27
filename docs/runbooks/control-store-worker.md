@@ -44,8 +44,11 @@ history.
      and tombstones at or below the horizon; live rows and outbox rows are
      never purged. It admits no plan (`idle`) when no row is purge-eligible.
      Before the head CAS the kernel recomputes the purge over a fresh replay
-     of the parent and refuses with `PreconditionFailed` when a later commit
-     rewrote a purged key; the worker reports that as `deferred` (see
+     of the parent; when a later commit rewrote a purged key it records the
+     job `Superseded` (the refusal is permanent for the job) and refuses
+     with `PreconditionFailed`. The worker re-reads the job once and reports
+     it as `terminal` in the same run: the record is cleared, consolidation
+     proceeds, and a fresh horizon recomputes the purge next run (see
      "Known limitations").
    - *Recovery.* If a persisted identity already exists from an earlier run,
      the worker resumes that exact job first, whatever its kind (`resume_at`
@@ -226,16 +229,18 @@ Maintenance `outcome` values:
   was replayed from an earlier run's persisted identity.
 - `deferred`: another actor holds or consumed the source (a
   `PreconditionFailed`/`CasFailed` from recover/prepare/start/resume/advance/
-  publish, a publication consumed by a different publication, or a
-  `retention_horizon` whose purged set a later commit superseded). The run
+  publish, or a publication consumed by a different publication). The run
   still exits `0`; a persisted identity stays in place and the next run
   replays it. Repeated `deferred` on the same domain across several runs means
   one of: the `epoch` phase reports `in_flight`/`stuck_epoch` (fix the epoch
   first), a manual `gcloud run jobs execute` overlapping the scheduled run, or
   a restore/snapshot workflow holding the workspace retention lock.
 - `terminal`: the job reached `Failed`, `Superseded` or `Abandoned`; its
-  persisted identity is cleared and the next run prepares a fresh plan.
-  Investigate if it repeats.
+  persisted identity is cleared and the next run prepares a fresh plan. A
+  `retention_horizon` whose purged set a later commit rewrote ends here in
+  the run that observes the refusal (the worker re-reads a job whose
+  publication was deferred and finds it `Superseded`), and consolidation
+  still runs in that run. Investigate if it repeats without such a commit.
 - `exhausted`: the advance budget ran out before `ReadyToPublish`. Raise
   `ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES` or run the job again; the job
   resumes from durable progress via its persisted identity.
@@ -353,16 +358,14 @@ Remedy, in order:
   rewrites no status, until a catalog mutation is materialized.
   `ArcoProjectionWatermarkLagHigh` fires at 1000 and is unaffected;
   `pending_records` is the truthful backlog signal.
-- **A horizon superseded by a later commit stays `deferred` until its record
-  expires.** When a commit after preparation rewrote a purged key,
-  `publish_at` refuses with `PreconditionFailed` and leaves the job's status
-  unchanged; the worker reports `deferred`, keeps the record, and every
-  following run replays the same job into the same refusal. The worker
-  prepares a fresh plan only once the record is older than the 24 h
-  descriptor lifetime (root recovery then clears it), and nothing else runs
-  in that domain's maintenance phase meanwhile, consolidation included. It
-  has no path to abandon the job earlier (`DurableMaintenanceWorker::abandon_at`
-  is the kernel operation).
+- **A horizon superseded by a later commit recomputes one run later.** When
+  a commit after preparation rewrote a purged key, `publish_at` records the
+  job `Superseded` (the refusal is permanent: the purged set is fixed by the
+  job identity) and refuses with `PreconditionFailed`. The worker re-reads
+  the job, reports `terminal` in the run that observes the refusal, clears
+  its record, and runs consolidation in that same run; the purge is
+  recomputed by a fresh horizon prepared on the next run, because a domain
+  drives at most one horizon per run. No operator action is needed.
 - **Writer clocks more than one hour behind object-store time defeat the
   skew margin.** The horizon's purge cutoff and age bound subtract a
   one-hour clock-skew margin from the job's clock. A writer whose clock lags

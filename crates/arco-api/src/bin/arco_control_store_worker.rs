@@ -912,7 +912,64 @@ async fn publish_job(
             );
             Ok(MaintenanceOutcome::Deferred)
         }
-        Step::Deferred => Ok(MaintenanceOutcome::Deferred),
+        // Boxed: the kernel re-read would otherwise push `run_once` past the
+        // large-futures threshold.
+        Step::Deferred => {
+            Ok(Box::pin(outcome_after_deferred_publication(worker, job_id, summary)).await)
+        }
+    }
+}
+
+/// A deferred publication may have recorded the job terminal itself: the
+/// kernel records a horizon whose purged set a later commit rewrote as
+/// `Superseded` before refusing with `PreconditionFailed`, a refusal that is
+/// permanent for the job. One re-read lets such a job end this run
+/// (`terminal` clears its record, so consolidation proceeds and a fresh plan
+/// is prepared next run) instead of being replayed into the same refusal on
+/// every run until its record expires. Any other status, and a re-read that
+/// is itself deferred or fails, keeps the deferral: the record stays and the
+/// next run replays the job.
+async fn outcome_after_deferred_publication(
+    worker: &DurableMaintenanceWorker,
+    job_id: &MaintenanceJobId,
+    summary: &DomainMaintenanceSummary,
+) -> MaintenanceOutcome {
+    match classify_step(
+        &summary.domain,
+        summary.kind,
+        "resume",
+        worker.resume_at(job_id, Utc::now()).await,
+    ) {
+        Ok(Step::Ready(progress))
+            if matches!(
+                progress.status,
+                MaintenanceStatus::Failed
+                    | MaintenanceStatus::Superseded
+                    | MaintenanceStatus::Abandoned
+            ) =>
+        {
+            tracing::warn!(
+                phase = "maintenance",
+                domain = %summary.domain,
+                kind = summary.kind,
+                job_id = job_id.as_str(),
+                status = ?progress.status,
+                "maintenance job is terminal; its persisted identity is cleared and a fresh plan is prepared"
+            );
+            MaintenanceOutcome::Terminal
+        }
+        Ok(Step::Ready(_) | Step::Deferred) => MaintenanceOutcome::Deferred,
+        Err(error) => {
+            tracing::warn!(
+                phase = "maintenance",
+                domain = %summary.domain,
+                kind = summary.kind,
+                job_id = job_id.as_str(),
+                error = format!("{error:#}"),
+                "maintenance job could not be re-read after its deferred publication; the deferral stands"
+            );
+            MaintenanceOutcome::Deferred
+        }
     }
 }
 
@@ -1588,6 +1645,26 @@ mod tests {
         Ok(store)
     }
 
+    /// A previous run prepared a horizon plan over the current catalog head,
+    /// persisted its identity, activated it and died; returns the job id.
+    async fn activate_persisted_horizon(storage: &ScopedStorage) -> Result<String> {
+        let dead = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
+        let now = Utc::now();
+        let plan = dead
+            .prepare_horizon_at(now)
+            .await?
+            .ok_or_else(|| anyhow!("an expired row must admit a horizon plan"))?;
+        assert_eq!(plan.kind(), MaintenanceKind::RetentionHorizon);
+        let persisted = plan.job_id().as_str().to_owned();
+        persist_selected_job(
+            storage,
+            &catalog_job_record(&persisted, MaintenanceKind::RetentionHorizon, now),
+        )
+        .await?;
+        dead.start_at(&plan, now).await?;
+        Ok(persisted)
+    }
+
     /// Seeds real catalog DDL commits, each staging one projection intent.
     async fn seed_catalog_intents(storage: &ScopedStorage, range: Range<usize>) -> Result<()> {
         let authority = ControlCatalogAuthority::new(storage.clone(), catalog_scope())?
@@ -1915,22 +1992,7 @@ mod tests {
     async fn run_once_resumes_a_persisted_horizon_job() -> Result<()> {
         let storage = test_storage()?;
         seed_expired_row(&storage).await?;
-        // A previous run prepared, persisted and activated a horizon job, then died.
-        let dead = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
-        let now = Utc::now();
-        let plan = dead
-            .prepare_horizon_at(now)
-            .await?
-            .ok_or_else(|| anyhow!("an expired row must admit a horizon plan"))?;
-        assert_eq!(plan.kind(), MaintenanceKind::RetentionHorizon);
-        let persisted = plan.job_id().as_str().to_owned();
-        persist_selected_job(
-            &storage,
-            &catalog_job_record(&persisted, MaintenanceKind::RetentionHorizon, now),
-        )
-        .await?;
-        dead.start_at(&plan, now).await?;
-        drop(dead);
+        let persisted = activate_persisted_horizon(&storage).await?;
 
         let summary = run(&storage).await?;
 
@@ -1954,6 +2016,107 @@ mod tests {
         );
         let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
         assert_eq!(reader.get(b"expired").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_supersedes_a_horizon_whose_purged_key_was_rewritten_and_recomputes_next_run()
+    -> Result<()> {
+        let storage = test_storage()?;
+        let store = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        let now_ms = Utc::now().timestamp_millis();
+        let mut tx = store.begin_control_txn(TxnOptions::default()).await?;
+        tx.put(b"live", Bytes::from_static(b"live")).await?;
+        tx.put_with_expiry(
+            b"rewritten",
+            Bytes::from_static(b"expired"),
+            now_ms - 2 * HOUR_MS,
+        )
+        .await?;
+        tx.put_with_expiry(
+            b"expired",
+            Bytes::from_static(b"expired"),
+            now_ms - 2 * HOUR_MS,
+        )
+        .await?;
+        tx.commit().await?;
+        // The activated job's admitted purged set holds both expired rows.
+        let persisted = activate_persisted_horizon(&storage).await?;
+        // A later commit rewrites one purged key, so the admitted purged set
+        // no longer describes the parent: the job can never publish.
+        let mut tx = store.begin_control_txn(TxnOptions::default()).await?;
+        tx.put(b"rewritten", Bytes::from_static(b"reborn")).await?;
+        tx.commit().await?;
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            domain_entries(&summary, "catalog"),
+            vec![
+                ("retention_horizon", MaintenanceOutcome::Terminal),
+                ("consolidation", MaintenanceOutcome::Idle),
+            ],
+            "the superseded horizon ends terminal in the run that observes the refusal, and consolidation proceeds"
+        );
+        let horizon = domain_summary(&summary, "catalog", "retention_horizon")?;
+        assert!(horizon.recovered);
+        assert_eq!(horizon.job_id.as_deref(), Some(persisted.as_str()));
+        assert_eq!(horizon.layout_generation, None);
+        assert_eq!(horizon.purged_expired_rows, None);
+        assert_eq!(horizon.purged_tombstones, None);
+        assert!(
+            load_selected_job(&storage, "catalog").await?.is_none(),
+            "a terminal job clears its persisted record"
+        );
+        let kernel = DurableMaintenanceWorker::new(storage.clone(), catalog_scope(), BINDING)?;
+        assert_eq!(
+            kernel
+                .resume_at(&MaintenanceJobId::parse(persisted.clone())?, Utc::now())
+                .await?
+                .status,
+            MaintenanceStatus::Superseded,
+            "the kernel recorded the refusal as terminal"
+        );
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(
+            reader.get(b"rewritten").await?,
+            Some(Bytes::from_static(b"reborn"))
+        );
+        assert_eq!(
+            reader.get(b"expired").await?,
+            Some(Bytes::from_static(b"expired")),
+            "a superseded job purges nothing"
+        );
+
+        let second = run(&storage).await?;
+
+        assert!(second.failures.is_empty(), "{:?}", second.failures);
+        assert_eq!(
+            domain_entries(&second, "catalog"),
+            vec![
+                ("consolidation", MaintenanceOutcome::Idle),
+                ("retention_horizon", MaintenanceOutcome::Published),
+            ],
+            "a fresh horizon recomputes the purge over the rewritten parent"
+        );
+        let horizon = domain_summary(&second, "catalog", "retention_horizon")?;
+        assert!(!horizon.recovered);
+        assert_ne!(horizon.job_id.as_deref(), Some(persisted.as_str()));
+        assert_eq!(horizon.purged_expired_rows, Some(1));
+        assert_eq!(horizon.purged_tombstones, Some(0));
+        assert!(load_selected_job(&storage, "catalog").await?.is_none());
+        let reader = ControlMvpStateStore::new(storage.clone(), catalog_scope())?;
+        assert_eq!(reader.get(b"expired").await?, None);
+        assert_eq!(
+            reader.get(b"rewritten").await?,
+            Some(Bytes::from_static(b"reborn")),
+            "the rewritten key is live and stays readable"
+        );
+        assert_eq!(
+            reader.get(b"live").await?,
+            Some(Bytes::from_static(b"live"))
+        );
         Ok(())
     }
 

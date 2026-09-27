@@ -914,7 +914,9 @@ pub enum MaintenanceStatus {
     Publishing,
     /// Exact publication evidence confirms selection.
     Published,
-    /// Source compatibility was consumed by a different publication.
+    /// Source compatibility was consumed by a different publication, or a
+    /// horizon job's admitted purged set was rewritten by a later commit
+    /// before any attempt was submitted.
     Superseded,
     /// The job was abandoned before any unresolved publication.
     Abandoned,
@@ -2599,6 +2601,24 @@ struct PublicationCandidate {
     manifest: Bytes,
 }
 
+/// What validating a complete job against the current head produced.
+enum Preparation {
+    /// A candidate whose fenced head CAS may be submitted.
+    Candidate(Box<PublicationCandidate>),
+    /// A horizon job whose admitted purged set no longer describes "parent
+    /// minus child": a suffix commit rewrote a purged key. The purged set is
+    /// fixed by the job identity and a rewritten key can never re-enter it,
+    /// so no attempt of this job can ever be certified; the refusal is
+    /// permanent for the job, unlike the transient refusals that share
+    /// `PreconditionFailed`.
+    PurgedSetSuperseded,
+}
+
+/// The refusal reported for [`Preparation::PurgedSetSuperseded`].
+fn purged_set_superseded() -> CatalogError {
+    precondition_failed("retention horizon purged set was superseded by later commits")
+}
+
 async fn read_attempt(
     store: &ControlMvpStateStore,
     id: &MaintenanceJobId,
@@ -2673,7 +2693,7 @@ impl DurableMaintenanceWorker {
         id: &MaintenanceJobId,
         job: &LoadedJob,
         ordinal: usize,
-    ) -> Result<PublicationCandidate> {
+    ) -> Result<Preparation> {
         if ordinal >= 16 {
             return Err(maintenance_capacity(
                 "maintenance publication attempt limit",
@@ -2751,8 +2771,8 @@ impl DurableMaintenanceWorker {
         // replay of the parent (bounded to rows the render cut held) and
         // requires the purged digest and counts to equal the admitted plan's:
         // a suffix that rewrote a purged key since preparation makes the
-        // admitted set stale, and the job is superseded rather than
-        // certified against the wrong parent.
+        // admitted set stale for good, and the job is reported superseded
+        // rather than certified against the wrong parent.
         let (final_state, final_checksum, certificate) = {
             let _phase = cost::PhaseGuard::enter("maintenance-final-equivalence");
             match (
@@ -2769,9 +2789,7 @@ impl DurableMaintenanceWorker {
                     if recomputed.purged_rows_sha256 != purge.purged_rows_sha256
                         || recomputed.purged_counts != purge.purged_counts
                     {
-                        return Err(precondition_failed(
-                            "retention horizon purged set was superseded by later commits",
-                        ));
+                        return Ok(Preparation::PurgedSetSuperseded);
                     }
                     let checksum = pruned.checksum()?;
                     let certificate = RetentionHorizonV1 {
@@ -2918,7 +2936,10 @@ impl DurableMaintenanceWorker {
             candidate_digest,
             pointer: pointer_bytes.to_vec(),
         };
-        Ok(PublicationCandidate { attempt, manifest })
+        Ok(Preparation::Candidate(Box::new(PublicationCandidate {
+            attempt,
+            manifest,
+        })))
     }
 
     fn load_attempt(job: &LoadedJob) -> Result<PublicationAttempt> {
@@ -2990,7 +3011,10 @@ impl DurableMaintenanceWorker {
 
     /// Fully validates and submits at most one fenced HEAD CAS. A selected
     /// pending attempt is reconciled or identically resubmitted; completed L1
-    /// objects are never rendered or PUT again.
+    /// objects are never rendered or PUT again. A horizon job whose admitted
+    /// purged set a later commit rewrote is recorded `Superseded` before its
+    /// first attempt and refused with `PreconditionFailed`: the refusal is
+    /// permanent for the job, and a resume then reports the terminal status.
     ///
     /// # Errors
     /// Returns typed validation, capacity, fencing, CAS or ambiguous outcomes.
@@ -3036,12 +3060,7 @@ impl DurableMaintenanceWorker {
                         }
                         job.descriptor.live(now)?;
                         self.verify_pin(&job.descriptor, id, now).await?;
-                        let candidate = self.prepare_publication(id, &job, attempt.ordinal).await?;
-                        if candidate.attempt != attempt {
-                            return Err(ambiguous_authority_outcome(
-                                "pending maintenance candidate cannot be identically reconstructed",
-                            ));
-                        }
+                        let candidate = self.reprepare_pending(id, &job, &attempt).await?;
                         job.descriptor.live(now.max(cost::now()))?;
                         let digest = job
                             .last()?
@@ -3067,8 +3086,7 @@ impl DurableMaintenanceWorker {
                     "publication requires two progress revisions",
                 ));
             }
-            let ordinal = job.attempts.len();
-            let candidate = self.prepare_publication(id, &job, ordinal).await?;
+            let candidate = self.prepare_fresh_attempt(id, &job).await?;
             let attempt_bytes = encode_json_limited(
                 &candidate.attempt,
                 MAX_PLAN_PAGE_BYTES,
@@ -3088,6 +3106,59 @@ impl DurableMaintenanceWorker {
             self.submit_publication(id, &job, candidate, now).await
         }))
         .await
+    }
+
+    /// Reconstructs the candidate of a selected attempt whose source is
+    /// still at HEAD; it must reproduce the attempt byte for byte.
+    async fn reprepare_pending(
+        &self,
+        id: &MaintenanceJobId,
+        job: &LoadedJob,
+        attempt: &PublicationAttempt,
+    ) -> Result<PublicationCandidate> {
+        let candidate = match self.prepare_publication(id, job, attempt.ordinal).await? {
+            Preparation::Candidate(candidate) => *candidate,
+            // Unreachable by construction: the pending attempt fixes the head
+            // at the source the attempt was validated against (a head that
+            // moved since observes as `Consumed`), and the purge recomputation
+            // over that same parent is deterministic. Were it ever reached,
+            // the attempt is still in flight and must be reconciled
+            // (`Selected` or `Consumed`) before the job may move, so the
+            // status is left unchanged here.
+            Preparation::PurgedSetSuperseded => return Err(purged_set_superseded()),
+        };
+        if candidate.attempt != *attempt {
+            return Err(ambiguous_authority_outcome(
+                "pending maintenance candidate cannot be identically reconstructed",
+            ));
+        }
+        Ok(candidate)
+    }
+
+    /// Prepares the next attempt of a `ReadyToPublish` job that has none
+    /// selected. A superseded purged set is permanent for the job: no attempt
+    /// was submitted and none ever can be, so the job is recorded
+    /// `Superseded` from the revision the caller loaded (a peer that moved
+    /// the job first surfaces as a lost selector CAS, or as the identical
+    /// revision already visible, never as a second transition) and the
+    /// refusal is still reported, so callers keep treating the job as
+    /// unpublished and the next resume observes `Superseded`.
+    async fn prepare_fresh_attempt(
+        &self,
+        id: &MaintenanceJobId,
+        job: &LoadedJob,
+    ) -> Result<PublicationCandidate> {
+        match self
+            .prepare_publication(id, job, job.attempts.len())
+            .await?
+        {
+            Preparation::Candidate(candidate) => Ok(*candidate),
+            Preparation::PurgedSetSuperseded => {
+                self.finish_publication(id, job, MaintenanceStatus::Superseded)
+                    .await?;
+                Err(purged_set_superseded())
+            }
+        }
     }
 
     async fn begin_submission(
@@ -3172,9 +3243,15 @@ impl DurableMaintenanceWorker {
         status: MaintenanceStatus,
     ) -> Result<Selection> {
         let (digest, last) = job.last()?;
-        if last.status != MaintenanceStatus::Publishing {
-            return Err(invariant_violation("maintenance attempt is not selected"));
-        }
+        // A selected attempt resolves to `Published`, back to `ReadyToPublish`
+        // or to `Superseded` and keeps its attempt digest. A job that never
+        // submitted an attempt can only be superseded here (its purged set
+        // no longer describes the parent) and carries none.
+        let attempt = match (last.status, status) {
+            (MaintenanceStatus::Publishing, _) => last.attempt.clone(),
+            (MaintenanceStatus::ReadyToPublish, MaintenanceStatus::Superseded) => None,
+            _ => return Err(invariant_violation("maintenance attempt is not selected")),
+        };
         let revision = Revision {
             version: MAINTENANCE_VERSION,
             job: id.as_str().into(),
@@ -3186,7 +3263,7 @@ impl DurableMaintenanceWorker {
             status,
             predecessor: Some(digest.clone()),
             receipt: None,
-            attempt: last.attempt.clone(),
+            attempt,
             submissions: last.submissions,
             submission_nonce: None,
         };

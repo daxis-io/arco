@@ -5,6 +5,15 @@ use super::super::{
 use super::*;
 use arco_core::{MemoryBackend, ScopedStorage};
 
+/// The candidate a complete consolidation job prepares; only a horizon job
+/// can find its purged set superseded.
+fn prepared_candidate(prepared: Preparation) -> PublicationCandidate {
+    match prepared {
+        Preparation::Candidate(candidate) => *candidate,
+        Preparation::PurgedSetSuperseded => panic!("a consolidation job has no purged set"),
+    }
+}
+
 async fn prepared_fixture() -> (DurableMaintenanceWorker, PreparedMaintenance, DateTime<Utc>) {
     let storage =
         ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
@@ -562,7 +571,7 @@ async fn publication_submission_reservations_are_bounded_and_exclusive() {
     let mut job = LoadedJob::load(&worker.worker.store, &id, worker.binding)
         .await
         .unwrap();
-    let candidate = worker.prepare_publication(&id, &job, 0).await.unwrap();
+    let candidate = prepared_candidate(worker.prepare_publication(&id, &job, 0).await.unwrap());
     let bytes =
         encode_json_limited(&candidate.attempt, MAX_PLAN_PAGE_BYTES, "test attempt").unwrap();
     let digest = sha256_hex(&bytes);
@@ -921,7 +930,8 @@ async fn maintenance_evidence_rejects_missing_truncated_oversized_and_copied_rec
     let job = LoadedJob::load(store, &plan.id, worker.binding)
         .await
         .unwrap();
-    let candidate = worker.prepare_publication(&plan.id, &job, 0).await.unwrap();
+    let candidate =
+        prepared_candidate(worker.prepare_publication(&plan.id, &job, 0).await.unwrap());
     let attempt_bytes =
         encode_json_limited(&candidate.attempt, MAX_PLAN_PAGE_BYTES, "test attempt").unwrap();
     let digest = sha256_hex(&attempt_bytes);
@@ -2201,52 +2211,93 @@ mod horizon {
         assert!(!state.kv.contains_key(b"doomed-low".as_slice()));
     }
 
-    #[tokio::test]
-    async fn a_suffix_that_rewrites_a_purged_key_supersedes_the_job_and_a_fresh_job_recomputes() {
-        let storage =
-            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
-        let worker = worker_on(storage, 47);
-        let store = &worker.worker.store;
-        let (_fixture, _) = aged_mixed_state(store).await;
-        let now = horizon_now();
-        let id = ready_to_publish(&worker, now).await;
-        let mut tx = store
-            .begin_control_txn(TxnOptions::default())
-            .await
+    /// A suffix commit that rewrites a purged key makes the admitted purged
+    /// set stale for good: publication refuses, records the job `Superseded`
+    /// by itself (no abandonment), counts no publication, and a fresh job
+    /// recomputes the purge over the new parent.
+    #[test]
+    fn a_suffix_that_rewrites_a_purged_key_supersedes_the_job_and_a_fresh_job_recomputes() {
+        const PUBLISHED: &str = "arco_state_store_maintenance_published_total{domain=\"catalog\",kind=\"retention_horizon\"}";
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        tx.put(b"doomed-low", Bytes::from_static(b"reborn"))
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
-        // The admitted purged set names a tombstone the parent no longer
-        // holds: the certificate would not describe "parent minus child".
-        assert!(matches!(
-            worker.publish_at(&id, now).await,
-            Err(CatalogError::PreconditionFailed { .. })
-        ));
-        let (pointer, unchanged) = head(store).await;
-        assert!(unchanged.retention_horizon.is_none());
-        worker.abandon_at(&id, now).await.unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let storage =
+                    ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+                        .unwrap();
+                let worker = worker_on(storage, 47);
+                let store = &worker.worker.store;
+                let (_fixture, _) = aged_mixed_state(store).await;
+                let now = horizon_now();
+                let id = ready_to_publish(&worker, now).await;
+                let mut tx = store
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap();
+                tx.put(b"doomed-low", Bytes::from_static(b"reborn"))
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                let (rewritten, _) = head(store).await;
+                // The admitted purged set names a tombstone the parent no longer
+                // holds: the certificate would not describe "parent minus child".
+                assert!(matches!(
+                    worker.publish_at(&id, now).await,
+                    Err(CatalogError::PreconditionFailed { .. })
+                ));
+                let (pointer, unchanged) = head(store).await;
+                assert_eq!(pointer.manifest_id, rewritten.manifest_id);
+                assert!(unchanged.retention_horizon.is_none());
+                // The refusal is permanent for the job (its purged set is fixed
+                // by its identity), so the refusing publication recorded it
+                // terminal: a resume reports `Superseded` without `abandon_at`.
+                let progress = worker.resume_at(&id, now).await.unwrap();
+                assert_eq!(progress.status, MaintenanceStatus::Superseded);
+                assert_eq!(progress.kind, MaintenanceKind::RetentionHorizon);
+                // A repeated publication finds a terminal job and moves nothing.
+                assert!(matches!(
+                    worker.publish_at(&id, now).await,
+                    Err(CatalogError::PreconditionFailed { .. })
+                ));
+                assert_eq!(
+                    worker.resume_at(&id, now).await.unwrap().status,
+                    MaintenanceStatus::Superseded
+                );
+                let (pointer, unchanged) = head(store).await;
+                assert_eq!(pointer.manifest_id, rewritten.manifest_id);
+                assert!(unchanged.retention_horizon.is_none());
+                assert_eq!(
+                    sample(&recorder.handle().render(), PUBLISHED),
+                    None,
+                    "a superseded job counts no publication"
+                );
 
-        let outcome = run(&worker, now).await.expect("eligible rows remain");
-        let (after_pointer, after) = head(store).await;
-        assert_ne!(after_pointer.manifest_id, pointer.manifest_id);
-        assert_eq!(
-            outcome.selected_token().authority_manifest_id(),
-            after.manifest_id
-        );
-        assert_eq!(
-            after.retention_horizon.as_ref().unwrap().purged_counts,
-            PurgedCountsV1 {
-                expired_rows: 1,
-                tombstones: 1,
-            }
-        );
-        let state = store.replay_for_successor(&after).await.unwrap();
-        assert_eq!(
-            state.kv[b"doomed-low".as_slice()].bytes,
-            b"reborn".as_slice()
-        );
+                let outcome = run(&worker, now).await.expect("eligible rows remain");
+                let (after_pointer, after) = head(store).await;
+                assert_ne!(after_pointer.manifest_id, pointer.manifest_id);
+                assert_eq!(
+                    outcome.selected_token().authority_manifest_id(),
+                    after.manifest_id
+                );
+                assert_eq!(
+                    after.retention_horizon.as_ref().unwrap().purged_counts,
+                    PurgedCountsV1 {
+                        expired_rows: 1,
+                        tombstones: 1,
+                    }
+                );
+                let state = store.replay_for_successor(&after).await.unwrap();
+                assert_eq!(
+                    state.kv[b"doomed-low".as_slice()].bytes,
+                    b"reborn".as_slice()
+                );
+            });
+        });
+        // Only the fresh job's publication was counted.
+        assert_eq!(Some(1.0), sample(&recorder.handle().render(), PUBLISHED));
     }
 
     #[tokio::test]

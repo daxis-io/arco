@@ -22,7 +22,7 @@ use crate::state::CatalogState;
 use crate::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionMaterializationStatus, ProjectionOutboxAckWriter,
     ProjectionOutboxDrainReport, ProjectionOutboxHandler, ProjectionOutboxProcessDisposition,
-    ProjectionOutboxWorker,
+    ProjectionOutboxTrimReport, ProjectionOutboxWorker,
 };
 use crate::state_store::{
     ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, ProjectionIntentV1,
@@ -1002,16 +1002,37 @@ impl CatalogProjectionMaterializer {
     ///
     /// Returns materialization, status, acknowledgement, or authority errors.
     pub async fn drain_once(&self) -> Result<ProjectionOutboxDrainReport> {
+        self.outbox_worker()?.drain_fixed_consumer(self).await
+    }
+
+    /// Trims the catalog outbox records this materializer's consumer has
+    /// acknowledged, through the fixed-consumer path: an exact-incarnation
+    /// trim at the fixed identity that writes no binding metadata to the
+    /// catalog root (a generic trim's binding would make every later
+    /// [`Self::drain_once`] refuse the root). Intended for the scheduled
+    /// control-store worker after its drain; the operator endpoint keeps
+    /// refusing catalog trims.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or CAS errors, or an invariant violation when the
+    /// catalog root carries generic binding metadata.
+    pub async fn trim_once(&self) -> Result<ProjectionOutboxTrimReport> {
+        self.outbox_worker()?.trim_fixed_consumer().await
+    }
+
+    /// The fixed catalog consumer's outbox worker, pinned to the explicit
+    /// epoch when one was configured.
+    fn outbox_worker(&self) -> Result<ProjectionOutboxWorker> {
         let worker = ProjectionOutboxWorker::new(
             self.storage.clone(),
             "catalog",
             CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
         )?;
-        let worker = match self.explicit_epoch {
-            Some(epoch) => worker.with_writer_epoch(epoch)?,
-            None => worker,
-        };
-        worker.drain_fixed_consumer(self).await
+        match self.explicit_epoch {
+            Some(epoch) => worker.with_writer_epoch(epoch),
+            None => Ok(worker),
+        }
     }
 
     /// Reads durable materialization status.

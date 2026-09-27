@@ -90,35 +90,61 @@ hint older than one hour before the job's clock) and tombstones at or below
 the certified horizon, then runs the same `start_at`/`advance_at`/`publish_at`
 cycle. It needs no maintenance intent, returns no plan when nothing is
 eligible, and bounds retained rows rather than the L0 suffix; it is not a
-mitigation for this alert, and the scheduled worker job does not invoke it
-yet (retention design step 2). Contract: `../plans/state-store-retention-format-v1.md`.
+mitigation for this alert. As of 2026-09-27 the scheduled worker job runs it
+once per domain per run, after that domain's consolidation slot
+(`docs/runbooks/control-store-worker.md`). Contract:
+`../plans/state-store-retention-format-v1.md`.
 
 The two kinds share the head's layout generation and claim the workspace
 retention epoch at activation, so at most one of two concurrent jobs
 publishes; the other fails its compatibility check with `PreconditionFailed`
 and is abandoned. For a horizon job:
 
-- `Superseded` (`MaintenanceStatus::Superseded` in `maintenance.rs`) means
-  what it means for consolidation: the head moved past the job's source and
-  the 24 h descriptor lifetime expired before a regenerated publication
-  landed. Before expiry a consumed attempt returns to `ReadyToPublish` and
-  the next `publish_at` regenerates over the new head. `publish_at` also refuses
-  a horizon job with `PreconditionFailed` (the persisted status is not changed)
-  when a commit after preparation rewrote a key the admitted plan purges; abandon it and call
-  `prepare_horizon_at` again.
+- `Superseded` (`MaintenanceStatus::Superseded` in `maintenance.rs`) has
+  two meanings for a horizon job. The first is what it means for
+  consolidation: the head moved past the job's source and the 24 h
+  descriptor lifetime expired before a regenerated publication landed
+  (before expiry a consumed attempt returns to `ReadyToPublish` and the
+  next `publish_at` regenerates over the new head). The second is specific
+  to horizons: when a commit after preparation rewrote a key the admitted
+  plan purges, `publish_at` records the job `Superseded` and refuses with
+  `PreconditionFailed`. That refusal is permanent for the job (its purged
+  set is fixed by the job identity), so there is nothing to abandon; call
+  `prepare_horizon_at` again for a fresh job. The worker re-reads the job
+  and reports it `terminal` in the run that observes the refusal, clears
+  its record, runs consolidation in that same run, and prepares a fresh
+  horizon on the next run; no operator action is needed (see the worker
+  runbook's known limitations).
 - A stuck retention epoch (`stuck_epoch` in the worker's epoch phase, see
   `docs/runbooks/control-store-worker.md`) blocks horizon activation exactly
   as it blocks consolidation: `start_at` claims the epoch under the retention
   lock and fails closed while a foreign epoch is in flight.
 
+## Outbox trim and retained rows
+
+As of 2026-09-27 the worker's `trim` phase removes acknowledged catalog
+projection outbox records after each drain
+(`CatalogProjectionMaterializer::trim_once`; the fixed-consumer path that
+installs no binding metadata in the catalog root). Outbox rows therefore no
+longer accumulate in the replayed catalog state beyond one run's backlog:
+trimmed records are folded out at replay, and the trim commit itself is one
+L0 segment the next consolidation folds. A published retention-horizon job
+additionally drops expired rows and tombstones no retained reader can
+observe. Both bound the retained rows a replay materializes, not the
+per-commit cost: format 9 still replays the whole retained state
+(`base_states` plus the L0 suffix) on every commit, so the 2 s and 64 MiB
+budgets remain governed by consolidation cadence and by how much live state
+the domain holds.
+
 ## Current Wiring Status
 
-Status as of 2026-09-23: the `arco_state_store_replay_duration_seconds` and
+Status as of 2026-09-27: the `arco_state_store_replay_duration_seconds` and
 `arco_state_store_replay_bytes` emitters exist, along with
 `arco_state_store_l0_segments` and
 `arco_state_store_maintenance_backpressure_total`, so the alerts can fire once
 a root is bound. The control store is route-wired for one exact root behind
 `ARCO_CATALOG_CONTROL_V1_*`, legacy by default, not provider-qualified, and not
 authoritative on any deployed root; the promotion gate has not run against
-real provider measurements. Maintenance is scheduled through the cron-driven
-worker job, not through queue-driven wake.
+real provider measurements. Maintenance (consolidation and retention horizon)
+and the catalog outbox trim are scheduled through the cron-driven worker job,
+not through queue-driven wake.

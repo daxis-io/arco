@@ -169,8 +169,8 @@ use integrity::{
 };
 use lazy::{TransactionBase, TransactionReads};
 pub use maintenance::{
-    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceProgress,
-    MaintenanceStatus, PreparedMaintenance,
+    DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind,
+    MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, PurgedCounts,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
 const RESTORE_PLAN_VERSION: u32 = 7;
@@ -2998,12 +2998,16 @@ impl ControlMvpGcOutcome {
     }
 }
 
-/// Successful publication of an equivalent-state physical layout.
+/// Successful publication of a maintenance rewrite: a consolidation (state
+/// unchanged) or a retention horizon (certified rows purged; logical sequence
+/// unchanged).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlMvpMaintenanceOutcome {
     source_token: StateToken,
     selected_token: StateToken,
     layout_generation: u64,
+    kind: MaintenanceKind,
+    purged_counts: Option<PurgedCounts>,
 }
 
 impl ControlMvpMaintenanceOutcome {
@@ -3023,6 +3027,19 @@ impl ControlMvpMaintenanceOutcome {
     #[must_use]
     pub const fn layout_generation(&self) -> u64 {
         self.layout_generation
+    }
+
+    /// Returns which physical rewrite this publication performed.
+    #[must_use]
+    pub const fn kind(&self) -> MaintenanceKind {
+        self.kind
+    }
+
+    /// Returns the counts certified by a retention horizon publication, or
+    /// `None` for a consolidation.
+    #[must_use]
+    pub const fn purged_counts(&self) -> Option<PurgedCounts> {
+        self.purged_counts
     }
 }
 

@@ -27,6 +27,8 @@ pub mod control_mvp;
     reason = "Phase 6 metadata stays crate-internal until its public activation gate"
 )]
 pub(crate) mod external_location_metadata;
+#[cfg(feature = "test-utils")]
+pub mod identity_probe;
 pub mod model;
 pub(crate) mod path_governance_metadata;
 pub mod projection_outbox_acks;

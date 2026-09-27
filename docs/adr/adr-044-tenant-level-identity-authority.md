@@ -101,9 +101,15 @@ cannot enter legacy ledger, catalog, or state-store APIs by substituting the
 tenant ID for a workspace. `StateScope` now carries a typed authority root with
 a versioned encoding: every new record serializes as version 2 with an explicit
 `scope_version` and `root_kind`, while legacy records decode only as workspace
-roots. `ControlMvpStateStore` still rejects
-non-workspace physical roots, even when their IDs have the same text. There is
+roots. `ControlMvpStateStore` rejects tenant identity physical roots in production,
+even when their IDs have the same text as workspace or metastore IDs. There is
 no implicit conversion from `AuthorityScope` to the persisted representation.
+PR #435 adds an opaque `IdentityStorage` and `RootStorage` seam for a future
+identity-root kernel. A later default-disabled `test-utils` child exercises
+synthetic identity checkpoint, protected-reference, retained-history, GC, and
+recovery contracts over the memory backend. It does not relax the production
+constructor guard or provide principal events, tenant-wide enforcement, layout
+maintenance, provider qualification, or identity routing.
 
 The representation work of the
 [Versioned AuthorityScope in StateScope and control/v1](../plans/2026-09-06-authority-root-review-revision.md#follow-up-versioned-authorityscope-in-statescope-and-controlv1)

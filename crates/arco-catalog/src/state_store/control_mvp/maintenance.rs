@@ -1999,6 +1999,11 @@ impl DurableMaintenanceWorker {
         now: DateTime<Utc>,
     ) -> Result<()> {
         use crate::workspace_snapshot::{retention_pin_latest_path, retention_pin_revision_path};
+        if self.worker.lifecycle.as_legacy_scoped().is_none() {
+            return Err(validation_failed(
+                "identity root layout maintenance is not admitted",
+            ));
+        }
         let storage = &self.worker.lifecycle;
         let store = &self.worker.store;
         load_pages(store, id, descriptor).await?;
@@ -3289,6 +3294,11 @@ pub(super) async fn expired_pin_page(
     now: DateTime<Utc>,
     cursor: &str,
 ) -> Result<Option<ControlMvpGcPlan>> {
+    if worker.lifecycle.as_legacy_scoped().is_none() {
+        return Err(validation_failed(
+            "identity root workspace pins are not admitted",
+        ));
+    }
     Box::pin(cost::phase("maintenance-GC-pins", async {
         use crate::workspace_snapshot::{RetentionTarget, retention_pin_revision_path};
         let Some(cursor) = cursor.strip_prefix(PIN_GC_CURSOR) else {

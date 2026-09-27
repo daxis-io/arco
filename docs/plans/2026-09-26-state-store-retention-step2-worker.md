@@ -89,3 +89,18 @@ Steps:
 ## Final verification (lead)
 
 `cargo test -p arco-api --bin arco_control_store_worker --locked`; `cargo test -p arco-api --test control_store_operator_api --locked`; `cargo test -p arco-catalog --features test-utils --lib --locked -- --skip older_cut_outbox_model --skip independent_reclamation_model --skip durable_maintenance_model_32_seeds --skip 32_seeds`; `--test state_store_control_mvp`; `--test state_store_reclamation_schedules` (skips); `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`; `cargo fmt --all -- --check`; `git diff --check`; `cargo xtask repo-hygiene-check`; the 32-seed durable model once at `CARGO_PROFILE_TEST_OPT_LEVEL=1`.
+
+---
+
+## As implemented
+
+- Package B: the persisted `SelectedJobRecord` carries an optional `kind`
+  (`#[serde(default)]`, the kernel's `MaintenanceKind` wire form) so every
+  replay log line and failure string names the job kind even when the kernel
+  yields no progress, as on a deferred replay. Records written before the
+  field existed decode with `kind: None`, are replayed exactly as before and
+  are labelled from the resumed progress; the Package B text above that calls
+  the record kind-agnostic predates this. Per domain and run the worker drives
+  at most one consolidation and one retention horizon; a replayed job fills
+  the slot of its own kind, and the horizon follows a consolidation slot only
+  when it ended `idle` or `published`.

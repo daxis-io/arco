@@ -64,11 +64,23 @@ struct RunLimits {
 // ---------------------------------------------------------------------------
 
 /// The identity the kernel requires callers to persist before `start_at`.
+/// `kind` labels log lines while the job is replayed; a record written before
+/// the field existed decodes with `None` and is replayed exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SelectedJobRecord {
     job_id: String,
     domain: String,
     prepared_at_ms: i64,
+    #[serde(default)]
+    kind: Option<MaintenanceKind>,
+}
+
+impl SelectedJobRecord {
+    /// The persisted kind's log name, or `unknown` for a record written
+    /// before the field existed.
+    fn kind_label(&self) -> &'static str {
+        self.kind.map_or("unknown", MaintenanceKind::as_str)
+    }
 }
 
 fn selected_job_path(domain: &str) -> String {
@@ -104,7 +116,13 @@ async fn persist_selected_job(storage: &ScopedStorage, record: &SelectedJobRecor
             WritePrecondition::None,
         )
         .await
-        .with_context(|| format!("persist maintenance job id for domain {}", record.domain))?;
+        .with_context(|| {
+            format!(
+                "persist maintenance job id ({}) for domain {}",
+                record.kind_label(),
+                record.domain
+            )
+        })?;
     Ok(())
 }
 
@@ -312,6 +330,21 @@ impl MaintenanceOutcome {
             Self::Exhausted => "exhausted",
         }
     }
+
+    /// The job is finished: nothing remains to replay, so `finish_job` clears
+    /// its persisted identity.
+    const fn clears_record(self) -> bool {
+        matches!(self, Self::Published | Self::Terminal)
+    }
+
+    /// A consolidation slot with this outcome lets the horizon slot run:
+    /// `idle` persisted nothing and `published` cleared its record. `deferred`
+    /// and `exhausted` leave a record that must be finished first; `terminal`
+    /// cleared its record but withholds the horizon all the same, and a fresh
+    /// plan is prepared next run.
+    const fn admits_horizon(self) -> bool {
+        matches!(self, Self::Idle | Self::Published)
+    }
 }
 
 impl DrainOutcome {
@@ -388,13 +421,15 @@ struct DomainMaintenanceSummary {
     purged_tombstones: Option<u64>,
     elapsed_ms: u64,
     /// When this entry's job was first considered; `elapsed_ms` is measured
-    /// from it by [`Self::finished`].
+    /// from it by [`Self::finish_into`].
     #[serde(skip)]
     started: Instant,
 }
 
 impl DomainMaintenanceSummary {
-    fn idle(domain: &str, kind: MaintenanceKind) -> Self {
+    /// Starts the entry for a job of `kind`; it reads `idle` until an outcome
+    /// is sealed by [`Self::finish_into`].
+    fn begin(domain: &str, kind: MaintenanceKind) -> Self {
         Self {
             domain: domain.to_owned(),
             kind: kind.as_str(),
@@ -632,6 +667,7 @@ enum Step<T> {
 
 fn classify_step<T>(
     domain: &str,
+    kind: &'static str,
     step: &'static str,
     result: arco_catalog::Result<T>,
 ) -> Result<Step<T>> {
@@ -641,13 +677,16 @@ fn classify_step<T>(
             tracing::warn!(
                 phase = "maintenance",
                 domain,
+                kind,
                 step,
                 error = %error,
                 "maintenance step deferred to the next run"
             );
             Ok(Step::Deferred)
         }
-        Err(error) => Err(error).with_context(|| format!("maintenance {step} for domain {domain}")),
+        Err(error) => {
+            Err(error).with_context(|| format!("maintenance {step} ({kind}) for domain {domain}"))
+        }
     }
 }
 
@@ -704,6 +743,7 @@ async fn advance_until_ready(
         summary.advances += 1;
         progress = match classify_step(
             &summary.domain,
+            summary.kind,
             "advance",
             worker.advance_at(job_id, Utc::now()).await,
         )? {
@@ -720,6 +760,7 @@ async fn publish_job(
 ) -> Result<MaintenanceOutcome> {
     match classify_step(
         &summary.domain,
+        summary.kind,
         "publish",
         worker.publish_at(job_id, Utc::now()).await,
     )? {
@@ -760,10 +801,7 @@ async fn finish_job(
         Advance::Ready => publish_job(worker, job_id, summary).await?,
         Advance::Stopped(outcome) => outcome,
     };
-    if matches!(
-        outcome,
-        MaintenanceOutcome::Published | MaintenanceOutcome::Terminal
-    ) {
+    if outcome.clears_record() {
         clear_selected_job(storage, &summary.domain).await?;
     }
     Ok(outcome)
@@ -790,12 +828,20 @@ async fn recover_selected_job(
         .with_context(|| format!("persisted maintenance job id for domain {domain} is invalid"))?;
     summary.job_id = Some(record.job_id.clone());
     summary.recovered = true;
+    // A record written by this binary names its kind; label the entry before
+    // any kernel call so even a deferred replay, which yields no progress,
+    // reports it. A record without one keeps the default label until the
+    // kernel reports the descriptor's kind.
+    if let Some(kind) = record.kind {
+        summary.kind = kind.as_str();
+    }
     let now = Utc::now();
     let age_ms = now.timestamp_millis().saturating_sub(record.prepared_at_ms);
     let expired = age_ms >= MAINTENANCE_JOB_LIFETIME_MS;
     tracing::info!(
         phase = "maintenance",
         domain = %domain,
+        kind = summary.kind,
         job_id = job_id.as_str(),
         age_ms,
         expired,
@@ -808,30 +854,34 @@ async fn recover_selected_job(
     // when the job is not directly resumable, e.g. its selector never landed.
     if !expired {
         match worker.resume_at(&job_id, now).await {
-            Ok(progress) => return Ok(Recovery::Resume(job_id, progress)),
+            Ok(progress) => {
+                summary.kind = progress.kind.as_str();
+                return Ok(Recovery::Resume(job_id, progress));
+            }
             Err(error)
                 if is_deferrable(&error) || matches!(error, CatalogError::NotFound { .. }) =>
             {
                 tracing::info!(
                     phase = "maintenance",
                     domain = %domain,
+                    kind = summary.kind,
                     job_id = job_id.as_str(),
                     error = %error,
                     "persisted maintenance job is not directly resumable; replaying activation"
                 );
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("maintenance resume for domain {domain}"));
+                return Err(error).with_context(|| {
+                    format!("maintenance resume ({}) for domain {domain}", summary.kind)
+                });
             }
         }
     }
     let disposition = match worker.recover_activation_at(&job_id, now).await {
         Ok(progress) if !expired => {
-            // Label the entry now so a resume deferred below still reports
-            // the replayed job's kind.
+            // The recovered descriptor's kind is authoritative over the record.
             summary.kind = progress.kind.as_str();
-            return resume_recovered_job(worker, &domain, job_id).await;
+            return resume_recovered_job(worker, &domain, summary.kind, job_id).await;
         }
         Ok(_) => RecoveryDisposition::Abandon(
             "persisted maintenance job exceeded its lifetime; its root was recovered and a fresh plan follows",
@@ -839,15 +889,20 @@ async fn recover_selected_job(
         Err(CatalogError::NotFound { .. }) => RecoveryDisposition::Abandon(
             "persisted maintenance job has no durable descriptor; activation never landed and a fresh plan follows",
         ),
-        // A deferred replay yields no progress, so the job's kind is unknown
-        // here and the entry keeps its default label.
+        // A deferred replay yields no progress; the entry keeps the record's
+        // label (or the default for a record written without one).
         Err(error) if is_deferrable(&error) && !expired => RecoveryDisposition::Defer(error),
         Err(error) if is_deferrable(&error) => RecoveryDisposition::AbandonAfterError(error),
         Err(error) => {
-            return Err(error).with_context(|| format!("maintenance recovery for domain {domain}"));
+            return Err(error).with_context(|| {
+                format!(
+                    "maintenance recovery ({}) for domain {domain}",
+                    summary.kind
+                )
+            });
         }
     };
-    apply_recovery_disposition(storage, &domain, &job_id, disposition).await
+    apply_recovery_disposition(storage, &domain, summary.kind, &job_id, disposition).await
 }
 
 /// How a replayed activation that did not resume should be handled.
@@ -865,10 +920,12 @@ enum RecoveryDisposition {
 async fn resume_recovered_job(
     worker: &DurableMaintenanceWorker,
     domain: &str,
+    kind: &'static str,
     job_id: MaintenanceJobId,
 ) -> Result<Recovery> {
     match classify_step(
         domain,
+        kind,
         "resume",
         worker.resume_at(&job_id, Utc::now()).await,
     )? {
@@ -880,6 +937,7 @@ async fn resume_recovered_job(
 async fn apply_recovery_disposition(
     storage: &ScopedStorage,
     domain: &str,
+    kind: &'static str,
     job_id: &MaintenanceJobId,
     disposition: RecoveryDisposition,
 ) -> Result<Recovery> {
@@ -888,6 +946,7 @@ async fn apply_recovery_disposition(
             tracing::warn!(
                 phase = "maintenance",
                 domain,
+                kind,
                 job_id = job_id.as_str(),
                 error = %error,
                 "persisted maintenance job replay deferred to the next run"
@@ -898,6 +957,7 @@ async fn apply_recovery_disposition(
             tracing::warn!(
                 phase = "maintenance",
                 domain,
+                kind,
                 job_id = job_id.as_str(),
                 reason
             );
@@ -908,6 +968,7 @@ async fn apply_recovery_disposition(
             tracing::warn!(
                 phase = "maintenance",
                 domain,
+                kind,
                 job_id = job_id.as_str(),
                 error = %error,
                 "expired persisted maintenance job could not be replayed; abandoning its record (a retention epoch it still holds is reported as stuck_epoch next run)"
@@ -929,11 +990,12 @@ async fn drive_fresh_job(
     max_advances: usize,
     summary: &mut DomainMaintenanceSummary,
 ) -> Result<MaintenanceOutcome> {
+    summary.kind = kind.as_str();
     let prepared = match kind {
         MaintenanceKind::Consolidation => worker.prepare_at(Utc::now()).await,
         MaintenanceKind::RetentionHorizon => worker.prepare_horizon_at(Utc::now()).await,
     };
-    let plan = match classify_step(&summary.domain, "prepare", prepared)? {
+    let plan = match classify_step(&summary.domain, summary.kind, "prepare", prepared)? {
         Step::Ready(Some(plan)) => plan,
         Step::Ready(None) => return Ok(MaintenanceOutcome::Idle),
         Step::Deferred => return Ok(MaintenanceOutcome::Deferred),
@@ -947,6 +1009,7 @@ async fn drive_fresh_job(
             job_id: job_id.as_str().to_owned(),
             domain: summary.domain.clone(),
             prepared_at_ms: Utc::now().timestamp_millis(),
+            kind: Some(kind),
         },
     )
     .await?;
@@ -960,6 +1023,7 @@ async fn drive_fresh_job(
     );
     let progress = match classify_step(
         &summary.domain,
+        summary.kind,
         "start",
         worker.start_at(&plan, Utc::now()).await,
     )? {
@@ -1005,13 +1069,13 @@ async fn maintain_domain(
     // The replayed job's kind and outcome, once it finished and cleared its
     // record; it fills this run's slot for that kind.
     let mut replayed: Option<(MaintenanceKind, MaintenanceOutcome)> = None;
-    let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
+    let mut summary = DomainMaintenanceSummary::begin(domain, MaintenanceKind::Consolidation);
 
     if let Some(record) = load_selected_job(&storage, domain).await? {
+        // `recover_selected_job` labels the entry with the replayed job's kind.
         match recover_selected_job(&storage, &worker, &record, &mut summary).await? {
             Recovery::Resume(job_id, progress) => {
                 let kind = progress.kind;
-                summary.kind = kind.as_str();
                 let outcome = finish_job(
                     &storage,
                     &worker,
@@ -1021,16 +1085,12 @@ async fn maintain_domain(
                     &mut summary,
                 )
                 .await?;
-                let record_cleared = matches!(
-                    outcome,
-                    MaintenanceOutcome::Published | MaintenanceOutcome::Terminal
-                );
                 summary.finish_into(outcome, entries);
-                if !record_cleared {
+                if !outcome.clears_record() {
                     return Ok(());
                 }
                 replayed = Some((kind, outcome));
-                summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::Consolidation);
+                summary = DomainMaintenanceSummary::begin(domain, MaintenanceKind::Consolidation);
             }
             Recovery::Deferred => {
                 summary.finish_into(MaintenanceOutcome::Deferred, entries);
@@ -1056,15 +1116,7 @@ async fn maintain_domain(
             &mut summary,
         )
         .await?;
-        // The horizon follows only `idle` (nothing was persisted) or
-        // `published` (`finish_job` cleared the record). `deferred` and
-        // `exhausted` leave a record that must be finished first; `terminal`
-        // cleared its record but withholds the horizon all the same, and a
-        // fresh plan is prepared next run.
-        let may_follow = matches!(
-            outcome,
-            MaintenanceOutcome::Idle | MaintenanceOutcome::Published
-        );
+        let may_follow = outcome.admits_horizon();
         summary.finish_into(outcome, entries);
         may_follow
     };
@@ -1072,7 +1124,7 @@ async fn maintain_domain(
         return Ok(());
     }
 
-    let mut summary = DomainMaintenanceSummary::idle(domain, MaintenanceKind::RetentionHorizon);
+    let mut summary = DomainMaintenanceSummary::begin(domain, MaintenanceKind::RetentionHorizon);
     let outcome = drive_fresh_job(
         &storage,
         &worker,
@@ -1148,10 +1200,10 @@ async fn collect_domain(
 
 /// Runs every phase once: epoch inspection, maintenance per domain
 /// (consolidation, then retention horizon), catalog projection drain, GC per
-/// domain. Phases are independent: a failure is
-/// recorded and the remaining phases still run, so one wedged domain never
-/// starves another. The returned summary carries every failure; callers exit
-/// non-zero through [`RunSummary::exit_error`].
+/// domain. Phases are independent: a failure is recorded and the remaining
+/// phases still run, so one wedged domain never starves another. The returned
+/// summary carries every failure; callers exit non-zero through
+/// [`RunSummary::exit_error`].
 async fn run_once(
     storage: ScopedStorage,
     tenant: &str,
@@ -1489,6 +1541,20 @@ mod tests {
             .collect()
     }
 
+    /// A catalog-domain job record as this binary persists it.
+    fn catalog_job_record(
+        job_id: &str,
+        kind: MaintenanceKind,
+        now: DateTime<Utc>,
+    ) -> SelectedJobRecord {
+        SelectedJobRecord {
+            job_id: job_id.to_owned(),
+            domain: "catalog".to_owned(),
+            prepared_at_ms: now.timestamp_millis(),
+            kind: Some(kind),
+        }
+    }
+
     fn epoch_record(kind: &str, operation_id: &str, age: Duration) -> Result<Bytes> {
         let record = serde_json::json!({
             "record_type": "arco.retention_mutation_epoch",
@@ -1699,11 +1765,7 @@ mod tests {
         let persisted = plan.job_id().as_str().to_owned();
         persist_selected_job(
             &storage,
-            &SelectedJobRecord {
-                job_id: persisted.clone(),
-                domain: "catalog".to_owned(),
-                prepared_at_ms: now.timestamp_millis(),
-            },
+            &catalog_job_record(&persisted, MaintenanceKind::RetentionHorizon, now),
         )
         .await?;
         dead.start_at(&plan, now).await?;
@@ -1831,11 +1893,7 @@ mod tests {
         let persisted = plan.job_id().as_str().to_owned();
         persist_selected_job(
             &storage,
-            &SelectedJobRecord {
-                job_id: persisted.clone(),
-                domain: "catalog".to_owned(),
-                prepared_at_ms: now.timestamp_millis(),
-            },
+            &catalog_job_record(&persisted, MaintenanceKind::Consolidation, now),
         )
         .await?;
         dead.start_at(&plan, now).await?;
@@ -1899,8 +1957,9 @@ mod tests {
         );
         assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
         assert!(
-            summary.failures[0].starts_with("maintenance[catalog]:"),
-            "{}",
+            summary.failures[0].starts_with("maintenance[catalog]:")
+                && summary.failures[0].contains("(retention_horizon)"),
+            "the failure names the phase, domain and job kind: {}",
             summary.failures[0]
         );
         assert!(summary.exit_error().is_some());
@@ -1935,11 +1994,7 @@ mod tests {
         let persisted = plan.job_id().as_str().to_owned();
         persist_selected_job(
             &storage,
-            &SelectedJobRecord {
-                job_id: persisted.clone(),
-                domain: "catalog".to_owned(),
-                prepared_at_ms: now.timestamp_millis(),
-            },
+            &catalog_job_record(&persisted, MaintenanceKind::Consolidation, now),
         )
         .await?;
         dead.start_at(&plan, now).await?;
@@ -1982,11 +2037,7 @@ mod tests {
         let persisted = plan.job_id().as_str().to_owned();
         persist_selected_job(
             &storage,
-            &SelectedJobRecord {
-                job_id: persisted.clone(),
-                domain: "catalog".to_owned(),
-                prepared_at_ms: now.timestamp_millis(),
-            },
+            &catalog_job_record(&persisted, MaintenanceKind::Consolidation, now),
         )
         .await?;
         let mut progress = dead.start_at(&plan, now).await?;
@@ -2186,6 +2237,44 @@ mod tests {
         for outcome in [DrainOutcome::Ok, DrainOutcome::Deferred] {
             assert_eq!(serde_json::to_value(outcome).unwrap(), outcome.as_str());
         }
+    }
+
+    #[tokio::test]
+    async fn selected_job_record_loads_without_a_kind_and_round_trips_with_one() -> Result<()> {
+        let storage = test_storage()?;
+        // The shape this binary persisted before the record carried a kind.
+        let legacy = serde_json::json!({
+            "job_id": "a".repeat(64),
+            "domain": "catalog",
+            "prepared_at_ms": 1_700_000_000_000_i64,
+        });
+        storage
+            .put_raw(
+                &selected_job_path("catalog"),
+                Bytes::from(serde_json::to_vec(&legacy)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        let loaded = load_selected_job(&storage, "catalog")
+            .await?
+            .ok_or_else(|| anyhow!("a record without a kind must still load"))?;
+        assert_eq!(loaded.job_id, "a".repeat(64));
+        assert_eq!(loaded.kind, None);
+        assert_eq!(loaded.kind_label(), "unknown");
+
+        let record = catalog_job_record(
+            &"b".repeat(64),
+            MaintenanceKind::RetentionHorizon,
+            Utc::now(),
+        );
+        persist_selected_job(&storage, &record).await?;
+
+        assert_eq!(
+            load_selected_job(&storage, "catalog").await?,
+            Some(record.clone())
+        );
+        assert_eq!(record.kind_label(), "retention_horizon");
+        Ok(())
     }
 
     #[test]

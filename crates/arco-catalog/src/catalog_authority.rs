@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
@@ -994,12 +994,154 @@ pub struct ControlCatalogAuthority {
 ///
 /// The catalog projection materializer writes immutable single-row Parquet
 /// files beneath it (see [`catalog_audit_artifact_path`]). Every acknowledged
-/// intent has exactly one file here, written before the acknowledgement. A
-/// quarantined intent may or may not have one (for example, one quarantined
-/// for a divergent snapshot manifest after its audit file landed); a present
-/// file still describes a committed mutation. The files are not listed in any
-/// snapshot manifest.
+/// intent has exactly one file here, written before the acknowledgement and
+/// kept until [`CatalogProjectionMaterializer::expire_audit_partitions`]
+/// deletes its day partition (after [`CATALOG_AUDIT_RETENTION_DAYS`] by
+/// default). A quarantined intent may or may not have one (for example, one
+/// quarantined for a divergent snapshot manifest after its audit file
+/// landed); a present file still describes a committed mutation. The files
+/// are not listed in any snapshot manifest.
 pub const CATALOG_AUDIT_PROJECTION_PREFIX: &str = "control/v1/projections/catalog-audit/";
+
+/// Default retention of `system.catalog.audit` day partitions, in days.
+///
+/// [`CatalogProjectionMaterializer::expire_audit_partitions`] deletes the
+/// partition of day `D` once `D` is strictly before the UTC date
+/// `retention_days` days before the sweep's clock. With this default a
+/// partition is kept through day `D + 400` and deleted by the first sweep on
+/// day `D + 401` or later. The scheduled control-store worker sweeps with this
+/// value unless its deployment configures another.
+pub const CATALOG_AUDIT_RETENTION_DAYS: u32 = 400;
+
+/// Objects one audit retention listing page returns, at most.
+const AUDIT_RETENTION_PAGE_LIMIT: usize = 1000;
+
+/// What one [`CatalogProjectionMaterializer::expire_audit_partitions`] call
+/// did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditRetentionReport {
+    /// Distinct partitions the call visited: every expired partition it
+    /// reached, the first retained day partition (which ends the walk through
+    /// the day partitions), and every unrecognized name it reached.
+    pub partitions_examined: u64,
+    /// Visited partitions with at least one object deleted by this call.
+    pub partitions_expired: u64,
+    /// Objects this call deleted; never more than its budget.
+    pub objects_deleted: u64,
+    /// Listed sizes of the deleted objects, in bytes.
+    pub bytes_reclaimed: u64,
+    /// The deletion budget ran out while expired objects remained: the call
+    /// found another expired object after its last permitted deletion. The
+    /// next call continues with it.
+    pub truncated: bool,
+}
+
+/// Where a listed object sits beneath [`CATALOG_AUDIT_PROJECTION_PREFIX`],
+/// judged by its first path segment.
+enum AuditPartition<'a> {
+    /// A well-formed day partition directory, `dt=YYYY-MM-DD/`.
+    Day {
+        /// The partition directory segment, trailing `/` included.
+        segment: &'a str,
+        /// The partition's UTC day.
+        day: NaiveDate,
+    },
+    /// Anything else, never deleted: a directory whose name is not a
+    /// canonical existing day, or an object directly under the prefix
+    /// (whose segment is its whole name).
+    Unrecognized {
+        /// The directory segment, trailing `/` included, or the object name.
+        segment: &'a str,
+    },
+}
+
+impl<'a> AuditPartition<'a> {
+    /// Classifies a path relative to [`CATALOG_AUDIT_PROJECTION_PREFIX`].
+    fn of(relative: &'a str) -> Self {
+        let segment = relative.split_inclusive('/').next().unwrap_or(relative);
+        segment
+            .strip_suffix('/')
+            .and_then(audit_partition_day)
+            .map_or(Self::Unrecognized { segment }, |day| Self::Day {
+                segment,
+                day,
+            })
+    }
+
+    /// The first path segment, which identifies the partition.
+    const fn segment(&self) -> &'a str {
+        match self {
+            Self::Day { segment, .. } | Self::Unrecognized { segment } => segment,
+        }
+    }
+}
+
+/// The day of a partition name, only in exactly the form
+/// [`catalog_audit_partition`] writes: `dt=` and a canonical existing
+/// `YYYY-MM-DD` with a four-digit year. Such names are fixed-width and start
+/// with a digit after `dt=`, so they sort chronologically and all sort before
+/// `dt=:`.
+fn audit_partition_day(name: &str) -> Option<NaiveDate> {
+    let text = name.strip_prefix("dt=")?;
+    if text.len() != 10 {
+        return None;
+    }
+    let day = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    (day.format("%Y-%m-%d").to_string() == text).then_some(day)
+}
+
+/// Bookkeeping of one audit retention call.
+struct AuditRetentionTally {
+    report: AuditRetentionReport,
+    /// Segment of the partition being visited. A partition's objects share
+    /// its segment as a path prefix, so they are contiguous in path order.
+    partition: Option<String>,
+    /// Whether this call deleted an object of the partition being visited.
+    partition_expired: bool,
+    /// Deletions left in this call's budget.
+    budget: usize,
+}
+
+impl AuditRetentionTally {
+    fn new(budget: usize) -> Self {
+        Self {
+            report: AuditRetentionReport::default(),
+            partition: None,
+            partition_expired: false,
+            budget,
+        }
+    }
+
+    /// Counts a partition the first time the walk reaches it, and warns about
+    /// an unrecognized one.
+    fn visit(&mut self, partition: &AuditPartition<'_>) {
+        let segment = partition.segment();
+        if self.partition.as_deref() == Some(segment) {
+            return;
+        }
+        self.report.partitions_examined += 1;
+        self.partition = Some(segment.to_owned());
+        self.partition_expired = false;
+        if let AuditPartition::Unrecognized { .. } = partition {
+            warn!(
+                prefix = CATALOG_AUDIT_PROJECTION_PREFIX,
+                partition = segment,
+                "catalog audit retention skipped an unrecognized partition; it is never deleted"
+            );
+        }
+    }
+
+    /// Records one deletion from the partition being visited.
+    fn deleted(&mut self, bytes: u64) {
+        self.budget = self.budget.saturating_sub(1);
+        self.report.objects_deleted += 1;
+        self.report.bytes_reclaimed = self.report.bytes_reclaimed.saturating_add(bytes);
+        if !self.partition_expired {
+            self.partition_expired = true;
+            self.report.partitions_expired += 1;
+        }
+    }
+}
 
 /// The last millisecond whose UTC date has a four-digit year,
 /// 9999-12-31T23:59:59.999Z. Bounding partitions to four-digit years keeps
@@ -1147,7 +1289,8 @@ fn decode_catalog_audit_row(
 /// For every catalog projection intent it materializes, it publishes the
 /// catalog snapshot under `control/v1/projections/catalog-parquet/` and the
 /// intent's audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only
-/// then acknowledges the intent.
+/// then acknowledges the intent. [`Self::expire_audit_partitions`] ages those
+/// audit records out by day partition.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1233,6 +1376,128 @@ impl CatalogProjectionMaterializer {
         self.status
             .projection_status(CATALOG_PARQUET_PROJECTION_CONSUMER_ID)
             .await
+    }
+
+    /// Deletes the `system.catalog.audit` day partitions older than
+    /// `retention_days`, at most `max_objects` objects per call.
+    ///
+    /// A partition `dt=D/` is expired when `D` is strictly before the cutoff
+    /// day, the UTC date `retention_days` days before `now`: a partition
+    /// exactly `retention_days` days old is kept, and since `retention_days`
+    /// is at least one, today's partition is never deleted.
+    ///
+    /// The call walks [`CATALOG_AUDIT_PROJECTION_PREFIX`] in path order in
+    /// bounded pages (at most `min(max_objects, 1000)` objects each) and
+    /// deletes the objects of expired partitions. Well-formed day partition
+    /// names sort chronologically, so the first object of a retained day
+    /// partition ends the walk through the day partitions: every later one is
+    /// at least as new. The walk then resumes past all of them (their names
+    /// start `dt=` and a digit, so they sort before `dt=:`) and lists no other
+    /// retained day partition.
+    ///
+    /// Every other name beneath the prefix is never deleted: a directory
+    /// whose name is not a canonical existing day (for example
+    /// `dt=not-a-date/`), or an object directly under the prefix. The walk
+    /// logs it at warn once, counts it as examined and continues past it, so
+    /// such a name sorting before the day partitions does not stop the
+    /// sweep. Unrecognized names that sort among the day partitions after the
+    /// first retained one are skipped with them. Nothing outside the prefix is
+    /// listed or deleted, and an empty prefix yields a default report.
+    ///
+    /// Objects are deleted one at a time in path order, so an interrupted or
+    /// truncated call leaves only the newest expired objects, and the next
+    /// call resumes with the oldest survivor. When the budget is spent the
+    /// walk looks for one more expired object: finding one sets
+    /// [`AuditRetentionReport::truncated`]; reaching a retained day partition
+    /// or the end of the listing leaves it unset.
+    ///
+    /// # Redelivery
+    ///
+    /// The sweep does not coordinate with [`Self::drain_once`]. A redelivered
+    /// intent whose partition has already expired rewrites its audit file (the
+    /// does-not-exist put succeeds), and the next sweep deletes it again. If a
+    /// sweep deletes the file after a redelivered intent's does-not-exist put
+    /// failed and before the materializer reads the existing bytes back, the
+    /// read reports `NotFound`, which is not retryable, so the intent is
+    /// quarantined as incompatible. Both need an intent that stayed
+    /// unacknowledged, or was redelivered, for more than `retention_days`
+    /// after it occurred; that edge is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `retention_days` or `max_objects` is
+    /// zero, and storage errors from listing or deleting; objects deleted
+    /// before an error stay deleted.
+    pub async fn expire_audit_partitions(
+        &self,
+        now: DateTime<Utc>,
+        retention_days: u32,
+        max_objects: usize,
+    ) -> Result<AuditRetentionReport> {
+        if retention_days == 0 || max_objects == 0 {
+            return Err(CatalogError::Validation {
+                message: format!(
+                    "catalog audit retention needs at least one day and one object per call, got {retention_days} days and {max_objects} objects"
+                ),
+            });
+        }
+        // `None` when the cutoff predates the calendar: nothing is old enough.
+        let cutoff = now
+            .date_naive()
+            .checked_sub_days(Days::new(u64::from(retention_days)));
+        let page_limit = max_objects.min(AUDIT_RETENTION_PAGE_LIMIT);
+        let past_day_partitions = format!("{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:");
+        let mut tally = AuditRetentionTally::new(max_objects);
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .storage
+                .list_page_meta(
+                    CATALOG_AUDIT_PROJECTION_PREFIX,
+                    cursor.as_deref(),
+                    page_limit,
+                )
+                .await?;
+            let mut next = page.next_start_after;
+            for object in page.objects {
+                let path = object.path.as_str();
+                let relative = path
+                    .strip_prefix(CATALOG_AUDIT_PROJECTION_PREFIX)
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: format!(
+                            "catalog audit retention listed {path} outside {CATALOG_AUDIT_PROJECTION_PREFIX}"
+                        ),
+                    })?;
+                let partition = AuditPartition::of(relative);
+                tally.visit(&partition);
+                match partition {
+                    AuditPartition::Unrecognized { .. } => {}
+                    AuditPartition::Day { day, .. }
+                        if cutoff.is_some_and(|cutoff| day < cutoff) =>
+                    {
+                        if tally.budget == 0 {
+                            tally.report.truncated = true;
+                            return Ok(tally.report);
+                        }
+                        self.storage.delete(path).await?;
+                        tally.deleted(object.size);
+                    }
+                    AuditPartition::Day { .. } => {
+                        // Retained, and so is every later day partition: skip
+                        // them all (and an object named exactly `dt=:`, which
+                        // is unrecognized anyway). The cursor always moves
+                        // forward, since `path` sorts before the skip cursor.
+                        next = (path < past_day_partitions.as_str())
+                            .then(|| past_day_partitions.clone());
+                        break;
+                    }
+                }
+            }
+            match next {
+                Some(start_after) => cursor = Some(start_after),
+                None => return Ok(tally.report),
+            }
+        }
     }
 
     async fn materialize(

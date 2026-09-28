@@ -20,14 +20,15 @@ use arco_catalog::state_store::projection_outbox_acks::{
     ProjectionOutboxBacklog, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    ArcoStateAdmin, ArcoStateReader, CATALOG_AUDIT_PROJECTION_PREFIX,
-    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority, CatalogAuthorityBinding,
-    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError, CatalogListRequest, CatalogPatch,
-    CatalogProjectionMaterializer, CatalogProjectionNotifier, ColumnDefinition,
-    ControlCatalogAuthority, ControlMvpMaintenanceOutcome, ControlMvpProjectionOutboxRecord,
-    ControlMvpStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus,
-    ProjectionIntentV1, PurgedCounts, RegisterTableInSchemaRequest, SchemaPatch, StateScope,
-    TxnOptions, WriteOptions, catalog_audit_artifact_path,
+    ArcoStateAdmin, ArcoStateReader, AuditRetentionReport, CATALOG_AUDIT_PROJECTION_PREFIX,
+    CATALOG_AUDIT_RETENTION_DAYS, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
+    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError,
+    CatalogListRequest, CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier,
+    ColumnDefinition, ControlCatalogAuthority, ControlMvpMaintenanceOutcome,
+    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, DurableAuthorityBinding,
+    DurableMaintenanceWorker, MaintenanceStatus, ProjectionIntentV1, PurgedCounts,
+    RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions, WriteOptions,
+    catalog_audit_artifact_path, catalog_audit_partition,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
@@ -1713,6 +1714,235 @@ async fn an_intent_whose_payload_is_not_an_audit_record_is_quarantined_without_a
         vec![expected_audit_row(&record)],
         read_audit_artifact(&storage, &audit_path).await
     );
+}
+
+/// The fixed clock of the audit retention sweep tests, so partition days are
+/// deterministic: with 400 days of retention the cutoff day is 2026-04-27.
+fn audit_sweep_now() -> chrono::DateTime<chrono::Utc> {
+    "2027-06-01T12:00:00Z".parse().expect("fixed sweep clock")
+}
+
+/// The `dt=YYYY-MM-DD/` audit partition `days` days before `now`.
+fn audit_partition_days_before(now: chrono::DateTime<chrono::Utc>, days: i64) -> String {
+    catalog_audit_partition((now - chrono::Duration::days(days)).timestamp_millis())
+        .expect("audit partition")
+}
+
+/// Puts `bytes` at `path` without a precondition and returns the path.
+async fn seed_object(storage: &ScopedStorage, path: String, bytes: &'static [u8]) -> String {
+    storage
+        .put_raw(&path, Bytes::from_static(bytes), WritePrecondition::None)
+        .await
+        .expect("seed object");
+    path
+}
+
+/// Every object under the audit projection prefix and its sibling prefix,
+/// sorted.
+async fn projection_objects(storage: &ScopedStorage) -> Vec<String> {
+    let mut paths = storage
+        .list("control/v1/projections/")
+        .await
+        .expect("list projections")
+        .into_iter()
+        .map(|path| path.as_str().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn audit_sweep_expires_only_partitions_strictly_older_than_the_retention() {
+    let storage = scoped_storage();
+    let now = audit_sweep_now();
+    let prefix = CATALOG_AUDIT_PROJECTION_PREFIX;
+    let expired = audit_partition_days_before(now, 401);
+    let boundary = audit_partition_days_before(now, 400);
+    let younger = audit_partition_days_before(now, 399);
+    let today = audit_partition_days_before(now, 0);
+    assert_eq!(
+        (
+            expired.as_str(),
+            boundary.as_str(),
+            younger.as_str(),
+            today.as_str()
+        ),
+        (
+            "dt=2026-04-26/",
+            "dt=2026-04-27/",
+            "dt=2026-04-28/",
+            "dt=2027-06-01/"
+        )
+    );
+    // Unrecognized names that sort before the day partitions: no `dt=`
+    // segment, and a canonical-looking day that does not exist.
+    let no_partition = seed_object(&storage, format!("{prefix}archive/early.parquet"), b"a").await;
+    let impossible_day =
+        seed_object(&storage, format!("{prefix}dt=1999-02-30/f.parquet"), b"ff").await;
+    seed_object(&storage, format!("{prefix}{expired}a.parquet"), b"aaa").await;
+    seed_object(&storage, format!("{prefix}{expired}b.parquet"), b"bbbbb").await;
+    let kept_boundary = seed_object(&storage, format!("{prefix}{boundary}c.parquet"), b"c").await;
+    let kept_younger = seed_object(&storage, format!("{prefix}{younger}d.parquet"), b"d").await;
+    let kept_today = seed_object(&storage, format!("{prefix}{today}e.parquet"), b"e").await;
+    // An unrecognized name that sorts after every day partition.
+    let junk = seed_object(&storage, format!("{prefix}dt=not-a-date/x.parquet"), b"x").await;
+    // A sibling prefix sharing the audit prefix's text is never touched.
+    let sibling = seed_object(
+        &storage,
+        "control/v1/projections/catalog-audit-archive/dt=2020-01-01/old.parquet".to_string(),
+        b"old",
+    )
+    .await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+
+    let report = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 100)
+        .await
+        .expect("sweep");
+
+    assert_eq!(CATALOG_AUDIT_RETENTION_DAYS, 400);
+    assert_eq!(
+        report,
+        AuditRetentionReport {
+            // archive/, dt=1999-02-30/, the expired partition, the first
+            // retained partition, then dt=not-a-date/ past the day range.
+            partitions_examined: 5,
+            partitions_expired: 1,
+            objects_deleted: 2,
+            bytes_reclaimed: 8,
+            truncated: false,
+        }
+    );
+    let mut remaining = vec![
+        no_partition.clone(),
+        impossible_day.clone(),
+        kept_boundary.clone(),
+        kept_younger.clone(),
+        kept_today.clone(),
+        junk.clone(),
+        sibling.clone(),
+    ];
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        projection_objects(&storage).await,
+        "only the partition strictly older than the retention is deleted"
+    );
+
+    let again = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 100)
+        .await
+        .expect("second sweep");
+
+    assert_eq!(
+        again,
+        AuditRetentionReport {
+            partitions_examined: 4,
+            ..AuditRetentionReport::default()
+        },
+        "a repeated sweep deletes nothing"
+    );
+    assert_eq!(remaining, projection_objects(&storage).await);
+}
+
+#[tokio::test]
+async fn audit_sweep_budget_truncates_and_later_calls_finish_the_partition() {
+    let storage = scoped_storage();
+    let now = audit_sweep_now();
+    let prefix = CATALOG_AUDIT_PROJECTION_PREFIX;
+    let expired = audit_partition_days_before(now, 401);
+    let today = audit_partition_days_before(now, 0);
+    for index in 0..5 {
+        seed_object(&storage, format!("{prefix}{expired}{index}.parquet"), b"ab").await;
+    }
+    let kept_today = seed_object(&storage, format!("{prefix}{today}t.parquet"), b"t").await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let sweep = || materializer.expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 2);
+
+    let first = sweep().await.expect("first sweep");
+    assert_eq!(
+        first,
+        AuditRetentionReport {
+            partitions_examined: 1,
+            partitions_expired: 1,
+            objects_deleted: 2,
+            bytes_reclaimed: 4,
+            truncated: true,
+        },
+        "the budget runs out while expired objects remain"
+    );
+    let second = sweep().await.expect("second sweep");
+    assert_eq!(second, first);
+    let last = sweep().await.expect("last sweep");
+    assert_eq!(
+        last,
+        AuditRetentionReport {
+            partitions_examined: 2,
+            partitions_expired: 1,
+            objects_deleted: 1,
+            bytes_reclaimed: 2,
+            truncated: false,
+        }
+    );
+    assert_eq!(vec![kept_today.clone()], projection_objects(&storage).await);
+
+    // A budget that exactly covers the expired objects is not truncated: the
+    // sweep looks past the last deletion before it reports.
+    let older = audit_partition_days_before(now, 500);
+    seed_object(&storage, format!("{prefix}{older}p.parquet"), b"p").await;
+    seed_object(&storage, format!("{prefix}{older}q.parquet"), b"q").await;
+
+    let exact = sweep().await.expect("exact sweep");
+
+    assert_eq!(
+        exact,
+        AuditRetentionReport {
+            partitions_examined: 2,
+            partitions_expired: 1,
+            objects_deleted: 2,
+            bytes_reclaimed: 2,
+            truncated: false,
+        }
+    );
+    assert_eq!(vec![kept_today], projection_objects(&storage).await);
+}
+
+#[tokio::test]
+async fn audit_sweep_rejects_a_zero_retention_or_budget_and_is_idle_on_an_empty_prefix() {
+    let storage = scoped_storage();
+    let now = audit_sweep_now();
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+
+    assert_eq!(
+        materializer
+            .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 10)
+            .await
+            .expect("empty sweep"),
+        AuditRetentionReport::default()
+    );
+
+    let old = seed_object(
+        &storage,
+        format!(
+            "{CATALOG_AUDIT_PROJECTION_PREFIX}{}old.parquet",
+            audit_partition_days_before(now, 900)
+        ),
+        b"old",
+    )
+    .await;
+    let zero_retention = materializer.expire_audit_partitions(now, 0, 10).await;
+    assert!(
+        matches!(zero_retention, Err(CatalogError::Validation { .. })),
+        "{zero_retention:?}"
+    );
+    let zero_budget = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 0)
+        .await;
+    assert!(
+        matches!(zero_budget, Err(CatalogError::Validation { .. })),
+        "{zero_budget:?}"
+    );
+    assert_eq!(vec![old], projection_objects(&storage).await);
 }
 
 #[tokio::test]

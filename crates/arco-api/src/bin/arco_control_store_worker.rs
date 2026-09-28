@@ -5,7 +5,10 @@
 //! retention horizon that purges expired rows and unobservable tombstones),
 //! then drains the catalog projection outbox, then trims the records the
 //! catalog consumer has acknowledged out of that outbox, then runs one bounded
-//! pass of conservative garbage collection per domain. The process exits `0`
+//! pass of conservative garbage collection per domain and one bounded sweep
+//! that deletes `system.catalog.audit` day partitions older than the audit
+//! retention (`ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS`, default 400 days;
+//! domain `catalog-audit` in the GC phase's logs). The process exits `0`
 //! when every phase either completed or deferred to the next run, and non-zero
 //! when any phase failed with a typed error or the retention epoch is stuck.
 //!
@@ -30,9 +33,10 @@ use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionMaterializationStatus, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogError, CatalogProjectionMaterializer,
-    ControlMvpMaintenanceWorker, DurableAuthorityBinding, DurableMaintenanceWorker,
-    MaintenanceJobId, MaintenanceKind, MaintenanceProgress, MaintenanceStatus, StateScope,
+    CATALOG_AUDIT_RETENTION_DAYS, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogError,
+    CatalogProjectionMaterializer, ControlMvpMaintenanceWorker, DurableAuthorityBinding,
+    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind, MaintenanceProgress,
+    MaintenanceStatus, StateScope,
 };
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::{ScopedStorage, WritePrecondition};
@@ -45,6 +49,11 @@ use serde::{Deserialize, Serialize};
 const CONTROL_DOMAINS: [&str; 2] = ["catalog", PROJECTION_OUTBOX_ACK_DOMAIN];
 const DEFAULT_GC_MAX_PAGES: usize = 16;
 const DEFAULT_MAINTENANCE_MAX_ADVANCES: usize = 4096;
+/// Audit partition objects the GC phase may delete per configured GC page:
+/// the audit sweep's per-run budget scales with `ARCO_CONTROL_STORE_GC_MAX_PAGES`.
+const AUDIT_SWEEP_OBJECTS_PER_GC_PAGE: usize = 1000;
+/// The GC phase's log and failure label for the catalog audit sweep.
+const AUDIT_SWEEP_DOMAIN: &str = "catalog-audit";
 /// Scope-relative prefix of the persisted per-domain maintenance job identity.
 const SELECTED_JOB_PREFIX: &str = "locks/control-store-worker/";
 /// The kernel admits a maintenance descriptor for 24 hours; after that the job
@@ -58,6 +67,38 @@ struct RunLimits {
     gc_max_pages: usize,
     /// Maximum `advance_at` calls per maintenance job per run.
     maintenance_max_advances: usize,
+    /// Days a `system.catalog.audit` day partition is retained.
+    audit_retention_days: u32,
+    /// Maximum audit partition objects deleted per run:
+    /// `gc_max_pages` × [`AUDIT_SWEEP_OBJECTS_PER_GC_PAGE`].
+    audit_sweep_max_objects: usize,
+}
+
+impl RunLimits {
+    /// Reads the limits from settings looked up by name (the process
+    /// environment in production). An unset or blank setting takes its
+    /// default; zero or a non-integer is rejected.
+    fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let gc_max_pages = positive_setting(
+            &setting,
+            "ARCO_CONTROL_STORE_GC_MAX_PAGES",
+            DEFAULT_GC_MAX_PAGES,
+        )?;
+        Ok(Self {
+            gc_max_pages,
+            maintenance_max_advances: positive_setting(
+                &setting,
+                "ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES",
+                DEFAULT_MAINTENANCE_MAX_ADVANCES,
+            )?,
+            audit_retention_days: positive_setting(
+                &setting,
+                "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS",
+                CATALOG_AUDIT_RETENTION_DAYS,
+            )?,
+            audit_sweep_max_objects: gc_max_pages.saturating_mul(AUDIT_SWEEP_OBJECTS_PER_GC_PAGE),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +613,36 @@ impl DomainGcSummary {
     }
 }
 
+/// The GC phase's sweep of the catalog audit projection.
+#[derive(Debug, Serialize)]
+struct AuditRetentionSummary {
+    partitions_examined: u64,
+    partitions_expired: u64,
+    objects_deleted: u64,
+    bytes_reclaimed: u64,
+    /// Expired objects remained after the deletion budget; the next run
+    /// continues with the oldest.
+    truncated: bool,
+    elapsed_ms: u64,
+}
+
+impl AuditRetentionSummary {
+    fn log(&self) {
+        tracing::info!(
+            phase = "gc",
+            domain = AUDIT_SWEEP_DOMAIN,
+            outcome = "ok",
+            partitions_examined = self.partitions_examined,
+            partitions_expired = self.partitions_expired,
+            objects_deleted = self.objects_deleted,
+            bytes_reclaimed = self.bytes_reclaimed,
+            truncated = self.truncated,
+            elapsed_ms = self.elapsed_ms,
+            "control-store worker phase complete"
+        );
+    }
+}
+
 /// Everything one invocation did. Phases that failed are absent from their
 /// collection and recorded in `failures`.
 #[derive(Debug, Default, Serialize)]
@@ -581,6 +652,7 @@ struct RunSummary {
     drain: Option<DrainSummary>,
     trim: Option<TrimSummary>,
     gc: Vec<DomainGcSummary>,
+    audit_retention: Option<AuditRetentionSummary>,
     failures: Vec<String>,
 }
 
@@ -1375,13 +1447,41 @@ async fn collect_domain(
     })
 }
 
+/// Deletes the catalog audit projection's expired day partitions, within the
+/// run's object budget. Every error is a phase failure: the sweep holds no
+/// coordination another actor could win, so there is nothing to defer on.
+async fn expire_catalog_audit(
+    storage: ScopedStorage,
+    limits: RunLimits,
+) -> Result<AuditRetentionSummary> {
+    let started = Instant::now();
+    let report = CatalogProjectionMaterializer::new(storage)
+        .context("construct catalog projection materializer")?
+        .expire_audit_partitions(
+            Utc::now(),
+            limits.audit_retention_days,
+            limits.audit_sweep_max_objects,
+        )
+        .await
+        .context("expire catalog audit partitions")?;
+    Ok(AuditRetentionSummary {
+        partitions_examined: report.partitions_examined,
+        partitions_expired: report.partitions_expired,
+        objects_deleted: report.objects_deleted,
+        bytes_reclaimed: report.bytes_reclaimed,
+        truncated: report.truncated,
+        elapsed_ms: elapsed_ms(started),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
 
 /// Runs every phase once: epoch inspection, maintenance per domain
 /// (consolidation, then retention horizon), catalog projection drain, catalog
-/// outbox trim, GC per domain. Phases are independent: a failure is recorded
+/// outbox trim, GC per domain, then the catalog audit partition sweep (also
+/// the GC phase). Phases are independent: a failure is recorded
 /// and the remaining phases still run, so one wedged domain never starves
 /// another. The returned summary carries every failure; callers exit non-zero
 /// through [`RunSummary::exit_error`].
@@ -1471,6 +1571,14 @@ async fn run_once(
         }
     }
 
+    match expire_catalog_audit(storage, limits).await {
+        Ok(audit) => {
+            audit.log();
+            summary.audit_retention = Some(audit);
+        }
+        Err(error) => summary.fail("gc", AUDIT_SWEEP_DOMAIN, &error),
+    }
+
     let failed = summary.failures.len();
     tracing::info!(
         phase = "run",
@@ -1493,14 +1601,24 @@ fn required_env(name: &str) -> Result<String> {
     }
 }
 
-fn usize_env(name: &str, default: usize) -> Result<usize> {
-    match std::env::var(name) {
-        Ok(value) if !value.trim().is_empty() => {
+/// Reads the positive integer setting `name`: unset or blank yields
+/// `default`; zero or a non-integer is an error.
+fn positive_setting<T>(
+    setting: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    default: T,
+) -> Result<T>
+where
+    T: std::str::FromStr + PartialEq + From<u8>,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    match setting(name) {
+        Some(value) if !value.trim().is_empty() => {
             let parsed = value
                 .trim()
-                .parse::<usize>()
+                .parse::<T>()
                 .with_context(|| format!("{name} must be a positive integer"))?;
-            if parsed == 0 {
+            if parsed == T::from(0) {
                 bail!("{name} must be greater than zero");
             }
             Ok(parsed)
@@ -1538,13 +1656,7 @@ async fn main() -> Result<()> {
     let tenant = required_env("ARCO_CATALOG_CONTROL_V1_TENANT_ID")?;
     let workspace = required_env("ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID")?;
     let binding = decode_binding(&required_env("ARCO_CONTROL_STORE_MAINTENANCE_BINDING")?)?;
-    let limits = RunLimits {
-        gc_max_pages: usize_env("ARCO_CONTROL_STORE_GC_MAX_PAGES", DEFAULT_GC_MAX_PAGES)?,
-        maintenance_max_advances: usize_env(
-            "ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES",
-            DEFAULT_MAINTENANCE_MAX_ADVANCES,
-        )?,
-    };
+    let limits = RunLimits::from_settings(|name| std::env::var(name).ok())?;
     let backend = arco_storage::from_bucket(&bucket)
         .with_context(|| format!("open storage bucket {bucket}"))?;
     let storage = ScopedStorage::new(backend, tenant.as_str(), workspace.as_str())
@@ -1554,6 +1666,8 @@ async fn main() -> Result<()> {
         workspace = %workspace,
         gc_max_pages = limits.gc_max_pages,
         maintenance_max_advances = limits.maintenance_max_advances,
+        audit_retention_days = limits.audit_retention_days,
+        audit_sweep_max_objects = limits.audit_sweep_max_objects,
         "control-store worker starting"
     );
     let summary = run_once(storage, &tenant, &workspace, binding, limits).await?;
@@ -1570,9 +1684,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use arco_catalog::{
-        ArcoStateReader as _, ArcoStateTxn as _, CatalogProjectionNotifier,
-        ControlCatalogAuthority, ControlMvpStateStore, ProjectionIntentV1, TxnOptions,
-        WriteOptions,
+        ArcoStateReader as _, ArcoStateTxn as _, CATALOG_AUDIT_PROJECTION_PREFIX,
+        CatalogProjectionNotifier, ControlCatalogAuthority, ControlMvpStateStore,
+        ProjectionIntentV1, TxnOptions, WriteOptions, catalog_audit_partition,
     };
     use arco_core::storage::{ListPage, ObjectMeta, StorageBackend};
     use arco_core::{MemoryBackend, WriteResult};
@@ -1585,6 +1699,8 @@ mod tests {
     const TEST_LIMITS: RunLimits = RunLimits {
         gc_max_pages: 4,
         maintenance_max_advances: 512,
+        audit_retention_days: CATALOG_AUDIT_RETENTION_DAYS,
+        audit_sweep_max_objects: 4 * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE,
     };
     const TENANT: &str = "tenant";
     const WORKSPACE: &str = "workspace";
@@ -2707,6 +2823,110 @@ mod tests {
         Ok(())
     }
 
+    /// Puts one object under the catalog audit projection, in the day
+    /// partition of `occurred_at`, and returns its path.
+    async fn seed_audit_object(
+        storage: &ScopedStorage,
+        occurred_at: DateTime<Utc>,
+        name: &str,
+    ) -> Result<String> {
+        let path = format!(
+            "{CATALOG_AUDIT_PROJECTION_PREFIX}{}{name}",
+            catalog_audit_partition(occurred_at.timestamp_millis())?
+        );
+        storage
+            .put_raw(&path, Bytes::from_static(b"audit"), WritePrecondition::None)
+            .await?;
+        Ok(path)
+    }
+
+    /// Every object under the catalog audit projection, sorted.
+    async fn audit_objects(storage: &ScopedStorage) -> Result<Vec<String>> {
+        let mut paths = storage
+            .list(CATALOG_AUDIT_PROJECTION_PREFIX)
+            .await?
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        paths.sort();
+        Ok(paths)
+    }
+
+    #[tokio::test]
+    async fn run_once_expires_old_audit_partitions_in_the_gc_phase() -> Result<()> {
+        let storage = test_storage()?;
+        let stale = seed_audit_object(
+            &storage,
+            Utc::now() - Duration::days(500),
+            "stale-audit.parquet",
+        )
+        .await?;
+        let current = seed_audit_object(&storage, Utc::now(), "current-audit.parquet").await?;
+        // A real mutation, drained by the run, writes today's audit file too.
+        seed_catalog_intents(&storage, 0..1).await?;
+
+        let summary = run(&storage).await?;
+
+        assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+        assert_eq!(
+            summary.drain.as_ref().map(|drain| drain.drained_records),
+            Some(1)
+        );
+        let audit = summary
+            .audit_retention
+            .as_ref()
+            .ok_or_else(|| anyhow!("audit retention summary missing"))?;
+        assert_eq!(
+            audit.partitions_examined, 2,
+            "the expired partition, then today's, which ends the walk"
+        );
+        assert_eq!(audit.partitions_expired, 1);
+        assert_eq!(audit.objects_deleted, 1);
+        assert_eq!(audit.bytes_reclaimed, 5);
+        assert!(!audit.truncated);
+        let remaining = audit_objects(&storage).await?;
+        assert!(!remaining.contains(&stale), "{remaining:?}");
+        assert!(remaining.contains(&current), "{remaining:?}");
+        assert_eq!(
+            remaining.len(),
+            2,
+            "today's seeded object and the drained mutation's audit file remain: {remaining:?}"
+        );
+        assert_eq!(summary.gc.len(), CONTROL_DOMAINS.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_once_records_an_audit_sweep_failure_as_a_gc_failure() -> Result<()> {
+        let backend = Arc::new(FailNthWrite::delete("/stale-audit.parquet", 1));
+        let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE)?;
+        let stale = seed_audit_object(
+            &storage,
+            Utc::now() - Duration::days(500),
+            "stale-audit.parquet",
+        )
+        .await?;
+
+        let summary = run(&storage).await?;
+
+        assert!(backend.fired(), "the sweep must attempt the stale delete");
+        assert!(summary.audit_retention.is_none());
+        assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
+        assert!(
+            summary.failures[0].starts_with("gc[catalog-audit]:"),
+            "the failure names the phase and the audit projection: {}",
+            summary.failures[0]
+        );
+        assert!(summary.exit_error().is_some());
+        assert_eq!(
+            summary.gc.len(),
+            CONTROL_DOMAINS.len(),
+            "the kernel GC still ran"
+        );
+        assert_eq!(audit_objects(&storage).await?, vec![stale]);
+        Ok(())
+    }
+
     #[test]
     fn trim_defers_on_backpressure_and_coordination_losses_only() {
         let message = || "injected".to_owned();
@@ -2845,6 +3065,72 @@ mod tests {
             Some(record.clone())
         );
         assert_eq!(record.kind_label(), "retention_horizon");
+        Ok(())
+    }
+
+    /// Run limits read from `pairs` in place of the process environment.
+    fn limits_from(pairs: &[(&str, &str)]) -> Result<RunLimits> {
+        RunLimits::from_settings(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn run_limits_default_the_audit_retention_to_400_days_and_reject_zero() -> Result<()> {
+        let defaults = limits_from(&[])?;
+        assert_eq!(defaults.audit_retention_days, 400);
+        assert_eq!(defaults.audit_retention_days, CATALOG_AUDIT_RETENTION_DAYS);
+        assert_eq!(defaults.gc_max_pages, DEFAULT_GC_MAX_PAGES);
+        assert_eq!(
+            defaults.maintenance_max_advances,
+            DEFAULT_MAINTENANCE_MAX_ADVANCES
+        );
+        assert_eq!(
+            defaults.audit_sweep_max_objects,
+            DEFAULT_GC_MAX_PAGES * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE
+        );
+        assert_eq!(
+            limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "  ")])?.audit_retention_days,
+            400,
+            "a blank setting keeps the default"
+        );
+
+        let custom = limits_from(&[
+            ("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", " 30 "),
+            ("ARCO_CONTROL_STORE_GC_MAX_PAGES", "2"),
+        ])?;
+        assert_eq!(custom.audit_retention_days, 30);
+        assert_eq!(custom.gc_max_pages, 2);
+        assert_eq!(
+            custom.audit_sweep_max_objects,
+            2 * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE
+        );
+
+        let zero = limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "0")])
+            .err()
+            .ok_or_else(|| anyhow!("a zero retention must be rejected"))?;
+        assert_eq!(
+            format!("{zero:#}"),
+            "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be greater than zero"
+        );
+        for invalid in ["-1", "4294967296", "400d"] {
+            let error = limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", invalid)])
+                .err()
+                .ok_or_else(|| anyhow!("retention {invalid:?} must be rejected"))?;
+            assert!(
+                format!("{error:#}").starts_with(
+                    "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be a positive integer"
+                ),
+                "{error:#}"
+            );
+        }
+        assert!(
+            limits_from(&[("ARCO_CONTROL_STORE_GC_MAX_PAGES", "0")]).is_err(),
+            "the existing limits keep rejecting zero"
+        );
         Ok(())
     }
 

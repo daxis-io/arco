@@ -136,6 +136,32 @@ per-commit cost: format 9 still replays the whole retained state
 budgets remain governed by consolidation cadence and by how much live state
 the domain holds.
 
+## Receipts and audit rows (retention step 3)
+
+As of 2026-09-27 the catalog adapter no longer writes audit rows (key tag 4)
+to the authority KV. The audit record rides the projection intent and lands
+in the catalog audit projection, a set of Parquet files outside the KV
+(`docs/guide/src/reference/system-catalog.md`). Tag 4 is retired and
+reserved: a format-9 root written before this change may still hold tag-4
+rows, and nothing expires or deletes them.
+
+On format 9 every idempotency receipt (key tag 3) is now written with an
+expiry hint of `occurredAtMs + 24 h` (`CATALOG_RECEIPT_RETENTION_MS`);
+unkeyed mutations write a receipt too, and the test-only bounded format 8
+writes plain receipts. The hint is not a read filter: a keyed request replays
+its original response for at least 24 hours, and an expired receipt keeps
+answering replays until it is purged. The retention horizon purges only rows
+whose expiry is more than one hour before its clock, so a receipt becomes
+purge-eligible strictly after `occurredAtMs + 25 h` and leaves the replayed
+state with the next published horizon.
+
+A catalog root's retained rows are therefore roughly: the receipts of the
+last ~25 hours (plus the time until the next published horizon), the
+tombstones the horizon cannot yet purge, outbox rows not yet trimmed, live
+catalog state, and any tag-4 rows left from before this change. This bounds
+the row count, not the per-commit cost: every commit still replays the whole
+retained state, and the caveat above stands.
+
 ## Current Wiring Status
 
 Status as of 2026-09-27: the `arco_state_store_replay_duration_seconds` and

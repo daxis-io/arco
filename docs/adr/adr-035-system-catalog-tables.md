@@ -30,6 +30,8 @@ projections.
 - `system.lineage.edges`
 - `system.orchestration.{runs,tasks,catalog_run_index,dep_satisfaction,timers,dispatch_outbox,sensor_state,sensor_evals,partition_status,schedule_definitions,schedule_state,schedule_ticks,backfills,backfill_chunks,run_key_conflicts}`
 
+Retention step 3 (2026-09-27) added the catalog audit projection, which the retention design calls `system.catalog.audit`: it is published as day-partitioned Parquet files under a control-bound catalog root, not as a hosted SQL table (see `docs/guide/src/reference/system-catalog.md`).
+
 ## Deferred Tables
 
 The initial surface does not include access, storage, governance, volume,

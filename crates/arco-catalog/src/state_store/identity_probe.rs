@@ -1,6 +1,6 @@
-//! Synthetic tenant identity-root admission probe; never a principal API.
+//! Test-only tenant identity-root lifecycle and principal probes.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use arco_core::lock::DistributedLock;
@@ -21,6 +21,7 @@ use super::{
 };
 use crate::error::{CatalogError, Result};
 use crate::gc::reachability::sha256_digest;
+use crate::metastore::events::PrincipalKind;
 use crate::retention_coordination::{
     RecoveredRetentionEpoch, RetentionMutationEpoch, RetentionMutationKind,
     recover_stale_identity_epoch,
@@ -227,6 +228,332 @@ impl SyntheticIdentityMutation {
 /// }
 /// ```
 pub struct IdentityStore(ControlMvpStateStore);
+
+// ponytail: one replay log fits the test-only 15-commit cap; use segmented events when identity layout maintenance is admitted.
+const PRINCIPAL_EVENTS_KEY: &[u8] = b"principal/events-v1";
+
+/// Optional request provenance; tenant authority is recorded on the event itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityOrigin {
+    /// Workspace that originated the request, if any.
+    pub workspace_id: Option<String>,
+    /// Metastore that originated the request, if any.
+    pub metastore_id: Option<String>,
+}
+
+/// The only principal mutations admitted by [`PrincipalIdentityStore`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityMutation {
+    /// Allocate a new, never reused principal ID.
+    Create {
+        /// Display name.
+        name: String,
+        /// Principal family.
+        kind: PrincipalKind,
+    },
+    /// Disable a principal throughout its tenant authority.
+    Disable {
+        /// Stable principal ID.
+        principal_id: String,
+    },
+    /// Replace direct group memberships at an expected revision.
+    ReviseMembership {
+        /// Stable principal ID.
+        principal_id: String,
+        /// Revision observed by the caller.
+        expected_revision: u64,
+        /// Complete set of direct group IDs.
+        group_ids: BTreeSet<String>,
+    },
+}
+
+/// One deterministic identity authority event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityEvent {
+    /// Tenant that owns the principal; origin is separate provenance.
+    pub tenant_id: String,
+    /// Optional originating request context.
+    pub origin: Option<IdentityOrigin>,
+    /// Monotonic event sequence within this tenant identity root.
+    pub sequence: u64,
+    /// Stable event ID derived from the sequence.
+    pub event_id: String,
+    /// Store-assigned principal ID.
+    pub principal_id: String,
+    /// Typed principal operation.
+    pub mutation: IdentityMutation,
+}
+
+/// Replayed principal state. Disabled records remain to reserve their IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityPrincipal {
+    /// Stable principal ID.
+    pub principal_id: String,
+    /// Principal display name.
+    pub name: String,
+    /// Principal family.
+    pub kind: PrincipalKind,
+    /// Whether principal use is enabled.
+    pub active: bool,
+    /// Monotonic membership revision.
+    pub membership_revision: u64,
+    /// Direct group memberships.
+    pub group_ids: BTreeSet<String>,
+}
+
+/// Deterministic replay of one tenant's identity events.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IdentityState {
+    /// All events in authority order.
+    pub events: Vec<IdentityEvent>,
+    /// Principals keyed by never-recycled ID.
+    pub principals: BTreeMap<String, IdentityPrincipal>,
+}
+
+impl IdentityState {
+    /// Apply a checked event. Duplicate IDs and invalid transitions fail closed.
+    ///
+    /// # Errors
+    /// Returns a validation error for a foreign tenant, gap, duplicate ID, or invalid transition.
+    pub fn apply_event(&mut self, event: IdentityEvent) -> Result<()> {
+        let expected = u64::try_from(self.events.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| identity_error("identity event sequence overflow"))?;
+        if event.tenant_id.is_empty()
+            || event.sequence != expected
+            || event.event_id != format!("identity-{expected}")
+            || self
+                .events
+                .first()
+                .is_some_and(|first| first.tenant_id != event.tenant_id)
+            || event.principal_id.is_empty()
+        {
+            return Err(identity_error(
+                "identity event has foreign tenant or invalid envelope",
+            ));
+        }
+        match &event.mutation {
+            IdentityMutation::Create { name, kind } => {
+                if name.is_empty() || self.principals.contains_key(&event.principal_id) {
+                    return Err(identity_error(
+                        "principal ID already assigned or name is empty",
+                    ));
+                }
+                self.principals.insert(
+                    event.principal_id.clone(),
+                    IdentityPrincipal {
+                        principal_id: event.principal_id.clone(),
+                        name: name.clone(),
+                        kind: *kind,
+                        active: true,
+                        membership_revision: 0,
+                        group_ids: BTreeSet::new(),
+                    },
+                );
+            }
+            IdentityMutation::Disable { principal_id } => {
+                if principal_id != &event.principal_id {
+                    return Err(identity_error("principal ID differs from event"));
+                }
+                let principal = self
+                    .principals
+                    .get_mut(principal_id)
+                    .ok_or_else(|| identity_error("principal does not exist"))?;
+                if !principal.active {
+                    return Err(identity_error("principal is already disabled"));
+                }
+                principal.active = false;
+            }
+            IdentityMutation::ReviseMembership {
+                principal_id,
+                expected_revision,
+                group_ids,
+            } => {
+                if principal_id != &event.principal_id
+                    || group_ids.contains(principal_id)
+                    || group_ids.iter().any(|id| {
+                        !self
+                            .principals
+                            .get(id)
+                            .is_some_and(|group| group.active && group.kind == PrincipalKind::Group)
+                    })
+                {
+                    return Err(identity_error(
+                        "membership contains an invalid group or principal",
+                    ));
+                }
+                let principal = self
+                    .principals
+                    .get_mut(principal_id)
+                    .ok_or_else(|| identity_error("principal does not exist"))?;
+                if !principal.active || principal.membership_revision != *expected_revision {
+                    return Err(identity_error(
+                        "principal is disabled or membership revision is stale",
+                    ));
+                }
+                principal.membership_revision = principal
+                    .membership_revision
+                    .checked_add(1)
+                    .ok_or_else(|| identity_error("membership revision overflow"))?;
+                principal.group_ids.clone_from(group_ids);
+            }
+        }
+        self.events.push(event);
+        Ok(())
+    }
+}
+
+fn identity_error(message: &str) -> CatalogError {
+    CatalogError::Validation {
+        message: message.into(),
+    }
+}
+
+/// Test-only principal API over the existing identity-root authority kernel.
+///
+/// Metastore mutations cannot enter this type boundary:
+///
+/// ```compile_fail
+/// use arco_catalog::state_store::identity_probe::PrincipalIdentityStore;
+/// use arco_catalog::metastore::events::MetastoreMutation;
+/// async fn wrong(store: &PrincipalIdentityStore, value: MetastoreMutation) {
+///     if let MetastoreMutation::GrantUpserted(_) = &value { store.commit(value, None).await.unwrap(); }
+/// }
+/// ```
+/// ```compile_fail
+/// use arco_catalog::state_store::identity_probe::PrincipalIdentityStore;
+/// use arco_catalog::metastore::events::MetastoreMutation;
+/// async fn wrong(store: &PrincipalIdentityStore, value: MetastoreMutation) {
+///     if let MetastoreMutation::StorageCredentialUpserted(_) = &value { store.commit(value, None).await.unwrap(); }
+/// }
+/// ```
+/// ```compile_fail
+/// use arco_catalog::state_store::identity_probe::PrincipalIdentityStore;
+/// use arco_catalog::metastore::events::MetastoreMutation;
+/// async fn wrong(store: &PrincipalIdentityStore, value: MetastoreMutation) {
+///     if let MetastoreMutation::ExternalLocationUpserted(_) = &value { store.commit(value, None).await.unwrap(); }
+/// }
+/// ```
+/// ```compile_fail
+/// use arco_catalog::state_store::identity_probe::PrincipalIdentityStore;
+/// use arco_catalog::metastore::events::MetastoreMutation;
+/// async fn wrong(store: &PrincipalIdentityStore, value: MetastoreMutation) {
+///     if let MetastoreMutation::ManagedRootUpserted(_) = &value { store.commit(value, None).await.unwrap(); }
+/// }
+/// ```
+/// ```compile_fail
+/// use arco_catalog::state_store::identity_probe::PrincipalIdentityStore;
+/// use arco_catalog::TxnOptions;
+/// async fn wrong(store: &PrincipalIdentityStore) {
+///     store.begin_control_txn(TxnOptions::new(None)).await.unwrap();
+/// }
+/// ```
+pub struct PrincipalIdentityStore {
+    kernel: ControlMvpStateStore,
+    tenant_id: String,
+}
+
+impl PrincipalIdentityStore {
+    /// Open the test-only principal interface for one tenant identity root.
+    ///
+    /// # Errors
+    /// Returns validation errors for an invalid identity storage capability.
+    pub fn new(storage: IdentityStorage) -> Result<Self> {
+        let tenant_id = storage.tenant_id().to_owned();
+        Ok(Self {
+            kernel: ControlMvpStateStore::new_identity_principals(storage)?,
+            tenant_id,
+        })
+    }
+
+    /// Commit one typed mutation and return its durable event and authority token.
+    ///
+    /// # Errors
+    /// Returns validation, storage, or CAS errors. A rejected mutation publishes nothing.
+    pub async fn commit(
+        &self,
+        mutation: IdentityMutation,
+        origin: Option<IdentityOrigin>,
+    ) -> Result<(IdentityEvent, StateToken)> {
+        let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
+        let events: Vec<IdentityEvent> = match txn.get(PRINCIPAL_EVENTS_KEY).await? {
+            Some(value) => serde_json::from_slice(value.bytes()).map_err(|error| {
+                CatalogError::Serialization {
+                    message: format!("decode identity events: {error}"),
+                }
+            })?,
+            None => Vec::new(),
+        };
+        let mut state = IdentityState::default();
+        for event in events {
+            if event.tenant_id != self.tenant_id {
+                return Err(identity_error("foreign tenant identity event"));
+            }
+            state.apply_event(event)?;
+        }
+        let principal_id = match &mutation {
+            IdentityMutation::Create { .. } => uuid::Uuid::new_v4().to_string(),
+            IdentityMutation::Disable { principal_id }
+            | IdentityMutation::ReviseMembership { principal_id, .. } => principal_id.clone(),
+        };
+        let sequence = u64::try_from(state.events.len())
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| identity_error("identity event sequence overflow"))?;
+        let event = IdentityEvent {
+            tenant_id: self.tenant_id.clone(),
+            origin,
+            sequence,
+            event_id: format!("identity-{sequence}"),
+            principal_id,
+            mutation,
+        };
+        state.apply_event(event.clone())?;
+        let bytes =
+            serde_jcs::to_vec(&state.events).map_err(|error| CatalogError::Serialization {
+                message: format!("serialize identity events: {error}"),
+            })?;
+        txn.put(PRINCIPAL_EVENTS_KEY, Bytes::from(bytes)).await?;
+        let token = txn.commit().await?.into_state_token();
+        Ok((event, token))
+    }
+
+    /// Replay current identity events from the authenticated authority state.
+    ///
+    /// # Errors
+    /// Returns validation or storage errors for unreadable or invalid history.
+    pub async fn replay(&self) -> Result<IdentityState> {
+        self.replay_reader(&self.kernel).await
+    }
+
+    /// Replay identity events at an exact historical identity token.
+    ///
+    /// # Errors
+    /// Returns validation or storage errors for foreign or unreadable tokens.
+    pub async fn replay_at(&self, token: StateToken) -> Result<IdentityState> {
+        let reader = self.kernel.read_at(token).await?;
+        self.replay_reader(reader.as_ref()).await
+    }
+
+    async fn replay_reader(&self, reader: &dyn ArcoStateReader) -> Result<IdentityState> {
+        let Some(bytes) = reader.get(PRINCIPAL_EVENTS_KEY).await? else {
+            return Ok(IdentityState::default());
+        };
+        let events: Vec<IdentityEvent> =
+            serde_json::from_slice(&bytes).map_err(|error| CatalogError::Serialization {
+                message: format!("decode identity events: {error}"),
+            })?;
+        let mut state = IdentityState::default();
+        for event in events {
+            if event.tenant_id != self.tenant_id {
+                return Err(identity_error("foreign tenant identity event"));
+            }
+            state.apply_event(event)?;
+        }
+        Ok(state)
+    }
+}
 
 enum IdentityReferenceToken<'a> {
     State(&'a StateToken),

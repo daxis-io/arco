@@ -7,10 +7,12 @@
 //! catalog consumer has acknowledged out of that outbox, then runs one bounded
 //! pass of conservative garbage collection per domain and one bounded sweep
 //! that deletes `system.catalog.audit` day partitions older than the audit
-//! retention (`ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS`, default 400 days;
-//! domain `catalog-audit` in the GC phase's logs). The process exits `0`
-//! when every phase either completed or deferred to the next run, and non-zero
-//! when any phase failed with a typed error or the retention epoch is stuck.
+//! retention (`ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS`, default 400 days, at
+//! least 30; at most `ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS` deletions,
+//! default 4096; domain `catalog-audit` in the GC phase's logs). The process
+//! exits `0` when every phase either completed or deferred to the next run,
+//! and non-zero when any phase failed with a typed error or the retention
+//! epoch is stuck.
 //!
 //! Maintenance runs before the drain because every drained record commits
 //! ack-domain L0 segments; consolidating first keeps a backlog from pushing the
@@ -49,9 +51,17 @@ use serde::{Deserialize, Serialize};
 const CONTROL_DOMAINS: [&str; 2] = ["catalog", PROJECTION_OUTBOX_ACK_DOMAIN];
 const DEFAULT_GC_MAX_PAGES: usize = 16;
 const DEFAULT_MAINTENANCE_MAX_ADVANCES: usize = 4096;
-/// Audit partition objects the GC phase may delete per configured GC page:
-/// the audit sweep's per-run budget scales with `ARCO_CONTROL_STORE_GC_MAX_PAGES`.
-const AUDIT_SWEEP_OBJECTS_PER_GC_PAGE: usize = 1000;
+/// Default audit partition objects the GC phase deletes per run
+/// (`ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS`). The sweep deletes serially,
+/// about 20 to 50 ms per object on GCS, so a full-budget sweep takes about 80
+/// to 200 s: inside the 5-minute schedule and the 1800 s task timeout.
+/// Overlapping sweeps are harmless (deleting a missing object succeeds) and
+/// only double-count their metrics.
+const DEFAULT_AUDIT_SWEEP_MAX_OBJECTS: usize = 4096;
+/// The shortest audit retention the worker accepts, in days. The kernel sweep
+/// accepts any retention of at least one day; the worker refuses a
+/// configuration that would age audit history out within weeks.
+const MIN_AUDIT_RETENTION_DAYS: u32 = 30;
 /// The GC phase's log and failure label for the catalog audit sweep.
 const AUDIT_SWEEP_DOMAIN: &str = "catalog-audit";
 /// Scope-relative prefix of the persisted per-domain maintenance job identity.
@@ -67,36 +77,46 @@ struct RunLimits {
     gc_max_pages: usize,
     /// Maximum `advance_at` calls per maintenance job per run.
     maintenance_max_advances: usize,
-    /// Days a `system.catalog.audit` day partition is retained.
+    /// Days a `system.catalog.audit` day partition is retained; at least
+    /// [`MIN_AUDIT_RETENTION_DAYS`].
     audit_retention_days: u32,
-    /// Maximum audit partition objects deleted per run:
-    /// `gc_max_pages` × [`AUDIT_SWEEP_OBJECTS_PER_GC_PAGE`].
+    /// Maximum audit partition objects deleted per run.
     audit_sweep_max_objects: usize,
 }
 
 impl RunLimits {
     /// Reads the limits from settings looked up by name (the process
     /// environment in production). An unset or blank setting takes its
-    /// default; zero or a non-integer is rejected.
+    /// default; zero, a non-integer, or an audit retention below
+    /// [`MIN_AUDIT_RETENTION_DAYS`] is rejected.
     fn from_settings(setting: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let gc_max_pages = positive_setting(
+        let audit_retention_days = positive_setting(
             &setting,
-            "ARCO_CONTROL_STORE_GC_MAX_PAGES",
-            DEFAULT_GC_MAX_PAGES,
+            "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS",
+            CATALOG_AUDIT_RETENTION_DAYS,
         )?;
+        if audit_retention_days < MIN_AUDIT_RETENTION_DAYS {
+            bail!(
+                "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be at least {MIN_AUDIT_RETENTION_DAYS} days, got {audit_retention_days}"
+            );
+        }
         Ok(Self {
-            gc_max_pages,
+            gc_max_pages: positive_setting(
+                &setting,
+                "ARCO_CONTROL_STORE_GC_MAX_PAGES",
+                DEFAULT_GC_MAX_PAGES,
+            )?,
             maintenance_max_advances: positive_setting(
                 &setting,
                 "ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES",
                 DEFAULT_MAINTENANCE_MAX_ADVANCES,
             )?,
-            audit_retention_days: positive_setting(
+            audit_retention_days,
+            audit_sweep_max_objects: positive_setting(
                 &setting,
-                "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS",
-                CATALOG_AUDIT_RETENTION_DAYS,
+                "ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS",
+                DEFAULT_AUDIT_SWEEP_MAX_OBJECTS,
             )?,
-            audit_sweep_max_objects: gc_max_pages.saturating_mul(AUDIT_SWEEP_OBJECTS_PER_GC_PAGE),
         })
     }
 }
@@ -617,6 +637,9 @@ impl DomainGcSummary {
 #[derive(Debug, Serialize)]
 struct AuditRetentionSummary {
     partitions_examined: u64,
+    /// Examined partitions the sweep never deletes; each is also logged at
+    /// warn.
+    partitions_unrecognized: u64,
     partitions_expired: u64,
     objects_deleted: u64,
     bytes_reclaimed: u64,
@@ -633,6 +656,7 @@ impl AuditRetentionSummary {
             domain = AUDIT_SWEEP_DOMAIN,
             outcome = "ok",
             partitions_examined = self.partitions_examined,
+            partitions_unrecognized = self.partitions_unrecognized,
             partitions_expired = self.partitions_expired,
             objects_deleted = self.objects_deleted,
             bytes_reclaimed = self.bytes_reclaimed,
@@ -1466,6 +1490,7 @@ async fn expire_catalog_audit(
         .context("expire catalog audit partitions")?;
     Ok(AuditRetentionSummary {
         partitions_examined: report.partitions_examined,
+        partitions_unrecognized: report.partitions_unrecognized,
         partitions_expired: report.partitions_expired,
         objects_deleted: report.objects_deleted,
         bytes_reclaimed: report.bytes_reclaimed,
@@ -1700,7 +1725,7 @@ mod tests {
         gc_max_pages: 4,
         maintenance_max_advances: 512,
         audit_retention_days: CATALOG_AUDIT_RETENTION_DAYS,
-        audit_sweep_max_objects: 4 * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE,
+        audit_sweep_max_objects: DEFAULT_AUDIT_SWEEP_MAX_OBJECTS,
     };
     const TENANT: &str = "tenant";
     const WORKSPACE: &str = "workspace";
@@ -2880,6 +2905,7 @@ mod tests {
             audit.partitions_examined, 2,
             "the expired partition, then today's, which ends the walk"
         );
+        assert_eq!(audit.partitions_unrecognized, 0);
         assert_eq!(audit.partitions_expired, 1);
         assert_eq!(audit.objects_deleted, 1);
         assert_eq!(audit.bytes_reclaimed, 5);
@@ -3078,6 +3104,14 @@ mod tests {
         })
     }
 
+    /// The startup error `pairs` must produce, rendered with its causes.
+    fn limits_error(pairs: &[(&str, &str)]) -> Result<String> {
+        let error = limits_from(pairs)
+            .err()
+            .ok_or_else(|| anyhow!("{pairs:?} must be rejected"))?;
+        Ok(format!("{error:#}"))
+    }
+
     #[test]
     fn run_limits_default_the_audit_retention_to_400_days_and_reject_zero() -> Result<()> {
         let defaults = limits_from(&[])?;
@@ -3089,47 +3123,78 @@ mod tests {
             DEFAULT_MAINTENANCE_MAX_ADVANCES
         );
         assert_eq!(
-            defaults.audit_sweep_max_objects,
-            DEFAULT_GC_MAX_PAGES * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE
-        );
-        assert_eq!(
             limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "  ")])?.audit_retention_days,
             400,
             "a blank setting keeps the default"
         );
-
-        let custom = limits_from(&[
-            ("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", " 30 "),
-            ("ARCO_CONTROL_STORE_GC_MAX_PAGES", "2"),
-        ])?;
-        assert_eq!(custom.audit_retention_days, 30);
-        assert_eq!(custom.gc_max_pages, 2);
         assert_eq!(
-            custom.audit_sweep_max_objects,
-            2 * AUDIT_SWEEP_OBJECTS_PER_GC_PAGE
+            limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", " 45 ")])?
+                .audit_retention_days,
+            45
         );
 
-        let zero = limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "0")])
-            .err()
-            .ok_or_else(|| anyhow!("a zero retention must be rejected"))?;
         assert_eq!(
-            format!("{zero:#}"),
+            limits_error(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "0")])?,
             "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be greater than zero"
         );
         for invalid in ["-1", "4294967296", "400d"] {
-            let error = limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", invalid)])
-                .err()
-                .ok_or_else(|| anyhow!("retention {invalid:?} must be rejected"))?;
+            let error = limits_error(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", invalid)])?;
             assert!(
-                format!("{error:#}").starts_with(
+                error.starts_with(
                     "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be a positive integer"
                 ),
-                "{error:#}"
+                "{error}"
             );
         }
-        assert!(
-            limits_from(&[("ARCO_CONTROL_STORE_GC_MAX_PAGES", "0")]).is_err(),
+        assert_eq!(
+            limits_error(&[("ARCO_CONTROL_STORE_GC_MAX_PAGES", "0")])?,
+            "ARCO_CONTROL_STORE_GC_MAX_PAGES must be greater than zero",
             "the existing limits keep rejecting zero"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_limits_floor_the_audit_retention_at_30_days() -> Result<()> {
+        assert_eq!(MIN_AUDIT_RETENTION_DAYS, 30);
+        assert_eq!(
+            limits_error(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "29")])?,
+            "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be at least 30 days, got 29"
+        );
+        assert_eq!(
+            limits_error(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "1")])?,
+            "ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be at least 30 days, got 1",
+            "the kernel accepts one day; the worker does not"
+        );
+        assert_eq!(
+            limits_from(&[("ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS", "30")])?.audit_retention_days,
+            30
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_limits_read_the_audit_sweep_budget_independently_of_gc_pages() -> Result<()> {
+        let defaults = limits_from(&[])?;
+        assert_eq!(defaults.audit_sweep_max_objects, 4096);
+        assert_eq!(
+            defaults.audit_sweep_max_objects,
+            DEFAULT_AUDIT_SWEEP_MAX_OBJECTS
+        );
+        let pages_only = limits_from(&[("ARCO_CONTROL_STORE_GC_MAX_PAGES", "2")])?;
+        assert_eq!(pages_only.gc_max_pages, 2);
+        assert_eq!(
+            pages_only.audit_sweep_max_objects, DEFAULT_AUDIT_SWEEP_MAX_OBJECTS,
+            "the GC page budget does not scale the audit sweep"
+        );
+        assert_eq!(
+            limits_from(&[("ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS", "250")])?
+                .audit_sweep_max_objects,
+            250
+        );
+        assert_eq!(
+            limits_error(&[("ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS", "0")])?,
+            "ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS must be greater than zero"
         );
         Ok(())
     }

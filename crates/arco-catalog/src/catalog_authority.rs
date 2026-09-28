@@ -1022,8 +1022,13 @@ const AUDIT_RETENTION_PAGE_LIMIT: usize = 1000;
 pub struct AuditRetentionReport {
     /// Distinct partitions the call visited: every expired partition it
     /// reached, the first retained day partition (which ends the walk through
-    /// the day partitions), and every unrecognized name it reached.
+    /// the day partitions), and every unrecognized partition it reached.
     pub partitions_examined: u64,
+    /// Of the examined partitions, the unrecognized ones: directories whose
+    /// name is not a well-formed day, and loose objects directly under the
+    /// prefix (each its own partition). They are never deleted, and each is
+    /// logged at warn once per call.
+    pub partitions_unrecognized: u64,
     /// Visited partitions with at least one object deleted by this call.
     pub partitions_expired: u64,
     /// Objects this call deleted; never more than its budget.
@@ -1041,16 +1046,22 @@ pub struct AuditRetentionReport {
 enum AuditPartition<'a> {
     /// A well-formed day partition directory, `dt=YYYY-MM-DD/`.
     Day {
-        /// The partition directory segment, trailing `/` included.
+        /// The directory segment, trailing `/` included.
         segment: &'a str,
         /// The partition's UTC day.
         day: NaiveDate,
     },
-    /// Anything else, never deleted: a directory whose name is not a
-    /// canonical existing day, or an object directly under the prefix
-    /// (whose segment is its whole name).
-    Unrecognized {
-        /// The directory segment, trailing `/` included, or the object name.
+    /// A directory whose name is not a well-formed day. Never deleted.
+    UnrecognizedDirectory {
+        /// The directory segment, trailing `/` included.
+        segment: &'a str,
+        /// The directory name, without the trailing `/`.
+        name: &'a str,
+    },
+    /// An object directly under the prefix, its own partition. Never
+    /// deleted.
+    Loose {
+        /// The object name.
         segment: &'a str,
     },
 }
@@ -1059,28 +1070,33 @@ impl<'a> AuditPartition<'a> {
     /// Classifies a path relative to [`CATALOG_AUDIT_PROJECTION_PREFIX`].
     fn of(relative: &'a str) -> Self {
         let segment = relative.split_inclusive('/').next().unwrap_or(relative);
-        segment
-            .strip_suffix('/')
-            .and_then(audit_partition_day)
-            .map_or(Self::Unrecognized { segment }, |day| Self::Day {
-                segment,
-                day,
-            })
+        let Some(name) = segment.strip_suffix('/') else {
+            return Self::Loose { segment };
+        };
+        audit_partition_day(name).map_or(Self::UnrecognizedDirectory { segment, name }, |day| {
+            Self::Day { segment, day }
+        })
     }
 
-    /// The first path segment, which identifies the partition.
+    /// The first path segment, which identifies the partition: a directory's
+    /// segment keeps its trailing `/`, so a loose object never shares a
+    /// directory's identity.
     const fn segment(&self) -> &'a str {
         match self {
-            Self::Day { segment, .. } | Self::Unrecognized { segment } => segment,
+            Self::Day { segment, .. }
+            | Self::UnrecognizedDirectory { segment, .. }
+            | Self::Loose { segment } => segment,
         }
     }
 }
 
-/// The day of a partition name, only in exactly the form
+/// The day of a partition directory name, only in exactly the form
 /// [`catalog_audit_partition`] writes: `dt=` and a canonical existing
-/// `YYYY-MM-DD` with a four-digit year. Such names are fixed-width and start
-/// with a digit after `dt=`, so they sort chronologically and all sort before
-/// `dt=:`.
+/// `YYYY-MM-DD` with a four-digit year, any date in `0000-01-01..=9999-12-31`.
+/// Years before 1970 are never written, but such a partition would be
+/// treated as expired. Accepted names are fixed-width and have a digit after
+/// `dt=`, so they sort chronologically and all sort before
+/// [`cursor_past_day_partitions`].
 fn audit_partition_day(name: &str) -> Option<NaiveDate> {
     let text = name.strip_prefix("dt=")?;
     if text.len() != 10 {
@@ -1088,6 +1104,46 @@ fn audit_partition_day(name: &str) -> Option<NaiveDate> {
     }
     let day = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
     (day.format("%Y-%m-%d").to_string() == text).then_some(day)
+}
+
+/// The listing cursor past every well-formed day partition:
+/// `{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:`.
+///
+/// Every day partition name [`audit_partition_day`] accepts is `dt=` and a
+/// digit, and `:` (0x3A) directly follows `9` (0x39), so every object of every
+/// day partition sorts before this cursor, and every name after `dt=` that
+/// starts with a later character sorts after it. `start_after` is exclusive,
+/// so an object named exactly `dt=:` is also skipped; it is unrecognized and
+/// never deleted.
+fn cursor_past_day_partitions() -> String {
+    format!("{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:")
+}
+
+/// The listing cursor past every object of the directory `name/` beneath
+/// [`CATALOG_AUDIT_PROJECTION_PREFIX`]: `{prefix}{name}0`, where `name` has no
+/// trailing `/`.
+///
+/// `/` (0x2F) and `0` (0x30) are adjacent, so every `{name}/…` path sorts
+/// before this cursor and no other path sorts between the directory and it.
+/// `start_after` is exclusive, so an object named exactly `{name}0` is also
+/// skipped; it has no `/`, so it is an unrecognized loose object, never
+/// deleted.
+fn cursor_past_directory(name: &str) -> String {
+    format!("{CATALOG_AUDIT_PROJECTION_PREFIX}{name}0")
+}
+
+/// Names what the audit sweep was doing in a storage or validation error,
+/// keeping the error's variant so callers classify it unchanged.
+fn audit_sweep_error(error: arco_core::Error, action: impl FnOnce() -> String) -> CatalogError {
+    match CatalogError::from(error) {
+        CatalogError::Storage { message } => CatalogError::Storage {
+            message: format!("catalog audit retention could not {}: {message}", action()),
+        },
+        CatalogError::Validation { message } => CatalogError::Validation {
+            message: format!("catalog audit retention could not {}: {message}", action()),
+        },
+        other => other,
+    }
 }
 
 /// Bookkeeping of one audit retention call.
@@ -1112,6 +1168,11 @@ impl AuditRetentionTally {
         }
     }
 
+    /// Whether the call's deletion budget is spent.
+    const fn exhausted(&self) -> bool {
+        self.budget == 0
+    }
+
     /// Counts a partition the first time the walk reaches it, and warns about
     /// an unrecognized one.
     fn visit(&mut self, partition: &AuditPartition<'_>) {
@@ -1122,7 +1183,8 @@ impl AuditRetentionTally {
         self.report.partitions_examined += 1;
         self.partition = Some(segment.to_owned());
         self.partition_expired = false;
-        if let AuditPartition::Unrecognized { .. } = partition {
+        if !matches!(partition, AuditPartition::Day { .. }) {
+            self.report.partitions_unrecognized += 1;
             warn!(
                 prefix = CATALOG_AUDIT_PROJECTION_PREFIX,
                 partition = segment,
@@ -1139,6 +1201,19 @@ impl AuditRetentionTally {
         if !self.partition_expired {
             self.partition_expired = true;
             self.report.partitions_expired += 1;
+        }
+    }
+
+    /// The report of a walk that finished within its budget.
+    fn finish(self) -> AuditRetentionReport {
+        self.report
+    }
+
+    /// The report of a walk that found an expired object with no budget left.
+    fn truncated(self) -> AuditRetentionReport {
+        AuditRetentionReport {
+            truncated: true,
+            ..self.report
         }
     }
 }
@@ -1384,7 +1459,8 @@ impl CatalogProjectionMaterializer {
     /// A partition `dt=D/` is expired when `D` is strictly before the cutoff
     /// day, the UTC date `retention_days` days before `now`: a partition
     /// exactly `retention_days` days old is kept, and since `retention_days`
-    /// is at least one, today's partition is never deleted.
+    /// is at least one, today's partition is never deleted. The cutoff is a
+    /// date, so every instant of one UTC day yields the same cutoff.
     ///
     /// The call walks [`CATALOG_AUDIT_PROJECTION_PREFIX`] in path order in
     /// bounded pages (at most `min(max_objects, 1000)` objects each) and
@@ -1395,14 +1471,18 @@ impl CatalogProjectionMaterializer {
     /// start `dt=` and a digit, so they sort before `dt=:`) and lists no other
     /// retained day partition.
     ///
-    /// Every other name beneath the prefix is never deleted: a directory
-    /// whose name is not a canonical existing day (for example
-    /// `dt=not-a-date/`), or an object directly under the prefix. The walk
-    /// logs it at warn once, counts it as examined and continues past it, so
-    /// such a name sorting before the day partitions does not stop the
-    /// sweep. Unrecognized names that sort among the day partitions after the
-    /// first retained one are skipped with them. Nothing outside the prefix is
-    /// listed or deleted, and an empty prefix yields a default report.
+    /// Every other name beneath the prefix is unrecognized and never deleted:
+    /// a directory whose name is not a canonical existing day (for example
+    /// `dt=not-a-date/`), or a loose object directly under the prefix (even a
+    /// day-like name such as `dt=2026-01-01` without a `/`). The walk logs it
+    /// at warn once per call, counts it as examined and unrecognized, and
+    /// continues past it: after the first object of an unrecognized directory
+    /// the listing resumes past the whole directory, so such a directory
+    /// costs one visit however many objects it holds, and one sorting before
+    /// the day partitions does not stop the sweep. Unrecognized names that
+    /// sort among the day partitions after the first retained one are
+    /// skipped with them. Nothing outside the prefix is listed or deleted,
+    /// and an empty prefix yields a default report.
     ///
     /// Objects are deleted one at a time in path order, so an interrupted or
     /// truncated call leaves only the newest expired objects, and the next
@@ -1426,8 +1506,9 @@ impl CatalogProjectionMaterializer {
     /// # Errors
     ///
     /// Returns a validation error when `retention_days` or `max_objects` is
-    /// zero, and storage errors from listing or deleting; objects deleted
-    /// before an error stay deleted.
+    /// zero. Storage errors from listing or deleting stay storage errors and
+    /// name the listing cursor or the object; objects deleted before an error
+    /// stay deleted.
     pub async fn expire_audit_partitions(
         &self,
         now: DateTime<Utc>,
@@ -1446,7 +1527,6 @@ impl CatalogProjectionMaterializer {
             .date_naive()
             .checked_sub_days(Days::new(u64::from(retention_days)));
         let page_limit = max_objects.min(AUDIT_RETENTION_PAGE_LIMIT);
-        let past_day_partitions = format!("{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:");
         let mut tally = AuditRetentionTally::new(max_objects);
         let mut cursor: Option<String> = None;
         loop {
@@ -1457,7 +1537,15 @@ impl CatalogProjectionMaterializer {
                     cursor.as_deref(),
                     page_limit,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    audit_sweep_error(error, || {
+                        format!(
+                            "list {CATALOG_AUDIT_PROJECTION_PREFIX} after {}",
+                            cursor.as_deref().unwrap_or("the start")
+                        )
+                    })
+                })?;
             let mut next = page.next_start_after;
             for object in page.objects {
                 let path = object.path.as_str();
@@ -1470,32 +1558,38 @@ impl CatalogProjectionMaterializer {
                     })?;
                 let partition = AuditPartition::of(relative);
                 tally.visit(&partition);
-                match partition {
-                    AuditPartition::Unrecognized { .. } => {}
+                let skip_to = match partition {
+                    AuditPartition::Loose { .. } => None,
+                    AuditPartition::UnrecognizedDirectory { name, .. } => {
+                        Some(cursor_past_directory(name))
+                    }
                     AuditPartition::Day { day, .. }
                         if cutoff.is_some_and(|cutoff| day < cutoff) =>
                     {
-                        if tally.budget == 0 {
-                            tally.report.truncated = true;
-                            return Ok(tally.report);
+                        if tally.exhausted() {
+                            return Ok(tally.truncated());
                         }
-                        self.storage.delete(path).await?;
+                        self.storage.delete(path).await.map_err(|error| {
+                            audit_sweep_error(error, || format!("delete {path}"))
+                        })?;
                         tally.deleted(object.size);
+                        None
                     }
-                    AuditPartition::Day { .. } => {
-                        // Retained, and so is every later day partition: skip
-                        // them all (and an object named exactly `dt=:`, which
-                        // is unrecognized anyway). The cursor always moves
-                        // forward, since `path` sorts before the skip cursor.
-                        next = (path < past_day_partitions.as_str())
-                            .then(|| past_day_partitions.clone());
-                        break;
-                    }
+                    // Retained, and so is every later day partition.
+                    AuditPartition::Day { .. } => Some(cursor_past_day_partitions()),
+                };
+                if let Some(skip_to) = skip_to {
+                    debug_assert!(
+                        path < skip_to.as_str(),
+                        "the audit retention cursor {skip_to} must advance past {path}"
+                    );
+                    next = Some(skip_to);
+                    break;
                 }
             }
             match next {
                 Some(start_after) => cursor = Some(start_after),
-                None => return Ok(tally.report),
+                None => return Ok(tally.finish()),
             }
         }
     }

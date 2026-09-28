@@ -1751,9 +1751,10 @@ async fn projection_objects(storage: &ScopedStorage) -> Vec<String> {
     paths
 }
 
-#[tokio::test]
-async fn audit_sweep_expires_only_partitions_strictly_older_than_the_retention() {
-    let storage = scoped_storage();
+/// Seeds the mixed audit prefix of the sweep tests and returns, sorted, every
+/// object a 400-day sweep at [`audit_sweep_now`] keeps. The only expired
+/// objects are two in `dt=2026-04-26/`, of 3 and 5 bytes.
+async fn seed_mixed_audit_fixture(storage: &ScopedStorage) -> Vec<String> {
     let now = audit_sweep_now();
     let prefix = CATALOG_AUDIT_PROJECTION_PREFIX;
     let expired = audit_partition_days_before(now, 401);
@@ -1774,29 +1775,129 @@ async fn audit_sweep_expires_only_partitions_strictly_older_than_the_retention()
             "dt=2027-06-01/"
         )
     );
-    // Unrecognized names that sort before the day partitions: no `dt=`
-    // segment, and a canonical-looking day that does not exist.
-    let no_partition = seed_object(&storage, format!("{prefix}archive/early.parquet"), b"a").await;
-    let impossible_day =
-        seed_object(&storage, format!("{prefix}dt=1999-02-30/f.parquet"), b"ff").await;
-    seed_object(&storage, format!("{prefix}{expired}a.parquet"), b"aaa").await;
-    seed_object(&storage, format!("{prefix}{expired}b.parquet"), b"bbbbb").await;
-    let kept_boundary = seed_object(&storage, format!("{prefix}{boundary}c.parquet"), b"c").await;
-    let kept_younger = seed_object(&storage, format!("{prefix}{younger}d.parquet"), b"d").await;
-    let kept_today = seed_object(&storage, format!("{prefix}{today}e.parquet"), b"e").await;
-    // An unrecognized name that sorts after every day partition.
-    let junk = seed_object(&storage, format!("{prefix}dt=not-a-date/x.parquet"), b"x").await;
+    let mut kept = Vec::new();
+    // Unrecognized names that sort before the expired partition: a directory
+    // without `dt=`, a canonical-looking day that does not exist, and a loose
+    // day-like object with no `/`.
+    kept.push(seed_object(storage, format!("{prefix}archive/early.parquet"), b"a").await);
+    kept.push(seed_object(storage, format!("{prefix}dt=1999-02-30/f.parquet"), b"ff").await);
+    kept.push(seed_object(storage, format!("{prefix}dt=2026-01-01"), b"loose").await);
+    seed_object(storage, format!("{prefix}{expired}a.parquet"), b"aaa").await;
+    seed_object(storage, format!("{prefix}{expired}b.parquet"), b"bbbbb").await;
+    kept.push(seed_object(storage, format!("{prefix}{boundary}c.parquet"), b"c").await);
+    kept.push(seed_object(storage, format!("{prefix}{younger}d.parquet"), b"d").await);
+    // An unrecognized directory among the later dates, skipped with them.
+    kept.push(seed_object(storage, format!("{prefix}dt=2026-13-01/x.parquet"), b"x").await);
+    kept.push(seed_object(storage, format!("{prefix}{today}e.parquet"), b"e").await);
+    // An unrecognized directory that sorts after every day partition.
+    kept.push(seed_object(storage, format!("{prefix}dt=not-a-date/x.parquet"), b"x").await);
     // A sibling prefix sharing the audit prefix's text is never touched.
-    let sibling = seed_object(
-        &storage,
-        "control/v1/projections/catalog-audit-archive/dt=2020-01-01/old.parquet".to_string(),
-        b"old",
-    )
-    .await;
+    kept.push(
+        seed_object(
+            storage,
+            "control/v1/projections/catalog-audit-archive/dt=2020-01-01/old.parquet".to_string(),
+            b"old",
+        )
+        .await,
+    );
+    kept.sort();
+    kept
+}
+
+/// Records the objects bounded listings return and, when armed, fails deletes
+/// or bounded listings with storage errors.
+struct AuditSweepBackend {
+    inner: MemoryBackend,
+    listed: std::sync::Mutex<Vec<String>>,
+    fail_deletes: AtomicBool,
+    fail_lists: AtomicBool,
+}
+
+impl AuditSweepBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            listed: std::sync::Mutex::new(Vec::new()),
+            fail_deletes: AtomicBool::new(false),
+            fail_lists: AtomicBool::new(false),
+        })
+    }
+
+    /// How many listed objects had a path containing `fragment`.
+    fn listed_containing(&self, fragment: &str) -> usize {
+        self.listed
+            .lock()
+            .expect("listed paths")
+            .iter()
+            .filter(|path| path.contains(fragment))
+            .count()
+    }
+}
+
+#[async_trait]
+impl StorageBackend for AuditSweepBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        if self.fail_deletes.load(Ordering::SeqCst) {
+            return Err(arco_core::Error::storage("injected delete failure"));
+        }
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        if self.fail_lists.load(Ordering::SeqCst) {
+            return Err(arco_core::Error::storage("injected listing failure"));
+        }
+        let page = self.inner.list_page(prefix, start_after, limit).await?;
+        self.listed
+            .lock()
+            .expect("listed paths")
+            .extend(page.objects.iter().map(|object| object.path.clone()));
+        Ok(page)
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+#[tokio::test]
+async fn audit_sweep_expires_only_partitions_strictly_older_than_the_retention() {
+    let storage = scoped_storage();
+    let kept = seed_mixed_audit_fixture(&storage).await;
     let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
 
     let report = materializer
-        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 100)
+        .expire_audit_partitions(audit_sweep_now(), CATALOG_AUDIT_RETENTION_DAYS, 100)
         .await
         .expect("sweep");
 
@@ -1804,45 +1905,73 @@ async fn audit_sweep_expires_only_partitions_strictly_older_than_the_retention()
     assert_eq!(
         report,
         AuditRetentionReport {
-            // archive/, dt=1999-02-30/, the expired partition, the first
-            // retained partition, then dt=not-a-date/ past the day range.
-            partitions_examined: 5,
+            // archive/, dt=1999-02-30/, the loose dt=2026-01-01, the expired
+            // partition, the first retained partition, then dt=not-a-date/
+            // past the day range. dt=2026-13-01/ sorts among the later dates
+            // and is skipped with them, uncounted.
+            partitions_examined: 6,
+            partitions_unrecognized: 4,
             partitions_expired: 1,
             objects_deleted: 2,
             bytes_reclaimed: 8,
             truncated: false,
         }
     );
-    let mut remaining = vec![
-        no_partition.clone(),
-        impossible_day.clone(),
-        kept_boundary.clone(),
-        kept_younger.clone(),
-        kept_today.clone(),
-        junk.clone(),
-        sibling.clone(),
-    ];
-    remaining.sort();
     assert_eq!(
-        remaining,
+        kept,
         projection_objects(&storage).await,
         "only the partition strictly older than the retention is deleted"
     );
 
     let again = materializer
-        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 100)
+        .expire_audit_partitions(audit_sweep_now(), CATALOG_AUDIT_RETENTION_DAYS, 100)
         .await
         .expect("second sweep");
 
     assert_eq!(
         again,
         AuditRetentionReport {
-            partitions_examined: 4,
+            partitions_examined: 5,
+            partitions_unrecognized: 4,
             ..AuditRetentionReport::default()
         },
         "a repeated sweep deletes nothing"
     );
-    assert_eq!(remaining, projection_objects(&storage).await);
+    assert_eq!(kept, projection_objects(&storage).await);
+}
+
+#[tokio::test]
+async fn audit_sweep_with_a_budget_of_one_converges_to_the_single_sweep_result() {
+    let storage = scoped_storage();
+    let kept = seed_mixed_audit_fixture(&storage).await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let mut calls = 0;
+    let mut deleted = 0;
+
+    loop {
+        calls += 1;
+        assert!(calls <= 10, "a budget-one sweep must converge");
+        let report = materializer
+            .expire_audit_partitions(audit_sweep_now(), CATALOG_AUDIT_RETENTION_DAYS, 1)
+            .await
+            .expect("budget-one sweep");
+        assert!(report.objects_deleted <= 1, "{report:?}");
+        deleted += report.objects_deleted;
+        if !report.truncated {
+            break;
+        }
+    }
+
+    assert_eq!(
+        calls, 2,
+        "one call per expired object: the last finds no expired object after its deletion"
+    );
+    assert_eq!(deleted, 2);
+    assert_eq!(
+        kept,
+        projection_objects(&storage).await,
+        "the same objects remain as after one unbounded sweep"
+    );
 }
 
 #[tokio::test]
@@ -1864,6 +1993,7 @@ async fn audit_sweep_budget_truncates_and_later_calls_finish_the_partition() {
         first,
         AuditRetentionReport {
             partitions_examined: 1,
+            partitions_unrecognized: 0,
             partitions_expired: 1,
             objects_deleted: 2,
             bytes_reclaimed: 4,
@@ -1878,6 +2008,7 @@ async fn audit_sweep_budget_truncates_and_later_calls_finish_the_partition() {
         last,
         AuditRetentionReport {
             partitions_examined: 2,
+            partitions_unrecognized: 0,
             partitions_expired: 1,
             objects_deleted: 1,
             bytes_reclaimed: 2,
@@ -1898,6 +2029,7 @@ async fn audit_sweep_budget_truncates_and_later_calls_finish_the_partition() {
         exact,
         AuditRetentionReport {
             partitions_examined: 2,
+            partitions_unrecognized: 0,
             partitions_expired: 1,
             objects_deleted: 2,
             bytes_reclaimed: 2,
@@ -1905,6 +2037,182 @@ async fn audit_sweep_budget_truncates_and_later_calls_finish_the_partition() {
         }
     );
     assert_eq!(vec![kept_today], projection_objects(&storage).await);
+}
+
+#[tokio::test]
+async fn audit_sweep_cutoff_is_a_utc_date_not_an_instant() {
+    let storage = scoped_storage();
+    let prefix = CATALOG_AUDIT_PROJECTION_PREFIX;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let boundary = seed_object(
+        &storage,
+        format!("{prefix}dt=2026-04-27/kept.parquet"),
+        b"k",
+    )
+    .await;
+
+    // The first and last instants of 2027-06-01 share the cutoff 2026-04-27.
+    for now in ["2027-06-01T00:00:00.000Z", "2027-06-01T23:59:59.999Z"] {
+        let now: chrono::DateTime<chrono::Utc> = now.parse().expect("sweep clock");
+        seed_object(&storage, format!("{prefix}dt=2026-04-26/old.parquet"), b"o").await;
+
+        let report = materializer
+            .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 10)
+            .await
+            .expect("sweep");
+
+        assert_eq!(
+            report,
+            AuditRetentionReport {
+                partitions_examined: 2,
+                partitions_unrecognized: 0,
+                partitions_expired: 1,
+                objects_deleted: 1,
+                bytes_reclaimed: 1,
+                truncated: false,
+            },
+            "at {now}"
+        );
+        assert_eq!(
+            vec![boundary.clone()],
+            projection_objects(&storage).await,
+            "the partition exactly 400 days old is kept at {now}"
+        );
+    }
+
+    let next_day: chrono::DateTime<chrono::Utc> =
+        "2027-06-02T00:00:00.000Z".parse().expect("sweep clock");
+    let report = materializer
+        .expire_audit_partitions(next_day, CATALOG_AUDIT_RETENTION_DAYS, 10)
+        .await
+        .expect("next-day sweep");
+    assert_eq!(report.objects_deleted, 1, "{report:?}");
+    assert!(
+        projection_objects(&storage).await.is_empty(),
+        "the cutoff moves with the UTC date"
+    );
+}
+
+#[tokio::test]
+async fn audit_sweep_visits_an_unrecognized_directory_once() {
+    let backend = AuditSweepBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let now = audit_sweep_now();
+    let prefix = CATALOG_AUDIT_PROJECTION_PREFIX;
+    let mut kept = Vec::new();
+    for index in 0..5 {
+        kept.push(seed_object(&storage, format!("{prefix}archive/{index}.parquet"), b"a").await);
+    }
+    seed_object(
+        &storage,
+        format!(
+            "{prefix}{}old.parquet",
+            audit_partition_days_before(now, 401)
+        ),
+        b"o",
+    )
+    .await;
+    kept.push(
+        seed_object(
+            &storage,
+            format!("{prefix}{}t.parquet", audit_partition_days_before(now, 0)),
+            b"t",
+        )
+        .await,
+    );
+    for index in 0..3 {
+        kept.push(
+            seed_object(
+                &storage,
+                format!("{prefix}dt=not-a-date/{index}.parquet"),
+                b"x",
+            )
+            .await,
+        );
+    }
+    kept.sort();
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+
+    // A budget of one lists one object per page, so every listed object is a
+    // visit.
+    let report = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 1)
+        .await
+        .expect("sweep");
+
+    assert_eq!(
+        report,
+        AuditRetentionReport {
+            partitions_examined: 4,
+            partitions_unrecognized: 2,
+            partitions_expired: 1,
+            objects_deleted: 1,
+            bytes_reclaimed: 1,
+            truncated: false,
+        }
+    );
+    assert_eq!(
+        backend.listed_containing(&format!("{prefix}archive/")),
+        1,
+        "the five-object directory before the dates costs one visit"
+    );
+    assert_eq!(
+        backend.listed_containing(&format!("{prefix}dt=not-a-date/")),
+        1,
+        "the three-object directory after the dates costs one visit"
+    );
+    assert_eq!(kept, projection_objects(&storage).await);
+}
+
+#[tokio::test]
+async fn audit_sweep_storage_errors_stay_storage_errors_and_name_the_object_or_listing() {
+    let backend = AuditSweepBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let now = audit_sweep_now();
+    let expired = seed_object(
+        &storage,
+        format!(
+            "{CATALOG_AUDIT_PROJECTION_PREFIX}{}old.parquet",
+            audit_partition_days_before(now, 401)
+        ),
+        b"old",
+    )
+    .await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+
+    backend.fail_deletes.store(true, Ordering::SeqCst);
+    let delete = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 10)
+        .await;
+    backend.fail_deletes.store(false, Ordering::SeqCst);
+    assert!(
+        matches!(
+            &delete,
+            Err(CatalogError::Storage { message })
+                if message.contains(&format!("delete {expired}"))
+                    && message.contains("injected delete failure")
+        ),
+        "{delete:?}"
+    );
+
+    backend.fail_lists.store(true, Ordering::SeqCst);
+    let list = materializer
+        .expire_audit_partitions(now, CATALOG_AUDIT_RETENTION_DAYS, 10)
+        .await;
+    backend.fail_lists.store(false, Ordering::SeqCst);
+    assert!(
+        matches!(
+            &list,
+            Err(CatalogError::Storage { message })
+                if message.contains(&format!(
+                    "list {CATALOG_AUDIT_PROJECTION_PREFIX} after the start"
+                )) && message.contains("injected listing failure")
+        ),
+        "{list:?}"
+    );
+    assert_eq!(vec![expired], projection_objects(&storage).await);
 }
 
 #[tokio::test]

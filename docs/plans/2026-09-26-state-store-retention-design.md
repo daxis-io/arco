@@ -10,7 +10,7 @@ metric emitters (PR #436).
 | Question | Decision |
 |---|---|
 | Where do catalog audit records live? | Projection only. No audit row is written to the authoritative KV; the audit record rides the projection intent payload (as today) and is materialized into an append-only `system.catalog.audit` Parquet projection with its own retention. |
-| How long is a keyed request replayable with its original response? | 24 hours from staging. Restore never restores receipts. |
+| How long is a keyed request replayable with its original response? | 24 hours from `occurredAtMs` (when the adapter accepted the request). Restore never restores receipts. |
 | How is the physical purge versioned? | New on-disk authority format 9. Old binaries fail closed on format-9 roots. No conversion from format 7 (no production root exists). Format 8 remains the test-only bounded-directory format. |
 
 ## What retention fixes and what it does not
@@ -151,7 +151,8 @@ root carrying it.
 ## Catalog adapter
 
 - `stage_commit_records` stops writing the audit row (key tag 4) and writes the
-  receipt with `put_with_expiry(staging time + 24 h)`. The audit record still
+  receipt with `put_with_expiry(occurredAtMs + 24 h)`, where `occurredAtMs`
+  is when the adapter accepted the request. The audit record still
   becomes the projection intent payload, unchanged.
 - `load_receipt` is untouched; an expired-but-unpurged receipt still
   short-circuits a replay, which is the safe direction.
@@ -204,7 +205,7 @@ written after the snapshot files and before the snapshot manifest. See the
 | Reader pinned before the rewrite | Reads its own manifest's L1 and still sees the tombstone. |
 | Transaction pinned after the rewrite | Observes absence; its commit validates against the same pinned replay. Deterministic. |
 | Older binary opens a format-9 root | `UnsupportedAuthorityFormat` at open; no partial read. |
-| Keyed request retried after its receipt was purged | Re-executes under the same deterministic operation id. While the earlier projection intent is still retained in the outbox, staging fails closed with a projection-intent conflict (`AlreadyExists { entity: "projection intent" }`) and commits nothing, unless the command fails first; after the worker drains and trims that intent, the retry commits and stages a fresh outbox incarnation. Audit identity downstream is `(operation_id, logical_sequence)`. A per-call operation id would remove the conflict; that is an owner decision. |
+| Keyed request retried after its receipt was purged | Re-executes under the same deterministic operation id. While the earlier projection intent is still retained in the outbox, staging fails closed with a projection-intent conflict (`AlreadyExists { entity: "projection intent" }`) and commits nothing, unless the command fails first; after the worker drains and trims that intent, the retry commits and stages a fresh outbox incarnation. A quarantined intent is never acknowledged, so never trimmed: a transient quarantine cause clears on a later drain, but a persistent one (for example divergent artifact bytes) keeps that (family, key) returning the conflict (409) until the quarantine is resolved; operators check the drain's `quarantined_records`. Audit identity downstream is `(operation_id, logical_sequence)`. A per-call operation id would remove the conflict; that is an owner decision. |
 
 ## Verification
 

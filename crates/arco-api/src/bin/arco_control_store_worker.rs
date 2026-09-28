@@ -56,7 +56,7 @@ const DEFAULT_MAINTENANCE_MAX_ADVANCES: usize = 4096;
 /// about 20 to 50 ms per object on GCS, so a full-budget sweep takes about 80
 /// to 200 s: inside the 5-minute schedule and the 1800 s task timeout.
 /// Overlapping sweeps are harmless (deleting a missing object succeeds) and
-/// only double-count their metrics.
+/// only double-count their summary fields.
 const DEFAULT_AUDIT_SWEEP_MAX_OBJECTS: usize = 4096;
 /// The shortest audit retention the worker accepts, in days. The kernel sweep
 /// accepts any retention of at least one day; the worker refuses a

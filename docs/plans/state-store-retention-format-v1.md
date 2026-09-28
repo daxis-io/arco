@@ -300,6 +300,12 @@ live row of the checkpoint cut and re-stages receipts with their hint); and
 the scheduled worker binary invoking the horizon job kind (it prepares
 consolidation only). These are steps 2 to 4 of the design.
 
+Status since then: the catalog outbox trim and the worker's horizon job kind
+landed in retention step 2; receipt expiry (`put_with_expiry` now has its
+adapter caller), audit-row removal and the `system.catalog.audit` projection
+landed in retention step 3. The restore that skips receipt rows remains for
+step 4. The paragraph above describes step 1 only.
+
 ## Vectors and fixtures
 
 `../reports/2026-09-26-format9-canonical-vectors.json` pins the format-9

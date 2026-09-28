@@ -59,7 +59,10 @@ authorizes the tenant and workspace.
 
 ### Schema
 
-`arco_catalog::catalog_audit_schema()` returns the exact schema:
+`arco_catalog::parquet_util::catalog_audit_schema()` returns the exact
+schema. Rust readers can decode a file with
+`arco_catalog::parquet_util::read_audit_records`, which returns
+`arco_catalog::parquet_util::CatalogAuditRow` values.
 
 | Column | Type | Nullable | Meaning |
 |---|---|---|---|
@@ -82,8 +85,10 @@ authorizes the tenant and workspace.
 - **Written before acknowledgement.** The projection materializer writes the
   file after the intent's catalog snapshot files and before the snapshot
   `manifest.json`, and acknowledges the intent only after the file exists.
-  Every acknowledged intent has its file, so trimming the outbox never loses
-  an audit row.
+  Every intent acknowledged since retention step 3 has its file, so trimming
+  the outbox never loses an audit row. Intents acknowledged earlier on an
+  existing format-9 root kept their audit record as a row in the authority
+  KV (key tag 4); the materializer never revisits them, so they have no file.
 - **Quarantined intents.** An intent the materializer quarantines may or may
   not have a file (for example, one quarantined for a divergent snapshot
   manifest after its audit file landed). A file that exists still describes a
@@ -96,10 +101,14 @@ authorizes the tenant and workspace.
 - **Identity.** A row is identified by `(operation_id, logical_sequence)`, not
   by `operation_id` alone. A keyed request's operation id is deterministic per
   operation family and idempotency key. Its idempotency receipt answers
-  replays with the original response for at least 24 hours; once the receipt
-  is purged, the same keyed request re-executes under the same `operation_id`
-  at a later logical sequence and produces a second row. Unkeyed requests get
-  a fresh operation id each time.
+  replays with the original response for at least 24 hours. Once the receipt
+  is purged, the same keyed request re-executes under the same `operation_id`.
+  While the earlier intent is still in the outbox, the retry is refused with
+  a 409 conflict and writes nothing; only after the earlier intent is drained
+  and trimmed does the retry commit at a later logical sequence and produce a
+  second row. See the known limitations in
+  `docs/runbooks/control-store-worker.md`. Unkeyed requests get a fresh
+  operation id each time.
 
 ### Retention
 

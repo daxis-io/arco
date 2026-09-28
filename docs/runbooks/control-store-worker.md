@@ -101,10 +101,14 @@ history.
    retained day partition ends the walk through the day partitions (the
    listing jumps past them), so a run with nothing to expire lists only a page
    or two. Names that are not a well-formed day partition are never deleted
-   (see "Known limitations"). The sweep does not coordinate with the drain and
-   never defers: any error is a phase failure. The kernel GC is scoped to
-   `control/v1/domains/<domain>/` and the sweep to the audit prefix, so
-   nothing collects the catalog snapshot directories under
+   (see "Known limitations"). The sweep does not coordinate with the drain,
+   neither reads the workspace retention epoch nor takes the retention lock,
+   and never defers: it runs in every run, even while an epoch is in flight
+   or stuck, and any error is a phase failure. Audit files are not referenced
+   by workspace snapshots or exports, so the epoch does not protect them, and
+   overlapping sweeps only double-count their summary fields. The kernel GC
+   is scoped to `control/v1/domains/<domain>/` and the sweep to the audit
+   prefix, so nothing collects the catalog snapshot directories under
    `control/v1/projections/catalog-parquet/` (see "Known limitations").
 
 The job runs under the **API service account**. That account is the sole
@@ -182,7 +186,10 @@ gcloud run jobs executions list --job "arco-control-store-worker-${ENV}" \
 ```
 
 Do not run two executions concurrently: they contend on the workspace
-retention lock and the second one's phases will all report `deferred`.
+retention lock and the second one's phases will all report `deferred`. The
+`catalog-audit` sweep is the exception: it takes no retention lock, never
+defers, and runs in both; the two sweeps only double-count their summary
+fields.
 
 The image is built with
 `scripts/build-cloud-run-image.sh --bin arco_control_store_worker --image <tag>`
@@ -214,7 +221,7 @@ exact field path depends on how the JSON layer nests `tracing` fields).
 | `maintenance` | `domain`, `kind`, `outcome`, `job_id`, `recovered`, `advances`, `completed`, `total`, `layout_generation`, `purged_expired_rows`, `purged_tombstones`, `elapsed_ms` |
 | `drain` | `outcome`, `drained_records`, `quarantined_records`, `already_acknowledged`, `pending_records`, `latest_projected_sequence`, `applied_authority_sequence`, `observed_authority_sequence`, `lag` (observed - applied), `age_secs` (since last successful materialization), `elapsed_ms` |
 | `trim` | `outcome`, `trimmed_records`, `trim_sequence` (catalog logical sequence of the trim commit, when one landed), `elapsed_ms` |
-| `gc` (control domains) | `domain`, `pages`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
+| `gc` (control domains) | `domain`, `outcome`, `pages`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
 | `gc` (`domain="catalog-audit"`) | `outcome`, `partitions_examined`, `partitions_unrecognized`, `partitions_expired`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
 | `run` | `outcome` (`ok`/`error`), `failures`, `elapsed_ms` |
 
@@ -223,8 +230,10 @@ Epoch `outcome` values:
 - `absent` / `idle`: nothing in flight. Normal.
 - `in_flight`: an epoch is in flight but younger than
   `STALE_RECLAMATION_EPOCH_MIN_AGE_SECS` (600 s), or it is a `control_gc`
-  epoch, which the kernel adopts on its own once stale. Maintenance and GC in
-  this run report `deferred`; the next run normally proceeds.
+  epoch, which the kernel adopts on its own once stale. Maintenance and the
+  control-domain GC in this run report `deferred`; the next run normally
+  proceeds. The `catalog-audit` sweep does not read the epoch and runs as
+  usual.
 - `recoverable`: a stale `maintenance_root_publish` epoch whose `operation_id`
   matches a persisted job identity. The maintenance phase of the same run
   replays that job (`recovered=true`), which settles the epoch.
@@ -233,7 +242,8 @@ Epoch `outcome` values:
   lost or belongs to another operation). **The run exits non-zero.** Every
   maintenance activation and GC page in the workspace fails closed with
   "a retention mutation epoch is already in flight" until an operator settles
-  it; see "Stuck retention epoch" below.
+  it; see "Stuck retention epoch" below. The `catalog-audit` sweep is not
+  affected: it takes no retention lock and keeps running.
 
 Maintenance `kind` values (one summary line per job, at most two per domain
 per run):
@@ -319,11 +329,12 @@ the execution exit non-zero. Maintenance failures name the job kind, for
 example `maintenance[catalog]: maintenance prepare (retention_horizon) for
 domain catalog: ...`; entries already finished in the same domain survive a
 later step's error. An audit sweep failure is recorded as
-`gc[catalog-audit]: ...` (for example `gc[catalog-audit]: expire catalog
-audit partitions: catalog audit retention could not delete ...`); its storage
-errors name the listing cursor or the object, and objects deleted before the
-error stay deleted. Storage, integrity, ambiguous-outcome and
-backpressure (outside the drain) errors are never retried silently; see
+`gc[catalog-audit]: ...`, for example `gc[catalog-audit]: expire catalog
+audit partitions: storage error: catalog audit retention could not delete
+<path>: ...`; its storage errors name the listing cursor or the object, and
+objects deleted before the error stay deleted. Storage, integrity,
+ambiguous-outcome and backpressure (outside the drain) errors are never
+retried silently; see
 `docs/runbooks/state-store-cas-publish-failure.md` and
 `docs/runbooks/state-store-corrupt-artifact.md`.
 
@@ -351,7 +362,8 @@ line and, on failure, the `gc[catalog-audit]` failure.
 ## Stuck retention epoch
 
 Symptom: `phase="epoch"` reports `outcome="stuck_epoch"` and the run exits
-non-zero; every maintenance and GC phase reports `deferred`.
+non-zero; every maintenance and control-domain GC phase reports `deferred`.
+The `catalog-audit` sweep does not read the epoch and keeps running.
 
 Cause: a process died (or a PUT outcome stayed uncertain) between claiming the
 workspace retention mutation epoch and settling it. The kernel adopts only
@@ -481,9 +493,10 @@ Remedy, in order:
   another build redelivers finds different bytes and is quarantined as
   `INCOMPATIBLE_PROJECTION_INTENT`, although its existing file still holds
   the row. Before such a deploy, run the job until the drain reports
-  `pending_records=0` and the trim after it reports `ok` or `idle`: a
-  `deferred` trim has already retired acknowledgements, so the next drain
-  redelivers those records. The API (its post-commit drain and the operator
+  `pending_records` equal to `quarantined_records` (normally 0; the backlog
+  counts quarantined records, which are never acknowledged) and the trim
+  after it reports `ok` or `idle`: a `deferred` trim has already retired
+  acknowledgements, so the next drain redelivers those records. The API (its post-commit drain and the operator
   drain) and this job materialize the same outbox, so they must run the same
   `parquet` and `arrow` versions. Accepting an existing file whose decoded
   rows match (semantic retry acceptance) is a follow-up due no later than
@@ -506,13 +519,20 @@ Remedy, in order:
   outbox (not yet drained and trimmed), the commit fails closed with
   `CatalogError::AlreadyExists { entity: "projection intent", .. }` (which
   `ApiError` maps to 409 Conflict, `projection intent already exists:
-  op-...`) and commits nothing,
-  unless the command itself fails first (for example on a name conflict).
+  op-...`) and commits nothing, unless the command itself fails first (for
+  example on a name conflict).
   This job's drain and trim remove the earlier intent; the retry then
-  commits and stages a fresh outbox incarnation of the same id. If the
-  conflict persists across runs, check the `drain` and `trim` outcomes. The
-  audit projection records the two executions as separate rows with the same
-  `operation_id` and different `logical_sequence` values.
+  commits and stages a fresh outbox incarnation of the same id. The conflict
+  can be permanent when the earlier intent was quarantined: a quarantined
+  record is never acknowledged, so it is never trimmed and keeps its id. A
+  transient quarantine cause clears on a later drain, which then
+  acknowledges the record; a persistent one (for example divergent bytes at
+  its artifact path) keeps that (operation family, idempotency key) pair
+  returning 409 until the quarantine is resolved. If the conflict persists
+  across runs, check the drain's `quarantined_records` and the `drain` and
+  `trim` outcomes. The audit projection records the two executions as
+  separate rows with the same `operation_id` and different
+  `logical_sequence` values.
 - The job maintains exactly the `catalog` and `projection-outbox-acks` domains.
   Other control domains need their own entry in `CONTROL_DOMAINS`.
 

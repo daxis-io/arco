@@ -35,7 +35,7 @@ All state-store program surfaces above are landed with CI-run test suites but ar
   explicit single-attempt conditional-write client.
 - deps(rust): bumped `serde_with` from 3.16.1 to 3.21.0 (#321).
 - Catalog audit records are no longer stored in the `control/v1` authority KV; they ride the projection intent into the catalog audit projection. Key tag 4 is retired and reserved, and format-9 roots written before this change keep any tag-4 rows they hold.
-- A keyed catalog request replays its original response for at least 24 hours. After its receipt is purged the request re-executes under the same operation id; while the earlier projection intent is still in the outbox it fails with a `projection intent` conflict (409) until the worker drains and trims that intent.
+- A keyed catalog request replays its original response for at least 24 hours. After its receipt is purged the request re-executes under the same operation id; while the earlier projection intent is still in the outbox it fails with a `projection intent` conflict (409) until the worker drains and trims that intent. A quarantined intent is never acknowledged or trimmed: a transient quarantine cause clears on a later drain, but a persistent one (for example divergent artifact bytes) keeps that operation family and idempotency key returning 409 until the quarantine is resolved; check the drain's `quarantined_records`.
 - **Breaking for `control/v1` roots:** authority format 9 is a hard cut from format 7. Every canonical digest frames the new format number, format-7 artifacts and eight-column format-1 segments fail closed, and there is no conversion or dual reader (no production root existed on format 7; format 8 remains the test-only bounded authority).
 
 ### Fixed

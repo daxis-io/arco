@@ -610,6 +610,12 @@ impl ControlMvpStateStore {
     }
 
     #[cfg(feature = "test-utils")]
+    pub(super) fn new_identity_principals(storage: arco_core::IdentityStorage) -> Result<Self> {
+        let scope = StateScope::tenant_identity(storage.tenant_id(), "principals");
+        Self::new_root(RootStorage::Identity(storage), scope)
+    }
+
+    #[cfg(feature = "test-utils")]
     pub(super) fn identity_lifecycle(&self) -> (&RootStorage, &StateScope) {
         (&self.retention, &self.scope)
     }

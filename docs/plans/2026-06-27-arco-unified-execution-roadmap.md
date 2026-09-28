@@ -379,6 +379,8 @@ The latter remains test-only and keeps the production constructor closed.
 Principal semantics need a separate child before Phase 8 authorization or any
 identity route. Tenant principal purge and physical state-store GC do not close
 each other's track.
+The [principal follow-up gates](2026-09-27-tenant-identity-principal-follow-up-gates.md)
+separate cross-metastore revocation from retention-qualified principal purge.
 
 ## Phase 3A: Deterministic State Model
 

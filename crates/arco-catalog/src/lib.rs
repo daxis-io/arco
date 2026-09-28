@@ -118,9 +118,11 @@ pub mod writer;
 // Re-export main types at crate root
 pub use asset::{Asset, AssetFormat, AssetKey, AssetKeyError, CreateAssetRequest};
 pub use catalog_authority::{
-    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority, CatalogAuthorityBinding,
-    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListPage, CatalogListRequest,
-    CatalogProjectionMaterializer, CatalogProjectionNotifier, ControlCatalogAuthority,
+    AuditRetentionReport, CATALOG_AUDIT_PROJECTION_PREFIX, CATALOG_AUDIT_RETENTION_DAYS,
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CATALOG_RECEIPT_RETENTION_MS, CatalogAuthority,
+    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListPage,
+    CatalogListRequest, CatalogProjectionMaterializer, CatalogProjectionNotifier,
+    ControlCatalogAuthority, catalog_audit_artifact_path, catalog_audit_partition,
 };
 pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};

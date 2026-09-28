@@ -5415,6 +5415,24 @@ impl CommitOutcomeV2 {
 }
 
 impl ControlMvpTxn {
+    /// Staged KV writes in key order. Instrumentation for adapter tests that
+    /// must prove the exact write shape they stage before it commits.
+    #[cfg(test)]
+    pub(crate) fn staged_kv_writes(&self) -> Vec<(Vec<u8>, StagedKvWrite)> {
+        self.writes
+            .iter()
+            .map(|(key, write)| {
+                let shape = match write {
+                    StagedWrite::Put { expires_at_ms, .. } => StagedKvWrite::Put {
+                        expires_at_ms: *expires_at_ms,
+                    },
+                    StagedWrite::Delete => StagedKvWrite::Delete,
+                };
+                (key.clone(), shape)
+            })
+            .collect()
+    }
+
     /// Freezes the stable operation identity for an explicit synthetic V2 transaction.
     ///
     /// # Errors
@@ -7450,6 +7468,20 @@ enum StagedWrite {
         /// read filter.
         expires_at_ms: Option<i64>,
     },
+    Delete,
+}
+
+/// Shape of one staged KV write, as reported by
+/// `ControlMvpTxn::staged_kv_writes` for adapter tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagedKvWrite {
+    /// A put, with its purge-eligibility hint when one was staged.
+    Put {
+        /// The expiry hint, `None` for a plain put.
+        expires_at_ms: Option<i64>,
+    },
+    /// A delete (tombstone).
     Delete,
 }
 

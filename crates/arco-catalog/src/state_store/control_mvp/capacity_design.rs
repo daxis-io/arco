@@ -202,9 +202,15 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
     let sample = scan_all_entries_bounded(&store, b"", MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
         .await
         .unwrap();
+    // Receipts are the only per-mutation KV row: audit records are
+    // projection-only since retention step 3.
     let receipt = sample.iter().find(|r| r.key().first() == Some(&3)).unwrap();
-    let audit = sample.iter().find(|r| r.key().first() == Some(&4)).unwrap();
+    assert!(sample.iter().all(|r| r.key().first() != Some(&4)));
     let mutations = 1_209_600_u64;
+    // Fixed synthetic acceptance clock: receipt `ordinal` is accepted 500 ms
+    // after the previous one and carries the production 24 h expiry hint, so
+    // the nullable expiry column is populated (monotone) like real receipts.
+    let base_occurred_at_ms: i64 = 1_800_000_000_000;
     let limits = half_segment_limits(PRODUCTION_SEGMENT_LIMITS);
     let started = Instant::now();
     let mut batch = Vec::new();
@@ -215,16 +221,11 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
     let mut shards = Vec::new();
     let mut input_hash = Sha256::new();
     let mut output_hash = Sha256::new();
-    for index in 0..mutations * 2 {
-        let is_receipt = index < mutations;
-        let ordinal = index % mutations + 1;
-        let template = if is_receipt { receipt } else { audit };
-        let (key, value) = crate::catalog_authority::capacity_fixture_record(
-            template.value().bytes(),
-            is_receipt,
-            ordinal,
-        )
-        .unwrap();
+    for index in 0..mutations {
+        let ordinal = index + 1;
+        let (key, value) =
+            crate::catalog_authority::capacity_fixture_record(receipt.value().bytes(), ordinal)
+                .unwrap();
         assert!(previous_key.as_ref().is_none_or(|previous| previous < &key));
         previous_key = Some(key.clone());
         let decoded_bytes = key.len() + value.len();
@@ -253,7 +254,11 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
             logical_sequence: mutations,
             logical_ordinal: index,
             origin_sequence: None,
-            expires_at_ms: None,
+            expires_at_ms: Some(
+                base_occurred_at_ms
+                    + i64::try_from(ordinal).unwrap() * 500
+                    + crate::catalog_authority::CATALOG_RECEIPT_RETENTION_MS,
+            ),
         });
     }
     if !batch.is_empty() {
@@ -271,13 +276,12 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
             .iter()
             .map(|s| s["rows"].as_u64().unwrap())
             .sum::<u64>(),
-        mutations * 2
+        mutations
     );
     let report = serde_json::json!({"status":"physical-encoding-feasible-only",
-        "semantic_mutations_executed":2, "synthetic_rows":mutations * 2,
+        "semantic_mutations_executed":2, "synthetic_rows":mutations,
         "sample_receipt_hex":hex::encode(receipt.value().bytes()),
-        "sample_audit_hex":hex::encode(audit.value().bytes()),
-        "sample_receipt_key_hex":hex::encode(receipt.key()), "sample_audit_key_hex":hex::encode(audit.key()),
+        "sample_receipt_key_hex":hex::encode(receipt.key()),
         "decoded_key_value_bytes":total_decoded_bytes,
         "encoded_segment_bytes":shards.iter().map(|s|s["segment_bytes"].as_u64().unwrap()).sum::<u64>(),
         "encoded_index_bytes":shards.iter().map(|s|s["index_bytes"].as_u64().unwrap()).sum::<u64>(),
@@ -286,13 +290,13 @@ async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {
         "elapsed_seconds":started.elapsed().as_secs_f64(), "shards":shards,
         "all_rows_round_trip":true, "all_output_hashes_match":true,
         "full_root_restore_replay_maintenance":false, "pilot_qualified":false,
-        "scope":"synthetic inventory from production typed receipt/audit encoders and production L1 codec; no whole pilot root, table mutation mix, history, concurrency or provider proof"});
+        "scope":"synthetic inventory from the production typed receipt encoder and production L1 codec (receipts only: audit records are projection-only since retention step 3); no whole pilot root, table mutation mix, history, concurrency or provider proof"});
     let path =
         std::env::var("ARCO_GATE7_CAPACITY_DESIGN_REPORT").expect("explicit report destination");
     std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     println!(
         "physical encoding: {} rows, {} shards, {} decoded bytes",
-        mutations * 2,
+        mutations,
         report["shards"].as_array().unwrap().len(),
         total_decoded_bytes
     );

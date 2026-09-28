@@ -89,7 +89,27 @@ history.
    `ARCO_CONTROL_STORE_GC_MAX_PAGES` pages of `collect_gc_page_at`, the
    conservative active collector (unreachable candidates older than seven days;
    maintenance retention pins last eight days, token/checkpoint pins 30 days,
-   manifests 30 days plus a one-hour clock-skew margin).
+   manifests 30 days plus a one-hour clock-skew margin). The phase ends with
+   the **catalog audit sweep** (`domain="catalog-audit"`):
+   `CatalogProjectionMaterializer::expire_audit_partitions` deletes the
+   objects of catalog audit projection day partitions
+   (`control/v1/projections/catalog-audit/dt=YYYY-MM-DD/`) whose day is
+   strictly before the UTC date `ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS` days
+   before now, oldest first, at most `ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS`
+   objects per run. With the default 400 days, the partition of day `D` is
+   kept through day `D + 400` and deleted from day `D + 401`. The first
+   retained day partition ends the walk through the day partitions (the
+   listing jumps past them), so a run with nothing to expire lists only a page
+   or two. Names that are not a well-formed day partition are never deleted
+   (see "Known limitations"). The sweep does not coordinate with the drain,
+   neither reads the workspace retention epoch nor takes the retention lock,
+   and never defers: it runs in every run, even while an epoch is in flight
+   or stuck, and any error is a phase failure. Audit files are not referenced
+   by workspace snapshots or exports, so the epoch does not protect them, and
+   overlapping sweeps only double-count their summary fields. The kernel GC
+   is scoped to `control/v1/domains/<domain>/` and the sweep to the audit
+   prefix, so nothing collects the catalog snapshot directories under
+   `control/v1/projections/catalog-parquet/` (see "Known limitations").
 
 The job runs under the **API service account**. That account is the sole
 writer of the `control/` prefix; do not rebind the job to a compactor service
@@ -107,8 +127,17 @@ foreign objects there as orphans.
 | `ARCO_CONTROL_STORE_MAINTENANCE_BINDING` | yes | Standard base64 of exactly 32 bytes; see the binding rule below. Mounted from Secret Manager (`control_store_maintenance_binding_secret`). |
 | `ARCO_CONTROL_STORE_GC_MAX_PAGES` | no (default 16) | GC pages collected per domain per run. |
 | `ARCO_CONTROL_STORE_MAINTENANCE_MAX_ADVANCES` | no (default 4096) | `advance_at` calls per maintenance job per run; the job resumes from its persisted identity next run when exhausted. |
+| `ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS` | no (default 400) | Days a catalog audit projection day partition is kept before the GC phase's sweep deletes it. An integer from 30 (`MIN_AUDIT_RETENTION_DAYS`) to 4294967295 (`u32`). |
+| `ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS` | no (default 4096) | Audit partition objects the sweep deletes per run; a positive integer (`usize`), independent of `ARCO_CONTROL_STORE_GC_MAX_PAGES`. The next run continues where the budget ran out. |
 | `ARCO_LOG_FORMAT` | no | `json` for structured logs (Terraform sets it); anything else is pretty. |
 | `RUST_LOG` | no | Standard `tracing` filter; defaults to `info`. |
+
+An unset or blank limit takes its default. Zero, a non-integer, or an audit
+retention below 30 days fails startup before any phase runs, for example
+`ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS must be at least 30 days, got 7`.
+The startup line (`control-store worker starting`) logs every effective limit:
+`gc_max_pages`, `maintenance_max_advances`, `audit_retention_days`,
+`audit_sweep_max_objects`.
 
 Terraform enables the job only when `control_store_worker_image`,
 `control_store_tenant_id`, `control_store_workspace_id` and
@@ -157,7 +186,10 @@ gcloud run jobs executions list --job "arco-control-store-worker-${ENV}" \
 ```
 
 Do not run two executions concurrently: they contend on the workspace
-retention lock and the second one's phases will all report `deferred`.
+retention lock and the second one's phases will all report `deferred`. The
+`catalog-audit` sweep is the exception: it takes no retention lock, never
+defers, and runs in both; the two sweeps only double-count their summary
+fields.
 
 The image is built with
 `scripts/build-cloud-run-image.sh --bin arco_control_store_worker --image <tag>`
@@ -189,7 +221,8 @@ exact field path depends on how the JSON layer nests `tracing` fields).
 | `maintenance` | `domain`, `kind`, `outcome`, `job_id`, `recovered`, `advances`, `completed`, `total`, `layout_generation`, `purged_expired_rows`, `purged_tombstones`, `elapsed_ms` |
 | `drain` | `outcome`, `drained_records`, `quarantined_records`, `already_acknowledged`, `pending_records`, `latest_projected_sequence`, `applied_authority_sequence`, `observed_authority_sequence`, `lag` (observed - applied), `age_secs` (since last successful materialization), `elapsed_ms` |
 | `trim` | `outcome`, `trimmed_records`, `trim_sequence` (catalog logical sequence of the trim commit, when one landed), `elapsed_ms` |
-| `gc` | `domain`, `pages`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
+| `gc` (control domains) | `domain`, `outcome`, `pages`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
+| `gc` (`domain="catalog-audit"`) | `outcome`, `partitions_examined`, `partitions_unrecognized`, `partitions_expired`, `objects_deleted`, `bytes_reclaimed`, `truncated`, `elapsed_ms` |
 | `run` | `outcome` (`ok`/`error`), `failures`, `elapsed_ms` |
 
 Epoch `outcome` values:
@@ -197,8 +230,10 @@ Epoch `outcome` values:
 - `absent` / `idle`: nothing in flight. Normal.
 - `in_flight`: an epoch is in flight but younger than
   `STALE_RECLAMATION_EPOCH_MIN_AGE_SECS` (600 s), or it is a `control_gc`
-  epoch, which the kernel adopts on its own once stale. Maintenance and GC in
-  this run report `deferred`; the next run normally proceeds.
+  epoch, which the kernel adopts on its own once stale. Maintenance and the
+  control-domain GC in this run report `deferred`; the next run normally
+  proceeds. The `catalog-audit` sweep does not read the epoch and runs as
+  usual.
 - `recoverable`: a stale `maintenance_root_publish` epoch whose `operation_id`
   matches a persisted job identity. The maintenance phase of the same run
   replays that job (`recovered=true`), which settles the epoch.
@@ -207,7 +242,8 @@ Epoch `outcome` values:
   lost or belongs to another operation). **The run exits non-zero.** Every
   maintenance activation and GC page in the workspace fails closed with
   "a retention mutation epoch is already in flight" until an operator settles
-  it; see "Stuck retention epoch" below.
+  it; see "Stuck retention epoch" below. The `catalog-audit` sweep is not
+  affected: it takes no retention lock and keeps running.
 
 Maintenance `kind` values (one summary line per job, at most two per domain
 per run):
@@ -267,12 +303,38 @@ Trim `outcome` values:
   before the catalog commit, so the next drain re-materializes those records
   (at-least-once) and the following trim removes them.
 
+Catalog audit sweep fields (`phase="gc"`, `domain="catalog-audit"`):
+
+- `partitions_examined`: distinct partitions the run visited: every expired
+  partition it reached, the first retained day partition (which ends the walk
+  through the day partitions), and every unrecognized partition it reached.
+- `partitions_unrecognized`: of those, names that are not a well-formed day
+  directory (for example `dt=not-a-date/` or `dt=1999-02-30/`) and loose
+  objects directly under the prefix. Never deleted; each is logged at warn.
+- `partitions_expired`: visited partitions with at least one object deleted
+  by this run.
+- `objects_deleted`, `bytes_reclaimed`: objects deleted by this run and their
+  listed sizes. `objects_deleted` never exceeds
+  `ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS`.
+- `truncated`: the budget ran out while an expired object remained. The next
+  run continues with the oldest survivor; no cursor is persisted, and none is
+  needed because deleted objects are gone.
+
+A steady state with nothing to expire reports `partitions_examined=1` (the
+oldest retained day partition) plus any unrecognized partitions it reached,
+and zero deletions; an empty prefix reports all zeros.
+
 A `phase failed` line with `outcome="error"` carries the typed error and makes
 the execution exit non-zero. Maintenance failures name the job kind, for
 example `maintenance[catalog]: maintenance prepare (retention_horizon) for
 domain catalog: ...`; entries already finished in the same domain survive a
-later step's error. Storage, integrity, ambiguous-outcome and
-backpressure (outside the drain) errors are never retried silently; see
+later step's error. An audit sweep failure is recorded as
+`gc[catalog-audit]: ...`, for example `gc[catalog-audit]: expire catalog
+audit partitions: storage error: catalog audit retention could not delete
+<path>: ...`; its storage errors name the listing cursor or the object, and
+objects deleted before the error stay deleted. Storage, integrity,
+ambiguous-outcome and backpressure (outside the drain) errors are never
+retried silently; see
 `docs/runbooks/state-store-cas-publish-failure.md` and
 `docs/runbooks/state-store-corrupt-artifact.md`.
 
@@ -294,10 +356,14 @@ The kernel emits these while the worker drives it
   acknowledged outbox records removed by trim commits, emitted after the
   source trim commit succeeds; a zero count emits nothing.
 
+The catalog audit sweep emits no metric. Its only signal is its `gc` summary
+line and, on failure, the `gc[catalog-audit]` failure.
+
 ## Stuck retention epoch
 
 Symptom: `phase="epoch"` reports `outcome="stuck_epoch"` and the run exits
-non-zero; every maintenance and GC phase reports `deferred`.
+non-zero; every maintenance and control-domain GC phase reports `deferred`.
+The `catalog-audit` sweep does not read the epoch and keeps running.
 
 Cause: a process died (or a PUT outcome stayed uncertain) between claiming the
 workspace retention mutation epoch and settling it. The kernel adopts only
@@ -390,6 +456,83 @@ Remedy, in order:
   catalog root, which the operator endpoint refuses for `catalog`.
   Acknowledgements an in-flight trim had already retired are redelivered by
   the next fixed drain once the root is unbound.
+- **One small audit file per catalog mutation.** The materializer writes one
+  single-row Parquet file under `control/v1/projections/catalog-audit/` for
+  every acknowledged catalog intent. At the pilot rate (1,209,600 mutations a
+  week) that is about 173,000 files a day and about 69 million files at the
+  400-day default. Compacting day partitions into larger files is a
+  follow-up.
+- **Audit sweep throughput is bounded by serial deletes.** The sweep deletes
+  one object at a time, about 20 to 50 ms each on GCS, so a full
+  4096-object run takes about 80 to 200 s: inside the 5-minute schedule and
+  the 1800 s task timeout. At the default budget and cadence the sweep
+  removes at most about 1.18 million objects a day (4096 x 288 runs), above
+  the pilot's daily file count. A larger backlog (for example after lowering
+  the retention) drains over several runs, each reporting `truncated=true`;
+  raise `ARCO_CONTROL_STORE_AUDIT_SWEEP_MAX_OBJECTS` for a one-off run, and
+  keep the run shorter than the schedule period. Overlapping sweeps are
+  harmless (deleting a missing object succeeds) and only double-count their
+  summary fields.
+- **Unrecognized names under the audit prefix are never deleted.** A directory
+  whose name is not `dt=` plus a canonical, existing `YYYY-MM-DD`, or an
+  object directly under the prefix, stays in place. The sweep logs it at warn
+  once per run (`catalog audit retention skipped an unrecognized partition;
+  it is never deleted`, fields `prefix` and `partition`), counts it in
+  `partitions_examined` and `partitions_unrecognized`, and visits it once:
+  after its first object the listing jumps past the whole directory, so a
+  large unrecognized directory costs one visit. An unrecognized name that
+  sorts among the day partitions after the first retained one (for example
+  `dt=2026-13-01/`) is skipped with them, uncounted and unlogged. The
+  materializer never writes such names; find where they came from, then
+  remove them by hand.
+- **Drain the catalog outbox before deploying a different `parquet` or
+  `arrow` version.** Audit files, like the catalog snapshot files, are
+  accepted on redelivery only when the rewritten bytes are identical, and
+  Parquet bytes are stable only within one build of the `parquet` crate (the
+  file footer records its version). An intent whose file one build wrote and
+  another build redelivers finds different bytes and is quarantined as
+  `INCOMPATIBLE_PROJECTION_INTENT`, although its existing file still holds
+  the row. Before such a deploy, run the job until the drain reports
+  `pending_records` equal to `quarantined_records` (normally 0; the backlog
+  counts quarantined records, which are never acknowledged) and the trim
+  after it reports `ok` or `idle`: a `deferred` trim has already retired
+  acknowledgements, so the next drain redelivers those records. The API (its post-commit drain and the operator
+  drain) and this job materialize the same outbox, so they must run the same
+  `parquet` and `arrow` versions. Accepting an existing file whose decoded
+  rows match (semantic retry acceptance) is a follow-up due no later than
+  retention step 4.
+- **Catalog snapshot directories are never collected.** Every acknowledged
+  catalog intent also publishes a full catalog snapshot directory,
+  `control/v1/projections/catalog-parquet/{sequence:020}-{manifest_id}/`.
+  Nothing deletes these: the kernel GC covers `control/v1/domains/<domain>/`,
+  the legacy GC covers `snapshots/`, and the audit sweep covers only the
+  audit prefix. Storage grows by one full catalog snapshot per mutation. The
+  retention design assumed a projection GC that ages superseded snapshots;
+  none exists. Collecting superseded snapshot directories is a follow-up.
+- **A keyed retry after its receipt was purged can fail with a
+  projection-intent conflict until the worker drains and trims.** A keyed
+  request replays its original response for at least 24 hours; its receipt
+  becomes purge-eligible strictly after `occurredAtMs + 25 h` and is removed
+  by the next published retention horizon. After that, a same-family request
+  with the same idempotency key re-executes under the same deterministic
+  operation id. While the earlier projection intent is still in the catalog
+  outbox (not yet drained and trimmed), the commit fails closed with
+  `CatalogError::AlreadyExists { entity: "projection intent", .. }` (which
+  `ApiError` maps to 409 Conflict, `projection intent already exists:
+  op-...`) and commits nothing, unless the command itself fails first (for
+  example on a name conflict).
+  This job's drain and trim remove the earlier intent; the retry then
+  commits and stages a fresh outbox incarnation of the same id. The conflict
+  can be permanent when the earlier intent was quarantined: a quarantined
+  record is never acknowledged, so it is never trimmed and keeps its id. A
+  transient quarantine cause clears on a later drain, which then
+  acknowledges the record; a persistent one (for example divergent bytes at
+  its artifact path) keeps that (operation family, idempotency key) pair
+  returning 409 until the quarantine is resolved. If the conflict persists
+  across runs, check the drain's `quarantined_records` and the `drain` and
+  `trim` outcomes. The audit projection records the two executions as
+  separate rows with the same `operation_id` and different
+  `logical_sequence` values.
 - The job maintains exactly the `catalog` and `projection-outbox-acks` domains.
   Other control domains need their own entry in `CONTROL_DOMAINS`.
 
@@ -400,3 +543,4 @@ Remedy, in order:
 - `docs/runbooks/control-plane-repair-and-dark-launch.md`
 - `docs/runbooks/gc-failure.md`
 - `docs/adr/adr-043-s3-state-token-authority.md`
+- `docs/guide/src/reference/system-catalog.md` (catalog audit projection)

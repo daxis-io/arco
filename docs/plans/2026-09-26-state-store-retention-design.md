@@ -10,7 +10,7 @@ metric emitters (PR #436).
 | Question | Decision |
 |---|---|
 | Where do catalog audit records live? | Projection only. No audit row is written to the authoritative KV; the audit record rides the projection intent payload (as today) and is materialized into an append-only `system.catalog.audit` Parquet projection with its own retention. |
-| How long is a keyed request replayable with its original response? | 24 hours from staging. Restore never restores receipts. |
+| How long is a keyed request replayable with its original response? | 24 hours from `occurredAtMs` (when the adapter accepted the request). Restore never restores receipts. |
 | How is the physical purge versioned? | New on-disk authority format 9. Old binaries fail closed on format-9 roots. No conversion from format 7 (no production root exists). Format 8 remains the test-only bounded-directory format. |
 
 ## What retention fixes and what it does not
@@ -151,7 +151,8 @@ root carrying it.
 ## Catalog adapter
 
 - `stage_commit_records` stops writing the audit row (key tag 4) and writes the
-  receipt with `put_with_expiry(staging time + 24 h)`. The audit record still
+  receipt with `put_with_expiry(occurredAtMs + 24 h)`, where `occurredAtMs`
+  is when the adapter accepted the request. The audit record still
   becomes the projection intent payload, unchanged.
 - `load_receipt` is untouched; an expired-but-unpurged receipt still
   short-circuits a replay, which is the safe direction.
@@ -164,10 +165,20 @@ On each drained intent the catalog materializer appends the decoded audit
 record to a day-partitioned `system.catalog.audit` Parquet artifact before it
 acknowledges, so artifact-before-ack ordering guarantees no audit is lost when
 the outbox row is later trimmed. Retention is a projection setting (default
-400 days) enforced by the projection GC that already ages superseded
-snapshots. The table is registered only when a control root is bound. A restore
-emits its own audit record for the restore mutation and does not resurrect
-historical audit rows.
+400 days) enforced by the control-store worker's audit sweep at the end of its
+GC phase (`CatalogProjectionMaterializer::expire_audit_partitions`;
+`ARCO_CONTROL_STORE_AUDIT_RETENTION_DAYS`, at least 30 days). Arco hosts no
+SQL catalog: `system.catalog.audit` is this design's name for a published
+Parquet projection, not a registered table, and it exists only under a
+control-bound catalog root. A restore emits its own audit record for the
+restore mutation and does not resurrect historical audit rows; the
+restore-emitted record is delivered by step 4.
+
+*As implemented (step 3):* one immutable single-row file per acknowledged
+intent at
+`control/v1/projections/catalog-audit/dt=YYYY-MM-DD/{source_logical_sequence:020}-{intent_id}.parquet`,
+written after the snapshot files and before the snapshot manifest. See the
+"As implemented" section of `2026-09-27-state-store-retention-step3-adapter.md`.
 
 ## Restore and checkpoints
 
@@ -194,6 +205,7 @@ historical audit rows.
 | Reader pinned before the rewrite | Reads its own manifest's L1 and still sees the tombstone. |
 | Transaction pinned after the rewrite | Observes absence; its commit validates against the same pinned replay. Deterministic. |
 | Older binary opens a format-9 root | `UnsupportedAuthorityFormat` at open; no partial read. |
+| Keyed request retried after its receipt was purged | Re-executes under the same deterministic operation id. While the earlier projection intent is still retained in the outbox, staging fails closed with a projection-intent conflict (`AlreadyExists { entity: "projection intent" }`) and commits nothing, unless the command fails first; after the worker drains and trims that intent, the retry commits and stages a fresh outbox incarnation. A quarantined intent is never acknowledged, so never trimmed: a transient quarantine cause clears on a later drain, but a persistent one (for example divergent artifact bytes) keeps that (family, key) returning the conflict (409) until the quarantine is resolved; operators check the drain's `quarantined_records`. Audit identity downstream is `(operation_id, logical_sequence)`. A per-call operation id would remove the conflict; that is an owner decision. |
 
 ## Verification
 
@@ -212,8 +224,29 @@ All tests are differential against pre-change behaviour.
   after a rewrite purged the receipt, the replay re-applies; restore never
   restores a receipt.
 - Projection: audit rows land in Parquet before ack; a drain interrupted after
-  the artifact and before the ack re-materializes idempotently; projection GC
-  ages audit partitions by the configured retention.
+  the artifact and before the ack re-materializes idempotently; the
+  control-store worker's audit sweep ages audit partitions by the configured
+  retention.
+
+## Gaps found during step 3
+
+- **Catalog snapshot directories are never collected.** The audit projection
+  text above originally relied on a projection GC that "already ages
+  superseded snapshots". None exists. Every acknowledged catalog intent
+  publishes a full catalog snapshot under
+  `control/v1/projections/catalog-parquet/`, and neither the kernel GC
+  (scoped to `control/v1/domains/<domain>/`), the legacy GC (`snapshots/`),
+  nor the audit sweep deletes it, so these directories grow by one full
+  snapshot per mutation without bound. Follow-up: collect superseded
+  snapshot directories.
+- **Semantic retry acceptance for projection Parquet is deferred.** A
+  redelivered audit file, like the snapshot files, is accepted only when its
+  bytes are identical, and Parquet bytes are stable only within one build of
+  the `parquet` crate. Accepting an existing file whose decoded rows match
+  must land no later than step 4, because restore-emitted audit records may
+  be written without snapshot files. Until then, drain the catalog outbox
+  before deploying a different `parquet`/`arrow` version; the API (post-commit
+  and operator drains) and the worker must run the same version.
 
 ## Capacity acceptance
 
@@ -234,10 +267,12 @@ Each step is its own reviewable change, landed in order after PR #436:
    `RetentionHorizon` transition, certificate validation, fixtures, oracle.
    Landed (PR #439).
 2. Worker: the horizon job kind and the catalog outbox trim after drain.
-   Landed (this change).
+   Landed (PR #442).
 3. Adapter: receipt expiry, audit-row removal, and the `system.catalog.audit`
-   projection with its retention.
-4. Restore plan 7 and checkpoint horizon.
+   projection with its retention. Landed (this change); the restore-emitted
+   audit record moved to step 4.
+4. Restore plan 7 and checkpoint horizon, the restore-emitted audit record,
+   and semantic retry acceptance for projection Parquet.
 5. Capacity probe and report.
 
 No conversion step exists: the pilot root is seeded fresh on format 9.

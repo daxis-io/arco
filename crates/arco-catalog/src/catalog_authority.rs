@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
@@ -17,7 +17,9 @@ use arco_core::{AuthorityRoot, ScopedStorage, TableFormat, WritePrecondition, Wr
 
 use crate::error::{CatalogError, Result};
 use crate::idempotency::validate_uuidv7;
-use crate::parquet_util::{CatalogRecord, ColumnRecord, NamespaceRecord, TableRecord};
+use crate::parquet_util::{
+    CatalogAuditRow, CatalogRecord, ColumnRecord, NamespaceRecord, TableRecord, write_audit_records,
+};
 use crate::state::CatalogState;
 use crate::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, ProjectionMaterializationStatus, ProjectionOutboxAckWriter,
@@ -46,6 +48,13 @@ pub mod projection_measurement;
 const OBJECT_KEY_TAG: u8 = 1;
 const NAME_INDEX_KEY_TAG: u8 = 2;
 const IDEMPOTENCY_KEY_TAG: u8 = 3;
+/// Retired key tag. Audit records left the authority KV in retention step 3
+/// (they are projection-only now); production never writes this tag again,
+/// and only fixtures that model historical authority-8 predecessor rows and
+/// the tests that assert the tag stays empty still name it. Tag 4 is reserved
+/// forever: format-9 roots written before step 3 may still hold tag-4 rows,
+/// and nothing expires or deletes them.
+#[cfg(any(test, feature = "test-utils"))]
 const AUDIT_KEY_TAG: u8 = 4;
 const CATALOG_KIND: u8 = 1;
 const SCHEMA_KIND: u8 = 2;
@@ -63,6 +72,28 @@ fn conflict_backoff(attempt: u32) -> Duration {
 /// Durable outbox kind and single-consumer identity for the catalog Parquet
 /// projection worker.
 pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
+
+/// How long a keyed catalog request stays replayable with its original
+/// response: at least 24 hours from when the adapter accepted the request
+/// (the audit record's `occurredAtMs`).
+///
+/// On format 9 every idempotency receipt is written with this expiry as its
+/// purge-eligibility hint; the test-only bounded format 8 refuses expiry
+/// hints and writes plain receipts. The hint is never a read filter, so a
+/// receipt stays visible (and keeps short-circuiting replays) until a
+/// `RetentionHorizon` maintenance job purges it, and that job only purges
+/// rows whose expiry lies more than one hour before its clock, adding a
+/// clock-skew margin on top of this window.
+///
+/// Once a receipt is purged its key is free again: a different request of the
+/// same operation family under the same key is no longer an idempotency
+/// conflict, and an identical one re-executes instead of returning the
+/// original response. Either re-execution reuses the deterministic operation
+/// id of its (operation family, idempotency key) pair, so while the earlier
+/// projection intent is still retained in the outbox it fails closed with an
+/// `AlreadyExists` projection-intent conflict and commits nothing, unless the
+/// command itself fails first (for example a name conflict).
+pub const CATALOG_RECEIPT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Non-blocking wake-up seam invoked after a catalog authority commit.
 ///
@@ -958,7 +989,383 @@ pub struct ControlCatalogAuthority {
     projection_notifier_v2: Option<Arc<dyn CatalogProjectionNotifierV2>>,
 }
 
+/// Object prefix of the `system.catalog.audit` projection, relative to an
+/// exact catalog authority root.
+///
+/// The catalog projection materializer writes immutable single-row Parquet
+/// files beneath it (see [`catalog_audit_artifact_path`]). Every acknowledged
+/// intent has exactly one file here, written before the acknowledgement and
+/// kept until [`CatalogProjectionMaterializer::expire_audit_partitions`]
+/// deletes its day partition (after [`CATALOG_AUDIT_RETENTION_DAYS`] by
+/// default). A quarantined intent may or may not have one (for example, one
+/// quarantined for a divergent snapshot manifest after its audit file
+/// landed); a present file still describes a committed mutation. The files
+/// are not listed in any snapshot manifest.
+pub const CATALOG_AUDIT_PROJECTION_PREFIX: &str = "control/v1/projections/catalog-audit/";
+
+/// Default retention of `system.catalog.audit` day partitions, in days.
+///
+/// [`CatalogProjectionMaterializer::expire_audit_partitions`] deletes the
+/// partition of day `D` once `D` is strictly before the UTC date
+/// `retention_days` days before the sweep's clock. With this default a
+/// partition is kept through day `D + 400` and deleted by the first sweep on
+/// day `D + 401` or later. The scheduled control-store worker sweeps with this
+/// value unless its deployment configures another.
+pub const CATALOG_AUDIT_RETENTION_DAYS: u32 = 400;
+
+/// Objects one audit retention listing page returns, at most.
+const AUDIT_RETENTION_PAGE_LIMIT: usize = 1000;
+
+/// What one [`CatalogProjectionMaterializer::expire_audit_partitions`] call
+/// did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditRetentionReport {
+    /// Distinct partitions the call visited: every expired partition it
+    /// reached, the first retained day partition (which ends the walk through
+    /// the day partitions), and every unrecognized partition it reached.
+    pub partitions_examined: u64,
+    /// Of the examined partitions, the unrecognized ones: directories whose
+    /// name is not a well-formed day, and loose objects directly under the
+    /// prefix (each its own partition). They are never deleted, and each is
+    /// logged at warn once per call.
+    pub partitions_unrecognized: u64,
+    /// Visited partitions with at least one object deleted by this call.
+    pub partitions_expired: u64,
+    /// Objects this call deleted; never more than its budget.
+    pub objects_deleted: u64,
+    /// Listed sizes of the deleted objects, in bytes.
+    pub bytes_reclaimed: u64,
+    /// The deletion budget ran out while expired objects remained: the call
+    /// found another expired object after its last permitted deletion. The
+    /// next call continues with it.
+    pub truncated: bool,
+}
+
+/// Where a listed object sits beneath [`CATALOG_AUDIT_PROJECTION_PREFIX`],
+/// judged by its first path segment.
+enum AuditPartition<'a> {
+    /// A well-formed day partition directory, `dt=YYYY-MM-DD/`.
+    Day {
+        /// The directory segment, trailing `/` included.
+        segment: &'a str,
+        /// The partition's UTC day.
+        day: NaiveDate,
+    },
+    /// A directory whose name is not a well-formed day. Never deleted.
+    UnrecognizedDirectory {
+        /// The directory segment, trailing `/` included.
+        segment: &'a str,
+        /// The directory name, without the trailing `/`.
+        name: &'a str,
+    },
+    /// An object directly under the prefix, its own partition. Never
+    /// deleted.
+    Loose {
+        /// The object name.
+        segment: &'a str,
+    },
+}
+
+impl<'a> AuditPartition<'a> {
+    /// Classifies a path relative to [`CATALOG_AUDIT_PROJECTION_PREFIX`].
+    fn of(relative: &'a str) -> Self {
+        let segment = relative.split_inclusive('/').next().unwrap_or(relative);
+        let Some(name) = segment.strip_suffix('/') else {
+            return Self::Loose { segment };
+        };
+        audit_partition_day(name).map_or(Self::UnrecognizedDirectory { segment, name }, |day| {
+            Self::Day { segment, day }
+        })
+    }
+
+    /// The first path segment, which identifies the partition: a directory's
+    /// segment keeps its trailing `/`, so a loose object never shares a
+    /// directory's identity.
+    const fn segment(&self) -> &'a str {
+        match self {
+            Self::Day { segment, .. }
+            | Self::UnrecognizedDirectory { segment, .. }
+            | Self::Loose { segment } => segment,
+        }
+    }
+}
+
+/// The day of a partition directory name, only in exactly the form
+/// [`catalog_audit_partition`] writes: `dt=` and a canonical existing
+/// `YYYY-MM-DD` with a four-digit year, any date in `0000-01-01..=9999-12-31`.
+/// Years before 1970 are never written, but such a partition would be
+/// treated as expired. Accepted names are fixed-width and have a digit after
+/// `dt=`, so they sort chronologically and all sort before
+/// [`cursor_past_day_partitions`].
+fn audit_partition_day(name: &str) -> Option<NaiveDate> {
+    let text = name.strip_prefix("dt=")?;
+    if text.len() != 10 {
+        return None;
+    }
+    let day = NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    (day.format("%Y-%m-%d").to_string() == text).then_some(day)
+}
+
+/// The listing cursor past every well-formed day partition:
+/// `{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:`.
+///
+/// Every day partition name [`audit_partition_day`] accepts is `dt=` and a
+/// digit, and `:` (0x3A) directly follows `9` (0x39), so every object of every
+/// day partition sorts before this cursor, and every name after `dt=` that
+/// starts with a later character sorts after it. `start_after` is exclusive,
+/// so an object named exactly `dt=:` is also skipped; it is unrecognized and
+/// never deleted.
+fn cursor_past_day_partitions() -> String {
+    format!("{CATALOG_AUDIT_PROJECTION_PREFIX}dt=:")
+}
+
+/// The listing cursor past every object of the directory `name/` beneath
+/// [`CATALOG_AUDIT_PROJECTION_PREFIX`]: `{prefix}{name}0`, where `name` has no
+/// trailing `/`.
+///
+/// `/` (0x2F) and `0` (0x30) are adjacent, so every `{name}/…` path sorts
+/// before this cursor and no other path sorts between the directory and it.
+/// `start_after` is exclusive, so an object named exactly `{name}0` is also
+/// skipped; it has no `/`, so it is an unrecognized loose object, never
+/// deleted.
+fn cursor_past_directory(name: &str) -> String {
+    format!("{CATALOG_AUDIT_PROJECTION_PREFIX}{name}0")
+}
+
+/// Names what the audit sweep was doing in a storage or validation error,
+/// keeping the error's variant so callers classify it unchanged.
+fn audit_sweep_error(error: arco_core::Error, action: impl FnOnce() -> String) -> CatalogError {
+    match CatalogError::from(error) {
+        CatalogError::Storage { message } => CatalogError::Storage {
+            message: format!("catalog audit retention could not {}: {message}", action()),
+        },
+        CatalogError::Validation { message } => CatalogError::Validation {
+            message: format!("catalog audit retention could not {}: {message}", action()),
+        },
+        other => other,
+    }
+}
+
+/// Bookkeeping of one audit retention call.
+struct AuditRetentionTally {
+    report: AuditRetentionReport,
+    /// Segment of the partition being visited. A partition's objects share
+    /// its segment as a path prefix, so they are contiguous in path order.
+    partition: Option<String>,
+    /// Whether this call deleted an object of the partition being visited.
+    partition_expired: bool,
+    /// Deletions left in this call's budget.
+    budget: usize,
+}
+
+impl AuditRetentionTally {
+    fn new(budget: usize) -> Self {
+        Self {
+            report: AuditRetentionReport::default(),
+            partition: None,
+            partition_expired: false,
+            budget,
+        }
+    }
+
+    /// Whether the call's deletion budget is spent.
+    const fn exhausted(&self) -> bool {
+        self.budget == 0
+    }
+
+    /// Counts a partition the first time the walk reaches it, and warns about
+    /// an unrecognized one.
+    fn visit(&mut self, partition: &AuditPartition<'_>) {
+        let segment = partition.segment();
+        if self.partition.as_deref() == Some(segment) {
+            return;
+        }
+        self.report.partitions_examined += 1;
+        self.partition = Some(segment.to_owned());
+        self.partition_expired = false;
+        if !matches!(partition, AuditPartition::Day { .. }) {
+            self.report.partitions_unrecognized += 1;
+            warn!(
+                prefix = CATALOG_AUDIT_PROJECTION_PREFIX,
+                partition = segment,
+                "catalog audit retention skipped an unrecognized partition; it is never deleted"
+            );
+        }
+    }
+
+    /// Records one deletion from the partition being visited.
+    fn deleted(&mut self, bytes: u64) {
+        self.budget = self.budget.saturating_sub(1);
+        self.report.objects_deleted += 1;
+        self.report.bytes_reclaimed = self.report.bytes_reclaimed.saturating_add(bytes);
+        if !self.partition_expired {
+            self.partition_expired = true;
+            self.report.partitions_expired += 1;
+        }
+    }
+
+    /// The report of a walk that finished within its budget.
+    fn finish(self) -> AuditRetentionReport {
+        self.report
+    }
+
+    /// The report of a walk that found an expired object with no budget left.
+    fn truncated(self) -> AuditRetentionReport {
+        AuditRetentionReport {
+            truncated: true,
+            ..self.report
+        }
+    }
+}
+
+/// The last millisecond whose UTC date has a four-digit year,
+/// 9999-12-31T23:59:59.999Z. Bounding partitions to four-digit years keeps
+/// their lexicographic order chronological.
+const LAST_AUDIT_PARTITION_MS: i64 = 253_402_300_799_999;
+
+/// Returns the day partition, `dt=YYYY-MM-DD/`, of an audit record that
+/// occurred at `occurred_at_ms` milliseconds since the Unix epoch.
+///
+/// The day is the UTC calendar day, so partition names sort chronologically.
+///
+/// # Errors
+///
+/// Returns a validation error when `occurred_at_ms` lies before the Unix
+/// epoch or after the last millisecond of the year 9999 (UTC).
+pub fn catalog_audit_partition(occurred_at_ms: i64) -> Result<String> {
+    let day = if (0..=LAST_AUDIT_PARTITION_MS).contains(&occurred_at_ms) {
+        DateTime::from_timestamp_millis(occurred_at_ms)
+    } else {
+        None
+    };
+    let day = day.ok_or_else(|| CatalogError::Validation {
+        message: format!(
+            "catalog audit occurrence {occurred_at_ms} ms has no day partition between 1970-01-01 and 9999-12-31 UTC"
+        ),
+    })?;
+    Ok(format!("dt={}/", day.format("%Y-%m-%d")))
+}
+
+/// Returns the `system.catalog.audit` artifact path of one committed catalog
+/// projection intent.
+///
+/// The path is relative to the catalog authority root:
+/// `control/v1/projections/catalog-audit/dt=YYYY-MM-DD/{source_logical_sequence:020}-{intent_id}.parquet`.
+///
+/// The day is the UTC day of the audit record's `occurredAtMs` (see
+/// [`catalog_audit_partition`]). The file name pairs the intent's source
+/// logical sequence with its id because keyed operation ids are
+/// deterministic and recur once their idempotency receipt is purged and the
+/// request re-executes: the audit identity is `(operation_id,
+/// logical_sequence)`. Intent ids are validated path-safe components (no
+/// `/`, `\`, `%`, dot segments, or control characters), so the file never
+/// leaves its partition.
+///
+/// # Errors
+///
+/// Returns a validation error unless the payload decodes as the catalog audit
+/// record of this intent (a version-1 record with operation id = intent id,
+/// logical sequence = source sequence, authority manifest id = source
+/// manifest id), or when the record's occurrence has no day partition.
+pub fn catalog_audit_artifact_path(intent: &ProjectionIntentV1) -> Result<String> {
+    audit_artifact_path(&catalog_audit_row(intent)?)
+}
+
+/// Decodes the audit row an intent's payload carries; see
+/// [`decode_catalog_audit_row`].
+fn catalog_audit_row(intent: &ProjectionIntentV1) -> Result<CatalogAuditRow> {
+    decode_catalog_audit_row(
+        intent.payload(),
+        intent.intent_id(),
+        intent.source_logical_sequence(),
+        intent.source_authority_manifest_id(),
+    )
+}
+
+/// The artifact path of a decoded row, whose operation id and logical
+/// sequence [`decode_catalog_audit_row`] has checked against its intent.
+fn audit_artifact_path(row: &CatalogAuditRow) -> Result<String> {
+    Ok(format!(
+        "{CATALOG_AUDIT_PROJECTION_PREFIX}{}{:020}-{}.parquet",
+        catalog_audit_partition(row.occurred_at_ms)?,
+        row.logical_sequence,
+        row.operation_id
+    ))
+}
+
+/// Decodes a V1 catalog projection intent's payload into its audit row and
+/// requires the record to belong to the intent that carries it.
+///
+/// Only the production `CatalogAuditRecordV1` shape is accepted. Bounded
+/// `CatalogAuditRecordV2` records ride only `ProjectionIntentV2` envelopes on
+/// format-8 roots, which refuse V1 outbox staging and reads, so a V2 record
+/// inside a V1 envelope is malformed. Every failure is a validation error,
+/// which the materializer quarantines instead of retrying forever.
+fn decode_catalog_audit_row(
+    payload: &[u8],
+    intent_id: &str,
+    source_logical_sequence: u64,
+    source_authority_manifest_id: &str,
+) -> Result<CatalogAuditRow> {
+    let record = serde_json::from_slice::<CatalogAuditRecordV1>(payload).map_err(|error| {
+        CatalogError::Validation {
+            message: format!(
+                "catalog projection intent payload is not a catalog audit record: {error}"
+            ),
+        }
+    })?;
+    if record.version != RECORD_VERSION {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record version {} is unsupported",
+                record.version
+            ),
+        });
+    }
+    if record.operation_id != intent_id {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names operation {} but rides projection intent {intent_id}",
+                record.operation_id
+            ),
+        });
+    }
+    if record.logical_sequence != source_logical_sequence {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names logical sequence {} but its intent was committed at {source_logical_sequence}",
+                record.logical_sequence
+            ),
+        });
+    }
+    if record.authority_manifest_id != source_authority_manifest_id {
+        return Err(CatalogError::Validation {
+            message: format!(
+                "catalog audit record names authority manifest {} but its intent was committed by {source_authority_manifest_id}",
+                record.authority_manifest_id
+            ),
+        });
+    }
+    Ok(CatalogAuditRow {
+        record_version: record.version,
+        operation_id: record.operation_id,
+        operation_family: record.operation_family,
+        request_digest: record.request_digest,
+        actor: record.actor,
+        occurred_at_ms: record.occurred_at_ms,
+        logical_sequence: record.logical_sequence,
+        authority_manifest_id: Some(record.authority_manifest_id),
+        logical_commit_id: None,
+    })
+}
+
 /// Restart-safe anti-entropy worker for catalog Parquet projections.
+///
+/// For every catalog projection intent it materializes, it publishes the
+/// catalog snapshot under `control/v1/projections/catalog-parquet/` and the
+/// intent's audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only
+/// then acknowledges the intent. [`Self::expire_audit_partitions`] ages those
+/// audit records out by day partition.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1046,6 +1453,147 @@ impl CatalogProjectionMaterializer {
             .await
     }
 
+    /// Deletes the `system.catalog.audit` day partitions older than
+    /// `retention_days`, at most `max_objects` objects per call.
+    ///
+    /// A partition `dt=D/` is expired when `D` is strictly before the cutoff
+    /// day, the UTC date `retention_days` days before `now`: a partition
+    /// exactly `retention_days` days old is kept, and since `retention_days`
+    /// is at least one, today's partition is never deleted. The cutoff is a
+    /// date, so every instant of one UTC day yields the same cutoff.
+    ///
+    /// The call walks [`CATALOG_AUDIT_PROJECTION_PREFIX`] in path order in
+    /// bounded pages (at most `min(max_objects, 1000)` objects each) and
+    /// deletes the objects of expired partitions. Well-formed day partition
+    /// names sort chronologically, so the first object of a retained day
+    /// partition ends the walk through the day partitions: every later one is
+    /// at least as new. The walk then resumes past all of them (their names
+    /// start `dt=` and a digit, so they sort before `dt=:`) and lists no other
+    /// retained day partition.
+    ///
+    /// Every other name beneath the prefix is unrecognized and never deleted:
+    /// a directory whose name is not a canonical existing day (for example
+    /// `dt=not-a-date/`), or a loose object directly under the prefix (even a
+    /// day-like name such as `dt=2026-01-01` without a `/`). The walk logs it
+    /// at warn once per call, counts it as examined and unrecognized, and
+    /// continues past it: after the first object of an unrecognized directory
+    /// the listing resumes past the whole directory, so such a directory
+    /// costs one visit however many objects it holds, and one sorting before
+    /// the day partitions does not stop the sweep. Unrecognized names that
+    /// sort among the day partitions after the first retained one are
+    /// skipped with them. Nothing outside the prefix is listed or deleted,
+    /// and an empty prefix yields a default report.
+    ///
+    /// Objects are deleted one at a time in path order, so an interrupted or
+    /// truncated call leaves only the newest expired objects, and the next
+    /// call resumes with the oldest survivor. When the budget is spent the
+    /// walk looks for one more expired object: finding one sets
+    /// [`AuditRetentionReport::truncated`]; reaching a retained day partition
+    /// or the end of the listing leaves it unset.
+    ///
+    /// # Redelivery
+    ///
+    /// The sweep does not coordinate with [`Self::drain_once`]. A redelivered
+    /// intent whose partition has already expired rewrites its audit file (the
+    /// does-not-exist put succeeds), and the next sweep deletes it again. If a
+    /// sweep deletes the file after a redelivered intent's does-not-exist put
+    /// failed and before the materializer reads the existing bytes back, the
+    /// read reports `NotFound`, which is not retryable, so the intent is
+    /// quarantined as incompatible. Both need an intent that stayed
+    /// unacknowledged, or was redelivered, for more than `retention_days`
+    /// after it occurred; that edge is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `retention_days` or `max_objects` is
+    /// zero. Storage errors from listing or deleting stay storage errors and
+    /// name the listing cursor or the object; objects deleted before an error
+    /// stay deleted.
+    pub async fn expire_audit_partitions(
+        &self,
+        now: DateTime<Utc>,
+        retention_days: u32,
+        max_objects: usize,
+    ) -> Result<AuditRetentionReport> {
+        if retention_days == 0 || max_objects == 0 {
+            return Err(CatalogError::Validation {
+                message: format!(
+                    "catalog audit retention needs at least one day and one object per call, got {retention_days} days and {max_objects} objects"
+                ),
+            });
+        }
+        // `None` when the cutoff predates the calendar: nothing is old enough.
+        let cutoff = now
+            .date_naive()
+            .checked_sub_days(Days::new(u64::from(retention_days)));
+        let page_limit = max_objects.min(AUDIT_RETENTION_PAGE_LIMIT);
+        let mut tally = AuditRetentionTally::new(max_objects);
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .storage
+                .list_page_meta(
+                    CATALOG_AUDIT_PROJECTION_PREFIX,
+                    cursor.as_deref(),
+                    page_limit,
+                )
+                .await
+                .map_err(|error| {
+                    audit_sweep_error(error, || {
+                        format!(
+                            "list {CATALOG_AUDIT_PROJECTION_PREFIX} after {}",
+                            cursor.as_deref().unwrap_or("the start")
+                        )
+                    })
+                })?;
+            let mut next = page.next_start_after;
+            for object in page.objects {
+                let path = object.path.as_str();
+                let relative = path
+                    .strip_prefix(CATALOG_AUDIT_PROJECTION_PREFIX)
+                    .ok_or_else(|| CatalogError::InvariantViolation {
+                        message: format!(
+                            "catalog audit retention listed {path} outside {CATALOG_AUDIT_PROJECTION_PREFIX}"
+                        ),
+                    })?;
+                let partition = AuditPartition::of(relative);
+                tally.visit(&partition);
+                let skip_to = match partition {
+                    AuditPartition::Loose { .. } => None,
+                    AuditPartition::UnrecognizedDirectory { name, .. } => {
+                        Some(cursor_past_directory(name))
+                    }
+                    AuditPartition::Day { day, .. }
+                        if cutoff.is_some_and(|cutoff| day < cutoff) =>
+                    {
+                        if tally.exhausted() {
+                            return Ok(tally.truncated());
+                        }
+                        self.storage.delete(path).await.map_err(|error| {
+                            audit_sweep_error(error, || format!("delete {path}"))
+                        })?;
+                        tally.deleted(object.size);
+                        None
+                    }
+                    // Retained, and so is every later day partition.
+                    AuditPartition::Day { .. } => Some(cursor_past_day_partitions()),
+                };
+                if let Some(skip_to) = skip_to {
+                    debug_assert!(
+                        path < skip_to.as_str(),
+                        "the audit retention cursor {skip_to} must advance past {path}"
+                    );
+                    next = Some(skip_to);
+                    break;
+                }
+            }
+            match next {
+                Some(start_after) => cursor = Some(start_after),
+                None => return Ok(tally.finish()),
+            }
+        }
+    }
+
     async fn materialize(
         &self,
         intent: &ProjectionIntentV1,
@@ -1059,6 +1607,12 @@ impl CatalogProjectionMaterializer {
                     .to_string(),
             });
         }
+        // Decode and encode the audit row before anything is written: a
+        // payload that is not this intent's audit record is a validation
+        // error, quarantined without leaving snapshot files behind.
+        let audit_row = catalog_audit_row(intent)?;
+        let audit_path = audit_artifact_path(&audit_row)?;
+        let audit_bytes = write_audit_records(std::slice::from_ref(&audit_row))?;
         let state = projection_measurement::phase("projection-source", async {
             let token = self
                 .source
@@ -1082,6 +1636,13 @@ impl CatalogProjectionMaterializer {
                 &state,
             )
             .await?;
+            // The immutable audit artifact lands after the snapshot files and
+            // before the snapshot manifest. `materialize` returns Ok, and so
+            // lets the intent be acknowledged, only after this put succeeds;
+            // writing it before the manifest also makes a published manifest
+            // imply an audit file.
+            self.publish_audit_artifact(&audit_path, audit_bytes)
+                .await?;
             let manifest_path = format!("{directory}manifest.json");
             let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
                 CatalogError::Serialization {
@@ -1128,6 +1689,30 @@ impl CatalogProjectionMaterializer {
             Ok(manifest_path)
         })
         .await
+    }
+
+    /// Writes one immutable audit artifact under a does-not-exist
+    /// precondition. At-least-once delivery rewrites the same deterministic
+    /// bytes, which are accepted; anything else at the path fails closed.
+    async fn publish_audit_artifact(&self, path: &str, bytes: Bytes) -> Result<()> {
+        match self
+            .storage
+            .put_raw(path, bytes.clone(), WritePrecondition::DoesNotExist)
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(()),
+            WriteResult::PreconditionFailed { current_version } => {
+                if self.storage.get_raw(path).await? == bytes {
+                    Ok(())
+                } else {
+                    Err(CatalogError::PreconditionFailed {
+                        message: format!(
+                            "catalog audit artifact already exists with different content at {path} with version {current_version}"
+                        ),
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -1198,6 +1783,12 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                     .await?;
                     Err(error)
                 } else {
+                    warn!(
+                        record_id = record.record_id(),
+                        source_sequence,
+                        error = %error,
+                        "catalog projection intent quarantined"
+                    );
                     projection_measurement::phase(
                         "projection-status-ack",
                         self.status.record_projection_quarantine(
@@ -2697,10 +3288,13 @@ fn freeze_mutation(
         .idempotency_key
         .as_ref()
         .map(|key| sha256_hex(key.as_str().as_bytes()));
-    // The audit key and projection intent id are derived from the operation
-    // id alone, while the receipt key is scoped by family. Folding the family
-    // into a keyed operation id keeps one idempotency key reusable across
-    // families without colliding on those family-agnostic identities.
+    // The projection intent id is derived from the operation id alone, while
+    // the receipt key is scoped by family. Folding the family into a keyed
+    // operation id keeps one idempotency key reusable across families
+    // without colliding on that family-agnostic identity. A keyed retry after
+    // its receipt was purged re-executes under the same operation id. While
+    // the earlier intent is still retained, staging fails closed with a
+    // projection-intent conflict until the worker drains and trims it.
     let operation_id = opts.idempotency_key.as_ref().map_or_else(
         || format!("op-{}", Ulid::new().to_string().to_ascii_lowercase()),
         |key| {
@@ -2907,10 +3501,11 @@ async fn stage_commit_records_v2(
 ) -> Result<()> {
     let (receipt, audit) =
         commit_record_bytes_v2(frozen, response, logical_commit_id, logical_sequence)?;
+    // The bounded (format 8) authority is test-only and refuses expiry
+    // hints, so its receipt stays a plain put with no retention window.
     txn.put(&frozen.receipt_key, receipt).await?;
-    let audit_key = audit_key(&frozen.operation_id);
-    txn.assert_absent(&audit_key).await?;
-    txn.put(&audit_key, audit.clone()).await?;
+    // The audit record is projection-only: it rides the intent and never
+    // lands in the authority KV.
     txn.stage_projection_intent_v2(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
@@ -2919,6 +3514,11 @@ async fn stage_commit_records_v2(
     .await
 }
 
+/// Stages the receipt and the audit projection intent of the mutation this
+/// transaction will commit. The receipt is the only commit record in the
+/// authority KV and carries [`CATALOG_RECEIPT_RETENTION_MS`] from the
+/// mutation's frozen `occurred_at_ms` as its purge-eligibility hint; the audit
+/// record is the intent payload and is never written as a KV row.
 async fn stage_commit_records(
     txn: &mut ControlMvpTxn,
     frozen: &FrozenMutation,
@@ -2933,9 +3533,12 @@ async fn stage_commit_records(
         authority_manifest_id: predicted.authority_manifest_id().to_string(),
         logical_sequence: predicted.logical_sequence(),
     };
-    txn.put(
+    txn.put_with_expiry(
         &frozen.receipt_key,
         encode_json(&receipt, "catalog idempotency receipt")?,
+        frozen
+            .occurred_at_ms
+            .saturating_add(CATALOG_RECEIPT_RETENTION_MS),
     )
     .await?;
     let audit = CatalogAuditRecordV1 {
@@ -2948,14 +3551,10 @@ async fn stage_commit_records(
         authority_manifest_id: predicted.authority_manifest_id().to_string(),
         logical_sequence: predicted.logical_sequence(),
     };
-    let audit_bytes = encode_json(&audit, "catalog audit record")?;
-    let audit_key = audit_key(&frozen.operation_id);
-    txn.assert_absent(&audit_key).await?;
-    txn.put(&audit_key, audit_bytes.clone()).await?;
     txn.stage_projection_intent(
         frozen.operation_id.clone(),
         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
-        audit_bytes,
+        encode_json(&audit, "catalog audit record")?,
     )
     .await?;
     Ok(())
@@ -3703,6 +4302,9 @@ fn receipt_key(family: &str, idempotency_hash: &str) -> Vec<u8> {
     key
 }
 
+/// Key of a historical authority-8 audit row. Fixture-only since retention
+/// step 3: see [`AUDIT_KEY_TAG`].
+#[cfg(any(test, feature = "test-utils"))]
 fn audit_key(operation_id: &str) -> Vec<u8> {
     let mut key = vec![AUDIT_KEY_TAG];
     push_component(&mut key, operation_id.as_bytes());
@@ -4377,41 +4979,26 @@ impl ControlCatalogAuthority {
     }
 }
 
-/// Synthetic capacity inventory using the production record and key encoders.
-/// These rows are not evidence of executed catalog mutations.
+/// Synthetic capacity inventory using the production receipt record and key
+/// encoders: one receipt row per modelled mutation, since audit records are
+/// projection-only (retention step 3) and leave no KV row behind. These rows
+/// are not evidence of executed catalog mutations.
 #[cfg(test)]
-pub(crate) fn capacity_fixture_record(
-    template: &[u8],
-    receipt: bool,
-    ordinal: u64,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn capacity_fixture_record(template: &[u8], ordinal: u64) -> Result<(Vec<u8>, Vec<u8>)> {
     let identity = format!("{ordinal:064x}");
     let manifest = format!(
         "manifest-{ordinal:020}-op-{ordinal:032x}-0001-head-{ordinal:064x}-rg-{0:020}",
         0
     );
-    if receipt {
-        let mut record: IdempotencyReceiptV1 = decode_json(template, "capacity receipt")?;
-        record.logical_sequence = ordinal;
-        assert_eq!(record.authority_manifest_id.len(), manifest.len());
-        record.authority_manifest_id = manifest;
-        record.request_digest.clone_from(&identity);
-        Ok((
-            receipt_key(&record.operation_family, &identity),
-            encode_json(&record, "capacity receipt")?.to_vec(),
-        ))
-    } else {
-        let mut record: CatalogAuditRecordV1 = decode_json(template, "capacity audit")?;
-        record.logical_sequence = ordinal;
-        assert_eq!(record.authority_manifest_id.len(), manifest.len());
-        record.authority_manifest_id = manifest;
-        record.request_digest = identity;
-        record.operation_id = format!("op-{ordinal:032x}");
-        Ok((
-            audit_key(&record.operation_id),
-            encode_json(&record, "capacity audit")?.to_vec(),
-        ))
-    }
+    let mut record: IdempotencyReceiptV1 = decode_json(template, "capacity receipt")?;
+    record.logical_sequence = ordinal;
+    assert_eq!(record.authority_manifest_id.len(), manifest.len());
+    record.authority_manifest_id = manifest;
+    record.request_digest.clone_from(&identity);
+    Ok((
+        receipt_key(&record.operation_family, &identity),
+        encode_json(&record, "capacity receipt")?.to_vec(),
+    ))
 }
 
 /// Receipt and audit `(key, value)` pairs for explicit synthetic genesis.
@@ -4423,7 +5010,9 @@ pub type BoundedCapacityV2RecordPair = ((Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>));
 ///
 /// The two tuples are `(key, value)` pairs in receipt then audit order. They are
 /// fixture input for explicit synthetic genesis only, rather than evidence of a
-/// catalog command or a substitute for normal authority-8 publication.
+/// catalog command or a substitute for normal authority-8 publication. The
+/// audit row models the pre-retention-step-3 row shape the recorded bounded
+/// cost measurements were taken with; production no longer writes it.
 ///
 /// # Errors
 /// Returns validation errors for zero ordinals or record encoding failures.
@@ -4565,6 +5154,350 @@ mod bounded_record_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod receipt_expiry_tests {
+    use super::*;
+    use crate::state_store::control_mvp::StagedKvWrite;
+
+    use arco_core::MemoryBackend;
+
+    const OCCURRED_AT_MS: i64 = 1_800_000_000_000;
+
+    fn frozen_delete(receipt_identity: &str) -> FrozenMutation {
+        FrozenMutation {
+            operation_id: "op-fixed".into(),
+            family: "delete_catalog",
+            digest: "11".repeat(32),
+            actor: "api".into(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            receipt_key: receipt_key("delete_catalog", receipt_identity),
+            request_id: None,
+            command: FrozenCommand::DeleteCatalog {
+                name: "catalog".into(),
+                force: false,
+            },
+        }
+    }
+
+    #[test]
+    fn receipt_retention_is_one_day() {
+        assert_eq!(CATALOG_RECEIPT_RETENTION_MS, 86_400_000);
+    }
+
+    #[tokio::test]
+    async fn stage_commit_records_stages_one_expiring_receipt_and_one_audit_intent() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let frozen = frozen_delete(&"22".repeat(32));
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        let predicted = txn.predicted_state_token().unwrap();
+        stage_commit_records(&mut txn, &frozen, &MutationResponseV1::Deleted, &predicted)
+            .await
+            .unwrap();
+
+        // Exactly one KV write: the receipt, carrying the retention expiry.
+        assert_eq!(
+            txn.staged_kv_writes(),
+            vec![(
+                frozen.receipt_key.clone(),
+                StagedKvWrite::Put {
+                    expires_at_ms: Some(OCCURRED_AT_MS + CATALOG_RECEIPT_RETENTION_MS),
+                },
+            )]
+        );
+
+        let outcome = txn.commit().await.unwrap();
+        assert_eq!(outcome.state_token(), &predicted);
+        let intents = outcome.projection_intents();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].intent_id(), "op-fixed");
+        assert_eq!(
+            intents[0].projection_kind(),
+            CATALOG_PARQUET_PROJECTION_CONSUMER_ID
+        );
+        let audit: CatalogAuditRecordV1 =
+            decode_json(intents[0].payload(), "intent audit payload").unwrap();
+        assert_eq!(audit.version, RECORD_VERSION);
+        assert_eq!(audit.operation_id, "op-fixed");
+        assert_eq!(audit.operation_family, "delete_catalog");
+        assert_eq!(audit.request_digest, "11".repeat(32));
+        assert_eq!(audit.occurred_at_ms, OCCURRED_AT_MS);
+        assert_eq!(
+            audit.authority_manifest_id,
+            predicted.authority_manifest_id()
+        );
+        assert_eq!(audit.logical_sequence, predicted.logical_sequence());
+
+        // Committed state: the receipt is read-visible, no audit row exists.
+        let receipts = store
+            .scan(ScanRequest::new([IDEMPOTENCY_KEY_TAG]))
+            .await
+            .unwrap();
+        assert_eq!(receipts.entries().len(), 1);
+        assert_eq!(receipts.entries()[0].key(), frozen.receipt_key.as_slice());
+        let receipt: IdempotencyReceiptV1 =
+            decode_json(receipts.entries()[0].value().bytes(), "receipt").unwrap();
+        assert_eq!(receipt.request_digest, "11".repeat(32));
+        assert!(matches!(receipt.response, MutationResponseV1::Deleted));
+        let audit_rows = store.scan(ScanRequest::new([AUDIT_KEY_TAG])).await.unwrap();
+        assert!(audit_rows.entries().is_empty());
+        assert_eq!(store.current_projection_outbox().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stage_commit_records_v2_keeps_a_plain_receipt_and_no_audit_row() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap();
+        let frozen = frozen_delete(&"33".repeat(32));
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation(&frozen.operation_id, frozen.family, &frozen.digest)
+            .unwrap();
+        stage_commit_records_v2(
+            &mut txn,
+            &frozen,
+            &MutationResponseV1::Deleted,
+            &"44".repeat(32),
+            1,
+        )
+        .await
+        .unwrap();
+        // The bounded format refuses expiry hints: one plain receipt put.
+        assert_eq!(
+            txn.staged_kv_writes(),
+            vec![(
+                frozen.receipt_key.clone(),
+                StagedKvWrite::Put {
+                    expires_at_ms: None
+                }
+            )]
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod audit_projection_tests {
+    use super::*;
+
+    use arco_core::MemoryBackend;
+
+    /// 2027-01-15T08:00:00Z.
+    const OCCURRED_AT_MS: i64 = 1_800_000_000_000;
+    /// 2027-01-15T00:00:00Z.
+    const DAY_START_MS: i64 = 1_799_971_200_000;
+    /// 9999-12-31T23:59:59.999Z, the last millisecond with a four-digit year.
+    const LAST_PARTITIONABLE_MS: i64 = 253_402_300_799_999;
+
+    const MANIFEST_ID: &str = "manifest-7";
+
+    fn v1_record() -> CatalogAuditRecordV1 {
+        CatalogAuditRecordV1 {
+            version: RECORD_VERSION,
+            operation_id: "op-1".to_string(),
+            operation_family: "create_catalog".to_string(),
+            request_digest: "11".repeat(32),
+            actor: "api".to_string(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            authority_manifest_id: MANIFEST_ID.to_string(),
+            logical_sequence: 7,
+        }
+    }
+
+    fn v1_payload(record: &CatalogAuditRecordV1) -> Bytes {
+        encode_json(record, "v1 audit").unwrap()
+    }
+
+    /// A bounded (format 8) audit record, which only ever rides a
+    /// `ProjectionIntentV2` envelope.
+    fn v2_payload(operation_id: &str, logical_sequence: u64) -> Bytes {
+        encode_json(
+            &CatalogAuditRecordV2 {
+                version: 2,
+                operation_id: operation_id.to_string(),
+                operation_family: "delete_catalog".to_string(),
+                request_digest: "22".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                logical_commit_id: "33".repeat(32),
+                logical_sequence,
+            },
+            "v2 audit",
+        )
+        .unwrap()
+    }
+
+    fn is_validation(result: &Result<CatalogAuditRow>) -> bool {
+        matches!(result, Err(CatalogError::Validation { .. }))
+    }
+
+    #[test]
+    fn audit_partition_is_the_utc_day_of_the_occurrence() {
+        assert_eq!(
+            catalog_audit_partition(OCCURRED_AT_MS).unwrap(),
+            "dt=2027-01-15/"
+        );
+        assert_eq!(
+            catalog_audit_partition(DAY_START_MS - 1).unwrap(),
+            "dt=2027-01-14/",
+            "the last millisecond of a day stays in that day"
+        );
+        assert_eq!(
+            catalog_audit_partition(DAY_START_MS).unwrap(),
+            "dt=2027-01-15/",
+            "the first millisecond of the next day starts a new partition"
+        );
+        assert_eq!(catalog_audit_partition(0).unwrap(), "dt=1970-01-01/");
+        assert_eq!(
+            catalog_audit_partition(LAST_PARTITIONABLE_MS).unwrap(),
+            "dt=9999-12-31/"
+        );
+    }
+
+    #[test]
+    fn audit_partition_rejects_instants_without_a_four_digit_utc_date() {
+        for occurred_at_ms in [-1, i64::MIN, LAST_PARTITIONABLE_MS + 1, i64::MAX] {
+            assert!(
+                matches!(
+                    catalog_audit_partition(occurred_at_ms),
+                    Err(CatalogError::Validation { .. })
+                ),
+                "{occurred_at_ms} must not map to a partition"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_decoder_accepts_the_production_record_of_its_intent() {
+        let row =
+            decode_catalog_audit_row(&v1_payload(&v1_record()), "op-1", 7, MANIFEST_ID).unwrap();
+        assert_eq!(
+            row,
+            CatalogAuditRow {
+                record_version: RECORD_VERSION,
+                operation_id: "op-1".to_string(),
+                operation_family: "create_catalog".to_string(),
+                request_digest: "11".repeat(32),
+                actor: "api".to_string(),
+                occurred_at_ms: OCCURRED_AT_MS,
+                logical_sequence: 7,
+                authority_manifest_id: Some(MANIFEST_ID.to_string()),
+                logical_commit_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn audit_decoder_rejects_junk_and_records_of_another_intent() {
+        let decode = |payload: &[u8]| decode_catalog_audit_row(payload, "op-1", 7, MANIFEST_ID);
+        assert!(is_validation(&decode(b"junk")));
+        assert!(is_validation(&decode(b"{}")));
+        let mut unknown_field: serde_json::Value =
+            serde_json::from_slice(&v1_payload(&v1_record())).unwrap();
+        unknown_field["extra"] = serde_json::json!(true);
+        assert!(is_validation(&decode(
+            &serde_json::to_vec(&unknown_field).unwrap()
+        )));
+        assert!(
+            is_validation(&decode(&v2_payload("op-1", 7))),
+            "a bounded V2 record inside a V1 envelope is malformed"
+        );
+        let wrong_version = CatalogAuditRecordV1 {
+            version: RECORD_VERSION + 1,
+            ..v1_record()
+        };
+        assert!(
+            is_validation(&decode(&v1_payload(&wrong_version))),
+            "only the production record version is materialized"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-2",
+                7,
+                MANIFEST_ID
+            )),
+            "the record must name the intent's operation"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-1",
+                8,
+                MANIFEST_ID
+            )),
+            "the record must carry the intent's source sequence"
+        );
+        assert!(
+            is_validation(&decode_catalog_audit_row(
+                &v1_payload(&v1_record()),
+                "op-1",
+                7,
+                "manifest-8"
+            )),
+            "the record must name the intent's source authority manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_artifact_path_names_the_day_sequence_and_intent() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        let predicted = txn.predicted_state_token().unwrap();
+        let frozen = FrozenMutation {
+            operation_id: "op-fixed".into(),
+            family: "delete_catalog",
+            digest: "11".repeat(32),
+            actor: "api".into(),
+            occurred_at_ms: OCCURRED_AT_MS,
+            receipt_key: receipt_key("delete_catalog", &"22".repeat(32)),
+            request_id: None,
+            command: FrozenCommand::DeleteCatalog {
+                name: "catalog".into(),
+                force: false,
+            },
+        };
+        stage_commit_records(&mut txn, &frozen, &MutationResponseV1::Deleted, &predicted)
+            .await
+            .unwrap();
+        let outcome = txn.commit().await.unwrap();
+        let intent = &outcome.projection_intents()[0];
+        assert_eq!(
+            catalog_audit_artifact_path(intent).unwrap(),
+            format!(
+                "control/v1/projections/catalog-audit/dt=2027-01-15/{:020}-op-fixed.parquet",
+                predicted.logical_sequence()
+            )
+        );
+        assert!(
+            catalog_audit_artifact_path(intent)
+                .unwrap()
+                .starts_with(CATALOG_AUDIT_PROJECTION_PREFIX)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod bounded_catalog_tests {
     use super::*;
     use crate::state_store::ArcoStateAdmin;
@@ -4575,13 +5508,48 @@ mod bounded_catalog_tests {
     #[derive(Default)]
     struct RecordingNotifierV2 {
         calls: AtomicUsize,
+        intents: Mutex<Vec<ProjectionIntentV2>>,
+    }
+
+    impl RecordingNotifierV2 {
+        /// Audit records carried by every notified intent, in commit order.
+        fn audit_history(&self) -> Vec<serde_json::Value> {
+            self.intents
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|intent| {
+                    assert_eq!(
+                        intent.projection_kind(),
+                        CATALOG_PARQUET_PROJECTION_CONSUMER_ID
+                    );
+                    serde_json::from_slice(intent.payload()).expect("V2 audit payload JSON")
+                })
+                .collect()
+        }
     }
 
     impl CatalogProjectionNotifierV2 for RecordingNotifierV2 {
-        fn notify(&self, _intent: &ProjectionIntentV2) -> Result<()> {
+        fn notify(&self, intent: &ProjectionIntentV2) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.intents.lock().unwrap().push(intent.clone());
             Ok(())
         }
+    }
+
+    /// Asserts that the bounded authority KV holds no audit row: audit
+    /// records are projection-only since retention step 3.
+    async fn assert_no_audit_rows(authority: &ControlCatalogAuthority) {
+        let page = authority
+            .store
+            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
+            .await
+            .expect("bounded audit key scan");
+        assert!(
+            page.entries().is_empty(),
+            "found {} tag-4 rows in the bounded authority KV",
+            page.entries().len()
+        );
     }
 
     fn table_request(name: &str) -> RegisterTableInSchemaRequest {
@@ -4638,15 +5606,20 @@ mod bounded_catalog_tests {
         .expect("bounded HEAD JSON");
         assert_eq!(head["format_version"], 8);
 
-        for prefix in [[IDEMPOTENCY_KEY_TAG], [AUDIT_KEY_TAG]] {
-            let page = authority
-                .store
-                .scan(ScanRequest::new(prefix).with_limits(8, 1024 * 1024, 8))
-                .await
-                .expect("bounded record scan");
-            assert_eq!(page.entries().len(), 1);
-            let record: serde_json::Value =
-                serde_json::from_slice(page.entries()[0].value().bytes()).expect("V2 record JSON");
+        // The receipt is the only commit record in the KV; the audit record
+        // rides the projection intent alone.
+        assert_no_audit_rows(&authority).await;
+        let page = authority
+            .store
+            .scan(ScanRequest::new([IDEMPOTENCY_KEY_TAG]).with_limits(8, 1024 * 1024, 8))
+            .await
+            .expect("bounded receipt scan");
+        assert_eq!(page.entries().len(), 1);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(page.entries()[0].value().bytes()).expect("V2 receipt JSON");
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 1);
+        for record in [&receipt, &history[0]] {
             assert_eq!(record["version"], 2);
             assert_eq!(record["logicalSequence"], 1);
             assert!(
@@ -4656,6 +5629,7 @@ mod bounded_catalog_tests {
             );
             assert!(record.get("authorityManifestId").is_none());
         }
+        assert_eq!(history[0]["operationFamily"], "create_catalog");
     }
 
     #[tokio::test]
@@ -4797,20 +5771,10 @@ mod bounded_catalog_tests {
         ));
         assert_eq!(2, notifier.calls.load(Ordering::SeqCst));
 
-        let page = authority
-            .store
-            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(8, 1024 * 1024, 8))
-            .await
-            .expect("bounded audit scan");
-        assert_eq!(page.entries().len(), 2);
-        let mut history = page
-            .entries()
-            .iter()
-            .map(|entry| {
-                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        // Zero audit rows in the KV; the history lives in the two intents.
+        assert_no_audit_rows(&authority).await;
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 2);
         assert_eq!(
             history
                 .iter()
@@ -4956,20 +5920,11 @@ mod bounded_catalog_tests {
         );
         assert_eq!(7, notifier.calls.load(Ordering::SeqCst));
 
-        let page = authority
-            .store
-            .scan(ScanRequest::new([AUDIT_KEY_TAG]).with_limits(16, 1024 * 1024, 16))
-            .await
-            .expect("bounded lifecycle audit scan");
-        assert_eq!(page.entries().len(), 7);
-        let mut history = page
-            .entries()
-            .iter()
-            .map(|entry| {
-                serde_json::from_slice::<serde_json::Value>(entry.value().bytes()).unwrap()
-            })
-            .collect::<Vec<_>>();
-        history.sort_by_key(|record| record["logicalSequence"].as_u64().unwrap());
+        // The lifecycle history is carried by the seven intents; the KV holds
+        // receipts only.
+        assert_no_audit_rows(&authority).await;
+        let history = notifier.audit_history();
+        assert_eq!(history.len(), 7);
         assert_eq!(
             history
                 .iter()

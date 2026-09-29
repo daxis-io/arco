@@ -14,12 +14,12 @@ The production identity-root constructor remains closed.
    membership revision against the named cut. Deny on missing, foreign,
    unreadable, or stale evidence. Grant writes must validate the principal at a
    named identity cut and retain that evidence in the metastore mutation.
-3. Proposed qualification budget: a disable or membership revision must affect
-   authorization in every metastore within **five seconds** of the identity
-   authority commit. Enforcement must deny if its validated identity evidence
-   is older than five seconds, even if a cache entry exists. This is a gate
-   target, not behavior implemented by the principal API. Confirm the budget
-   before admitting production routing.
+3. **Five seconds is a test target, pending a separate production policy
+   decision.** Exercise disable and membership-revision visibility against that
+   target in every metastore. A production budget must specify when enforcement
+   denies stale identity evidence, including cache hits, before routing is
+   admitted. Neither the principal API nor the test-only authorization probe
+   implements or qualifies that production budget.
 4. Prove the bound with two or more metastores, cache hit and miss paths,
    concurrent grant and disable, stale/missing identity state, membership
    revisions, restart, and historical catalog reads pinned before disable.

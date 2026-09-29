@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{CatalogError, Result};
 use crate::identity::memberships::IdentitySnapshot;
 use crate::metastore::events::{LifecycleState, PrincipalKind};
@@ -11,7 +13,7 @@ use super::grants::ActiveGrant;
 use super::privileges::Privilege;
 
 /// Securable object metadata needed for permission inheritance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurableObject {
     /// Stable object ID.
     pub object_id: String,
@@ -181,6 +183,15 @@ impl CompiledPermissionSet {
 ///
 /// Returns an error if the securable hierarchy references a missing parent.
 pub fn compile_permissions(input: PermissionCompileInput<'_>) -> Result<CompiledPermissionSet> {
+    compile_permissions_with_active(input, |principal_id| {
+        principal_is_active(input.metastore, principal_id)
+    })
+}
+
+pub(crate) fn compile_permissions_with_active(
+    input: PermissionCompileInput<'_>,
+    principal_is_active: impl Fn(&str) -> bool,
+) -> Result<CompiledPermissionSet> {
     let objects = input
         .securables
         .iter()
@@ -190,7 +201,7 @@ pub fn compile_permissions(input: PermissionCompileInput<'_>) -> Result<Compiled
 
     let mut rows = Vec::new();
     for object in input.securables {
-        if principal_is_active(input.metastore, &object.owner_principal_id) {
+        if principal_is_active(&object.owner_principal_id) {
             rows.push(owner_row(object, input.identity.snapshot_version()));
         }
     }
@@ -199,7 +210,7 @@ pub fn compile_permissions(input: PermissionCompileInput<'_>) -> Result<Compiled
         let Some(grant) = ActiveGrant::from_record(record) else {
             continue;
         };
-        if !principal_is_active(input.metastore, &grant.principal_id) {
+        if !principal_is_active(&grant.principal_id) {
             continue;
         }
         for object in input.securables {
@@ -208,7 +219,7 @@ pub fn compile_permissions(input: PermissionCompileInput<'_>) -> Result<Compiled
             }
             let inheritance_path = inheritance_path(&grant.object_id, &object.object_id, &objects);
             for effective_principal in input.identity.effective_members(&grant.principal_id) {
-                if !principal_is_active(input.metastore, &effective_principal) {
+                if !principal_is_active(&effective_principal) {
                     continue;
                 }
                 rows.push(CompiledPermissionRow {

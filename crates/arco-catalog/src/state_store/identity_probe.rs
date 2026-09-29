@@ -467,6 +467,14 @@ impl PrincipalIdentityStore {
         })
     }
 
+    /// Return the authenticated current principal authority token.
+    ///
+    /// # Errors
+    /// Returns an error when the identity head is unavailable or invalid.
+    pub async fn current_token(&self) -> Result<StateToken> {
+        self.kernel.current_state_token().await
+    }
+
     /// Commit one typed mutation and return its durable event and authority token.
     ///
     /// # Errors

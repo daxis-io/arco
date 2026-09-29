@@ -22,6 +22,9 @@ Neither shared Cargo files nor other worktree targets were changed.
 | `crates/arco-catalog/tests/permission_compilation.rs` | `37b4586e15b6fb33639438b5da5f2b9d4012e8f6bd49a8e5ecf5842c70cc267a` |
 | `crates/arco-catalog/tests/tenant_revocation_probe.rs` | `a31ebddc3e46e50c9d912c8b905a9080299e1100855af6eec49729bcec843b30` |
 | `crates/arco-catalog/tests/tenant_catalog_paths.rs` | `c0a9a949e8dac4fe22036bb9fbee4405b59e1ff5ce79c51fd95198d35c53f1cd` |
+| `crates/arco-api/tests/unity_catalog_production_wiring.rs` | `5b57acb87bb7606c5dc0b121f2ad59df1c8fa92e3d56027522c42fda9eafbfa7` |
+| `crates/arco-integration-tests/tests/delta_engine_smoke.rs` | `c5154689c506f2a3bc96abbb7fc0af8bb89a8d23bd94c0e4fb6b68f6de9b48c2` |
+| `crates/arco-uc/src/permissions.rs` | `0ea47349f321a2eff8a73c24ad74e00bb0d11e2fb4bc76d2b6bb6a05fb5a42c7` |
 | [Follow-up gates](../plans/2026-09-27-tenant-identity-principal-follow-up-gates.md) | `060b476a6c6a2e8b233b17db39a4470e577c493f0e20aaf2b2ecaaad4bc898ba` |
 
 ## Checks
@@ -34,6 +37,8 @@ Neither shared Cargo files nor other worktree targets were changed.
 | `cargo test -p arco-catalog --features test-utils --doc --locked --offline` | passed: 3 ordinary, 11 compile-fail, 5 ignored | `target/receipts/rustdoc_final.log`: `e4034863b6f629eebf96af09287e94fb1eb7db99707d34cc385f9a9273a0cdc1` |
 | `cargo clippy -p arco-core -p arco-catalog --all-targets --features arco-catalog/test-utils --locked --offline -- -D warnings` | passed | `target/receipts/clippy_source_final.log`: `c7c53e123050d21030da2532f43cf75a9fc51b423425f10a31f8d7ae438d9382` |
 | `cargo check -p arco-catalog --locked --offline` without `test-utils` | passed | `target/receipts/default_check_final.log`: `243507c778f357958904af620bc1e3ecac8f4c3116a292b769127c51f12d3e17` |
+| `cargo check --workspace --all-targets --features arco-catalog/test-utils --locked --offline` | passed | `target/receipts/workspace_check_final.log`: `1ed532ecd06bdbf8f35c968fee020b73cbde7476276704ec6de32988c2e52d85` |
+| `cargo test -p arco-uc --lib --locked --offline --quiet` | passed: 27 | `target/receipts/uc_lib_final.log`: `d5626a832f2af09905c1e16e0b8d952ab5cb4e963d05344384dcb7f55933d799` |
 | `cargo xtask repo-hygiene-check` on staged files | passed | `target/receipts/hygiene_pass.log`: `a1ec4f5e12cada7c502f4ee773c95d506f611d956f7f7cc5b6f344c5f0b50504` |
 
 The new nine-case integration file uses actual `MetastoreLedger` events and
@@ -67,6 +72,10 @@ state-token witness are separate commits.
   report (`target/receipts/hygiene_final.log`, SHA-256
   `04e819e3b933b4468b7cd5189a23226fb554ef9c61efabd349ca9153f261d412`).
   The path is now a relative link; the source and tests were unchanged.
+- A whole-repository constructor search after PR creation found four
+  `GrantRecord` initializers in API, integration, and UC test code omitted by
+  the focused package checks. They now set the optional evidence to `None`;
+  the workspace all-targets check and UC library tests passed on that change.
 - This is a `test-utils` probe. Production grant writers and catalog readers
   are not routed through it. Direct native ledger writes remain possible in
   the compatibility path; before routing, they must be unable to bypass

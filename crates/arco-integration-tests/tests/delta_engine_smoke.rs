@@ -93,6 +93,7 @@ async fn seed_create_table_authority(
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 3,
                 properties: BTreeMap::new(),
+                identity_cut: None,
             }),
         ),
     ] {

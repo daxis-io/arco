@@ -362,6 +362,7 @@ fn grant_state(principal_id: &str) -> MetastoreState {
             lifecycle_state: LifecycleState::Active,
             updated_at_ms: 0,
             properties: BTreeMap::new(),
+            identity_cut: None,
         },
     );
     state

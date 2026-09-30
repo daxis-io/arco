@@ -13,6 +13,16 @@ ledger append and metastore state-token commit are separate writes; production
 admission needs a reconciliation contract for a grant event that lands without
 its watermark witness. Direct ledger writes must not bypass identity admission
 when routing is enabled.
+The next test-only child records one exact pending grant and its prior ledger
+watermark in the metastore authority before append. It can witness that grant
+after restart only when the persisted event is unchanged and no other event
+intervened. A pending, absent, changed, or superseded event denies compilation.
+This proves recovery of an appended event, not a production grant workflow.
+The outstanding admission decision is how to fence and dispose of a prepared
+grant whose ledger event never appears, including a late writer after an abort;
+until that is specified, the pending record is retained and further grant
+admission in that metastore is blocked. Production routing also needs all
+native grant writers to use the admission path and a multiwriter contract.
 Owner-derived permissions are excluded from this probe because catalog object
 owner changes have no tenant identity admission contract yet. That contract,
 including recovery of owned objects, is a separate production gate.

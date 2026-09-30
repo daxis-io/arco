@@ -84,6 +84,8 @@ impl MetastoreState {
             MetastoreMutation::GrantUpserted(record) => {
                 self.grants.insert(record.grant_id.clone(), record.clone());
             }
+            #[cfg(feature = "test-utils")]
+            MetastoreMutation::GrantAdmissionAborted { .. } => {}
             MetastoreMutation::StorageCredentialUpserted(record) => {
                 self.storage_credentials
                     .insert(record.credential_id.clone(), record.clone());

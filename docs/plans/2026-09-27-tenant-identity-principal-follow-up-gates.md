@@ -18,11 +18,14 @@ watermark in the metastore authority before append. It can witness that grant
 after restart only when the persisted event is unchanged and no other event
 intervened. A pending, absent, changed, or superseded event denies compilation.
 This proves recovery of an appended event, not a production grant workflow.
-The outstanding admission decision is how to fence and dispose of a prepared
-grant whose ledger event never appears, including a late writer after an abort;
-until that is specified, the pending record is retained and further grant
-admission in that metastore is blocked. Production routing also needs all
-native grant writers to use the admission path and a multiwriter contract.
+The next test-only child can append an explicit no-op abort at the prepared
+grant's exact immutable native event ID and sequence. If the abort wins, a late
+grant cannot reuse that slot; restart can witness the abort and resume grant
+admission. If the grant wins, abort fails and grant reconciliation remains
+required. A changed or superseded ledger still retains the pending record and
+denies compilation. Production routing needs all native grant writers to use
+the admission path, a qualified multiwriter contract, and provider-backed
+recovery and fencing evidence; this memory-backend probe supplies none of those.
 Owner-derived permissions are excluded from this probe because catalog object
 owner changes have no tenant identity admission contract yet. That contract,
 including recovery of owned objects, is a separate production gate.

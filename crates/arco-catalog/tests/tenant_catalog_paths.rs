@@ -341,6 +341,158 @@ async fn unwitnessed_native_ledger_advance_cannot_compile_a_new_cut() {
 }
 
 #[tokio::test]
+async fn prepared_grant_recovers_after_restart_without_reauthorizing_a_disabled_principal() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity_storage = IdentityStorage::new(backend.clone(), "tenant-a").unwrap();
+    let identity = PrincipalIdentityStore::new(identity_storage.clone()).unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let probe = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    let prepared = probe
+        .prepare_grant(
+            "interrupted-grant",
+            2,
+            grant(&principal.principal_id, &table_id),
+        )
+        .await
+        .unwrap();
+    MetastoreLedger::new(storage.clone())
+        .unwrap()
+        .append_event(&prepared)
+        .await
+        .unwrap();
+    assert!(probe.compile_current().await.is_err());
+
+    identity
+        .commit(
+            IdentityMutation::Disable {
+                principal_id: principal.principal_id.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let restarted_identity = PrincipalIdentityStore::new(identity_storage).unwrap();
+    let restarted = TenantCatalogProbe::new(&restarted_identity, storage).unwrap();
+    let watermark = restarted.reconcile_prepared_grant().await.unwrap();
+    assert_eq!(watermark.event_id, "interrupted-grant");
+    let cut = restarted.compile_current().await.unwrap();
+    assert!(
+        restarted
+            .read_table(&cut, &request(&principal.principal_id, &table_id))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn recovery_rejects_absent_or_changed_event_and_preserves_denial() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        PrincipalIdentityStore::new(IdentityStorage::new(backend.clone(), "tenant-a").unwrap())
+            .unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let probe = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    let mut prepared = probe
+        .prepare_grant(
+            "interrupted-grant",
+            2,
+            grant(&principal.principal_id, &table_id),
+        )
+        .await
+        .unwrap();
+    assert!(
+        probe
+            .prepare_grant("second-grant", 3, grant(&principal.principal_id, &table_id))
+            .await
+            .is_err(),
+        "one pending grant fences another admission attempt"
+    );
+    assert!(probe.reconcile_prepared_grant().await.is_err());
+    assert!(probe.compile_current().await.is_err());
+
+    if let MetastoreMutation::GrantUpserted(ref mut grant) = prepared.mutation {
+        grant.privilege = "MODIFY".into();
+    }
+    MetastoreLedger::new(storage)
+        .unwrap()
+        .append_event(&prepared)
+        .await
+        .unwrap();
+    assert!(probe.reconcile_prepared_grant().await.is_err());
+    assert!(probe.compile_current().await.is_err());
+}
+
+#[tokio::test]
+async fn later_admitted_grant_cannot_witness_a_direct_ledger_grant() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        PrincipalIdentityStore::new(IdentityStorage::new(backend.clone(), "tenant-a").unwrap())
+            .unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let probe = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    let admitted = probe
+        .append_grant("first-grant", 2, grant(&principal.principal_id, &table_id))
+        .await
+        .unwrap();
+    let mut forged = grant(&principal.principal_id, &table_id);
+    forged.grant_id = "direct-grant".into();
+    forged.privilege = "MODIFY".into();
+    forged.identity_cut = Some(admitted);
+    let scope = ControlPlaneScope::new("tenant-a", "workspace", "first").unwrap();
+    MetastoreLedger::new(storage)
+        .unwrap()
+        .append_event(&MetastoreEvent::new_scoped(
+            &scope,
+            "direct-grant",
+            3,
+            MetastoreMutation::GrantUpserted(forged),
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        probe
+            .append_grant("later-grant", 4, grant(&principal.principal_id, &table_id))
+            .await
+            .is_err()
+    );
+    assert!(probe.compile_current().await.is_err());
+}
+
+#[tokio::test]
 async fn foreign_scoped_native_event_cannot_compile_permissions() {
     let backend = Arc::new(MemoryBackend::new());
     let identity =

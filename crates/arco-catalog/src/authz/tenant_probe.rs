@@ -3,6 +3,7 @@
 use arco_core::ScopedStorage;
 use arco_core::{AuthorityRoot, ControlPlaneScope};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::authz::compiler::{
     CompiledPermissionSet, PermissionCompileInput, SecurableObject, compile_permissions_with_active,
@@ -26,6 +27,15 @@ use crate::{
 /// State key used only by the test metastore fixture.
 pub const METASTORE_AUTHZ_STATE_KEY: &[u8] = b"authz/tenant-probe-state-v1";
 const NATIVE_LEDGER_WITNESS_KEY: &[u8] = b"authz/native-ledger-watermark-v1";
+// ponytail: one pending grant per metastore; per-event intents need a multiwriter proof.
+const PENDING_NATIVE_GRANT_KEY: &[u8] = b"authz/pending-native-grant-v1";
+
+#[derive(Serialize, Deserialize)]
+struct PendingNativeGrant {
+    event: MetastoreEvent,
+    previous_watermark: Option<MetastoreLedgerWatermark>,
+    had_witness: bool,
+}
 
 /// Permissions compiled from exact identity and metastore authority tokens.
 pub struct TenantPermissionCut {
@@ -246,8 +256,33 @@ impl<'a> TenantCatalogProbe<'a> {
         &self,
         event_id: &str,
         sequence: u64,
-        mut grant: GrantRecord,
+        grant: GrantRecord,
     ) -> Result<GrantIdentityCut> {
+        let event = self.prepare_grant(event_id, sequence, grant).await?;
+        let MetastoreMutation::GrantUpserted(grant) = &event.mutation else {
+            unreachable!("prepared grant has a grant mutation")
+        };
+        let cut = grant
+            .identity_cut
+            .clone()
+            .ok_or_else(|| CatalogError::InvariantViolation {
+                message: "prepared grant lacks identity evidence".into(),
+            })?;
+        self.ledger.append_event(&event).await?;
+        self.reconcile_prepared_grant().await?;
+        Ok(cut)
+    }
+
+    /// Persist exact admission intent before appending its native grant event.
+    ///
+    /// # Errors
+    /// Rejects invalid grants and another grant that is awaiting reconciliation.
+    pub async fn prepare_grant(
+        &self,
+        event_id: &str,
+        sequence: u64,
+        mut grant: GrantRecord,
+    ) -> Result<MetastoreEvent> {
         if grant.lifecycle_state != LifecycleState::Active {
             return Err(CatalogError::Validation {
                 message: "grant admission only accepts active grant creation".into(),
@@ -287,29 +322,146 @@ impl<'a> TenantCatalogProbe<'a> {
             identity_sequence: token.logical_sequence(),
             membership_revision: principal.membership_revision,
         };
-        grant.identity_cut = Some(cut.clone());
-        self.ledger
-            .append_event(&MetastoreEvent::new_scoped(
-                self.reader.scope(),
-                event_id,
-                sequence,
-                MetastoreMutation::GrantUpserted(grant),
-            ))
-            .await?;
-        let watermark = self.ledger.latest_watermark().await?.ok_or_else(|| {
-            CatalogError::InvariantViolation {
-                message: "appended grant has no native ledger watermark".into(),
-            }
-        })?;
+        grant.identity_cut = Some(cut);
+        let event = MetastoreEvent::new_scoped(
+            self.reader.scope(),
+            event_id,
+            sequence,
+            MetastoreMutation::GrantUpserted(grant),
+        );
         let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
+        txn.assert_absent(PENDING_NATIVE_GRANT_KEY).await?;
+        let previous_watermark = self.ledger.latest_watermark().await?;
+        let witnessed = txn.get(NATIVE_LEDGER_WITNESS_KEY).await?;
+        let had_witness = witnessed.is_some();
+        if let Some(witnessed) = witnessed {
+            let prior: MetastoreLedgerWatermark = serde_json::from_slice(witnessed.bytes())
+                .map_err(|error| CatalogError::Serialization {
+                    message: format!("decode native ledger watermark: {error}"),
+                })?;
+            if previous_watermark.as_ref() != Some(&prior) {
+                return Err(CatalogError::Validation {
+                    message: "native ledger advanced beyond its previous witness".into(),
+                });
+            }
+        } else {
+            let prior_events = self.ledger.load_events().await?;
+            if prior_events.iter().any(|prior| {
+                matches!(prior.mutation, MetastoreMutation::GrantUpserted(_))
+                    || !self.event_has_native_scope(prior)
+            }) {
+                return Err(CatalogError::Validation {
+                    message: "unwitnessed native grant or foreign event precedes admission".into(),
+                });
+            }
+        }
+        let pending = PendingNativeGrant {
+            event: event.clone(),
+            previous_watermark,
+            had_witness,
+        };
+        let bytes = serde_jcs::to_vec(&pending).map_err(|error| CatalogError::Serialization {
+            message: format!("serialize prepared native grant: {error}"),
+        })?;
+        txn.put(PENDING_NATIVE_GRANT_KEY, Bytes::from(bytes))
+            .await?;
+        txn.commit().await?;
+        Ok(event)
+    }
+
+    /// Complete a prepared grant only when its exact ledger event is current.
+    /// A missing or changed event leaves the pending record and denies compilation.
+    ///
+    /// # Errors
+    /// Rejects missing, foreign, changed, or superseded native ledger evidence.
+    pub async fn reconcile_prepared_grant(&self) -> Result<MetastoreLedgerWatermark> {
+        let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
+        let pending =
+            txn.get(PENDING_NATIVE_GRANT_KEY)
+                .await?
+                .ok_or_else(|| CatalogError::Validation {
+                    message: "metastore has no prepared native grant".into(),
+                })?;
+        let pending: PendingNativeGrant =
+            serde_json::from_slice(pending.bytes()).map_err(|error| {
+                CatalogError::Serialization {
+                    message: format!("decode prepared native grant: {error}"),
+                }
+            })?;
+        let current_witness = txn.get(NATIVE_LEDGER_WITNESS_KEY).await?;
+        let current_witness = current_witness
+            .map(|value| serde_json::from_slice::<MetastoreLedgerWatermark>(value.bytes()))
+            .transpose()
+            .map_err(|error| CatalogError::Serialization {
+                message: format!("decode native ledger watermark: {error}"),
+            })?;
+        if (pending.had_witness && current_witness != pending.previous_watermark)
+            || (!pending.had_witness && current_witness.is_some())
+        {
+            return Err(CatalogError::Validation {
+                message: "prepared native grant has a changed prior witness".into(),
+            });
+        }
+        let event = &pending.event;
+        if !self.event_has_native_scope(event)
+            || !matches!(&event.mutation, MetastoreMutation::GrantUpserted(grant)
+            if grant.identity_cut.as_ref().is_some_and(|cut| cut.tenant_id == self.reader.scope().tenant_id()))
+        {
+            return Err(CatalogError::Validation {
+                message: "prepared native grant has foreign authority evidence".into(),
+            });
+        }
+        let watermark =
+            self.ledger
+                .latest_watermark()
+                .await?
+                .ok_or_else(|| CatalogError::Validation {
+                    message: "prepared native grant is absent from the ledger".into(),
+                })?;
+        if watermark.event_id != event.event_id || watermark.sequence != event.sequence {
+            return Err(CatalogError::Validation {
+                message: "prepared native grant is not the current ledger event".into(),
+            });
+        }
+        let events = self.ledger.load_events().await?;
+        let prior_sequence = pending
+            .previous_watermark
+            .as_ref()
+            .map_or(0, |prior| prior.sequence);
+        let tail = events
+            .iter()
+            .filter(|stored| stored.sequence > prior_sequence)
+            .collect::<Vec<_>>();
+        if tail != [event]
+            || events
+                .iter()
+                .any(|stored| !self.event_has_native_scope(stored))
+            || pending.previous_watermark.as_ref().is_some_and(|prior| {
+                !events.iter().any(|stored| {
+                    stored.sequence == prior.sequence && stored.event_id == prior.event_id
+                })
+            })
+        {
+            return Err(CatalogError::Validation {
+                message: "prepared native grant does not match the scoped ledger".into(),
+            });
+        }
         let bytes =
             serde_json::to_vec(&watermark).map_err(|error| CatalogError::Serialization {
                 message: format!("serialize native ledger watermark: {error}"),
             })?;
         txn.put(NATIVE_LEDGER_WITNESS_KEY, Bytes::from(bytes))
             .await?;
+        txn.delete(PENDING_NATIVE_GRANT_KEY).await?;
         txn.commit().await?;
-        Ok(cut)
+        Ok(watermark)
+    }
+
+    fn event_has_native_scope(&self, event: &MetastoreEvent) -> bool {
+        event.scope.as_ref().is_some_and(|scope| {
+            scope.tenant_id == self.reader.scope().tenant_id()
+                && scope.metastore_id == self.reader.scope().metastore_id()
+        })
     }
 
     /// Compile native ledger grants against current tenant principal state.
@@ -409,6 +561,15 @@ impl<'a> TenantCatalogProbe<'a> {
             .ok_or_else(|| CatalogError::Validation {
                 message: "metastore authority token lacks native ledger witness".into(),
             })?;
+        if metastore_reader
+            .get(PENDING_NATIVE_GRANT_KEY)
+            .await?
+            .is_some()
+        {
+            return Err(CatalogError::Validation {
+                message: "metastore has a grant awaiting reconciliation".into(),
+            });
+        }
         let witnessed: MetastoreLedgerWatermark =
             serde_json::from_slice(&witness_bytes).map_err(|error| {
                 CatalogError::Serialization {

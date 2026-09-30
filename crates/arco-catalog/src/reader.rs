@@ -666,6 +666,23 @@ impl CatalogReader {
         Ok(read_model.get_table_by_id(table_id))
     }
 
+    /// Reads a table from a historical root token for test-only authorization probes.
+    ///
+    /// # Errors
+    /// Returns an error if the root token or pinned catalog snapshot is invalid.
+    #[cfg(feature = "test-utils")]
+    pub async fn get_table_by_id_for_root_token(
+        &self,
+        read_token: &str,
+        table_id: &str,
+    ) -> Result<Option<Table>> {
+        let manifest = self
+            .read_catalog_manifest_for_root_token(read_token)
+            .await?;
+        let read_model = self.uncached_catalog_read_model(&manifest).await?;
+        Ok(read_model.get_table_by_id(table_id))
+    }
+
     /// Lists columns for a table by table ID.
     ///
     /// Columns are returned in ordinal order.

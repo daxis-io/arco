@@ -82,6 +82,19 @@ pub struct PrincipalRecord {
     pub properties: BTreeMap<String, String>,
 }
 
+/// Admission evidence for a tenant principal grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantIdentityCut {
+    /// Tenant whose principal authority was checked at grant admission.
+    pub tenant_id: String,
+    /// Authenticated identity manifest observed at admission.
+    pub identity_manifest_id: String,
+    /// Logical identity authority sequence observed at admission.
+    pub identity_sequence: u64,
+    /// Grantee membership revision observed at admission.
+    pub membership_revision: u64,
+}
+
 /// Grant record used by the replay kernel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantRecord {
@@ -103,6 +116,9 @@ pub struct GrantRecord {
     pub updated_at_ms: i64,
     /// Compatibility metadata. Not an enforcement model.
     pub properties: BTreeMap<String, String>,
+    /// Named tenant identity cut checked when this grant was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_cut: Option<GrantIdentityCut>,
 }
 
 /// Storage credential metadata used by the replay kernel.

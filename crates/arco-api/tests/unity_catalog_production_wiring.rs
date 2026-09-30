@@ -231,6 +231,7 @@ async fn seed_metastore_admin(backend: &Arc<dyn StorageBackend>) {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_001,
                 properties: BTreeMap::new(),
+                identity_cut: None,
             }),
         ))
         .await

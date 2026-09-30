@@ -319,6 +319,7 @@ fn grant(
             lifecycle_state,
             updated_at_ms: sequence as i64,
             properties: BTreeMap::new(),
+            identity_cut: None,
         }),
     )
 }

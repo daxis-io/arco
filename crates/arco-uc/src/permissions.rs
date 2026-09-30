@@ -292,6 +292,7 @@ mod tests {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 0,
                 properties: BTreeMap::new(),
+                identity_cut: None,
             },
         );
 
@@ -343,6 +344,7 @@ mod tests {
                 lifecycle_state: LifecycleState::Deleted,
                 updated_at_ms: 0,
                 properties: BTreeMap::new(),
+                identity_cut: None,
             },
         );
         state.catalog_objects.insert(

@@ -4,6 +4,19 @@ The test-only principal event API proves identity-root mutation and replay. It
 does not route authorization, revoke a metastore privilege, or purge a principal.
 The production identity-root constructor remains closed.
 
+The test-only native-path probe now admits an active grant at a named identity
+cut, records that cut on the native grant event, witnesses the native ledger
+watermark in a metastore state token, and checks current identity before and
+after moving-head or historical `CatalogReader` table reads. This does not
+route production grant writes or catalog reads through the probe. The native
+ledger append and metastore state-token commit are separate writes; production
+admission needs a reconciliation contract for a grant event that lands without
+its watermark witness. Direct ledger writes must not bypass identity admission
+when routing is enabled.
+Owner-derived permissions are excluded from this probe because catalog object
+owner changes have no tenant identity admission contract yet. That contract,
+including recovery of owned objects, is a separate production gate.
+
 ## Gate 1: revocation across metastores
 
 1. Define a named authorization cut containing both the identity token and the

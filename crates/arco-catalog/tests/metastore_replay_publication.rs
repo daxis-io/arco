@@ -2005,6 +2005,7 @@ fn sample_events() -> Vec<MetastoreEvent> {
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_001,
                 properties: sensitive_properties(),
+                identity_cut: None,
             }),
         ),
         MetastoreEvent::new(

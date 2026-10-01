@@ -14,7 +14,10 @@ use std::time::Duration;
 
 #[cfg(feature = "test-utils")]
 use arco_catalog::catalog_authority::{BoundedCatalogTestCommand, CatalogProjectionNotifierV2};
-use arco_catalog::parquet_util::{CatalogAuditRow, read_audit_records};
+use arco_catalog::parquet_util::{
+    CatalogAuditRow, CatalogRecord, ColumnRecord, NamespaceRecord, TableRecord, read_audit_records,
+    read_catalogs, read_columns, read_namespaces, read_tables,
+};
 use arco_catalog::state_store::projection_outbox_acks::{
     PROJECTION_OUTBOX_ACK_DOMAIN, PROJECTION_OUTBOX_TRIM_BINDING_KEY, ProjectionOutboxAckWriter,
     ProjectionOutboxBacklog, ProjectionOutboxWorker,
@@ -27,11 +30,11 @@ use arco_catalog::{
     CatalogProjectionMaterializer, CatalogProjectionNotifier, CheckpointOptions, ColumnDefinition,
     ControlCatalogAuthority, ControlMvpMaintenanceOutcome, ControlMvpProjectionOutboxRecord,
     ControlMvpStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus,
-    PersistedAuthorityAdapter, PersistedRestoreParticipantPlan, ProjectionIntentV1, PurgedCounts,
-    RegisterTableInSchemaRequest, RestoreAttemptIdentity, RestoreKeyPolicy,
-    RestoreParticipantInspection, SchemaPatch, StateRestoreParticipant, StateScope, TxnOptions,
-    WriteOptions, catalog_audit_artifact_path, catalog_audit_partition, catalog_restore_key_policy,
-    catalog_restore_participant,
+    PersistedAuthorityAdapter, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
+    ProjectionIntentV1, PurgedCounts, RegisterTableInSchemaRequest, RestoreAttemptIdentity,
+    RestoreKeyPolicy, RestoreParticipantInspection, SchemaPatch, StateRestoreParticipant,
+    StateScope, TxnOptions, WriteOptions, catalog_audit_artifact_path, catalog_audit_partition,
+    catalog_restore_key_policy, catalog_restore_participant,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
@@ -3012,6 +3015,787 @@ async fn restore_never_restores_receipts_and_a_replay_re_executes() {
         0,
         receipts().await,
         "a failed re-execution commits no receipt"
+    );
+}
+
+/// A catalog checkpointed after a keyed and an unkeyed mutation and then
+/// mutated further (a keyed patch and an unkeyed create): the restore source
+/// of the restore projection tests. Drains are explicit (the notifier only
+/// records), so nothing is materialized yet.
+struct CheckpointedCatalog {
+    authority: ControlCatalogAuthority,
+    store: ControlMvpStateStore,
+    reference: PersistedAuthorityReference,
+}
+
+async fn checkpointed_catalog(storage: &ScopedStorage) -> CheckpointedCatalog {
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    authority
+        .create_catalog(
+            "analytics",
+            Some("first"),
+            WriteOptions::with_idempotency("create-analytics"),
+        )
+        .await
+        .expect("keyed create");
+    authority
+        .create_schema("analytics", "sales", None, WriteOptions::default())
+        .await
+        .expect("unkeyed schema create");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint");
+    let reference = store
+        .persist_checkpoint_reference(&checkpoint, chrono::Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("persist checkpoint reference");
+    authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("patched".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("patch-analytics"),
+        )
+        .await
+        .expect("keyed patch");
+    authority
+        .create_catalog("finance", None, WriteOptions::default())
+        .await
+        .expect("unkeyed create");
+    CheckpointedCatalog {
+        authority,
+        store,
+        reference,
+    }
+}
+
+/// The committed outcome of restoring a [`CheckpointedCatalog`] to its
+/// checkpoint: the restore notice in the outbox and the result manifest.
+struct RestoredCatalog {
+    notice: ControlMvpProjectionOutboxRecord,
+    result_sequence: u64,
+    result_manifest_id: String,
+    committed_at_ms: i64,
+}
+
+/// Restores `catalog` to its checkpoint through the catalog restore
+/// participant. The result manifest's `committed_at_ms` is read from the
+/// published manifest object, independently of the materializer.
+async fn restore_to_checkpoint(
+    storage: &ScopedStorage,
+    catalog: &CheckpointedCatalog,
+    restore_id: &str,
+) -> RestoredCatalog {
+    let participant =
+        catalog_restore_participant(catalog.store.clone()).expect("catalog restore participant");
+    let plan = participant
+        .plan_restore(
+            &catalog.reference,
+            &RestoreAttemptIdentity::new(restore_id, 1, "catalog").expect("identity"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("plan catalog restore");
+    let control = if let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan {
+        Some(control)
+    } else {
+        None
+    }
+    .expect("a ControlMvp restore plan");
+    let visible = participant
+        .apply_restore(&plan, chrono::Utc::now())
+        .await
+        .expect("apply catalog restore");
+    let token = if let RestoreParticipantInspection::Visible { token, .. } = visible {
+        Some(token)
+    } else {
+        None
+    }
+    .expect("the restore becomes visible");
+    assert_eq!(control.result_logical_sequence(), token.logical_sequence());
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get_raw(control.candidate_manifest_path())
+            .await
+            .expect("restore manifest object"),
+    )
+    .expect("restore manifest JSON");
+    let committed_at_ms = manifest
+        .pointer("/payload/committed_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .expect("format-9 manifests carry committed_at_ms");
+    let notice_id = format!("restore:{restore_id}:1:catalog");
+    let notice = catalog
+        .store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .find(|record| record.record_id() == notice_id)
+        .expect("the restore commits its notice to the outbox");
+    assert_eq!(Some(token.logical_sequence()), notice.origin_sequence());
+    RestoredCatalog {
+        notice,
+        result_sequence: token.logical_sequence(),
+        result_manifest_id: control.candidate_manifest_id().to_string(),
+        committed_at_ms,
+    }
+}
+
+/// The audit row a materialized restore must project to, derived from the
+/// notice and the result manifest independently of the materializer.
+fn expected_restore_audit_row(restored: &RestoredCatalog) -> CatalogAuditRow {
+    use sha2::Digest as _;
+    CatalogAuditRow {
+        record_version: 1,
+        operation_id: restored.notice.record_id().to_string(),
+        operation_family: "restore_domain".to_string(),
+        request_digest: hex::encode(sha2::Sha256::digest(restored.notice.payload())),
+        actor: "restore".to_string(),
+        occurred_at_ms: restored.committed_at_ms,
+        logical_sequence: restored.result_sequence,
+        authority_manifest_id: Some(restored.result_manifest_id.clone()),
+        logical_commit_id: None,
+    }
+}
+
+/// The audit artifact path of a materialized restore: the UTC day of the
+/// result manifest's `committed_at_ms`, then the result sequence and the
+/// notice record id (which contains `:`).
+fn expected_restore_audit_path(restored: &RestoredCatalog) -> String {
+    let day = chrono::DateTime::from_timestamp_millis(restored.committed_at_ms)
+        .expect("stamp within chrono's range")
+        .format("%Y-%m-%d");
+    let path = format!(
+        "control/v1/projections/catalog-audit/dt={day}/{:020}-{}.parquet",
+        restored.result_sequence,
+        restored.notice.record_id()
+    );
+    assert!(path.starts_with(&format!(
+        "{CATALOG_AUDIT_PROJECTION_PREFIX}{}",
+        catalog_audit_partition(restored.committed_at_ms).expect("partition")
+    )));
+    path
+}
+
+/// The catalog Parquet projection directory published for `sequence` and
+/// authority manifest `manifest_id`.
+fn snapshot_directory(sequence: u64, manifest_id: &str) -> String {
+    format!("control/v1/projections/catalog-parquet/{sequence:020}-{manifest_id}/")
+}
+
+/// Every published catalog projection snapshot directory (one with a
+/// `manifest.json`), sorted, so in sequence order.
+async fn snapshot_directories(storage: &ScopedStorage) -> Vec<String> {
+    let mut directories = storage
+        .list("control/v1/projections/catalog-parquet/")
+        .await
+        .expect("list catalog snapshots")
+        .into_iter()
+        .filter_map(|path| {
+            path.as_str()
+                .strip_suffix("manifest.json")
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories
+}
+
+/// The decoded catalog, schema, table and column rows of one snapshot.
+async fn snapshot_rows(
+    storage: &ScopedStorage,
+    directory: &str,
+) -> (
+    Vec<CatalogRecord>,
+    Vec<NamespaceRecord>,
+    Vec<TableRecord>,
+    Vec<ColumnRecord>,
+) {
+    let file = |name: &str| {
+        let path = format!("{directory}{name}");
+        async move { storage.get_raw(&path).await.expect("snapshot file") }
+    };
+    (
+        read_catalogs(&file("catalogs.parquet").await).expect("catalogs"),
+        read_namespaces(&file("namespaces.parquet").await).expect("namespaces"),
+        read_tables(&file("tables.parquet").await).expect("tables"),
+        read_columns(&file("columns.parquet").await).expect("columns"),
+    )
+}
+
+/// A restore notice is materialized like a mutation instead of being
+/// quarantined: the restored catalog state is published as a snapshot at the
+/// restore sequence, one audit file records the restore, the notice is
+/// acknowledged, and the trim removes it from the outbox.
+#[tokio::test]
+async fn a_catalog_restore_is_materialized_with_a_restore_audit_row() {
+    let storage = scoped_storage();
+    let catalog = checkpointed_catalog(&storage).await;
+    let checkpoint_directory = snapshot_directory(
+        catalog.reference.logical_sequence(),
+        catalog.reference.manifest_id(),
+    );
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000101").await;
+    let outbox = catalog
+        .store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .map(|record| record.record_id().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        5,
+        outbox.len(),
+        "four mutation intents and the restore notice"
+    );
+    assert_eq!(
+        Some(restored.notice.record_id()),
+        outbox.last().map(String::as_str)
+    );
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let report = materializer.drain_once().await.expect("drain");
+    assert!(
+        report.quarantined_record_ids.is_empty(),
+        "a restore notice is not quarantined: {:?}",
+        report.quarantined_record_ids
+    );
+    assert_eq!(outbox, report.drained_record_ids);
+    assert_eq!(
+        Some(restored.result_sequence),
+        report.latest_projected_sequence
+    );
+    let status = materializer
+        .status()
+        .await
+        .expect("status")
+        .expect("materialized status");
+    assert_eq!(None, status.failure_state());
+    assert_eq!(
+        Some(restored.result_sequence),
+        status.applied_authority_sequence()
+    );
+    let restore_directory =
+        snapshot_directory(restored.result_sequence, &restored.result_manifest_id);
+    let manifest_path = format!("{restore_directory}manifest.json");
+    assert_eq!(
+        Some(manifest_path.as_str()),
+        status.artifact_manifest_path()
+    );
+    let manifest: arco_catalog::manifest::SnapshotInfo = serde_json::from_slice(
+        &storage
+            .get_raw(&manifest_path)
+            .await
+            .expect("restore snapshot manifest"),
+    )
+    .expect("snapshot manifest decodes");
+    assert_eq!(restored.result_sequence, manifest.version);
+
+    let directories = snapshot_directories(&storage).await;
+    assert_eq!(5, directories.len(), "one snapshot per materialized record");
+    assert_eq!(Some(&restore_directory), directories.last());
+    assert!(directories.contains(&checkpoint_directory));
+    let at_checkpoint = snapshot_rows(&storage, &checkpoint_directory).await;
+    let at_restore = snapshot_rows(&storage, &restore_directory).await;
+    assert_eq!(
+        at_checkpoint, at_restore,
+        "the restore snapshot holds the checkpoint state"
+    );
+    let catalogs = at_restore
+        .0
+        .iter()
+        .map(|record| (record.name.as_str(), record.description.as_deref()))
+        .collect::<Vec<_>>();
+    assert_eq!(vec![("analytics", Some("first"))], catalogs);
+    assert_eq!(1, at_restore.1.len(), "the checkpoint's schema is restored");
+    let before_restore = snapshot_rows(&storage, &directories[3]).await;
+    assert_ne!(
+        at_restore, before_restore,
+        "the restore replaced the patched head"
+    );
+
+    let audit = audit_artifacts(&storage).await;
+    assert_eq!(5, audit.len(), "one audit file per materialized record");
+    let audit_path = expected_restore_audit_path(&restored);
+    assert_eq!(
+        vec![audit_path.clone()],
+        audit
+            .iter()
+            .filter(|path| path.contains("restore:"))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![expected_restore_audit_row(&restored)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+
+    let trimmed = materializer.trim_once().await.expect("trim");
+    assert_eq!(outbox, trimmed.trimmed_record_ids);
+    assert!(
+        catalog
+            .store
+            .current_projection_outbox()
+            .await
+            .expect("outbox after trim")
+            .is_empty(),
+        "the acknowledged notice is trimmed"
+    );
+    let backlog = catalog_worker(&storage).backlog().await.expect("backlog");
+    assert!(backlog.pending_record_ids.is_empty());
+    assert_eq!(
+        Some(restored.result_sequence),
+        backlog.latest_projected_sequence
+    );
+}
+
+/// After a restore is materialized and trimmed, a later mutation still
+/// materializes over the restored state and the status stays healthy.
+#[tokio::test]
+async fn a_mutation_after_a_materialized_restore_still_materializes() {
+    let storage = scoped_storage();
+    let catalog = checkpointed_catalog(&storage).await;
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000102").await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let report = materializer.drain_once().await.expect("drain the restore");
+    assert!(report.quarantined_record_ids.is_empty());
+    materializer.trim_once().await.expect("trim the restore");
+
+    catalog
+        .authority
+        .create_catalog("after-restore", None, WriteOptions::default())
+        .await
+        .expect("mutate after the restore");
+    let record = catalog
+        .store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .next()
+        .expect("the later mutation's intent");
+    assert!(record.origin_sequence() > Some(restored.result_sequence));
+    let report = materializer.drain_once().await.expect("drain the mutation");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        report.drained_record_ids
+    );
+    assert!(report.quarantined_record_ids.is_empty());
+    let status = materializer
+        .status()
+        .await
+        .expect("status")
+        .expect("materialized status");
+    assert_eq!(None, status.failure_state());
+    assert_eq!(
+        record.origin_sequence(),
+        status.applied_authority_sequence()
+    );
+    let directories = snapshot_directories(&storage).await;
+    let latest = directories.last().expect("the later snapshot");
+    assert!(latest.starts_with(&format!(
+        "control/v1/projections/catalog-parquet/{:020}-",
+        record.origin_sequence().expect("origin sequence")
+    )));
+    let catalogs = snapshot_rows(&storage, latest)
+        .await
+        .0
+        .into_iter()
+        .map(|record| (record.name, record.description))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        std::collections::BTreeSet::from([
+            ("after-restore".to_string(), None),
+            ("analytics".to_string(), Some("first".to_string())),
+        ]),
+        catalogs
+    );
+    let audit_path = expected_audit_path(&record);
+    assert_eq!(
+        vec![expected_audit_row(&record)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+}
+
+/// The canonical restore notice payload shape, for forging notices.
+#[derive(serde::Serialize)]
+struct ForgedRestoreNotice<'a> {
+    restore_id: &'a str,
+    participant_attempt: u64,
+    domain: &'a str,
+    source_logical_sequence: u64,
+    result_logical_sequence: u64,
+}
+
+/// Commits one raw outbox record through a plain control transaction and
+/// returns its origin sequence. `payload` receives the sequence the record
+/// will commit at.
+async fn commit_raw_outbox_record(
+    store: &ControlMvpStateStore,
+    record_id: &str,
+    options: TxnOptions,
+    payload: impl FnOnce(u64) -> Vec<u8>,
+) -> u64 {
+    let origin = store
+        .current_state_token()
+        .await
+        .map_or(1, |token| token.logical_sequence() + 1);
+    let mut txn = store
+        .begin_control_txn(options)
+        .await
+        .expect("begin raw transaction");
+    txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+        record_id,
+        Bytes::from(payload(origin)),
+    ))
+    .await
+    .expect("stage raw outbox record");
+    let committed = txn
+        .commit()
+        .await
+        .expect("commit raw outbox record")
+        .into_state_token()
+        .logical_sequence();
+    assert_eq!(origin, committed);
+    committed
+}
+
+/// Records that claim to be restore notices (a `restore:` id) but are not
+/// the notice of a committed restore are quarantined `INVALID_RESTORE_NOTICE`
+/// without writing any projection artifact, and later work proceeds. The
+/// last one is consistent in itself and even carries the notice id as its
+/// transaction request id, but it was committed by a plain transaction, not
+/// a restore, so the authenticated lineage refutes it.
+#[tokio::test]
+async fn forged_restore_notices_are_quarantined_without_artifacts_or_blocking_later_work() {
+    let storage = scoped_storage();
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let notice = |restore_id: &'static str, domain: &'static str, delta: u64| {
+        move |origin: u64| {
+            serde_json::to_vec(&ForgedRestoreNotice {
+                restore_id,
+                participant_attempt: 1,
+                domain,
+                source_logical_sequence: origin - 1,
+                result_logical_sequence: origin + delta,
+            })
+            .expect("encode forged notice")
+        }
+    };
+    let wrong_domain = "restore:rst_00000000000000000000000111:1:catalog";
+    let wrong_sequence = "restore:rst_00000000000000000000000112:1:catalog";
+    let malformed = "restore:rst_00000000000000000000000113:1:catalog";
+    let not_a_restore = "restore:rst_00000000000000000000000114:1:catalog";
+    let mut forged = Vec::new();
+    forged.push(
+        commit_raw_outbox_record(
+            &store,
+            wrong_domain,
+            TxnOptions::default(),
+            notice("rst_00000000000000000000000111", "orchestration", 0),
+        )
+        .await,
+    );
+    forged.push(
+        commit_raw_outbox_record(
+            &store,
+            wrong_sequence,
+            TxnOptions::default(),
+            notice("rst_00000000000000000000000112", "catalog", 7),
+        )
+        .await,
+    );
+    forged.push(
+        commit_raw_outbox_record(&store, malformed, TxnOptions::default(), |_| {
+            b"{\"restore_id\":".to_vec()
+        })
+        .await,
+    );
+    forged.push(
+        commit_raw_outbox_record(
+            &store,
+            not_a_restore,
+            TxnOptions::new(Some(scope())).with_request_id(not_a_restore),
+            notice("rst_00000000000000000000000114", "catalog", 0),
+        )
+        .await,
+    );
+    let forged_ids = vec![wrong_domain, wrong_sequence, malformed, not_a_restore];
+
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("a quarantine is not a drain failure");
+    assert_eq!(forged_ids, report.quarantined_record_ids);
+    assert!(report.drained_record_ids.is_empty());
+    assert!(
+        projection_objects(&storage).await.is_empty(),
+        "no snapshot or audit file is written for a forged notice"
+    );
+    let ack_writer = ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            "synthetic-tenant",
+            "synthetic-workspace",
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .expect("ack writer");
+    for (record_id, sequence) in forged_ids.iter().zip(&forged) {
+        let quarantine = ack_writer
+            .projection_quarantine(CATALOG_PARQUET_PROJECTION_CONSUMER_ID, *sequence)
+            .await
+            .expect("read quarantine")
+            .expect("durable quarantine");
+        assert_eq!(*record_id, quarantine.source_record_id());
+        assert_eq!("INVALID_RESTORE_NOTICE", quarantine.failure_code());
+    }
+
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("after-forgery", None, WriteOptions::default())
+        .await
+        .expect("commit a real mutation after the forged notices");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .find(|record| !record.record_id().starts_with("restore:"))
+        .expect("the real mutation's intent");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("the forged notices do not block later work");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        report.drained_record_ids
+    );
+    assert_eq!(forged_ids, report.quarantined_record_ids);
+    let status = materializer
+        .status()
+        .await
+        .expect("status")
+        .expect("materialized status");
+    assert_eq!(
+        Some("terminal:INVALID_RESTORE_NOTICE"),
+        status.failure_state()
+    );
+    assert_eq!(
+        record.origin_sequence(),
+        status.applied_authority_sequence()
+    );
+    let audit_path = expected_audit_path(&record);
+    assert_eq!(vec![audit_path.clone()], audit_artifacts(&storage).await);
+    assert_eq!(
+        vec![expected_audit_row(&record)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+    assert_eq!(1, snapshot_directories(&storage).await.len());
+    assert_eq!(
+        forged_ids,
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids,
+        "quarantined notices stay unacknowledged for an operator"
+    );
+
+    let retry = CatalogProjectionMaterializer::new(storage)
+        .expect("restart")
+        .drain_once()
+        .await
+        .expect("restart drain");
+    assert_eq!(forged_ids, retry.quarantined_record_ids);
+    assert_eq!(1, retry.already_acknowledged);
+    assert!(retry.drained_record_ids.is_empty());
+}
+
+/// A restore notice whose acknowledgement is lost is redelivered, and the
+/// redelivery rewrites byte-identical audit bytes instead of failing closed.
+#[tokio::test]
+async fn a_redelivered_restore_notice_rewrites_an_identical_audit_artifact() {
+    let backend = FailProjectionPutBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let catalog = checkpointed_catalog(&storage).await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    assert_eq!(
+        4,
+        materializer
+            .drain_once()
+            .await
+            .expect("drain the mutations")
+            .drained_record_ids
+            .len()
+    );
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000121").await;
+    let audit_path = expected_restore_audit_path(&restored);
+    let puts = backend.audit_puts.load(Ordering::SeqCst);
+
+    backend.fail_acks.store(true, Ordering::SeqCst);
+    materializer
+        .drain_once()
+        .await
+        .expect_err("a lost acknowledgement fails the drain after publication");
+    backend.fail_acks.store(false, Ordering::SeqCst);
+    let published = storage
+        .get_raw(&audit_path)
+        .await
+        .expect("the restore audit file was published before the lost acknowledgement");
+    assert_eq!(puts + 1, backend.audit_puts.load(Ordering::SeqCst));
+    assert_eq!(
+        vec![restored.notice.record_id().to_string()],
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids,
+        "the unacknowledged notice is redelivered"
+    );
+
+    let restarted = CatalogProjectionMaterializer::new(storage.clone()).expect("restart");
+    let redelivered = restarted
+        .drain_once()
+        .await
+        .expect("the redelivery accepts the identical artifact");
+    assert_eq!(
+        vec![restored.notice.record_id().to_string()],
+        redelivered.drained_record_ids
+    );
+    assert!(redelivered.quarantined_record_ids.is_empty());
+    assert_eq!(
+        puts + 2,
+        backend.audit_puts.load(Ordering::SeqCst),
+        "the redelivery attempted the does-not-exist write again"
+    );
+    assert_eq!(
+        published,
+        storage.get_raw(&audit_path).await.expect("artifact bytes")
+    );
+    assert_eq!(
+        vec![expected_restore_audit_row(&restored)],
+        read_audit_artifact(&storage, &audit_path).await
+    );
+    let status = restarted
+        .status()
+        .await
+        .expect("status")
+        .expect("success status");
+    assert_eq!(None, status.failure_state());
+    assert_eq!(
+        Some(restored.result_sequence),
+        status.applied_authority_sequence()
+    );
+    assert!(
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids
+            .is_empty()
+    );
+}
+
+/// An authenticated restore whose audit path already holds different bytes
+/// fails closed in the publication path it shares with mutations: the
+/// snapshot files land, the divergent file is untouched, the snapshot
+/// manifest is not published, and the notice is quarantined
+/// `INCOMPATIBLE_PROJECTION_INTENT` (a publication failure, not an invalid
+/// notice) without being acknowledged.
+#[tokio::test]
+async fn a_divergent_restore_audit_artifact_fails_closed_without_acknowledging() {
+    let storage = scoped_storage();
+    let catalog = checkpointed_catalog(&storage).await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    materializer
+        .drain_once()
+        .await
+        .expect("drain the mutations");
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000131").await;
+    let audit_path = expected_restore_audit_path(&restored);
+    let foreign = Bytes::from_static(b"not the restore audit record");
+    storage
+        .put_raw(
+            &audit_path,
+            foreign.clone(),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("seed a divergent artifact");
+
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("a quarantine is not a drain failure");
+    assert_eq!(
+        vec![restored.notice.record_id().to_string()],
+        report.quarantined_record_ids
+    );
+    assert!(report.drained_record_ids.is_empty());
+    assert_eq!(
+        foreign,
+        storage.get_raw(&audit_path).await.expect("artifact bytes"),
+        "the divergent artifact is left untouched"
+    );
+    let directory = snapshot_directory(restored.result_sequence, &restored.result_manifest_id);
+    assert!(
+        storage
+            .head_raw(&format!("{directory}catalogs.parquet"))
+            .await
+            .expect("head")
+            .is_some(),
+        "the snapshot files landed, so the quarantine came from the audit step"
+    );
+    assert!(
+        storage
+            .head_raw(&format!("{directory}manifest.json"))
+            .await
+            .expect("head")
+            .is_none(),
+        "the snapshot manifest follows the audit artifact"
+    );
+    let quarantine = ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            "synthetic-tenant",
+            "synthetic-workspace",
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .expect("ack writer")
+    .projection_quarantine(
+        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        restored.result_sequence,
+    )
+    .await
+    .expect("read quarantine")
+    .expect("durable quarantine");
+    assert_eq!(restored.notice.record_id(), quarantine.source_record_id());
+    assert_eq!("INCOMPATIBLE_PROJECTION_INTENT", quarantine.failure_code());
+    assert_eq!(
+        vec![restored.notice.record_id().to_string()],
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids,
+        "a quarantined notice is never acknowledged"
     );
 }
 

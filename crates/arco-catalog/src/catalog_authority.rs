@@ -27,7 +27,8 @@ use crate::state_store::projection_outbox_acks::{
     ProjectionOutboxTrimReport, ProjectionOutboxWorker,
 };
 use crate::state_store::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpRestoreParticipant, ControlMvpStateStore,
+    ArcoStateReader, ArcoStateTxn, ControlMvpProjectionOutboxRecord,
+    ControlMvpResolvedRestoreNotice, ControlMvpRestoreParticipant, ControlMvpStateStore,
     ControlMvpTxn, ProjectionIntentV1, ProjectionIntentV2, RestoreKeyPolicy, ScanContinuation,
     ScanContinuationKey, ScanRequest, StateRestoreParticipant, StateScope, StateToken, TxnOptions,
 };
@@ -61,6 +62,10 @@ const SCHEMA_KIND: u8 = 2;
 const TABLE_KIND: u8 = 3;
 const COLUMN_KIND: u8 = 4;
 const RECORD_VERSION: u32 = 1;
+/// `operation_family` of the `system.catalog.audit` row of a catalog restore.
+const RESTORE_AUDIT_OPERATION_FAMILY: &str = "restore_domain";
+/// `actor` of the `system.catalog.audit` row of a catalog restore.
+const RESTORE_AUDIT_ACTOR: &str = "restore";
 const RETRY_BUDGET: Duration = Duration::from_millis(1_500);
 
 /// Exponential conflict backoff with ULID-derived jitter, capped at 200-400 ms.
@@ -1043,13 +1048,16 @@ pub struct ControlCatalogAuthority {
 ///
 /// The catalog projection materializer writes immutable single-row Parquet
 /// files beneath it (see [`catalog_audit_artifact_path`]). Every acknowledged
-/// intent has exactly one file here, written before the acknowledgement and
-/// kept until [`CatalogProjectionMaterializer::expire_audit_partitions`]
-/// deletes its day partition (after [`CATALOG_AUDIT_RETENTION_DAYS`] by
-/// default). A quarantined intent may or may not have one (for example, one
+/// intent has exactly one file here, and so does every acknowledged restore
+/// notice (at `dt=YYYY-MM-DD/{result_logical_sequence:020}-{notice_record_id}.parquet`;
+/// see [`CatalogProjectionMaterializer`]). Each file is written before the
+/// acknowledgement and kept until
+/// [`CatalogProjectionMaterializer::expire_audit_partitions`] deletes its day
+/// partition (after [`CATALOG_AUDIT_RETENTION_DAYS`] by default). A
+/// quarantined intent or notice may or may not have one (for example, one
 /// quarantined for a divergent snapshot manifest after its audit file
-/// landed); a present file still describes a committed mutation. The files
-/// are not listed in any snapshot manifest.
+/// landed); a present file still describes a committed mutation or restore.
+/// The files are not listed in any snapshot manifest.
 pub const CATALOG_AUDIT_PROJECTION_PREFIX: &str = "control/v1/projections/catalog-audit/";
 
 /// Default retention of `system.catalog.audit` day partitions, in days.
@@ -1415,6 +1423,29 @@ fn decode_catalog_audit_row(
 /// intent's audit record under [`CATALOG_AUDIT_PROJECTION_PREFIX`], and only
 /// then acknowledges the intent. [`Self::expire_audit_partitions`] ages those
 /// audit records out by day partition.
+///
+/// # Restore notices
+///
+/// A catalog restore commits one outbox record that is not a projection
+/// intent: its restore notice (record id `restore:{restore_id}:{attempt}:{domain}`).
+/// The worker recognises any record whose id starts with `restore:` before
+/// decoding an intent, authenticates it with
+/// [`ControlMvpStateStore::resolve_restore_notice_source`], and materializes
+/// it like a mutation: the restored catalog state as the snapshot at the
+/// restore's result sequence and manifest, then one audit row for the restore
+/// (operation id = the notice record id, family `restore_domain`, request
+/// digest = SHA-256 hex of the notice payload, actor `restore`, occurrence =
+/// the result manifest's `committed_at_ms`), then the snapshot manifest; the
+/// notice is acknowledged after that and trimmed like an intent.
+///
+/// A `restore:` record that fails authentication with a validation error or
+/// an invariant violation is quarantined `INVALID_RESTORE_NOTICE`; storage
+/// and ambiguous-authority errors are retried. Once authenticated, a notice
+/// shares the intents' publication path and its failure handling (a
+/// non-retryable publication failure, such as a divergent existing artifact,
+/// is quarantined `INCOMPATIBLE_PROJECTION_INTENT`). Notices quarantined as
+/// `INVALID_PROJECTION_INTENT` before restores were materialized stay
+/// quarantined; this worker does not revisit terminal dispositions.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1643,10 +1674,12 @@ impl CatalogProjectionMaterializer {
         }
     }
 
+    /// Materializes one V1 catalog projection intent: the catalog state at the
+    /// intent's source manifest and the audit record its payload carries.
     async fn materialize(
         &self,
         intent: &ProjectionIntentV1,
-        record: &crate::state_store::ControlMvpProjectionOutboxRecord,
+        record: &ControlMvpProjectionOutboxRecord,
     ) -> Result<String> {
         if intent.projection_kind() != CATALOG_PARQUET_PROJECTION_CONSUMER_ID
             || intent.source_scope().domain() != "catalog"
@@ -1656,88 +1689,125 @@ impl CatalogProjectionMaterializer {
                     .to_string(),
             });
         }
-        // Decode and encode the audit row before anything is written: a
-        // payload that is not this intent's audit record is a validation
+        // A payload that is not this intent's audit record is a validation
         // error, quarantined without leaving snapshot files behind.
         let audit_row = catalog_audit_row(intent)?;
-        let audit_path = audit_artifact_path(&audit_row)?;
-        let audit_bytes = write_audit_records(std::slice::from_ref(&audit_row))?;
-        let state = projection_measurement::phase("projection-source", async {
-            let token = self
-                .source
-                .resolve_projection_source(record, intent)
-                .await?;
-            let reader = self.source.read_at(token).await?;
+        self.publish_projection(
+            self.source.resolve_projection_source(record, intent),
+            &audit_row,
+        )
+        .await
+    }
+
+    /// Materializes one authenticated restore notice: the restored catalog
+    /// state at the restore's result manifest and the restore's audit row
+    /// (see [`restore_audit_row`]).
+    async fn materialize_restore(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+        restore: &ControlMvpResolvedRestoreNotice,
+    ) -> Result<String> {
+        let audit_row = restore_audit_row(record, restore);
+        self.publish_projection(std::future::ready(Ok(restore.token().clone())), &audit_row)
+            .await
+    }
+
+    /// Publishes one catalog projection and returns its snapshot manifest
+    /// path: the catalog snapshot of the state at the token `source` resolves,
+    /// under `control/v1/projections/catalog-parquet/{sequence:020}-{manifest_id}/`
+    /// of that token, then `audit_row`'s audit file, then the snapshot
+    /// manifest. Every write is immutable and accepts an identical rewrite, so
+    /// a redelivery republishes the same bytes.
+    async fn publish_projection(
+        &self,
+        source: impl Future<Output = Result<StateToken>>,
+        audit_row: &CatalogAuditRow,
+    ) -> Result<String> {
+        // Encode the audit row before anything is read or written: a row
+        // without a day partition fails before any snapshot file lands.
+        let audit_path = audit_artifact_path(audit_row)?;
+        let audit_bytes = write_audit_records(std::slice::from_ref(audit_row))?;
+        let (token, state) = projection_measurement::phase("projection-source", async {
+            let token = source.await?;
+            let reader = self.source.read_at(token.clone()).await?;
             let state = catalog_state_from_reader(reader.as_ref()).await?;
-            Ok::<_, CatalogError>(state)
+            Ok::<_, CatalogError>((token, state))
         })
         .await?;
         projection_measurement::phase("projection-publication", async {
             let directory = format!(
                 "control/v1/projections/catalog-parquet/{:020}-{}/",
-                intent.source_logical_sequence(),
-                intent.source_authority_manifest_id()
+                token.logical_sequence(),
+                token.authority_manifest_id()
             );
-            let mut snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
+            let snapshot = tier1_snapshot::write_catalog_snapshot_in_dir(
                 &self.storage,
-                intent.source_logical_sequence(),
+                token.logical_sequence(),
                 &directory,
                 &state,
             )
             .await?;
             // The immutable audit artifact lands after the snapshot files and
-            // before the snapshot manifest. `materialize` returns Ok, and so
-            // lets the intent be acknowledged, only after this put succeeds;
+            // before the snapshot manifest. Publication returns Ok, and so
+            // lets the record be acknowledged, only after this put succeeds;
             // writing it before the manifest also makes a published manifest
             // imply an audit file.
             self.publish_audit_artifact(&audit_path, audit_bytes)
                 .await?;
             let manifest_path = format!("{directory}manifest.json");
-            let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
-                CatalogError::Serialization {
-                    message: format!("catalog projection manifest encode failed: {error}"),
-                }
-            })?);
-            match self
-                .storage
-                .put_raw(
-                    &manifest_path,
-                    manifest_bytes.clone(),
-                    WritePrecondition::DoesNotExist,
-                )
-                .await?
-            {
-                WriteResult::Success { .. } => {}
-                WriteResult::PreconditionFailed { .. } => {
-                    let existing = self.storage.get_raw(&manifest_path).await?;
-                    let published: crate::manifest::SnapshotInfo =
-                        serde_json::from_slice(&existing).map_err(|error| {
-                            CatalogError::Serialization {
-                                message: format!(
-                                    "catalog projection manifest decode failed: {error}"
-                                ),
-                            }
-                        })?;
-                    // At-least-once delivery retains the first publication time.
-                    // Every other manifest field and all immutable file bytes must agree.
-                    snapshot.published_at = published.published_at;
-                    let retry_bytes = serde_json::to_vec(&snapshot).map_err(|error| {
-                        CatalogError::Serialization {
-                            message: format!("catalog projection manifest encode failed: {error}"),
-                        }
-                    })?;
-                    if existing.as_ref() != retry_bytes {
-                        return Err(CatalogError::PreconditionFailed {
-                            message:
-                                "catalog projection manifest already exists with different bytes"
-                                    .to_string(),
-                        });
-                    }
-                }
-            }
+            self.publish_snapshot_manifest(&manifest_path, snapshot)
+                .await?;
             Ok(manifest_path)
         })
         .await
+    }
+
+    /// Writes one snapshot manifest under a does-not-exist precondition. An
+    /// existing manifest is accepted only when it differs from `snapshot` in
+    /// nothing but its first publication time.
+    async fn publish_snapshot_manifest(
+        &self,
+        manifest_path: &str,
+        mut snapshot: crate::manifest::SnapshotInfo,
+    ) -> Result<()> {
+        let manifest_bytes = Bytes::from(serde_json::to_vec(&snapshot).map_err(|error| {
+            CatalogError::Serialization {
+                message: format!("catalog projection manifest encode failed: {error}"),
+            }
+        })?);
+        match self
+            .storage
+            .put_raw(
+                manifest_path,
+                manifest_bytes,
+                WritePrecondition::DoesNotExist,
+            )
+            .await?
+        {
+            WriteResult::Success { .. } => Ok(()),
+            WriteResult::PreconditionFailed { .. } => {
+                let existing = self.storage.get_raw(manifest_path).await?;
+                let published: crate::manifest::SnapshotInfo = serde_json::from_slice(&existing)
+                    .map_err(|error| CatalogError::Serialization {
+                        message: format!("catalog projection manifest decode failed: {error}"),
+                    })?;
+                // At-least-once delivery retains the first publication time.
+                // Every other manifest field and all immutable file bytes must agree.
+                snapshot.published_at = published.published_at;
+                let retry_bytes =
+                    serde_json::to_vec(&snapshot).map_err(|error| CatalogError::Serialization {
+                        message: format!("catalog projection manifest encode failed: {error}"),
+                    })?;
+                if existing.as_ref() == retry_bytes {
+                    Ok(())
+                } else {
+                    Err(CatalogError::PreconditionFailed {
+                        message: "catalog projection manifest already exists with different bytes"
+                            .to_string(),
+                    })
+                }
+            }
+        }
     }
 
     /// Writes one immutable audit artifact under a does-not-exist
@@ -1763,13 +1833,108 @@ impl CatalogProjectionMaterializer {
             }
         }
     }
+
+    /// Settles a failed materialization. A retryable error is recorded as a
+    /// retryable failure observed at `observed_sequence` and returned, so the
+    /// record is redelivered; any other error is logged and quarantines the
+    /// record at its origin `source_sequence` under `terminal_code`.
+    async fn settle_failure(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+        source_sequence: u64,
+        observed_sequence: u64,
+        error: CatalogError,
+        terminal_code: &str,
+        at_ms: i64,
+    ) -> Result<ProjectionOutboxProcessDisposition> {
+        let retryable = matches!(
+            error,
+            CatalogError::Storage { .. }
+                | CatalogError::CasFailed { .. }
+                | CatalogError::MaintenanceBackpressure { .. }
+                | CatalogError::AmbiguousAuthorityOutcome { .. }
+        );
+        if retryable {
+            projection_measurement::phase(
+                "projection-status-ack",
+                self.status.record_projection_failure(
+                    CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+                    observed_sequence,
+                    "CATALOG_PROJECTION_FAILED",
+                    true,
+                    at_ms,
+                ),
+            )
+            .await?;
+            return Err(error);
+        }
+        warn!(
+            record_id = record.record_id(),
+            source_sequence,
+            failure_code = terminal_code,
+            error = %error,
+            "catalog projection intent quarantined"
+        );
+        self.quarantine(record, source_sequence, terminal_code, at_ms)
+            .await
+    }
+
+    /// Records a durable terminal disposition for `record`; it is never
+    /// acknowledged.
+    async fn quarantine(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+        source_sequence: u64,
+        failure_code: &str,
+        at_ms: i64,
+    ) -> Result<ProjectionOutboxProcessDisposition> {
+        projection_measurement::phase(
+            "projection-status-ack",
+            self.status.record_projection_quarantine(
+                CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+                source_sequence,
+                record.record_id(),
+                failure_code,
+                at_ms,
+            ),
+        )
+        .await?;
+        Ok(ProjectionOutboxProcessDisposition::Quarantined)
+    }
+}
+
+/// The `system.catalog.audit` row of one authenticated catalog restore.
+///
+/// A restore has no adapter audit record, so the row is derived from the
+/// restore notice record and the restore's result manifest: operation id =
+/// the notice record id (`restore:{restore_id}:{attempt}:{domain}`), family
+/// `restore_domain`, request digest = SHA-256 hex of the notice payload bytes,
+/// actor `restore`, occurrence = the result manifest's `committed_at_ms`,
+/// logical sequence = the result sequence, authority manifest = the result
+/// manifest. Every input is committed and deterministic, so a redelivery
+/// rebuilds identical audit bytes.
+fn restore_audit_row(
+    record: &ControlMvpProjectionOutboxRecord,
+    restore: &ControlMvpResolvedRestoreNotice,
+) -> CatalogAuditRow {
+    CatalogAuditRow {
+        record_version: RECORD_VERSION,
+        operation_id: record.record_id().to_string(),
+        operation_family: RESTORE_AUDIT_OPERATION_FAMILY.to_string(),
+        request_digest: sha256_hex(record.payload()),
+        actor: RESTORE_AUDIT_ACTOR.to_string(),
+        occurred_at_ms: restore.committed_at_ms(),
+        logical_sequence: restore.notice().result_logical_sequence(),
+        authority_manifest_id: Some(restore.result_manifest_id().to_string()),
+        logical_commit_id: None,
+    }
 }
 
 #[async_trait::async_trait]
 impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
     async fn process(
         &self,
-        record: &crate::state_store::ControlMvpProjectionOutboxRecord,
+        record: &ControlMvpProjectionOutboxRecord,
     ) -> Result<ProjectionOutboxProcessDisposition> {
         let at_ms = Utc::now().timestamp_millis();
         let source_sequence =
@@ -1779,30 +1944,47 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                     message: "committed catalog projection intent is missing its origin sequence"
                         .to_string(),
                 })?;
-        let intent: ProjectionIntentV1 =
-            if let Ok(intent) = serde_json::from_slice(record.payload()) {
-                intent
-            } else {
-                projection_measurement::phase(
-                    "projection-status-ack",
-                    self.status.record_projection_quarantine(
-                        CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+        // A restore notice is recognised before the intent decode: it is not
+        // a projection intent, and one that fails authentication is
+        // quarantined as an invalid notice.
+        let restore = match self.source.resolve_restore_notice_source(record).await {
+            Ok(restore) => restore,
+            Err(error) => {
+                return self
+                    .settle_failure(
+                        record,
                         source_sequence,
-                        record.record_id(),
-                        "INVALID_PROJECTION_INTENT",
+                        source_sequence,
+                        error,
+                        "INVALID_RESTORE_NOTICE",
                         at_ms,
-                    ),
-                )
-                .await?;
-                return Ok(ProjectionOutboxProcessDisposition::Quarantined);
+                    )
+                    .await;
+            }
+        };
+        let (applied_sequence, materialized) = if let Some(restore) = restore {
+            (
+                restore.notice().result_logical_sequence(),
+                self.materialize_restore(record, &restore).await,
+            )
+        } else {
+            let Ok(intent) = serde_json::from_slice::<ProjectionIntentV1>(record.payload()) else {
+                return self
+                    .quarantine(record, source_sequence, "INVALID_PROJECTION_INTENT", at_ms)
+                    .await;
             };
-        match self.materialize(&intent, record).await {
+            (
+                intent.source_logical_sequence(),
+                self.materialize(&intent, record).await,
+            )
+        };
+        match materialized {
             Ok(manifest_path) => {
                 projection_measurement::phase(
                     "projection-status-ack",
                     self.status.record_projection_success(
                         CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
-                        intent.source_logical_sequence(),
+                        applied_sequence,
                         &manifest_path,
                         at_ms,
                     ),
@@ -1811,46 +1993,15 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                 Ok(ProjectionOutboxProcessDisposition::Materialized)
             }
             Err(error) => {
-                let retryable = matches!(
+                self.settle_failure(
+                    record,
+                    source_sequence,
+                    applied_sequence,
                     error,
-                    CatalogError::Storage { .. }
-                        | CatalogError::CasFailed { .. }
-                        | CatalogError::MaintenanceBackpressure { .. }
-                        | CatalogError::AmbiguousAuthorityOutcome { .. }
-                );
-                if retryable {
-                    projection_measurement::phase(
-                        "projection-status-ack",
-                        self.status.record_projection_failure(
-                            CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
-                            intent.source_logical_sequence(),
-                            "CATALOG_PROJECTION_FAILED",
-                            true,
-                            at_ms,
-                        ),
-                    )
-                    .await?;
-                    Err(error)
-                } else {
-                    warn!(
-                        record_id = record.record_id(),
-                        source_sequence,
-                        error = %error,
-                        "catalog projection intent quarantined"
-                    );
-                    projection_measurement::phase(
-                        "projection-status-ack",
-                        self.status.record_projection_quarantine(
-                            CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
-                            source_sequence,
-                            record.record_id(),
-                            "INCOMPATIBLE_PROJECTION_INTENT",
-                            at_ms,
-                        ),
-                    )
-                    .await?;
-                    Ok(ProjectionOutboxProcessDisposition::Quarantined)
-                }
+                    "INCOMPATIBLE_PROJECTION_INTENT",
+                    at_ms,
+                )
+                .await
             }
         }
     }
@@ -5689,7 +5840,7 @@ mod bounded_catalog_tests {
         impl ProjectionOutboxHandler for Handler {
             async fn process(
                 &self,
-                _record: &crate::ControlMvpProjectionOutboxRecord,
+                _record: &ControlMvpProjectionOutboxRecord,
             ) -> Result<ProjectionOutboxProcessDisposition> {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 Ok(ProjectionOutboxProcessDisposition::Materialized)

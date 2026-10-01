@@ -1054,6 +1054,120 @@ impl ControlMvpStateStore {
         })
     }
 
+    /// Recognises a restore notice in this domain's projection outbox and
+    /// authenticates it against the restore commit it announces.
+    ///
+    /// Returns `Ok(None)` without any read when the record id does not start
+    /// with `restore:`: the record does not claim to be a restore notice.
+    /// Every record whose id starts with `restore:` claims to be one, and it
+    /// is returned resolved only when all of these hold:
+    ///
+    /// 1. its payload decodes as a restore notice with exactly the five
+    ///    notice fields and is byte-for-byte the canonical encoding the
+    ///    restore writes;
+    /// 2. its id is `restore:{restore_id}:{participant_attempt}:{domain}` of
+    ///    that payload, and those name a valid restore attempt identity;
+    /// 3. the payload's domain is this store's domain;
+    /// 4. the record committed at the payload's result sequence;
+    /// 5. walking authenticated ancestry from the root the record was read at
+    ///    (not newer than it) finds the commit manifest at the result
+    ///    sequence, skipping any maintenance or retention-horizon rewrite
+    ///    published at that sequence since;
+    /// 6. that commit is a restore: its manifest and transaction ids are
+    ///    restore-rendered for that sequence, and the transaction's request
+    ///    id is the record id.
+    ///
+    /// Only the manifests on that path and the commit's transaction metadata
+    /// are read, never state. The returned token reads the restored state at
+    /// the restore's own manifest.
+    ///
+    /// # Errors
+    ///
+    /// - [`CatalogError::Validation`] when the record itself is not a
+    ///   well-formed notice of this domain: checks 1 to 4 (an uncommitted
+    ///   record fails check 4).
+    /// - [`CatalogError::InvariantViolation`] when the record is well formed
+    ///   but the authenticated lineage refutes it: it carries no
+    ///   authenticated observed root (it was not read from a committed
+    ///   outbox), its root is of another scope or older than the result
+    ///   sequence, or checks 5 and 6 fail. A notice-shaped record committed
+    ///   by a plain transaction fails here.
+    /// - Storage and ambiguous-authority errors when the lineage or the
+    ///   transaction metadata cannot be read; these are retryable.
+    pub async fn resolve_restore_notice_source(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+    ) -> Result<Option<ControlMvpResolvedRestoreNotice>> {
+        if !record
+            .record_id()
+            .starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
+        {
+            return Ok(None);
+        }
+        let notice = decode_restore_notice_record(record, self.scope.domain())?;
+        let sequence = notice.result_logical_sequence;
+        let observed = record.observed_root.as_ref().ok_or_else(|| {
+            invariant_violation("restore notice has no authenticated observed root")
+        })?;
+        if observed.scope() != &self.scope || observed.logical_sequence() < sequence {
+            return Err(invariant_violation(
+                "restore notice result is not in the authenticated root it was read at",
+            ));
+        }
+        let commit = self
+            .resolve_ancestor(
+                observed.authority_manifest_id(),
+                observed.manifest_witness()?,
+                |manifest, digest| {
+                    if manifest.logical_sequence < sequence {
+                        return Some(None);
+                    }
+                    (manifest.logical_sequence == sequence
+                        && manifest.equivalence.is_none()
+                        && manifest.retention_horizon.is_none())
+                    .then(|| {
+                        Some(RestoreNoticeCommit {
+                            manifest_id: manifest.manifest_id.clone(),
+                            manifest_digest: digest.to_string(),
+                            committed_at_ms: manifest.committed_at_ms,
+                            tx_ref: manifest.tx_refs.last().cloned(),
+                        })
+                    })
+                },
+            )
+            .await?
+            .flatten()
+            .ok_or_else(|| {
+                invariant_violation("restore notice result is absent from authenticated lineage")
+            })?;
+        let tx_ref = commit
+            .tx_ref
+            .as_ref()
+            .filter(|tx_ref| {
+                tx_ref.sequence == sequence
+                    && tx_ref
+                        .tx_id
+                        .starts_with(&format!("tx-restore-{sequence:020}-"))
+                    && commit
+                        .manifest_id
+                        .starts_with(&format!("manifest-{sequence:020}-restore-"))
+            })
+            .ok_or_else(|| invariant_violation("restore notice was not committed by a restore"))?;
+        let tx = self.load_tx_metadata(tx_ref).await?;
+        if tx.request_id.as_deref() != Some(record.record_id()) {
+            return Err(invariant_violation(
+                "restore notice was not committed by a restore that carries it",
+            ));
+        }
+        Ok(Some(ControlMvpResolvedRestoreNotice {
+            notice,
+            token: self
+                .token(commit.manifest_id, sequence)
+                .with_manifest_witness(commit.manifest_digest),
+            committed_at_ms: commit.committed_at_ms,
+        }))
+    }
+
     async fn load_current_base_state(&self) -> Result<ControlMvpBase> {
         self.pin_transaction_base().await?.materialize(self).await
     }
@@ -4686,6 +4800,103 @@ impl ControlMvpOutboxTrimTarget {
     }
 }
 
+/// Outbox record id prefix of a restore notice. Every record id with this
+/// prefix claims to be one; catalog projection intent ids never take it.
+const RESTORE_NOTICE_RECORD_ID_PREFIX: &str = "restore:";
+
+/// Read-only view of the projection outbox notice a committed Control MVP
+/// restore carries.
+///
+/// A restore commit stages exactly one outbox record and no projection
+/// intent: its id is `restore:{restore_id}:{participant_attempt}:{domain}`,
+/// and its payload is the canonical JSON of the five fields this view
+/// exposes. The record is an announcement, not a projection intent; a
+/// projection consumer materializes the restored state at
+/// [`Self::result_logical_sequence`]. Views are obtained only from
+/// [`ControlMvpStateStore::resolve_restore_notice_source`], which
+/// authenticates the record against the committed restore first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpRestoreNoticeView {
+    restore_id: String,
+    participant_attempt: u64,
+    domain: String,
+    source_logical_sequence: u64,
+    result_logical_sequence: u64,
+}
+
+impl ControlMvpRestoreNoticeView {
+    /// Returns the workspace restore id.
+    #[must_use]
+    pub fn restore_id(&self) -> &str {
+        &self.restore_id
+    }
+
+    /// Returns the restore participant attempt that committed the restore.
+    #[must_use]
+    pub const fn participant_attempt(&self) -> u64 {
+        self.participant_attempt
+    }
+
+    /// Returns the restored state domain.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Returns the logical sequence of the restore source (the checkpoint or
+    /// retained root whose state was restored).
+    #[must_use]
+    pub const fn source_logical_sequence(&self) -> u64 {
+        self.source_logical_sequence
+    }
+
+    /// Returns the logical sequence of the restore commit itself, which is
+    /// also the notice record's origin sequence.
+    #[must_use]
+    pub const fn result_logical_sequence(&self) -> u64 {
+        self.result_logical_sequence
+    }
+}
+
+/// A restore notice authenticated against the committed restore it
+/// announces; see [`ControlMvpStateStore::resolve_restore_notice_source`].
+#[derive(Debug, Clone)]
+pub struct ControlMvpResolvedRestoreNotice {
+    notice: ControlMvpRestoreNoticeView,
+    token: StateToken,
+    committed_at_ms: i64,
+}
+
+impl ControlMvpResolvedRestoreNotice {
+    /// Returns the decoded notice.
+    #[must_use]
+    pub const fn notice(&self) -> &ControlMvpRestoreNoticeView {
+        &self.notice
+    }
+
+    /// Returns a read token at the restore's result manifest: the manifest
+    /// that committed the restore, at the notice's result sequence. Reading
+    /// at it yields the restored state, whatever later maintenance or
+    /// retention-horizon rewrites published at the same sequence.
+    #[must_use]
+    pub const fn token(&self) -> &StateToken {
+        &self.token
+    }
+
+    /// Returns the id of the restore's result manifest.
+    #[must_use]
+    pub fn result_manifest_id(&self) -> &str {
+        self.token.authority_manifest_id()
+    }
+
+    /// Returns the result manifest's `committed_at_ms` stamp: when the
+    /// restore was rendered for commit, in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn committed_at_ms(&self) -> i64 {
+        self.committed_at_ms
+    }
+}
+
 /// Durable deterministic evidence for one Control MVP restore participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -7381,13 +7592,75 @@ struct RenderedControlMvpStateSegment {
     index_bytes: Bytes,
 }
 
+/// Wire payload of a restore notice. Decoding denies unknown fields;
+/// encoding is unchanged (the field set and order are the wire contract).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlMvpRestoreNotice {
     restore_id: String,
     participant_attempt: u64,
     domain: String,
     source_logical_sequence: u64,
     result_logical_sequence: u64,
+}
+
+/// The commit manifest found at a restore notice's result sequence.
+struct RestoreNoticeCommit {
+    manifest_id: String,
+    manifest_digest: String,
+    committed_at_ms: i64,
+    tx_ref: Option<ControlMvpTxRef>,
+}
+
+/// Checks a `restore:` record's own content (checks 1 to 4 of
+/// `resolve_restore_notice_source`); every failure is a validation error.
+fn decode_restore_notice_record(
+    record: &ControlMvpProjectionOutboxRecord,
+    domain: &str,
+) -> Result<ControlMvpRestoreNoticeView> {
+    let notice: ControlMvpRestoreNotice =
+        serde_json::from_slice(record.payload()).map_err(|error| CatalogError::Validation {
+            message: format!(
+                "restore notice {} payload does not decode: {error}",
+                record.record_id()
+            ),
+        })?;
+    if encode_json_vec(&notice, "restore notice")? != record.payload().as_ref() {
+        return Err(validation_failed("restore notice payload is not canonical"));
+    }
+    if record.record_id()
+        != format!(
+            "{RESTORE_NOTICE_RECORD_ID_PREFIX}{}:{}:{}",
+            notice.restore_id, notice.participant_attempt, notice.domain
+        )
+    {
+        return Err(validation_failed(
+            "restore notice record id does not match its payload",
+        ));
+    }
+    RestoreAttemptIdentity::new(
+        notice.restore_id.as_str(),
+        notice.participant_attempt,
+        notice.domain.as_str(),
+    )
+    .map_err(|error| CatalogError::Validation {
+        message: format!("restore notice names an invalid restore identity: {error}"),
+    })?;
+    if notice.domain != domain {
+        return Err(validation_failed("restore notice names another domain"));
+    }
+    if record.origin_sequence() != Some(notice.result_logical_sequence) {
+        return Err(validation_failed(
+            "restore notice was not committed at its result sequence",
+        ));
+    }
+    Ok(ControlMvpRestoreNoticeView {
+        restore_id: notice.restore_id,
+        participant_attempt: notice.participant_attempt,
+        domain: notice.domain,
+        source_logical_sequence: notice.source_logical_sequence,
+        result_logical_sequence: notice.result_logical_sequence,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -12553,6 +12826,101 @@ mod tests {
                     .unwrap(),
                 RestoreParticipantInspection::Visible { .. }
             ));
+        }
+    }
+
+    /// The restore notice recogniser trusts only the authenticated root the
+    /// record was read at: a record without one, with one older than the
+    /// result sequence, or with one of another scope is an invariant
+    /// violation, while the record read from the outbox resolves.
+    #[tokio::test]
+    async fn restore_notice_recognition_requires_the_authenticated_root_it_was_read_at() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope).unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"v1")).await.unwrap();
+        txn.commit().await.unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let source = store
+            .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+            .await
+            .unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"v2")).await.unwrap();
+        let before_restore = txn.commit().await.unwrap().state_token().clone();
+        let participant = ControlMvpRestoreParticipant::new(store.clone());
+        let plan = participant
+            .plan_restore(
+                &source,
+                &RestoreAttemptIdentity::new("rst_00000000000000000000000401", 1, "catalog")
+                    .unwrap(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        participant.apply_restore(&plan, Utc::now()).await.unwrap();
+        let notice = store
+            .current_projection_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                record
+                    .record_id()
+                    .starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
+            })
+            .unwrap();
+        assert!(
+            store
+                .resolve_restore_notice_source(&notice)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let other = ControlMvpStateStore::new(
+            storage,
+            StateScope::new("tenant", "workspace", "orchestration"),
+        )
+        .unwrap();
+        let foreign_root = other
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap()
+            .state_token()
+            .clone();
+        for (root, reason) in [
+            (None, "no authenticated observed root"),
+            (Some(before_restore), "not in the authenticated root"),
+            (Some(foreign_root), "not in the authenticated root"),
+        ] {
+            let mut forged = notice.clone();
+            forged.observed_root = root;
+            let error = store
+                .resolve_restore_notice_source(&forged)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    CatalogError::InvariantViolation { message } if message.contains(reason)
+                ),
+                "expected an invariant violation naming {reason:?}, got {error:?}"
+            );
         }
     }
 

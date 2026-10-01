@@ -50,11 +50,11 @@ pub use control_mvp::{
     ControlMvpMaintenanceOutcome, ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget,
     ControlMvpPaths, ControlMvpProjectionOutboxRecord, ControlMvpReadCache,
     ControlMvpReadCacheConfig, ControlMvpReadCachePoolStatistics, ControlMvpReadCacheStatistics,
-    ControlMvpRestoreFenceWitness, ControlMvpRestoreParticipant, ControlMvpRestorePlan,
-    ControlMvpRestorePlanV7, ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding,
-    DurableMaintenanceWorker, MaintenanceJobId, MaintenanceKind, MaintenanceProgress,
-    MaintenanceStatus, PreparedMaintenance, ProjectionIntentV2, PurgedCounts, RestoreKeyPolicy,
-    control_mvp_outbox_event_id,
+    ControlMvpResolvedRestoreNotice, ControlMvpRestoreFenceWitness, ControlMvpRestoreNoticeView,
+    ControlMvpRestoreParticipant, ControlMvpRestorePlan, ControlMvpRestorePlanV7,
+    ControlMvpStateStore, ControlMvpTxn, DurableAuthorityBinding, DurableMaintenanceWorker,
+    MaintenanceJobId, MaintenanceKind, MaintenanceProgress, MaintenanceStatus, PreparedMaintenance,
+    ProjectionIntentV2, PurgedCounts, RestoreKeyPolicy, control_mvp_outbox_event_id,
 };
 pub use model::{ModelCommitRecord, ModelStateStore, ModelWrite};
 

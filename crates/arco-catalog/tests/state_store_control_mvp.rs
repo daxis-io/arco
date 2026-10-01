@@ -3423,6 +3423,354 @@ async fn restore_empty_current_base_extends_source_lineage_and_retries_idempoten
     ));
 }
 
+/// The canonical restore notice payload shape, for forging notices.
+#[derive(serde::Serialize)]
+struct ForgedRestoreNotice<'a> {
+    restore_id: &'a str,
+    participant_attempt: u64,
+    domain: &'a str,
+    source_logical_sequence: u64,
+    result_logical_sequence: u64,
+}
+
+/// Renders a forged outbox payload for the sequence it commits at.
+type ForgedPayload = Box<dyn FnOnce(u64) -> Vec<u8>>;
+
+/// The canonical bytes of a forged restore notice.
+fn forged_notice(restore_id: &str, domain: &str, source: u64, result: u64) -> Vec<u8> {
+    serde_json::to_vec(&ForgedRestoreNotice {
+        restore_id,
+        participant_attempt: 1,
+        domain,
+        source_logical_sequence: source,
+        result_logical_sequence: result,
+    })
+    .expect("encode forged notice")
+}
+
+/// Commits one raw outbox record through a plain control transaction and
+/// returns it as read back from the outbox at the new head. `payload`
+/// receives the sequence the record commits at.
+async fn commit_raw_outbox_record(
+    store: &ControlMvpStateStore,
+    record_id: &str,
+    options: TxnOptions,
+    payload: impl FnOnce(u64) -> Vec<u8>,
+) -> ControlMvpProjectionOutboxRecord {
+    let origin = store
+        .current_state_token()
+        .await
+        .expect("seeded head")
+        .logical_sequence()
+        + 1;
+    let mut txn = store
+        .begin_control_txn(options)
+        .await
+        .expect("begin raw transaction");
+    txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
+        record_id,
+        Bytes::from(payload(origin)),
+    ))
+    .await
+    .expect("stage raw outbox record");
+    txn.commit().await.expect("commit raw outbox record");
+    let record = store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .find(|record| record.record_id() == record_id)
+        .expect("the committed record");
+    assert_eq!(Some(origin), record.origin_sequence());
+    record
+}
+
+/// The restore notice recogniser ignores records that do not claim to be
+/// notices and authenticates a real notice against the restore commit at its
+/// result sequence: here a retention horizon has since published another
+/// manifest at that same sequence (the head the notice is read at), and the
+/// recogniser still resolves the restore's own manifest, whose state still
+/// holds the row the horizon purged.
+#[tokio::test]
+async fn restore_notice_recogniser_resolves_the_restore_commit_past_a_horizon_at_its_sequence() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let now = Utc::now();
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v1");
+    first
+        .put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("put v1");
+    first
+        .put_with_expiry(
+            b"catalog/expiring",
+            Bytes::from_static(b"expired"),
+            now.timestamp_millis() - 2 * 60 * 60 * 1000,
+        )
+        .await
+        .expect("put an expired row");
+    first.commit().await.expect("commit v1");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint v1");
+    let source = store
+        .persist_checkpoint_reference(&checkpoint, now + ChronoDuration::hours(1))
+        .await
+        .expect("persist checkpoint");
+    let plain_record =
+        commit_raw_outbox_record(&store, "op-not-a-notice", TxnOptions::default(), |_| {
+            b"{}".to_vec()
+        })
+        .await;
+
+    let participant = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = participant
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000201", 1, "catalog")
+                .expect("identity"),
+            now,
+        )
+        .await
+        .expect("plan");
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected a ControlMvp plan")
+    };
+    let RestoreParticipantInspection::Visible { token, .. } =
+        participant.apply_restore(&plan, now).await.expect("apply")
+    else {
+        panic!("the restore must become visible")
+    };
+    let manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(control.candidate_manifest_path())
+            .await
+            .expect("restore manifest"),
+    )
+    .expect("restore manifest JSON");
+    let committed_at_ms = manifest["payload"]["committed_at_ms"]
+        .as_i64()
+        .expect("committed_at_ms");
+
+    let horizon = durable_maintenance::horizon_pending(
+        &arco_catalog::DurableMaintenanceWorker::new(
+            storage.clone(),
+            scope(),
+            arco_catalog::DurableAuthorityBinding::new([41; 32]),
+        )
+        .expect("maintenance worker"),
+        now,
+    )
+    .await
+    .expect("drive the horizon")
+    .expect("the expired row admits a horizon");
+    let head = store.current_state_token().await.expect("horizon head");
+    assert_eq!(horizon.selected_token(), &head);
+    assert_eq!(token.logical_sequence(), head.logical_sequence());
+    assert_ne!(token.authority_manifest_id(), head.authority_manifest_id());
+    assert_eq!(
+        None,
+        store
+            .get(b"catalog/expiring")
+            .await
+            .expect("purged at the head")
+    );
+
+    let notice_id = "restore:rst_00000000000000000000000201:1:catalog";
+    let notice = store
+        .current_projection_outbox()
+        .await
+        .expect("outbox at the horizon head")
+        .into_iter()
+        .find(|record| record.record_id() == notice_id)
+        .expect("the restore notice");
+    assert!(
+        store
+            .resolve_restore_notice_source(&plain_record)
+            .await
+            .expect("a plain record is not a notice")
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_restore_notice_source(&ControlMvpProjectionOutboxRecord::new(
+                "op-staged",
+                Bytes::from_static(b"{}"),
+            ))
+            .await
+            .expect("an uncommitted plain record is not a notice")
+            .is_none()
+    );
+    let resolved = store
+        .resolve_restore_notice_source(&notice)
+        .await
+        .expect("an authentic notice")
+        .expect("a restore notice");
+    let view = resolved.notice();
+    assert_eq!("rst_00000000000000000000000201", view.restore_id());
+    assert_eq!(1, view.participant_attempt());
+    assert_eq!("catalog", view.domain());
+    assert_eq!(source.logical_sequence(), view.source_logical_sequence());
+    assert_eq!(token.logical_sequence(), view.result_logical_sequence());
+    assert_eq!(&token, resolved.token());
+    assert_eq!(
+        control.candidate_manifest_id(),
+        resolved.result_manifest_id()
+    );
+    assert_eq!(committed_at_ms, resolved.committed_at_ms());
+    let restored = store
+        .read_at(resolved.token().clone())
+        .await
+        .expect("read the restored state");
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        restored
+            .get(b"catalog/default")
+            .await
+            .expect("restored row")
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"expired")),
+        restored
+            .get(b"catalog/expiring")
+            .await
+            .expect("the restore commit still holds the purged row")
+    );
+}
+
+/// Asserts that resolving `record` is refused with the given error class and
+/// a message naming `reason`.
+async fn assert_notice_refused(
+    store: &ControlMvpStateStore,
+    record: &ControlMvpProjectionOutboxRecord,
+    invariant: bool,
+    reason: &str,
+) {
+    let error = store
+        .resolve_restore_notice_source(record)
+        .await
+        .expect_err("a forged notice is refused");
+    let (class, message) = match &error {
+        CatalogError::Validation { message } => (Some(false), message.as_str()),
+        CatalogError::InvariantViolation { message } => (Some(true), message.as_str()),
+        _ => (None, ""),
+    };
+    assert_eq!(
+        Some(invariant),
+        class,
+        "{}: unexpected error class {error:?}",
+        record.record_id()
+    );
+    assert!(
+        message.contains(reason),
+        "{}: expected a refusal naming {reason:?}, got {message:?}",
+        record.record_id()
+    );
+}
+
+/// A record whose id claims to be a restore notice but is not the notice of
+/// a committed restore of this domain is refused: a validation error when
+/// the record itself is malformed, an invariant violation when it is
+/// well-formed but the authenticated lineage holds no restore that carries
+/// it (here a plain transaction committed it, even with the notice id as its
+/// request id).
+#[tokio::test]
+async fn forged_restore_notices_are_refused_with_typed_errors() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let mut seed = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin seed");
+    seed.put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("seed row");
+    seed.commit().await.expect("commit seed");
+
+    let id = |ordinal: u32, domain: &str| format!("restore:rst_{ordinal:026}:1:{domain}");
+    let rid = |ordinal: u32| format!("rst_{ordinal:026}");
+    let cases: Vec<(String, ForgedPayload, bool, &str)> = vec![
+        (
+            id(301, "catalog"),
+            Box::new(|_| b"{\"restore_id\":".to_vec()),
+            false,
+            "does not decode",
+        ),
+        (
+            id(302, "catalog"),
+            Box::new(move |origin| {
+                let mut notice: Value =
+                    serde_json::from_slice(&forged_notice(&rid(302), "catalog", 1, origin))
+                        .expect("notice JSON");
+                notice["unexpected"] = Value::from(1);
+                serde_json::to_vec(&notice).expect("encode")
+            }),
+            false,
+            "does not decode",
+        ),
+        (
+            id(303, "catalog"),
+            Box::new(move |origin| {
+                let notice: Value =
+                    serde_json::from_slice(&forged_notice(&rid(303), "catalog", 1, origin))
+                        .expect("notice JSON");
+                serde_json::to_vec_pretty(&notice).expect("encode")
+            }),
+            false,
+            "not canonical",
+        ),
+        (
+            id(304, "catalog"),
+            Box::new(move |origin| forged_notice(&rid(399), "catalog", 1, origin)),
+            false,
+            "does not match its payload",
+        ),
+        (
+            "restore:x:1:catalog".to_string(),
+            Box::new(|origin| forged_notice("x", "catalog", 1, origin)),
+            false,
+            "restore identity",
+        ),
+        (
+            id(306, "orchestration"),
+            Box::new(move |origin| forged_notice(&rid(306), "orchestration", 1, origin)),
+            false,
+            "another domain",
+        ),
+        (
+            id(307, "catalog"),
+            Box::new(move |origin| forged_notice(&rid(307), "catalog", 1, origin + 1)),
+            false,
+            "result sequence",
+        ),
+    ];
+    for (record_id, payload, invariant, reason) in cases {
+        let record =
+            commit_raw_outbox_record(&store, &record_id, TxnOptions::default(), payload).await;
+        assert_notice_refused(&store, &record, invariant, reason).await;
+    }
+
+    let consistent = id(308, "catalog");
+    let record = commit_raw_outbox_record(
+        &store,
+        &consistent,
+        TxnOptions::new(Some(scope())).with_request_id(consistent.clone()),
+        |origin| forged_notice(&rid(308), "catalog", 1, origin),
+    )
+    .await;
+    assert_notice_refused(&store, &record, true, "not committed by a restore").await;
+
+    let staged = ControlMvpProjectionOutboxRecord::new(
+        id(309, "catalog"),
+        Bytes::from(forged_notice(&rid(309), "catalog", 1, 2)),
+    );
+    assert_notice_refused(&store, &staged, false, "result sequence").await;
+}
+
 #[tokio::test]
 async fn restore_empty_current_base_competing_first_writer_is_superseded_without_overwrite() {
     let (_backend, storage) = storage();

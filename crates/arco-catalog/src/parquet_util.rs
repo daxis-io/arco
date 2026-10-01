@@ -192,6 +192,10 @@ pub struct CatalogCommitRecord {
 /// projection: the audit record a `control/v1` catalog mutation carries in its
 /// projection intent, flattened to one row.
 ///
+/// A catalog restore has no such record; the projection derives its row from
+/// the restore notice (family `restore_domain`, actor `restore`; see the field
+/// docs).
+///
 /// Every row materialized today comes from a production (authority format 9)
 /// record and carries `authority_manifest_id`; `logical_commit_id` is
 /// reserved for a future materializer of the test-only bounded format 8's
@@ -204,22 +208,28 @@ pub struct CatalogAuditRow {
     /// Version of the source audit record; always `1`, the production record,
     /// today.
     pub record_version: u32,
-    /// Operation identifier; also the projection intent identifier.
+    /// Operation identifier; also the projection intent identifier. For a
+    /// restore, the restore notice's outbox record id
+    /// (`restore:{restore_id}:{attempt}:{domain}`).
     pub operation_id: String,
-    /// Operation family, for example `create_catalog`.
+    /// Operation family, for example `create_catalog`; `restore_domain` for a
+    /// restore.
     pub operation_family: String,
-    /// Canonical digest of the request.
+    /// Canonical digest of the request; for a restore, the SHA-256 hex of the
+    /// restore notice payload bytes.
     pub request_digest: String,
-    /// Actor that issued the mutation.
+    /// Actor that issued the mutation; `restore` for a restore.
     pub actor: String,
     /// When the adapter accepted the mutation, in milliseconds since the Unix
-    /// epoch (UTC).
+    /// epoch (UTC); for a restore, the `committed_at_ms` stamp of the
+    /// restore's result manifest.
     pub occurred_at_ms: i64,
-    /// Committed logical sequence of the mutation. Stored as `Int64`, so
-    /// values above `i64::MAX` are rejected on write.
+    /// Committed logical sequence of the mutation (of a restore, its result
+    /// sequence). Stored as `Int64`, so values above `i64::MAX` are rejected
+    /// on write.
     pub logical_sequence: u64,
-    /// Authority manifest that committed the mutation; set on every row
-    /// materialized today.
+    /// Authority manifest that committed the mutation or restore; set on
+    /// every row materialized today.
     pub authority_manifest_id: Option<String>,
     /// Physical-layout-independent logical commit identity of a bounded
     /// format 8 mutation. Reserved for a future materializer of those intents;

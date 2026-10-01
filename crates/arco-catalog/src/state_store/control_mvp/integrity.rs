@@ -318,7 +318,8 @@ impl Canonical {
         Ok(this)
     }
     /// A framing for a value that belongs to no authority root: the domain
-    /// tag and framing version only.
+    /// tag and framing version only. Invariant: each domain tag is used with
+    /// exactly one framing, scoped or unscoped, never both.
     fn unscoped(tag: &[u8]) -> Self {
         let mut this = Self(Vec::new());
         this.bytes(tag);

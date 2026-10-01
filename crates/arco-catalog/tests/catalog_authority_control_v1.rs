@@ -2877,7 +2877,7 @@ fn catalog_restore_key_policy_excludes_only_the_receipt_prefix() {
 /// plain restore rules: kept when the checkpoint holds it, deleted when only
 /// the current head does.
 #[tokio::test]
-async fn restore_never_restores_receipts_and_a_replay_reapplies() {
+async fn restore_never_restores_receipts_and_a_replay_re_executes() {
     let storage = scoped_storage();
     let authority = ControlCatalogAuthority::new(storage.clone(), scope())
         .expect("control authority")

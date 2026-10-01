@@ -178,6 +178,95 @@ async fn disjoint_restore_diff_exceeds_one_l0_with_small_injected_limits() {
     );
 }
 
+/// Receipt-like rows identical in the source and the current state need no
+/// write under the plain rules, but a receipt key policy deletes every one of
+/// them, so the excluded-key deletes alone can overflow the restore's single
+/// L0. The restore then fails `Validation`, naming the restore and its write
+/// counts, and HEAD does not move.
+#[tokio::test]
+async fn excluded_key_deletes_alone_can_exceed_one_restore_l0_with_small_injected_limits() {
+    let storage =
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+    let scope = StateScope::new("tenant", "workspace", "catalog");
+    let store = ControlMvpStateStore::new(storage, scope)
+        .unwrap()
+        .with_checkpoint_interval(NonZeroU64::new(1).unwrap())
+        .with_segment_limits(SegmentLimits {
+            rows: 32,
+            ..PRODUCTION_SEGMENT_LIMITS
+        });
+    // Forty receipts in two commits, so no commit's own L0 exceeds 32 rows.
+    for batch in 0_u8..2 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        for n in 0_u8..20 {
+            txn.put_with_expiry(&[0x03, batch, n], Bytes::from_static(b"receipt"), 5)
+                .await
+                .unwrap();
+        }
+        txn.commit().await.unwrap();
+    }
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    txn.put(b"plain", Bytes::from_static(b"v1")).await.unwrap();
+    txn.commit().await.unwrap();
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::default())
+        .await
+        .unwrap();
+    let source = store
+        .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+        .await
+        .unwrap();
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .unwrap();
+    txn.put(b"plain", Bytes::from_static(b"v2")).await.unwrap();
+    txn.commit().await.unwrap();
+    let before = store.current_state_token().await.unwrap();
+    let identity =
+        RestoreAttemptIdentity::new("rst_00000000000000000000000041", 1, "catalog").unwrap();
+
+    // Positive control: without a policy the identical receipts need no
+    // write and the one-put restore fits.
+    ControlMvpRestoreParticipant::new(store.clone())
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("the plain restore fits one L0");
+    let error = ControlMvpRestoreParticipant::new(store.clone())
+        .with_key_policy(RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap())
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .unwrap_err();
+    let CatalogError::Validation { message } = &error else {
+        panic!("an L0 overflow stays Validation: {error:?}");
+    };
+    assert!(
+        message.starts_with(
+            "Control MVP restore rst_00000000000000000000000041 attempt 1 of domain catalog \
+             does not fit one L0 segment (puts: 1, deletes: 0, excluded-key deletes: 40, plus \
+             one restore notice): "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("segment exceeds the supported row limit"),
+        "{message}"
+    );
+    assert_eq!(store.current_state_token().await.unwrap(), before);
+    println!(
+        "{}",
+        serde_json::json!({"case":"excluded-key-deletes-overflow-one-restore-l0",
+        "receipt_rows":40,"plain_puts":1,"injected_l0_rows":32,
+        "production_limits_changed":false,"head_unchanged":true,"error":error.to_string()})
+    );
+}
+
 #[tokio::test]
 #[ignore = "explicit full-size capacity encoding experiment; not a pilot workload"]
 async fn pilot_inventory_round_trips_through_bounded_production_l1_shards() {

@@ -119,8 +119,13 @@ pub fn catalog_restore_key_policy() -> RestoreKeyPolicy {
 ///
 /// Register this participant, rather than a plain
 /// [`ControlMvpRestoreParticipant::new`], for the catalog domain so that a
-/// restore never restores idempotency receipts. The key policy applies to the
-/// format-9 restore; bounded authority-8 planning refuses it.
+/// restore never restores idempotency receipts. The key policy governs
+/// rendering, not recognition of a committed restore: once a plan's
+/// transaction is in the lineage, inspection reports `Visible` whatever the
+/// policy, while an unapplied plan bound to another policy is superseded. A
+/// version-7 plan (which binds no policy) inspects `Superseded` even when its
+/// restore already landed, as version-6 plans do. The key policy applies to
+/// the format-9 restore; bounded authority-8 planning and advance refuse it.
 ///
 /// # Errors
 ///

@@ -6099,15 +6099,29 @@ async fn gate4_cancelled_multi_trim_stages_nothing() {
 // Per-row expiry hint (segment format 2)
 // ---------------------------------------------------------------------------
 
-/// Decodes `(record_kind, key, expires_at_ms)` for every row of a segment by
-/// walking its authenticated index directory block by block.
-async fn segment_row_expiries(
+/// Record kind of a KV row in a segment (`record_kind` column).
+const SEGMENT_RECORD_KV: u8 = 0;
+
+/// One decoded segment row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentRow {
+    kind: u8,
+    key: Vec<u8>,
+    /// `None` for a tombstone.
+    value: Option<Vec<u8>>,
+    generation: u64,
+    expires_at_ms: Option<i64>,
+}
+
+/// Decodes every row of a format-2 segment by walking its authenticated index
+/// directory block by block.
+async fn segment_rows(
     storage: &ScopedStorage,
     paths: &ControlMvpPaths,
     segment_id: &str,
     segment_path: &str,
-) -> Vec<(u8, Vec<u8>, Option<i64>)> {
-    use arrow::array::{Array, BinaryArray, Int64Array, UInt8Array};
+) -> Vec<SegmentRow> {
+    use arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array};
     use arrow::ipc::reader::FileReader;
     let index: Value = serde_json::from_slice(
         &storage
@@ -6138,40 +6152,44 @@ async fn segment_row_expiries(
         assert_eq!(9, reader.schema().fields().len(), "format-2 column count");
         for batch in reader {
             let batch = batch.expect("decode block batch");
-            let kinds = batch
-                .column(0)
-                .as_any()
+            let column = |index: usize| batch.column(index).as_any();
+            let kinds = column(0)
                 .downcast_ref::<UInt8Array>()
                 .expect("record_kind column");
-            let keys = batch
-                .column(1)
-                .as_any()
+            let keys = column(1).downcast_ref::<BinaryArray>().expect("key column");
+            let values = column(2)
                 .downcast_ref::<BinaryArray>()
-                .expect("key column");
-            let expiries = batch
-                .column(8)
-                .as_any()
+                .expect("value column");
+            let generations = column(3)
+                .downcast_ref::<UInt64Array>()
+                .expect("generation column");
+            let tombstones = column(4)
+                .downcast_ref::<BooleanArray>()
+                .expect("tombstone column");
+            let expiries = column(8)
                 .downcast_ref::<Int64Array>()
                 .expect("expires_at_ms column");
             for row in 0..batch.num_rows() {
-                rows.push((
-                    kinds.value(row),
-                    keys.value(row).to_vec(),
-                    (!expiries.is_null(row)).then(|| expiries.value(row)),
-                ));
+                rows.push(SegmentRow {
+                    kind: kinds.value(row),
+                    key: keys.value(row).to_vec(),
+                    value: (!tombstones.value(row)).then(|| values.value(row).to_vec()),
+                    generation: generations.value(row),
+                    expires_at_ms: (!expiries.is_null(row)).then(|| expiries.value(row)),
+                });
             }
         }
     }
     rows
 }
 
-fn kv_expiry(rows: &[(u8, Vec<u8>, Option<i64>)], key: &[u8]) -> Option<i64> {
+fn kv_expiry(rows: &[SegmentRow], key: &[u8]) -> Option<i64> {
     let matches = rows
         .iter()
-        .filter(|(kind, row_key, _)| *kind == 0 && row_key == key)
+        .filter(|row| row.kind == SEGMENT_RECORD_KV && row.key == key)
         .collect::<Vec<_>>();
     assert_eq!(1, matches.len(), "exactly one KV row for {key:?}");
-    matches[0].2
+    matches[0].expires_at_ms
 }
 
 async fn manifest_payload(storage: &ScopedStorage, paths: &ControlMvpPaths, id: &str) -> Value {
@@ -6254,7 +6272,7 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
     );
 
     // The L0 segment carries the hint on the expiring row and null elsewhere.
-    let l0 = segment_row_expiries(
+    let l0 = segment_rows(
         &storage,
         &paths,
         &first_tx_id,
@@ -6312,9 +6330,8 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
     let mut l1_rows = Vec::new();
     for state in base_states {
         let state_id = state["state_id"].as_str().expect("state id");
-        l1_rows.extend(
-            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
-        );
+        l1_rows
+            .extend(segment_rows(&storage, &paths, state_id, &paths.state_object(state_id)).await);
     }
     assert_eq!(
         Some(EXPIRES_AT_MS),
@@ -6359,9 +6376,8 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
         .expect("checkpoint states")
     {
         let state_id = state["state_id"].as_str().expect("state id");
-        checkpoint_rows.extend(
-            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
-        );
+        checkpoint_rows
+            .extend(segment_rows(&storage, &paths, state_id, &paths.state_object(state_id)).await);
     }
     assert_eq!(
         Some(EXPIRES_AT_MS),
@@ -6419,7 +6435,7 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
         .expect("restore transaction reference")
         .to_string();
     assert!(restore_tx_id.starts_with("tx-restore-"));
-    let restore_rows = segment_row_expiries(
+    let restore_rows = segment_rows(
         &storage,
         &paths,
         &restore_tx_id,
@@ -6465,8 +6481,7 @@ async fn expiry_changes_the_state_checksum_and_mutation_digest_but_plain_puts_ar
                 .expect("read transaction"),
         )
         .expect("decode transaction");
-        let rows =
-            segment_row_expiries(&storage, &paths, &tx_id, &paths.l0_segment_object(&tx_id)).await;
+        let rows = segment_rows(&storage, &paths, &tx_id, &paths.l0_segment_object(&tx_id)).await;
         assert_eq!(
             with_expiry.then_some(EXPIRES_AT_MS),
             kv_expiry(&rows, b"catalog/row")
@@ -6554,16 +6569,14 @@ fn delete(key: &[u8]) -> RestoreWrite {
 }
 
 /// Decodes every KV row of an applied restore plan's L0 segment as
-/// `(key, value, expires_at_ms)`, with `None` for a tombstone, by walking the
-/// segment's index directory block by block. These rows are the restore
-/// transaction's writes: transaction JSON never embeds state data.
+/// `(key, value, expires_at_ms)`, with `None` for a tombstone. These rows are
+/// the restore transaction's writes: transaction JSON never embeds state
+/// data.
 async fn applied_restore_writes(
     storage: &ScopedStorage,
     paths: &ControlMvpPaths,
     plan: &PersistedRestoreParticipantPlan,
 ) -> Vec<RestoreWrite> {
-    use arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array};
-    use arrow::ipc::reader::FileReader;
     let wire = serde_json::to_value(plan).expect("restore plan wire");
     let segment_id = wire["transaction_id"]
         .as_str()
@@ -6571,54 +6584,23 @@ async fn applied_restore_writes(
     let result_sequence = wire["result_logical_sequence"]
         .as_u64()
         .expect("restore result sequence");
-    let index: Value = serde_json::from_slice(
-        &storage
-            .get_raw(&paths.segment_index(segment_id))
-            .await
-            .expect("read restore L0 index"),
+    segment_rows(
+        storage,
+        paths,
+        segment_id,
+        &paths.l0_segment_object(segment_id),
     )
-    .expect("decode restore L0 index");
-    let segment = storage
-        .get_raw(&paths.l0_segment_object(segment_id))
-        .await
-        .expect("read restore L0 segment");
-    let mut writes = Vec::new();
-    for block in index["blocks"].as_array().expect("index blocks") {
-        let offset = usize::try_from(block["offset"].as_u64().expect("block offset"))
-            .expect("block offset fits usize");
-        let length = usize::try_from(block["length"].as_u64().expect("block length"))
-            .expect("block length fits usize");
-        let reader = FileReader::try_new(
-            std::io::Cursor::new(segment.slice(offset..offset + length)),
-            None,
-        )
-        .expect("Arrow IPC block reader");
-        for batch in reader {
-            let batch = batch.expect("decode block batch");
-            let column = |index: usize| batch.column(index).as_any();
-            let kinds = column(0).downcast_ref::<UInt8Array>().expect("record_kind");
-            let keys = column(1).downcast_ref::<BinaryArray>().expect("key");
-            let values = column(2).downcast_ref::<BinaryArray>().expect("value");
-            let generations = column(3).downcast_ref::<UInt64Array>().expect("generation");
-            let tombstones = column(4).downcast_ref::<BooleanArray>().expect("tombstone");
-            let expiries = column(8)
-                .downcast_ref::<Int64Array>()
-                .expect("expires_at_ms");
-            for row in (0..batch.num_rows()).filter(|row| kinds.value(*row) == 0) {
-                assert_eq!(
-                    result_sequence,
-                    generations.value(row),
-                    "every restore write lands at the restore sequence"
-                );
-                writes.push((
-                    keys.value(row).to_vec(),
-                    (!tombstones.value(row)).then(|| values.value(row).to_vec()),
-                    (!expiries.is_null(row)).then(|| expiries.value(row)),
-                ));
-            }
-        }
-    }
-    writes
+    .await
+    .into_iter()
+    .filter(|row| row.kind == SEGMENT_RECORD_KV)
+    .map(|row| {
+        assert_eq!(
+            result_sequence, row.generation,
+            "every restore write lands at the restore sequence"
+        );
+        (row.key, row.value, row.expires_at_ms)
+    })
+    .collect()
 }
 
 /// Seeds a checkpoint (sequence 1) and a diverged head (sequence 2) that

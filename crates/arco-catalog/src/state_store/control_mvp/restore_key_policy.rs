@@ -114,7 +114,7 @@ impl RestoreKeyPolicy {
 
     /// Returns whether the policy excludes nothing.
     #[must_use]
-    pub fn is_none(&self) -> bool {
+    pub fn excludes_nothing(&self) -> bool {
         self.excluded_prefixes.is_empty()
     }
 
@@ -220,8 +220,8 @@ mod tests {
         assert!(!policy.excludes(b"\x07c"));
         assert!(!policy.excludes(b"\x04"));
         assert!(!policy.excludes(b""));
-        assert!(!policy.is_none());
-        assert!(RestoreKeyPolicy::none().is_none());
+        assert!(!policy.excludes_nothing());
+        assert!(RestoreKeyPolicy::none().excludes_nothing());
         assert_eq!(RestoreKeyPolicy::default(), RestoreKeyPolicy::none());
         assert!(!RestoreKeyPolicy::none().excludes(b"\x03"));
         assert_eq!(

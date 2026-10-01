@@ -180,11 +180,17 @@ pub use maintenance::{
     MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, PurgedCounts,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 8;
+const RESTORE_PLAN_VERSION: u32 = RESTORE_PLAN_VERSION_V8;
+/// Restore plan 8 binds the digest of the restore key policy its candidate
+/// was rendered under (`restore_key_policy_sha256`).
+const RESTORE_PLAN_VERSION_V8: u32 = 8;
 /// Restore plan 7 is the last shape written before restore key policies. It
 /// pins `committed_at_ms` but not the key policy its candidate was rendered
 /// under, so it cannot say which keys the candidate excluded and is
 /// supersession-only.
+///
+/// Unrelated to the bounded authority-8 plan `ControlMvpRestorePlanV7`
+/// (`PersistedRestoreParticipantPlan::ControlMvpV7`), a separate plan family.
 const RESTORE_PLAN_VERSION_V7: u32 = 7;
 /// Restore plan 6 is the last shape written on authority format 7. It predates
 /// the `committed_at_ms` stamp plan 7 pins, so it can never reproduce format-9
@@ -3091,44 +3097,48 @@ impl ControlMvpStateStore {
 
     /// Computes the restore writes, all staged at the restore sequence.
     ///
-    /// Plain keys are diffed between the source rows and `current`. A key the
-    /// policy excludes is never put; it is deleted when live in `current` or
-    /// in `candidate_parent`, the lineage the writes land on (with an empty
-    /// current base that is the source lineage, not `current`).
+    /// Keys the scan's policy does not exclude are diffed between the source
+    /// rows and `current`. Keys it excludes are never put, and every one live
+    /// in `candidate_parent`, the lineage the writes land on, is deleted.
     fn restore_writes(
-        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
+        source: &RestoreSourceScan,
         current: &ReplayState,
         candidate_parent: &ReplayState,
-        policy: &RestoreKeyPolicy,
     ) -> BTreeMap<Vec<u8>, StagedWrite> {
+        let policy = &source.policy;
         let mut writes = BTreeMap::new();
-        for (key, current) in current.kv.iter().filter(|(_key, value)| !value.tombstone) {
-            match source_values.get(key) {
-                // An excluded key is never kept, whatever the source holds.
-                _ if policy.excludes(key) => {
-                    writes.insert(key.clone(), StagedWrite::Delete);
-                }
+        for (key, current) in current
+            .kv
+            .iter()
+            .filter(|(key, value)| !value.tombstone && !policy.excludes(key))
+        {
+            match source.rows.get(key) {
                 // A row whose bytes and hint both match needs no rewrite; a
                 // hint-only difference is still a difference the restore
                 // must reproduce.
-                Some(source) if source.matches(current) => {}
-                Some(source) => {
-                    writes.insert(key.clone(), source.staged());
+                Some(row) if row.matches(current) => {}
+                Some(row) => {
+                    writes.insert(key.clone(), row.staged());
                 }
                 None => {
                     writes.insert(key.clone(), StagedWrite::Delete);
                 }
             }
         }
-        for (key, source) in source_values {
-            if !policy.excludes(key) && current.kv.get(key).is_none_or(|current| current.tombstone)
-            {
-                writes.insert(key.clone(), source.staged());
+        for (key, row) in source.rows.iter().filter(|(key, _)| !policy.excludes(key)) {
+            if current.kv.get(key).is_none_or(|current| current.tombstone) {
+                writes.insert(key.clone(), row.staged());
             }
         }
-        // The writes land on the candidate parent. With an empty current base
-        // that is the source lineage, whose excluded keys `current` cannot
-        // show, so a source filter alone would leave them in place.
+        // Invariant: every excluded key live in `current` is live in
+        // `candidate_parent`. With a pointer base the candidate parent is
+        // `current`; with an empty base `current` is empty and the candidate
+        // parent is the source lineage, whose excluded keys a source filter
+        // alone would leave in place.
+        debug_assert!(
+            current.kv.is_empty() || current.history_root == candidate_parent.history_root,
+            "restore writes land on the current state or, with an empty base, the source lineage"
+        );
         for key in policy.live_excluded_keys(&candidate_parent.kv) {
             writes.insert(key.clone(), StagedWrite::Delete);
         }
@@ -3191,11 +3201,11 @@ impl ControlMvpStateStore {
         );
 
         let writes = Self::restore_writes(
-            &source_values.rows,
+            source_values,
             &stable.current.state,
             &stable.candidate_parent.state,
-            &source_values.policy,
         );
+        let write_counts = RestoreWriteCounts::of(&writes, &source_values.policy);
 
         let notice = ControlMvpRestoreNotice {
             restore_id: identity.restore_id().to_string(),
@@ -3240,7 +3250,8 @@ impl ControlMvpStateStore {
             &self.scope,
             &l0_rows,
             self.segment_limits,
-        )?;
+        )
+        .map_err(|error| write_counts.l0_capacity_error(identity, error))?;
         tx.l0_segment = l0_reference;
         self.validate_rendered_transaction(&tx, &l0_segment_bytes, &l0_index_bytes)?;
         let transaction_bytes = encode_envelope_limited(
@@ -3527,16 +3538,25 @@ const fn legacy_restore_plan_version(version: u32) -> bool {
     )
 }
 
-/// Returns whether plans of `version` carry the plan-7 `committed_at_ms` stamp.
+/// Returns whether plans of `version` carry the plan-7 `committed_at_ms`
+/// stamp: every version from 7 through the current one, including versions a
+/// later bump makes supersession-only.
 const fn stamped_restore_plan_version(version: u32) -> bool {
-    matches!(version, RESTORE_PLAN_VERSION_V7 | RESTORE_PLAN_VERSION)
+    matches!(version, RESTORE_PLAN_VERSION_V7..=RESTORE_PLAN_VERSION)
+}
+
+/// Returns whether plans of `version` carry the plan-8
+/// `restore_key_policy_sha256` binding: every version from 8 through the
+/// current one, including versions a later bump makes supersession-only.
+const fn key_policy_bound_restore_plan_version(version: u32) -> bool {
+    matches!(version, RESTORE_PLAN_VERSION_V8..=RESTORE_PLAN_VERSION)
 }
 
 /// Decodes the plan-7 `committed_at_ms` field per plan version: required and
-/// positive on every version that carries it (7 and the current version),
-/// forbidden on older supersession-only versions (no older writer ever wrote
-/// it), and passed through for unknown versions, which plan validation
-/// rejects.
+/// positive on every version that carries it (7 through the current
+/// version), forbidden on older supersession-only versions (no older writer
+/// ever wrote it), and passed through for unknown versions, which plan
+/// validation rejects.
 fn restore_plan_committed_at_ms<E: serde::de::Error>(
     version: u32,
     stamp: Option<i64>,
@@ -3561,14 +3581,15 @@ fn restore_plan_committed_at_ms<E: serde::de::Error>(
 }
 
 /// Decodes the plan-8 `restore_key_policy_sha256` binding per plan version:
-/// required on the current version, forbidden on supersession-only versions
-/// (no older writer ever wrote it), and passed through for unknown versions,
-/// which plan validation rejects. Its digest form is checked by validation.
+/// required on every version that carries it (8 through the current
+/// version), forbidden on older supersession-only versions (no older writer
+/// ever wrote it), and passed through for unknown versions, which plan
+/// validation rejects. Its digest form is checked by validation.
 fn restore_plan_key_policy_sha256<E: serde::de::Error>(
     version: u32,
     digest: Option<String>,
 ) -> std::result::Result<Option<String>, E> {
-    if version == RESTORE_PLAN_VERSION {
+    if key_policy_bound_restore_plan_version(version) {
         return digest.map(Some).ok_or_else(|| {
             E::custom("Control MVP restore plan is missing restore_key_policy_sha256")
         });
@@ -4691,8 +4712,13 @@ impl ControlMvpRestoreCurrentBaseKind {
 /// `committed_at_ms` stamp, version 6's exact transaction/history reference,
 /// observed reclamation generation and exact HEAD identity. A participant
 /// configured with a different policy reports such a plan superseded instead
-/// of applying it. Versions 1 through 7 are supersession-only; recovery must
-/// replan them before writing any artifacts.
+/// of applying it. The policy governs rendering, not recognition of a
+/// committed restore: once the plan's transaction is in the lineage,
+/// inspection reports `Visible` whatever the participant's policy.
+///
+/// Versions 1 through 7 are supersession-only; recovery must replan them
+/// before writing any artifacts. Like a landed version-6 plan before it, a
+/// version-7 plan whose restore already landed now inspects `Superseded`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5147,6 +5173,7 @@ impl ControlMvpRestorePlan {
             || self.committed_at_ms.is_some() != stamped_restore_plan_version(self.version)
             || self.committed_at_ms.is_some_and(|stamp| stamp <= 0)
             || self.restore_key_policy_sha256.is_some()
+                != key_policy_bound_restore_plan_version(self.version)
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -5212,9 +5239,16 @@ impl ControlMvpRestoreParticipant {
     /// Replaces the participant's [`RestoreKeyPolicy`].
     ///
     /// Plans this participant writes bind the policy's digest, and it reports
-    /// a plan bound to any other policy as superseded instead of applying it.
+    /// an unapplied plan bound to any other policy as superseded instead of
+    /// applying it. The policy governs rendering, not recognition of a
+    /// committed restore: once a plan's transaction is in the lineage,
+    /// inspection reports `Visible` whatever the policy. A version-7 plan
+    /// (which binds no policy) inspects `Superseded` even when its restore
+    /// already landed, as version-6 plans do.
+    ///
     /// The policy applies to the format-9 restore only: bounded authority-8
-    /// planning refuses a participant whose policy excludes anything.
+    /// planning and advance refuse a participant whose policy excludes
+    /// anything.
     #[must_use]
     pub fn with_key_policy(mut self, policy: RestoreKeyPolicy) -> Self {
         self.key_policy = policy;
@@ -5225,6 +5259,17 @@ impl ControlMvpRestoreParticipant {
     #[must_use]
     pub const fn key_policy(&self) -> &RestoreKeyPolicy {
         &self.key_policy
+    }
+
+    /// Bounded authority-8 restore cannot honour a key policy, so it refuses
+    /// one before reading or writing anything rather than ignoring it.
+    fn reject_bounded_key_policy(&self) -> Result<()> {
+        if self.key_policy.excludes_nothing() {
+            return Ok(());
+        }
+        Err(CatalogError::UnsupportedOperation {
+            message: "bounded authority-8 restore cannot honour a restore key policy".into(),
+        })
     }
 
     async fn write_restore_immutable_artifacts(
@@ -6826,11 +6871,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         identity: &RestoreAttemptIdentity,
         context: &mut crate::state_store::RestorePlanningContext<'_>,
     ) -> Result<PersistedRestoreParticipantPlan> {
-        if !self.key_policy.is_none() {
-            return Err(CatalogError::UnsupportedOperation {
-                message: "bounded authority-8 restore cannot honour a restore key policy".into(),
-            });
-        }
+        self.reject_bounded_key_policy()?;
         Ok(PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
             bounded::restore::plan(&self.store, source, identity, context).await?,
         )))
@@ -6846,6 +6887,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         context: &mut crate::state_store::RestoreAdvanceContext<'_>,
     ) -> Result<crate::state_store::RestoreParticipantAdvance> {
         if context.is_bounded() {
+            self.reject_bounded_key_policy()?;
             if self.store.authority_format != 8 {
                 return Err(CatalogError::UnsupportedOperation {
                     message: "bounded advance requires synthetic authority 8".into(),
@@ -7265,6 +7307,59 @@ struct RestoreSourceValue {
 struct RestoreSourceScan {
     rows: BTreeMap<Vec<u8>, RestoreSourceValue>,
     policy: RestoreKeyPolicy,
+}
+
+/// Write counts of one rendered restore, named when its L0 cannot hold them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreWriteCounts {
+    puts: usize,
+    deletes: usize,
+    excluded_key_deletes: usize,
+}
+
+impl RestoreWriteCounts {
+    fn of(writes: &BTreeMap<Vec<u8>, StagedWrite>, policy: &RestoreKeyPolicy) -> Self {
+        let mut counts = Self {
+            puts: 0,
+            deletes: 0,
+            excluded_key_deletes: 0,
+        };
+        for (key, write) in writes {
+            let count = match write {
+                StagedWrite::Put { .. } => &mut counts.puts,
+                StagedWrite::Delete if policy.excludes(key) => &mut counts.excluded_key_deletes,
+                StagedWrite::Delete => &mut counts.deletes,
+            };
+            *count = count.saturating_add(1);
+        }
+        counts
+    }
+
+    /// Names the restore and its write counts in an L0 capacity error, which
+    /// is always `Validation` at L0, keeping the segment's own detail. Any
+    /// other error passes through unchanged.
+    fn l0_capacity_error(
+        self,
+        identity: &RestoreAttemptIdentity,
+        error: CatalogError,
+    ) -> CatalogError {
+        match error {
+            CatalogError::Validation { message } => CatalogError::Validation {
+                message: format!(
+                    "Control MVP restore {} attempt {} of domain {} does not fit one L0 segment \
+                     (puts: {}, deletes: {}, excluded-key deletes: {}, plus one restore notice): \
+                     {message}",
+                    identity.restore_id(),
+                    identity.attempt(),
+                    identity.domain(),
+                    self.puts,
+                    self.deletes,
+                    self.excluded_key_deletes,
+                ),
+            },
+            other => other,
+        }
+    }
 }
 
 impl RestoreSourceValue {
@@ -14222,12 +14317,11 @@ mod tests {
             (b"equal".to_vec(), source(Some(7))),
             (b"plain".to_vec(), source(None)),
         ]);
-        let writes = ControlMvpStateStore::restore_writes(
-            &source_values,
-            &current,
-            &current,
-            &RestoreKeyPolicy::none(),
-        );
+        let scan = RestoreSourceScan {
+            rows: source_values,
+            policy: RestoreKeyPolicy::none(),
+        };
+        let writes = ControlMvpStateStore::restore_writes(&scan, &current, &current);
         assert_eq!(
             writes.keys().collect::<Vec<_>>(),
             vec![&b"clear".to_vec(), &b"gain".to_vec(), &b"shift".to_vec()],
@@ -14238,12 +14332,14 @@ mod tests {
         assert_eq!(put_hint(writes.get(b"shift".as_slice())), Some(9));
     }
 
-    /// Every excluded key live in the current state or in the candidate
-    /// parent is deleted; tombstoned ones need no write; an excluded source
-    /// row is never put, whatever the caller passes; other keys keep the
-    /// plain rules.
+    /// Every excluded key live in the lineage the writes land on is deleted
+    /// and tombstoned ones need no write, for both restore bases: a pointer
+    /// base (the candidate parent is the current state) and an empty base
+    /// (no current state; the candidate parent is the source lineage). An
+    /// excluded source row is never put, whatever the scan holds; other keys
+    /// keep the plain rules.
     #[test]
-    fn restore_writes_delete_excluded_keys_live_in_current_or_candidate_parent() {
+    fn restore_writes_delete_excluded_keys_live_in_the_candidate_parent_for_both_bases() {
         fn stored(tombstone: bool) -> StoredValue {
             StoredValue {
                 bytes: Bytes::from_static(b"same"),
@@ -14252,51 +14348,135 @@ mod tests {
                 expires_at_ms: Some(7),
             }
         }
-        let source = RestoreSourceValue {
-            bytes: Bytes::from_static(b"same"),
-            expires_at_ms: Some(7),
-        };
+        fn scan(keys: &[&[u8]]) -> RestoreSourceScan {
+            RestoreSourceScan {
+                rows: keys
+                    .iter()
+                    .map(|key| {
+                        (
+                            key.to_vec(),
+                            RestoreSourceValue {
+                                bytes: Bytes::from_static(b"same"),
+                                expires_at_ms: Some(7),
+                            },
+                        )
+                    })
+                    .collect(),
+                policy: RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap(),
+            }
+        }
+        fn summary(writes: &BTreeMap<Vec<u8>, StagedWrite>) -> Vec<(Vec<u8>, bool)> {
+            writes
+                .iter()
+                .map(|(key, write)| (key.clone(), matches!(write, StagedWrite::Delete)))
+                .collect()
+        }
+
         let mut current = ReplayState::default();
         current.kv.insert(b"\x03current".to_vec(), stored(false));
         current.kv.insert(b"\x03gone".to_vec(), stored(true));
         current.kv.insert(b"\x03same".to_vec(), stored(false));
         current.kv.insert(b"\x05kept".to_vec(), stored(false));
-        let mut candidate_parent = ReplayState::default();
-        candidate_parent
-            .kv
-            .insert(b"\x03lineage".to_vec(), stored(false));
-        candidate_parent
-            .kv
-            .insert(b"\x03lineage-gone".to_vec(), stored(true));
-        candidate_parent
-            .kv
-            .insert(b"\x04audit".to_vec(), stored(false));
-        let source_values = BTreeMap::from([
-            (b"\x03same".to_vec(), source.clone()),
-            (b"\x03source".to_vec(), source.clone()),
-            (b"\x05kept".to_vec(), source),
-        ]);
-        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
-        let writes = ControlMvpStateStore::restore_writes(
-            &source_values,
+        let pointer_base = ControlMvpStateStore::restore_writes(
+            &scan(&[b"\x03same", b"\x03source", b"\x05kept"]),
             &current,
-            &candidate_parent,
-            &policy,
+            &current.clone(),
         );
         assert_eq!(
             vec![
-                &b"\x03current".to_vec(),
-                &b"\x03lineage".to_vec(),
-                &b"\x03same".to_vec(),
+                (b"\x03current".to_vec(), true),
+                (b"\x03same".to_vec(), true),
             ],
-            writes.keys().collect::<Vec<_>>()
+            summary(&pointer_base),
+            "pointer base: live excluded keys are deleted, the rest is the plain diff"
         );
-        assert!(
-            writes
-                .values()
-                .all(|write| matches!(write, StagedWrite::Delete)),
-            "excluded keys are only ever deleted: {writes:?}"
+
+        let mut lineage = ReplayState::default();
+        lineage.kv.insert(b"\x03lineage".to_vec(), stored(false));
+        lineage
+            .kv
+            .insert(b"\x03lineage-gone".to_vec(), stored(true));
+        lineage.kv.insert(b"\x04audit".to_vec(), stored(false));
+        let empty_base = ControlMvpStateStore::restore_writes(
+            &scan(&[b"\x03lineage", b"\x04audit"]),
+            &ReplayState::default(),
+            &lineage,
         );
+        assert_eq!(
+            vec![
+                (b"\x03lineage".to_vec(), true),
+                (b"\x04audit".to_vec(), false),
+            ],
+            summary(&empty_base),
+            "empty base: the source lineage's live excluded keys are deleted"
+        );
+    }
+
+    /// Field presence is decided by version ranges ending at the current
+    /// version, so a later bump that makes the current version
+    /// supersession-only still decodes it with its fields.
+    #[test]
+    fn restore_plan_field_presence_follows_version_ranges_through_the_current_version() {
+        assert!(!stamped_restore_plan_version(RESTORE_PLAN_VERSION_V6));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION_V7));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION_V8));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION));
+        assert!(!key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION_V7
+        ));
+        assert!(key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION_V8
+        ));
+        assert!(key_policy_bound_restore_plan_version(RESTORE_PLAN_VERSION));
+        assert!(!stamped_restore_plan_version(RESTORE_PLAN_VERSION + 1));
+        assert!(!key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn restore_l0_capacity_errors_name_the_restore_and_its_write_counts() {
+        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
+        let writes = BTreeMap::from([
+            (b"\x03a".to_vec(), StagedWrite::Delete),
+            (b"\x03b".to_vec(), StagedWrite::Delete),
+            (b"plain-delete".to_vec(), StagedWrite::Delete),
+            (
+                b"plain-put".to_vec(),
+                StagedWrite::Put {
+                    value: Bytes::from_static(b"v"),
+                    expires_at_ms: None,
+                },
+            ),
+        ]);
+        let counts = RestoreWriteCounts::of(&writes, &policy);
+        assert_eq!(
+            RestoreWriteCounts {
+                puts: 1,
+                deletes: 1,
+                excluded_key_deletes: 2,
+            },
+            counts
+        );
+        let identity =
+            RestoreAttemptIdentity::new("rst_00000000000000000000000001", 3, "catalog").unwrap();
+        let error = counts.l0_capacity_error(
+            &identity,
+            validation_failed("control MVP segment exceeds the supported row limit"),
+        );
+        let CatalogError::Validation { message } = error else {
+            panic!("an L0 capacity error stays Validation: {error:?}");
+        };
+        assert_eq!(
+            "Control MVP restore rst_00000000000000000000000001 attempt 3 of domain catalog does \
+             not fit one L0 segment (puts: 1, deletes: 1, excluded-key deletes: 2, plus one \
+             restore notice): control MVP segment exceeds the supported row limit",
+            message
+        );
+        assert!(matches!(
+            counts.l0_capacity_error(&identity, invariant_violation("other")),
+            CatalogError::InvariantViolation { .. }
+        ));
     }
 }
 

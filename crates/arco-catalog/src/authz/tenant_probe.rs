@@ -37,6 +37,19 @@ struct PendingNativeGrant {
     had_witness: bool,
 }
 
+fn aborted_grant_event(pending: &PendingNativeGrant) -> Result<MetastoreEvent> {
+    let MetastoreMutation::GrantUpserted(grant) = &pending.event.mutation else {
+        return Err(CatalogError::Validation {
+            message: "prepared native event is not a grant".into(),
+        });
+    };
+    let mut event = pending.event.clone();
+    event.mutation = MetastoreMutation::GrantAdmissionAborted {
+        grant_id: grant.grant_id.clone(),
+    };
+    Ok(event)
+}
+
 /// Permissions compiled from exact identity and metastore authority tokens.
 pub struct TenantPermissionCut {
     identity_token: StateToken,
@@ -347,8 +360,11 @@ impl<'a> TenantCatalogProbe<'a> {
         } else {
             let prior_events = self.ledger.load_events().await?;
             if prior_events.iter().any(|prior| {
-                matches!(prior.mutation, MetastoreMutation::GrantUpserted(_))
-                    || !self.event_has_native_scope(prior)
+                matches!(
+                    prior.mutation,
+                    MetastoreMutation::GrantUpserted(_)
+                        | MetastoreMutation::GrantAdmissionAborted { .. }
+                ) || !self.event_has_native_scope(prior)
             }) {
                 return Err(CatalogError::Validation {
                     message: "unwitnessed native grant or foreign event precedes admission".into(),
@@ -375,6 +391,49 @@ impl<'a> TenantCatalogProbe<'a> {
     /// # Errors
     /// Rejects missing, foreign, changed, or superseded native ledger evidence.
     pub async fn reconcile_prepared_grant(&self) -> Result<MetastoreLedgerWatermark> {
+        self.reconcile_prepared_grant_event(false).await
+    }
+
+    /// Replace an absent prepared grant with a durable no-op in its exact native
+    /// event slot, then witness that no-op. A late grant append cannot take the slot.
+    ///
+    /// # Errors
+    /// Rejects a landed grant, advanced ledger, changed witness, or missing intent.
+    pub async fn abort_prepared_grant(&self) -> Result<MetastoreLedgerWatermark> {
+        let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
+        let bytes =
+            txn.get(PENDING_NATIVE_GRANT_KEY)
+                .await?
+                .ok_or_else(|| CatalogError::Validation {
+                    message: "metastore has no prepared native grant".into(),
+                })?;
+        let pending: PendingNativeGrant =
+            serde_json::from_slice(bytes.bytes()).map_err(|error| CatalogError::Serialization {
+                message: format!("decode prepared native grant: {error}"),
+            })?;
+        let abort = aborted_grant_event(&pending)?;
+        let prior_sequence = pending
+            .previous_watermark
+            .as_ref()
+            .map_or(0, |prior| prior.sequence);
+        let events = self.ledger.load_events().await?;
+        let tail = events
+            .iter()
+            .filter(|event| event.sequence > prior_sequence)
+            .collect::<Vec<_>>();
+        if !tail.is_empty() && tail != [&abort] {
+            return Err(CatalogError::Validation {
+                message: "native ledger advanced beyond prepared grant".into(),
+            });
+        }
+        self.ledger.append_event(&abort).await?;
+        self.reconcile_prepared_grant_event(true).await
+    }
+
+    async fn reconcile_prepared_grant_event(
+        &self,
+        aborted: bool,
+    ) -> Result<MetastoreLedgerWatermark> {
         let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
         let pending =
             txn.get(PENDING_NATIVE_GRANT_KEY)
@@ -402,15 +461,20 @@ impl<'a> TenantCatalogProbe<'a> {
                 message: "prepared native grant has a changed prior witness".into(),
             });
         }
-        let event = &pending.event;
-        if !self.event_has_native_scope(event)
-            || !matches!(&event.mutation, MetastoreMutation::GrantUpserted(grant)
+        if !self.event_has_native_scope(&pending.event)
+            || !matches!(&pending.event.mutation, MetastoreMutation::GrantUpserted(grant)
             if grant.identity_cut.as_ref().is_some_and(|cut| cut.tenant_id == self.reader.scope().tenant_id()))
         {
             return Err(CatalogError::Validation {
                 message: "prepared native grant has foreign authority evidence".into(),
             });
         }
+        let expected_abort = aborted_grant_event(&pending)?;
+        let event = if aborted {
+            &expected_abort
+        } else {
+            &pending.event
+        };
         let watermark =
             self.ledger
                 .latest_watermark()

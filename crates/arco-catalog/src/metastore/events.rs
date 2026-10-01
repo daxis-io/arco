@@ -259,6 +259,12 @@ pub enum MetastoreMutation {
     PrincipalUpserted(PrincipalRecord),
     /// Upsert a grant by stable ID.
     GrantUpserted(GrantRecord),
+    /// Occupy a prepared grant's immutable native event slot after a failed append.
+    #[cfg(feature = "test-utils")]
+    GrantAdmissionAborted {
+        /// Grant ID whose prepared native event was abandoned.
+        grant_id: String,
+    },
     /// Upsert safe storage credential metadata by stable ID.
     StorageCredentialUpserted(StorageCredentialRecord),
     /// Upsert an external location by stable ID.

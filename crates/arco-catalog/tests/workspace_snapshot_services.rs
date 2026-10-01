@@ -8,6 +8,11 @@
 // conflict with test ergonomics here; production code keeps them active.
 #![allow(clippy::too_many_lines, clippy::unused_async)]
 
+#[cfg(feature = "test-utils")]
+#[allow(dead_code)]
+#[path = "../benches/support/durable_maintenance.rs"]
+mod durable_maintenance;
+
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -48,7 +53,7 @@ use arco_catalog::{
     StateRestoreParticipant as _,
 };
 #[cfg(feature = "test-utils")]
-use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
+use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker};
 use arco_core::error::Result as StorageResult;
 use arco_core::lock::LockInfo;
 use arco_core::{
@@ -1693,40 +1698,6 @@ async fn mixed_authority8_and_v7_capture_uses_a_bounded_v7_checkpoint_source() {
     );
 }
 
-/// Drives one retention horizon job on `scope` to publication at `now`.
-#[cfg(feature = "test-utils")]
-async fn publish_retention_horizon_at(
-    storage: &ScopedStorage,
-    scope: StateScope,
-    now: DateTime<Utc>,
-) {
-    let worker = DurableMaintenanceWorker::new(
-        storage.clone(),
-        scope,
-        DurableAuthorityBinding::new([23; 32]),
-    )
-    .expect("maintenance worker");
-    let plan = worker
-        .prepare_horizon_at(now)
-        .await
-        .expect("horizon preflight")
-        .expect("an expired row makes the horizon eligible");
-    let job_id = plan.job_id().clone();
-    let mut progress = worker.start_at(&plan, now).await.expect("start horizon");
-    while progress.status == MaintenanceStatus::Active {
-        progress = worker
-            .advance_at(&job_id, now)
-            .await
-            .expect("advance horizon");
-    }
-    assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
-    worker
-        .publish_at(&job_id, now)
-        .await
-        .expect("publish horizon")
-        .expect("the horizon publishes over an uncontended head");
-}
-
 /// When the format-9 domain's HEAD is a retention horizon manifest, the
 /// bounded checkpoint source the mixed capture prepares carries the head's
 /// certificate, so the capture succeeds and its checkpoint stays readable.
@@ -1736,21 +1707,33 @@ async fn mixed_capture_at_a_v7_horizon_head_carries_the_certificate_in_its_check
     let backend = Arc::new(RecordingBackend::default());
     let (storage, service, request, v7) = mixed_v7_capture_fixture(backend).await;
     let legacy_scope = StateScope::new("tenant", "workspace", "legacy");
-    let now = Utc::now();
+    let expires_at_ms = (Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
     let mut txn = v7
         .begin_control_txn(TxnOptions::new(Some(legacy_scope.clone())))
         .await
         .expect("begin transaction");
-    txn.put_with_expiry(
-        b"expiring",
-        Bytes::from_static(b"expired"),
-        now.timestamp_millis() - 2 * 60 * 60 * 1000,
-    )
-    .await
-    .expect("expired row");
+    txn.put_with_expiry(b"expiring", Bytes::from_static(b"expired"), expires_at_ms)
+        .await
+        .expect("expired row");
     txn.commit().await.expect("commit the expired row");
-    publish_retention_horizon_at(&storage, legacy_scope, now).await;
+    // Taken after the commit, so the horizon never runs before HEAD's stamp.
+    let now = Utc::now();
+    let worker = DurableMaintenanceWorker::new(
+        storage.clone(),
+        legacy_scope,
+        DurableAuthorityBinding::new([23; 32]),
+    )
+    .expect("maintenance worker");
+    let horizon = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .expect("drive the horizon")
+        .expect("the expired row admits a horizon");
     let head = v7.current_state_token().await.expect("horizon head");
+    assert_eq!(
+        horizon.selected_token(),
+        &head,
+        "the horizon published as HEAD"
+    );
     let manifest: Value = serde_json::from_slice(
         &storage
             .get_raw(&v7.paths().manifest_object(head.authority_manifest_id()))
@@ -1812,15 +1795,25 @@ async fn mixed_capture_at_a_v7_horizon_head_carries_the_certificate_in_its_check
         )
         .await
         .expect("plan a restore from the bounded horizon checkpoint");
+    let pre_restore = v7.current_state_token().await.expect("pre-restore head");
+    let RestoreParticipantInspection::Visible { token, .. } = participant
+        .apply_restore(&plan, now)
+        .await
+        .expect("apply the restore")
+    else {
+        panic!("the restore from the bounded horizon checkpoint must become visible")
+    };
     assert!(
-        matches!(
-            participant
-                .apply_restore(&plan, now)
-                .await
-                .expect("apply the restore"),
-            RestoreParticipantInspection::Visible { .. }
-        ),
-        "the restore from the bounded horizon checkpoint must become visible"
+        token.logical_sequence() > pre_restore.logical_sequence(),
+        "the restore commits past the pre-restore head"
+    );
+    let restored = v7.read_at(token).await.expect("read the restored state");
+    assert_eq!(
+        None,
+        restored
+            .get(b"expiring")
+            .await
+            .expect("the row the horizon purged")
     );
 }
 

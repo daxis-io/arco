@@ -3632,7 +3632,7 @@ async fn restore_notice_recogniser_resolves_the_restore_commit_past_rewrites_at_
 async fn restore_from_a_checkpoint_taken_at_a_horizon_head_succeeds() {
     let (_backend, storage) = storage();
     let store = store(storage.clone());
-    let now = Utc::now();
+    let expires_at_ms = (Utc::now() - ChronoDuration::hours(2)).timestamp_millis();
     let mut first = store
         .begin_control_txn(TxnOptions::default())
         .await
@@ -3645,11 +3645,13 @@ async fn restore_from_a_checkpoint_taken_at_a_horizon_head_succeeds() {
         .put_with_expiry(
             b"catalog/expiring",
             Bytes::from_static(b"expired"),
-            now.timestamp_millis() - 2 * 60 * 60 * 1000,
+            expires_at_ms,
         )
         .await
         .expect("put an expired row");
     first.commit().await.expect("commit v1");
+    // Taken after the commit, so the horizon never runs before HEAD's stamp.
+    let now = Utc::now();
     let worker = arco_catalog::DurableMaintenanceWorker::new(
         storage.clone(),
         scope(),

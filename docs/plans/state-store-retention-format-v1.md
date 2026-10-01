@@ -1,14 +1,16 @@
 # Authority 9 retention contract, encoding 1
 
 Retention step 1 writes authority format 9, segment/directory format 2 and
-restore-plan format 7. Format 9 is format 7 (see
+restore-plan format 7; retention step 4 moves restore plans to format 8 (see
+"Restore plan 8 and the restore key policy"). Format 9 is format 7 (see
 [integrity encoding 1](state-store-integrity-format-v1.md) and
 [block format 1](state-store-block-format-v1.md)) plus wall-clock stamps, a
 per-row expiry hint, an age-anchor chain and a certified `RetentionHorizon`
 maintenance transition. Layout, exact-version HEAD CAS, writer-epoch fencing,
-reclamation generation, the history root, the existing hash domain tags (one
-tag, `arco/control-v1/retention-purge`, is added), the retention
-floors (7-day orphan, 30-day token and checkpoint) and the 16/32 L0 thresholds
+reclamation generation, the history root, the existing hash domain tags
+(step 1 adds `arco/control-v1/retention-purge` and step 4 adds
+`arco/control-v1/restore-key-policy`), the retention floors (7-day orphan,
+30-day token and checkpoint) and the 16/32 L0 thresholds
 are unchanged. Point reads, scans and witnesses are unchanged. The design is
 `2026-09-26-state-store-retention-design.md` (accepted, including the
 2026-09-26 age-anchor amendment).
@@ -17,10 +19,11 @@ are unchanged. Point reads, scans and witnesses are unchanged. The design is
 
 `CONTROL_MVP_FORMAT_VERSION` is 9 on the head pointer, manifests, transactions
 and checkpoints; `SEGMENT_FORMAT_VERSION` is 2 on segment directories and in
-every owning state reference; `RESTORE_PLAN_VERSION` is 7. Restore plans 1
-through 6 decode as supersession-only: they can be inspected and superseded
-but never applied. Retained-token reads accept a manifest header of 9 or 8,
-where 8 is the test-only bounded-directory authority; any other header returns
+every owning state reference; `RESTORE_PLAN_VERSION` is 8 (7 until retention
+step 4). Restore plans 1 through 7 decode as supersession-only: they can be
+inspected and superseded but never applied. Retained-token reads accept a
+manifest header of 9 or 8, where 8 is the test-only bounded-directory
+authority; any other header returns
 `UnsupportedAuthorityFormat`. Durable maintenance descriptors bind authority
 version 9 and segment/directory version 2.
 
@@ -58,9 +61,9 @@ Stamps never run backwards along ancestry. A commit stamps its child
 the same bytes and a job clock up to 24 h older than the parent HEAD cannot
 regress the stamp. A restore candidate rejects a stamp before its candidate
 parent. The ancestry walker rejects a child stamped before its parent as an
-invalid transition. Restore plan 7 pins the `committed_at_ms` its format-9
-candidate bytes carry (required and positive); legacy plans must not carry
-one.
+invalid transition. Restore plans 7 and 8 pin the `committed_at_ms` their
+format-9 candidate bytes carry (required and positive on every version from
+7 through the current one); plans 1 through 6 must not carry one.
 
 ## Segment format 2 and the expiry hint
 
@@ -95,8 +98,9 @@ wall clock in it. Two places bind the hint:
 
 L1 rendering, durable maintenance and restore renders carry the hint row for
 row. The restore source scan returns every live row of the materialized
-checkpoint cut with its hint, and `restore_writes` treats a hint-only
-difference as a difference to reproduce.
+checkpoint cut with its hint, except rows the participant's restore key
+policy excludes, and `restore_writes` treats a hint-only difference as a
+difference to reproduce.
 
 ## Age anchors
 
@@ -144,7 +148,11 @@ hex; `horizon_sequence <= logical_sequence`; `purge_cutoff_ms > 0`; every
 evidence entry names a kind in `manifest_age | snapshot | export | checkpoint`
 by a valid immutable id, with `sequence >= horizon_sequence`. A manifest with
 a certificate must also carry rewrite equivalence evidence. Checkpoints copy
-the source manifest's certificate at creation and validate it on read.
+the source manifest's certificate at creation and validate it on read;
+`validate_source` requires it to equal the source manifest's. Every capture
+path copies it: `prepare_checkpoint`, and since retention step 4
+`prepare_bounded_checkpoint`, which the mixed workspace capture uses and
+which copied none before.
 
 `purged_rows_sha256` uses tag `arco/control-v1/retention-purge` and the
 standard framing, then `u64(row count)` and, per purged row in strictly
@@ -277,6 +285,69 @@ compatibility was consumed by a different publication and the descriptor's
 24 h lifetime has expired; before that a consumed attempt returns to
 `ReadyToPublish` and regenerates.
 
+## Restore plan 8 and the restore key policy
+
+Retention step 4 sets `RESTORE_PLAN_VERSION` to 8. A version-8 plan carries
+everything a version-7 plan does plus `restore_key_policy_sha256`, the
+digest of the `RestoreKeyPolicy` its candidate was rendered under. The field
+is required on every version from 8 through the current one and forbidden
+on versions 1 through 7, and validation checks its `sha256:<hex>` form.
+Field presence follows version ranges that end at the current version
+(`committed_at_ms` from 7, the policy digest from 8), so a later bump makes
+version 8 supersession-only instead of undecodable.
+
+Version 7 is supersession-only: it binds no policy, so it cannot say which
+keys its candidate excluded. It inspects `Superseded` even when its restore
+already landed, as version 6 does, and apply returns `Superseded` without
+writes. `v7_last_before_restore_key_policy.json` is the literal last
+version-7 shape, captured before the change.
+
+A policy is a set of excluded key prefixes in canonical form: non-empty,
+sorted ascending by bytes, deduplicated, and without any prefix that a
+shorter excluded prefix covers. At most 16 canonical prefixes are allowed
+(`RestoreKeyPolicy::MAX_EXCLUDED_PREFIXES`); duplicates and covered prefixes
+do not count. Two policies that exclude the same keys therefore have equal
+prefixes and an equal digest.
+
+The digest uses tag `arco/control-v1/restore-key-policy` with an unscoped
+framing. A policy belongs to a restore participant, not to an authority
+root, so the preimage binds no implementation, authority format or scope:
+
+```text
+bytes(tag)                 // u64 big-endian length, then the bytes
+u32(framing version = 1)
+u64(prefix count)
+bytes(prefix)              // per canonical prefix, in ascending order
+```
+
+The digest is written `sha256:<hex>`. Pinned values: the empty policy is
+`sha256:f91fb77fb64beaf1a4f9185901153a078cd922424bef1b798854e31e18a9432c`,
+and the catalog policy (prefix `0x03`, the receipt tag) is
+`sha256:84a448ca23f39ec4da22620f03a4678d64594d9be4b5a244227f403a3ef549ff`.
+Each domain tag is used with exactly one framing, scoped or unscoped.
+
+A format-9 restore under a policy follows three rules:
+
+- source rows under an excluded prefix are dropped before the source scan
+  charges its row and byte budget, so they are never put;
+- every excluded key live in the current state or in the candidate parent is
+  deleted at the restore sequence (with no head pointer the candidate parent
+  is the source lineage, whose excluded keys a source filter alone would
+  leave in place);
+- every other key follows the plain rules.
+
+Inspection compares the plan's digest with the participant's policy. A
+mismatch inspects `Superseded`, so the driver replans, instead of failing as
+a byte mismatch. The policy governs rendering, not recognition: a plan whose
+transaction is already in the lineage inspects `Visible` whatever the
+participant's policy. The bounded format-8 restore cannot honour a policy;
+its planning and advance refuse a non-empty one with `UnsupportedOperation`
+before any read or write.
+
+The restore notice wire shape is unchanged. Decoding it now refuses unknown
+fields, and the catalog projection accepts a notice only when its payload is
+byte-for-byte the canonical encoding.
+
 ## Old binaries
 
 The format checks are symmetric. This binary rejects a format-7 head pointer,
@@ -285,7 +356,7 @@ transaction metadata load and the retained-token format witness, before any
 typed payload is followed; a format-7 binary rejects format 9 at the same
 points. A format-9 root is therefore unreadable and unwritable by an older
 binary, and recovery is roll-forward, never a partial read. Segment format 1
-(eight columns) fails preflight, and restore plans 1 through 6 are
+(eight columns) fails preflight, and restore plans 1 through 7 are
 supersession-only. No production root existed on format 7, so no conversion
 exists: the pilot root is seeded fresh on format 9.
 
@@ -303,8 +374,9 @@ consolidation only). These are steps 2 to 4 of the design.
 Status since then: the catalog outbox trim and the worker's horizon job kind
 landed in retention step 2; receipt expiry (`put_with_expiry` now has its
 adapter caller), audit-row removal and the `system.catalog.audit` projection
-landed in retention step 3. The restore that skips receipt rows remains for
-step 4. The paragraph above describes step 1 only.
+landed in retention step 3. The restore that skips receipt rows landed in
+retention step 4 (restore plan 8 and the restore key policy above). The
+paragraph above describes step 1 only.
 
 ## Vectors and fixtures
 
@@ -317,4 +389,5 @@ is a follow-up. `../reports/2026-09-06-gate3-canonical-vectors.json` is the
 independently produced format-7 set and is historical. Fixtures live in
 `crates/arco-catalog/tests/fixtures/control_mvp_authority_v9/` (legacy-scope
 manifest, transaction and checkpoint) and
-`crates/arco-catalog/tests/fixtures/control_mvp_restore_plans/`.
+`crates/arco-catalog/tests/fixtures/control_mvp_restore_plans/` (including
+`v7_last_before_restore_key_policy.json`).

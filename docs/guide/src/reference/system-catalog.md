@@ -28,9 +28,10 @@ migration.
 ## Catalog Audit Projection
 
 A catalog root bound to the `control/v1` authority publishes one audit row for
-every acknowledged catalog mutation. The rows are immutable Parquet files, not a
-SQL table. The retention design calls this projection `system.catalog.audit`;
-like the aliases above, that name is not an Arco API name.
+every acknowledged catalog mutation and every acknowledged catalog restore.
+The rows are immutable Parquet files, not a SQL table. The retention design
+calls this projection `system.catalog.audit`; like the aliases above, that
+name is not an Arco API name.
 
 The projection exists only under the one control-bound catalog root selected
 by `ARCO_CATALOG_CONTROL_V1_*` (see [Control-Plane Scope](./control-plane-scope.md)).
@@ -41,14 +42,23 @@ Legacy catalog roots have no audit projection.
 Paths are relative to the catalog root (`tenant=<tenant>/workspace=<workspace>/`):
 
 ```text
-control/v1/projections/catalog-audit/dt=YYYY-MM-DD/{source_logical_sequence:020}-{intent_id}.parquet
+control/v1/projections/catalog-audit/dt=YYYY-MM-DD/{logical_sequence:020}-{file_id}.parquet
 ```
 
 - `dt=YYYY-MM-DD` is the UTC day of the row's `occurred_at_ms`. Day names are
   fixed-width, so they sort chronologically.
-- `{source_logical_sequence:020}` is the mutation's committed logical sequence,
-  zero-padded to 20 digits.
-- `{intent_id}` is the projection intent id, which equals `operation_id`.
+- `{logical_sequence:020}` is the row's `logical_sequence` (a mutation's
+  committed logical sequence, or a restore's result sequence), zero-padded to
+  20 digits.
+- `{file_id}` is the row's `operation_id` with every `:` replaced by `-`,
+  because Hadoop-style path readers reject `:` in a file name. A mutation's
+  operation id (`op-...`) contains no `:`, so its file id is the projection
+  intent id unchanged. A restore's operation id is
+  `restore:{restore_id}:{attempt}:{domain}`, so its file is
+  `{logical_sequence:020}-restore-{restore_id}-{attempt}-{domain}.parquet`.
+- The mapping is not reversible. Do not build a file name from an
+  `operation_id`, and do not parse an `operation_id` out of a file name: list
+  the day prefix and read `operation_id` from the row.
 
 Each file holds exactly one row. No manifest lists these files, so a reader
 lists a day prefix (for example
@@ -67,18 +77,19 @@ schema. Rust readers can decode a file with
 | Column | Type | Nullable | Meaning |
 |---|---|---|---|
 | `record_version` | `UInt32` | no | Version of the source audit record; always `1` today. |
-| `operation_id` | `Utf8` | no | Operation id; also the projection intent id. |
-| `operation_family` | `Utf8` | no | Operation family. |
-| `request_digest` | `Utf8` | no | SHA-256 hex digest of the canonical request. |
-| `actor` | `Utf8` | no | Actor that issued the mutation; `api` when the request named none. |
-| `occurred_at_ms` | `Int64` | no | When the adapter accepted the mutation, in milliseconds since the Unix epoch (UTC). |
-| `logical_sequence` | `Int64` | no | Committed logical sequence of the mutation. |
-| `authority_manifest_id` | `Utf8` | yes | Authority manifest that committed the mutation. Set on every row written today. |
+| `operation_id` | `Utf8` | no | Operation id; also the projection intent id. For a restore, the restore notice's record id `restore:{restore_id}:{attempt}:{domain}`. |
+| `operation_family` | `Utf8` | no | Operation family; `restore_domain` for a restore. |
+| `request_digest` | `Utf8` | no | SHA-256 hex digest of the canonical request; for a restore, of the restore notice payload bytes. |
+| `actor` | `Utf8` | no | Actor that issued the mutation; `api` when the request named none; `restore` for a restore. |
+| `occurred_at_ms` | `Int64` | no | When the adapter accepted the mutation, in milliseconds since the Unix epoch (UTC). For a restore, the `committed_at_ms` of the restore's result manifest, a stamp fixed when the restore was planned. |
+| `logical_sequence` | `Int64` | no | Committed logical sequence of the mutation, or the restore's result sequence. |
+| `authority_manifest_id` | `Utf8` | yes | Authority manifest that committed the mutation or the restore. Set on every row written today. |
 | `logical_commit_id` | `Utf8` | yes | Reserved for the test-only bounded authority format. Always null today. |
 
 `operation_family` is one of `create_catalog`, `patch_catalog`,
 `delete_catalog`, `create_schema`, `patch_schema`, `delete_schema`,
-`register_table`, `update_table`, `rename_table` or `drop_table`.
+`register_table`, `update_table`, `rename_table` or `drop_table` for a
+mutation, and `restore_domain` for a restore.
 
 ### Guarantees
 
@@ -89,12 +100,17 @@ schema. Rust readers can decode a file with
   the outbox never loses an audit row. Intents acknowledged earlier on an
   existing format-9 root kept their audit record as a row in the authority
   KV (key tag 4); the materializer never revisits them, so they have no file.
+  A restore notice follows the same order (see "Restores").
 - **Quarantined intents.** An intent the materializer quarantines may or may
   not have a file (for example, one quarantined for a divergent snapshot
   manifest after its audit file landed). A file that exists still describes a
   committed mutation. An intent whose payload is not the audit record of that
   intent is quarantined as `INCOMPATIBLE_PROJECTION_INTENT` before anything is
-  written.
+  written. A record whose id starts with `restore:` but is not the notice of a
+  committed restore (malformed, or refuted by the authenticated authority
+  lineage) is quarantined as `INVALID_RESTORE_NOTICE`, also before anything
+  is written; a genuine restore notice that fails at publication is
+  quarantined as `INCOMPATIBLE_PROJECTION_INTENT`.
 - **Immutable files.** A file is written only if the path is free. A
   redelivered intent that produces identical bytes is accepted; different
   bytes at the path fail closed and quarantine the intent.
@@ -125,5 +141,33 @@ partition are never deleted. Operating details are in
 
 ### Restores
 
-A workspace restore writes no audit row yet. The audit record for the restore
-mutation itself arrives with retention step 4.
+A catalog restore commits one outbox record, its restore notice, instead of a
+projection intent. Since retention step 4 the projection materializer
+publishes it like a mutation, in this order:
+
+1. a catalog snapshot of the restored state at the restore sequence, under
+   `control/v1/projections/catalog-parquet/{result_logical_sequence:020}-{result_manifest_id}/`,
+   read at the restore's own result manifest;
+2. one audit row for the restore: `operation_id` is the notice record id
+   `restore:{restore_id}:{attempt}:{domain}`, `operation_family` is
+   `restore_domain`, `actor` is `restore`, `request_digest` is the SHA-256
+   hex of the notice payload bytes, `occurred_at_ms` is the result
+   manifest's `committed_at_ms`, and `logical_sequence` and
+   `authority_manifest_id` name the restore's result;
+3. the snapshot `manifest.json`. The notice is acknowledged after that.
+
+A restore does not rewrite or re-emit audit rows. Rows of mutations the
+restore rolled back stay in the projection; read them together with the
+restore row at a higher `logical_sequence`.
+
+A restore wakes no post-commit drain, so its snapshot and row appear on the
+next drain: the scheduled control-store worker's run (every 5 minutes by
+default) or the drain the next catalog mutation wakes.
+
+A catalog restore also deletes every idempotency receipt. A keyed request
+replayed after it re-executes and, if it commits, produces a new row at a
+later `logical_sequence` (see "Identity" above).
+
+A restore notice quarantined before retention step 4 (code
+`INVALID_PROJECTION_INTENT`) stays quarantined and has no snapshot at its
+sequence and no audit row. See `docs/runbooks/control-store-worker.md`.

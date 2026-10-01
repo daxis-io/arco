@@ -171,8 +171,8 @@ GC phase (`CatalogProjectionMaterializer::expire_audit_partitions`;
 SQL catalog: `system.catalog.audit` is this design's name for a published
 Parquet projection, not a registered table, and it exists only under a
 control-bound catalog root. A restore emits its own audit record for the
-restore mutation and does not resurrect historical audit rows; the
-restore-emitted record is delivered by step 4.
+restore mutation and does not resurrect historical audit rows; step 4
+delivered the restore-emitted record (see "Restore and checkpoints").
 
 *As implemented (step 3):* one immutable single-row file per acknowledged
 intent at
@@ -180,15 +180,96 @@ intent at
 written after the snapshot files and before the snapshot manifest. See the
 "As implemented" section of `2026-09-27-state-store-retention-step3-adapter.md`.
 
+*As implemented (step 4):* every `:` of an operation id becomes `-` in the
+file name, because Hadoop-style path readers reject `:`. Intent ids contain
+no `:`, so their names are unchanged. A restore's row is filed at
+`dt=YYYY-MM-DD/{result_logical_sequence:020}-restore-{restore_id}-{attempt}-{domain}.parquet`.
+
 ## Restore and checkpoints
 
-- The restore source scan skips receipt rows (tag 3) entirely. After a restore a
-  client replay must re-apply, not be answered from a receipt taken before it.
-- Restore plans move to version 7 to bind the format-9 transaction shape;
-  versions 1 through 6 remain supersession-only.
-- Checkpoints carry the manifest's `retention_horizon`. A key live in the source
-  cut and absent in current is written at the restore sequence (existing rule),
-  so a purged tombstone can never be resurrected as an old generation.
+- Restore plan 7 landed in step 1. It binds the format-9 transaction shape
+  and pins the candidate's `committed_at_ms`; versions 1 through 6 are
+  supersession-only.
+- A restore never restores idempotency receipts (tag 3) and leaves none
+  behind. After a restore a client replay must re-apply, not be answered from
+  a receipt taken before it. This changes the rendered restore bytes, so it
+  needs a new plan version: step 4 moved restore plans to version 8.
+- *As implemented (step 4):* the exclusion is a restore key policy held by
+  the restore participant, not a catalog rule inside the kernel.
+  `RestoreKeyPolicy` holds at most 16 canonical excluded key prefixes
+  (non-empty, sorted, deduplicated, and without any prefix a shorter one
+  covers) and a `sha256:<hex>` digest over them.
+  `ControlMvpRestoreParticipant::with_key_policy` sets it; the default,
+  `RestoreKeyPolicy::none()`, follows the plain rules for every key. The
+  catalog policy, `catalog_restore_key_policy()`, excludes tag 3 only, and
+  `catalog_restore_participant(store)` builds the catalog participant with
+  it (it refuses a store outside the `catalog` domain). Tag 4 (residual
+  pre-step-3 audit rows) is not excluded: those rows are the only record of
+  those audits and follow the plain rules.
+- Under a policy a format-9 restore follows three rules. Excluded source
+  rows are dropped before the restore source scan charges its row and byte
+  budget, so they are never put. Every excluded key live in the current
+  state or in the candidate parent is deleted at the restore sequence. Every
+  other key follows the plain rules. A keyed request replayed after the
+  restore therefore re-executes, as after its receipt expired.
+- Empty-base rule. With no head pointer the writes are diffed against an
+  empty current state but land on the candidate parent, which is the source
+  lineage. A filter on the source scan alone would leave that lineage's
+  receipts in place, so the excluded deletes are taken from the candidate
+  parent: the source lineage's receipts are tombstoned too.
+- Plan 8 binds the policy digest (`restore_key_policy_sha256`, required).
+  Plan 7 joins the supersession-only versions: it inspects `Superseded`,
+  even when its restore already landed, and apply refuses it without
+  writes. A plan bound to another policy inspects `Superseded`, so the
+  driver replans it, rather than failing as a byte mismatch. The policy
+  governs rendering, not recognition: a landed restore inspects `Visible`
+  whatever the inspecting participant's policy. The bounded (format 8)
+  restore cannot honour a policy, so its planning and advance refuse a
+  non-empty one with `UnsupportedOperation`.
+- Capacity. Before step 4 the source scan charged receipts against its
+  64 MiB decoded budget. At about 564 B per receipt row that budget held
+  about 119k receipts, below the ~180k live at the pilot rate, so a
+  pilot-rate restore failed at plan time. Receipts no longer charge it.
+  Their deletes share the restore's single L0 segment with every other
+  restore write and the notice; its 512 KiB index limit binds at roughly
+  390k live receipts. A restore that does not fit fails `Validation` naming
+  the restore and its put, delete and excluded-key delete counts, and HEAD
+  does not move. Each restore also turns every live receipt into a
+  tombstone at the restore sequence. Tombstones carry no expiry hint, so the
+  horizon purges them only once it passes the restore sequence (at least
+  30 days): up to ~180k extra retained rows at the pilot rate.
+- Restore projection and audit row. Before step 4 the restore commit's one
+  outbox record, the restore notice `restore:{restore_id}:{attempt}:{domain}`
+  (payload `ControlMvpRestoreNotice`), was not a `ProjectionIntentV1`. The
+  catalog materializer quarantined it `INVALID_PROJECTION_INTENT`. The
+  quarantine was terminal, the record was never acknowledged or trimmed, and
+  no snapshot was published at the restore sequence. Step 3 did not cause
+  this. *As implemented (step 4):* the materializer recognises every
+  `restore:` record before the intent decode and authenticates it with
+  `ControlMvpStateStore::resolve_restore_notice_source`. It then publishes it
+  like a mutation: the restored catalog state as the snapshot at the
+  restore's own result manifest, one audit row for the restore, then the
+  snapshot manifest. The notice is acknowledged after that and trimmed. The row's
+  operation id is the notice record id; its family is `restore_domain`, its
+  actor `restore`, its request digest the SHA-256 hex of the notice payload,
+  its occurrence the result manifest's `committed_at_ms`, and its logical
+  sequence and authority manifest those of the restore's result. A
+  malformed notice, or one the authenticated lineage refutes, is
+  quarantined `INVALID_RESTORE_NOTICE`; a publication failure is
+  quarantined `INCOMPATIBLE_PROJECTION_INTENT`. A notice quarantined before
+  step 4 keeps its `INVALID_PROJECTION_INTENT` disposition and is never
+  processed again; resolving it is an operator follow-up. A restore commit
+  wakes no post-commit drain, so its notice is materialized on the next
+  drain.
+- Checkpoints carry the manifest's `retention_horizon`, and
+  `validate_source` requires it to equal the source manifest's. Step 1
+  copied it in `prepare_checkpoint` only. Step 4 makes
+  `prepare_bounded_checkpoint` (the mixed workspace capture path) copy it
+  too, so every capture path carries the certificate and a capture no
+  longer fails when a format-9 domain's HEAD is a horizon manifest.
+- A key live in the source cut and absent in current is written at the
+  restore sequence (existing rule), so a purged tombstone can never be
+  resurrected as an old generation.
 - A checkpoint's `min_retention_seconds` participates in `horizon_sequence`, so
   a long-lived checkpoint holds the horizon back rather than being violated.
 
@@ -243,10 +324,41 @@ All tests are differential against pre-change behaviour.
   redelivered audit file, like the snapshot files, is accepted only when its
   bytes are identical, and Parquet bytes are stable only within one build of
   the `parquet` crate. Accepting an existing file whose decoded rows match
-  must land no later than step 4, because restore-emitted audit records may
-  be written without snapshot files. Until then, drain the catalog outbox
+  was due no later than step 4, because restore-emitted audit records might
+  be written without snapshot files. Step 4 re-scoped it out: a restore
+  writes its snapshot files before its audit file, exactly like a mutation,
+  so that trigger does not exist. The library-upgrade hazard itself is
+  older than step 4 (snapshot files compare bytes too) and stays a
+  follow-up with no step attached. Until it lands, drain the catalog outbox
   before deploying a different `parquet`/`arrow` version; the API (post-commit
   and operator drains) and the worker must run the same version.
+
+## Gaps found during step 4
+
+- **An intent quarantined at publication is re-walked on every drain and
+  can stall every drain.** The drain hands every unacknowledged record to
+  the materializer, quarantined or not. An intent quarantined
+  `INCOMPATIBLE_PROJECTION_INTENT` at publication (for example for different
+  bytes at an artifact path) is therefore resolved again on every drain: an
+  authenticated ancestry walk from the current head back to its source
+  manifest, then a publication that fails again. The walk is capped at
+  4,096 manifests. Once the intent's source is further behind the head than
+  that, the walk fails `AmbiguousAuthorityOutcome` ("authenticated ancestry
+  resolution budget exhausted"), which is retryable, so every drain aborts
+  at that record and no later record is materialized, acknowledged or
+  trimmed. At the pilot rate (about two catalog commits a second) the cap is
+  reached within about 35 minutes. This predates step 4; step 4 exempts only
+  `restore:` records, which are never processed again once quarantined. The
+  same cap applies to any record left undrained for more than 4,096 catalog
+  manifests. Follow-up: the quarantine-resolution path.
+- **Restore notices quarantined before step 4 stay quarantined.** They keep
+  `INVALID_PROJECTION_INTENT`, are never acknowledged or trimmed, and have
+  no snapshot at the restore sequence and no audit row. Later mutations
+  materialize normally. Resolving them needs the same operator path.
+- **No production composition registers restore participants.** Restore is
+  reached from tests, benches and the S3 qualification binary; a production
+  composition must register `catalog_restore_participant` for the catalog
+  domain.
 
 ## Capacity acceptance
 
@@ -254,7 +366,8 @@ Re-run the Gate 7 capacity probe on format 9 with the pilot mutation mix for one
 synthetic week, with the horizon job running on every worker invocation:
 
 - retained rows stay under 500k;
-- restore of the current cut fits the existing scanner;
+- restore of the current cut fits the existing scanner and one restore L0
+  segment, including its receipt deletes;
 - the operation-cost harness reports per-commit replay bytes at that state
   size. That number is an input to the real-provider throughput decision, not a
   pass/fail criterion here.
@@ -269,10 +382,14 @@ Each step is its own reviewable change, landed in order after PR #436:
 2. Worker: the horizon job kind and the catalog outbox trim after drain.
    Landed (PR #442).
 3. Adapter: receipt expiry, audit-row removal, and the `system.catalog.audit`
-   projection with its retention. Landed (this change); the restore-emitted
+   projection with its retention. Landed (PR #444); the restore-emitted
    audit record moved to step 4.
-4. Restore plan 7 and checkpoint horizon, the restore-emitted audit record,
-   and semantic retry acceptance for projection Parquet.
+4. Restore: the restore key policy and restore plan 8 (a restore never
+   restores receipts), restore notices materialized with a restore audit
+   row, and the horizon certificate on every checkpoint capture path.
+   Landed (this change). Restore plan 7 and the certificate on the main
+   capture path had landed in step 1. Semantic retry acceptance for
+   projection Parquet was re-scoped out (see "Gaps found during step 3").
 5. Capacity probe and report.
 
 No conversion step exists: the pilot root is seeded fresh on format 9.

@@ -329,6 +329,11 @@ impl<'a> TenantCatalogProbe<'a> {
                 message: "grant object is not active in this metastore".into(),
             });
         }
+        if metastore.event_scopes.contains_key(event_id) {
+            return Err(CatalogError::Validation {
+                message: "native grant event ID is already used".into(),
+            });
+        }
         let cut = GrantIdentityCut {
             tenant_id: token.scope().tenant_id().to_owned(),
             identity_manifest_id: token.authority_manifest_id().to_owned(),
@@ -345,6 +350,11 @@ impl<'a> TenantCatalogProbe<'a> {
         let mut txn = self.kernel.begin_control_txn(TxnOptions::new(None)).await?;
         txn.assert_absent(PENDING_NATIVE_GRANT_KEY).await?;
         let previous_watermark = self.ledger.latest_watermark().await?;
+        if sequence < self.ledger.next_sequence().await? {
+            return Err(CatalogError::Validation {
+                message: "native grant sequence is already reserved".into(),
+            });
+        }
         let witnessed = txn.get(NATIVE_LEDGER_WITNESS_KEY).await?;
         let had_witness = witnessed.is_some();
         if let Some(witnessed) = witnessed {

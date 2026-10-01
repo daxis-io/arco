@@ -26,6 +26,12 @@ required. A changed or superseded ledger still retains the pending record and
 denies compilation. Production routing needs all native grant writers to use
 the admission path, a qualified multiwriter contract, and provider-backed
 recovery and fencing evidence; this memory-backend probe supplies none of those.
+The test-only preparation path now rejects an event ID already present in
+native replay and a sequence already present in the ledger's reservation view
+before persisting a new pending grant. Independent probe writers still share
+one pending slot through the metastore authority transaction. A direct native
+writer can race this preflight; production admission must close that bypass
+and prove the protocol on its storage providers.
 Owner-derived permissions are excluded from this probe because catalog object
 owner changes have no tenant identity admission contract yet. That contract,
 including recovery of owned objects, is a separate production gate.

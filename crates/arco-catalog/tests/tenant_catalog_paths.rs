@@ -709,6 +709,146 @@ async fn racing_late_grant_and_abort_leave_one_replayable_winner() {
 }
 
 #[tokio::test]
+async fn preparation_rejects_reused_event_ids_and_stale_sequences_without_blocking_next_grant() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        PrincipalIdentityStore::new(IdentityStorage::new(backend.clone(), "tenant-a").unwrap())
+            .unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let probe = TenantCatalogProbe::new(&identity, storage).unwrap();
+    probe
+        .append_grant("first-grant", 2, grant(&principal.principal_id, &table_id))
+        .await
+        .unwrap();
+    assert!(
+        probe
+            .prepare_grant("first-grant", 3, grant(&principal.principal_id, &table_id))
+            .await
+            .is_err()
+    );
+    assert!(
+        probe
+            .prepare_grant(
+                "stale-sequence",
+                2,
+                grant(&principal.principal_id, &table_id)
+            )
+            .await
+            .is_err()
+    );
+    probe
+        .append_grant("next-grant", 3, grant(&principal.principal_id, &table_id))
+        .await
+        .unwrap();
+    assert!(probe.compile_current().await.is_ok());
+}
+
+#[tokio::test]
+async fn preparation_rejects_an_aborted_event_id_and_an_orphan_sequence_reservation() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        PrincipalIdentityStore::new(IdentityStorage::new(backend.clone(), "tenant-a").unwrap())
+            .unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let probe = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    probe
+        .prepare_grant(
+            "aborted-grant",
+            2,
+            grant(&principal.principal_id, &table_id),
+        )
+        .await
+        .unwrap();
+    probe.abort_prepared_grant().await.unwrap();
+    assert!(
+        probe
+            .prepare_grant(
+                "aborted-grant",
+                3,
+                grant(&principal.principal_id, &table_id)
+            )
+            .await
+            .is_err()
+    );
+    storage
+        .put_raw(
+            "ledger/metastore-sequences/00000000000000000003.event_id",
+            Bytes::from_static(b"other-writer"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    assert!(
+        probe
+            .prepare_grant("new-grant", 3, grant(&principal.principal_id, &table_id))
+            .await
+            .is_err()
+    );
+    assert!(probe.compile_current().await.is_ok());
+}
+
+#[tokio::test]
+async fn independent_probe_writers_prepare_only_one_native_grant() {
+    let backend = Arc::new(MemoryBackend::new());
+    let identity =
+        PrincipalIdentityStore::new(IdentityStorage::new(backend.clone(), "tenant-a").unwrap())
+            .unwrap();
+    let (principal, _) = identity
+        .commit(
+            IdentityMutation::Create {
+                name: "alice".into(),
+                kind: PrincipalKind::User,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let storage = metastore_storage(backend, "first");
+    let table_id = seed_table_and_object(&storage).await;
+    let first = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    let second = TenantCatalogProbe::new(&identity, storage.clone()).unwrap();
+    let (one, two) = tokio::join!(
+        first.prepare_grant("writer-one", 2, grant(&principal.principal_id, &table_id)),
+        second.prepare_grant("writer-two", 2, grant(&principal.principal_id, &table_id)),
+    );
+    assert_ne!(one.is_ok(), two.is_ok());
+    let prepared = one.or(two).unwrap();
+    MetastoreLedger::new(storage)
+        .unwrap()
+        .append_event(&prepared)
+        .await
+        .unwrap();
+    first.reconcile_prepared_grant().await.unwrap();
+    assert!(second.compile_current().await.is_ok());
+    second
+        .append_grant("next-grant", 3, grant(&principal.principal_id, &table_id))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn later_admitted_grant_cannot_witness_a_direct_ledger_grant() {
     let backend = Arc::new(MemoryBackend::new());
     let identity =

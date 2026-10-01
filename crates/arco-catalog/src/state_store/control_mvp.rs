@@ -2366,7 +2366,7 @@ impl ControlMvpStateStore {
             manifest_checksum_sha256: pointer.manifest_checksum_sha256,
             states,
             min_retention_seconds: options.min_retention_seconds(),
-            retention_horizon: None,
+            retention_horizon: manifest.retention_horizon.clone(),
         };
         checkpoint.validate(&self.scope, &checkpoint.checkpoint_id)?;
         checkpoint.validate_source(&manifest)?;

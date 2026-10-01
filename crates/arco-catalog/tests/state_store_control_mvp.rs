@@ -3624,6 +3624,135 @@ async fn restore_notice_recogniser_resolves_the_restore_commit_past_rewrites_at_
     );
 }
 
+/// A checkpoint taken while HEAD is a retention horizon manifest carries the
+/// head's horizon certificate in its record and is a valid restore source:
+/// the restore lands the checkpoint's (already purged) cut over later
+/// commits.
+#[tokio::test]
+async fn restore_from_a_checkpoint_taken_at_a_horizon_head_succeeds() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let now = Utc::now();
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v1");
+    first
+        .put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("put v1");
+    first
+        .put_with_expiry(
+            b"catalog/expiring",
+            Bytes::from_static(b"expired"),
+            now.timestamp_millis() - 2 * 60 * 60 * 1000,
+        )
+        .await
+        .expect("put an expired row");
+    first.commit().await.expect("commit v1");
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([43; 32]),
+    )
+    .expect("maintenance worker");
+    let horizon = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .expect("drive the horizon")
+        .expect("the expired row admits a horizon");
+    let head = store.current_state_token().await.expect("horizon head");
+    assert_eq!(horizon.selected_token(), &head);
+    let manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&store.paths().manifest_object(head.authority_manifest_id()))
+            .await
+            .expect("horizon manifest"),
+    )
+    .expect("horizon manifest JSON");
+    let certificate = &manifest["payload"]["retention_horizon"];
+    assert!(certificate.is_object(), "HEAD is a horizon manifest");
+
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint at the horizon head");
+    let record: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&store.paths().checkpoint_object(checkpoint.checkpoint_id()))
+            .await
+            .expect("checkpoint record"),
+    )
+    .expect("checkpoint record JSON");
+    assert_eq!(
+        certificate, &record["payload"]["retention_horizon"],
+        "the checkpoint carries the head's certificate"
+    );
+    let source = store
+        .persist_checkpoint_reference(&checkpoint, now + ChronoDuration::hours(1))
+        .await
+        .expect("persist the horizon checkpoint");
+    assert_eq!(head.logical_sequence(), source.logical_sequence());
+    assert_eq!(head.authority_manifest_id(), source.manifest_id());
+
+    let mut later = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v2");
+    later
+        .put(b"catalog/default", Bytes::from_static(b"v2"))
+        .await
+        .expect("put v2");
+    later
+        .put(b"catalog/later", Bytes::from_static(b"later"))
+        .await
+        .expect("put a later row");
+    let later = later.commit().await.expect("commit v2");
+
+    let participant = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = participant
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000301", 1, "catalog")
+                .expect("identity"),
+            now,
+        )
+        .await
+        .expect("plan a restore from the horizon checkpoint");
+    let RestoreParticipantInspection::Visible { token, .. } = participant
+        .apply_restore(&plan, now)
+        .await
+        .expect("apply the restore")
+    else {
+        panic!("the restore must become visible")
+    };
+    assert_eq!(
+        later.state_token().logical_sequence() + 1,
+        token.logical_sequence()
+    );
+    let restored = store.read_at(token).await.expect("read the restored state");
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        restored
+            .get(b"catalog/default")
+            .await
+            .expect("restored row")
+    );
+    assert_eq!(
+        None,
+        restored
+            .get(b"catalog/later")
+            .await
+            .expect("a row committed after the checkpoint")
+    );
+    assert_eq!(
+        None,
+        restored
+            .get(b"catalog/expiring")
+            .await
+            .expect("the row the horizon purged")
+    );
+}
+
 /// Asserts that resolving `record` is refused with the given error class and
 /// a message naming `reason`.
 async fn assert_notice_refused(

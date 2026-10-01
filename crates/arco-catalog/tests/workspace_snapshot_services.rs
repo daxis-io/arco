@@ -22,8 +22,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::Notify;
 
 #[cfg(feature = "test-utils")]
-use arco_catalog::DurableAuthorityBinding;
-#[cfg(feature = "test-utils")]
 use arco_catalog::state_store::WorkspaceCaptureConfig;
 use arco_catalog::state_store::{PersistedAuthorityKind, PersistedAuthorityReference, StateScope};
 use arco_catalog::workspace_snapshot::{
@@ -44,10 +42,18 @@ use arco_catalog::{
     ArcoStateAdmin as _, ArcoStateReader, ArcoStateTxn as _, CheckpointToken, ControlMvpStateStore,
     CurrentStateStore, PersistedAuthorityAdapter, Result, StateToken, Tier1Writer, TxnOptions,
 };
+#[cfg(feature = "test-utils")]
+use arco_catalog::{
+    ControlMvpRestoreParticipant, RestoreAttemptIdentity, RestoreParticipantInspection,
+    StateRestoreParticipant as _,
+};
+#[cfg(feature = "test-utils")]
+use arco_catalog::{DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus};
 use arco_core::error::Result as StorageResult;
 use arco_core::lock::LockInfo;
 use arco_core::{
-    MemoryBackend, ObjectMeta, ScopedStorage, StorageBackend, WritePrecondition, WriteResult,
+    ListPage, MemoryBackend, ObjectMeta, ScopedStorage, StorageBackend, WritePrecondition,
+    WriteResult,
 };
 
 use arco_catalog::gc::{GarbageCollector, RetentionPolicy};
@@ -433,6 +439,19 @@ impl StorageBackend for RecordingBackend {
             return Err(arco_core::Error::InvalidInput("list denied".to_string()));
         }
         self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> StorageResult<ListPage> {
+        self.record(BackendOperation::List(prefix.to_string()));
+        if self.deny_list.load(Ordering::SeqCst) {
+            return Err(arco_core::Error::InvalidInput("list denied".to_string()));
+        }
+        self.inner.list_page(prefix, start_after, limit).await
     }
 
     async fn head(&self, path: &str) -> StorageResult<Option<ObjectMeta>> {
@@ -1671,6 +1690,137 @@ async fn mixed_authority8_and_v7_capture_uses_a_bounded_v7_checkpoint_source() {
             .await
             .is_ok(),
         "mixed capture must select its workspace pin"
+    );
+}
+
+/// Drives one retention horizon job on `scope` to publication at `now`.
+#[cfg(feature = "test-utils")]
+async fn publish_retention_horizon_at(
+    storage: &ScopedStorage,
+    scope: StateScope,
+    now: DateTime<Utc>,
+) {
+    let worker = DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope,
+        DurableAuthorityBinding::new([23; 32]),
+    )
+    .expect("maintenance worker");
+    let plan = worker
+        .prepare_horizon_at(now)
+        .await
+        .expect("horizon preflight")
+        .expect("an expired row makes the horizon eligible");
+    let job_id = plan.job_id().clone();
+    let mut progress = worker.start_at(&plan, now).await.expect("start horizon");
+    while progress.status == MaintenanceStatus::Active {
+        progress = worker
+            .advance_at(&job_id, now)
+            .await
+            .expect("advance horizon");
+    }
+    assert_eq!(progress.status, MaintenanceStatus::ReadyToPublish);
+    worker
+        .publish_at(&job_id, now)
+        .await
+        .expect("publish horizon")
+        .expect("the horizon publishes over an uncontended head");
+}
+
+/// When the format-9 domain's HEAD is a retention horizon manifest, the
+/// bounded checkpoint source the mixed capture prepares carries the head's
+/// certificate, so the capture succeeds and its checkpoint stays readable.
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn mixed_capture_at_a_v7_horizon_head_carries_the_certificate_in_its_checkpoint_source() {
+    let backend = Arc::new(RecordingBackend::default());
+    let (storage, service, request, v7) = mixed_v7_capture_fixture(backend).await;
+    let legacy_scope = StateScope::new("tenant", "workspace", "legacy");
+    let now = Utc::now();
+    let mut txn = v7
+        .begin_control_txn(TxnOptions::new(Some(legacy_scope.clone())))
+        .await
+        .expect("begin transaction");
+    txn.put_with_expiry(
+        b"expiring",
+        Bytes::from_static(b"expired"),
+        now.timestamp_millis() - 2 * 60 * 60 * 1000,
+    )
+    .await
+    .expect("expired row");
+    txn.commit().await.expect("commit the expired row");
+    publish_retention_horizon_at(&storage, legacy_scope, now).await;
+    let head = v7.current_state_token().await.expect("horizon head");
+    let manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&v7.paths().manifest_object(head.authority_manifest_id()))
+            .await
+            .expect("horizon manifest"),
+    )
+    .expect("horizon manifest JSON");
+    let certificate = &manifest["payload"]["retention_horizon"];
+    assert!(certificate.is_object(), "HEAD is a horizon manifest");
+
+    let snapshot = service
+        .create_snapshot(&request)
+        .await
+        .expect("mixed capture at a horizon head must prepare a bounded V7 checkpoint source");
+    let legacy = snapshot
+        .domains()
+        .iter()
+        .find(|domain| domain.domain() == "legacy")
+        .expect("legacy domain");
+    assert_eq!(
+        legacy.authority().reference_kind(),
+        PersistedAuthorityKind::Checkpoint
+    );
+    assert_eq!(
+        legacy.authority().manifest_id(),
+        head.authority_manifest_id()
+    );
+    let record: Value = serde_json::from_slice(
+        &storage
+            .get_raw(
+                legacy
+                    .authority()
+                    .checkpoint_path()
+                    .expect("checkpoint path"),
+            )
+            .await
+            .expect("checkpoint record"),
+    )
+    .expect("checkpoint record JSON");
+    assert_eq!(
+        certificate, &record["payload"]["retention_horizon"],
+        "the bounded checkpoint carries the head's certificate"
+    );
+    v7.resolve_persisted_reference(legacy.authority())
+        .await
+        .expect("the published bounded checkpoint reference remains readable");
+    service
+        .create_snapshot(&request)
+        .await
+        .expect("exact mixed snapshot retry must retain its already-published V7 checkpoint");
+
+    let participant = ControlMvpRestoreParticipant::new(v7.as_ref().clone());
+    let plan = participant
+        .plan_restore(
+            legacy.authority(),
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000302", 1, "legacy")
+                .expect("identity"),
+            now,
+        )
+        .await
+        .expect("plan a restore from the bounded horizon checkpoint");
+    assert!(
+        matches!(
+            participant
+                .apply_restore(&plan, now)
+                .await
+                .expect("apply the restore"),
+            RestoreParticipantInspection::Visible { .. }
+        ),
+        "the restore from the bounded horizon checkpoint must become visible"
     );
 }
 

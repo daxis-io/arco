@@ -1049,8 +1049,9 @@ pub struct ControlCatalogAuthority {
 /// The catalog projection materializer writes immutable single-row Parquet
 /// files beneath it (see [`catalog_audit_artifact_path`]). Every acknowledged
 /// intent has exactly one file here, and so does every acknowledged restore
-/// notice (at `dt=YYYY-MM-DD/{result_logical_sequence:020}-{notice_record_id}.parquet`;
-/// see [`CatalogProjectionMaterializer`]). Each file is written before the
+/// notice (at `dt=YYYY-MM-DD/{result_logical_sequence:020}-restore-{restore_id}-{attempt}-{domain}.parquet`,
+/// the notice record id with each `:` replaced by `-`; see
+/// [`CatalogProjectionMaterializer`]). Each file is written before the
 /// acknowledgement and kept until
 /// [`CatalogProjectionMaterializer::expire_audit_partitions`] deletes its day
 /// partition (after [`CATALOG_AUDIT_RETENTION_DAYS`] by default). A
@@ -1316,7 +1317,9 @@ pub fn catalog_audit_partition(occurred_at_ms: i64) -> Result<String> {
 /// request re-executes: the audit identity is `(operation_id,
 /// logical_sequence)`. Intent ids are validated path-safe components (no
 /// `/`, `\`, `%`, dot segments, or control characters), so the file never
-/// leaves its partition.
+/// leaves its partition. Every `:` of the id becomes `-` in the file name
+/// (catalog intent ids, `op-…`, contain none), so Hadoop-style path readers,
+/// which reject `:` in a file name, can read every audit file.
 ///
 /// # Errors
 ///
@@ -1339,14 +1342,25 @@ fn catalog_audit_row(intent: &ProjectionIntentV1) -> Result<CatalogAuditRow> {
     )
 }
 
-/// The artifact path of a decoded row, whose operation id and logical
-/// sequence [`decode_catalog_audit_row`] has checked against its intent.
+/// The artifact path of an audit row:
+/// `dt=<day of occurred_at_ms>/{logical_sequence:020}-{file id}.parquet`
+/// beneath [`CATALOG_AUDIT_PROJECTION_PREFIX`].
+///
+/// An intent's row comes from [`decode_catalog_audit_row`], which checks its
+/// operation id and logical sequence against the intent; a restore's row
+/// comes from [`restore_audit_row`] over an authenticated restore notice,
+/// whose operation id is the notice record id
+/// `restore:{restore_id}:{attempt}:{domain}`. The file id is the operation id
+/// with every `:` replaced by `-`, because Hadoop-style path readers reject
+/// `:` in a file name; the row keeps the exact operation id. Names stay unique
+/// per logical sequence: catalog intent ids (`op-…`) contain no `:`, and a
+/// restore commit carries no intent.
 fn audit_artifact_path(row: &CatalogAuditRow) -> Result<String> {
     Ok(format!(
         "{CATALOG_AUDIT_PROJECTION_PREFIX}{}{:020}-{}.parquet",
         catalog_audit_partition(row.occurred_at_ms)?,
         row.logical_sequence,
-        row.operation_id
+        row.operation_id.replace(':', "-")
     ))
 }
 
@@ -1438,14 +1452,27 @@ fn decode_catalog_audit_row(
 /// the result manifest's `committed_at_ms`), then the snapshot manifest; the
 /// notice is acknowledged after that and trimmed like an intent.
 ///
-/// A `restore:` record that fails authentication with a validation error or
-/// an invariant violation is quarantined `INVALID_RESTORE_NOTICE`; storage
-/// and ambiguous-authority errors are retried. Once authenticated, a notice
-/// shares the intents' publication path and its failure handling (a
-/// non-retryable publication failure, such as a divergent existing artifact,
-/// is quarantined `INCOMPATIBLE_PROJECTION_INTENT`). Notices quarantined as
-/// `INVALID_PROJECTION_INTENT` before restores were materialized stay
-/// quarantined; this worker does not revisit terminal dispositions.
+/// The audit file is named after the notice record id with each `:`
+/// replaced by `-`; the row keeps the exact record id.
+///
+/// Failures of a `restore:` record are settled like those of an intent:
+///
+/// - Authentication errors that are retryable (`Storage`, `CasFailed`,
+///   `MaintenanceBackpressure`, `AmbiguousAuthorityOutcome`; an unreadable or
+///   missing manifest on the ancestry path or a missing restore transaction
+///   is ambiguous) record a retryable failure and leave the notice pending;
+///   every other authentication error (a malformed notice, or one the
+///   authenticated lineage refutes) quarantines it `INVALID_RESTORE_NOTICE`.
+/// - Once authenticated, the notice shares the intents' publication path: the
+///   same errors are retried, and every other publication error (for example
+///   a divergent existing artifact) quarantines it
+///   `INCOMPATIBLE_PROJECTION_INTENT`.
+///
+/// A `restore:` record that already carries a terminal disposition (any
+/// code) is reported quarantined again without being authenticated or
+/// published; in particular, notices quarantined `INVALID_PROJECTION_INTENT`
+/// before restores were materialized stay quarantined. This worker never
+/// revisits a terminal disposition.
 pub struct CatalogProjectionMaterializer {
     storage: ScopedStorage,
     source: ControlMvpStateStore,
@@ -1717,7 +1744,8 @@ impl CatalogProjectionMaterializer {
     /// under `control/v1/projections/catalog-parquet/{sequence:020}-{manifest_id}/`
     /// of that token, then `audit_row`'s audit file, then the snapshot
     /// manifest. Every write is immutable and accepts an identical rewrite, so
-    /// a redelivery republishes the same bytes.
+    /// a redelivery republishes the same bytes. `source` is awaited inside the
+    /// `projection-source` measurement phase, after the audit row is encoded.
     async fn publish_projection(
         &self,
         source: impl Future<Output = Result<StateToken>>,
@@ -1944,12 +1972,28 @@ impl ProjectionOutboxHandler for CatalogProjectionMaterializer {
                     message: "committed catalog projection intent is missing its origin sequence"
                         .to_string(),
                 })?;
+        // A restore notice that already carries a terminal disposition stays
+        // quarantined without being authenticated or published again: one
+        // recorded before restores were materialized has another code, and
+        // recording a second disposition at its sequence would fail every
+        // later drain.
+        if record.claims_restore_notice()
+            && self
+                .status
+                .projection_quarantine(CATALOG_PARQUET_PROJECTION_CONSUMER_ID, source_sequence)
+                .await?
+                .is_some_and(|disposition| disposition.source_record_id() == record.record_id())
+        {
+            return Ok(ProjectionOutboxProcessDisposition::Quarantined);
+        }
         // A restore notice is recognised before the intent decode: it is not
         // a projection intent, and one that fails authentication is
         // quarantined as an invalid notice.
         let restore = match self.source.resolve_restore_notice_source(record).await {
             Ok(restore) => restore,
             Err(error) => {
+                // A notice commits at its result sequence, so its origin is
+                // both the quarantine key and the observed sequence.
                 return self
                     .settle_failure(
                         record,

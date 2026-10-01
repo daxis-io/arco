@@ -15,6 +15,8 @@
 
 #[path = "../benches/support/durable_maintenance.rs"]
 mod durable_maintenance;
+#[path = "support/restore_notice.rs"]
+mod restore_notice;
 
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -40,6 +42,7 @@ use serde_json::Value;
 use sha2::Digest;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use restore_notice::{ForgedPayload, commit_raw_outbox_record, forged_notice};
 
 fn scope() -> StateScope {
     StateScope::new("tenant", "workspace", "catalog")
@@ -3423,76 +3426,16 @@ async fn restore_empty_current_base_extends_source_lineage_and_retries_idempoten
     ));
 }
 
-/// The canonical restore notice payload shape, for forging notices.
-#[derive(serde::Serialize)]
-struct ForgedRestoreNotice<'a> {
-    restore_id: &'a str,
-    participant_attempt: u64,
-    domain: &'a str,
-    source_logical_sequence: u64,
-    result_logical_sequence: u64,
-}
-
-/// Renders a forged outbox payload for the sequence it commits at.
-type ForgedPayload = Box<dyn FnOnce(u64) -> Vec<u8>>;
-
-/// The canonical bytes of a forged restore notice.
-fn forged_notice(restore_id: &str, domain: &str, source: u64, result: u64) -> Vec<u8> {
-    serde_json::to_vec(&ForgedRestoreNotice {
-        restore_id,
-        participant_attempt: 1,
-        domain,
-        source_logical_sequence: source,
-        result_logical_sequence: result,
-    })
-    .expect("encode forged notice")
-}
-
-/// Commits one raw outbox record through a plain control transaction and
-/// returns it as read back from the outbox at the new head. `payload`
-/// receives the sequence the record commits at.
-async fn commit_raw_outbox_record(
-    store: &ControlMvpStateStore,
-    record_id: &str,
-    options: TxnOptions,
-    payload: impl FnOnce(u64) -> Vec<u8>,
-) -> ControlMvpProjectionOutboxRecord {
-    let origin = store
-        .current_state_token()
-        .await
-        .expect("seeded head")
-        .logical_sequence()
-        + 1;
-    let mut txn = store
-        .begin_control_txn(options)
-        .await
-        .expect("begin raw transaction");
-    txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        record_id,
-        Bytes::from(payload(origin)),
-    ))
-    .await
-    .expect("stage raw outbox record");
-    txn.commit().await.expect("commit raw outbox record");
-    let record = store
-        .current_projection_outbox()
-        .await
-        .expect("outbox")
-        .into_iter()
-        .find(|record| record.record_id() == record_id)
-        .expect("the committed record");
-    assert_eq!(Some(origin), record.origin_sequence());
-    record
-}
-
 /// The restore notice recogniser ignores records that do not claim to be
 /// notices and authenticates a real notice against the restore commit at its
-/// result sequence: here a retention horizon has since published another
-/// manifest at that same sequence (the head the notice is read at), and the
+/// result sequence. Here the restore is the sixteenth L0 commit, so a layout
+/// maintenance rewrite and then a retention horizon publish two more
+/// manifests at that same sequence (the head the notice is read at), and the
 /// recogniser still resolves the restore's own manifest, whose state still
-/// holds the row the horizon purged.
+/// holds the row the horizon purged. Once the restore transaction object is
+/// gone, the notice is an ambiguous (retryable) outcome, not a refutation.
 #[tokio::test]
-async fn restore_notice_recogniser_resolves_the_restore_commit_past_a_horizon_at_its_sequence() {
+async fn restore_notice_recogniser_resolves_the_restore_commit_past_rewrites_at_its_sequence() {
     let (_backend, storage) = storage();
     let store = store(storage.clone());
     let now = Utc::now();
@@ -3526,6 +3469,16 @@ async fn restore_notice_recogniser_resolves_the_restore_commit_past_a_horizon_at
             b"{}".to_vec()
         })
         .await;
+    for sequence in 3..=15_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin filler");
+        txn.put(b"catalog/default", Bytes::from(format!("v{sequence}")))
+            .await
+            .expect("put filler");
+        txn.commit().await.expect("commit filler");
+    }
 
     let participant = ControlMvpRestoreParticipant::new(store.clone());
     let plan = participant
@@ -3556,22 +3509,33 @@ async fn restore_notice_recogniser_resolves_the_restore_commit_past_a_horizon_at
         .as_i64()
         .expect("committed_at_ms");
 
-    let horizon = durable_maintenance::horizon_pending(
-        &arco_catalog::DurableMaintenanceWorker::new(
-            storage.clone(),
-            scope(),
-            arco_catalog::DurableAuthorityBinding::new([41; 32]),
-        )
-        .expect("maintenance worker"),
-        now,
+    assert_eq!(16, token.logical_sequence());
+
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([41; 32]),
     )
-    .await
-    .expect("drive the horizon")
-    .expect("the expired row admits a horizon");
+    .expect("maintenance worker");
+    let consolidated = durable_maintenance::consolidate_pending(&worker)
+        .await
+        .expect("consolidate the restore's suffix")
+        .expect("sixteen L0 segments admit layout maintenance");
+    assert_eq!(&token, consolidated.source_token());
+    let horizon = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .expect("drive the horizon")
+        .expect("the expired row admits a horizon");
+    assert_eq!(consolidated.selected_token(), horizon.source_token());
     let head = store.current_state_token().await.expect("horizon head");
     assert_eq!(horizon.selected_token(), &head);
     assert_eq!(token.logical_sequence(), head.logical_sequence());
-    assert_ne!(token.authority_manifest_id(), head.authority_manifest_id());
+    for rewrite in [consolidated.selected_token(), &head] {
+        assert_ne!(
+            token.authority_manifest_id(),
+            rewrite.authority_manifest_id()
+        );
+    }
     assert_eq!(
         None,
         store
@@ -3639,6 +3603,24 @@ async fn restore_notice_recogniser_resolves_the_restore_commit_past_a_horizon_at
             .get(b"catalog/expiring")
             .await
             .expect("the restore commit still holds the purged row")
+    );
+
+    storage
+        .delete(&store.paths().tx_object(control.transaction_id()))
+        .await
+        .expect("remove the restore transaction object");
+    let unavailable = store
+        .resolve_restore_notice_source(&notice)
+        .await
+        .expect_err("the restore transaction is unreadable");
+    assert!(
+        matches!(
+            &unavailable,
+            CatalogError::AmbiguousAuthorityOutcome { message }
+                if message.contains(notice_id)
+                    && message.contains("restore transaction is unavailable")
+        ),
+        "a missing restore transaction is retryable, got {unavailable:?}"
     );
 }
 

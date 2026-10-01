@@ -1073,15 +1073,18 @@ impl ControlMvpStateStore {
     ///    (not newer than it) finds the commit manifest at the result
     ///    sequence, skipping any maintenance or retention-horizon rewrite
     ///    published at that sequence since;
-    /// 6. that commit is a restore: its manifest and transaction ids are
-    ///    restore-rendered for that sequence, and the transaction's request
-    ///    id is the record id.
+    /// 6. that commit is a restore: its manifest id and the id of its
+    ///    transaction at that sequence are restore-rendered for that
+    ///    sequence, and that transaction's request id is the record id.
     ///
     /// Only the manifests on that path and the commit's transaction metadata
     /// are read, never state. The returned token reads the restored state at
     /// the restore's own manifest.
     ///
     /// # Errors
+    ///
+    /// The refusals raised by checks 1 to 6, and the missing-transaction
+    /// outcome, name the record id in their message.
     ///
     /// - [`CatalogError::Validation`] when the record itself is not a
     ///   well-formed notice of this domain: checks 1 to 4 (an uncommitted
@@ -1090,28 +1093,39 @@ impl ControlMvpStateStore {
     ///   but the authenticated lineage refutes it: it carries no
     ///   authenticated observed root (it was not read from a committed
     ///   outbox), its root is of another scope or older than the result
-    ///   sequence, or checks 5 and 6 fail. A notice-shaped record committed
-    ///   by a plain transaction fails here.
-    /// - Storage and ambiguous-authority errors when the lineage or the
-    ///   transaction metadata cannot be read; these are retryable.
+    ///   sequence, checks 5 and 6 fail, or an object on the path fails its
+    ///   checksum. A notice-shaped record committed by a plain transaction
+    ///   fails here.
+    /// - [`CatalogError::AmbiguousAuthorityOutcome`] when a manifest on the
+    ///   ancestry path cannot be read (missing or failing), the ancestry
+    ///   budget is exhausted, or the restore commit's transaction object is
+    ///   missing; [`CatalogError::Storage`] when the transaction read fails
+    ///   in transport. Both are retryable: the lineage may become readable.
+    /// - Any other error (for example a transaction object that does not
+    ///   decode) is passed through and is not retryable.
     pub async fn resolve_restore_notice_source(
         &self,
         record: &ControlMvpProjectionOutboxRecord,
     ) -> Result<Option<ControlMvpResolvedRestoreNotice>> {
-        if !record
-            .record_id()
-            .starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
-        {
+        if !record.claims_restore_notice() {
             return Ok(None);
         }
+        let id = record.record_id();
         let notice = decode_restore_notice_record(record, self.scope.domain())?;
         let sequence = notice.result_logical_sequence;
         let observed = record.observed_root.as_ref().ok_or_else(|| {
-            invariant_violation("restore notice has no authenticated observed root")
+            restore_notice_invariant(id, "the record has no authenticated observed root")
         })?;
-        if observed.scope() != &self.scope || observed.logical_sequence() < sequence {
-            return Err(invariant_violation(
-                "restore notice result is not in the authenticated root it was read at",
+        if observed.scope() != &self.scope {
+            return Err(restore_notice_invariant(
+                id,
+                "the observed root belongs to another scope",
+            ));
+        }
+        if observed.logical_sequence() < sequence {
+            return Err(restore_notice_invariant(
+                id,
+                "the result is newer than the authenticated root it was read at",
             ));
         }
         let commit = self
@@ -1130,7 +1144,11 @@ impl ControlMvpStateStore {
                             manifest_id: manifest.manifest_id.clone(),
                             manifest_digest: digest.to_string(),
                             committed_at_ms: manifest.committed_at_ms,
-                            tx_ref: manifest.tx_refs.last().cloned(),
+                            tx_ref: manifest
+                                .tx_refs
+                                .iter()
+                                .find(|tx_ref| tx_ref.sequence == sequence)
+                                .cloned(),
                         })
                     })
                 },
@@ -1138,25 +1156,36 @@ impl ControlMvpStateStore {
             .await?
             .flatten()
             .ok_or_else(|| {
-                invariant_violation("restore notice result is absent from authenticated lineage")
+                restore_notice_invariant(id, "the result is absent from authenticated lineage")
             })?;
         let tx_ref = commit
             .tx_ref
             .as_ref()
             .filter(|tx_ref| {
-                tx_ref.sequence == sequence
-                    && tx_ref
-                        .tx_id
-                        .starts_with(&format!("tx-restore-{sequence:020}-"))
+                tx_ref
+                    .tx_id
+                    .starts_with(&restore_transaction_id_prefix(sequence))
                     && commit
                         .manifest_id
-                        .starts_with(&format!("manifest-{sequence:020}-restore-"))
+                        .starts_with(&restore_manifest_id_prefix(sequence))
             })
-            .ok_or_else(|| invariant_violation("restore notice was not committed by a restore"))?;
-        let tx = self.load_tx_metadata(tx_ref).await?;
-        if tx.request_id.as_deref() != Some(record.record_id()) {
-            return Err(invariant_violation(
-                "restore notice was not committed by a restore that carries it",
+            .ok_or_else(|| restore_notice_invariant(id, "it was not committed by a restore"))?;
+        // The manifest walk reports unreadable lineage as an ambiguous
+        // outcome; a missing transaction object is retried the same way.
+        let tx = self
+            .load_tx_metadata(tx_ref)
+            .await
+            .map_err(|error| match error {
+                CatalogError::NotFound { .. } => ambiguous_authority_outcome_for(
+                    self.scope.domain(),
+                    format!("restore notice {id}: the restore transaction is unavailable: {error}"),
+                ),
+                error => error,
+            })?;
+        if tx.request_id.as_deref() != Some(id) {
+            return Err(restore_notice_invariant(
+                id,
+                "it was not committed by a restore that carries it",
             ));
         }
         Ok(Some(ControlMvpResolvedRestoreNotice {
@@ -3305,14 +3334,11 @@ impl ControlMvpStateStore {
             Some(checkpoint_interval),
         )?;
         let suffix = format!("{suffix}-rg-{:020}", stable.current.reclamation_generation);
-        let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
-        let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
-        let outbox_record_id = format!(
-            "restore:{}:{}:{}",
-            identity.restore_id(),
-            identity.attempt(),
-            identity.domain()
-        );
+        let transaction_id = format!("{}{suffix}", restore_transaction_id_prefix(result_sequence));
+        let candidate_manifest_id =
+            format!("{}{suffix}", restore_manifest_id_prefix(result_sequence));
+        let outbox_record_id =
+            restore_notice_record_id(identity.restore_id(), identity.attempt(), identity.domain());
 
         let writes = Self::restore_writes(
             source_values,
@@ -3338,12 +3364,7 @@ impl ControlMvpStateStore {
             sequence: result_sequence,
             writer_epoch: stable.writer_epoch,
             committed_at_ms,
-            request_id: Some(format!(
-                "restore:{}:{}:{}",
-                identity.restore_id(),
-                identity.attempt(),
-                identity.domain()
-            )),
+            request_id: Some(outbox_record_id.clone()),
             l0_segment: unwritten_l0_segment_ref(&transaction_id, result_sequence),
             writes: writes
                 .into_iter()
@@ -4804,6 +4825,37 @@ impl ControlMvpOutboxTrimTarget {
 /// prefix claims to be one; catalog projection intent ids never take it.
 const RESTORE_NOTICE_RECORD_ID_PREFIX: &str = "restore:";
 
+/// Outbox record id of a restore notice, which is also the restore
+/// transaction's request id: `restore:{restore_id}:{attempt}:{domain}`.
+fn restore_notice_record_id(restore_id: &str, attempt: u64, domain: &str) -> String {
+    format!("{RESTORE_NOTICE_RECORD_ID_PREFIX}{restore_id}:{attempt}:{domain}")
+}
+
+/// Prefix of the id of a restore transaction committed at `sequence`; the
+/// restore identity suffix follows. Plain transaction ids start with
+/// `tx-` and twenty digits, so they never take it.
+fn restore_transaction_id_prefix(sequence: u64) -> String {
+    format!("tx-restore-{sequence:020}-")
+}
+
+/// Prefix of the id of a restore's result manifest at `sequence`; the restore
+/// identity suffix follows.
+fn restore_manifest_id_prefix(sequence: u64) -> String {
+    format!("manifest-{sequence:020}-restore-")
+}
+
+/// A validation error naming the restore notice record it refutes.
+fn restore_notice_validation(record_id: &str, reason: impl fmt::Display) -> CatalogError {
+    CatalogError::Validation {
+        message: format!("restore notice {record_id}: {reason}"),
+    }
+}
+
+/// An invariant violation naming the restore notice record it refutes.
+fn restore_notice_invariant(record_id: &str, reason: &str) -> CatalogError {
+    invariant_violation(format!("restore notice {record_id}: {reason}"))
+}
+
 /// Read-only view of the projection outbox notice a committed Control MVP
 /// restore carries.
 ///
@@ -5315,17 +5367,18 @@ impl ControlMvpRestorePlan {
             Some(checkpoint_interval),
         )?;
         let suffix = format!("{suffix}-rg-{:020}", self.observed_reclamation_generation);
-        let expected_transaction_id =
-            format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
-        let expected_manifest_id = format!(
-            "manifest-{:020}-restore-{suffix}",
-            self.result_logical_sequence
+        let expected_transaction_id = format!(
+            "{}{suffix}",
+            restore_transaction_id_prefix(self.result_logical_sequence)
         );
-        let expected_outbox_id = format!(
-            "restore:{}:{}:{}",
+        let expected_manifest_id = format!(
+            "{}{suffix}",
+            restore_manifest_id_prefix(self.result_logical_sequence)
+        );
+        let expected_outbox_id = restore_notice_record_id(
             self.identity.restore_id(),
             self.identity.attempt(),
-            self.identity.domain()
+            self.identity.domain(),
         );
         if self.transaction_id != expected_transaction_id
             || self.transaction_path != store.paths.tx_object(&expected_transaction_id)
@@ -5403,11 +5456,10 @@ impl ControlMvpRestorePlan {
         {
             return Err(validation_failed("invalid legacy Control MVP restore plan"));
         }
-        let expected_outbox_id = format!(
-            "restore:{}:{}:{}",
+        let expected_outbox_id = restore_notice_record_id(
             self.identity.restore_id(),
             self.identity.attempt(),
-            self.identity.domain()
+            self.identity.domain(),
         );
         if self.restore_outbox_record_id != expected_outbox_id {
             return Err(validation_failed(
@@ -5541,11 +5593,10 @@ impl ControlMvpRestoreParticipant {
     ) -> Result<RestoreParticipantInspection> {
         let planned_tx_ref = plan.transaction_reference()?;
         let tx = self.store.load_tx(planned_tx_ref).await?;
-        let expected_request_id = format!(
-            "restore:{}:{}:{}",
+        let expected_request_id = restore_notice_record_id(
             plan.identity.restore_id(),
             plan.identity.attempt(),
-            plan.identity.domain()
+            plan.identity.domain(),
         );
         let [restore_notice] = tx.outbox.as_slice() else {
             return Err(invariant_violation(
@@ -5694,6 +5745,15 @@ impl ControlMvpProjectionOutboxRecord {
     #[must_use]
     pub fn record_id(&self) -> &str {
         &self.record_id
+    }
+
+    /// Returns whether this record claims to be a restore notice: its id
+    /// starts with `restore:`. Such a record is never a projection intent;
+    /// [`ControlMvpStateStore::resolve_restore_notice_source`] authenticates
+    /// the claim.
+    #[must_use]
+    pub fn claims_restore_notice(&self) -> bool {
+        self.record_id.starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
     }
 
     /// Returns the outbox payload.
@@ -7618,24 +7678,24 @@ fn decode_restore_notice_record(
     record: &ControlMvpProjectionOutboxRecord,
     domain: &str,
 ) -> Result<ControlMvpRestoreNoticeView> {
+    let id = record.record_id();
     let notice: ControlMvpRestoreNotice =
-        serde_json::from_slice(record.payload()).map_err(|error| CatalogError::Validation {
-            message: format!(
-                "restore notice {} payload does not decode: {error}",
-                record.record_id()
-            ),
+        serde_json::from_slice(record.payload()).map_err(|error| {
+            restore_notice_validation(id, format!("payload does not decode: {error}"))
         })?;
     if encode_json_vec(&notice, "restore notice")? != record.payload().as_ref() {
-        return Err(validation_failed("restore notice payload is not canonical"));
+        return Err(restore_notice_validation(id, "payload is not canonical"));
     }
-    if record.record_id()
-        != format!(
-            "{RESTORE_NOTICE_RECORD_ID_PREFIX}{}:{}:{}",
-            notice.restore_id, notice.participant_attempt, notice.domain
+    if id
+        != restore_notice_record_id(
+            &notice.restore_id,
+            notice.participant_attempt,
+            &notice.domain,
         )
     {
-        return Err(validation_failed(
-            "restore notice record id does not match its payload",
+        return Err(restore_notice_validation(
+            id,
+            "record id does not match its payload",
         ));
     }
     RestoreAttemptIdentity::new(
@@ -7643,15 +7703,14 @@ fn decode_restore_notice_record(
         notice.participant_attempt,
         notice.domain.as_str(),
     )
-    .map_err(|error| CatalogError::Validation {
-        message: format!("restore notice names an invalid restore identity: {error}"),
-    })?;
+    .map_err(|error| restore_notice_validation(id, format!("invalid restore identity: {error}")))?;
     if notice.domain != domain {
-        return Err(validation_failed("restore notice names another domain"));
+        return Err(restore_notice_validation(id, "it names another domain"));
     }
     if record.origin_sequence() != Some(notice.result_logical_sequence) {
-        return Err(validation_failed(
-            "restore notice was not committed at its result sequence",
+        return Err(restore_notice_validation(
+            id,
+            "it was not committed at its result sequence",
         ));
     }
     Ok(ControlMvpRestoreNoticeView {
@@ -12894,19 +12953,32 @@ mod tests {
             StateScope::new("tenant", "workspace", "orchestration"),
         )
         .unwrap();
-        let foreign_root = other
-            .begin_control_txn(TxnOptions::default())
-            .await
-            .unwrap()
-            .commit()
-            .await
-            .unwrap()
-            .state_token()
-            .clone();
+        // Enough commits that the foreign root is not older than the result,
+        // so only its scope refutes it.
+        let mut foreign_root = None;
+        for _ in 0..3 {
+            foreign_root = Some(
+                other
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap()
+                    .commit()
+                    .await
+                    .unwrap()
+                    .state_token()
+                    .clone(),
+            );
+        }
+        let foreign_root = foreign_root.unwrap();
+        // The restore committed right after `before_restore`.
+        assert!(foreign_root.logical_sequence() > before_restore.logical_sequence());
         for (root, reason) in [
             (None, "no authenticated observed root"),
-            (Some(before_restore), "not in the authenticated root"),
-            (Some(foreign_root), "not in the authenticated root"),
+            (
+                Some(before_restore),
+                "newer than the authenticated root it was read at",
+            ),
+            (Some(foreign_root), "observed root belongs to another scope"),
         ] {
             let mut forged = notice.clone();
             forged.observed_root = root;

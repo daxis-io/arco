@@ -41,6 +41,10 @@ use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+#[path = "support/restore_notice.rs"]
+mod restore_notice;
+use restore_notice::{ForgedPayload, commit_raw_outbox_record, forged_notice};
+
 struct FailProjectionPutBackend {
     inner: MemoryBackend,
     /// Fails every put under `control/v1/projections/`.
@@ -3078,6 +3082,7 @@ async fn checkpointed_catalog(storage: &ScopedStorage) -> CheckpointedCatalog {
 /// The committed outcome of restoring a [`CheckpointedCatalog`] to its
 /// checkpoint: the restore notice in the outbox and the result manifest.
 struct RestoredCatalog {
+    restore_id: String,
     notice: ControlMvpProjectionOutboxRecord,
     result_sequence: u64,
     result_manifest_id: String,
@@ -3087,6 +3092,10 @@ struct RestoredCatalog {
 /// Restores `catalog` to its checkpoint through the catalog restore
 /// participant. The result manifest's `committed_at_ms` is read from the
 /// published manifest object, independently of the materializer.
+#[allow(
+    clippy::panic,
+    reason = "an unexpected plan or inspection variant fails the calling test"
+)]
 async fn restore_to_checkpoint(
     storage: &ScopedStorage,
     catalog: &CheckpointedCatalog,
@@ -3102,22 +3111,16 @@ async fn restore_to_checkpoint(
         )
         .await
         .expect("plan catalog restore");
-    let control = if let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan {
-        Some(control)
-    } else {
-        None
-    }
-    .expect("a ControlMvp restore plan");
-    let visible = participant
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected a ControlMvp restore plan")
+    };
+    let RestoreParticipantInspection::Visible { token, .. } = participant
         .apply_restore(&plan, chrono::Utc::now())
         .await
-        .expect("apply catalog restore");
-    let token = if let RestoreParticipantInspection::Visible { token, .. } = visible {
-        Some(token)
-    } else {
-        None
-    }
-    .expect("the restore becomes visible");
+        .expect("apply catalog restore")
+    else {
+        panic!("the restore must become visible")
+    };
     assert_eq!(control.result_logical_sequence(), token.logical_sequence());
     let manifest: serde_json::Value = serde_json::from_slice(
         &storage
@@ -3141,6 +3144,7 @@ async fn restore_to_checkpoint(
         .expect("the restore commits its notice to the outbox");
     assert_eq!(Some(token.logical_sequence()), notice.origin_sequence());
     RestoredCatalog {
+        restore_id: restore_id.to_string(),
         notice,
         result_sequence: token.logical_sequence(),
         result_manifest_id: control.candidate_manifest_id().to_string(),
@@ -3167,16 +3171,21 @@ fn expected_restore_audit_row(restored: &RestoredCatalog) -> CatalogAuditRow {
 
 /// The audit artifact path of a materialized restore: the UTC day of the
 /// result manifest's `committed_at_ms`, then the result sequence and the
-/// notice record id (which contains `:`).
+/// notice record id `restore:{restore_id}:1:catalog` with each `:` spelled
+/// `-`, so the file name is readable by Hadoop-style path readers.
 fn expected_restore_audit_path(restored: &RestoredCatalog) -> String {
     let day = chrono::DateTime::from_timestamp_millis(restored.committed_at_ms)
         .expect("stamp within chrono's range")
         .format("%Y-%m-%d");
     let path = format!(
-        "control/v1/projections/catalog-audit/dt={day}/{:020}-{}.parquet",
-        restored.result_sequence,
+        "control/v1/projections/catalog-audit/dt={day}/{:020}-restore-{}-1-catalog.parquet",
+        restored.result_sequence, restored.restore_id
+    );
+    assert_eq!(
+        format!("restore:{}:1:catalog", restored.restore_id),
         restored.notice.record_id()
     );
+    assert!(!path.contains(':'), "audit file names never contain ':'");
     assert!(path.starts_with(&format!(
         "{CATALOG_AUDIT_PROJECTION_PREFIX}{}",
         catalog_audit_partition(restored.committed_at_ms).expect("partition")
@@ -3317,7 +3326,16 @@ async fn a_catalog_restore_is_materialized_with_a_restore_audit_row() {
         .collect::<Vec<_>>();
     assert_eq!(vec![("analytics", Some("first"))], catalogs);
     assert_eq!(1, at_restore.1.len(), "the checkpoint's schema is restored");
-    let before_restore = snapshot_rows(&storage, &directories[3]).await;
+    let pre_restore_directory = directories
+        .iter()
+        .find(|directory| {
+            directory.starts_with(&format!(
+                "control/v1/projections/catalog-parquet/{:020}-",
+                restored.result_sequence - 1
+            ))
+        })
+        .expect("the snapshot of the head the restore replaced");
+    let before_restore = snapshot_rows(&storage, pre_restore_directory).await;
     assert_ne!(
         at_restore, before_restore,
         "the restore replaced the patched head"
@@ -3330,7 +3348,7 @@ async fn a_catalog_restore_is_materialized_with_a_restore_audit_row() {
         vec![audit_path.clone()],
         audit
             .iter()
-            .filter(|path| path.contains("restore:"))
+            .filter(|path| path.contains("-restore-rst_"))
             .cloned()
             .collect::<Vec<_>>()
     );
@@ -3427,49 +3445,6 @@ async fn a_mutation_after_a_materialized_restore_still_materializes() {
     );
 }
 
-/// The canonical restore notice payload shape, for forging notices.
-#[derive(serde::Serialize)]
-struct ForgedRestoreNotice<'a> {
-    restore_id: &'a str,
-    participant_attempt: u64,
-    domain: &'a str,
-    source_logical_sequence: u64,
-    result_logical_sequence: u64,
-}
-
-/// Commits one raw outbox record through a plain control transaction and
-/// returns its origin sequence. `payload` receives the sequence the record
-/// will commit at.
-async fn commit_raw_outbox_record(
-    store: &ControlMvpStateStore,
-    record_id: &str,
-    options: TxnOptions,
-    payload: impl FnOnce(u64) -> Vec<u8>,
-) -> u64 {
-    let origin = store
-        .current_state_token()
-        .await
-        .map_or(1, |token| token.logical_sequence() + 1);
-    let mut txn = store
-        .begin_control_txn(options)
-        .await
-        .expect("begin raw transaction");
-    txn.stage_projection_outbox(ControlMvpProjectionOutboxRecord::new(
-        record_id,
-        Bytes::from(payload(origin)),
-    ))
-    .await
-    .expect("stage raw outbox record");
-    let committed = txn
-        .commit()
-        .await
-        .expect("commit raw outbox record")
-        .into_state_token()
-        .logical_sequence();
-    assert_eq!(origin, committed);
-    committed
-}
-
 /// Records that claim to be restore notices (a `restore:` id) but are not
 /// the notice of a committed restore are quarantined `INVALID_RESTORE_NOTICE`
 /// without writing any projection artifact, and later work proceeds. The
@@ -3481,55 +3456,43 @@ async fn forged_restore_notices_are_quarantined_without_artifacts_or_blocking_la
     let storage = scoped_storage();
     let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
     let notice = |restore_id: &'static str, domain: &'static str, delta: u64| {
-        move |origin: u64| {
-            serde_json::to_vec(&ForgedRestoreNotice {
-                restore_id,
-                participant_attempt: 1,
-                domain,
-                source_logical_sequence: origin - 1,
-                result_logical_sequence: origin + delta,
-            })
-            .expect("encode forged notice")
-        }
+        move |origin: u64| forged_notice(restore_id, domain, origin - 1, origin + delta)
     };
-    let wrong_domain = "restore:rst_00000000000000000000000111:1:catalog";
+    let wrong_domain = "restore:rst_00000000000000000000000111:1:orchestration";
     let wrong_sequence = "restore:rst_00000000000000000000000112:1:catalog";
     let malformed = "restore:rst_00000000000000000000000113:1:catalog";
     let not_a_restore = "restore:rst_00000000000000000000000114:1:catalog";
     let mut forged = Vec::new();
-    forged.push(
-        commit_raw_outbox_record(
-            &store,
+    let cases: [(&str, TxnOptions, ForgedPayload); 4] = [
+        (
             wrong_domain,
             TxnOptions::default(),
-            notice("rst_00000000000000000000000111", "orchestration", 0),
-        )
-        .await,
-    );
-    forged.push(
-        commit_raw_outbox_record(
-            &store,
+            Box::new(notice("rst_00000000000000000000000111", "orchestration", 0)),
+        ),
+        (
             wrong_sequence,
             TxnOptions::default(),
-            notice("rst_00000000000000000000000112", "catalog", 7),
-        )
-        .await,
-    );
-    forged.push(
-        commit_raw_outbox_record(&store, malformed, TxnOptions::default(), |_| {
-            b"{\"restore_id\":".to_vec()
-        })
-        .await,
-    );
-    forged.push(
-        commit_raw_outbox_record(
-            &store,
+            Box::new(notice("rst_00000000000000000000000112", "catalog", 7)),
+        ),
+        (
+            malformed,
+            TxnOptions::default(),
+            Box::new(|_| b"{\"restore_id\":".to_vec()),
+        ),
+        (
             not_a_restore,
             TxnOptions::new(Some(scope())).with_request_id(not_a_restore),
-            notice("rst_00000000000000000000000114", "catalog", 0),
-        )
-        .await,
-    );
+            Box::new(notice("rst_00000000000000000000000114", "catalog", 0)),
+        ),
+    ];
+    for (record_id, options, payload) in cases {
+        forged.push(
+            commit_raw_outbox_record(&store, record_id, options, payload)
+                .await
+                .origin_sequence()
+                .expect("committed origin sequence"),
+        );
+    }
     let forged_ids = vec![wrong_domain, wrong_sequence, malformed, not_a_restore];
 
     let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
@@ -3796,6 +3759,363 @@ async fn a_divergent_restore_audit_artifact_fails_closed_without_acknowledging()
             .expect("backlog")
             .pending_record_ids,
         "a quarantined notice is never acknowledged"
+    );
+}
+
+/// Reports reads (`get` and `get_range`) of one armed scope-relative path as
+/// a missing object, and counts them.
+struct MissingObjectBackend {
+    inner: MemoryBackend,
+    missing: std::sync::Mutex<Option<String>>,
+    missing_reads: AtomicUsize,
+}
+
+impl MissingObjectBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryBackend::new(),
+            missing: std::sync::Mutex::new(None),
+            missing_reads: AtomicUsize::new(0),
+        })
+    }
+
+    fn arm(&self, path: &str) {
+        *self.missing.lock().expect("missing path") = Some(path.to_string());
+    }
+
+    fn disarm(&self) {
+        *self.missing.lock().expect("missing path") = None;
+    }
+
+    fn missing_reads(&self) -> usize {
+        self.missing_reads.load(Ordering::SeqCst)
+    }
+
+    fn check(&self, path: &str) -> arco_core::Result<()> {
+        let armed = self
+            .missing
+            .lock()
+            .expect("missing path")
+            .as_deref()
+            .is_some_and(|armed| path.ends_with(armed));
+        if armed {
+            self.missing_reads.fetch_add(1, Ordering::SeqCst);
+            return Err(arco_core::Error::NotFound(path.to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StorageBackend for MissingObjectBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.check(path)?;
+        self.inner.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.check(path)?;
+        self.inner.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.inner.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.inner.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.inner.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.inner.signed_url(path, expiry).await
+    }
+}
+
+/// The ack writer of the synthetic catalog root's projection status.
+fn catalog_ack_writer(storage: &ScopedStorage) -> ProjectionOutboxAckWriter {
+    ProjectionOutboxAckWriter::new(
+        storage.clone(),
+        StateScope::new(
+            "synthetic-tenant",
+            "synthetic-workspace",
+            PROJECTION_OUTBOX_ACK_DOMAIN,
+        ),
+    )
+    .expect("ack writer")
+}
+
+/// A restore notice quarantined `INVALID_PROJECTION_INTENT` before restores
+/// were materialized (seeded here exactly as that code recorded it) stays
+/// quarantined: it is neither authenticated nor published, its disposition
+/// keeps the original code (recording another one at its sequence would fail
+/// every later drain), and later work drains.
+#[tokio::test]
+async fn a_restore_notice_quarantined_before_restores_materialized_stays_quarantined() {
+    let storage = scoped_storage();
+    let catalog = checkpointed_catalog(&storage).await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    materializer
+        .drain_once()
+        .await
+        .expect("drain the mutations");
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000141").await;
+    let notice_id = restored.notice.record_id().to_string();
+    let ack_writer = catalog_ack_writer(&storage);
+    ack_writer
+        .record_projection_quarantine(
+            CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+            restored.result_sequence,
+            &notice_id,
+            "INVALID_PROJECTION_INTENT",
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .expect("the quarantine the materializer recorded before this change");
+    let artifacts = projection_objects(&storage).await;
+
+    for _ in 0..2 {
+        let report = materializer
+            .drain_once()
+            .await
+            .expect("a quarantined notice never fails the drain");
+        assert_eq!(vec![notice_id.clone()], report.quarantined_record_ids);
+        assert!(report.drained_record_ids.is_empty());
+    }
+    let quarantine = ack_writer
+        .projection_quarantine(
+            CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+            restored.result_sequence,
+        )
+        .await
+        .expect("read quarantine")
+        .expect("durable quarantine");
+    assert_eq!(notice_id, quarantine.source_record_id());
+    assert_eq!("INVALID_PROJECTION_INTENT", quarantine.failure_code());
+    assert_eq!(
+        artifacts,
+        projection_objects(&storage).await,
+        "the quarantined notice publishes nothing"
+    );
+    assert!(
+        !snapshot_directories(&storage)
+            .await
+            .contains(&snapshot_directory(
+                restored.result_sequence,
+                &restored.result_manifest_id
+            ))
+    );
+
+    catalog
+        .authority
+        .create_catalog("after-quarantine", None, WriteOptions::default())
+        .await
+        .expect("mutate after the quarantined restore");
+    let record = catalog
+        .store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .last()
+        .filter(|record| !record.claims_restore_notice())
+        .expect("the later mutation's intent is the newest record");
+    let report = materializer
+        .drain_once()
+        .await
+        .expect("later work drains past the quarantined notice");
+    assert_eq!(
+        vec![record.record_id().to_string()],
+        report.drained_record_ids
+    );
+    assert_eq!(vec![notice_id], report.quarantined_record_ids);
+    assert_eq!(
+        record.origin_sequence(),
+        materializer
+            .status()
+            .await
+            .expect("status")
+            .expect("materialized status")
+            .applied_authority_sequence()
+    );
+}
+
+/// A notice quarantined `INVALID_RESTORE_NOTICE` is not authenticated again
+/// on later drains: with the forged commit's manifest now unreadable, a
+/// re-authentication would walk to it and fail the drain as an ambiguous
+/// outcome, but the drain never reads it and later work proceeds.
+#[tokio::test]
+async fn a_quarantined_restore_notice_is_not_authenticated_again() {
+    let backend = MissingObjectBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let forged_id = "restore:rst_00000000000000000000000151:1:catalog";
+    let forged = commit_raw_outbox_record(
+        &store,
+        forged_id,
+        TxnOptions::new(Some(scope())).with_request_id(forged_id),
+        |origin| forged_notice("rst_00000000000000000000000151", "catalog", 0, origin),
+    )
+    .await;
+    let forged_manifest = store
+        .current_state_token()
+        .await
+        .expect("forged head")
+        .authority_manifest_id()
+        .to_string();
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    let first = materializer
+        .drain_once()
+        .await
+        .expect("a quarantine is not a drain failure");
+    assert_eq!(vec![forged_id], first.quarantined_record_ids);
+    let sequence = forged.origin_sequence().expect("committed origin sequence");
+    assert_eq!(
+        "INVALID_RESTORE_NOTICE",
+        catalog_ack_writer(&storage)
+            .projection_quarantine(CATALOG_PARQUET_PROJECTION_CONSUMER_ID, sequence)
+            .await
+            .expect("read quarantine")
+            .expect("durable quarantine")
+            .failure_code()
+    );
+
+    ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()))
+        .create_catalog("after-forgery", None, WriteOptions::default())
+        .await
+        .expect("mutate after the forged notice");
+    backend.arm(&store.paths().manifest_object(&forged_manifest));
+    let second = materializer
+        .drain_once()
+        .await
+        .expect("the quarantined notice is not authenticated again");
+    assert_eq!(
+        0,
+        backend.missing_reads(),
+        "nothing reads the forged commit's manifest"
+    );
+    assert_eq!(vec![forged_id], second.quarantined_record_ids);
+    assert_eq!(1, second.drained_record_ids.len());
+}
+
+/// A restore notice whose authenticated lineage cannot be read (here its
+/// result manifest is missing) is retried, not quarantined: the drain fails
+/// with an ambiguous outcome, the status is retryable, the notice stays
+/// pending, and it materializes once the manifest is readable again.
+#[tokio::test]
+async fn a_restore_notice_with_an_unreadable_lineage_is_retried_not_quarantined() {
+    let backend = MissingObjectBackend::new();
+    let storage = ScopedStorage::new(backend.clone(), "synthetic-tenant", "synthetic-workspace")
+        .expect("storage");
+    let catalog = checkpointed_catalog(&storage).await;
+    let materializer = CatalogProjectionMaterializer::new(storage.clone()).expect("materializer");
+    materializer
+        .drain_once()
+        .await
+        .expect("drain the mutations");
+    let restored =
+        restore_to_checkpoint(&storage, &catalog, "rst_00000000000000000000000161").await;
+    catalog
+        .authority
+        .create_catalog("after-restore", None, WriteOptions::default())
+        .await
+        .expect("mutate after the restore");
+    let intent_id = catalog
+        .store
+        .current_projection_outbox()
+        .await
+        .expect("outbox")
+        .into_iter()
+        .last()
+        .filter(|record| !record.claims_restore_notice())
+        .expect("the later mutation's intent is the newest record")
+        .record_id()
+        .to_string();
+
+    backend.arm(
+        &catalog
+            .store
+            .paths()
+            .manifest_object(&restored.result_manifest_id),
+    );
+    let error = materializer
+        .drain_once()
+        .await
+        .expect_err("an unreadable lineage fails the drain for a retry");
+    assert!(
+        matches!(error, CatalogError::AmbiguousAuthorityOutcome { .. }),
+        "expected an ambiguous outcome, got {error:?}"
+    );
+    assert!(backend.missing_reads() > 0);
+    assert_eq!(
+        Some("retryable:CATALOG_PROJECTION_FAILED"),
+        materializer
+            .status()
+            .await
+            .expect("status")
+            .expect("failure status")
+            .failure_state()
+    );
+    assert_eq!(
+        None,
+        catalog_ack_writer(&storage)
+            .projection_quarantine(
+                CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+                restored.result_sequence,
+            )
+            .await
+            .expect("read quarantine"),
+        "an unreadable lineage is never a quarantine"
+    );
+    assert_eq!(
+        vec![restored.notice.record_id().to_string(), intent_id.clone()],
+        catalog_worker(&storage)
+            .backlog()
+            .await
+            .expect("backlog")
+            .pending_record_ids
+    );
+
+    backend.disarm();
+    let report = materializer.drain_once().await.expect("the retry drains");
+    assert_eq!(
+        vec![restored.notice.record_id().to_string(), intent_id],
+        report.drained_record_ids
+    );
+    assert!(report.quarantined_record_ids.is_empty());
+    assert_eq!(
+        None,
+        materializer
+            .status()
+            .await
+            .expect("status")
+            .expect("success status")
+            .failure_state()
     );
 }
 

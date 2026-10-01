@@ -92,6 +92,14 @@ Alerts (`infra/monitoring/alerts.yaml`, group `arco.state_store`):
   surgery is involved. A malformed intent receives a sticky terminal
   quarantine status and stays visible as unresolved backlog while later valid
   intents continue — it needs an operator decision, not another retry.
+  Later intents continue only while the quarantined intent's source is
+  inside the ancestry cap: an intent quarantined
+  `INCOMPATIBLE_PROJECTION_INTENT` at publication is resolved again on every
+  drain, and once its source is more than 4,096 manifests (or 64 MiB of
+  manifest bytes) behind the head, every drain aborts at it and no later
+  record is materialized. See the known limitation "An intent quarantined
+  at publication can stop every drain" in
+  `docs/runbooks/control-store-worker.md`.
 - If the watermark update itself keeps failing, retry the watermark publish;
   watermark publication is CAS-guarded like every other control write.
 - While lag persists, verify staleness is surfaced explicitly wherever the

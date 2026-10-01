@@ -833,6 +833,51 @@ async fn authority8_rejects_put_with_expiry_before_staging() {
     assert_eq!(after.generation(), Some(1));
 }
 
+/// Bounded authority-8 planning cannot honour a restore key policy, so it
+/// refuses a participant whose policy excludes anything rather than planning
+/// a restore that would silently restore the excluded keys.
+#[tokio::test]
+async fn authority8_bounded_restore_refuses_a_restore_key_policy() {
+    use crate::state_store::RestorePlanningContext;
+    use crate::workspace_io_budget::{WorkspaceCaptureIo, WorkspaceIoBudget};
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([36; 32]));
+    let mut txn = transaction(&store, "restore-key-policy-source").await;
+    txn.put(b"\x03receipt", Bytes::from_static(b"receipt"))
+        .await
+        .unwrap();
+    let token = txn.commit_v2().await.unwrap().token().clone();
+    let now = Utc::now();
+    let source = store
+        .persist_state_reference(&token, now + ChronoDuration::days(2))
+        .await
+        .unwrap();
+    let identity =
+        RestoreAttemptIdentity::new(format!("rst_{}", Ulid::from(706_u128)), 1, "catalog").unwrap();
+    let mut budget = WorkspaceIoBudget::new();
+    let mut context = RestorePlanningContext::new(
+        prefixed_sha256(b"workspace-request"),
+        now,
+        now + ChronoDuration::hours(24),
+        now,
+        WorkspaceCaptureIo::new(
+            store.retention.as_legacy_scoped().expect("workspace root"),
+            &mut budget,
+        ),
+    );
+    let error = ControlMvpRestoreParticipant::new(store.clone())
+        .with_key_policy(RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap())
+        .plan_restore_bounded(&source, &identity, &mut context)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            CatalogError::UnsupportedOperation { message } if message.contains("restore key policy")
+        ),
+        "{error:?}"
+    );
+}
+
 #[tokio::test]
 async fn authority8_bounded_restore_plans_the_authenticated_source_without_writes() {
     use crate::state_store::RestorePlanningContext;

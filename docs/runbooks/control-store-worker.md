@@ -68,8 +68,10 @@ history.
    `CatalogProjectionMaterializer::drain_once` materializes every pending
    catalog projection outbox record and acknowledges it, then reads the durable
    materialization status and backlog and logs applied/observed sequence, lag,
-   age and pending records. Every drained record commits two
-   `projection-outbox-acks` L0 segments (status + ack), which is why
+   age and pending records. A catalog restore's notice is materialized the
+   same way: a catalog snapshot at the restore sequence and one restore audit
+   row (`docs/guide/src/reference/system-catalog.md`). Every drained record
+   commits two `projection-outbox-acks` L0 segments (status + ack), which is why
    maintenance runs first: it consolidates the ack domain before the drain
    needs the commit headroom.
 4. **Catalog outbox trim** (`phase="trim"`, `domain="catalog"`). After the
@@ -291,6 +293,36 @@ Drain `outcome` values:
   backlog; if it does not fall between runs, the maintenance phase for
   `projection-outbox-acks` is not publishing (check its `outcome`).
 
+A drained record that cannot be materialized either stops the drain or is
+quarantined. A retryable error (`Storage`, `CasFailed`,
+`MaintenanceBackpressure` or `AmbiguousAuthorityOutcome`) leaves the record
+pending and stops the drain at it: ack-domain backpressure
+(`MaintenanceBackpressure`) reports `outcome="deferred"`, and any other of
+these errors fails the `drain` phase. A quarantined record gets a terminal
+disposition, is never acknowledged or trimmed, and counts in
+`quarantined_records` and `pending_records` on every later run. The warn
+line `catalog projection intent quarantined` (fields `record_id`,
+`source_sequence`, `failure_code`, `error`) is logged only for
+`INVALID_RESTORE_NOTICE` and `INCOMPATIBLE_PROJECTION_INTENT` quarantines;
+an `INVALID_PROJECTION_INTENT` quarantine and a skipped, already-quarantined
+restore notice log nothing. Failure codes:
+
+- `INVALID_PROJECTION_INTENT`: the payload is not a projection intent.
+  Before retention step 4 every restore notice ended here.
+- `INVALID_RESTORE_NOTICE`: a record whose id starts with `restore:` is not
+  the notice of a committed restore of the catalog domain. It is malformed,
+  the authenticated authority lineage refutes it (for example a plain
+  transaction, not a restore, committed it), or an object on its lineage is
+  corrupt (see `docs/runbooks/state-store-corrupt-artifact.md`); the
+  quarantine is not retried after repair. Nothing is written. An
+  unreadable lineage (a missing manifest on the ancestry path, or a missing
+  restore transaction) is not refutation: it fails the drain and the notice
+  stays pending.
+- `INCOMPATIBLE_PROJECTION_INTENT`: the intent's payload is not its audit
+  record, or publication failed with a non-retryable error (for example
+  different bytes already at an artifact path). A restore notice that fails
+  at publication takes this code too.
+
 Trim `outcome` values:
 
 - `ok`: a trim commit landed; `trimmed_records` records left the catalog
@@ -458,9 +490,9 @@ Remedy, in order:
   the next fixed drain once the root is unbound.
 - **One small audit file per catalog mutation.** The materializer writes one
   single-row Parquet file under `control/v1/projections/catalog-audit/` for
-  every acknowledged catalog intent. At the pilot rate (1,209,600 mutations a
-  week) that is about 173,000 files a day and about 69 million files at the
-  400-day default. Compacting day partitions into larger files is a
+  every acknowledged catalog intent and restore notice. At the pilot rate
+  (1,209,600 mutations a week) that is about 173,000 files a day and about
+  69 million files at the 400-day default. Compacting day partitions into larger files is a
   follow-up.
 - **Audit sweep throughput is bounded by serial deletes.** The sweep deletes
   one object at a time, about 20 to 50 ms each on GCS, so a full
@@ -499,16 +531,19 @@ Remedy, in order:
   acknowledgements, so the next drain redelivers those records. The API (its post-commit drain and the operator
   drain) and this job materialize the same outbox, so they must run the same
   `parquet` and `arrow` versions. Accepting an existing file whose decoded
-  rows match (semantic retry acceptance) is a follow-up due no later than
-  retention step 4.
+  rows match (semantic retry acceptance) remains a follow-up. Retention step
+  4 re-scoped it out of that step, because a restore writes its snapshot
+  files before its audit file, exactly like a mutation; the upgrade hazard
+  is unchanged.
 - **Catalog snapshot directories are never collected.** Every acknowledged
-  catalog intent also publishes a full catalog snapshot directory,
+  catalog intent and restore notice also publishes a full catalog snapshot
+  directory,
   `control/v1/projections/catalog-parquet/{sequence:020}-{manifest_id}/`.
   Nothing deletes these: the kernel GC covers `control/v1/domains/<domain>/`,
   the legacy GC covers `snapshots/`, and the audit sweep covers only the
-  audit prefix. Storage grows by one full catalog snapshot per mutation. The
-  retention design assumed a projection GC that ages superseded snapshots;
-  none exists. Collecting superseded snapshot directories is a follow-up.
+  audit prefix. Storage grows by one full catalog snapshot per mutation or
+  restore. The retention design assumed a projection GC that ages superseded
+  snapshots; none exists. Collecting superseded snapshot directories is a follow-up.
 - **A keyed retry after its receipt was purged can fail with a
   projection-intent conflict until the worker drains and trims.** A keyed
   request replays its original response for at least 24 hours; its receipt
@@ -526,13 +561,62 @@ Remedy, in order:
   can be permanent when the earlier intent was quarantined: a quarantined
   record is never acknowledged, so it is never trimmed and keeps its id. A
   transient quarantine cause clears on a later drain, which then
-  acknowledges the record; a persistent one (for example divergent bytes at
-  its artifact path) keeps that (operation family, idempotency key) pair
+  acknowledges the record (restore notices excepted: a quarantined restore
+  notice is never processed again); a persistent one (for example divergent
+  bytes at its artifact path) keeps that (operation family, idempotency key) pair
   returning 409 until the quarantine is resolved. If the conflict persists
   across runs, check the drain's `quarantined_records` and the `drain` and
   `trim` outcomes. The audit projection records the two executions as
   separate rows with the same `operation_id` and different
   `logical_sequence` values.
+- **A restore's projection appears on the next drain, not at commit.** A
+  restore commits through the restore participant, not through the catalog
+  API, so it wakes no post-commit drain. Its notice is materialized by the
+  next drain that reaches it: normally this job's next run (every 5 minutes
+  by default) or the post-commit drain the next catalog mutation wakes. A
+  drain stops at the first record that fails retryably, and ack-domain
+  backpressure defers it, so the notice can wait longer. Until then
+  `pending_records` counts the notice, and the newest published catalog
+  snapshot is the one from before the restore.
+- **Restore notices quarantined before retention step 4 stay quarantined.**
+  Before step 4 the materializer did not recognise a restore notice
+  (`restore:{restore_id}:{attempt}:{domain}`) and quarantined it
+  `INVALID_PROJECTION_INTENT`. The materializer now skips any `restore:`
+  record that already carries a terminal disposition, so such a notice is
+  never processed again and keeps its original code. It is never
+  acknowledged or trimmed: it counts in `quarantined_records` and
+  `pending_records` on every run, and its restore has no catalog snapshot at
+  the restore sequence and no audit row. Later mutations materialize
+  normally, and their snapshots include the restored state. Operator
+  action: no tool resolves a terminal quarantine yet (the
+  quarantine-resolution follow-up). Record the notice's record id and
+  restore id and escalate to the owner; do not re-run the restore to
+  produce the missing audit row, because a new restore rolls the catalog
+  back again.
+- **An intent quarantined at publication can stop every drain.** The drain
+  hands every unacknowledged record to the materializer, quarantined ones
+  included (only a quarantined restore notice is skipped). An intent
+  quarantined `INCOMPATIBLE_PROJECTION_INTENT` at publication (for example
+  for different bytes at an artifact path) is therefore resolved again on
+  every drain: an authenticated ancestry walk from the head back to its
+  source manifest, then a publication that fails again. The walk is capped
+  at 4,096 manifests (mutations, outbox trims, consolidations and horizons
+  all count) or 64 MiB of manifest bytes. Once the intent's source is beyond
+  that cap, every drain aborts at that record with an ambiguous-authority
+  error. Symptom: the `drain` phase fails on every run with
+  `drain[catalog]: drain catalog projection outbox: ambiguous authority outcome: authenticated ancestry resolution budget exhausted`
+  or
+  `drain[catalog]: drain catalog projection outbox: ambiguous authority outcome: authenticated ancestry metadata budget exhausted`,
+  the job exits non-zero, the API's post-commit drains log
+  `best-effort catalog projection wake failed` with the same error, and no
+  later record is materialized, acknowledged or trimmed, so
+  `pending_records` only grows (and keyed retries keep their 409). At the
+  pilot rate (about two catalog commits a second) the cap is reached within
+  at most about 34 minutes of the quarantine. The same cap applies to any
+  record left undrained beyond it. Remedy: none automated; resolving the
+  quarantine is the operator-resolution follow-up. Treat an
+  `INCOMPATIBLE_PROJECTION_INTENT` quarantine as urgent and escalate it to
+  the owner as soon as `quarantined_records` reports it.
 - The job maintains exactly the `catalog` and `projection-outbox-acks` domains.
   Other control domains need their own entry in `CONTROL_DOMAINS`.
 
@@ -540,6 +624,7 @@ Remedy, in order:
 
 - `docs/runbooks/state-store-projection-lag.md`
 - `docs/runbooks/state-store-replay-budget.md`
+- `docs/runbooks/state-store-restore-repair-required.md` (restore effects on receipts)
 - `docs/runbooks/control-plane-repair-and-dark-launch.md`
 - `docs/runbooks/gc-failure.md`
 - `docs/adr/adr-043-s3-state-token-authority.md`

@@ -1539,8 +1539,9 @@ mod horizon {
     use super::super::super::fixture_driver::horizon_pending;
     use super::super::super::{
         ArcoStateAdmin as _, ArcoStateReader as _, ArcoStateTxn as _, CheckpointOptions,
-        ControlMvpMaintenanceOutcome, ControlMvpManifest, ControlMvpProjectionOutboxRecord,
-        PinnedSequenceV1, PurgedCountsV1, PurgedRow, StateToken, TxnOptions, purged_rows_digest,
+        ControlMvpCheckpoint, ControlMvpMaintenanceOutcome, ControlMvpManifest,
+        ControlMvpProjectionOutboxRecord, PinnedSequenceV1, PurgedCountsV1, PurgedRow, StateToken,
+        TxnOptions, purged_rows_digest,
     };
     use super::super::*;
     use crate::metrics::sample;
@@ -1933,6 +1934,106 @@ mod horizon {
             reader.get(b"receipt-expired").await.unwrap(),
             Some(Bytes::from_static(VALUE))
         );
+    }
+
+    /// A checkpoint taken while HEAD is a horizon manifest carries that
+    /// manifest's certificate, and the certificate is bound to the source: a
+    /// checkpoint record without it, or with any part of it altered, no
+    /// longer matches its source manifest, and neither does a certificate
+    /// checked against a source that carries none.
+    #[tokio::test]
+    async fn a_checkpoint_at_a_horizon_head_carries_and_binds_the_certificate() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 45);
+        let store = &worker.worker.store;
+        let (_fixture, _) = aged_mixed_state(store).await;
+        run(&worker, horizon_now()).await.expect("eligible rows");
+        let (_, source) = head(store).await;
+        let certificate = source
+            .retention_horizon
+            .clone()
+            .expect("HEAD is a horizon manifest");
+
+        let token = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let checkpoint = store.load_checkpoint(&token).await.unwrap();
+        assert_eq!(checkpoint.manifest_id, source.manifest_id);
+        assert_eq!(checkpoint.retention_horizon.as_ref(), Some(&certificate));
+        checkpoint.validate_source(&source).unwrap();
+        store.read_checkpoint(token).await.unwrap();
+
+        let mut forgeries: Vec<(&str, ControlMvpCheckpoint, &ControlMvpManifest)> = Vec::new();
+        let mut forged = checkpoint.clone();
+        forged.retention_horizon = None;
+        forgeries.push(("certificate removed", forged, &source));
+        let mut forged = checkpoint.clone();
+        forged.retention_horizon.as_mut().unwrap().purge_cutoff_ms -= 1;
+        forgeries.push(("purge cutoff altered", forged, &source));
+        let mut forged = checkpoint.clone();
+        forged
+            .retention_horizon
+            .as_mut()
+            .unwrap()
+            .purged_counts
+            .expired_rows += 1;
+        forgeries.push(("purged counts altered", forged, &source));
+        let mut forged = checkpoint.clone();
+        forged
+            .retention_horizon
+            .as_mut()
+            .unwrap()
+            .pinned_evidence
+            .clear();
+        forgeries.push(("pinned evidence altered", forged, &source));
+        let mut uncertified = source.clone();
+        uncertified.retention_horizon = None;
+        forgeries.push((
+            "source without a certificate",
+            checkpoint.clone(),
+            &uncertified,
+        ));
+        for (case, forged, manifest) in forgeries {
+            let error = forged.validate_source(manifest).unwrap_err();
+            assert!(
+                matches!(&error, CatalogError::InvariantViolation { message }
+                    if message.contains("checkpoint source validation evidence mismatch")),
+                "{case}: {error}"
+            );
+        }
+    }
+
+    /// The bounded checkpoint preparation a workspace capture uses for a
+    /// format-9 domain copies the horizon certificate like the ordinary
+    /// checkpoint path does, so its source validation passes at a horizon
+    /// HEAD.
+    #[tokio::test]
+    async fn bounded_checkpoint_preparation_at_a_horizon_head_carries_the_certificate() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let worker = worker_on(storage, 46);
+        let store = &worker.worker.store;
+        let (_fixture, _) = aged_mixed_state(store).await;
+        run(&worker, horizon_now()).await.expect("eligible rows");
+        let (_, source) = head(store).await;
+        assert!(
+            source.retention_horizon.is_some(),
+            "HEAD is a horizon manifest"
+        );
+
+        let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
+        let (checkpoint, _) = store
+            .prepare_bounded_checkpoint(
+                &CheckpointOptions::new(Some(store.scope.clone())),
+                &mut budget,
+            )
+            .await
+            .expect("bounded checkpoint preparation at a horizon HEAD");
+        assert_eq!(checkpoint.manifest_id, source.manifest_id);
+        assert_eq!(checkpoint.retention_horizon, source.retention_horizon);
+        checkpoint.validate_source(&source).unwrap();
     }
 
     #[derive(Debug)]

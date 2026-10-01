@@ -6918,6 +6918,84 @@ mod plan7_tests {
             .expect("settle unit epoch");
     }
 
+    /// Bounded advance cannot honour a restore key policy: a participant whose
+    /// policy excludes anything refuses the fenced invocation before it reads
+    /// or writes any authority object, instead of advancing a unit that would
+    /// restore the excluded keys.
+    #[tokio::test]
+    async fn plan7_bounded_advance_refuses_a_restore_key_policy_before_any_write() {
+        let mut fixture = live_fence_fixture().await;
+        let head_path =
+            crate::state_store::control_mvp::ControlMvpPaths::new("catalog").current_pointer();
+        let head_before = fixture
+            .service
+            .storage
+            .get_raw(&head_path)
+            .await
+            .expect("original HEAD");
+        let inventory = |objects: Vec<arco_core::storage::ObjectMeta>| {
+            objects
+                .into_iter()
+                .map(|object| (object.path, object.version))
+                .collect::<BTreeSet<_>>()
+        };
+        let before = inventory(
+            fixture
+                .service
+                .storage
+                .backend()
+                .list("")
+                .await
+                .expect("inventory before"),
+        );
+        let plan = fixture.attempt.participants[0].plan.clone();
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            fixture.service.storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store")
+        .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+        let adapter = ControlMvpRestoreParticipant::new(store).with_key_policy(
+            crate::state_store::RestoreKeyPolicy::excluding([[0x03_u8]]).expect("policy"),
+        );
+        let refused = adapter.advance_restore(&plan, &mut fixture.context()).await;
+        assert!(
+            matches!(
+                &refused,
+                Err(CatalogError::UnsupportedOperation { message })
+                    if message.contains("restore key policy")
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .get_raw(&head_path)
+                .await
+                .expect("same HEAD"),
+            head_before
+        );
+        assert_eq!(
+            before,
+            inventory(
+                fixture
+                    .service
+                    .storage
+                    .backend()
+                    .list("")
+                    .await
+                    .expect("inventory after")
+            ),
+            "a refused advance writes nothing"
+        );
+        fixture
+            .epoch
+            .settle_bounded(&mut fixture.guard, &mut fixture.budget)
+            .await
+            .expect("settle refused epoch");
+    }
+
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,

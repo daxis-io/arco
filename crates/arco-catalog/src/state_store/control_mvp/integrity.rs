@@ -262,6 +262,19 @@ pub(super) fn purged_rows_digest(scope: &StateScope, rows: &[PurgedRow<'_>]) -> 
     Ok(out.finish())
 }
 
+/// Digest over a restore key policy's canonical excluded prefixes: the
+/// prefix count, then each prefix in ascending byte order. A policy belongs to
+/// a restore participant rather than to an authority root, so the framing
+/// binds no scope, implementation or format version.
+pub(super) fn restore_key_policy_digest(prefixes: &[Vec<u8>]) -> String {
+    let mut out = Canonical::unscoped(b"arco/control-v1/restore-key-policy");
+    out.u64(u64::try_from(prefixes.len()).unwrap_or(u64::MAX));
+    for prefix in prefixes {
+        out.bytes(prefix);
+    }
+    out.finish()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct CheckpointValidation {
     pub encoding_version: u32,
@@ -303,6 +316,15 @@ impl Canonical {
         }
         this.bytes(scope.domain.as_bytes());
         Ok(this)
+    }
+    /// A framing for a value that belongs to no authority root: the domain
+    /// tag and framing version only. Invariant: each domain tag is used with
+    /// exactly one framing, scoped or unscoped, never both.
+    fn unscoped(tag: &[u8]) -> Self {
+        let mut this = Self(Vec::new());
+        this.bytes(tag);
+        this.u32(1);
+        this
     }
     fn u8(&mut self, value: u8) {
         self.0.push(value);

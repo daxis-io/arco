@@ -6960,7 +6960,11 @@ mod plan7_tests {
         );
         let refused = adapter.advance_restore(&plan, &mut fixture.context()).await;
         assert!(
-            matches!(refused, Err(CatalogError::UnsupportedOperation { .. })),
+            matches!(
+                &refused,
+                Err(CatalogError::UnsupportedOperation { message })
+                    if message.contains("restore key policy")
+            ),
             "{refused:?}"
         );
         assert_eq!(

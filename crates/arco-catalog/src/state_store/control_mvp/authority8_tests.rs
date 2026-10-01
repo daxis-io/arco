@@ -870,7 +870,10 @@ async fn authority8_bounded_restore_refuses_a_restore_key_policy() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, CatalogError::UnsupportedOperation { .. }),
+        matches!(
+            &error,
+            CatalogError::UnsupportedOperation { message } if message.contains("restore key policy")
+        ),
         "{error:?}"
     );
 }

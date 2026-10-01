@@ -293,21 +293,28 @@ Drain `outcome` values:
   backlog; if it does not fall between runs, the maintenance phase for
   `projection-outbox-acks` is not publishing (check its `outcome`).
 
-A drained record that cannot be materialized either fails the drain (a
-retryable `Storage`, `CasFailed`, `MaintenanceBackpressure` or
-`AmbiguousAuthorityOutcome` error; the record stays pending and the drain
-stops at it) or is quarantined: given a terminal disposition, never
-acknowledged and never trimmed, and counted in `quarantined_records` and
-`pending_records` on every later run. Quarantines through a failure are
-logged at warn (`catalog projection intent quarantined`, fields `record_id`,
-`source_sequence`, `failure_code`, `error`). Failure codes:
+A drained record that cannot be materialized either stops the drain or is
+quarantined. A retryable error (`Storage`, `CasFailed`,
+`MaintenanceBackpressure` or `AmbiguousAuthorityOutcome`) leaves the record
+pending and stops the drain at it: ack-domain backpressure
+(`MaintenanceBackpressure`) reports `outcome="deferred"`, and any other of
+these errors fails the `drain` phase. A quarantined record gets a terminal
+disposition, is never acknowledged or trimmed, and counts in
+`quarantined_records` and `pending_records` on every later run. The warn
+line `catalog projection intent quarantined` (fields `record_id`,
+`source_sequence`, `failure_code`, `error`) is logged only for
+`INVALID_RESTORE_NOTICE` and `INCOMPATIBLE_PROJECTION_INTENT` quarantines;
+an `INVALID_PROJECTION_INTENT` quarantine and a skipped, already-quarantined
+restore notice log nothing. Failure codes:
 
 - `INVALID_PROJECTION_INTENT`: the payload is not a projection intent.
   Before retention step 4 every restore notice ended here.
 - `INVALID_RESTORE_NOTICE`: a record whose id starts with `restore:` is not
   the notice of a committed restore of the catalog domain. It is malformed,
-  or the authenticated authority lineage refutes it (for example a plain
-  transaction, not a restore, committed it). Nothing is written. An
+  the authenticated authority lineage refutes it (for example a plain
+  transaction, not a restore, committed it), or an object on its lineage is
+  corrupt (see `docs/runbooks/state-store-corrupt-artifact.md`); the
+  quarantine is not retried after repair. Nothing is written. An
   unreadable lineage (a missing manifest on the ancestry path, or a missing
   restore transaction) is not refutation: it fails the drain and the notice
   stays pending.
@@ -565,10 +572,12 @@ Remedy, in order:
 - **A restore's projection appears on the next drain, not at commit.** A
   restore commits through the restore participant, not through the catalog
   API, so it wakes no post-commit drain. Its notice is materialized by the
-  next drain: this job's next run (at most 5 minutes at the default
-  cadence) or the post-commit drain the next catalog mutation wakes. Until
-  then `pending_records` counts the notice, and the newest published
-  catalog snapshot is the one from before the restore.
+  next drain that reaches it: normally this job's next run (every 5 minutes
+  by default) or the post-commit drain the next catalog mutation wakes. A
+  drain stops at the first record that fails retryably, and ack-domain
+  backpressure defers it, so the notice can wait longer. Until then
+  `pending_records` counts the notice, and the newest published catalog
+  snapshot is the one from before the restore.
 - **Restore notices quarantined before retention step 4 stay quarantined.**
   Before step 4 the materializer did not recognise a restore notice
   (`restore:{restore_id}:{attempt}:{domain}`) and quarantined it
@@ -591,18 +600,20 @@ Remedy, in order:
   for different bytes at an artifact path) is therefore resolved again on
   every drain: an authenticated ancestry walk from the head back to its
   source manifest, then a publication that fails again. The walk is capped
-  at 4,096 manifests. Once the intent's source is further behind the head
-  than that, every drain aborts at that record with an ambiguous-authority
+  at 4,096 manifests (mutations, outbox trims, consolidations and horizons
+  all count) or 64 MiB of manifest bytes. Once the intent's source is beyond
+  that cap, every drain aborts at that record with an ambiguous-authority
   error. Symptom: the `drain` phase fails on every run with
-  `drain[catalog]: drain catalog projection outbox: ambiguous authority
-  outcome: authenticated ancestry resolution budget exhausted`, the job
-  exits non-zero, the API's post-commit drains log `best-effort catalog
-  projection wake failed` with the same error, and no later record is
-  materialized, acknowledged or trimmed, so `pending_records` only grows
-  (and keyed retries keep their 409). At the pilot rate (about two catalog
-  commits a second) the cap is reached within about 35 minutes of the
-  quarantine. The same cap applies to any record left undrained for more
-  than 4,096 catalog manifests. Remedy: none automated; resolving the
+  `drain[catalog]: drain catalog projection outbox: ambiguous authority outcome: authenticated ancestry resolution budget exhausted`
+  or
+  `drain[catalog]: drain catalog projection outbox: ambiguous authority outcome: authenticated ancestry metadata budget exhausted`,
+  the job exits non-zero, the API's post-commit drains log
+  `best-effort catalog projection wake failed` with the same error, and no
+  later record is materialized, acknowledged or trimmed, so
+  `pending_records` only grows (and keyed retries keep their 409). At the
+  pilot rate (about two catalog commits a second) the cap is reached within
+  at most about 34 minutes of the quarantine. The same cap applies to any
+  record left undrained beyond it. Remedy: none automated; resolving the
   quarantine is the operator-resolution follow-up. Treat an
   `INCOMPATIBLE_PROJECTION_INTENT` quarantine as urgent and escalate it to
   the owner as soon as `quarantined_records` reports it.

@@ -152,7 +152,8 @@ the source manifest's certificate at creation and validate it on read;
 `validate_source` requires it to equal the source manifest's. Every capture
 path copies it: `prepare_checkpoint`, and since retention step 4
 `prepare_bounded_checkpoint`, which the mixed workspace capture uses and
-which copied none before.
+which copied none before. That path is reachable only with a synthetic
+authority-8 domain under `test-utils`.
 
 `purged_rows_sha256` uses tag `arco/control-v1/retention-purge` and the
 standard framing, then `u64(row count)` and, per purged row in strictly
@@ -338,9 +339,10 @@ A format-9 restore under a policy follows three rules:
 
 Inspection compares the plan's digest with the participant's policy. A
 mismatch inspects `Superseded`, so the driver replans, instead of failing as
-a byte mismatch. The policy governs rendering, not recognition: a plan whose
-transaction is already in the lineage inspects `Visible` whatever the
-participant's policy. The bounded format-8 restore cannot honour a policy;
+a byte mismatch. The policy governs rendering, not recognition: a version-8
+plan whose transaction is already in the lineage inspects `Visible` whatever
+the participant's policy, while plans 1 through 7 return `Superseded` before
+the lineage check. The bounded format-8 restore cannot honour a policy;
 its planning and advance refuse a non-empty one with `UnsupportedOperation`
 before any read or write.
 

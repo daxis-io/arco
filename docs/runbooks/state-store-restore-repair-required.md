@@ -59,8 +59,13 @@ visible bytes match the plan.
    version 8 with its pinned `observed_writer_epoch`, checkpoint interval,
    `committed_at_ms` stamp, `restore_key_policy_sha256`, scope, checksums,
    and shape) and fails closed with `invalid Control MVP restore plan`
-   before touching storage — a plan that no
-   longer validates must not be re-applied. Restore-plan versions 1 through 7
+   before touching storage. A missing `restore_key_policy_sha256` fails
+   decoding with
+   `Control MVP restore plan is missing restore_key_policy_sha256`; a
+   malformed one fails with
+   `Control MVP restore digest must use sha256: prefix` or
+   `Control MVP restore digest must contain 64 lowercase hexadecimal characters`.
+   A plan that no longer validates must not be re-applied. Restore-plan versions 1 through 7
    are supersession-only: a version-8 plan may supersede them, but they are
    never re-applied (version 6 is the last shape written on authority format
    7 and cannot reproduce format-9 candidate bytes; version 7 predates
@@ -68,8 +73,9 @@ visible bytes match the plan.
    `Superseded` even when its restore already landed. A version-8 plan
    rendered under a different restore key policy than the participant's
    inspects `Superseded`, so recovery replans it; it is not a checksum
-   mismatch. A plan whose restore already landed inspects `Visible`
-   whatever the participant's policy. A plan whose authority
+   mismatch. A version-8 plan whose restore already landed inspects
+   `Visible` whatever the participant's policy; versions 1 through 7 return
+   `Superseded` before the lineage check. A plan whose authority
    reference does not have the canonical `control/v1` manifest and checkpoint
    path shape returns `UnsupportedAuthorityFormat` with hard-cut recovery
    direction; separately, the head and manifest validators fail closed on any
@@ -110,7 +116,10 @@ idempotency receipts (key tag 3). It changes more than the restored keys:
   it. A keyed request replayed after the restore is not answered with its
   original response: it re-executes, as after its receipt expired. The
   outcome depends on the command; for example a keyed `create_catalog` of a
-  catalog the restore brought back fails with a name conflict.
+  catalog the restore brought back fails with a name conflict. While the
+  request's earlier projection intent is still in the outbox, the
+  re-execution fails with the 409 `projection intent` conflict (unless the
+  command fails first) until the worker drains and trims that intent.
 - Key tag 4 (residual audit rows written before retention step 3) follows
   the plain restore rules.
 - The catalog projection publishes the restored state and one restore audit
@@ -129,8 +138,9 @@ participant during recovery. The participant has written nothing and HEAD
 is unchanged. The binding limit is the segment's 512 KiB index, reached at
 roughly 390k live receipts. Live receipts are the last ~25 hours of catalog
 mutations (keyed and unkeyed) plus any the retention horizon has not purged
-yet: about 180k at the pilot rate. When `excluded-key deletes` dominates the counts, confirm that the
-control-store worker's retention horizon is publishing
+yet: about 180k at the pilot rate. When `excluded-key deletes` dominates
+the counts, confirm that the control-store worker's retention horizon is
+publishing
 (`kind="retention_horizon"`, `outcome="published"`) and retry after expired
 receipts are purged. A restore cannot be split across L0 segments.
 

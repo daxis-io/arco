@@ -107,10 +107,12 @@ mutation, and `restore_domain` for a restore.
   committed mutation. An intent whose payload is not the audit record of that
   intent is quarantined as `INCOMPATIBLE_PROJECTION_INTENT` before anything is
   written. A record whose id starts with `restore:` but is not the notice of a
-  committed restore (malformed, or refuted by the authenticated authority
-  lineage) is quarantined as `INVALID_RESTORE_NOTICE`, also before anything
-  is written; a genuine restore notice that fails at publication is
-  quarantined as `INCOMPATIBLE_PROJECTION_INTENT`.
+  committed restore (malformed, refuted by the authenticated authority
+  lineage, or with a corrupt object on its lineage; see
+  `docs/runbooks/state-store-corrupt-artifact.md`) is quarantined as
+  `INVALID_RESTORE_NOTICE`, also before anything is written; the quarantine
+  is not retried after repair. A genuine restore notice that fails at
+  publication is quarantined as `INCOMPATIBLE_PROJECTION_INTENT`.
 - **Immutable files.** A file is written only if the path is free. A
   redelivered intent that produces identical bytes is accepted; different
   bytes at the path fail closed and quarantine the intent.

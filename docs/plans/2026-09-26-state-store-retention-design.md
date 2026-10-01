@@ -21,11 +21,15 @@ retained reader can observe the key live (the 30-day token and checkpoint
 floor, plus any snapshot or export pin). Audit rows leave the KV.
 
 At the pilot rate (1,209,600 mutations per week, 80/10/5/5 update, rename,
-create, drop) this leaves roughly 200k receipts, up to ~260k tombstones over 30
-days, and a few thousand catalog rows: under half a million rows, inside the
-1M-row restore scanner, and restore skips receipt rows outright. Growth becomes
-bounded on every format, including authority 8, whose restore and GC also carry
-the whole log today.
+create, drop) this leaves roughly 180k receipts (two a second for the ~25
+hours before one is purged), up to ~260k tombstones over 30 days, and a few
+thousand catalog rows: under half a million rows, inside the 1M-row restore
+scanner, and restore skips receipt rows outright. Each catalog restore adds
+up to ~180k receipt tombstones for at least 30 days on top of that bound,
+which can take the total past half a million rows for that month; they stay
+inside the 1M-row scanner because tombstones are not live source rows.
+Growth becomes bounded on every format, including authority 8, whose restore
+and GC also carry the whole log today.
 
 It does not fix per-commit cost. Format 7 replays and hashes the entire retained
 state on every commit; half a million rows is on the order of 250 MB decoded per
@@ -188,7 +192,7 @@ no `:`, so their names are unchanged. A restore's row is filed at
 ## Restore and checkpoints
 
 - Restore plan 7 landed in step 1. It binds the format-9 transaction shape
-  and pins the candidate's `committed_at_ms`; versions 1 through 6 are
+  and pins the candidate's `committed_at_ms`; versions 1 through 6 were
   supersession-only.
 - A restore never restores idempotency receipts (tag 3) and leaves none
   behind. After a restore a client replay must re-apply, not be answered from
@@ -222,8 +226,9 @@ no `:`, so their names are unchanged. A restore's row is filed at
   even when its restore already landed, and apply refuses it without
   writes. A plan bound to another policy inspects `Superseded`, so the
   driver replans it, rather than failing as a byte mismatch. The policy
-  governs rendering, not recognition: a landed restore inspects `Visible`
-  whatever the inspecting participant's policy. The bounded (format 8)
+  governs rendering, not recognition: a landed version-8 plan inspects
+  `Visible` whatever the inspecting participant's policy (plans 1 through 7
+  return `Superseded` before the lineage check). The bounded (format 8)
   restore cannot honour a policy, so its planning and advance refuse a
   non-empty one with `UnsupportedOperation`.
 - Capacity. Before step 4 the source scan charged receipts against its
@@ -254,9 +259,11 @@ no `:`, so their names are unchanged. A restore's row is filed at
   actor `restore`, its request digest the SHA-256 hex of the notice payload,
   its occurrence the result manifest's `committed_at_ms`, and its logical
   sequence and authority manifest those of the restore's result. A
-  malformed notice, or one the authenticated lineage refutes, is
-  quarantined `INVALID_RESTORE_NOTICE`; a publication failure is
-  quarantined `INCOMPATIBLE_PROJECTION_INTENT`. A notice quarantined before
+  malformed notice, one the authenticated lineage refutes, or one with a
+  corrupt object on its lineage (see
+  `docs/runbooks/state-store-corrupt-artifact.md`) is quarantined
+  `INVALID_RESTORE_NOTICE`; the quarantine is not retried after repair. A
+  publication failure is quarantined `INCOMPATIBLE_PROJECTION_INTENT`. A notice quarantined before
   step 4 keeps its `INVALID_PROJECTION_INTENT` disposition and is never
   processed again; resolving it is an operator follow-up. A restore commit
   wakes no post-commit drain, so its notice is materialized on the next
@@ -266,7 +273,9 @@ no `:`, so their names are unchanged. A restore's row is filed at
   copied it in `prepare_checkpoint` only. Step 4 makes
   `prepare_bounded_checkpoint` (the mixed workspace capture path) copy it
   too, so every capture path carries the certificate and a capture no
-  longer fails when a format-9 domain's HEAD is a horizon manifest.
+  longer fails when a format-9 domain's HEAD is a horizon manifest. That
+  path is reachable only with a synthetic authority-8 domain under
+  `test-utils`.
 - A key live in the source cut and absent in current is written at the
   restore sequence (existing rule), so a purged tombstone can never be
   resurrected as an old generation.
@@ -342,15 +351,17 @@ All tests are differential against pre-change behaviour.
   bytes at an artifact path) is therefore resolved again on every drain: an
   authenticated ancestry walk from the current head back to its source
   manifest, then a publication that fails again. The walk is capped at
-  4,096 manifests. Once the intent's source is further behind the head than
-  that, the walk fails `AmbiguousAuthorityOutcome` ("authenticated ancestry
-  resolution budget exhausted"), which is retryable, so every drain aborts
-  at that record and no later record is materialized, acknowledged or
-  trimmed. At the pilot rate (about two catalog commits a second) the cap is
-  reached within about 35 minutes. This predates step 4; step 4 exempts only
+  4,096 manifests (mutations, outbox trims, consolidations and horizons all
+  count) or 64 MiB of manifest bytes. Once the intent's source is beyond
+  that cap, the walk fails `AmbiguousAuthorityOutcome` ("authenticated
+  ancestry resolution budget exhausted" or "authenticated ancestry metadata
+  budget exhausted"), which is retryable, so every drain aborts at that
+  record and no later record is materialized, acknowledged or trimmed. At
+  the pilot rate (about two catalog commits a second) the cap is reached
+  within at most about 34 minutes. This predates step 4; step 4 exempts only
   `restore:` records, which are never processed again once quarantined. The
-  same cap applies to any record left undrained for more than 4,096 catalog
-  manifests. Follow-up: the quarantine-resolution path.
+  same cap applies to any record left undrained beyond it. Follow-up: the
+  quarantine-resolution path.
 - **Restore notices quarantined before step 4 stay quarantined.** They keep
   `INVALID_PROJECTION_INTENT`, are never acknowledged or trimmed, and have
   no snapshot at the restore sequence and no audit row. Later mutations

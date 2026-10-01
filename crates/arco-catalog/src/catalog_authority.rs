@@ -27,9 +27,9 @@ use crate::state_store::projection_outbox_acks::{
     ProjectionOutboxTrimReport, ProjectionOutboxWorker,
 };
 use crate::state_store::{
-    ArcoStateReader, ArcoStateTxn, ControlMvpStateStore, ControlMvpTxn, ProjectionIntentV1,
-    ProjectionIntentV2, ScanContinuation, ScanContinuationKey, ScanRequest, StateScope, StateToken,
-    TxnOptions,
+    ArcoStateReader, ArcoStateTxn, ControlMvpRestoreParticipant, ControlMvpStateStore,
+    ControlMvpTxn, ProjectionIntentV1, ProjectionIntentV2, RestoreKeyPolicy, ScanContinuation,
+    ScanContinuationKey, ScanRequest, StateRestoreParticipant, StateScope, StateToken, TxnOptions,
 };
 use crate::tier1_snapshot;
 use crate::write_options::WriteOptions;
@@ -94,6 +94,50 @@ pub const CATALOG_PARQUET_PROJECTION_CONSUMER_ID: &str = "catalog-parquet-v1";
 /// `AlreadyExists` projection-intent conflict and commits nothing, unless the
 /// command itself fails first (for example a name conflict).
 pub const CATALOG_RECEIPT_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Restore key policy of the catalog domain: it excludes the idempotency
+/// receipt key prefix (key tag 3), so a catalog restore never restores a
+/// receipt and leaves none behind.
+///
+/// Every receipt live in the authority the restore replaces is deleted at the
+/// restore sequence, whether or not the restore source holds it, and no
+/// receipt is restored from the source. A keyed request replayed after the
+/// restore is therefore no longer answered with its original response: it
+/// re-executes, exactly as after its receipt expired (see
+/// [`CATALOG_RECEIPT_RETENTION_MS`]).
+///
+/// Key tag 4 (residual audit rows written before audits became
+/// projection-only) is not excluded: those rows are the only record of those
+/// audits and follow the plain restore rules.
+#[must_use]
+pub fn catalog_restore_key_policy() -> RestoreKeyPolicy {
+    RestoreKeyPolicy::excluding_key_tag(IDEMPOTENCY_KEY_TAG)
+}
+
+/// Creates the restore participant of a catalog-domain state store,
+/// configured with [`catalog_restore_key_policy`].
+///
+/// Register this participant, rather than a plain
+/// [`ControlMvpRestoreParticipant::new`], for the catalog domain so that a
+/// restore never restores idempotency receipts. The key policy applies to the
+/// format-9 restore; bounded authority-8 planning refuses it.
+///
+/// # Errors
+///
+/// Returns [`CatalogError::Validation`] when `store` is not bound to the
+/// `catalog` state domain.
+pub fn catalog_restore_participant(
+    store: ControlMvpStateStore,
+) -> Result<ControlMvpRestoreParticipant> {
+    let participant =
+        ControlMvpRestoreParticipant::new(store).with_key_policy(catalog_restore_key_policy());
+    if StateRestoreParticipant::scope(&participant).domain() != "catalog" {
+        return Err(CatalogError::Validation {
+            message: "catalog restore participant requires the catalog state domain".to_string(),
+        });
+    }
+    Ok(participant)
+}
 
 /// Non-blocking wake-up seam invoked after a catalog authority commit.
 ///

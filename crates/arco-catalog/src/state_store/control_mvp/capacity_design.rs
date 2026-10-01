@@ -32,11 +32,12 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
         .await
         .unwrap();
     let source_values = store
-        .restore_source_values(&source, Utc::now())
+        .restore_source_values(&source, &RestoreKeyPolicy::none(), Utc::now())
         .await
         .unwrap();
-    assert_eq!(source_values.len(), 8);
+    assert_eq!(source_values.rows.len(), 8);
     let decoded_bytes = source_values
+        .rows
         .iter()
         .map(|(k, v)| k.len() + v.bytes.len())
         .sum::<usize>();
@@ -82,7 +83,7 @@ async fn restore_values_are_referenced_by_compact_transaction_metadata() {
             .logical_sequence()
             > before.logical_sequence()
     );
-    for (key, expected) in &source_values {
+    for (key, expected) in &source_values.rows {
         assert_eq!(
             store.get(key).await.unwrap().as_ref(),
             Some(&expected.bytes)
@@ -146,9 +147,10 @@ async fn disjoint_restore_diff_exceeds_one_l0_with_small_injected_limits() {
     txn.commit().await.unwrap();
     assert_eq!(
         store
-            .restore_source_values(&source, Utc::now())
+            .restore_source_values(&source, &RestoreKeyPolicy::none(), Utc::now())
             .await
             .unwrap()
+            .rows
             .len(),
         24
     );

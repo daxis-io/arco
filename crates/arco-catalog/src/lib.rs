@@ -123,6 +123,7 @@ pub use catalog_authority::{
     CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogListPage,
     CatalogListRequest, CatalogProjectionMaterializer, CatalogProjectionNotifier,
     ControlCatalogAuthority, catalog_audit_artifact_path, catalog_audit_partition,
+    catalog_restore_key_policy, catalog_restore_participant,
 };
 pub use compactor::{CompactionResult, Compactor, MaterializationRecord};
 pub use error::{CatalogError, Result};
@@ -163,11 +164,11 @@ pub use state_store::{
     MaintenanceStatus, ModelCommitRecord, ModelStateStore, ModelWrite, PersistedAuthorityAdapter,
     PersistedAuthorityKind, PersistedAuthorityReference, PersistedRestoreParticipantPlan,
     PredicateInputSet, PreparedMaintenance, PreparedRetainedSource, ProjectionIntentV1,
-    PurgedCounts, RestoreAdvanceContext, RestoreAttemptIdentity, RestoreParticipantAdvance,
-    RestoreParticipantInspection, RestoredAuthorityEvidence, RetainedSourceCaptureContext,
-    ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant, StateScope,
-    StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions, VersionedValue,
-    control_mvp_outbox_event_id,
+    PurgedCounts, RestoreAdvanceContext, RestoreAttemptIdentity, RestoreKeyPolicy,
+    RestoreParticipantAdvance, RestoreParticipantInspection, RestoredAuthorityEvidence,
+    RetainedSourceCaptureContext, ScanContinuation, ScanPage, ScanRequest, StateRestoreParticipant,
+    StateScope, StateStoreBindingIdentity, StateStoreCapabilities, StateToken, TxnOptions,
+    VersionedValue, control_mvp_outbox_event_id,
 };
 pub use sync_compactor::SyncCompactor;
 pub use tier1_compactor::{Tier1CompactionError, Tier1CompactionResult, Tier1Compactor};

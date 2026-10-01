@@ -20,15 +20,18 @@ use arco_catalog::state_store::projection_outbox_acks::{
     ProjectionOutboxBacklog, ProjectionOutboxWorker,
 };
 use arco_catalog::{
-    ArcoStateAdmin, ArcoStateReader, AuditRetentionReport, CATALOG_AUDIT_PROJECTION_PREFIX,
-    CATALOG_AUDIT_RETENTION_DAYS, CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority,
-    CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError,
-    CatalogListRequest, CatalogPatch, CatalogProjectionMaterializer, CatalogProjectionNotifier,
-    ColumnDefinition, ControlCatalogAuthority, ControlMvpMaintenanceOutcome,
-    ControlMvpProjectionOutboxRecord, ControlMvpStateStore, DurableAuthorityBinding,
-    DurableMaintenanceWorker, MaintenanceStatus, ProjectionIntentV1, PurgedCounts,
-    RegisterTableInSchemaRequest, SchemaPatch, StateScope, TxnOptions, WriteOptions,
-    catalog_audit_artifact_path, catalog_audit_partition,
+    ArcoStateAdmin, ArcoStateReader, ArcoStateTxn, AuditRetentionReport,
+    CATALOG_AUDIT_PROJECTION_PREFIX, CATALOG_AUDIT_RETENTION_DAYS,
+    CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogAuthority, CatalogAuthorityBinding,
+    CatalogAuthorityBindings, CatalogAuthorityKind, CatalogError, CatalogListRequest, CatalogPatch,
+    CatalogProjectionMaterializer, CatalogProjectionNotifier, CheckpointOptions, ColumnDefinition,
+    ControlCatalogAuthority, ControlMvpMaintenanceOutcome, ControlMvpProjectionOutboxRecord,
+    ControlMvpStateStore, DurableAuthorityBinding, DurableMaintenanceWorker, MaintenanceStatus,
+    PersistedAuthorityAdapter, PersistedRestoreParticipantPlan, ProjectionIntentV1, PurgedCounts,
+    RegisterTableInSchemaRequest, RestoreAttemptIdentity, RestoreKeyPolicy,
+    RestoreParticipantInspection, SchemaPatch, StateRestoreParticipant, StateScope, TxnOptions,
+    WriteOptions, catalog_audit_artifact_path, catalog_audit_partition, catalog_restore_key_policy,
+    catalog_restore_participant,
 };
 use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{AuthorityRoot, MemoryBackend, ScopedStorage};
@@ -2824,6 +2827,191 @@ async fn a_receipt_becomes_purge_eligible_strictly_after_twenty_five_hours() {
             .expect("horizon preflight past the boundary")
             .is_some(),
         "one millisecond past the boundary the receipt is eligible"
+    );
+}
+
+/// The catalog restore key policy excludes exactly the idempotency-receipt
+/// prefix (tag 3). Tag 4 (residual pre-step-3 audit rows) is not excluded,
+/// and the catalog restore participant only binds the catalog domain.
+#[test]
+fn catalog_restore_key_policy_excludes_only_the_receipt_prefix() {
+    let policy = catalog_restore_key_policy();
+    assert_eq!(vec![vec![0x03_u8]], policy.excluded_prefixes());
+    assert!(policy.excludes(b"\x03any-receipt"));
+    for key in [b"\x01object".as_slice(), b"\x02name", b"\x04audit"] {
+        assert!(
+            !policy.excludes(key),
+            "{key:?} follows the plain restore rules"
+        );
+    }
+    assert_ne!(RestoreKeyPolicy::none().sha256(), policy.sha256());
+    assert_eq!(
+        RestoreKeyPolicy::excluding([[0x03_u8]])
+            .expect("receipt policy")
+            .sha256(),
+        policy.sha256()
+    );
+
+    let catalog = catalog_restore_participant(
+        ControlMvpStateStore::new(scoped_storage(), scope()).expect("catalog store"),
+    )
+    .expect("catalog restore participant");
+    assert_eq!(&policy, catalog.key_policy());
+    let other = ControlMvpStateStore::new(
+        scoped_storage(),
+        StateScope::new("synthetic-tenant", "synthetic-workspace", "orchestration"),
+    )
+    .expect("non-catalog store");
+    assert!(matches!(
+        catalog_restore_participant(other),
+        Err(CatalogError::Validation { .. })
+    ));
+}
+
+/// A catalog restore through the catalog restore participant never restores
+/// an idempotency receipt and leaves none behind, so a keyed replay after the
+/// restore re-executes instead of returning its original response. Here the
+/// re-executed `create_catalog` observably collides with the restored
+/// catalog's name (the name check runs before any intent is staged), so the
+/// replay fails `AlreadyExists` and commits nothing. A tag-4 row follows the
+/// plain restore rules: kept when the checkpoint holds it, deleted when only
+/// the current head does.
+#[tokio::test]
+async fn restore_never_restores_receipts_and_a_replay_reapplies() {
+    let storage = scoped_storage();
+    let authority = ControlCatalogAuthority::new(storage.clone(), scope())
+        .expect("control authority")
+        .with_projection_notifier(Arc::new(RecordingProjectionNotifier::default()));
+    let create = || {
+        authority.create_catalog(
+            "analytics",
+            Some("first"),
+            WriteOptions::with_idempotency("create-analytics"),
+        )
+    };
+    let first = create().await.expect("first create");
+    let replay = create().await.expect("exact replay before the restore");
+    assert_eq!(first.id, replay.id);
+
+    let store = ControlMvpStateStore::new(storage.clone(), scope()).expect("control store");
+    let put_raw_row = |key: &'static [u8]| {
+        let store = store.clone();
+        async move {
+            let mut txn = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("begin raw row");
+            txn.put(key, Bytes::from_static(b"audit"))
+                .await
+                .expect("put raw row");
+            txn.commit().await.expect("commit raw row");
+        }
+    };
+    put_raw_row(b"\x04residual-audit").await;
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint");
+    let reference = store
+        .persist_checkpoint_reference(&checkpoint, chrono::Utc::now() + chrono::Duration::hours(1))
+        .await
+        .expect("persist checkpoint reference");
+
+    let patched = authority
+        .patch_catalog(
+            "analytics",
+            CatalogPatch {
+                description: Some(Some("patched".to_string())),
+                ..CatalogPatch::default()
+            },
+            WriteOptions::with_idempotency("patch-analytics"),
+        )
+        .await
+        .expect("keyed patch");
+    assert_eq!(Some("patched"), patched.description.as_deref());
+    put_raw_row(b"\x04later-audit").await;
+    let receipts = || async {
+        store
+            .scan(arco_catalog::ScanRequest::new(b"\x03"))
+            .await
+            .expect("receipt scan")
+            .entries()
+            .len()
+    };
+    assert_eq!(2, receipts().await, "one receipt per keyed mutation");
+
+    let participant =
+        catalog_restore_participant(store.clone()).expect("catalog restore participant");
+    let plan = participant
+        .plan_restore(
+            &reference,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000091", 1, "catalog")
+                .expect("identity"),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("plan catalog restore");
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected a ControlMvp restore plan")
+    };
+    assert_eq!(
+        Some(catalog_restore_key_policy().sha256().as_str()),
+        control.restore_key_policy_sha256(),
+        "the plan binds the catalog key policy"
+    );
+    assert!(matches!(
+        participant
+            .apply_restore(&plan, chrono::Utc::now())
+            .await
+            .expect("apply catalog restore"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+
+    assert_eq!(
+        0,
+        receipts().await,
+        "the restore restores no receipt and leaves none behind"
+    );
+    let restored = authority
+        .get_catalog("analytics")
+        .await
+        .expect("get restored catalog")
+        .expect("the catalog exists at the checkpoint");
+    assert_eq!(first.id, restored.id);
+    assert_eq!(first.description, restored.description);
+    assert_eq!(first.created_at, restored.created_at);
+    assert_eq!(first.updated_at, restored.updated_at);
+    assert_eq!(1, authority.list_catalogs().await.expect("catalogs").len());
+    assert_eq!(
+        Some(Bytes::from_static(b"audit")),
+        store
+            .get(b"\x04residual-audit")
+            .await
+            .expect("checkpoint tag-4 row")
+    );
+    assert_eq!(
+        None,
+        store
+            .get(b"\x04later-audit")
+            .await
+            .expect("current-only tag-4 row")
+    );
+
+    let reapplied = create()
+        .await
+        .expect_err("without its receipt the replay re-executes and collides");
+    assert!(
+        matches!(
+            &reapplied,
+            CatalogError::AlreadyExists { entity, name }
+                if entity == "catalog" && name == "analytics"
+        ),
+        "expected the non-idempotent catalog name conflict, got {reapplied:?}"
+    );
+    assert_eq!(
+        0,
+        receipts().await,
+        "a failed re-execution commits no receipt"
     );
 }
 

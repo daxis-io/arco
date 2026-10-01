@@ -75,7 +75,7 @@
 //! Restore *plans* are versioned separately from on-disk state artifacts,
 //! because an in-flight restore attempt written by an older revision must
 //! still be readable by the recovery path that has to supersede it. Plan
-//! versions 1 through 5 are therefore decoded as legacy plans
+//! versions 1 through 7 are therefore decoded as legacy plans
 //! that can be inspected and superseded but can never be applied. See
 //! [`ControlMvpRestorePlan`].
 
@@ -153,11 +153,13 @@ mod lazy;
     reason = "physical descriptors await authority-8 integration"
 )]
 mod physical;
+mod restore_key_policy;
 mod retained;
 #[cfg(feature = "test-utils")]
 pub use bounded::SyntheticKvEntry;
 pub use bounded::restore::{ControlMvpRestoreFenceWitness, ControlMvpRestorePlanV7};
 pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
+pub use restore_key_policy::RestoreKeyPolicy;
 pub(crate) use retained::{RetainedSourcePublication, VerifiedRetainedPointer};
 #[cfg(test)]
 mod authority8_tests;
@@ -178,7 +180,12 @@ pub use maintenance::{
     MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, PurgedCounts,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 7;
+const RESTORE_PLAN_VERSION: u32 = 8;
+/// Restore plan 7 is the last shape written before restore key policies. It
+/// pins `committed_at_ms` but not the key policy its candidate was rendered
+/// under, so it cannot say which keys the candidate excluded and is
+/// supersession-only.
+const RESTORE_PLAN_VERSION_V7: u32 = 7;
 /// Restore plan 6 is the last shape written on authority format 7. It predates
 /// the `committed_at_ms` stamp plan 7 pins, so it can never reproduce format-9
 /// candidate bytes and is supersession-only.
@@ -3054,8 +3061,9 @@ impl ControlMvpStateStore {
     async fn restore_source_values(
         &self,
         source: &PersistedAuthorityReference,
+        policy: &RestoreKeyPolicy,
         now: DateTime<Utc>,
-    ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
+    ) -> Result<RestoreSourceScan> {
         self.validate_restore_authority_format(source)?;
         if source.reference_kind() != PersistedAuthorityKind::Checkpoint
             || source.checkpoint_path().is_none()
@@ -3068,7 +3076,10 @@ impl ControlMvpStateStore {
         let reader = self
             .resolve_persisted_retained_reader_at(source, now)
             .await?;
-        reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+        Ok(RestoreSourceScan {
+            rows: reader.live_entries_bounded(policy, MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)?,
+            policy: policy.clone(),
+        })
     }
 
     fn validate_restore_authority_format(
@@ -3078,13 +3089,25 @@ impl ControlMvpStateStore {
         validate_control_mvp_authority_format(&self.paths, source)
     }
 
+    /// Computes the restore writes, all staged at the restore sequence.
+    ///
+    /// Plain keys are diffed between the source rows and `current`. A key the
+    /// policy excludes is never put; it is deleted when live in `current` or
+    /// in `candidate_parent`, the lineage the writes land on (with an empty
+    /// current base that is the source lineage, not `current`).
     fn restore_writes(
         source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
         current: &ReplayState,
+        candidate_parent: &ReplayState,
+        policy: &RestoreKeyPolicy,
     ) -> BTreeMap<Vec<u8>, StagedWrite> {
         let mut writes = BTreeMap::new();
         for (key, current) in current.kv.iter().filter(|(_key, value)| !value.tombstone) {
             match source_values.get(key) {
+                // An excluded key is never kept, whatever the source holds.
+                _ if policy.excludes(key) => {
+                    writes.insert(key.clone(), StagedWrite::Delete);
+                }
                 // A row whose bytes and hint both match needs no rewrite; a
                 // hint-only difference is still a difference the restore
                 // must reproduce.
@@ -3098,9 +3121,16 @@ impl ControlMvpStateStore {
             }
         }
         for (key, source) in source_values {
-            if current.kv.get(key).is_none_or(|current| current.tombstone) {
+            if !policy.excludes(key) && current.kv.get(key).is_none_or(|current| current.tombstone)
+            {
                 writes.insert(key.clone(), source.staged());
             }
+        }
+        // The writes land on the candidate parent. With an empty current base
+        // that is the source lineage, whose excluded keys `current` cannot
+        // show, so a source filter alone would leave them in place.
+        for key in policy.live_excluded_keys(&candidate_parent.kv) {
+            writes.insert(key.clone(), StagedWrite::Delete);
         }
         writes
     }
@@ -3109,7 +3139,7 @@ impl ControlMvpStateStore {
     fn render_restore_candidate(
         &self,
         source: &PersistedAuthorityReference,
-        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
+        source_values: &RestoreSourceScan,
         identity: &RestoreAttemptIdentity,
         stable: &StableRestoreBase,
         checkpoint_interval: u64,
@@ -3160,7 +3190,12 @@ impl ControlMvpStateStore {
             identity.domain()
         );
 
-        let writes = Self::restore_writes(source_values, &stable.current.state);
+        let writes = Self::restore_writes(
+            &source_values.rows,
+            &stable.current.state,
+            &stable.candidate_parent.state,
+            &source_values.policy,
+        );
 
         let notice = ControlMvpRestoreNotice {
             restore_id: identity.restore_id().to_string(),
@@ -3325,12 +3360,13 @@ impl ControlMvpStateStore {
         &self,
         source: &PersistedAuthorityReference,
         identity: &RestoreAttemptIdentity,
+        policy: &RestoreKeyPolicy,
         now: DateTime<Utc>,
     ) -> Result<ControlMvpRestorePlan> {
         if identity.domain() != self.scope.domain() {
             return Err(validation_failed("restore identity domain mismatch"));
         }
-        let source_values = self.restore_source_values(source, now).await?;
+        let source_values = self.restore_source_values(source, policy, now).await?;
         let stable = self.load_stable_restore_base(source).await?;
         // Stamps are monotone along ancestry: never before the candidate parent.
         let committed_at_ms = stable
@@ -3359,6 +3395,7 @@ impl ControlMvpStateStore {
             observed_reclamation_generation: stable.current.reclamation_generation,
             checkpoint_interval: Some(self.checkpoint_interval),
             committed_at_ms: Some(committed_at_ms),
+            restore_key_policy_sha256: Some(policy.sha256()),
             base_manifest_id: stable
                 .candidate_parent
                 .manifest_id
@@ -3486,18 +3523,25 @@ const fn legacy_restore_plan_version(version: u32) -> bool {
             | RESTORE_PLAN_VERSION_V4
             | RESTORE_PLAN_VERSION_V5
             | RESTORE_PLAN_VERSION_V6
+            | RESTORE_PLAN_VERSION_V7
     )
 }
 
+/// Returns whether plans of `version` carry the plan-7 `committed_at_ms` stamp.
+const fn stamped_restore_plan_version(version: u32) -> bool {
+    matches!(version, RESTORE_PLAN_VERSION_V7 | RESTORE_PLAN_VERSION)
+}
+
 /// Decodes the plan-7 `committed_at_ms` field per plan version: required and
-/// positive on the current version, forbidden on supersession-only versions
-/// (no older writer ever wrote it), and passed through for unknown versions,
-/// which plan validation rejects.
+/// positive on every version that carries it (7 and the current version),
+/// forbidden on older supersession-only versions (no older writer ever wrote
+/// it), and passed through for unknown versions, which plan validation
+/// rejects.
 fn restore_plan_committed_at_ms<E: serde::de::Error>(
     version: u32,
     stamp: Option<i64>,
 ) -> std::result::Result<Option<i64>, E> {
-    if version == RESTORE_PLAN_VERSION {
+    if stamped_restore_plan_version(version) {
         return match stamp {
             Some(stamp) if stamp > 0 => Ok(Some(stamp)),
             Some(_) => Err(E::custom(
@@ -3514,6 +3558,27 @@ fn restore_plan_committed_at_ms<E: serde::de::Error>(
         ));
     }
     Ok(stamp)
+}
+
+/// Decodes the plan-8 `restore_key_policy_sha256` binding per plan version:
+/// required on the current version, forbidden on supersession-only versions
+/// (no older writer ever wrote it), and passed through for unknown versions,
+/// which plan validation rejects. Its digest form is checked by validation.
+fn restore_plan_key_policy_sha256<E: serde::de::Error>(
+    version: u32,
+    digest: Option<String>,
+) -> std::result::Result<Option<String>, E> {
+    if version == RESTORE_PLAN_VERSION {
+        return digest.map(Some).ok_or_else(|| {
+            E::custom("Control MVP restore plan is missing restore_key_policy_sha256")
+        });
+    }
+    if legacy_restore_plan_version(version) && digest.is_some() {
+        return Err(E::custom(
+            "legacy Control MVP restore plans must not carry restore_key_policy_sha256",
+        ));
+    }
+    Ok(digest)
 }
 
 /// Returns the wall-clock stamp a restore plan pins for its candidate bytes.
@@ -4621,10 +4686,13 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 7 pins the `committed_at_ms` stamp its format-9 candidate bytes
-/// carry, on top of version 6's exact transaction/history reference, observed
-/// reclamation generation and exact HEAD identity. Versions 1 through 6 are
-/// supersession-only; recovery must replan them before writing any artifacts.
+/// Version 8 binds the digest of the [`RestoreKeyPolicy`] its candidate was
+/// rendered under (`restore_key_policy_sha256`), on top of version 7's
+/// `committed_at_ms` stamp, version 6's exact transaction/history reference,
+/// observed reclamation generation and exact HEAD identity. A participant
+/// configured with a different policy reports such a plan superseded instead
+/// of applying it. Versions 1 through 7 are supersession-only; recovery must
+/// replan them before writing any artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4646,6 +4714,11 @@ pub struct ControlMvpRestorePlan {
     /// pins it so inspection and apply re-render byte-identical candidates.
     #[serde(skip_serializing_if = "Option::is_none")]
     committed_at_ms: Option<i64>,
+    /// Digest of the restore key policy the candidate was rendered under.
+    /// Plan 8 binds it so a participant with another policy supersedes the
+    /// plan instead of failing to reproduce its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_key_policy_sha256: Option<String>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -4685,6 +4758,8 @@ struct ControlMvpRestorePlanWire {
     checkpoint_interval: Option<u64>,
     #[serde(default)]
     committed_at_ms: Option<i64>,
+    #[serde(default)]
+    restore_key_policy_sha256: Option<String>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -4749,6 +4824,10 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
         };
         let committed_at_ms =
             restore_plan_committed_at_ms::<D::Error>(wire.version, wire.committed_at_ms)?;
+        let restore_key_policy_sha256 = restore_plan_key_policy_sha256::<D::Error>(
+            wire.version,
+            wire.restore_key_policy_sha256,
+        )?;
         Ok(Self {
             transaction_ref: if wire.version == RESTORE_PLAN_VERSION {
                 Some(wire.transaction_ref.ok_or_else(|| {
@@ -4778,6 +4857,7 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             },
             checkpoint_interval,
             committed_at_ms,
+            restore_key_policy_sha256,
             base_manifest_id: wire.base_manifest_id,
             base_logical_sequence: wire.base_logical_sequence,
             transaction_id: wire.transaction_id,
@@ -4820,8 +4900,10 @@ impl ControlMvpRestorePlan {
         self.version
     }
 
-    /// Returns whether this plan names the retired authority layout and
-    /// therefore may only be superseded, never applied.
+    /// Returns whether this plan is a supersession-only version (1 through
+    /// 7): it names the retired authority layout or predates the current
+    /// candidate rendering, and therefore may only be superseded, never
+    /// applied.
     #[must_use]
     pub const fn is_legacy_version(&self) -> bool {
         legacy_restore_plan_version(self.version)
@@ -4906,6 +4988,19 @@ impl ControlMvpRestorePlan {
         self.result_logical_sequence
     }
 
+    /// Returns the `sha256:<hex>` digest of the [`RestoreKeyPolicy`] the
+    /// candidate was rendered under; `None` on versions before 8.
+    #[must_use]
+    pub fn restore_key_policy_sha256(&self) -> Option<&str> {
+        self.restore_key_policy_sha256.as_deref()
+    }
+
+    fn required_restore_key_policy_sha256(&self) -> Result<&str> {
+        self.restore_key_policy_sha256().ok_or_else(|| {
+            validation_failed("Control MVP restore plan restore_key_policy_sha256 is missing")
+        })
+    }
+
     fn required_committed_at_ms(&self) -> Result<i64> {
         self.committed_at_ms
             .filter(|stamp| *stamp > 0)
@@ -4949,6 +5044,7 @@ impl ControlMvpRestorePlan {
         };
         let checkpoint_interval = self.required_checkpoint_interval()?;
         self.required_committed_at_ms()?;
+        let restore_key_policy_sha256 = self.required_restore_key_policy_sha256()?;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || self.version != RESTORE_PLAN_VERSION
             || self.implementation != IMPLEMENTATION
@@ -5005,10 +5101,11 @@ impl ControlMvpRestorePlan {
             ));
         }
         for digest in [
-            &self.observed_base_pointer_sha256,
-            &self.transaction_sha256,
-            &self.candidate_manifest_sha256,
-            &self.candidate_pointer_sha256,
+            self.observed_base_pointer_sha256.as_str(),
+            self.transaction_sha256.as_str(),
+            self.candidate_manifest_sha256.as_str(),
+            self.candidate_pointer_sha256.as_str(),
+            restore_key_policy_sha256,
         ] {
             validate_prefixed_digest(digest, "Control MVP restore digest")?;
         }
@@ -5047,7 +5144,9 @@ impl ControlMvpRestorePlan {
             || !self.is_legacy_version()
             || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
             || (self.version < RESTORE_PLAN_VERSION_V3 && self.checkpoint_interval.is_some())
-            || self.committed_at_ms.is_some()
+            || self.committed_at_ms.is_some() != stamped_restore_plan_version(self.version)
+            || self.committed_at_ms.is_some_and(|stamp| stamp <= 0)
+            || self.restore_key_policy_sha256.is_some()
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -5096,13 +5195,36 @@ impl ControlMvpRestorePlan {
 #[derive(Clone)]
 pub struct ControlMvpRestoreParticipant {
     store: ControlMvpStateStore,
+    key_policy: RestoreKeyPolicy,
 }
 
 impl ControlMvpRestoreParticipant {
-    /// Creates an explicitly configured restore participant.
+    /// Creates an explicitly configured restore participant whose restores
+    /// follow the plain rules for every key ([`RestoreKeyPolicy::none`]).
     #[must_use]
     pub const fn new(store: ControlMvpStateStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            key_policy: RestoreKeyPolicy::none(),
+        }
+    }
+
+    /// Replaces the participant's [`RestoreKeyPolicy`].
+    ///
+    /// Plans this participant writes bind the policy's digest, and it reports
+    /// a plan bound to any other policy as superseded instead of applying it.
+    /// The policy applies to the format-9 restore only: bounded authority-8
+    /// planning refuses a participant whose policy excludes anything.
+    #[must_use]
+    pub fn with_key_policy(mut self, policy: RestoreKeyPolicy) -> Self {
+        self.key_policy = policy;
+        self
+    }
+
+    /// Returns the participant's restore key policy.
+    #[must_use]
+    pub const fn key_policy(&self) -> &RestoreKeyPolicy {
+        &self.key_policy
     }
 
     async fn write_restore_immutable_artifacts(
@@ -6692,7 +6814,9 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
     ) -> Result<PersistedRestoreParticipantPlan> {
         self.store.require_legacy_lifecycle("plan_restore").await?;
         Ok(PersistedRestoreParticipantPlan::ControlMvp(
-            self.store.build_restore_plan(source, identity, now).await?,
+            self.store
+                .build_restore_plan(source, identity, &self.key_policy, now)
+                .await?,
         ))
     }
 
@@ -6702,6 +6826,11 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         identity: &RestoreAttemptIdentity,
         context: &mut crate::state_store::RestorePlanningContext<'_>,
     ) -> Result<PersistedRestoreParticipantPlan> {
+        if !self.key_policy.is_none() {
+            return Err(CatalogError::UnsupportedOperation {
+                message: "bounded authority-8 restore cannot honour a restore key policy".into(),
+            });
+        }
         Ok(PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
             bounded::restore::plan(&self.store, source, identity, context).await?,
         )))
@@ -6773,10 +6902,15 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             prefixed_sha256(&stable.pointer_bytes) == plan.observed_base_pointer_sha256;
         let manifest_matches =
             stable.candidate_parent.manifest_id.as_deref() == Some(plan.base_manifest_id.as_str());
-        if version_matches && bytes_match && manifest_matches {
+        // A plan rendered under another key policy cannot reproduce this
+        // participant's bytes; it is stale configuration, so the driver
+        // replans it rather than failing it as an invariant violation.
+        let policy_matches =
+            plan.restore_key_policy_sha256() == Some(self.key_policy.sha256().as_str());
+        if version_matches && bytes_match && manifest_matches && policy_matches {
             let source_values = self
                 .store
-                .restore_source_values(&plan.source, cost::now())
+                .restore_source_values(&plan.source, &self.key_policy, cost::now())
                 .await?;
             let rendered = self.store.render_restore_candidate(
                 &plan.source,
@@ -6828,7 +6962,10 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             other => return Ok(other),
         }
 
-        let source_values = self.store.restore_source_values(&plan.source, now).await?;
+        let source_values = self
+            .store
+            .restore_source_values(&plan.source, &self.key_policy, now)
+            .await?;
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         if stable.current_base_kind != plan.current_base_kind
             || stable.current.pointer_version.as_deref() != plan.base_pointer_version.as_deref()
@@ -7121,6 +7258,13 @@ fn stored_row_value(row: ControlMvpSegmentRow) -> StoredValue {
 struct RestoreSourceValue {
     bytes: Bytes,
     expires_at_ms: Option<i64>,
+}
+
+/// The restore source rows, already filtered by the key policy the render
+/// applies to the base, so a render can never mix two policies.
+struct RestoreSourceScan {
+    rows: BTreeMap<Vec<u8>, RestoreSourceValue>,
+    policy: RestoreKeyPolicy,
 }
 
 impl RestoreSourceValue {
@@ -9817,8 +9961,9 @@ enum ControlMvpRetainedSource {
 }
 
 impl ControlMvpRetainedReader {
-    /// Collects every live entry with its expiry hint, bounded like a
-    /// restore source scan. This is the only path that surfaces the hint
+    /// Collects every live entry the policy does not exclude with its expiry
+    /// hint, bounded like a restore source scan; excluded rows never charge
+    /// the row or byte budget. This is the only path that surfaces the hint
     /// past the reader boundary, and it is internal: public reads never
     /// expose or filter on it.
     ///
@@ -9827,6 +9972,7 @@ impl ControlMvpRetainedReader {
     /// is an invariant violation here rather than a silent full replay.
     fn live_entries_bounded(
         &self,
+        policy: &RestoreKeyPolicy,
         max_total_rows: usize,
         max_total_bytes: usize,
     ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
@@ -9845,7 +9991,12 @@ impl ControlMvpRetainedReader {
         };
         let mut entries = BTreeMap::new();
         let mut decoded_bytes = 0_usize;
-        for (key, value) in state.kv.iter().filter(|(_, value)| !value.tombstone) {
+        // Excluded rows are dropped before they can charge the budget.
+        for (key, value) in state
+            .kv
+            .iter()
+            .filter(|(key, value)| !value.tombstone && !policy.excludes(key))
+        {
             decoded_bytes = key
                 .len()
                 .checked_add(value.bytes.len())
@@ -13956,7 +14107,11 @@ mod tests {
         // A manifest-backed reader would need an unbounded replay; the scan is
         // only defined over the materialized checkpoint cut restore resolves.
         assert!(matches!(
-            manifest_reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES),
+            manifest_reader.live_entries_bounded(
+                &RestoreKeyPolicy::none(),
+                MAX_SEGMENT_ROWS,
+                MAX_SEGMENT_BYTES
+            ),
             Err(CatalogError::InvariantViolation { .. })
         ));
         let checkpoint = store
@@ -13969,7 +14124,11 @@ mod tests {
             ControlMvpRetainedSource::Materialized(_)
         ));
         let entries = materialized
-            .live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+            .live_entries_bounded(
+                &RestoreKeyPolicy::none(),
+                MAX_SEGMENT_ROWS,
+                MAX_SEGMENT_BYTES,
+            )
             .unwrap();
         assert_eq!(
             entries.get(b"row".as_slice()),
@@ -13978,6 +14137,48 @@ mod tests {
                 expires_at_ms: Some(5),
             })
         );
+    }
+
+    /// Excluded rows never reach the restore source, so they never charge the
+    /// scan's row or byte budget: a source whose non-excluded rows fit a
+    /// budget the excluded rows alone would exhaust still scans.
+    #[tokio::test]
+    async fn live_entries_bounded_drops_excluded_rows_before_charging_the_row_and_byte_budget() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        for key in [b"\x03receipt-a".as_slice(), b"\x03receipt-b"] {
+            tx.put_with_expiry(key, Bytes::from(vec![7; 1024]), 5)
+                .await
+                .unwrap();
+        }
+        tx.put(b"row", Bytes::from_static(b"value")).await.unwrap();
+        tx.commit().await.unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reader = store.retained_checkpoint_reader(checkpoint).await.unwrap();
+        let row_bytes = b"row".len() + b"value".len();
+
+        // Without a policy the receipt-like rows exhaust either budget first.
+        for (rows, bytes) in [(1, MAX_SEGMENT_BYTES), (MAX_SEGMENT_ROWS, row_bytes)] {
+            assert!(matches!(
+                reader.live_entries_bounded(&RestoreKeyPolicy::none(), rows, bytes),
+                Err(CatalogError::MaintenanceBackpressure { .. })
+            ));
+        }
+        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
+        let entries = reader
+            .live_entries_bounded(&policy, 1, row_bytes)
+            .expect("the one non-excluded row fits a one-row, row-sized budget");
+        assert_eq!(vec![&b"row".to_vec()], entries.keys().collect::<Vec<_>>());
     }
 
     #[test]
@@ -14021,7 +14222,12 @@ mod tests {
             (b"equal".to_vec(), source(Some(7))),
             (b"plain".to_vec(), source(None)),
         ]);
-        let writes = ControlMvpStateStore::restore_writes(&source_values, &current);
+        let writes = ControlMvpStateStore::restore_writes(
+            &source_values,
+            &current,
+            &current,
+            &RestoreKeyPolicy::none(),
+        );
         assert_eq!(
             writes.keys().collect::<Vec<_>>(),
             vec![&b"clear".to_vec(), &b"gain".to_vec(), &b"shift".to_vec()],
@@ -14030,6 +14236,67 @@ mod tests {
         assert_eq!(put_hint(writes.get(b"gain".as_slice())), Some(7));
         assert_eq!(put_hint(writes.get(b"clear".as_slice())), None);
         assert_eq!(put_hint(writes.get(b"shift".as_slice())), Some(9));
+    }
+
+    /// Every excluded key live in the current state or in the candidate
+    /// parent is deleted; tombstoned ones need no write; an excluded source
+    /// row is never put, whatever the caller passes; other keys keep the
+    /// plain rules.
+    #[test]
+    fn restore_writes_delete_excluded_keys_live_in_current_or_candidate_parent() {
+        fn stored(tombstone: bool) -> StoredValue {
+            StoredValue {
+                bytes: Bytes::from_static(b"same"),
+                generation: 1,
+                tombstone,
+                expires_at_ms: Some(7),
+            }
+        }
+        let source = RestoreSourceValue {
+            bytes: Bytes::from_static(b"same"),
+            expires_at_ms: Some(7),
+        };
+        let mut current = ReplayState::default();
+        current.kv.insert(b"\x03current".to_vec(), stored(false));
+        current.kv.insert(b"\x03gone".to_vec(), stored(true));
+        current.kv.insert(b"\x03same".to_vec(), stored(false));
+        current.kv.insert(b"\x05kept".to_vec(), stored(false));
+        let mut candidate_parent = ReplayState::default();
+        candidate_parent
+            .kv
+            .insert(b"\x03lineage".to_vec(), stored(false));
+        candidate_parent
+            .kv
+            .insert(b"\x03lineage-gone".to_vec(), stored(true));
+        candidate_parent
+            .kv
+            .insert(b"\x04audit".to_vec(), stored(false));
+        let source_values = BTreeMap::from([
+            (b"\x03same".to_vec(), source.clone()),
+            (b"\x03source".to_vec(), source.clone()),
+            (b"\x05kept".to_vec(), source),
+        ]);
+        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
+        let writes = ControlMvpStateStore::restore_writes(
+            &source_values,
+            &current,
+            &candidate_parent,
+            &policy,
+        );
+        assert_eq!(
+            vec![
+                &b"\x03current".to_vec(),
+                &b"\x03lineage".to_vec(),
+                &b"\x03same".to_vec(),
+            ],
+            writes.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            writes
+                .values()
+                .all(|write| matches!(write, StagedWrite::Delete)),
+            "excluded keys are only ever deleted: {writes:?}"
+        );
     }
 }
 

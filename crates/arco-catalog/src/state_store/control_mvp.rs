@@ -75,7 +75,7 @@
 //! Restore *plans* are versioned separately from on-disk state artifacts,
 //! because an in-flight restore attempt written by an older revision must
 //! still be readable by the recovery path that has to supersede it. Plan
-//! versions 1 through 5 are therefore decoded as legacy plans
+//! versions 1 through 7 are therefore decoded as legacy plans
 //! that can be inspected and superseded but can never be applied. See
 //! [`ControlMvpRestorePlan`].
 
@@ -153,11 +153,13 @@ mod lazy;
     reason = "physical descriptors await authority-8 integration"
 )]
 mod physical;
+mod restore_key_policy;
 mod retained;
 #[cfg(feature = "test-utils")]
 pub use bounded::SyntheticKvEntry;
 pub use bounded::restore::{ControlMvpRestoreFenceWitness, ControlMvpRestorePlanV7};
 pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
+pub use restore_key_policy::RestoreKeyPolicy;
 pub(crate) use retained::{RetainedSourcePublication, VerifiedRetainedPointer};
 #[cfg(test)]
 mod authority8_tests;
@@ -178,7 +180,18 @@ pub use maintenance::{
     MaintenanceProgress, MaintenanceStatus, PreparedMaintenance, PurgedCounts,
 };
 const RESTORE_PLAN_RECORD_TYPE: &str = "control_mvp_restore_plan";
-const RESTORE_PLAN_VERSION: u32 = 7;
+const RESTORE_PLAN_VERSION: u32 = RESTORE_PLAN_VERSION_V8;
+/// Restore plan 8 binds the digest of the restore key policy its candidate
+/// was rendered under (`restore_key_policy_sha256`).
+const RESTORE_PLAN_VERSION_V8: u32 = 8;
+/// Restore plan 7 is the last shape written before restore key policies. It
+/// pins `committed_at_ms` but not the key policy its candidate was rendered
+/// under, so it cannot say which keys the candidate excluded and is
+/// supersession-only.
+///
+/// Unrelated to the bounded authority-8 plan `ControlMvpRestorePlanV7`
+/// (`PersistedRestoreParticipantPlan::ControlMvpV7`), a separate plan family.
+const RESTORE_PLAN_VERSION_V7: u32 = 7;
 /// Restore plan 6 is the last shape written on authority format 7. It predates
 /// the `committed_at_ms` stamp plan 7 pins, so it can never reproduce format-9
 /// candidate bytes and is supersession-only.
@@ -1039,6 +1052,149 @@ impl ControlMvpStateStore {
         .ok_or_else(|| {
             invariant_violation("projection source is absent from authenticated lineage")
         })
+    }
+
+    /// Recognises a restore notice in this domain's projection outbox and
+    /// authenticates it against the restore commit it announces.
+    ///
+    /// Returns `Ok(None)` without any read when the record id does not start
+    /// with `restore:`: the record does not claim to be a restore notice.
+    /// Every record whose id starts with `restore:` claims to be one, and it
+    /// is returned resolved only when all of these hold:
+    ///
+    /// 1. its payload decodes as a restore notice with exactly the five
+    ///    notice fields and is byte-for-byte the canonical encoding the
+    ///    restore writes;
+    /// 2. its id is `restore:{restore_id}:{participant_attempt}:{domain}` of
+    ///    that payload, and those name a valid restore attempt identity;
+    /// 3. the payload's domain is this store's domain;
+    /// 4. the record committed at the payload's result sequence;
+    /// 5. walking authenticated ancestry from the root the record was read at
+    ///    (not newer than it) finds the commit manifest at the result
+    ///    sequence, skipping any maintenance or retention-horizon rewrite
+    ///    published at that sequence since;
+    /// 6. that commit is a restore: its manifest id and the id of its
+    ///    transaction at that sequence are restore-rendered for that
+    ///    sequence, and that transaction's request id is the record id.
+    ///
+    /// Only the manifests on that path and the commit's transaction metadata
+    /// are read, never state. The returned token reads the restored state at
+    /// the restore's own manifest.
+    ///
+    /// # Errors
+    ///
+    /// The refusals raised by checks 1 to 6, and the missing-transaction
+    /// outcome, name the record id in their message.
+    ///
+    /// - [`CatalogError::Validation`] when the record itself is not a
+    ///   well-formed notice of this domain: checks 1 to 4 (an uncommitted
+    ///   record fails check 4).
+    /// - [`CatalogError::InvariantViolation`] when the record is well formed
+    ///   but the authenticated lineage refutes it: it carries no
+    ///   authenticated observed root (it was not read from a committed
+    ///   outbox), its root is of another scope or older than the result
+    ///   sequence, checks 5 and 6 fail, or an object on the path fails its
+    ///   checksum. A notice-shaped record committed by a plain transaction
+    ///   fails here.
+    /// - [`CatalogError::AmbiguousAuthorityOutcome`] when a manifest on the
+    ///   ancestry path cannot be read (missing or failing), the ancestry
+    ///   budget is exhausted, or the restore commit's transaction object is
+    ///   missing; [`CatalogError::Storage`] when the transaction read fails
+    ///   in transport. Both are retryable: the lineage may become readable.
+    /// - Any other error (for example a transaction object that does not
+    ///   decode) is passed through and is not retryable.
+    pub async fn resolve_restore_notice_source(
+        &self,
+        record: &ControlMvpProjectionOutboxRecord,
+    ) -> Result<Option<ControlMvpResolvedRestoreNotice>> {
+        if !record.claims_restore_notice() {
+            return Ok(None);
+        }
+        let id = record.record_id();
+        let notice = decode_restore_notice_record(record, self.scope.domain())?;
+        let sequence = notice.result_logical_sequence;
+        let observed = record.observed_root.as_ref().ok_or_else(|| {
+            restore_notice_invariant(id, "the record has no authenticated observed root")
+        })?;
+        if observed.scope() != &self.scope {
+            return Err(restore_notice_invariant(
+                id,
+                "the observed root belongs to another scope",
+            ));
+        }
+        if observed.logical_sequence() < sequence {
+            return Err(restore_notice_invariant(
+                id,
+                "the result is newer than the authenticated root it was read at",
+            ));
+        }
+        let commit = self
+            .resolve_ancestor(
+                observed.authority_manifest_id(),
+                observed.manifest_witness()?,
+                |manifest, digest| {
+                    if manifest.logical_sequence < sequence {
+                        return Some(None);
+                    }
+                    (manifest.logical_sequence == sequence
+                        && manifest.equivalence.is_none()
+                        && manifest.retention_horizon.is_none())
+                    .then(|| {
+                        Some(RestoreNoticeCommit {
+                            manifest_id: manifest.manifest_id.clone(),
+                            manifest_digest: digest.to_string(),
+                            committed_at_ms: manifest.committed_at_ms,
+                            tx_ref: manifest
+                                .tx_refs
+                                .iter()
+                                .find(|tx_ref| tx_ref.sequence == sequence)
+                                .cloned(),
+                        })
+                    })
+                },
+            )
+            .await?
+            .flatten()
+            .ok_or_else(|| {
+                restore_notice_invariant(id, "the result is absent from authenticated lineage")
+            })?;
+        let tx_ref = commit
+            .tx_ref
+            .as_ref()
+            .filter(|tx_ref| {
+                tx_ref
+                    .tx_id
+                    .starts_with(&restore_transaction_id_prefix(sequence))
+                    && commit
+                        .manifest_id
+                        .starts_with(&restore_manifest_id_prefix(sequence))
+            })
+            .ok_or_else(|| restore_notice_invariant(id, "it was not committed by a restore"))?;
+        // The manifest walk reports unreadable lineage as an ambiguous
+        // outcome; a missing transaction object is retried the same way.
+        let tx = self
+            .load_tx_metadata(tx_ref)
+            .await
+            .map_err(|error| match error {
+                CatalogError::NotFound { .. } => ambiguous_authority_outcome_for(
+                    self.scope.domain(),
+                    format!("restore notice {id}: the restore transaction is unavailable: {error}"),
+                ),
+                error => error,
+            })?;
+        if tx.request_id.as_deref() != Some(id) {
+            return Err(restore_notice_invariant(
+                id,
+                "it was not committed by a restore that carries it",
+            ));
+        }
+        Ok(Some(ControlMvpResolvedRestoreNotice {
+            notice,
+            token: self
+                .token(commit.manifest_id, sequence)
+                .with_manifest_witness(commit.manifest_digest),
+            committed_at_ms: commit.committed_at_ms,
+        }))
     }
 
     async fn load_current_base_state(&self) -> Result<ControlMvpBase> {
@@ -2210,7 +2366,7 @@ impl ControlMvpStateStore {
             manifest_checksum_sha256: pointer.manifest_checksum_sha256,
             states,
             min_retention_seconds: options.min_retention_seconds(),
-            retention_horizon: None,
+            retention_horizon: manifest.retention_horizon.clone(),
         };
         checkpoint.validate(&self.scope, &checkpoint.checkpoint_id)?;
         checkpoint.validate_source(&manifest)?;
@@ -3054,8 +3210,9 @@ impl ControlMvpStateStore {
     async fn restore_source_values(
         &self,
         source: &PersistedAuthorityReference,
+        policy: &RestoreKeyPolicy,
         now: DateTime<Utc>,
-    ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
+    ) -> Result<RestoreSourceScan> {
         self.validate_restore_authority_format(source)?;
         if source.reference_kind() != PersistedAuthorityKind::Checkpoint
             || source.checkpoint_path().is_none()
@@ -3068,7 +3225,10 @@ impl ControlMvpStateStore {
         let reader = self
             .resolve_persisted_retained_reader_at(source, now)
             .await?;
-        reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+        Ok(RestoreSourceScan {
+            rows: reader.live_entries_bounded(policy, MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)?,
+            policy: policy.clone(),
+        })
     }
 
     fn validate_restore_authority_format(
@@ -3078,29 +3238,52 @@ impl ControlMvpStateStore {
         validate_control_mvp_authority_format(&self.paths, source)
     }
 
+    /// Computes the restore writes, all staged at the restore sequence.
+    ///
+    /// Keys the scan's policy does not exclude are diffed between the source
+    /// rows and `current`. Keys it excludes are never put, and every one live
+    /// in `candidate_parent`, the lineage the writes land on, is deleted.
     fn restore_writes(
-        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
+        source: &RestoreSourceScan,
         current: &ReplayState,
+        candidate_parent: &ReplayState,
     ) -> BTreeMap<Vec<u8>, StagedWrite> {
+        let policy = &source.policy;
         let mut writes = BTreeMap::new();
-        for (key, current) in current.kv.iter().filter(|(_key, value)| !value.tombstone) {
-            match source_values.get(key) {
+        for (key, current) in current
+            .kv
+            .iter()
+            .filter(|(key, value)| !value.tombstone && !policy.excludes(key))
+        {
+            match source.rows.get(key) {
                 // A row whose bytes and hint both match needs no rewrite; a
                 // hint-only difference is still a difference the restore
                 // must reproduce.
-                Some(source) if source.matches(current) => {}
-                Some(source) => {
-                    writes.insert(key.clone(), source.staged());
+                Some(row) if row.matches(current) => {}
+                Some(row) => {
+                    writes.insert(key.clone(), row.staged());
                 }
                 None => {
                     writes.insert(key.clone(), StagedWrite::Delete);
                 }
             }
         }
-        for (key, source) in source_values {
+        for (key, row) in source.rows.iter().filter(|(key, _)| !policy.excludes(key)) {
             if current.kv.get(key).is_none_or(|current| current.tombstone) {
-                writes.insert(key.clone(), source.staged());
+                writes.insert(key.clone(), row.staged());
             }
+        }
+        // Invariant: every excluded key live in `current` is live in
+        // `candidate_parent`. With a pointer base the candidate parent is
+        // `current`; with an empty base `current` is empty and the candidate
+        // parent is the source lineage, whose excluded keys a source filter
+        // alone would leave in place.
+        debug_assert!(
+            current.kv.is_empty() || current.history_root == candidate_parent.history_root,
+            "restore writes land on the current state or, with an empty base, the source lineage"
+        );
+        for key in policy.live_excluded_keys(&candidate_parent.kv) {
+            writes.insert(key.clone(), StagedWrite::Delete);
         }
         writes
     }
@@ -3109,7 +3292,7 @@ impl ControlMvpStateStore {
     fn render_restore_candidate(
         &self,
         source: &PersistedAuthorityReference,
-        source_values: &BTreeMap<Vec<u8>, RestoreSourceValue>,
+        source_values: &RestoreSourceScan,
         identity: &RestoreAttemptIdentity,
         stable: &StableRestoreBase,
         checkpoint_interval: u64,
@@ -3151,16 +3334,18 @@ impl ControlMvpStateStore {
             Some(checkpoint_interval),
         )?;
         let suffix = format!("{suffix}-rg-{:020}", stable.current.reclamation_generation);
-        let transaction_id = format!("tx-restore-{result_sequence:020}-{suffix}");
-        let candidate_manifest_id = format!("manifest-{result_sequence:020}-restore-{suffix}");
-        let outbox_record_id = format!(
-            "restore:{}:{}:{}",
-            identity.restore_id(),
-            identity.attempt(),
-            identity.domain()
-        );
+        let transaction_id = format!("{}{suffix}", restore_transaction_id_prefix(result_sequence));
+        let candidate_manifest_id =
+            format!("{}{suffix}", restore_manifest_id_prefix(result_sequence));
+        let outbox_record_id =
+            restore_notice_record_id(identity.restore_id(), identity.attempt(), identity.domain());
 
-        let writes = Self::restore_writes(source_values, &stable.current.state);
+        let writes = Self::restore_writes(
+            source_values,
+            &stable.current.state,
+            &stable.candidate_parent.state,
+        );
+        let write_counts = RestoreWriteCounts::of(&writes, &source_values.policy);
 
         let notice = ControlMvpRestoreNotice {
             restore_id: identity.restore_id().to_string(),
@@ -3179,12 +3364,7 @@ impl ControlMvpStateStore {
             sequence: result_sequence,
             writer_epoch: stable.writer_epoch,
             committed_at_ms,
-            request_id: Some(format!(
-                "restore:{}:{}:{}",
-                identity.restore_id(),
-                identity.attempt(),
-                identity.domain()
-            )),
+            request_id: Some(outbox_record_id.clone()),
             l0_segment: unwritten_l0_segment_ref(&transaction_id, result_sequence),
             writes: writes
                 .into_iter()
@@ -3205,7 +3385,8 @@ impl ControlMvpStateStore {
             &self.scope,
             &l0_rows,
             self.segment_limits,
-        )?;
+        )
+        .map_err(|error| write_counts.l0_capacity_error(identity, error))?;
         tx.l0_segment = l0_reference;
         self.validate_rendered_transaction(&tx, &l0_segment_bytes, &l0_index_bytes)?;
         let transaction_bytes = encode_envelope_limited(
@@ -3325,12 +3506,13 @@ impl ControlMvpStateStore {
         &self,
         source: &PersistedAuthorityReference,
         identity: &RestoreAttemptIdentity,
+        policy: &RestoreKeyPolicy,
         now: DateTime<Utc>,
     ) -> Result<ControlMvpRestorePlan> {
         if identity.domain() != self.scope.domain() {
             return Err(validation_failed("restore identity domain mismatch"));
         }
-        let source_values = self.restore_source_values(source, now).await?;
+        let source_values = self.restore_source_values(source, policy, now).await?;
         let stable = self.load_stable_restore_base(source).await?;
         // Stamps are monotone along ancestry: never before the candidate parent.
         let committed_at_ms = stable
@@ -3359,6 +3541,7 @@ impl ControlMvpStateStore {
             observed_reclamation_generation: stable.current.reclamation_generation,
             checkpoint_interval: Some(self.checkpoint_interval),
             committed_at_ms: Some(committed_at_ms),
+            restore_key_policy_sha256: Some(policy.sha256()),
             base_manifest_id: stable
                 .candidate_parent
                 .manifest_id
@@ -3486,18 +3669,34 @@ const fn legacy_restore_plan_version(version: u32) -> bool {
             | RESTORE_PLAN_VERSION_V4
             | RESTORE_PLAN_VERSION_V5
             | RESTORE_PLAN_VERSION_V6
+            | RESTORE_PLAN_VERSION_V7
     )
 }
 
+/// Returns whether plans of `version` carry the plan-7 `committed_at_ms`
+/// stamp: every version from 7 through the current one, including versions a
+/// later bump makes supersession-only.
+const fn stamped_restore_plan_version(version: u32) -> bool {
+    matches!(version, RESTORE_PLAN_VERSION_V7..=RESTORE_PLAN_VERSION)
+}
+
+/// Returns whether plans of `version` carry the plan-8
+/// `restore_key_policy_sha256` binding: every version from 8 through the
+/// current one, including versions a later bump makes supersession-only.
+const fn key_policy_bound_restore_plan_version(version: u32) -> bool {
+    matches!(version, RESTORE_PLAN_VERSION_V8..=RESTORE_PLAN_VERSION)
+}
+
 /// Decodes the plan-7 `committed_at_ms` field per plan version: required and
-/// positive on the current version, forbidden on supersession-only versions
-/// (no older writer ever wrote it), and passed through for unknown versions,
-/// which plan validation rejects.
+/// positive on every version that carries it (7 through the current
+/// version), forbidden on older supersession-only versions (no older writer
+/// ever wrote it), and passed through for unknown versions, which plan
+/// validation rejects.
 fn restore_plan_committed_at_ms<E: serde::de::Error>(
     version: u32,
     stamp: Option<i64>,
 ) -> std::result::Result<Option<i64>, E> {
-    if version == RESTORE_PLAN_VERSION {
+    if stamped_restore_plan_version(version) {
         return match stamp {
             Some(stamp) if stamp > 0 => Ok(Some(stamp)),
             Some(_) => Err(E::custom(
@@ -3514,6 +3713,28 @@ fn restore_plan_committed_at_ms<E: serde::de::Error>(
         ));
     }
     Ok(stamp)
+}
+
+/// Decodes the plan-8 `restore_key_policy_sha256` binding per plan version:
+/// required on every version that carries it (8 through the current
+/// version), forbidden on older supersession-only versions (no older writer
+/// ever wrote it), and passed through for unknown versions, which plan
+/// validation rejects. Its digest form is checked by validation.
+fn restore_plan_key_policy_sha256<E: serde::de::Error>(
+    version: u32,
+    digest: Option<String>,
+) -> std::result::Result<Option<String>, E> {
+    if key_policy_bound_restore_plan_version(version) {
+        return digest.map(Some).ok_or_else(|| {
+            E::custom("Control MVP restore plan is missing restore_key_policy_sha256")
+        });
+    }
+    if legacy_restore_plan_version(version) && digest.is_some() {
+        return Err(E::custom(
+            "legacy Control MVP restore plans must not carry restore_key_policy_sha256",
+        ));
+    }
+    Ok(digest)
 }
 
 /// Returns the wall-clock stamp a restore plan pins for its candidate bytes.
@@ -4600,6 +4821,134 @@ impl ControlMvpOutboxTrimTarget {
     }
 }
 
+/// Outbox record id prefix of a restore notice. Every record id with this
+/// prefix claims to be one; catalog projection intent ids never take it.
+const RESTORE_NOTICE_RECORD_ID_PREFIX: &str = "restore:";
+
+/// Outbox record id of a restore notice, which is also the restore
+/// transaction's request id: `restore:{restore_id}:{attempt}:{domain}`.
+fn restore_notice_record_id(restore_id: &str, attempt: u64, domain: &str) -> String {
+    format!("{RESTORE_NOTICE_RECORD_ID_PREFIX}{restore_id}:{attempt}:{domain}")
+}
+
+/// Prefix of the id of a restore transaction committed at `sequence`; the
+/// restore identity suffix follows. Plain transaction ids start with
+/// `tx-` and twenty digits, so they never take it.
+fn restore_transaction_id_prefix(sequence: u64) -> String {
+    format!("tx-restore-{sequence:020}-")
+}
+
+/// Prefix of the id of a restore's result manifest at `sequence`; the restore
+/// identity suffix follows.
+fn restore_manifest_id_prefix(sequence: u64) -> String {
+    format!("manifest-{sequence:020}-restore-")
+}
+
+/// A validation error naming the restore notice record it refutes.
+fn restore_notice_validation(record_id: &str, reason: impl fmt::Display) -> CatalogError {
+    CatalogError::Validation {
+        message: format!("restore notice {record_id}: {reason}"),
+    }
+}
+
+/// An invariant violation naming the restore notice record it refutes.
+fn restore_notice_invariant(record_id: &str, reason: &str) -> CatalogError {
+    invariant_violation(format!("restore notice {record_id}: {reason}"))
+}
+
+/// Read-only view of the projection outbox notice a committed Control MVP
+/// restore carries.
+///
+/// A restore commit stages exactly one outbox record and no projection
+/// intent: its id is `restore:{restore_id}:{participant_attempt}:{domain}`,
+/// and its payload is the canonical JSON of the five fields this view
+/// exposes. The record is an announcement, not a projection intent; a
+/// projection consumer materializes the restored state at
+/// [`Self::result_logical_sequence`]. Views are obtained only from
+/// [`ControlMvpStateStore::resolve_restore_notice_source`], which
+/// authenticates the record against the committed restore first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlMvpRestoreNoticeView {
+    restore_id: String,
+    participant_attempt: u64,
+    domain: String,
+    source_logical_sequence: u64,
+    result_logical_sequence: u64,
+}
+
+impl ControlMvpRestoreNoticeView {
+    /// Returns the workspace restore id.
+    #[must_use]
+    pub fn restore_id(&self) -> &str {
+        &self.restore_id
+    }
+
+    /// Returns the restore participant attempt that committed the restore.
+    #[must_use]
+    pub const fn participant_attempt(&self) -> u64 {
+        self.participant_attempt
+    }
+
+    /// Returns the restored state domain.
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    /// Returns the logical sequence of the restore source (the checkpoint or
+    /// retained root whose state was restored).
+    #[must_use]
+    pub const fn source_logical_sequence(&self) -> u64 {
+        self.source_logical_sequence
+    }
+
+    /// Returns the logical sequence of the restore commit itself, which is
+    /// also the notice record's origin sequence.
+    #[must_use]
+    pub const fn result_logical_sequence(&self) -> u64 {
+        self.result_logical_sequence
+    }
+}
+
+/// A restore notice authenticated against the committed restore it
+/// announces; see [`ControlMvpStateStore::resolve_restore_notice_source`].
+#[derive(Debug, Clone)]
+pub struct ControlMvpResolvedRestoreNotice {
+    notice: ControlMvpRestoreNoticeView,
+    token: StateToken,
+    committed_at_ms: i64,
+}
+
+impl ControlMvpResolvedRestoreNotice {
+    /// Returns the decoded notice.
+    #[must_use]
+    pub const fn notice(&self) -> &ControlMvpRestoreNoticeView {
+        &self.notice
+    }
+
+    /// Returns a read token at the restore's result manifest: the manifest
+    /// that committed the restore, at the notice's result sequence. Reading
+    /// at it yields the restored state, whatever later maintenance or
+    /// retention-horizon rewrites published at the same sequence.
+    #[must_use]
+    pub const fn token(&self) -> &StateToken {
+        &self.token
+    }
+
+    /// Returns the id of the restore's result manifest.
+    #[must_use]
+    pub fn result_manifest_id(&self) -> &str {
+        self.token.authority_manifest_id()
+    }
+
+    /// Returns the result manifest's `committed_at_ms` stamp: when the
+    /// restore was rendered for commit, in milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn committed_at_ms(&self) -> i64 {
+        self.committed_at_ms
+    }
+}
+
 /// Durable deterministic evidence for one Control MVP restore participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4621,10 +4970,18 @@ impl ControlMvpRestoreCurrentBaseKind {
 ///
 /// # Plan versioning
 ///
-/// Version 7 pins the `committed_at_ms` stamp its format-9 candidate bytes
-/// carry, on top of version 6's exact transaction/history reference, observed
-/// reclamation generation and exact HEAD identity. Versions 1 through 6 are
-/// supersession-only; recovery must replan them before writing any artifacts.
+/// Version 8 binds the digest of the [`RestoreKeyPolicy`] its candidate was
+/// rendered under (`restore_key_policy_sha256`), on top of version 7's
+/// `committed_at_ms` stamp, version 6's exact transaction/history reference,
+/// observed reclamation generation and exact HEAD identity. A participant
+/// configured with a different policy reports such a plan superseded instead
+/// of applying it. The policy governs rendering, not recognition of a
+/// committed restore: once the plan's transaction is in the lineage,
+/// inspection reports `Visible` whatever the participant's policy.
+///
+/// Versions 1 through 7 are supersession-only; recovery must replan them
+/// before writing any artifacts. Like a landed version-6 plan before it, a
+/// version-7 plan whose restore already landed now inspects `Superseded`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ControlMvpRestorePlan {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4646,6 +5003,11 @@ pub struct ControlMvpRestorePlan {
     /// pins it so inspection and apply re-render byte-identical candidates.
     #[serde(skip_serializing_if = "Option::is_none")]
     committed_at_ms: Option<i64>,
+    /// Digest of the restore key policy the candidate was rendered under.
+    /// Plan 8 binds it so a participant with another policy supersedes the
+    /// plan instead of failing to reproduce its bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_key_policy_sha256: Option<String>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -4685,6 +5047,8 @@ struct ControlMvpRestorePlanWire {
     checkpoint_interval: Option<u64>,
     #[serde(default)]
     committed_at_ms: Option<i64>,
+    #[serde(default)]
+    restore_key_policy_sha256: Option<String>,
     base_manifest_id: String,
     base_logical_sequence: u64,
     transaction_id: String,
@@ -4749,6 +5113,10 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
         };
         let committed_at_ms =
             restore_plan_committed_at_ms::<D::Error>(wire.version, wire.committed_at_ms)?;
+        let restore_key_policy_sha256 = restore_plan_key_policy_sha256::<D::Error>(
+            wire.version,
+            wire.restore_key_policy_sha256,
+        )?;
         Ok(Self {
             transaction_ref: if wire.version == RESTORE_PLAN_VERSION {
                 Some(wire.transaction_ref.ok_or_else(|| {
@@ -4778,6 +5146,7 @@ impl<'de> Deserialize<'de> for ControlMvpRestorePlan {
             },
             checkpoint_interval,
             committed_at_ms,
+            restore_key_policy_sha256,
             base_manifest_id: wire.base_manifest_id,
             base_logical_sequence: wire.base_logical_sequence,
             transaction_id: wire.transaction_id,
@@ -4820,8 +5189,10 @@ impl ControlMvpRestorePlan {
         self.version
     }
 
-    /// Returns whether this plan names the retired authority layout and
-    /// therefore may only be superseded, never applied.
+    /// Returns whether this plan is a supersession-only version (1 through
+    /// 7): it names the retired authority layout or predates the current
+    /// candidate rendering, and therefore may only be superseded, never
+    /// applied.
     #[must_use]
     pub const fn is_legacy_version(&self) -> bool {
         legacy_restore_plan_version(self.version)
@@ -4906,6 +5277,19 @@ impl ControlMvpRestorePlan {
         self.result_logical_sequence
     }
 
+    /// Returns the `sha256:<hex>` digest of the [`RestoreKeyPolicy`] the
+    /// candidate was rendered under; `None` on versions before 8.
+    #[must_use]
+    pub fn restore_key_policy_sha256(&self) -> Option<&str> {
+        self.restore_key_policy_sha256.as_deref()
+    }
+
+    fn required_restore_key_policy_sha256(&self) -> Result<&str> {
+        self.restore_key_policy_sha256().ok_or_else(|| {
+            validation_failed("Control MVP restore plan restore_key_policy_sha256 is missing")
+        })
+    }
+
     fn required_committed_at_ms(&self) -> Result<i64> {
         self.committed_at_ms
             .filter(|stamp| *stamp > 0)
@@ -4949,6 +5333,7 @@ impl ControlMvpRestorePlan {
         };
         let checkpoint_interval = self.required_checkpoint_interval()?;
         self.required_committed_at_ms()?;
+        let restore_key_policy_sha256 = self.required_restore_key_policy_sha256()?;
         if self.record_type != RESTORE_PLAN_RECORD_TYPE
             || self.version != RESTORE_PLAN_VERSION
             || self.implementation != IMPLEMENTATION
@@ -4982,17 +5367,18 @@ impl ControlMvpRestorePlan {
             Some(checkpoint_interval),
         )?;
         let suffix = format!("{suffix}-rg-{:020}", self.observed_reclamation_generation);
-        let expected_transaction_id =
-            format!("tx-restore-{:020}-{suffix}", self.result_logical_sequence);
-        let expected_manifest_id = format!(
-            "manifest-{:020}-restore-{suffix}",
-            self.result_logical_sequence
+        let expected_transaction_id = format!(
+            "{}{suffix}",
+            restore_transaction_id_prefix(self.result_logical_sequence)
         );
-        let expected_outbox_id = format!(
-            "restore:{}:{}:{}",
+        let expected_manifest_id = format!(
+            "{}{suffix}",
+            restore_manifest_id_prefix(self.result_logical_sequence)
+        );
+        let expected_outbox_id = restore_notice_record_id(
             self.identity.restore_id(),
             self.identity.attempt(),
-            self.identity.domain()
+            self.identity.domain(),
         );
         if self.transaction_id != expected_transaction_id
             || self.transaction_path != store.paths.tx_object(&expected_transaction_id)
@@ -5005,10 +5391,11 @@ impl ControlMvpRestorePlan {
             ));
         }
         for digest in [
-            &self.observed_base_pointer_sha256,
-            &self.transaction_sha256,
-            &self.candidate_manifest_sha256,
-            &self.candidate_pointer_sha256,
+            self.observed_base_pointer_sha256.as_str(),
+            self.transaction_sha256.as_str(),
+            self.candidate_manifest_sha256.as_str(),
+            self.candidate_pointer_sha256.as_str(),
+            restore_key_policy_sha256,
         ] {
             validate_prefixed_digest(digest, "Control MVP restore digest")?;
         }
@@ -5047,7 +5434,10 @@ impl ControlMvpRestorePlan {
             || !self.is_legacy_version()
             || (self.version == RESTORE_PLAN_VERSION_V1 && self.observed_writer_epoch != 0)
             || (self.version < RESTORE_PLAN_VERSION_V3 && self.checkpoint_interval.is_some())
-            || self.committed_at_ms.is_some()
+            || self.committed_at_ms.is_some() != stamped_restore_plan_version(self.version)
+            || self.committed_at_ms.is_some_and(|stamp| stamp <= 0)
+            || self.restore_key_policy_sha256.is_some()
+                != key_policy_bound_restore_plan_version(self.version)
             || self.implementation != IMPLEMENTATION
             || self.scope != store.scope
             || self.identity != validated_identity
@@ -5066,11 +5456,10 @@ impl ControlMvpRestorePlan {
         {
             return Err(validation_failed("invalid legacy Control MVP restore plan"));
         }
-        let expected_outbox_id = format!(
-            "restore:{}:{}:{}",
+        let expected_outbox_id = restore_notice_record_id(
             self.identity.restore_id(),
             self.identity.attempt(),
-            self.identity.domain()
+            self.identity.domain(),
         );
         if self.restore_outbox_record_id != expected_outbox_id {
             return Err(validation_failed(
@@ -5096,13 +5485,54 @@ impl ControlMvpRestorePlan {
 #[derive(Clone)]
 pub struct ControlMvpRestoreParticipant {
     store: ControlMvpStateStore,
+    key_policy: RestoreKeyPolicy,
 }
 
 impl ControlMvpRestoreParticipant {
-    /// Creates an explicitly configured restore participant.
+    /// Creates an explicitly configured restore participant whose restores
+    /// follow the plain rules for every key ([`RestoreKeyPolicy::none`]).
     #[must_use]
     pub const fn new(store: ControlMvpStateStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            key_policy: RestoreKeyPolicy::none(),
+        }
+    }
+
+    /// Replaces the participant's [`RestoreKeyPolicy`].
+    ///
+    /// Plans this participant writes bind the policy's digest, and it reports
+    /// an unapplied plan bound to any other policy as superseded instead of
+    /// applying it. The policy governs rendering, not recognition of a
+    /// committed restore: once a plan's transaction is in the lineage,
+    /// inspection reports `Visible` whatever the policy. A version-7 plan
+    /// (which binds no policy) inspects `Superseded` even when its restore
+    /// already landed, as version-6 plans do.
+    ///
+    /// The policy applies to the format-9 restore only: bounded authority-8
+    /// planning and advance refuse a participant whose policy excludes
+    /// anything.
+    #[must_use]
+    pub fn with_key_policy(mut self, policy: RestoreKeyPolicy) -> Self {
+        self.key_policy = policy;
+        self
+    }
+
+    /// Returns the participant's restore key policy.
+    #[must_use]
+    pub const fn key_policy(&self) -> &RestoreKeyPolicy {
+        &self.key_policy
+    }
+
+    /// Bounded authority-8 restore cannot honour a key policy, so it refuses
+    /// one before reading or writing anything rather than ignoring it.
+    fn reject_bounded_key_policy(&self) -> Result<()> {
+        if self.key_policy.excludes_nothing() {
+            return Ok(());
+        }
+        Err(CatalogError::UnsupportedOperation {
+            message: "bounded authority-8 restore cannot honour a restore key policy".into(),
+        })
     }
 
     async fn write_restore_immutable_artifacts(
@@ -5163,11 +5593,10 @@ impl ControlMvpRestoreParticipant {
     ) -> Result<RestoreParticipantInspection> {
         let planned_tx_ref = plan.transaction_reference()?;
         let tx = self.store.load_tx(planned_tx_ref).await?;
-        let expected_request_id = format!(
-            "restore:{}:{}:{}",
+        let expected_request_id = restore_notice_record_id(
             plan.identity.restore_id(),
             plan.identity.attempt(),
-            plan.identity.domain()
+            plan.identity.domain(),
         );
         let [restore_notice] = tx.outbox.as_slice() else {
             return Err(invariant_violation(
@@ -5316,6 +5745,15 @@ impl ControlMvpProjectionOutboxRecord {
     #[must_use]
     pub fn record_id(&self) -> &str {
         &self.record_id
+    }
+
+    /// Returns whether this record claims to be a restore notice: its id
+    /// starts with `restore:`. Such a record is never a projection intent;
+    /// [`ControlMvpStateStore::resolve_restore_notice_source`] authenticates
+    /// the claim.
+    #[must_use]
+    pub fn claims_restore_notice(&self) -> bool {
+        self.record_id.starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
     }
 
     /// Returns the outbox payload.
@@ -6692,7 +7130,9 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
     ) -> Result<PersistedRestoreParticipantPlan> {
         self.store.require_legacy_lifecycle("plan_restore").await?;
         Ok(PersistedRestoreParticipantPlan::ControlMvp(
-            self.store.build_restore_plan(source, identity, now).await?,
+            self.store
+                .build_restore_plan(source, identity, &self.key_policy, now)
+                .await?,
         ))
     }
 
@@ -6702,6 +7142,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         identity: &RestoreAttemptIdentity,
         context: &mut crate::state_store::RestorePlanningContext<'_>,
     ) -> Result<PersistedRestoreParticipantPlan> {
+        self.reject_bounded_key_policy()?;
         Ok(PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
             bounded::restore::plan(&self.store, source, identity, context).await?,
         )))
@@ -6717,6 +7158,7 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         context: &mut crate::state_store::RestoreAdvanceContext<'_>,
     ) -> Result<crate::state_store::RestoreParticipantAdvance> {
         if context.is_bounded() {
+            self.reject_bounded_key_policy()?;
             if self.store.authority_format != 8 {
                 return Err(CatalogError::UnsupportedOperation {
                     message: "bounded advance requires synthetic authority 8".into(),
@@ -6773,10 +7215,15 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             prefixed_sha256(&stable.pointer_bytes) == plan.observed_base_pointer_sha256;
         let manifest_matches =
             stable.candidate_parent.manifest_id.as_deref() == Some(plan.base_manifest_id.as_str());
-        if version_matches && bytes_match && manifest_matches {
+        // A plan rendered under another key policy cannot reproduce this
+        // participant's bytes; it is stale configuration, so the driver
+        // replans it rather than failing it as an invariant violation.
+        let policy_matches =
+            plan.restore_key_policy_sha256() == Some(self.key_policy.sha256().as_str());
+        if version_matches && bytes_match && manifest_matches && policy_matches {
             let source_values = self
                 .store
-                .restore_source_values(&plan.source, cost::now())
+                .restore_source_values(&plan.source, &self.key_policy, cost::now())
                 .await?;
             let rendered = self.store.render_restore_candidate(
                 &plan.source,
@@ -6828,7 +7275,10 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
             other => return Ok(other),
         }
 
-        let source_values = self.store.restore_source_values(&plan.source, now).await?;
+        let source_values = self
+            .store
+            .restore_source_values(&plan.source, &self.key_policy, now)
+            .await?;
         let stable = self.store.load_stable_restore_base(&plan.source).await?;
         if stable.current_base_kind != plan.current_base_kind
             || stable.current.pointer_version.as_deref() != plan.base_pointer_version.as_deref()
@@ -7123,6 +7573,66 @@ struct RestoreSourceValue {
     expires_at_ms: Option<i64>,
 }
 
+/// The restore source rows, already filtered by the key policy the render
+/// applies to the base, so a render can never mix two policies.
+struct RestoreSourceScan {
+    rows: BTreeMap<Vec<u8>, RestoreSourceValue>,
+    policy: RestoreKeyPolicy,
+}
+
+/// Write counts of one rendered restore, named when its L0 cannot hold them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreWriteCounts {
+    puts: usize,
+    deletes: usize,
+    excluded_key_deletes: usize,
+}
+
+impl RestoreWriteCounts {
+    fn of(writes: &BTreeMap<Vec<u8>, StagedWrite>, policy: &RestoreKeyPolicy) -> Self {
+        let mut counts = Self {
+            puts: 0,
+            deletes: 0,
+            excluded_key_deletes: 0,
+        };
+        for (key, write) in writes {
+            let count = match write {
+                StagedWrite::Put { .. } => &mut counts.puts,
+                StagedWrite::Delete if policy.excludes(key) => &mut counts.excluded_key_deletes,
+                StagedWrite::Delete => &mut counts.deletes,
+            };
+            *count = count.saturating_add(1);
+        }
+        counts
+    }
+
+    /// Names the restore and its write counts in an L0 capacity error, which
+    /// is always `Validation` at L0, keeping the segment's own detail. Any
+    /// other error passes through unchanged.
+    fn l0_capacity_error(
+        self,
+        identity: &RestoreAttemptIdentity,
+        error: CatalogError,
+    ) -> CatalogError {
+        match error {
+            CatalogError::Validation { message } => CatalogError::Validation {
+                message: format!(
+                    "Control MVP restore {} attempt {} of domain {} does not fit one L0 segment \
+                     (puts: {}, deletes: {}, excluded-key deletes: {}, plus one restore notice): \
+                     {message}",
+                    identity.restore_id(),
+                    identity.attempt(),
+                    identity.domain(),
+                    self.puts,
+                    self.deletes,
+                    self.excluded_key_deletes,
+                ),
+            },
+            other => other,
+        }
+    }
+}
+
 impl RestoreSourceValue {
     fn matches(&self, current: &StoredValue) -> bool {
         self.bytes == current.bytes && self.expires_at_ms == current.expires_at_ms
@@ -7142,13 +7652,74 @@ struct RenderedControlMvpStateSegment {
     index_bytes: Bytes,
 }
 
+/// Wire payload of a restore notice. Decoding denies unknown fields;
+/// encoding is unchanged (the field set and order are the wire contract).
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ControlMvpRestoreNotice {
     restore_id: String,
     participant_attempt: u64,
     domain: String,
     source_logical_sequence: u64,
     result_logical_sequence: u64,
+}
+
+/// The commit manifest found at a restore notice's result sequence.
+struct RestoreNoticeCommit {
+    manifest_id: String,
+    manifest_digest: String,
+    committed_at_ms: i64,
+    tx_ref: Option<ControlMvpTxRef>,
+}
+
+/// Checks a `restore:` record's own content (checks 1 to 4 of
+/// `resolve_restore_notice_source`); every failure is a validation error.
+fn decode_restore_notice_record(
+    record: &ControlMvpProjectionOutboxRecord,
+    domain: &str,
+) -> Result<ControlMvpRestoreNoticeView> {
+    let id = record.record_id();
+    let notice: ControlMvpRestoreNotice =
+        serde_json::from_slice(record.payload()).map_err(|error| {
+            restore_notice_validation(id, format!("payload does not decode: {error}"))
+        })?;
+    if encode_json_vec(&notice, "restore notice")? != record.payload().as_ref() {
+        return Err(restore_notice_validation(id, "payload is not canonical"));
+    }
+    if id
+        != restore_notice_record_id(
+            &notice.restore_id,
+            notice.participant_attempt,
+            &notice.domain,
+        )
+    {
+        return Err(restore_notice_validation(
+            id,
+            "record id does not match its payload",
+        ));
+    }
+    RestoreAttemptIdentity::new(
+        notice.restore_id.as_str(),
+        notice.participant_attempt,
+        notice.domain.as_str(),
+    )
+    .map_err(|error| restore_notice_validation(id, format!("invalid restore identity: {error}")))?;
+    if notice.domain != domain {
+        return Err(restore_notice_validation(id, "it names another domain"));
+    }
+    if record.origin_sequence() != Some(notice.result_logical_sequence) {
+        return Err(restore_notice_validation(
+            id,
+            "it was not committed at its result sequence",
+        ));
+    }
+    Ok(ControlMvpRestoreNoticeView {
+        restore_id: notice.restore_id,
+        participant_attempt: notice.participant_attempt,
+        domain: notice.domain,
+        source_logical_sequence: notice.source_logical_sequence,
+        result_logical_sequence: notice.result_logical_sequence,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -9817,8 +10388,9 @@ enum ControlMvpRetainedSource {
 }
 
 impl ControlMvpRetainedReader {
-    /// Collects every live entry with its expiry hint, bounded like a
-    /// restore source scan. This is the only path that surfaces the hint
+    /// Collects every live entry the policy does not exclude with its expiry
+    /// hint, bounded like a restore source scan; excluded rows never charge
+    /// the row or byte budget. This is the only path that surfaces the hint
     /// past the reader boundary, and it is internal: public reads never
     /// expose or filter on it.
     ///
@@ -9827,6 +10399,7 @@ impl ControlMvpRetainedReader {
     /// is an invariant violation here rather than a silent full replay.
     fn live_entries_bounded(
         &self,
+        policy: &RestoreKeyPolicy,
         max_total_rows: usize,
         max_total_bytes: usize,
     ) -> Result<BTreeMap<Vec<u8>, RestoreSourceValue>> {
@@ -9845,7 +10418,12 @@ impl ControlMvpRetainedReader {
         };
         let mut entries = BTreeMap::new();
         let mut decoded_bytes = 0_usize;
-        for (key, value) in state.kv.iter().filter(|(_, value)| !value.tombstone) {
+        // Excluded rows are dropped before they can charge the budget.
+        for (key, value) in state
+            .kv
+            .iter()
+            .filter(|(key, value)| !value.tombstone && !policy.excludes(key))
+        {
             decoded_bytes = key
                 .len()
                 .checked_add(value.bytes.len())
@@ -12310,6 +12888,114 @@ mod tests {
         }
     }
 
+    /// The restore notice recogniser trusts only the authenticated root the
+    /// record was read at: a record without one, with one older than the
+    /// result sequence, or with one of another scope is an invariant
+    /// violation, while the record read from the outbox resolves.
+    #[tokio::test]
+    async fn restore_notice_recognition_requires_the_authenticated_root_it_was_read_at() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = ControlMvpStateStore::new(storage.clone(), scope).unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"v1")).await.unwrap();
+        txn.commit().await.unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let source = store
+            .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+            .await
+            .unwrap();
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"v2")).await.unwrap();
+        let before_restore = txn.commit().await.unwrap().state_token().clone();
+        let participant = ControlMvpRestoreParticipant::new(store.clone());
+        let plan = participant
+            .plan_restore(
+                &source,
+                &RestoreAttemptIdentity::new("rst_00000000000000000000000401", 1, "catalog")
+                    .unwrap(),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        participant.apply_restore(&plan, Utc::now()).await.unwrap();
+        let notice = store
+            .current_projection_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                record
+                    .record_id()
+                    .starts_with(RESTORE_NOTICE_RECORD_ID_PREFIX)
+            })
+            .unwrap();
+        assert!(
+            store
+                .resolve_restore_notice_source(&notice)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let other = ControlMvpStateStore::new(
+            storage,
+            StateScope::new("tenant", "workspace", "orchestration"),
+        )
+        .unwrap();
+        // Enough commits that the foreign root is not older than the result,
+        // so only its scope refutes it.
+        let mut foreign_root = None;
+        for _ in 0..3 {
+            foreign_root = Some(
+                other
+                    .begin_control_txn(TxnOptions::default())
+                    .await
+                    .unwrap()
+                    .commit()
+                    .await
+                    .unwrap()
+                    .state_token()
+                    .clone(),
+            );
+        }
+        let foreign_root = foreign_root.unwrap();
+        // The restore committed right after `before_restore`.
+        assert!(foreign_root.logical_sequence() > before_restore.logical_sequence());
+        for (root, reason) in [
+            (None, "no authenticated observed root"),
+            (
+                Some(before_restore),
+                "newer than the authenticated root it was read at",
+            ),
+            (Some(foreign_root), "observed root belongs to another scope"),
+        ] {
+            let mut forged = notice.clone();
+            forged.observed_root = root;
+            let error = store
+                .resolve_restore_notice_source(&forged)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    CatalogError::InvariantViolation { message } if message.contains(reason)
+                ),
+                "expected an invariant violation naming {reason:?}, got {error:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn frozen_operation_retry_after_head_only_change_gets_fresh_artifact_identity() {
         let storage =
@@ -13956,7 +14642,11 @@ mod tests {
         // A manifest-backed reader would need an unbounded replay; the scan is
         // only defined over the materialized checkpoint cut restore resolves.
         assert!(matches!(
-            manifest_reader.live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES),
+            manifest_reader.live_entries_bounded(
+                &RestoreKeyPolicy::none(),
+                MAX_SEGMENT_ROWS,
+                MAX_SEGMENT_BYTES
+            ),
             Err(CatalogError::InvariantViolation { .. })
         ));
         let checkpoint = store
@@ -13969,7 +14659,11 @@ mod tests {
             ControlMvpRetainedSource::Materialized(_)
         ));
         let entries = materialized
-            .live_entries_bounded(MAX_SEGMENT_ROWS, MAX_SEGMENT_BYTES)
+            .live_entries_bounded(
+                &RestoreKeyPolicy::none(),
+                MAX_SEGMENT_ROWS,
+                MAX_SEGMENT_BYTES,
+            )
             .unwrap();
         assert_eq!(
             entries.get(b"row".as_slice()),
@@ -13978,6 +14672,48 @@ mod tests {
                 expires_at_ms: Some(5),
             })
         );
+    }
+
+    /// Excluded rows never reach the restore source, so they never charge the
+    /// scan's row or byte budget: a source whose non-excluded rows fit a
+    /// budget the excluded rows alone would exhaust still scans.
+    #[tokio::test]
+    async fn live_entries_bounded_drops_excluded_rows_before_charging_the_row_and_byte_budget() {
+        let storage =
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap();
+        let store =
+            ControlMvpStateStore::new(storage, StateScope::new("tenant", "workspace", "catalog"))
+                .unwrap();
+        let mut tx = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        for key in [b"\x03receipt-a".as_slice(), b"\x03receipt-b"] {
+            tx.put_with_expiry(key, Bytes::from(vec![7; 1024]), 5)
+                .await
+                .unwrap();
+        }
+        tx.put(b"row", Bytes::from_static(b"value")).await.unwrap();
+        tx.commit().await.unwrap();
+        let checkpoint = store
+            .checkpoint(CheckpointOptions::default())
+            .await
+            .unwrap();
+        let reader = store.retained_checkpoint_reader(checkpoint).await.unwrap();
+        let row_bytes = b"row".len() + b"value".len();
+
+        // Without a policy the receipt-like rows exhaust either budget first.
+        for (rows, bytes) in [(1, MAX_SEGMENT_BYTES), (MAX_SEGMENT_ROWS, row_bytes)] {
+            assert!(matches!(
+                reader.live_entries_bounded(&RestoreKeyPolicy::none(), rows, bytes),
+                Err(CatalogError::MaintenanceBackpressure { .. })
+            ));
+        }
+        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
+        let entries = reader
+            .live_entries_bounded(&policy, 1, row_bytes)
+            .expect("the one non-excluded row fits a one-row, row-sized budget");
+        assert_eq!(vec![&b"row".to_vec()], entries.keys().collect::<Vec<_>>());
     }
 
     #[test]
@@ -14021,7 +14757,11 @@ mod tests {
             (b"equal".to_vec(), source(Some(7))),
             (b"plain".to_vec(), source(None)),
         ]);
-        let writes = ControlMvpStateStore::restore_writes(&source_values, &current);
+        let scan = RestoreSourceScan {
+            rows: source_values,
+            policy: RestoreKeyPolicy::none(),
+        };
+        let writes = ControlMvpStateStore::restore_writes(&scan, &current, &current);
         assert_eq!(
             writes.keys().collect::<Vec<_>>(),
             vec![&b"clear".to_vec(), &b"gain".to_vec(), &b"shift".to_vec()],
@@ -14030,6 +14770,153 @@ mod tests {
         assert_eq!(put_hint(writes.get(b"gain".as_slice())), Some(7));
         assert_eq!(put_hint(writes.get(b"clear".as_slice())), None);
         assert_eq!(put_hint(writes.get(b"shift".as_slice())), Some(9));
+    }
+
+    /// Every excluded key live in the lineage the writes land on is deleted
+    /// and tombstoned ones need no write, for both restore bases: a pointer
+    /// base (the candidate parent is the current state) and an empty base
+    /// (no current state; the candidate parent is the source lineage). An
+    /// excluded source row is never put, whatever the scan holds; other keys
+    /// keep the plain rules.
+    #[test]
+    fn restore_writes_delete_excluded_keys_live_in_the_candidate_parent_for_both_bases() {
+        fn stored(tombstone: bool) -> StoredValue {
+            StoredValue {
+                bytes: Bytes::from_static(b"same"),
+                generation: 1,
+                tombstone,
+                expires_at_ms: Some(7),
+            }
+        }
+        fn scan(keys: &[&[u8]]) -> RestoreSourceScan {
+            RestoreSourceScan {
+                rows: keys
+                    .iter()
+                    .map(|key| {
+                        (
+                            key.to_vec(),
+                            RestoreSourceValue {
+                                bytes: Bytes::from_static(b"same"),
+                                expires_at_ms: Some(7),
+                            },
+                        )
+                    })
+                    .collect(),
+                policy: RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap(),
+            }
+        }
+        fn summary(writes: &BTreeMap<Vec<u8>, StagedWrite>) -> Vec<(Vec<u8>, bool)> {
+            writes
+                .iter()
+                .map(|(key, write)| (key.clone(), matches!(write, StagedWrite::Delete)))
+                .collect()
+        }
+
+        let mut current = ReplayState::default();
+        current.kv.insert(b"\x03current".to_vec(), stored(false));
+        current.kv.insert(b"\x03gone".to_vec(), stored(true));
+        current.kv.insert(b"\x03same".to_vec(), stored(false));
+        current.kv.insert(b"\x05kept".to_vec(), stored(false));
+        let pointer_base = ControlMvpStateStore::restore_writes(
+            &scan(&[b"\x03same", b"\x03source", b"\x05kept"]),
+            &current,
+            &current.clone(),
+        );
+        assert_eq!(
+            vec![
+                (b"\x03current".to_vec(), true),
+                (b"\x03same".to_vec(), true),
+            ],
+            summary(&pointer_base),
+            "pointer base: live excluded keys are deleted, the rest is the plain diff"
+        );
+
+        let mut lineage = ReplayState::default();
+        lineage.kv.insert(b"\x03lineage".to_vec(), stored(false));
+        lineage
+            .kv
+            .insert(b"\x03lineage-gone".to_vec(), stored(true));
+        lineage.kv.insert(b"\x04audit".to_vec(), stored(false));
+        let empty_base = ControlMvpStateStore::restore_writes(
+            &scan(&[b"\x03lineage", b"\x04audit"]),
+            &ReplayState::default(),
+            &lineage,
+        );
+        assert_eq!(
+            vec![
+                (b"\x03lineage".to_vec(), true),
+                (b"\x04audit".to_vec(), false),
+            ],
+            summary(&empty_base),
+            "empty base: the source lineage's live excluded keys are deleted"
+        );
+    }
+
+    /// Field presence is decided by version ranges ending at the current
+    /// version, so a later bump that makes the current version
+    /// supersession-only still decodes it with its fields.
+    #[test]
+    fn restore_plan_field_presence_follows_version_ranges_through_the_current_version() {
+        assert!(!stamped_restore_plan_version(RESTORE_PLAN_VERSION_V6));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION_V7));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION_V8));
+        assert!(stamped_restore_plan_version(RESTORE_PLAN_VERSION));
+        assert!(!key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION_V7
+        ));
+        assert!(key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION_V8
+        ));
+        assert!(key_policy_bound_restore_plan_version(RESTORE_PLAN_VERSION));
+        assert!(!stamped_restore_plan_version(RESTORE_PLAN_VERSION + 1));
+        assert!(!key_policy_bound_restore_plan_version(
+            RESTORE_PLAN_VERSION + 1
+        ));
+    }
+
+    #[test]
+    fn restore_l0_capacity_errors_name_the_restore_and_its_write_counts() {
+        let policy = RestoreKeyPolicy::excluding([[0x03_u8]]).unwrap();
+        let writes = BTreeMap::from([
+            (b"\x03a".to_vec(), StagedWrite::Delete),
+            (b"\x03b".to_vec(), StagedWrite::Delete),
+            (b"plain-delete".to_vec(), StagedWrite::Delete),
+            (
+                b"plain-put".to_vec(),
+                StagedWrite::Put {
+                    value: Bytes::from_static(b"v"),
+                    expires_at_ms: None,
+                },
+            ),
+        ]);
+        let counts = RestoreWriteCounts::of(&writes, &policy);
+        assert_eq!(
+            RestoreWriteCounts {
+                puts: 1,
+                deletes: 1,
+                excluded_key_deletes: 2,
+            },
+            counts
+        );
+        let identity =
+            RestoreAttemptIdentity::new("rst_00000000000000000000000001", 3, "catalog").unwrap();
+        let error = counts.l0_capacity_error(
+            &identity,
+            validation_failed("control MVP segment exceeds the supported row limit"),
+        );
+        let CatalogError::Validation { message } = error else {
+            panic!("an L0 capacity error stays Validation: {error:?}");
+        };
+        assert_eq!(
+            "Control MVP restore rst_00000000000000000000000001 attempt 3 of domain catalog does \
+             not fit one L0 segment (puts: 1, deletes: 1, excluded-key deletes: 2, plus one \
+             restore notice): control MVP segment exceeds the supported row limit",
+            message
+        );
+        assert!(matches!(
+            counts.l0_capacity_error(&identity, invariant_violation("other")),
+            CatalogError::InvariantViolation { .. }
+        ));
     }
 }
 

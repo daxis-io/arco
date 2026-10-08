@@ -158,9 +158,27 @@ state with the next published horizon.
 A catalog root's retained rows are therefore roughly: the receipts of the
 last ~25 hours (plus the time until the next published horizon), the
 tombstones the horizon cannot yet purge, outbox rows not yet trimmed, live
-catalog state, and any tag-4 rows left from before this change. This bounds
-the row count, not the per-commit cost: every commit still replays the whole
-retained state, and the caveat above stands.
+catalog state, and any tag-4 rows left from before this change. For at least
+30 days after a catalog restore it also holds the receipt tombstones that
+restore wrote (see below). This bounds the row count, not the per-commit
+cost: every commit still replays the whole retained state, and the caveat
+above stands.
+
+## Restores and receipt tombstones (retention step 4)
+
+As of 2026-10-01 a catalog restore never restores receipts: at the restore
+sequence it deletes every receipt live before the restore
+(`docs/runbooks/state-store-restore-repair-required.md`). Each delete is a
+tombstone, and tombstones carry no expiry hint, so the expiry purge never
+removes them. The retention horizon purges them only once `horizon_sequence`
+reaches the restore sequence: at least 30 days after the restore (the
+token-retention floor plus its one-hour margin), and later while a
+checkpoint, snapshot or export pin holds the horizon back. A receipt that
+would have been purged about 25 hours after it was written therefore stays
+in the replayed state as a tombstone for at least 30 days. At the pilot rate
+that is up to about 180k extra retained rows per restore for that period,
+on top of the receipts written after the restore. These rows add to what
+every commit replays; they do not lengthen the L0 suffix.
 
 ## Current Wiring Status
 

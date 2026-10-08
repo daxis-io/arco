@@ -8,10 +8,10 @@
 )]
 use arco_catalog::{
     ArcoStateAdmin as _, ArcoStateReader as _, ArcoStateTxn as _, CatalogProjectionMaterializer,
-    CheckpointOptions, ControlCatalogAuthority, ControlMvpReadCacheConfig,
-    ControlMvpRestoreParticipant, ControlMvpStateStore, PersistedAuthorityAdapter as _,
-    RestoreAttemptIdentity, ScanRequest, StateRestoreParticipant as _, StateScope, TxnOptions,
-    WriteOptions,
+    CheckpointOptions, ControlCatalogAuthority, ControlMvpReadCacheConfig, ControlMvpStateStore,
+    PersistedAuthorityAdapter as _, RestoreAttemptIdentity, ScanRequest,
+    StateRestoreParticipant as _, StateScope, TxnOptions, WriteOptions,
+    catalog_restore_participant,
 };
 use arco_core::{MemoryBackend, ScopedStorage, StorageBackend, WritePrecondition, WriteResult};
 use arco_storage_s3::S3StorageBackend;
@@ -282,7 +282,7 @@ async fn scenarios(
         retained.get(b"gate7-key").await?,
         Some(Bytes::from_static(b"retained"))
     );
-    let participant = ControlMvpRestoreParticipant::new(store.clone());
+    let participant = catalog_restore_participant(store.clone())?;
     let identity = RestoreAttemptIdentity::new(format!("rst_{}", ulid::Ulid::new()), 1, "catalog")?;
     let now = chrono::Utc::now();
     let plan = participant.plan_restore(&reference, &identity, now).await?;

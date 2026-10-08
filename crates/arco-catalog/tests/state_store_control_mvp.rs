@@ -15,6 +15,8 @@
 
 #[path = "../benches/support/durable_maintenance.rs"]
 mod durable_maintenance;
+#[path = "support/restore_notice.rs"]
+mod restore_notice;
 
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -29,8 +31,8 @@ use arco_catalog::{
     ControlMvpMaintenanceWorker, ControlMvpOutboxTrimTarget, ControlMvpPaths,
     ControlMvpProjectionOutboxRecord, ControlMvpRestoreParticipant, ControlMvpStateStore, KeyRange,
     PersistedAuthorityAdapter, PersistedAuthorityKind, PersistedAuthorityReference,
-    PersistedRestoreParticipantPlan, RestoreAttemptIdentity, RestoreParticipantInspection,
-    ScanRequest, StateRestoreParticipant, StateScope, TxnOptions,
+    PersistedRestoreParticipantPlan, RestoreAttemptIdentity, RestoreKeyPolicy,
+    RestoreParticipantInspection, ScanRequest, StateRestoreParticipant, StateScope, TxnOptions,
 };
 use arco_core::storage::{ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
 use arco_core::{MemoryBackend, ScopedStorage};
@@ -40,6 +42,7 @@ use serde_json::Value;
 use sha2::Digest;
 
 use chrono::{Duration as ChronoDuration, Utc};
+use restore_notice::{ForgedPayload, commit_raw_outbox_record, forged_notice};
 
 fn scope() -> StateScope {
     StateScope::new("tenant", "workspace", "catalog")
@@ -1580,11 +1583,16 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
     assert!(!serialized.contains("StateToken"));
     assert!(!serialized.contains("CheckpointToken"));
     assert_eq!(
-        7,
+        8,
         plan.version(),
         "planning writes the current plan version"
     );
     assert!(!plan.is_legacy_version());
+    assert_eq!(
+        Some(RestoreKeyPolicy::none().sha256().as_str()),
+        plan.restore_key_policy_sha256(),
+        "a participant without a key policy binds the empty policy's digest"
+    );
     assert_eq!(Some(32_u64), downgraded_checkpoint_interval(&serialized));
 
     // R6: a round trip of the version this revision writes proves only that
@@ -1607,6 +1615,14 @@ async fn restore_plan_is_deterministic_read_only_and_binds_both_pointer_digests(
         .expect("plan object")
         .remove("committed_at_ms");
     assert!(removed_stamp.is_some_and(|stamp| stamp.as_i64().is_some_and(|ms| ms > 0)));
+    let removed_policy = downgraded
+        .as_object_mut()
+        .expect("plan object")
+        .remove("restore_key_policy_sha256");
+    assert_eq!(
+        Some(Value::String(RestoreKeyPolicy::none().sha256())),
+        removed_policy
+    );
     downgraded["version"] = Value::from(1_u64);
     let migrated: PersistedRestoreParticipantPlan =
         serde_json::from_value(downgraded.clone()).expect("v1 plans must remain decodable");
@@ -1895,6 +1911,8 @@ async fn literal_old_layout_restore_plans_are_superseded_without_writes() {
         include_str!("fixtures/control_mvp_restore_plans/v2_current.json"),
         // Current layout, but the last plan shape written on authority format 7.
         include_str!("fixtures/control_mvp_restore_plans/v6_last_before_format9.json"),
+        // Format 9, but the last plan shape written before restore key policies.
+        include_str!("fixtures/control_mvp_restore_plans/v7_last_before_restore_key_policy.json"),
     ] {
         let plan: PersistedRestoreParticipantPlan =
             serde_json::from_str(fixture).expect("decode superseded plan fixture");
@@ -1964,6 +1982,7 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
     object.remove("checkpoint_interval");
     object.remove("transaction_ref");
     object.remove("committed_at_ms");
+    object.remove("restore_key_policy_sha256");
     object.insert("version".to_string(), Value::from(1_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v1_pre_observed_writer_epoch.json"
@@ -2041,8 +2060,8 @@ async fn a_v1_plan_over_a_matching_source_is_superseded_and_never_applied() {
 /// R6: restore plan 7 pins the `committed_at_ms` stamp its candidate bytes
 /// carry, so a version-6 plan (the last shape written on authority format 7)
 /// can never reproduce format-9 candidate bytes. It is supersession-only: it
-/// reaches a defined terminal outcome and writes nothing, while the plan-7
-/// rendering of the same lineage still applies.
+/// reaches a defined terminal outcome and writes nothing, while the
+/// current-version rendering of the same lineage still applies.
 #[tokio::test]
 async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
     let (backend, storage) = storage();
@@ -2072,12 +2091,12 @@ async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
     );
 
     // Downgrade it to the checked-in version 6 shape: same fields minus the
-    // stamp plan 7 introduced.
+    // stamp plan 7 introduced and the key-policy binding plan 8 introduced.
     let mut wire = serde_json::to_value(&plan).expect("plan json");
     assert_eq!(
-        Value::from(7_u64),
+        Value::from(8_u64),
         wire["version"],
-        "the current restore plan version is 7"
+        "the current restore plan version is 8"
     );
     assert!(
         wire["committed_at_ms"].as_i64().is_some_and(|ms| ms > 0),
@@ -2085,6 +2104,7 @@ async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
     );
     let object = wire.as_object_mut().expect("plan object");
     object.remove("committed_at_ms");
+    object.remove("restore_key_policy_sha256");
     object.insert("version".to_string(), Value::from(6_u64));
     let fixture: Value = serde_json::from_str(include_str!(
         "fixtures/control_mvp_restore_plans/v6_last_before_format9.json"
@@ -2147,10 +2167,191 @@ async fn a_v6_plan_over_a_matching_source_is_superseded_and_never_applied() {
             .expect("current authority is untouched")
     );
 
-    // The version-7 plan, round-tripped through its durable JSON, still applies.
+    // The current-version plan, round-tripped through its durable JSON, still
+    // applies.
     let current: PersistedRestoreParticipantPlan =
         serde_json::from_str(&serde_json::to_string(&plan).expect("plan json"))
-            .expect("a v7 plan round-trips");
+            .expect("a current-version plan round-trips");
+    assert!(matches!(
+        adapter
+            .apply_restore(&current, Utc::now())
+            .await
+            .expect("apply current-version plan"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        store.get(b"catalog/default").await.expect("restored value")
+    );
+}
+
+/// R6: `v7_last_before_restore_key_policy.json` is the last plan shape written
+/// before restore key policies, captured from that revision. Plan 8 added the
+/// `restore_key_policy_sha256` binding; a v7 record never carried it and a v8
+/// record cannot omit it, so neither direction can be guessed at. Plan 7 keeps
+/// its own stamp policy: it still must carry `committed_at_ms`.
+#[test]
+fn literal_v7_restore_plan_fixture_is_supersession_only_and_pins_the_key_policy_binding() {
+    let v7 =
+        include_str!("fixtures/control_mvp_restore_plans/v7_last_before_restore_key_policy.json");
+    let v7_value: Value = serde_json::from_str(v7).expect("v7 fixture json");
+    assert_eq!(Value::from(7_u64), v7_value["version"]);
+    assert!(
+        v7_value["committed_at_ms"]
+            .as_i64()
+            .is_some_and(|ms| ms > 0)
+    );
+    assert!(v7_value.get("restore_key_policy_sha256").is_none());
+    let PersistedRestoreParticipantPlan::ControlMvp(last_unbound) =
+        serde_json::from_str(v7).expect("v7 fixture must decode")
+    else {
+        panic!("v7 fixture decoded as a different plan kind")
+    };
+    assert_eq!(7, last_unbound.version());
+    assert!(
+        last_unbound.is_legacy_version(),
+        "a v7 plan is supersession-only once plan 8 binds the key policy"
+    );
+    assert_eq!(None, last_unbound.restore_key_policy_sha256());
+    assert_eq!(3, last_unbound.result_logical_sequence());
+
+    let mut contradictory_v7 = v7_value.clone();
+    contradictory_v7["restore_key_policy_sha256"] =
+        Value::String(RestoreKeyPolicy::none().sha256());
+    let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(contradictory_v7)
+        .expect_err("a v7 record with restore_key_policy_sha256 must fail closed");
+    assert!(
+        error.to_string().contains("restore_key_policy_sha256"),
+        "unexpected error: {error}"
+    );
+    let mut unstamped_v7 = v7_value.clone();
+    unstamped_v7
+        .as_object_mut()
+        .expect("v7 object")
+        .remove("committed_at_ms");
+    let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(unstamped_v7)
+        .expect_err("a v7 record without committed_at_ms must still fail closed");
+    assert!(
+        error.to_string().contains("committed_at_ms"),
+        "unexpected error: {error}"
+    );
+    let mut unbound_v8 = v7_value;
+    unbound_v8["version"] = Value::from(8_u64);
+    let error = serde_json::from_value::<PersistedRestoreParticipantPlan>(unbound_v8)
+        .expect_err("a v8 record without restore_key_policy_sha256 must fail closed");
+    assert!(
+        error.to_string().contains("restore_key_policy_sha256"),
+        "unexpected error: {error}"
+    );
+}
+
+/// R6: restore plan 8 binds the restore key policy its candidate was rendered
+/// under, so a version-7 plan (the last shape written before key policies)
+/// cannot say which keys its candidate excluded. It is supersession-only: it
+/// reaches a defined terminal outcome and writes nothing, while the
+/// current-version rendering of the same lineage still applies.
+#[tokio::test]
+async fn a_v7_plan_over_a_matching_source_is_superseded_and_never_applied() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    let source = retained_v1_and_current_v2(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000017", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan restore");
+
+    // Positive control: at the current version this exact plan is Ready.
+    assert!(
+        matches!(
+            adapter
+                .inspect_restore(&plan)
+                .await
+                .expect("inspect current-version plan"),
+            RestoreParticipantInspection::Ready
+        ),
+        "the fixture harness must be able to reach Ready, or Superseded proves nothing"
+    );
+
+    // Downgrade it to the checked-in version 7 shape: same fields minus the
+    // key-policy binding plan 8 introduced.
+    let mut wire = serde_json::to_value(&plan).expect("plan json");
+    assert_eq!(Value::from(8_u64), wire["version"]);
+    let object = wire.as_object_mut().expect("plan object");
+    assert_eq!(
+        Some(Value::String(RestoreKeyPolicy::none().sha256())),
+        object.remove("restore_key_policy_sha256")
+    );
+    object.insert("version".to_string(), Value::from(7_u64));
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/control_mvp_restore_plans/v7_last_before_restore_key_policy.json"
+    ))
+    .expect("v7 fixture json");
+    let names = |value: &Value| {
+        let mut names = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        names(&fixture),
+        names(&wire),
+        "the downgrade must reproduce the checked-in v7 field set exactly"
+    );
+    let legacy: PersistedRestoreParticipantPlan =
+        serde_json::from_value(wire).expect("the downgraded plan must remain decodable");
+    let PersistedRestoreParticipantPlan::ControlMvp(decoded) = &legacy else {
+        panic!("downgraded v7 plan decoded as a different plan kind")
+    };
+    assert_eq!(7, decoded.version());
+    assert!(decoded.is_legacy_version());
+
+    let inventory_before = backend.list("").await.expect("inventory before").len();
+    assert!(
+        matches!(
+            adapter
+                .inspect_restore(&legacy)
+                .await
+                .expect("inspect v7 plan"),
+            RestoreParticipantInspection::Superseded
+        ),
+        "a v7 plan must reach a defined terminal outcome, not an error"
+    );
+    assert!(
+        matches!(
+            adapter
+                .apply_restore(&legacy, Utc::now())
+                .await
+                .expect("apply v7 plan"),
+            RestoreParticipantInspection::Superseded
+        ),
+        "a v7 plan must never be applied"
+    );
+    assert_eq!(
+        inventory_before,
+        backend.list("").await.expect("inventory after").len(),
+        "a v7 plan must not write anything"
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("current authority is untouched")
+    );
+
+    let current: PersistedRestoreParticipantPlan =
+        serde_json::from_str(&serde_json::to_string(&plan).expect("plan json"))
+            .expect("a current-version plan round-trips");
     assert!(matches!(
         adapter
             .apply_restore(&current, Utc::now())
@@ -2561,6 +2762,15 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
     }
 
     let mut value = serde_json::to_value(&plan).expect("plan json");
+    value["restore_key_policy_sha256"] = Value::String("not-a-policy-digest".to_string());
+    let malformed_policy: PersistedRestoreParticipantPlan =
+        serde_json::from_value(value).expect("plan shape");
+    assert!(
+        adapter.inspect_restore(&malformed_policy).await.is_err(),
+        "a malformed key-policy digest fails validation rather than superseding"
+    );
+
+    let mut value = serde_json::to_value(&plan).expect("plan json");
     value["source"]["manifest_sha256"] = Value::String(format!("sha256:{}", "f".repeat(64)));
     let corrupt_source: PersistedRestoreParticipantPlan =
         serde_json::from_value(value).expect("plan shape");
@@ -2600,6 +2810,10 @@ async fn restore_plan_rejects_corrupt_deterministic_identity_fields() {
         .as_object_mut()
         .expect("plan object")
         .remove("committed_at_ms");
+    value
+        .as_object_mut()
+        .expect("plan object")
+        .remove("restore_key_policy_sha256");
     let legacy: PersistedRestoreParticipantPlan =
         serde_json::from_value(value).expect("legacy plan remains decodable");
     assert_eq!(
@@ -3210,6 +3424,464 @@ async fn restore_empty_current_base_extends_source_lineage_and_retries_idempoten
             .expect("idempotent retry"),
         RestoreParticipantInspection::Visible { .. }
     ));
+}
+
+/// The restore notice recogniser ignores records that do not claim to be
+/// notices and authenticates a real notice against the restore commit at its
+/// result sequence. Here the restore is the sixteenth L0 commit, so a layout
+/// maintenance rewrite and then a retention horizon publish two more
+/// manifests at that same sequence (the head the notice is read at), and the
+/// recogniser still resolves the restore's own manifest, whose state still
+/// holds the row the horizon purged. Once the restore transaction object is
+/// gone, the notice is an ambiguous (retryable) outcome, not a refutation.
+#[tokio::test]
+async fn restore_notice_recogniser_resolves_the_restore_commit_past_rewrites_at_its_sequence() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let now = Utc::now();
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v1");
+    first
+        .put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("put v1");
+    first
+        .put_with_expiry(
+            b"catalog/expiring",
+            Bytes::from_static(b"expired"),
+            now.timestamp_millis() - 2 * 60 * 60 * 1000,
+        )
+        .await
+        .expect("put an expired row");
+    first.commit().await.expect("commit v1");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint v1");
+    let source = store
+        .persist_checkpoint_reference(&checkpoint, now + ChronoDuration::hours(1))
+        .await
+        .expect("persist checkpoint");
+    let plain_record =
+        commit_raw_outbox_record(&store, "op-not-a-notice", TxnOptions::default(), |_| {
+            b"{}".to_vec()
+        })
+        .await;
+    for sequence in 3..=15_u64 {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("begin filler");
+        txn.put(b"catalog/default", Bytes::from(format!("v{sequence}")))
+            .await
+            .expect("put filler");
+        txn.commit().await.expect("commit filler");
+    }
+
+    let participant = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = participant
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000201", 1, "catalog")
+                .expect("identity"),
+            now,
+        )
+        .await
+        .expect("plan");
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected a ControlMvp plan")
+    };
+    let RestoreParticipantInspection::Visible { token, .. } =
+        participant.apply_restore(&plan, now).await.expect("apply")
+    else {
+        panic!("the restore must become visible")
+    };
+    let manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(control.candidate_manifest_path())
+            .await
+            .expect("restore manifest"),
+    )
+    .expect("restore manifest JSON");
+    let committed_at_ms = manifest["payload"]["committed_at_ms"]
+        .as_i64()
+        .expect("committed_at_ms");
+
+    assert_eq!(16, token.logical_sequence());
+
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([41; 32]),
+    )
+    .expect("maintenance worker");
+    let consolidated = durable_maintenance::consolidate_pending(&worker)
+        .await
+        .expect("consolidate the restore's suffix")
+        .expect("sixteen L0 segments admit layout maintenance");
+    assert_eq!(&token, consolidated.source_token());
+    let horizon = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .expect("drive the horizon")
+        .expect("the expired row admits a horizon");
+    assert_eq!(consolidated.selected_token(), horizon.source_token());
+    let head = store.current_state_token().await.expect("horizon head");
+    assert_eq!(horizon.selected_token(), &head);
+    assert_eq!(token.logical_sequence(), head.logical_sequence());
+    for rewrite in [consolidated.selected_token(), &head] {
+        assert_ne!(
+            token.authority_manifest_id(),
+            rewrite.authority_manifest_id()
+        );
+    }
+    assert_eq!(
+        None,
+        store
+            .get(b"catalog/expiring")
+            .await
+            .expect("purged at the head")
+    );
+
+    let notice_id = "restore:rst_00000000000000000000000201:1:catalog";
+    let notice = store
+        .current_projection_outbox()
+        .await
+        .expect("outbox at the horizon head")
+        .into_iter()
+        .find(|record| record.record_id() == notice_id)
+        .expect("the restore notice");
+    assert!(
+        store
+            .resolve_restore_notice_source(&plain_record)
+            .await
+            .expect("a plain record is not a notice")
+            .is_none()
+    );
+    assert!(
+        store
+            .resolve_restore_notice_source(&ControlMvpProjectionOutboxRecord::new(
+                "op-staged",
+                Bytes::from_static(b"{}"),
+            ))
+            .await
+            .expect("an uncommitted plain record is not a notice")
+            .is_none()
+    );
+    let resolved = store
+        .resolve_restore_notice_source(&notice)
+        .await
+        .expect("an authentic notice")
+        .expect("a restore notice");
+    let view = resolved.notice();
+    assert_eq!("rst_00000000000000000000000201", view.restore_id());
+    assert_eq!(1, view.participant_attempt());
+    assert_eq!("catalog", view.domain());
+    assert_eq!(source.logical_sequence(), view.source_logical_sequence());
+    assert_eq!(token.logical_sequence(), view.result_logical_sequence());
+    assert_eq!(&token, resolved.token());
+    assert_eq!(
+        control.candidate_manifest_id(),
+        resolved.result_manifest_id()
+    );
+    assert_eq!(committed_at_ms, resolved.committed_at_ms());
+    let restored = store
+        .read_at(resolved.token().clone())
+        .await
+        .expect("read the restored state");
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        restored
+            .get(b"catalog/default")
+            .await
+            .expect("restored row")
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"expired")),
+        restored
+            .get(b"catalog/expiring")
+            .await
+            .expect("the restore commit still holds the purged row")
+    );
+
+    storage
+        .delete(&store.paths().tx_object(control.transaction_id()))
+        .await
+        .expect("remove the restore transaction object");
+    let unavailable = store
+        .resolve_restore_notice_source(&notice)
+        .await
+        .expect_err("the restore transaction is unreadable");
+    assert!(
+        matches!(
+            &unavailable,
+            CatalogError::AmbiguousAuthorityOutcome { message }
+                if message.contains(notice_id)
+                    && message.contains("restore transaction is unavailable")
+        ),
+        "a missing restore transaction is retryable, got {unavailable:?}"
+    );
+}
+
+/// A checkpoint taken while HEAD is a retention horizon manifest carries the
+/// head's horizon certificate in its record and is a valid restore source:
+/// the restore lands the checkpoint's (already purged) cut over later
+/// commits.
+#[tokio::test]
+async fn restore_from_a_checkpoint_taken_at_a_horizon_head_succeeds() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let expires_at_ms = (Utc::now() - ChronoDuration::hours(2)).timestamp_millis();
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v1");
+    first
+        .put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("put v1");
+    first
+        .put_with_expiry(
+            b"catalog/expiring",
+            Bytes::from_static(b"expired"),
+            expires_at_ms,
+        )
+        .await
+        .expect("put an expired row");
+    first.commit().await.expect("commit v1");
+    // Taken after the commit, so the horizon never runs before HEAD's stamp.
+    let now = Utc::now();
+    let worker = arco_catalog::DurableMaintenanceWorker::new(
+        storage.clone(),
+        scope(),
+        arco_catalog::DurableAuthorityBinding::new([43; 32]),
+    )
+    .expect("maintenance worker");
+    let horizon = durable_maintenance::horizon_pending(&worker, now)
+        .await
+        .expect("drive the horizon")
+        .expect("the expired row admits a horizon");
+    let head = store.current_state_token().await.expect("horizon head");
+    assert_eq!(horizon.selected_token(), &head);
+    let manifest: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&store.paths().manifest_object(head.authority_manifest_id()))
+            .await
+            .expect("horizon manifest"),
+    )
+    .expect("horizon manifest JSON");
+    let certificate = &manifest["payload"]["retention_horizon"];
+    assert!(certificate.is_object(), "HEAD is a horizon manifest");
+
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint at the horizon head");
+    let record: Value = serde_json::from_slice(
+        &storage
+            .get_raw(&store.paths().checkpoint_object(checkpoint.checkpoint_id()))
+            .await
+            .expect("checkpoint record"),
+    )
+    .expect("checkpoint record JSON");
+    assert_eq!(
+        certificate, &record["payload"]["retention_horizon"],
+        "the checkpoint carries the head's certificate"
+    );
+    let source = store
+        .persist_checkpoint_reference(&checkpoint, now + ChronoDuration::hours(1))
+        .await
+        .expect("persist the horizon checkpoint");
+    assert_eq!(head.logical_sequence(), source.logical_sequence());
+    assert_eq!(head.authority_manifest_id(), source.manifest_id());
+
+    let mut later = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin v2");
+    later
+        .put(b"catalog/default", Bytes::from_static(b"v2"))
+        .await
+        .expect("put v2");
+    later
+        .put(b"catalog/later", Bytes::from_static(b"later"))
+        .await
+        .expect("put a later row");
+    let later = later.commit().await.expect("commit v2");
+
+    let participant = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = participant
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000301", 1, "catalog")
+                .expect("identity"),
+            now,
+        )
+        .await
+        .expect("plan a restore from the horizon checkpoint");
+    let RestoreParticipantInspection::Visible { token, .. } = participant
+        .apply_restore(&plan, now)
+        .await
+        .expect("apply the restore")
+    else {
+        panic!("the restore must become visible")
+    };
+    assert_eq!(
+        later.state_token().logical_sequence() + 1,
+        token.logical_sequence()
+    );
+    let restored = store.read_at(token).await.expect("read the restored state");
+    assert_eq!(
+        Some(Bytes::from_static(b"v1")),
+        restored
+            .get(b"catalog/default")
+            .await
+            .expect("restored row")
+    );
+    assert_eq!(
+        None,
+        restored
+            .get(b"catalog/later")
+            .await
+            .expect("a row committed after the checkpoint")
+    );
+    assert_eq!(
+        None,
+        restored
+            .get(b"catalog/expiring")
+            .await
+            .expect("the row the horizon purged")
+    );
+}
+
+/// Asserts that resolving `record` is refused with the given error class and
+/// a message naming `reason`.
+async fn assert_notice_refused(
+    store: &ControlMvpStateStore,
+    record: &ControlMvpProjectionOutboxRecord,
+    invariant: bool,
+    reason: &str,
+) {
+    let error = store
+        .resolve_restore_notice_source(record)
+        .await
+        .expect_err("a forged notice is refused");
+    let (class, message) = match &error {
+        CatalogError::Validation { message } => (Some(false), message.as_str()),
+        CatalogError::InvariantViolation { message } => (Some(true), message.as_str()),
+        _ => (None, ""),
+    };
+    assert_eq!(
+        Some(invariant),
+        class,
+        "{}: unexpected error class {error:?}",
+        record.record_id()
+    );
+    assert!(
+        message.contains(reason),
+        "{}: expected a refusal naming {reason:?}, got {message:?}",
+        record.record_id()
+    );
+}
+
+/// A record whose id claims to be a restore notice but is not the notice of
+/// a committed restore of this domain is refused: a validation error when
+/// the record itself is malformed, an invariant violation when it is
+/// well-formed but the authenticated lineage holds no restore that carries
+/// it (here a plain transaction committed it, even with the notice id as its
+/// request id).
+#[tokio::test]
+async fn forged_restore_notices_are_refused_with_typed_errors() {
+    let (_backend, storage) = storage();
+    let store = store(storage);
+    let mut seed = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin seed");
+    seed.put(b"catalog/default", Bytes::from_static(b"v1"))
+        .await
+        .expect("seed row");
+    seed.commit().await.expect("commit seed");
+
+    let id = |ordinal: u32, domain: &str| format!("restore:rst_{ordinal:026}:1:{domain}");
+    let rid = |ordinal: u32| format!("rst_{ordinal:026}");
+    let cases: Vec<(String, ForgedPayload, bool, &str)> = vec![
+        (
+            id(301, "catalog"),
+            Box::new(|_| b"{\"restore_id\":".to_vec()),
+            false,
+            "does not decode",
+        ),
+        (
+            id(302, "catalog"),
+            Box::new(move |origin| {
+                let mut notice: Value =
+                    serde_json::from_slice(&forged_notice(&rid(302), "catalog", 1, origin))
+                        .expect("notice JSON");
+                notice["unexpected"] = Value::from(1);
+                serde_json::to_vec(&notice).expect("encode")
+            }),
+            false,
+            "does not decode",
+        ),
+        (
+            id(303, "catalog"),
+            Box::new(move |origin| {
+                let notice: Value =
+                    serde_json::from_slice(&forged_notice(&rid(303), "catalog", 1, origin))
+                        .expect("notice JSON");
+                serde_json::to_vec_pretty(&notice).expect("encode")
+            }),
+            false,
+            "not canonical",
+        ),
+        (
+            id(304, "catalog"),
+            Box::new(move |origin| forged_notice(&rid(399), "catalog", 1, origin)),
+            false,
+            "does not match its payload",
+        ),
+        (
+            "restore:x:1:catalog".to_string(),
+            Box::new(|origin| forged_notice("x", "catalog", 1, origin)),
+            false,
+            "restore identity",
+        ),
+        (
+            id(306, "orchestration"),
+            Box::new(move |origin| forged_notice(&rid(306), "orchestration", 1, origin)),
+            false,
+            "another domain",
+        ),
+        (
+            id(307, "catalog"),
+            Box::new(move |origin| forged_notice(&rid(307), "catalog", 1, origin + 1)),
+            false,
+            "result sequence",
+        ),
+    ];
+    for (record_id, payload, invariant, reason) in cases {
+        let record =
+            commit_raw_outbox_record(&store, &record_id, TxnOptions::default(), payload).await;
+        assert_notice_refused(&store, &record, invariant, reason).await;
+    }
+
+    let consistent = id(308, "catalog");
+    let record = commit_raw_outbox_record(
+        &store,
+        &consistent,
+        TxnOptions::new(Some(scope())).with_request_id(consistent.clone()),
+        |origin| forged_notice(&rid(308), "catalog", 1, origin),
+    )
+    .await;
+    assert_notice_refused(&store, &record, true, "not committed by a restore").await;
+
+    let staged = ControlMvpProjectionOutboxRecord::new(
+        id(309, "catalog"),
+        Bytes::from(forged_notice(&rid(309), "catalog", 1, 2)),
+    );
+    assert_notice_refused(&store, &staged, false, "result sequence").await;
 }
 
 #[tokio::test]
@@ -5888,15 +6560,29 @@ async fn gate4_cancelled_multi_trim_stages_nothing() {
 // Per-row expiry hint (segment format 2)
 // ---------------------------------------------------------------------------
 
-/// Decodes `(record_kind, key, expires_at_ms)` for every row of a segment by
-/// walking its authenticated index directory block by block.
-async fn segment_row_expiries(
+/// Record kind of a KV row in a segment (`record_kind` column).
+const SEGMENT_RECORD_KV: u8 = 0;
+
+/// One decoded segment row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentRow {
+    kind: u8,
+    key: Vec<u8>,
+    /// `None` for a tombstone.
+    value: Option<Vec<u8>>,
+    generation: u64,
+    expires_at_ms: Option<i64>,
+}
+
+/// Decodes every row of a format-2 segment by walking its authenticated index
+/// directory block by block.
+async fn segment_rows(
     storage: &ScopedStorage,
     paths: &ControlMvpPaths,
     segment_id: &str,
     segment_path: &str,
-) -> Vec<(u8, Vec<u8>, Option<i64>)> {
-    use arrow::array::{Array, BinaryArray, Int64Array, UInt8Array};
+) -> Vec<SegmentRow> {
+    use arrow::array::{Array, BinaryArray, BooleanArray, Int64Array, UInt8Array, UInt64Array};
     use arrow::ipc::reader::FileReader;
     let index: Value = serde_json::from_slice(
         &storage
@@ -5927,40 +6613,44 @@ async fn segment_row_expiries(
         assert_eq!(9, reader.schema().fields().len(), "format-2 column count");
         for batch in reader {
             let batch = batch.expect("decode block batch");
-            let kinds = batch
-                .column(0)
-                .as_any()
+            let column = |index: usize| batch.column(index).as_any();
+            let kinds = column(0)
                 .downcast_ref::<UInt8Array>()
                 .expect("record_kind column");
-            let keys = batch
-                .column(1)
-                .as_any()
+            let keys = column(1).downcast_ref::<BinaryArray>().expect("key column");
+            let values = column(2)
                 .downcast_ref::<BinaryArray>()
-                .expect("key column");
-            let expiries = batch
-                .column(8)
-                .as_any()
+                .expect("value column");
+            let generations = column(3)
+                .downcast_ref::<UInt64Array>()
+                .expect("generation column");
+            let tombstones = column(4)
+                .downcast_ref::<BooleanArray>()
+                .expect("tombstone column");
+            let expiries = column(8)
                 .downcast_ref::<Int64Array>()
                 .expect("expires_at_ms column");
             for row in 0..batch.num_rows() {
-                rows.push((
-                    kinds.value(row),
-                    keys.value(row).to_vec(),
-                    (!expiries.is_null(row)).then(|| expiries.value(row)),
-                ));
+                rows.push(SegmentRow {
+                    kind: kinds.value(row),
+                    key: keys.value(row).to_vec(),
+                    value: (!tombstones.value(row)).then(|| values.value(row).to_vec()),
+                    generation: generations.value(row),
+                    expires_at_ms: (!expiries.is_null(row)).then(|| expiries.value(row)),
+                });
             }
         }
     }
     rows
 }
 
-fn kv_expiry(rows: &[(u8, Vec<u8>, Option<i64>)], key: &[u8]) -> Option<i64> {
+fn kv_expiry(rows: &[SegmentRow], key: &[u8]) -> Option<i64> {
     let matches = rows
         .iter()
-        .filter(|(kind, row_key, _)| *kind == 0 && row_key == key)
+        .filter(|row| row.kind == SEGMENT_RECORD_KV && row.key == key)
         .collect::<Vec<_>>();
     assert_eq!(1, matches.len(), "exactly one KV row for {key:?}");
-    matches[0].2
+    matches[0].expires_at_ms
 }
 
 async fn manifest_payload(storage: &ScopedStorage, paths: &ControlMvpPaths, id: &str) -> Value {
@@ -6043,7 +6733,7 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
     );
 
     // The L0 segment carries the hint on the expiring row and null elsewhere.
-    let l0 = segment_row_expiries(
+    let l0 = segment_rows(
         &storage,
         &paths,
         &first_tx_id,
@@ -6101,9 +6791,8 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
     let mut l1_rows = Vec::new();
     for state in base_states {
         let state_id = state["state_id"].as_str().expect("state id");
-        l1_rows.extend(
-            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
-        );
+        l1_rows
+            .extend(segment_rows(&storage, &paths, state_id, &paths.state_object(state_id)).await);
     }
     assert_eq!(
         Some(EXPIRES_AT_MS),
@@ -6148,9 +6837,8 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
         .expect("checkpoint states")
     {
         let state_id = state["state_id"].as_str().expect("state id");
-        checkpoint_rows.extend(
-            segment_row_expiries(&storage, &paths, state_id, &paths.state_object(state_id)).await,
-        );
+        checkpoint_rows
+            .extend(segment_rows(&storage, &paths, state_id, &paths.state_object(state_id)).await);
     }
     assert_eq!(
         Some(EXPIRES_AT_MS),
@@ -6208,7 +6896,7 @@ async fn put_with_expiry_survives_replay_consolidation_checkpoint_and_restore_wi
         .expect("restore transaction reference")
         .to_string();
     assert!(restore_tx_id.starts_with("tx-restore-"));
-    let restore_rows = segment_row_expiries(
+    let restore_rows = segment_rows(
         &storage,
         &paths,
         &restore_tx_id,
@@ -6254,8 +6942,7 @@ async fn expiry_changes_the_state_checksum_and_mutation_digest_but_plain_puts_ar
                 .expect("read transaction"),
         )
         .expect("decode transaction");
-        let rows =
-            segment_row_expiries(&storage, &paths, &tx_id, &paths.l0_segment_object(&tx_id)).await;
+        let rows = segment_rows(&storage, &paths, &tx_id, &paths.l0_segment_object(&tx_id)).await;
         assert_eq!(
             with_expiry.then_some(EXPIRES_AT_MS),
             kv_expiry(&rows, b"catalog/row")
@@ -6319,4 +7006,465 @@ async fn put_with_expiry_rejects_non_positive_hints_before_staging() {
     );
     txn.commit().await.expect("empty commit");
     assert_eq!(None, store.get(b"catalog/row").await.expect("get"));
+}
+
+// ---------------------------------------------------------------------------
+// Restore key policy (restore plan 8)
+// ---------------------------------------------------------------------------
+
+/// A restore key policy excluding the one-byte prefix `0x03`, the shape of the
+/// catalog's idempotency-receipt prefix.
+fn receipt_policy() -> RestoreKeyPolicy {
+    RestoreKeyPolicy::excluding([[0x03_u8]]).expect("receipt key policy")
+}
+
+/// One restore transaction write: key, value (`None` for a delete) and expiry.
+type RestoreWrite = (Vec<u8>, Option<Vec<u8>>, Option<i64>);
+
+fn put(key: &[u8], value: &[u8], expires_at_ms: Option<i64>) -> RestoreWrite {
+    (key.to_vec(), Some(value.to_vec()), expires_at_ms)
+}
+
+fn delete(key: &[u8]) -> RestoreWrite {
+    (key.to_vec(), None, None)
+}
+
+/// Decodes every KV row of an applied restore plan's L0 segment as
+/// `(key, value, expires_at_ms)`, with `None` for a tombstone. These rows are
+/// the restore transaction's writes: transaction JSON never embeds state
+/// data.
+async fn applied_restore_writes(
+    storage: &ScopedStorage,
+    paths: &ControlMvpPaths,
+    plan: &PersistedRestoreParticipantPlan,
+) -> Vec<RestoreWrite> {
+    let wire = serde_json::to_value(plan).expect("restore plan wire");
+    let segment_id = wire["transaction_id"]
+        .as_str()
+        .expect("restore transaction id");
+    let result_sequence = wire["result_logical_sequence"]
+        .as_u64()
+        .expect("restore result sequence");
+    segment_rows(
+        storage,
+        paths,
+        segment_id,
+        &paths.l0_segment_object(segment_id),
+    )
+    .await
+    .into_iter()
+    .filter(|row| row.kind == SEGMENT_RECORD_KV)
+    .map(|row| {
+        assert_eq!(
+            result_sequence, row.generation,
+            "every restore write lands at the restore sequence"
+        );
+        (row.key, row.value, row.expires_at_ms)
+    })
+    .collect()
+}
+
+/// Seeds a checkpoint (sequence 1) and a diverged head (sequence 2) that
+/// exercise every receipt-like (`0x03`) and plain restore case:
+///
+/// | key                  | source (checkpoint)  | current head         |
+/// |----------------------|----------------------|----------------------|
+/// | `03 both`            | `receipt`, hint      | unchanged            |
+/// | `03 current-only`    | absent               | `receipt`, hint      |
+/// | `03 differs`         | `old`, hint          | `new`, hint          |
+/// | `03 source-only`     | `receipt`, hint      | deleted              |
+/// | `02 ff` (below 03)   | `below`              | unchanged            |
+/// | `04 audit` (tag 4)   | `residual`           | unchanged            |
+/// | `catalog/default`    | `v1`                 | `v2`                 |
+/// | `catalog/newer-only` | absent               | `new`                |
+/// | `catalog/removed-later` | `kept`            | deleted              |
+/// | `catalog/same`       | `same`               | unchanged            |
+async fn receipt_like_source_and_diverged_head(
+    store: &ControlMvpStateStore,
+) -> PersistedAuthorityReference {
+    let mut first = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin source");
+    for (key, value) in [
+        (b"catalog/default".as_slice(), b"v1".as_slice()),
+        (b"catalog/removed-later", b"kept"),
+        (b"catalog/same", b"same"),
+        (b"\x02\xff", b"below"),
+        (b"\x04audit", b"residual"),
+    ] {
+        first
+            .put(key, Bytes::copy_from_slice(value))
+            .await
+            .expect("put plain source row");
+    }
+    for (key, value) in [
+        (b"\x03both".as_slice(), b"receipt".as_slice()),
+        (b"\x03source-only", b"receipt"),
+        (b"\x03differs", b"old"),
+    ] {
+        first
+            .put_with_expiry(key, Bytes::copy_from_slice(value), EXPIRES_AT_MS)
+            .await
+            .expect("put receipt-like source row");
+    }
+    first.commit().await.expect("commit source");
+    let checkpoint = store
+        .checkpoint(CheckpointOptions::new(Some(scope())))
+        .await
+        .expect("checkpoint source");
+    let reference = store
+        .persist_checkpoint_reference(&checkpoint, Utc::now() + ChronoDuration::hours(1))
+        .await
+        .expect("persist checkpoint");
+
+    let mut second = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin head");
+    second
+        .put(b"catalog/default", Bytes::from_static(b"v2"))
+        .await
+        .expect("put v2");
+    second
+        .delete(b"catalog/removed-later")
+        .await
+        .expect("delete retained key");
+    second
+        .put(b"catalog/newer-only", Bytes::from_static(b"new"))
+        .await
+        .expect("put newer key");
+    second
+        .delete(b"\x03source-only")
+        .await
+        .expect("delete source-only receipt");
+    second
+        .put_with_expiry(
+            b"\x03current-only",
+            Bytes::from_static(b"receipt"),
+            EXPIRES_AT_MS,
+        )
+        .await
+        .expect("put current-only receipt");
+    second
+        .put_with_expiry(b"\x03differs", Bytes::from_static(b"new"), EXPIRES_AT_MS)
+        .await
+        .expect("put differing receipt");
+    second.commit().await.expect("commit head");
+    reference
+}
+
+async fn receipt_like_rows(store: &ControlMvpStateStore) -> Vec<Vec<u8>> {
+    store
+        .scan(ScanRequest::new(b"\x03"))
+        .await
+        .expect("receipt-like scan")
+        .entries()
+        .iter()
+        .map(|entry| entry.key().to_vec())
+        .collect()
+}
+
+async fn assert_plain_rows_follow_the_restore_rules(store: &ControlMvpStateStore) {
+    for (key, expected) in [
+        (b"catalog/default".as_slice(), Some(b"v1".as_slice())),
+        (b"catalog/removed-later", Some(b"kept")),
+        (b"catalog/newer-only", None),
+        (b"catalog/same", Some(b"same")),
+        (b"\x02\xff", Some(b"below")),
+        (b"\x04audit", Some(b"residual")),
+    ] {
+        assert_eq!(
+            expected.map(Bytes::copy_from_slice),
+            store.get(key).await.expect("restored read"),
+            "non-excluded key {key:?} follows the plain restore rules"
+        );
+    }
+}
+
+/// A restore under a policy excluding `0x03` never restores and never keeps
+/// a receipt-like row: identical rows are deleted, current-only rows are
+/// deleted, differing rows are deleted rather than rolled back, and
+/// source-only rows stay absent. Every other key follows the plain rules,
+/// including the neighbours `02 ff` and `04 audit`.
+#[tokio::test]
+async fn restore_key_policy_deletes_excluded_keys_and_never_restores_them() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let source = receipt_like_source_and_diverged_head(&store).await;
+    let policy = receipt_policy();
+    let adapter = ControlMvpRestoreParticipant::new(store.clone()).with_key_policy(policy.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000081", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan restore under the receipt policy");
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &plan else {
+        panic!("expected a ControlMvp restore plan")
+    };
+    assert_eq!(8, control.version());
+    assert_eq!(
+        Some(policy.sha256().as_str()),
+        control.restore_key_policy_sha256()
+    );
+    assert!(matches!(
+        adapter.inspect_restore(&plan).await.expect("inspect"),
+        RestoreParticipantInspection::Ready
+    ));
+    let RestoreParticipantInspection::Visible { token, .. } = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect("apply")
+    else {
+        panic!("restore must become visible");
+    };
+    assert_eq!(3, token.logical_sequence());
+
+    assert_eq!(
+        vec![
+            delete(b"\x03both"),
+            delete(b"\x03current-only"),
+            delete(b"\x03differs"),
+            put(b"catalog/default", b"v1", None),
+            delete(b"catalog/newer-only"),
+            put(b"catalog/removed-later", b"kept", None),
+        ],
+        applied_restore_writes(&storage, &store.paths(), &plan).await
+    );
+    assert!(
+        receipt_like_rows(&store).await.is_empty(),
+        "no receipt-like row survives or is resurrected by the restore"
+    );
+    assert_plain_rows_follow_the_restore_rules(&store).await;
+    assert!(matches!(
+        adapter.inspect_restore(&plan).await.expect("reinspect"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+}
+
+/// Without a key policy a plan-8 restore keeps the plain diff rules for every
+/// key, receipt-like rows included: an identical row is kept, a source-only
+/// row is restored with its hint, and a differing row is rolled back.
+#[tokio::test]
+async fn restore_without_a_key_policy_keeps_the_plain_rules_for_every_key() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let source = receipt_like_source_and_diverged_head(&store).await;
+    let adapter = ControlMvpRestoreParticipant::new(store.clone());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000082", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan restore without a policy");
+    assert!(matches!(
+        adapter
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("apply"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    assert_eq!(
+        vec![
+            delete(b"\x03current-only"),
+            put(b"\x03differs", b"old", Some(EXPIRES_AT_MS)),
+            put(b"\x03source-only", b"receipt", Some(EXPIRES_AT_MS)),
+            put(b"catalog/default", b"v1", None),
+            delete(b"catalog/newer-only"),
+            put(b"catalog/removed-later", b"kept", None),
+        ],
+        applied_restore_writes(&storage, &store.paths(), &plan).await
+    );
+    assert_eq!(
+        vec![
+            b"\x03both".to_vec(),
+            b"\x03differs".to_vec(),
+            b"\x03source-only".to_vec(),
+        ],
+        receipt_like_rows(&store).await
+    );
+    assert_plain_rows_follow_the_restore_rules(&store).await;
+}
+
+/// Empty-base trap: with no head pointer the writes are diffed against an
+/// empty current state but land over the source lineage, so a filter on the
+/// source scan alone would leave the lineage's receipt-like rows in place.
+/// The policy tombstones every excluded key live in the candidate parent.
+#[tokio::test]
+async fn restore_key_policy_tombstones_excluded_keys_of_an_empty_base_source_lineage() {
+    let (_backend, storage) = storage();
+    let store = store(storage.clone());
+    let source = receipt_like_source_and_diverged_head(&store).await;
+    storage
+        .delete(&store.paths().current_pointer())
+        .await
+        .expect("remove current pointer while retaining source lineage");
+    let adapter =
+        ControlMvpRestoreParticipant::new(store.clone()).with_key_policy(receipt_policy());
+    let plan = adapter
+        .plan_restore(
+            &source,
+            &RestoreAttemptIdentity::new("rst_00000000000000000000000083", 1, "catalog")
+                .expect("identity"),
+            Utc::now(),
+        )
+        .await
+        .expect("plan from an empty current base");
+    assert_eq!(
+        "empty",
+        serde_json::to_value(&plan).expect("plan wire")["current_base_kind"]
+    );
+    assert!(matches!(
+        adapter.inspect_restore(&plan).await.expect("ready inspect"),
+        RestoreParticipantInspection::Ready
+    ));
+    let RestoreParticipantInspection::Visible { token, .. } = adapter
+        .apply_restore(&plan, Utc::now())
+        .await
+        .expect("empty-base apply")
+    else {
+        panic!("empty-base restore must become visible");
+    };
+    assert_eq!(source.logical_sequence() + 1, token.logical_sequence());
+    assert_eq!(
+        vec![
+            put(b"\x02\xff", b"below", None),
+            delete(b"\x03both"),
+            delete(b"\x03differs"),
+            delete(b"\x03source-only"),
+            put(b"\x04audit", b"residual", None),
+            put(b"catalog/default", b"v1", None),
+            put(b"catalog/removed-later", b"kept", None),
+            put(b"catalog/same", b"same", None),
+        ],
+        applied_restore_writes(&storage, &store.paths(), &plan).await
+    );
+    assert!(
+        receipt_like_rows(&store).await.is_empty(),
+        "the source lineage's receipt-like rows are tombstoned in the candidate"
+    );
+    assert_plain_rows_follow_the_restore_rules(&store).await;
+    assert!(matches!(
+        adapter
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("idempotent retry"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+}
+
+/// A plan binds the key policy it was rendered under. A participant with a
+/// different policy reports it Superseded (so the driver replans it) and never
+/// fails it as a byte mismatch or writes anything; a landed restore stays
+/// Visible whatever policy inspects it.
+#[tokio::test]
+async fn a_restore_plan_binds_its_key_policy_and_a_different_policy_supersedes_it() {
+    let (backend, storage) = storage();
+    let store = store(storage);
+    let source = receipt_like_source_and_diverged_head(&store).await;
+    let policy = receipt_policy();
+    let wider = RestoreKeyPolicy::excluding([[0x03_u8], [0x09]]).expect("wider policy");
+    assert_ne!(policy.sha256(), RestoreKeyPolicy::none().sha256());
+    assert_ne!(policy.sha256(), wider.sha256());
+    let planner = ControlMvpRestoreParticipant::new(store.clone()).with_key_policy(policy.clone());
+    let unbound = ControlMvpRestoreParticipant::new(store.clone());
+    let other = ControlMvpRestoreParticipant::new(store.clone()).with_key_policy(wider);
+    let identity = RestoreAttemptIdentity::new("rst_00000000000000000000000084", 1, "catalog")
+        .expect("identity");
+    let plan = planner
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan under the receipt policy");
+    let policy_less_plan = unbound
+        .plan_restore(&source, &identity, Utc::now())
+        .await
+        .expect("plan without a policy");
+    let PersistedRestoreParticipantPlan::ControlMvp(control) = &policy_less_plan else {
+        panic!("expected a ControlMvp restore plan")
+    };
+    assert_eq!(
+        Some(RestoreKeyPolicy::none().sha256().as_str()),
+        control.restore_key_policy_sha256()
+    );
+
+    // Positive controls: each plan is Ready under the policy it was built with.
+    assert!(matches!(
+        planner.inspect_restore(&plan).await.expect("inspect"),
+        RestoreParticipantInspection::Ready
+    ));
+    assert!(matches!(
+        unbound
+            .inspect_restore(&policy_less_plan)
+            .await
+            .expect("inspect policy-less plan"),
+        RestoreParticipantInspection::Ready
+    ));
+
+    let inventory_before = backend.list("").await.expect("inventory before").len();
+    for (label, participant, candidate) in [
+        ("policy-less participant", &unbound, &plan),
+        ("wider policy", &other, &plan),
+        (
+            "receipt policy over a policy-less plan",
+            &planner,
+            &policy_less_plan,
+        ),
+    ] {
+        assert!(
+            matches!(
+                participant
+                    .inspect_restore(candidate)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: inspect failed: {error:?}")),
+                RestoreParticipantInspection::Superseded
+            ),
+            "{label}: a plan bound to another key policy is superseded"
+        );
+        assert!(
+            matches!(
+                participant
+                    .apply_restore(candidate, Utc::now())
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: apply failed: {error:?}")),
+                RestoreParticipantInspection::Superseded
+            ),
+            "{label}: a plan bound to another key policy is never applied"
+        );
+    }
+    assert_eq!(
+        inventory_before,
+        backend.list("").await.expect("inventory after").len(),
+        "a policy mismatch writes nothing"
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"v2")),
+        store
+            .get(b"catalog/default")
+            .await
+            .expect("current authority is untouched")
+    );
+
+    assert!(matches!(
+        planner
+            .apply_restore(&plan, Utc::now())
+            .await
+            .expect("apply under the bound policy"),
+        RestoreParticipantInspection::Visible { .. }
+    ));
+    for participant in [&planner, &unbound, &other] {
+        assert!(matches!(
+            participant
+                .inspect_restore(&plan)
+                .await
+                .expect("inspect a landed restore"),
+            RestoreParticipantInspection::Visible { .. }
+        ));
+    }
 }

@@ -16,7 +16,7 @@ authors.workspace = true
 workspace = true
 
 [features]
-default = ["jwt-aws-lc"]
+default = ["jwt-aws-lc", "http-client"]
 legacy-scheduler = []
 full = ["gcp", "aws", "azure"]
 http-client = ["dep:reqwest"]
@@ -97,3 +97,7 @@ tracing-subscriber = { workspace = true }
 [[bench]]
 name = "plan_generation"
 harness = false
+
+[[example]]
+name = "operator_owned_dispatcher"
+required-features = ["http-client"]

@@ -101,6 +101,17 @@ pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBack
     };
     assert_ne!(recreated_version, first_version);
     assert_ne!(recreated_version, second_version);
+    assert_eq!(
+        backend.get(&path).await.expect("read recreated object"),
+        Bytes::from_static(b"v3")
+    );
+    assert_eq!(
+        backend
+            .get_range(&path, 0..1)
+            .await
+            .expect("range read recreated object"),
+        Bytes::from_static(b"v")
+    );
 
     for token in [first_version, "not-a-backend-version-token".to_string()] {
         let rejected = backend

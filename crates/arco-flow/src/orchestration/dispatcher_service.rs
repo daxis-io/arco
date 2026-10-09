@@ -266,7 +266,7 @@ async fn run_handler(
                     "refusing unscoped dispatch for missing task row: run={run_id} task={task_key}"
                 ))
             })?;
-        let envelope = dispatch_envelope_for_attempt(
+        let mut envelope = dispatch_envelope_for_attempt(
             DispatchEnvelopeSpec {
                 tenant_id: state.tenant_id.clone(),
                 workspace_id: state.workspace_id.clone(),
@@ -282,6 +282,16 @@ async fn run_handler(
             },
             Some(task_row),
         );
+        let run = fold_state
+            .runs
+            .get(run_id)
+            .ok_or_else(|| Error::dispatch("dispatch run is missing"))?;
+        crate::orchestration::accepted_plan::populate_accepted_payload(
+            &state.ledger.storage(),
+            run,
+            &mut envelope,
+        )
+        .await?;
         let result = enqueue_worker_dispatch(
             state.task_queue.as_ref(),
             cloud_task_id,

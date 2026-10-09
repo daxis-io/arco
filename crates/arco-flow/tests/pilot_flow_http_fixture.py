@@ -1,12 +1,19 @@
 import hashlib
 import json
 import os
+import sqlite3
+import subprocess
+import sys
+from urllib.parse import urlparse
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from urllib.request import Request, urlopen
 
-ROOT = Path('/private/tmp/arco-pilot-flow-process')
+if sys.flags.optimize:
+    raise SystemExit('fixture requires unoptimized Python for its validation assertions')
+
+ROOT = Path(os.environ['ARCO_FLOW_FIXTURE_ROOT'])
 PENDING = ROOT / 'pending'
 DONE = ROOT / 'done'
 for directory in (ROOT, PENDING, DONE):
@@ -14,6 +21,16 @@ for directory in (ROOT, PENDING, DONE):
 MODE = ROOT / 'mode'
 if not MODE.exists():
     MODE.write_text('accept')
+
+
+def immutable_task_hash(task):
+    envelope = json.loads(task['body'])
+    # Attempt credentials may renew; the execution intent and delivery metadata cannot change.
+    envelope.pop('taskToken', None)
+    envelope.pop('tokenExpiresAt', None)
+    immutable = {**task, 'body': envelope}
+    canonical = json.dumps(immutable, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -46,8 +63,13 @@ class Handler(BaseHTTPRequestHandler):
             task = json.loads(body)
             task_id = task['taskId']
             path = PENDING / (hashlib.sha256(task_id.encode()).hexdigest() + '.json')
-            if (DONE / path.name).exists() or path.exists():
-                return self.respond(409)
+            previous = DONE / path.name if (DONE / path.name).exists() else path
+            if previous.exists():
+                incoming = immutable_task_hash(task)
+                stored = immutable_task_hash(json.loads(previous.read_text()))
+                witness = {'incomingIntentSha256': incoming, 'storedIntentSha256': stored}
+                (ROOT / ('duplicate-' + path.stem + '.json')).write_text(json.dumps(witness))
+                return self.respond(409 if incoming == stored else 422)
             mode = MODE.read_text().strip()
             if mode == 'full':
                 return self.respond(429)
@@ -64,10 +86,35 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get('X-Arco-Dispatch-Secret') != 'local-secret':
                 return self.respond(403)
             envelope = json.loads(body)
+            result = None
+            if envelope.get('payload', {}).get('version') == 1:
+                callback = envelope['callbackBaseUrl']
+                assert urlparse(callback).hostname in ('127.0.0.1', 'localhost')
+                callback_headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + envelope['taskToken']}
+                identity = {'attempt': envelope['attempt'], 'attemptId': envelope['attemptId'], 'workerId': 'reference-worker'}
+                def callback_post(suffix, payload):
+                    request = Request(callback + '/api/v1/tasks/' + envelope['taskId'] + suffix,
+                                      data=json.dumps(payload).encode(), headers=callback_headers, method='POST')
+                    with urlopen(request, timeout=10) as response:
+                        assert response.status == 200
+                callback_post('/started', identity)
+                execution = envelope['payload']['asset']['execution']['payload']
+                parameters = execution['parameters']
+                assert all(v['type'] == 'int64' and type(v['value']) is int and -(2**63) <= v['value'] < 2**63 for v in parameters.values())
+                assert execution['sql'].lower().startswith('select ') and len(execution['sql']) < 4096
+                with sqlite3.connect(':memory:') as connection:
+                    rows = connection.execute(execution['sql'], {k: v['value'] for k, v in parameters.items()}).fetchall()
+                assert len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], int)
+                result = rows[0][0]
+                output = json.loads(subprocess.check_output([os.environ['ARCO_FLOW_OUTPUT_SEED'], 'output', envelope['runId'], str(result)], text=True))
+                callback_post('/completed', {**identity, 'outcome': 'SUCCEEDED', 'output': {'rowCount': 1, 'byteSize': output['byteSize'], 'publication': output}})
             receipt = {
                 key: envelope[key]
                 for key in ('dispatchId', 'runId', 'taskId', 'attemptId', 'callbackBaseUrl')
             }
+            if result is not None:
+                receipt['result'] = result
+                receipt['manifestId'] = envelope['payload']['manifest']['manifestId']
             path = ROOT / ('received-' + hashlib.sha256(body).hexdigest() + '.json')
             path.write_text(json.dumps(receipt, sort_keys=True))
             return self.respond(204)
@@ -91,8 +138,9 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(404)
 
 
-for port in (5198, 5199):
-    server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
-    Thread(target=server.serve_forever, daemon=True).start()
-print('ARCO_FLOW_FIXTURE_READY', flush=True)
-ThreadingHTTPServer(('127.0.0.1', 5200), Handler).serve_forever()
+if __name__ == '__main__':
+    for port in (5198, 5199):
+        server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+        Thread(target=server.serve_forever, daemon=True).start()
+    print('ARCO_FLOW_FIXTURE_READY', flush=True)
+    ThreadingHTTPServer(('127.0.0.1', 5200), Handler).serve_forever()

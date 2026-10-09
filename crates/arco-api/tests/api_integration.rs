@@ -2316,6 +2316,24 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
 
     const TEST_USER_ID: &str = "test-user";
 
+    fn release_config(compactor_url: Option<String>) -> Config {
+        Config {
+            debug: false,
+            posture: Posture::Private,
+            storage: arco_api::config::StorageConfig {
+                bucket: Some("test-bucket".to_string()),
+            },
+            jwt: arco_api::config::JwtConfig {
+                hs256_secret: Some(TEST_JWT_SECRET.to_string()),
+                issuer: Some(TEST_JWT_ISSUER.to_string()),
+                audience: Some(TEST_JWT_AUDIENCE.to_string()),
+                ..Default::default()
+            },
+            compactor_url,
+            ..Config::default()
+        }
+    }
+
     fn make_test_jwt(tenant: &str, workspace: &str) -> Result<String> {
         use serde::Serialize;
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2664,6 +2682,141 @@ QzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/by2h
         let response = router.oneshot(request).await.map_err(|err| match err {})?;
         assert_eq!(response.status(), StatusCode::CREATED);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_api_instances_share_local_tier1_publication() -> Result<()> {
+        use std::sync::Arc;
+
+        use arco_core::storage::{MemoryBackend, StorageBackend};
+
+        let config = release_config(None);
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let first =
+            Server::with_storage_backend(config.clone(), Arc::clone(&backend)).test_router();
+        let second = Server::with_storage_backend(config, Arc::clone(&backend)).test_router();
+        let jwt = make_test_jwt("test-tenant", "test-workspace")?;
+        for (router, name) in [(first.clone(), "first"), (second.clone(), "second")] {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/namespaces")
+                        .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(serde_json::json!({"name": name}).to_string()))
+                        .context("request")?,
+                )
+                .await
+                .map_err(|error| match error {})?;
+            assert_eq!(StatusCode::CREATED, response.status(), "{name} write");
+        }
+        let response = first
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/namespaces")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .body(Body::empty())
+                    .context("request")?,
+            )
+            .await
+            .map_err(|error| match error {})?;
+        assert_eq!(StatusCode::OK, response.status());
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+        let names: Vec<_> = json["namespaces"]
+            .as_array()
+            .context("namespaces")?
+            .iter()
+            .filter_map(|row| row["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"first") && names.contains(&"second"),
+            "{names:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_iceberg_crud_uses_local_tier1_compaction() -> Result<()> {
+        use std::sync::Arc;
+
+        use arco_core::storage::{MemoryBackend, StorageBackend};
+
+        let mut config = release_config(None);
+        config.iceberg.enabled = true;
+        config.iceberg.allow_namespace_crud = true;
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let router = Server::with_storage_backend(config, backend).test_router();
+        let jwt = make_test_jwt("test-tenant", "test-workspace")?;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/iceberg/v1/arco/namespaces")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"namespace":["iceberg_local"],"properties":{}}"#,
+                    ))
+                    .context("request")?,
+            )
+            .await
+            .map_err(|error| match error {})?;
+        assert_eq!(StatusCode::OK, response.status());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn release_api_writes_through_remote_tier1_compactor() -> Result<()> {
+        use std::sync::Arc;
+
+        use arco_catalog::{SyncCompactor, Tier1Compactor};
+        use arco_core::ScopedStorage;
+        use arco_core::storage::{MemoryBackend, StorageBackend};
+        use arco_core::sync_compact::SyncCompactRequest;
+        use axum::Json;
+        use axum::routing::post;
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let storage = ScopedStorage::new(Arc::clone(&backend), "test-tenant", "test-workspace")?;
+        let compactor = Arc::new(Tier1Compactor::new(storage));
+        let app = axum::Router::new().route(
+            "/internal/sync-compact",
+            post(move |Json(request): Json<SyncCompactRequest>| {
+                let compactor = Arc::clone(&compactor);
+                async move {
+                    Json(
+                        SyncCompactor::sync_compact(compactor.as_ref(), request)
+                            .await
+                            .expect("remote compaction"),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let compactor_url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let router =
+            Server::with_storage_backend(release_config(Some(compactor_url)), Arc::clone(&backend))
+                .test_router();
+        let jwt = make_test_jwt("test-tenant", "test-workspace")?;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/namespaces")
+                    .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"remote"}"#))
+                    .context("request")?,
+            )
+            .await
+            .map_err(|error| match error {})?;
+        server.abort();
+        assert_eq!(StatusCode::CREATED, response.status());
         Ok(())
     }
 

@@ -10,7 +10,7 @@ use super::{EnqueueOptions, EnqueueResult, HttpTaskEnqueuer};
 use crate::error::{Error, Result};
 
 /// HTTP sender that acknowledges only durable operator ingress responses.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OperatorHttpEnqueuer {
     client: reqwest::Client,
     ingress_url: String,
@@ -43,6 +43,7 @@ impl OperatorHttpEnqueuer {
             ));
         }
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| Error::configuration(format!("HTTP client: {error}")))?;

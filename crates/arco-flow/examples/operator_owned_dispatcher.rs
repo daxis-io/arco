@@ -442,6 +442,7 @@ mod tests {
                             partition_key: row.partition_key.clone(),
                             code_version: None,
                             cancel_requested: false,
+                            requires_visible_output: row.requires_visible_output,
                         });
                         let ctx = CallbackContext::new(
                             Arc::new(LedgerWriter::new(storage)),

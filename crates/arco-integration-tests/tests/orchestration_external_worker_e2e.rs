@@ -126,6 +126,7 @@ impl TaskStateLookup for CompactorLookup {
                     partition_key: row.partition_key.clone(),
                     code_version: run.and_then(|run| run.code_version.clone()),
                     cancel_requested: run.is_some_and(|run| run.cancel_requested),
+                    requires_visible_output: row.requires_visible_output,
                 }));
             }
 
@@ -161,6 +162,7 @@ impl TaskStateLookup for CompactorLookup {
                 partition_key: row.partition_key.clone(),
                 code_version: run.and_then(|run| run.code_version.clone()),
                 cancel_requested: run.is_some_and(|run| run.cancel_requested),
+                requires_visible_output: row.requires_visible_output,
             }))
         }
     }
@@ -465,6 +467,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,

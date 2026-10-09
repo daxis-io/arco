@@ -74,6 +74,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::tasks::task_started,
         crate::routes::tasks::task_heartbeat,
         crate::routes::tasks::task_completed,
+        crate::routes::tasks::inspect_publication,
     ),
     components(
         schemas(
@@ -183,6 +184,9 @@ use utoipa::{Modify, OpenApi};
             crate::routes::tasks::WorkerOutcome,
             crate::routes::tasks::TaskOutputVisibilityState,
             crate::routes::tasks::TaskOutput,
+            crate::routes::tasks::PublicationDescriptor,
+            crate::routes::tasks::PublicationOwnerEvidence,
+            crate::routes::tasks::PublicationInspectionResponse,
             crate::routes::tasks::TaskError,
             crate::routes::tasks::ErrorCategory,
             crate::routes::tasks::TaskMetrics,

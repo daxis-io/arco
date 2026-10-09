@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use chrono::{TimeZone, Utc};
 
 use arco_flow::orchestration::callbacks::{
-    ErrorCategory as CallbackErrorCategory, TaskError as CallbackTaskError,
-    TaskMetrics as CallbackTaskMetrics, TaskOutput as CallbackTaskOutput,
+    ErrorCategory as CallbackErrorCategory, PublicationDescriptor, PublicationOwnerEvidence,
+    TaskError as CallbackTaskError, TaskMetrics as CallbackTaskMetrics,
+    TaskOutput as CallbackTaskOutput,
 };
 use arco_flow::orchestration::compactor::fold::{
     RunRow, RunState as FoldRunState, TaskRow, TaskState as FoldTaskState,
@@ -47,6 +48,7 @@ fn base_task_row(state: FoldTaskState) -> TaskRow {
         output_visibility_state: None,
         published_at: None,
         publish_error: None,
+        publication: None,
         retry_not_before: None,
         delta_table: None,
         delta_version: None,
@@ -154,6 +156,21 @@ fn task_finished_proto_round_trip_preserves_typed_callback_payloads_without_publ
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: Some(PublicationDescriptor {
+                    version: 1,
+                    manifest_id: format!("sha256:{}", "a".repeat(64)),
+                    object_path: "outputs/part-000.parquet".to_string(),
+                    object_version: "7".to_string(),
+                    checksum_sha256: "a".repeat(64),
+                    byte_size: 512,
+                    format: "parquet".to_string(),
+                    schema_ref: "schema://default.raw.events/v1".to_string(),
+                    owner_evidence: Some(PublicationOwnerEvidence {
+                        verified_at: Utc.with_ymd_and_hms(2026, 4, 9, 12, 1, 6).unwrap(),
+                        object_version: "7".to_string(),
+                        etag: Some("etag-7".to_string()),
+                    }),
+                }),
             }),
             error: Some(CallbackTaskError {
                 category: CallbackErrorCategory::UserCode,
@@ -195,6 +212,14 @@ fn task_finished_proto_round_trip_preserves_typed_callback_payloads_without_publ
         Some("default.raw.events")
     );
     assert_eq!(callback_output.delta_version, Some(7));
+    assert_eq!(
+        callback_output
+            .publication
+            .as_ref()
+            .expect("publication")
+            .object_version,
+        "7"
+    );
 
     let roundtrip = event_from_proto_envelope("tenant-01", "workspace-01", &envelope)
         .expect("proto event should map back to runtime");
@@ -220,6 +245,14 @@ fn task_finished_proto_round_trip_preserves_typed_callback_payloads_without_publ
     assert_eq!(
         output.as_ref().and_then(|value| value.delta_version),
         Some(7)
+    );
+    assert_eq!(
+        output
+            .as_ref()
+            .and_then(|value| value.publication.as_ref())
+            .and_then(|value| value.owner_evidence.as_ref())
+            .and_then(|value| value.etag.as_deref()),
+        Some("etag-7")
     );
     assert_eq!(
         error.as_ref().map(|value| value.message.as_str()),

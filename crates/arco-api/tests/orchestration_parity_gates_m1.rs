@@ -1817,6 +1817,7 @@ async fn parity_m1_rerun_from_failure_rejects_succeeded_parent() -> Result<()> {
                         visibility_state: OutputVisibilityState::Visible,
                         published_at: Some(base + Duration::milliseconds(2)),
                         publish_error: None,
+                        publication: None,
                     },
                 );
                 event.timestamp = base + Duration::milliseconds(2);

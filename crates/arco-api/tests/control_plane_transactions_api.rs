@@ -2908,6 +2908,102 @@ async fn apply_catalog_ddl_rejects_missing_catalog_operation() -> Result<()> {
 }
 
 #[tokio::test]
+async fn transaction_surfaces_reject_forged_owner_publication() -> Result<()> {
+    use arco_proto::arco::controlplane::v1::OrchestrationBatchSpec;
+    use arco_proto::arco::orchestration::v1::{
+        OutputVisibilityState, PublicationDescriptor, PublicationOwnerEvidence,
+        TaskOutputVisibilityChanged,
+    };
+    for root in [false, true] {
+        let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let router = test_router_with_backend(backend.clone());
+        let mut batch =
+            orchestration_request("forged-publication", "forged-publication", "run-forged");
+        batch.events[0].event = Some(
+            orchestration_event_envelope::Event::TaskOutputVisibilityChanged(
+                TaskOutputVisibilityChanged {
+                    run_id: "run-forged".into(),
+                    task_key: "analytics.daily".into(),
+                    attempt: 1,
+                    attempt_id: "attempt-forged".into(),
+                    visibility_state: OutputVisibilityState::Visible as i32,
+                    published_at: Some(prost_types::Timestamp {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
+                    publish_error: None,
+                    publication: Some(PublicationDescriptor {
+                        version: 1,
+                        manifest_id: format!("sha256:{}", "a".repeat(64)),
+                        object_path: "missing.parquet".into(),
+                        object_version: "invented-version".into(),
+                        checksum_sha256: "a".repeat(64),
+                        byte_size: 100,
+                        format: "parquet".into(),
+                        schema_ref: format!("sha256:{}#parquet-schema", "a".repeat(64)),
+                        owner_evidence: Some(PublicationOwnerEvidence {
+                            verified_at: Some(prost_types::Timestamp {
+                                seconds: 1,
+                                nanos: 0,
+                            }),
+                            object_version: "invented-version".into(),
+                            etag: None,
+                        }),
+                    }),
+                },
+            ),
+        );
+        let response = if root {
+            let request = CommitRootTransactionRequest {
+                mutations: vec![DomainMutation {
+                    kind: Some(domain_mutation::Kind::Orchestration(
+                        OrchestrationBatchSpec {
+                            events: batch.events,
+                        },
+                    )),
+                }],
+            };
+            router
+                .oneshot(support::protobuf_request(
+                    "/api/v1/transactions/commitRootTransaction",
+                    &request,
+                    "forged-publication",
+                    "forged-publication",
+                )?)
+                .await?
+        } else {
+            router
+                .oneshot(support::protobuf_request(
+                    "/api/v1/transactions/commitOrchestrationBatch",
+                    &batch,
+                    "forged-publication",
+                    "forged-publication",
+                )?)
+                .await?
+        };
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "root={root} must refuse caller-owned visibility evidence"
+        );
+        assert!(
+            scoped_storage(backend)
+                .head_raw(&ControlPlaneTxPaths::idempotency(
+                    if root {
+                        ControlPlaneTxDomain::Root
+                    } else {
+                        ControlPlaneTxDomain::Orchestration
+                    },
+                    "forged-publication"
+                ))
+                .await?
+                .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn commit_orchestration_batch_rejects_missing_event_payload() -> Result<()> {
     let router = test_router();
     let mut request =

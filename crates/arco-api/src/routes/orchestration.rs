@@ -2719,7 +2719,10 @@ fn task_has_failed_required_output(task: &TaskRow) -> bool {
 fn task_has_pending_required_output(task: &TaskRow) -> bool {
     task.requires_visible_output
         && task.state == FoldTaskState::Succeeded
-        && task.output_visibility_state == Some(OutputVisibilityState::Pending)
+        && matches!(
+            task.output_visibility_state,
+            None | Some(OutputVisibilityState::Pending)
+        )
 }
 
 fn map_run_row_state(run: &RunRow, tasks: &[&TaskRow]) -> RunStateResponse {
@@ -7641,6 +7644,7 @@ mod tests {
             output_visibility_state: visibility_state,
             published_at: Some(Utc::now()),
             publish_error: publish_error.map(ToString::to_string),
+            publication: None,
             retry_not_before: None,
             delta_table: Some("analytics.daily".to_string()),
             delta_version: Some(7),
@@ -7682,14 +7686,11 @@ mod tests {
     }
 
     #[test]
-    fn test_map_run_row_state_treats_missing_visibility_as_succeeded_until_event_arrives() {
+    fn test_map_run_row_state_keeps_required_output_pending_without_visibility() {
         let run = visibility_run_row(FoldRunState::Succeeded);
         let task = visibility_task_row(true, None, None);
 
-        assert_eq!(
-            map_run_row_state(&run, &[&task]),
-            RunStateResponse::Succeeded
-        );
+        assert_eq!(map_run_row_state(&run, &[&task]), RunStateResponse::Running);
     }
 
     #[test]

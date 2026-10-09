@@ -162,6 +162,7 @@ fn completed_and_error_messages_roundtrip_wire_format() {
             output_visibility_state: 0,
             published_at: None,
             publish_error: None,
+            publication: None,
         }),
         error: Some(WorkerTaskError {
             category: 3,

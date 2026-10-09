@@ -16,7 +16,9 @@
 //! 4. **Token validation**: Scoped bearer tokens for authentication
 
 mod handlers;
+mod publication;
 mod types;
 
 pub use handlers::*;
+pub use publication::*;
 pub use types::*;

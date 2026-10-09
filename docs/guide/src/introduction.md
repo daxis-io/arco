@@ -1,6 +1,7 @@
 # Introduction
 
-Arco is a serverless lakehouse infrastructure that unifies a file-native catalog with execution-first orchestration.
+Arco is a file-native lakehouse catalog with orchestration contracts. Operators
+deploy its catalog API and bring their own query engine and task runtime.
 
 ## Key Features
 
@@ -11,12 +12,13 @@ Arco is a serverless lakehouse infrastructure that unifies a file-native catalog
 
 ## Engine Boundaries
 
-Arco uses split services with hard boundaries:
+Arco's current split deployment has hard ownership boundaries. The operator
+chooses how to deploy the API and its supporting components:
 
-- API/orchestration are control-plane services.
+- The API and Flow modules operate catalog and task state.
 - Query execution runs in a client-supplied engine.
 - Compactors own Parquet projection writes.
-- Arco mints scoped URLs for published files; clients bring their own query engine.
+- The legacy catalog API mints scoped URLs for published files.
 - Task execution happens in external workers via canonical dispatch envelopes.
 
 Pointer-first published state remains the source for reads. Arco publishes

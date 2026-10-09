@@ -30,6 +30,21 @@ worker reports lifecycle facts through callback endpoints using the scoped task
 token and active attempt identity. Workers heartbeat only when the selected
 runtime supports heartbeat callbacks. Workers do not write projections directly.
 
+The packaged dispatcher and sweeper default to Cloud Tasks. Their
+worker handoff uses `arco_flow::dispatch::enqueue_worker_dispatch` and the
+`HttpTaskEnqueuer` contract. The public `dispatcher_service::router` and
+`sweeper_service::router` let an operator host both controllers with the same
+queue. An operator-built dispatcher may provide a
+different queue implementation, but must durably accept a task before reporting
+success, deduplicate retries by task ID, honor timer delays and queue routing,
+and report uncertain acceptance as an error so the outbox can retry. The
+packaged binaries can select an operator HTTP ingress with
+`ARCO_FLOW_WORKER_TRANSPORT=http`; this mode refuses scheduled timers. The [single-host file
+queue example](../../../runbooks/operator-owned-flow-dispatcher.md) has local
+durability, process-reopen, callback, and sweeper redrive tests, but is not
+production qualified. The expired original queue record still needs a
+retention policy, and the chosen state provider needs qualification.
+
 The evidence surface is the published orchestration projections. They are
 derived read models, not the enforcement path for authorization, dispatch, or
 correctness decisions.

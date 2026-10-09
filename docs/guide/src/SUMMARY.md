@@ -18,9 +18,13 @@
 
 - [Documentation Map](./reference/documentation-map.md)
 - [Control-Plane Scope](./reference/control-plane-scope.md)
+- [0.3.0 Integration Profile](./reference/integration-profile-030.md)
 - [Catalog Authority Hard Cut](./reference/catalog-authority-hard-cut.md)
 - [Published Projections](./reference/system-catalog.md)
 - [Orchestration Product Contract](./reference/orchestration-product-contract.md)
+- [Frozen Flow Intent](./reference/frozen-flow-intent.md)
+- [Publication Contract](./reference/publication-contract-030.md)
+- [Catalog Read Handoff](./reference/catalog-read-handoff-030.md)
 - [Orchestration Embedding](./reference/orchestration-embedding.md)
 - [Catalog Run Index](./reference/catalog-run-index.md)
 - [Catalog Privilege Matrix](./reference/catalog-privilege-matrix.md)

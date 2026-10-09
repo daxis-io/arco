@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-10-08
+
+### Integration interfaces
+- Add operator-owned HTTP dispatch for packaged Flow dispatcher and sweeper, with durable acceptance, stable task identity, uncertain-response recovery, and explicit timer/priority refusal.
+- Freeze accepted run plans, deployment identity, worker execution declarations and input references across response loss, partial event publication, concurrent replay, and later deployments. Incomplete legacy reservations without frozen proof now fail closed.
+- Add versioned publication metadata with owner verification and a separate publication retry/inspection boundary; worker visibility claims alone do not establish a readable output.
+- Add a typed manifest-pinned catalog read descriptor for the default-off operator route, with verified scope, exact Parquet files and authority/projection fencing.
+- Allow standalone production API operation with local Tier1 compaction when no remote compactor is configured.
+- Prepare Arco-owned deterministic and opt-in R2 provider conformance CI. Live provider qualification remains a separate gate.
+- Align the existing Python packages and CLI scaffolds to 0.3.0, and document adapter relocation and authority-format migration.
+
 ### Added
 - Phase 3 state-store prototype gates: the `ArcoStateReader`/`ArcoStateStore`/`ArcoStateTxn` seam with capability-discovery-only current adapter, the deterministic `ModelStateStore` reference backend, the object-store control-store MVP (txlog + manifest + pointer-CAS), and the advisory prototype promotion gate (#316).
 - Phase 4 shadow replay importer into an isolated `catalog-shadow` control-store domain plus opt-in internal comparison reads behind `ARCO_CATALOG_SHADOW_COMPARE_READS` (#317).

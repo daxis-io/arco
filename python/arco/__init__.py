@@ -5,7 +5,7 @@ Provides the @asset decorator and client for interacting with Arco.
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 from arco.decorator import asset
 

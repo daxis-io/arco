@@ -4,7 +4,8 @@ import os
 import sqlite3
 import subprocess
 import sys
-from urllib.parse import urlparse
+from contextlib import closing
+from urllib.parse import quote
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -88,22 +89,22 @@ class Handler(BaseHTTPRequestHandler):
             envelope = json.loads(body)
             result = None
             if envelope.get('payload', {}).get('version') == 1:
-                callback = envelope['callbackBaseUrl']
-                assert urlparse(callback).hostname in ('127.0.0.1', 'localhost')
+                assert envelope['callbackBaseUrl'] == 'http://127.0.0.1:5187'
+                execution = envelope['payload']['asset']['execution']['payload']
+                assert execution['sql'] == 'select :value'
+                parameters = execution['parameters']
+                assert set(parameters) == {'value'}
+                assert all(v['type'] == 'int64' and type(v['value']) is int and -(2**63) <= v['value'] < 2**63 for v in parameters.values())
                 callback_headers = {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + envelope['taskToken']}
                 identity = {'attempt': envelope['attempt'], 'attemptId': envelope['attemptId'], 'workerId': 'reference-worker'}
                 def callback_post(suffix, payload):
-                    request = Request(callback + '/api/v1/tasks/' + envelope['taskId'] + suffix,
+                    request = Request('http://127.0.0.1:5187/api/v1/tasks/' + quote(envelope['taskId'], safe='') + suffix,
                                       data=json.dumps(payload).encode(), headers=callback_headers, method='POST')
                     with urlopen(request, timeout=10) as response:
                         assert response.status == 200
                 callback_post('/started', identity)
-                execution = envelope['payload']['asset']['execution']['payload']
-                parameters = execution['parameters']
-                assert all(v['type'] == 'int64' and type(v['value']) is int and -(2**63) <= v['value'] < 2**63 for v in parameters.values())
-                assert execution['sql'].lower().startswith('select ') and len(execution['sql']) < 4096
-                with sqlite3.connect(':memory:') as connection:
-                    rows = connection.execute(execution['sql'], {k: v['value'] for k, v in parameters.items()}).fetchall()
+                with closing(sqlite3.connect(':memory:')) as connection:
+                    rows = connection.execute('select :value', {k: v['value'] for k, v in parameters.items()}).fetchall()
                 assert len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], int)
                 result = rows[0][0]
                 output = json.loads(subprocess.check_output([os.environ['ARCO_FLOW_OUTPUT_SEED'], 'output', envelope['runId'], str(result)], text=True))
@@ -122,8 +123,9 @@ class Handler(BaseHTTPRequestHandler):
             delivered = 0
             for path in sorted(PENDING.glob('*.json')):
                 task = json.loads(path.read_text())
+                assert task['targetUrl'] == 'http://127.0.0.1:5199/dispatch'
                 request = Request(
-                    task['targetUrl'],
+                    'http://127.0.0.1:5199/dispatch',
                     data=task['body'].encode(),
                     headers={'Content-Type': 'application/json', **(task.get('headers') or {})},
                     method='POST',

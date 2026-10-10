@@ -73,7 +73,7 @@ provider behavior or throughput. Hosting and activation remain operator choices.
 
 For the packaged API, dispatcher and sweeper proof, use a dedicated target and a
 disposable Python test environment with `moto[server]` and `boto3`. The driver
-executes a typed integer SQL parameter through SQLite, writes real Parquet with
+executes the fixed `select :value` operation with a bound `int64` parameter through SQLite, writes real Parquet with
 the Rust fixture and inspects owner verification. It also checks catalog HTTP
 range reads, uncertain acceptance, duplicate recovery, queue capacity, sweeper
 repair and HTTP timer refusal. Ports 5187–5191 and 5198–5200 must be available.

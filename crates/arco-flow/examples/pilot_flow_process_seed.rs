@@ -14,6 +14,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 #[tokio::main]
+#[allow(
+    clippy::print_stdout,
+    reason = "fixture stdout is the descriptor protocol consumed by the reference worker"
+)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = std::env::args().nth(1).ok_or("run ID required")?;
     let backend = from_bucket(&std::env::var("ARCO_STORAGE_BUCKET")?)?;

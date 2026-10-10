@@ -252,12 +252,7 @@ async fn local_pipeline_uat_writes_delta_catalogs_and_completes_run() {
         None,
         &[("Authorization", "Bearer local-uat-token")],
     );
-    let inspection: Value = send_json(
-        &app.router,
-        inspection_request,
-        StatusCode::OK,
-    )
-    .await;
+    let inspection: Value = send_json(&app.router, inspection_request, StatusCode::OK).await;
     assert_eq!(inspection["publication"]["objectPath"], delta_data_path);
     assert!(inspection["publication"]["ownerEvidence"].is_object());
 }

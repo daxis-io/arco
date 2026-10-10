@@ -145,6 +145,10 @@ fn scoped(backend: Arc<dyn StorageBackend>) -> ScopedStorage {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one lifecycle proves the pinned read, HTTP/Parquet consumption, lag and quarantine refusals"
+)]
 async fn operator_catalog_urls_pin_one_control_projection_and_refuse_lag() {
     let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let signer = Arc::new(
@@ -233,8 +237,8 @@ async fn operator_catalog_urls_pin_one_control_projection_and_refuse_lag() {
             .contains("commits")
     }));
     let url = files[0]["url"].as_str().expect("signed URL");
-    let signed = reqwest::Url::parse(url).expect("signed URL syntax");
-    let expires: u64 = signed
+    let parsed_url = reqwest::Url::parse(url).expect("signed URL syntax");
+    let expires: u64 = parsed_url
         .query_pairs()
         .find(|(name, _)| name == "expires")
         .expect("signed expiry")

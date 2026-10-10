@@ -131,6 +131,10 @@ fn automation_code_versions_proto_round_trip_preserves_source_metadata() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one round trip exercises every optional callback and publication field"
+)]
 fn task_finished_proto_round_trip_preserves_typed_callback_payloads_without_public_json_escape_hatch()
  {
     let event = OrchestrationEvent::new(

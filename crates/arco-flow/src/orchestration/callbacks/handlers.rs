@@ -2368,20 +2368,21 @@ mod tests {
         });
         entered.notified().await;
 
-        let events = ledger.events.lock().expect("events");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0].data,
-            OrchestrationEventData::TaskCompletionRecorded {
-                outcome: TaskOutcome::Succeeded,
-                output_visibility: Some(OutputVisibilityUpdate {
-                    visibility_state: OutputVisibilityState::Pending,
+        {
+            let events = ledger.events.lock().expect("events");
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0].data,
+                OrchestrationEventData::TaskCompletionRecorded {
+                    outcome: TaskOutcome::Succeeded,
+                    output_visibility: Some(OutputVisibilityUpdate {
+                        visibility_state: OutputVisibilityState::Pending,
+                        ..
+                    }),
                     ..
-                }),
-                ..
-            }
-        ));
-        drop(events);
+                }
+            ));
+        }
 
         callback.abort();
         assert!(
@@ -2504,16 +2505,17 @@ mod tests {
         let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
         assert!(matches!(result, CallbackResult::Ok(_)));
         assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
-        let events = ledger.events.lock().expect("events");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0].data,
-            OrchestrationEventData::TaskOutputVisibilityChanged {
-                visibility_state: OutputVisibilityState::Visible,
-                ..
-            }
-        ));
-        drop(events);
+        {
+            let events = ledger.events.lock().expect("events");
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                events[0].data,
+                OrchestrationEventData::TaskOutputVisibilityChanged {
+                    visibility_state: OutputVisibilityState::Visible,
+                    ..
+                }
+            ));
+        }
 
         let changed =
             handle_task_completed(&ctx, "task-1", "token", changed_request, &lookup).await;

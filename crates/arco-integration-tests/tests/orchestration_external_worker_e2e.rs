@@ -445,7 +445,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
     .await;
     assert!(matches!(started, CallbackResult::Ok(_)));
 
-    let completed = handle_task_completed(
+    let completed = Box::pin(handle_task_completed(
         &callback_ctx,
         task_key,
         &envelope.task_token,
@@ -475,7 +475,7 @@ async fn run_dispatch_callback_path_advances_task_state() {
             partial_progress: None,
         },
         &lookup,
-    )
+    ))
     .await;
     assert!(matches!(completed, CallbackResult::Ok(_)));
 

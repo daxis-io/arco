@@ -5028,7 +5028,7 @@ mod tests {
         );
         assert_eq!(task.publication.as_ref(), Some(&publication_a));
 
-        let mut verified_a = publication_a.clone();
+        let mut verified_a = publication_a;
         verified_a.owner_evidence = Some(PublicationOwnerEvidence {
             verified_at: Utc::now(),
             object_version: verified_a.object_version.clone(),

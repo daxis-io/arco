@@ -11431,7 +11431,8 @@ mod native_directory_tests {
                         1 => cost::allocated(24, || {
                             let value = std::hint::black_box(vec![0_u8; 64]);
                             std::hint::black_box(&value);
-                            panic!("recorded nested allocation panic")
+                            // Measure unwind accounting without process panic-hook allocations.
+                            std::panic::resume_unwind(Box::new("recorded nested allocation panic"))
                         }),
                         2 => Ok(vec![0_u8; 1024]),
                         3 => {

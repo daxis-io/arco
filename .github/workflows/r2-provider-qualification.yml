@@ -1,0 +1,204 @@
+name: R2 Provider Qualification
+
+# Local adapter evidence runs on every relevant change. Live provider evidence is
+# dispatch-only until a dedicated account and bucket are assigned; a skipped live
+# job is not provider qualification.
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/r2-provider-qualification.yml'
+      - 'Cargo.lock'
+      - 'crates/arco-core/**'
+      - 'crates/arco-storage-object-store/**'
+      - 'crates/arco-storage-s3/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/r2-provider-qualification.yml'
+      - 'Cargo.lock'
+      - 'crates/arco-core/**'
+      - 'crates/arco-storage-object-store/**'
+      - 'crates/arco-storage-s3/**'
+  workflow_dispatch:
+    inputs:
+      run_live:
+        description: Run the credentialed R2 campaign in the configured test bucket
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  deterministic:
+    name: Deterministic S3-compatible contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: 'false'
+
+      - name: Record deterministic evidence identity
+        run: |
+          receipt_dir="receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic"
+          mkdir -p "$receipt_dir"
+          {
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF}"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+            echo "package=arco-storage-s3"
+            echo "features=default"
+            echo "elapsed_ceiling_seconds=1200"
+            echo "live_provider_executed=false"
+            echo "provider_gate=unqualified"
+          } > "$receipt_dir/identity.txt"
+
+      - name: Validate R2 configuration admission
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --test live_conformance r2_configuration \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/configuration.log"
+
+      - name: Exercise retry and ambiguous-write boundary
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --lib \
+            safe_get_retries_but_ambiguous_conditional_put_is_attempted_once \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/transport.log"
+
+      - name: Exercise adapter read, range, CAS, and paging contracts
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-object-store --test adapter_contract \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/adapter.log"
+
+      - name: Verify live probe discovery
+        run: |
+          discovered="$({ cargo test --locked -p arco-storage-s3 --test live_conformance -- --ignored --list; } |
+            grep -Fxc 'r2_backend_satisfies_storage_conformance: test')"
+          test "$discovered" -eq 1
+
+      - name: Record deterministic result
+        if: always()
+        run: |
+          {
+            echo "job_status=${{ job.status }}"
+            echo "live_provider_executed=false"
+            echo "provider_gate=unqualified"
+          } >> "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/identity.txt"
+          {
+            echo "## R2 provider qualification"
+            echo ""
+            echo "Deterministic adapter status: **${{ job.status }}**."
+            echo "Live R2 status: **not run / unqualified**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain deterministic receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r2-${{ github.run_id }}-${{ github.run_attempt }}-deterministic
+          path: receipts/r2-${{ github.run_id }}-${{ github.run_attempt }}-deterministic
+          if-no-files-found: error
+          retention-days: 30
+
+  live-r2:
+    name: Live R2 conformance
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
+    needs: deterministic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: r2-qualification
+    concurrency:
+      group: r2-provider-qualification-live
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: 'false'
+
+      - name: Record live evidence identity
+        env:
+          ACCOUNT_ID: ${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}
+          BUCKET: ${{ vars.ARCO_TEST_R2_BUCKET }}
+        run: |
+          receipt_dir="receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-live"
+          mkdir -p "$receipt_dir"
+          {
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF}"
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | cut -d ' ' -f 1)"
+            echo "package=arco-storage-s3"
+            echo "features=default"
+            echo "provider=cloudflare-r2-s3"
+            echo "account_id=${ACCOUNT_ID}"
+            echo "bucket=${BUCKET}"
+            echo "region=auto"
+            echo "elapsed_ceiling_seconds=1800"
+            echo "declared_request_estimate_upper_bound=512"
+            echo "declared_submitted_bytes_estimate_upper_bound=1024"
+            echo "declared_cost_estimate_ceiling_microusd=1000"
+            echo "provider_gate=evidence-pending"
+          } > "$receipt_dir/identity.txt"
+
+      - name: Check dedicated R2 scope
+        env:
+          ACCOUNT_ID: ${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}
+          BUCKET: ${{ vars.ARCO_TEST_R2_BUCKET }}
+          ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "$ACCOUNT_ID"
+          test -n "$BUCKET"
+          test -n "$ACCESS_KEY_ID"
+          test -n "$SECRET_ACCESS_KEY"
+
+      - name: Run live R2 conformance
+        env:
+          ARCO_TEST_R2_ACCOUNT_ID: ${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}
+          ARCO_TEST_R2_BUCKET: ${{ vars.ARCO_TEST_R2_BUCKET }}
+          AWS_ENDPOINT: https://${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
+          AWS_EC2_METADATA_DISABLED: 'true'
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --test live_conformance \
+            r2_backend_satisfies_storage_conformance -- --ignored --exact --nocapture \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-live/conformance.log"
+
+      - name: Record live result
+        if: always()
+        run: |
+          {
+            echo "job_status=${{ job.status }}"
+            echo "provider_gate=${{ job.status == 'success' && 'evidence-pending-review' || 'failed' }}"
+          } >> "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-live/identity.txt"
+
+      - name: Retain live receipts, including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r2-${{ github.run_id }}-${{ github.run_attempt }}-live
+          path: receipts/r2-${{ github.run_id }}-${{ github.run_attempt }}-live
+          if-no-files-found: error
+          retention-days: 90

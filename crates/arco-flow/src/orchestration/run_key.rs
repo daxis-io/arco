@@ -87,6 +87,9 @@ pub struct RunKeyReservation {
     /// Fingerprint of the trigger request payload (selection/partitions/labels).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_fingerprint: Option<String>,
+    /// Integrity binding for the immutable accepted execution plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_plan_sha256: Option<String>,
     /// When the reservation was created.
     pub created_at: DateTime<Utc>,
 }
@@ -305,6 +308,7 @@ mod tests {
             event_id: ulid::Ulid::new().to_string(),
             plan_event_id: Some(ulid::Ulid::new().to_string()),
             request_fingerprint: Some(format!("fingerprint:{run_key}")),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         }
     }
@@ -707,6 +711,7 @@ mod tests {
             event_id: "01MNOPQR".to_string(),
             plan_event_id: Some("01PLANEVENT".to_string()),
             request_fingerprint: Some("fingerprint-123".to_string()),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
 

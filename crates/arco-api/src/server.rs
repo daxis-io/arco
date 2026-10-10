@@ -903,15 +903,11 @@ impl Server {
                     iceberg_state = iceberg_state
                         .with_compactor_factory(Arc::new(SharedCompactorFactory::new(compactor)));
                     tracing::info!("Iceberg CRUD enabled with remote sync compaction");
-                } else if state.config.debug {
+                } else {
                     iceberg_state =
                         iceberg_state.with_compactor_factory(Arc::new(Tier1CompactorFactory));
-                    tracing::warn!(
-                        "Iceberg CRUD enabled without compactor_url; using local Tier1 compaction (debug mode only)"
-                    );
-                } else {
-                    tracing::error!(
-                        "Iceberg CRUD enabled without compactor_url; CRUD endpoints will fail"
+                    tracing::info!(
+                        "Iceberg CRUD enabled without compactor_url; using local Tier1 compaction"
                     );
                 }
             }
@@ -1208,22 +1204,6 @@ impl Server {
         if !self.config.debug && self.config.storage.bucket.is_none() {
             return Err(arco_core::Error::InvalidInput(
                 "storage.bucket is required when debug=false".to_string(),
-            ));
-        }
-
-        if !self.config.debug && self.config.compactor_url.is_none() {
-            return Err(arco_core::Error::InvalidInput(
-                "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false".to_string(),
-            ));
-        }
-
-        if self.config.iceberg.enabled
-            && (self.config.iceberg.allow_namespace_crud || self.config.iceberg.allow_table_crud)
-            && !self.config.debug
-            && self.config.compactor_url.is_none()
-        {
-            return Err(arco_core::Error::InvalidInput(
-                "Iceberg CRUD requires ARCO_COMPACTOR_URL when ARCO_DEBUG=false".to_string(),
             ));
         }
 
@@ -1596,23 +1576,13 @@ mod tests {
     }
 
     #[test]
-    fn test_compactor_url_required_when_debug_false() {
+    fn test_local_compactor_allowed_when_debug_false() {
         let mut builder = ServerBuilder::new();
-        builder.config.debug = false;
-        builder.config.posture = Posture::Private;
-        builder.config.storage.bucket = Some("test-bucket".to_string());
-        builder.config.jwt.hs256_secret = Some("test-secret".to_string());
+        configure_non_dev_jwt(&mut builder);
         builder.config.compactor_url = None;
-
-        let server = builder.build();
-        let err = server.validate_config().unwrap_err();
-        let arco_core::Error::InvalidInput(message) = err else {
-            panic!("unexpected error: {err:?}");
-        };
-        assert_eq!(
-            message,
-            "ARCO_COMPACTOR_URL is required when ARCO_DEBUG=false"
-        );
+        builder.config.jwt.issuer = Some("test-issuer".to_string());
+        builder.config.jwt.audience = Some("test-audience".to_string());
+        assert!(builder.build().validate_config().is_ok());
     }
 
     #[test]

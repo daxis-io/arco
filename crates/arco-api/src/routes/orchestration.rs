@@ -1427,16 +1427,14 @@ impl ResolvedPartitionKey {
 }
 
 struct ManifestContext {
-    manifest_id: String,
-    deployed_at: DateTime<Utc>,
     graph: arco_flow::orchestration::AssetGraph,
     known_assets: HashSet<String>,
     partitioning_specs: HashMap<String, PartitioningSpec>,
 }
 
 struct RunPlanContext {
-    manifest_id: String,
-    deployed_at: DateTime<Utc>,
+    accepted_manifest: arco_flow::orchestration::accepted_plan::AcceptedManifestRef,
+    task_payloads: BTreeMap<String, serde_json::Value>,
     code_version_id: String,
     graph: arco_flow::orchestration::AssetGraph,
     root_assets: Vec<String>,
@@ -1590,8 +1588,6 @@ fn build_manifest_context(stored: &StoredManifest) -> Result<ManifestContext, Ap
     }
 
     Ok(ManifestContext {
-        manifest_id: stored.manifest_id.clone(),
-        deployed_at: stored.deployed_at,
         graph,
         known_assets,
         partitioning_specs,
@@ -1667,7 +1663,28 @@ async fn load_run_plan_context(
         ));
     };
 
-    let manifest_context = build_manifest_context(&stored)?;
+    let bytes = storage
+        .get_raw(&crate::paths::manifest_path(&stored.manifest_id))
+        .await?;
+    let immutable: StoredManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::internal(format!("invalid accepted manifest: {e}")))?;
+    if immutable.manifest_id != stored.manifest_id
+        || immutable.tenant_id != storage.tenant_id()
+        || immutable.workspace_id != storage.workspace_id()
+    {
+        return Err(ApiError::internal(
+            "deployed manifest identity or scope mismatch",
+        ));
+    }
+    run_plan_context_from_manifest(&immutable, &bytes, request)
+}
+
+fn run_plan_context_from_manifest(
+    stored: &StoredManifest,
+    bytes: &[u8],
+    request: &TriggerRunRequest,
+) -> Result<RunPlanContext, ApiError> {
+    let manifest_context = build_manifest_context(stored)?;
     let root_assets = resolve_root_assets(request, &manifest_context.known_assets)?;
     let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
     let partitioning_spec = derive_run_partitioning_spec(
@@ -1675,11 +1692,26 @@ async fn load_run_plan_context(
         &manifest_context.partitioning_specs,
         has_partition_request,
     )?;
-
+    let accepted_manifest = arco_flow::orchestration::accepted_plan::AcceptedManifestRef {
+        manifest_id: stored.manifest_id.clone(),
+        sha256: hex::encode(Sha256::digest(bytes)),
+    };
+    let mut task_payloads = BTreeMap::new();
+    for asset in &stored.assets {
+        let key = arco_flow::orchestration::canonicalize_asset_key(&format!(
+            "{}/{}",
+            asset.key.namespace, asset.key.name
+        ))
+        .map_err(ApiError::bad_request)?;
+        task_payloads.insert(
+            key,
+            serde_json::json!({"version": 1, "manifest": accepted_manifest, "asset": asset}),
+        );
+    }
     Ok(RunPlanContext {
-        manifest_id: manifest_context.manifest_id,
-        deployed_at: manifest_context.deployed_at,
-        code_version_id: stored.code_version_id,
+        accepted_manifest,
+        task_payloads,
+        code_version_id: stored.code_version_id.clone(),
         graph: manifest_context.graph,
         root_assets,
         partitioning_spec,
@@ -2608,10 +2640,7 @@ struct RunEventOverrides {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn append_run_events(
-    config: &crate::config::Config,
-    storage: ScopedStorage,
-    request_id: Option<&str>,
+fn build_run_events(
     tenant_id: &str,
     workspace_id: &str,
     user_id: String,
@@ -2622,8 +2651,8 @@ async fn append_run_events(
     code_version: Option<String>,
     root_assets: Vec<String>,
     tasks: Vec<TaskDef>,
-    overrides: Option<RunEventOverrides>,
-) -> Result<(), ApiError> {
+    overrides: Option<&RunEventOverrides>,
+) -> Vec<OrchestrationEvent> {
     let mut events = Vec::with_capacity(2);
     let mut run_triggered = OrchestrationEvent::new(
         tenant_id,
@@ -2639,7 +2668,7 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
+    if let Some(overrides) = overrides {
         apply_event_metadata(
             &mut run_triggered,
             &overrides.run_event_id,
@@ -2659,7 +2688,7 @@ async fn append_run_events(
         },
     );
 
-    if let Some(ref overrides) = overrides {
+    if let Some(overrides) = overrides {
         apply_event_metadata(
             &mut plan_created,
             &overrides.plan_event_id,
@@ -2668,8 +2697,7 @@ async fn append_run_events(
     }
 
     events.push(plan_created);
-    append_events_and_compact(config, storage, events, request_id).await?;
-    Ok(())
+    events
 }
 
 fn map_run_state(state: FoldRunState) -> RunStateResponse {
@@ -2691,7 +2719,10 @@ fn task_has_failed_required_output(task: &TaskRow) -> bool {
 fn task_has_pending_required_output(task: &TaskRow) -> bool {
     task.requires_visible_output
         && task.state == FoldTaskState::Succeeded
-        && task.output_visibility_state == Some(OutputVisibilityState::Pending)
+        && matches!(
+            task.output_visibility_state,
+            None | Some(OutputVisibilityState::Pending)
+        )
 }
 
 fn map_run_row_state(run: &RunRow, tasks: &[&TaskRow]) -> RunStateResponse {
@@ -2972,10 +3003,14 @@ fn api_error_from_flow_error(error: FlowError) -> ApiError {
 }
 
 fn reject_reserved_lineage_labels(labels: &HashMap<String, String>) -> Result<(), ApiError> {
-    let forbidden = [LABEL_PARENT_RUN_ID, LABEL_RERUN_KIND]
-        .into_iter()
-        .filter(|key| labels.contains_key(*key))
-        .collect::<Vec<_>>();
+    let forbidden = [
+        LABEL_PARENT_RUN_ID,
+        LABEL_RERUN_KIND,
+        arco_flow::orchestration::accepted_plan::ACCEPTED_PLAN_SHA256_LABEL,
+    ]
+    .into_iter()
+    .filter(|key| labels.contains_key(*key))
+    .collect::<Vec<_>>();
 
     if forbidden.is_empty() {
         return Ok(());
@@ -4228,6 +4263,86 @@ fn filter_sensor_evals_by_time_range(
 // Route Handlers
 // ============================================================================
 
+async fn load_reserved_plan(
+    storage: &ScopedStorage,
+    reservation: &RunKeyReservation,
+) -> Result<arco_flow::orchestration::accepted_plan::AcceptedRunPlan, ApiError> {
+    let sha256 = reservation.accepted_plan_sha256.as_deref().ok_or_else(|| {
+        ApiError::conflict("run reservation lacks frozen execution proof; recovery is blocked")
+    })?;
+    let plan = arco_flow::orchestration::accepted_plan::load_accepted_run_plan(
+        storage,
+        &reservation.run_id,
+        &reservation.plan_id,
+        sha256,
+    )
+    .await
+    .map_err(|e| ApiError::conflict(format!("accepted execution proof unavailable: {e}")))?;
+    let [run_event, plan_event] = plan.events.as_slice() else {
+        return Err(ApiError::conflict("accepted plan event count mismatch"));
+    };
+    let OrchestrationEventData::RunTriggered { run_key, .. } = &run_event.data else {
+        return Err(ApiError::conflict("accepted plan lacks trigger"));
+    };
+    if run_key.as_deref() != Some(reservation.run_key.as_str()) {
+        return Err(ApiError::conflict("accepted run key mismatch"));
+    }
+    if run_event.event_id != reservation.event_id
+        || Some(&plan_event.event_id) != reservation.plan_event_id.as_ref()
+        || plan
+            .events
+            .iter()
+            .any(|e| e.timestamp != reservation.created_at)
+    {
+        return Err(ApiError::conflict("accepted event identity mismatch"));
+    }
+    Ok(plan)
+}
+
+async fn recover_reserved_plan(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+    reservation: &RunKeyReservation,
+) -> Result<(), ApiError> {
+    let plan = load_reserved_plan(storage, reservation).await?;
+    append_events_and_compact(
+        &state.config,
+        storage.clone(),
+        plan.publication_events(
+            reservation
+                .accepted_plan_sha256
+                .as_deref()
+                .unwrap_or_default(),
+        ),
+        Some(ctx.request_id.as_str()),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn reconcile_reserved_plan(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+    reservation: &RunKeyReservation,
+) -> Result<RunStateResponse, ApiError> {
+    if let Ok(folded) = load_orchestration_state(ctx, state).await {
+        if let Some(run) = folded.runs.get(&reservation.run_id) {
+            let tasks: Vec<_> = folded
+                .tasks
+                .values()
+                .filter(|task| task.run_id == reservation.run_id)
+                .collect();
+            if !tasks.is_empty() {
+                return Ok(map_run_row_state(run, &tasks));
+            }
+        }
+    }
+    recover_reserved_plan(state, ctx, storage, reservation).await?;
+    Ok(RunStateResponse::Pending)
+}
+
 /// Trigger a new run.
 ///
 /// Creates an execution plan and starts a new run for the selected assets.
@@ -4290,12 +4405,35 @@ pub(crate) async fn trigger_run(
     // Create storage for reservation and ledger
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
-    let mut run_event_overrides: Option<RunEventOverrides> = None;
+    let existing_reservation = if let Some(run_key) = &request.run_key {
+        get_reservation(&storage, run_key)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        None
+    };
 
     let has_partition_request = request.partition_key.is_some() || !request.partitions.is_empty();
     let mut plan_context: Option<RunPlanContext> = None;
     let partitioning_spec = if has_partition_request {
-        let context = load_run_plan_context(&storage, &request).await?;
+        let context = if let Some(existing) = existing_reservation
+            .as_ref()
+            .filter(|r| r.accepted_plan_sha256.is_some())
+        {
+            let accepted = load_reserved_plan(&storage, existing).await?;
+            let manifest = accepted
+                .manifest
+                .as_ref()
+                .ok_or_else(|| ApiError::conflict("accepted plan lacks manifest proof"))?;
+            let bytes = storage
+                .get_raw(&crate::paths::manifest_path(&manifest.manifest_id))
+                .await?;
+            let stored: StoredManifest =
+                serde_json::from_slice(&bytes).map_err(|e| ApiError::internal(e.to_string()))?;
+            run_plan_context_from_manifest(&stored, &bytes, &request)?
+        } else {
+            load_run_plan_context(&storage, &request).await?
+        };
         let spec = context.partitioning_spec.clone();
         plan_context = Some(context);
         spec
@@ -4317,13 +4455,11 @@ pub(crate) async fn trigger_run(
         (None, Vec::new())
     };
 
-    if let Some(ref run_key) = request.run_key {
+    if request.run_key.is_some() {
         let fingerprint_policy =
             FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
 
-        let existing = get_reservation(&storage, run_key)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to read run_key reservation: {e}")))?;
+        let existing = existing_reservation;
 
         if let Some(existing) = existing {
             let fingerprints_match = match (
@@ -4358,84 +4494,7 @@ pub(crate) async fn trigger_run(
                 ));
             }
 
-            let mut run_state = RunStateResponse::Pending;
-            let mut run_found = false;
-
-            match load_orchestration_state(&ctx, &state).await {
-                Ok(fold_state) => {
-                    if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                        let tasks: Vec<&TaskRow> = fold_state
-                            .tasks
-                            .values()
-                            .filter(|task| task.run_id == existing.run_id)
-                            .collect();
-                        run_state = map_run_row_state(run, &tasks);
-                        run_found = true;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        run_key = %existing.run_key,
-                        run_id = %existing.run_id,
-                        error = ?err,
-                        "failed to load orchestration state for run_key lookup"
-                    );
-                }
-            }
-
-            if !run_found {
-                if plan_context.is_none() {
-                    plan_context = Some(load_run_plan_context(&storage, &request).await?);
-                }
-                let Some(plan_context_ref) = plan_context.as_ref() else {
-                    return Err(ApiError::internal("internal error: missing plan context"));
-                };
-
-                let tasks = build_task_defs_for_request(
-                    plan_context_ref,
-                    &request,
-                    resolved_partition_key.canonical(),
-                )?;
-
-                let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
-                    let new_id = Ulid::new().to_string();
-                    tracing::warn!(
-                        run_key = %existing.run_key,
-                        run_id = %existing.run_id,
-                        "missing plan_event_id in reservation; generating new plan event id"
-                    );
-                    new_id
-                });
-
-                tracing::info!(
-                    manifest_id = %plan_context_ref.manifest_id,
-                    manifest_deployed_at = %plan_context_ref.deployed_at,
-                    run_id = %existing.run_id,
-                    "re-emitting run plan from latest manifest"
-                );
-
-                append_run_events(
-                    &state.config,
-                    storage.clone(),
-                    Some(ctx.request_id.as_str()),
-                    &ctx.tenant,
-                    &workspace_id,
-                    user_id.clone(),
-                    &existing.run_id,
-                    &existing.plan_id,
-                    Some(existing.run_key.clone()),
-                    request.labels.clone(),
-                    Some(plan_context_ref.code_version_id.clone()),
-                    plan_context_ref.root_assets.clone(),
-                    tasks,
-                    Some(RunEventOverrides {
-                        run_event_id: existing.event_id.clone(),
-                        plan_event_id,
-                        created_at: existing.created_at,
-                    }),
-                )
-                .await?;
-            }
+            let run_state = reconcile_reserved_plan(&state, &ctx, &storage, &existing).await?;
 
             return Ok((
                 StatusCode::OK,
@@ -4450,152 +4509,75 @@ pub(crate) async fn trigger_run(
         }
     }
 
-    // If run_key provided, attempt to reserve it (strong idempotency)
-    if let Some(ref run_key) = request.run_key {
-        // Ensure request is valid against the deployed manifest before reserving.
-        // This preserves the invariant: run_key is not reserved on BAD_REQUEST.
-        if plan_context.is_none() {
-            plan_context = Some(load_run_plan_context(&storage, &request).await?);
-        }
-
-        let run_event_id = Ulid::new().to_string();
-        let plan_event_id = Ulid::new().to_string();
+    if plan_context.is_none() {
+        plan_context = Some(load_run_plan_context(&storage, &request).await?);
+    }
+    let context = plan_context
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("missing plan context"))?;
+    let tasks = build_task_defs_for_request(context, &request, resolved_partition_key.canonical())?;
+    let task_payloads = tasks
+        .iter()
+        .map(|task| {
+            context
+                .task_payloads
+                .get(&task.key)
+                .cloned()
+                .map(|payload| (task.key.clone(), payload))
+                .ok_or_else(|| ApiError::internal("accepted task lacks execution declaration"))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let run_event_id = Ulid::new().to_string();
+    let plan_event_id = Ulid::new().to_string();
+    let accepted = arco_flow::orchestration::accepted_plan::AcceptedRunPlan {
+        version: 1,
+        manifest: Some(context.accepted_manifest.clone()),
+        task_payloads,
+        events: build_run_events(
+            &ctx.tenant,
+            &workspace_id,
+            user_id,
+            &run_id,
+            &plan_id,
+            request.run_key.clone(),
+            request.labels.clone(),
+            Some(context.code_version_id.clone()),
+            context.root_assets.clone(),
+            tasks,
+            Some(&RunEventOverrides {
+                run_event_id: run_event_id.clone(),
+                plan_event_id: plan_event_id.clone(),
+                created_at: now,
+            }),
+        ),
+    };
+    let sha256 = accepted
+        .persist(&storage, &run_id, &plan_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to freeze execution plan: {e}")))?;
+    if let Some(run_key) = &request.run_key {
         let reservation = RunKeyReservation {
             run_key: run_key.clone(),
             run_id: run_id.clone(),
             plan_id: plan_id.clone(),
-            event_id: run_event_id.clone(),
-            plan_event_id: Some(plan_event_id.clone()),
+            event_id: run_event_id,
+            plan_event_id: Some(plan_event_id),
             request_fingerprint: request_fingerprint.clone(),
+            accepted_plan_sha256: Some(sha256.clone()),
             created_at: now,
         };
-
-        let fingerprint_policy =
-            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff);
-        let reservation_result = reserve_run_key(&storage, &reservation, fingerprint_policy)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
-        let reservation_result = normalize_trigger_run_reservation_result(
-            reservation_result,
-            &request_fingerprint_variants,
-        );
-
-        match reservation_result {
-            ReservationResult::Reserved => {
-                // We won the race - proceed to emit events
-                tracing::debug!(run_key = %run_key, "run_key reserved, proceeding with run creation");
-                run_event_overrides = Some(RunEventOverrides {
-                    run_event_id,
-                    plan_event_id,
-                    created_at: now,
-                });
-            }
+        let result = reserve_run_key(
+            &storage,
+            &reservation,
+            FingerprintPolicy::from_cutoff(state.config.run_key_fingerprint_cutoff),
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?;
+        match normalize_trigger_run_reservation_result(result, &request_fingerprint_variants) {
+            ReservationResult::Reserved => {}
             ReservationResult::AlreadyExists(existing) => {
-                if let (Some(existing_fp), Some(_)) = (
-                    existing.request_fingerprint.as_deref(),
-                    request_fingerprint.as_deref(),
-                ) {
-                    if !request_fingerprint_variants
-                        .iter()
-                        .any(|fp| fp == existing_fp)
-                    {
-                        tracing::warn!(
-                            run_key = %existing.run_key,
-                            run_id = %existing.run_id,
-                            "run_key reused with different trigger payload"
-                        );
-                        return Err(run_key_conflict_error(
-                            &existing,
-                            request_fingerprint.as_deref(),
-                        ));
-                    }
-                } else if existing.request_fingerprint.is_none() && request_fingerprint.is_some() {
-                    tracing::warn!(
-                        run_key = %existing.run_key,
-                        run_id = %existing.run_id,
-                        "run_key reservation missing request_fingerprint; skipping payload validation"
-                    );
-                }
-
-                // Return existing run - check FoldState for current state if available
-                let mut run_state = RunStateResponse::Pending;
-                let mut run_found = false;
-
-                match load_orchestration_state(&ctx, &state).await {
-                    Ok(fold_state) => {
-                        if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                            let tasks: Vec<&TaskRow> = fold_state
-                                .tasks
-                                .values()
-                                .filter(|task| task.run_id == existing.run_id)
-                                .collect();
-                            run_state = map_run_row_state(run, &tasks);
-                            run_found = true;
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_key = %existing.run_key,
-                            run_id = %existing.run_id,
-                            error = ?err,
-                            "failed to load orchestration state for run_key lookup"
-                        );
-                    }
-                }
-
-                if !run_found {
-                    if plan_context.is_none() {
-                        plan_context = Some(load_run_plan_context(&storage, &request).await?);
-                    }
-                    let Some(plan_context_ref) = plan_context.as_ref() else {
-                        return Err(ApiError::internal("internal error: missing plan context"));
-                    };
-                    let tasks = build_task_defs_for_request(
-                        plan_context_ref,
-                        &request,
-                        resolved_partition_key.canonical(),
-                    )?;
-
-                    let plan_event_id = existing.plan_event_id.clone().unwrap_or_else(|| {
-                        let new_id = Ulid::new().to_string();
-                        tracing::warn!(
-                            run_key = %existing.run_key,
-                            run_id = %existing.run_id,
-                            "missing plan_event_id in reservation; generating new plan event id"
-                        );
-                        new_id
-                    });
-
-                    tracing::info!(
-                        manifest_id = %plan_context_ref.manifest_id,
-                        manifest_deployed_at = %plan_context_ref.deployed_at,
-                        run_id = %existing.run_id,
-                        "re-emitting run plan from latest manifest"
-                    );
-
-                    append_run_events(
-                        &state.config,
-                        storage.clone(),
-                        Some(ctx.request_id.as_str()),
-                        &ctx.tenant,
-                        &workspace_id,
-                        user_id.clone(),
-                        &existing.run_id,
-                        &existing.plan_id,
-                        Some(existing.run_key.clone()),
-                        request.labels.clone(),
-                        Some(plan_context_ref.code_version_id.clone()),
-                        plan_context_ref.root_assets.clone(),
-                        tasks,
-                        Some(RunEventOverrides {
-                            run_event_id: existing.event_id.clone(),
-                            plan_event_id,
-                            created_at: existing.created_at,
-                        }),
-                    )
-                    .await?;
-                }
-
+                // The concurrent winner's immutable plan owns this identity.
+                let run_state = reconcile_reserved_plan(&state, &ctx, &storage, &existing).await?;
                 return Ok((
                     StatusCode::OK,
                     Json(TriggerRunResponse {
@@ -4611,15 +4593,6 @@ pub(crate) async fn trigger_run(
                 existing,
                 requested_fingerprint,
             } => {
-                // The run_key was reserved with a different trigger payload.
-                // This is a client error - return 409 Conflict.
-                tracing::warn!(
-                    run_key = %existing.run_key,
-                    run_id = %existing.run_id,
-                    existing_fingerprint = ?existing.request_fingerprint,
-                    requested_fingerprint = ?requested_fingerprint,
-                    "run_key reused with different trigger payload (fingerprint mismatch)"
-                );
                 return Err(run_key_conflict_error(
                     &existing,
                     requested_fingerprint.as_deref(),
@@ -4627,44 +4600,11 @@ pub(crate) async fn trigger_run(
             }
         }
     }
-
-    if plan_context.is_none() {
-        plan_context = Some(load_run_plan_context(&storage, &request).await?);
-    }
-    let Some(plan_context_ref) = plan_context.as_ref() else {
-        return Err(ApiError::internal("internal error: missing plan context"));
-    };
-    let tasks = build_task_defs_for_request(
-        plan_context_ref,
-        &request,
-        resolved_partition_key.canonical(),
-    )?;
-
-    tracing::info!(
-        manifest_id = %plan_context_ref.manifest_id,
-        manifest_deployed_at = %plan_context_ref.deployed_at,
-        root_assets = ?plan_context_ref.root_assets,
-        include_upstream = request.include_upstream,
-        include_downstream = request.include_downstream,
-        planned_tasks = tasks.len(),
-        "planning run from latest manifest"
-    );
-
-    append_run_events(
+    append_events_and_compact(
         &state.config,
-        storage.clone(),
+        storage,
+        accepted.publication_events(&sha256),
         Some(ctx.request_id.as_str()),
-        &ctx.tenant,
-        &workspace_id,
-        user_id,
-        &run_id,
-        &plan_id,
-        request.run_key.clone(),
-        request.labels.clone(),
-        Some(plan_context_ref.code_version_id.clone()),
-        plan_context_ref.root_assets.clone(),
-        tasks,
-        run_event_overrides,
     )
     .await?;
 
@@ -4858,6 +4798,64 @@ pub(crate) async fn rerun_run(
     let run_event_id = Ulid::new().to_string();
     let plan_event_id = Ulid::new().to_string();
 
+    let parent_plan = if let Some(sha256) = parent_run
+        .labels
+        .get(arco_flow::orchestration::accepted_plan::ACCEPTED_PLAN_SHA256_LABEL)
+    {
+        Some(
+            arco_flow::orchestration::accepted_plan::load_accepted_run_plan(
+                &storage,
+                &parent_run.run_id,
+                &parent_run.plan_id,
+                sha256,
+            )
+            .await
+            .map_err(|e| ApiError::conflict(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let task_payloads = tasks
+        .iter()
+        .map(|task| {
+            let payload = if let Some(parent) = &parent_plan {
+                parent
+                    .task_payloads
+                    .get(&task.key)
+                    .cloned()
+                    .ok_or_else(|| ApiError::conflict("parent accepted payload missing"))?
+            } else {
+                serde_json::json!({})
+            };
+            Ok((task.key.clone(), payload))
+        })
+        .collect::<Result<BTreeMap<_, _>, ApiError>>()?;
+    let accepted = arco_flow::orchestration::accepted_plan::AcceptedRunPlan {
+        version: 1,
+        manifest: parent_plan.and_then(|p| p.manifest),
+        task_payloads,
+        events: build_run_events(
+            &ctx.tenant,
+            &workspace_id,
+            user_id_for_events(&ctx),
+            &run_id,
+            &plan_id,
+            Some(run_key.clone()),
+            labels,
+            parent_run.code_version.clone(),
+            root_assets,
+            tasks,
+            Some(&RunEventOverrides {
+                run_event_id: run_event_id.clone(),
+                plan_event_id: plan_event_id.clone(),
+                created_at: now,
+            }),
+        ),
+    };
+    let sha256 = accepted
+        .persist(&storage, &run_id, &plan_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let reservation = RunKeyReservation {
         run_key: run_key.clone(),
         run_id: run_id.clone(),
@@ -4865,64 +4863,17 @@ pub(crate) async fn rerun_run(
         event_id: run_event_id.clone(),
         plan_event_id: Some(plan_event_id.clone()),
         request_fingerprint: request_fingerprint.clone(),
+        accepted_plan_sha256: Some(sha256.clone()),
         created_at: now,
     };
 
-    let run_event_overrides = match reserve_run_key(&storage, &reservation, fingerprint_policy)
+    match reserve_run_key(&storage, &reservation, fingerprint_policy)
         .await
         .map_err(|e| ApiError::internal(format!("failed to reserve run_key: {e}")))?
     {
-        ReservationResult::Reserved => Some(RunEventOverrides {
-            run_event_id,
-            plan_event_id,
-            created_at: now,
-        }),
+        ReservationResult::Reserved => {}
         ReservationResult::AlreadyExists(existing) => {
-            let mut run_state = RunStateResponse::Pending;
-            let mut run_found = false;
-
-            if let Ok(fold_state) = load_orchestration_state(&ctx, &state).await {
-                if let Some(run) = fold_state.runs.get(&existing.run_id) {
-                    let tasks: Vec<&TaskRow> = fold_state
-                        .tasks
-                        .values()
-                        .filter(|task| task.run_id == existing.run_id)
-                        .collect();
-                    run_state = map_run_row_state(run, &tasks);
-                    run_found = true;
-                }
-            }
-
-            if !run_found {
-                let user_id = user_id_for_events(&ctx);
-                let plan_event_id = existing
-                    .plan_event_id
-                    .clone()
-                    .unwrap_or_else(|| Ulid::new().to_string());
-
-                append_run_events(
-                    &state.config,
-                    storage.clone(),
-                    Some(ctx.request_id.as_str()),
-                    &ctx.tenant,
-                    &workspace_id,
-                    user_id,
-                    &existing.run_id,
-                    &existing.plan_id,
-                    Some(existing.run_key.clone()),
-                    labels.clone(),
-                    parent_run.code_version.clone(),
-                    root_assets.clone(),
-                    tasks.clone(),
-                    Some(RunEventOverrides {
-                        run_event_id: existing.event_id.clone(),
-                        plan_event_id,
-                        created_at: existing.created_at,
-                    }),
-                )
-                .await?;
-            }
-
+            let run_state = reconcile_reserved_plan(&state, &ctx, &storage, &existing).await?;
             return Ok((
                 StatusCode::OK,
                 Json(RerunRunResponse {
@@ -4946,25 +4897,13 @@ pub(crate) async fn rerun_run(
                 requested_fingerprint.as_deref(),
             ));
         }
-    };
+    }
 
-    let user_id = user_id_for_events(&ctx);
-
-    append_run_events(
+    append_events_and_compact(
         &state.config,
-        storage.clone(),
+        storage,
+        accepted.publication_events(&sha256),
         Some(ctx.request_id.as_str()),
-        &ctx.tenant,
-        &workspace_id,
-        user_id,
-        &run_id,
-        &plan_id,
-        Some(run_key),
-        labels,
-        parent_run.code_version.clone(),
-        root_assets,
-        tasks,
-        run_event_overrides,
     )
     .await?;
 
@@ -6339,7 +6278,7 @@ pub(crate) async fn create_backfill(
         .await?
         .map(|manifest| manifest.code_version_id);
 
-    let response = append_backfill_created_event(
+    let response = Box::pin(append_backfill_created_event(
         state.as_ref(),
         &ctx,
         &workspace_id,
@@ -6347,7 +6286,7 @@ pub(crate) async fn create_backfill(
         &idempotency_key,
         &storage,
         fingerprint,
-    )
+    ))
     .await?;
 
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
@@ -7705,6 +7644,7 @@ mod tests {
             output_visibility_state: visibility_state,
             published_at: Some(Utc::now()),
             publish_error: publish_error.map(ToString::to_string),
+            publication: None,
             retry_not_before: None,
             delta_table: Some("analytics.daily".to_string()),
             delta_version: Some(7),
@@ -7746,14 +7686,11 @@ mod tests {
     }
 
     #[test]
-    fn test_map_run_row_state_treats_missing_visibility_as_succeeded_until_event_arrives() {
+    fn test_map_run_row_state_keeps_required_output_pending_without_visibility() {
         let run = visibility_run_row(FoldRunState::Succeeded);
         let task = visibility_task_row(true, None, None);
 
-        assert_eq!(
-            map_run_row_state(&run, &[&task]),
-            RunStateResponse::Succeeded
-        );
+        assert_eq!(map_run_row_state(&run, &[&task]), RunStateResponse::Running);
     }
 
     #[test]
@@ -8857,6 +8794,265 @@ mod tests {
         Ok(())
     }
 
+    async fn frozen_trigger_fixture() -> Result<(
+        Arc<FailLedgerPutsBackend>,
+        Arc<AppState>,
+        RequestContext,
+        ScopedStorage,
+        TriggerRunRequest,
+    )> {
+        let backend = Arc::new(FailLedgerPutsBackend::new());
+        let config = crate::config::Config {
+            debug: true,
+            ..Default::default()
+        };
+        let state = Arc::new(AppState::new(config, backend.clone()));
+        let ctx = RequestContext {
+            tenant: "tenant".into(),
+            workspace: "workspace".into(),
+            user_id: Some("user@example.com".into()),
+            groups: vec![],
+            request_id: "frozen-plan".into(),
+            idempotency_key: None,
+        };
+        let storage = ctx.scoped_storage(state.storage_backend()?)?;
+        seed_latest_manifest_code_version(&storage, &ctx, "manifest-a").await?;
+        let index: LatestManifestIndex =
+            serde_json::from_slice(&storage.get_raw(MANIFEST_LATEST_INDEX_PATH).await?)?;
+        let path = crate::paths::manifest_path(&index.latest_manifest_id);
+        let mut manifest: StoredManifest = serde_json::from_slice(&storage.get_raw(&path).await?)?;
+        manifest.assets[0].code = json!({"artifact": "sha256:code-a", "entrypoint": "compute"});
+        manifest.assets[0].execution = json!({"payload": {"sql": "select :value", "parameters": {"value": {"type": "int64", "value": 7}}}});
+        manifest.assets[0].resources = json!({"memoryBytes": 4096, "timeoutSeconds": 30});
+        manifest.assets[0].io =
+            json!({"inputs": [{"snapshotId": "input-a", "checksumSha256": "input-hash"}]});
+        storage
+            .put_raw(
+                &path,
+                Bytes::from(serde_json::to_vec(&manifest)?),
+                WritePrecondition::None,
+            )
+            .await?;
+        let request = TriggerRunRequest {
+            selection: vec!["analytics.daily".into()],
+            include_upstream: false,
+            include_downstream: false,
+            partitions: vec![],
+            partition_key: None,
+            run_key: Some("frozen-intent".into()),
+            labels: HashMap::new(),
+        };
+        Ok((backend, state, ctx, storage, request))
+    }
+
+    #[tokio::test]
+    async fn accepted_trigger_recovers_manifest_a_after_deployment_b() -> Result<()> {
+        for partial_publication in [false, true] {
+            let (backend, state, ctx, storage, request) = frozen_trigger_fixture().await?;
+            backend.set_fail_ledger_puts(true);
+            assert!(
+                trigger_run(
+                    State(state.clone()),
+                    ctx.clone(),
+                    Path(ctx.workspace.clone()),
+                    Json(request.clone())
+                )
+                .await
+                .is_err()
+            );
+            let reserved = get_reservation(&storage, "frozen-intent")
+                .await?
+                .expect("accepted reservation");
+            backend.set_fail_ledger_puts(false);
+            if partial_publication {
+                let accepted = load_reserved_plan(&storage, &reserved)
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+                let mut events = accepted
+                    .publication_events(reserved.accepted_plan_sha256.as_deref().expect("binding"));
+                events.truncate(1);
+                append_events_and_compact(&state.config, storage.clone(), events, None)
+                    .await
+                    .map_err(|e| anyhow!("{e:?}"))?;
+            }
+            seed_latest_manifest_code_version(&storage, &ctx, "manifest-b").await?;
+            let restarted = Arc::new(AppState::new(state.config.clone(), backend));
+            let response = trigger_run(
+                State(restarted),
+                ctx.clone(),
+                Path(ctx.workspace.clone()),
+                Json(request),
+            )
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let (_, folded) = MicroCompactor::new(storage.clone()).load_state().await?;
+            let run = folded.runs.get(&reserved.run_id).expect("recovered run");
+            assert_eq!(run.code_version.as_deref(), Some("manifest-a"));
+            let row = folded
+                .tasks
+                .get(&(reserved.run_id.clone(), "analytics.daily".into()))
+                .expect("recovered task");
+            let mut envelope =
+                arco_flow::orchestration::worker_contract::dispatch_envelope_for_attempt(
+                    arco_flow::orchestration::worker_contract::DispatchEnvelopeSpec {
+                        tenant_id: ctx.tenant.clone(),
+                        workspace_id: ctx.workspace.clone(),
+                        run_id: run.run_id.clone(),
+                        task_key: row.task_key.clone(),
+                        attempt: 1,
+                        attempt_id: "attempt-a".into(),
+                        dispatch_id: "dispatch-a".into(),
+                        worker_queue: "default-queue".into(),
+                        callback_base_url: "http://localhost".into(),
+                        task_token: "test".into(),
+                        token_expires_at: Utc::now(),
+                    },
+                    Some(row),
+                );
+            arco_flow::orchestration::accepted_plan::populate_accepted_payload(
+                &storage,
+                run,
+                &mut envelope,
+            )
+            .await?;
+            assert_eq!(
+                envelope.payload["asset"]["code"]["artifact"],
+                "sha256:code-a"
+            );
+            assert_eq!(
+                envelope.payload["asset"]["execution"]["payload"]["parameters"]["value"]["value"],
+                7
+            );
+            assert_eq!(
+                envelope.payload["asset"]["io"]["inputs"][0]["snapshotId"],
+                "input-a"
+            );
+            assert_eq!(envelope.payload["asset"]["resources"]["memoryBytes"], 4096);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_trigger_blocks_missing_corrupt_and_legacy_proof() -> Result<()> {
+        for failure in [
+            "missing-plan",
+            "corrupt-plan",
+            "corrupt-manifest",
+            "legacy-reservation",
+        ] {
+            let (backend, state, ctx, storage, request) = frozen_trigger_fixture().await?;
+            backend.set_fail_ledger_puts(true);
+            assert!(
+                trigger_run(
+                    State(state.clone()),
+                    ctx.clone(),
+                    Path(ctx.workspace.clone()),
+                    Json(request.clone())
+                )
+                .await
+                .is_err()
+            );
+            backend.set_fail_ledger_puts(false);
+            let mut reserved = get_reservation(&storage, "frozen-intent")
+                .await?
+                .expect("reservation");
+            let accepted = load_reserved_plan(&storage, &reserved)
+                .await
+                .map_err(|e| anyhow!("{e:?}"))?;
+            let path = format!("accepted_plans/{}.json", reserved.plan_id);
+            match failure {
+                "missing-plan" => {
+                    storage.delete(&path).await?;
+                }
+                "corrupt-plan" => {
+                    storage
+                        .put_raw(&path, Bytes::from_static(b"{}"), WritePrecondition::None)
+                        .await?;
+                }
+                "corrupt-manifest" => {
+                    let path = crate::paths::manifest_path(
+                        &accepted.manifest.expect("manifest").manifest_id,
+                    );
+                    storage
+                        .put_raw(&path, Bytes::from_static(b"{}"), WritePrecondition::None)
+                        .await?;
+                }
+                _ => {
+                    reserved.accepted_plan_sha256 = None;
+                    storage
+                        .put_raw(
+                            &reservation_path(&reserved.run_key),
+                            Bytes::from(serde_json::to_vec(&reserved)?),
+                            WritePrecondition::None,
+                        )
+                        .await?;
+                }
+            }
+            seed_latest_manifest_code_version(&storage, &ctx, "manifest-b").await?;
+            let response = trigger_run(
+                State(state),
+                ctx.clone(),
+                Path(ctx.workspace.clone()),
+                Json(request),
+            )
+            .await;
+            assert!(response.is_err(), "{failure} must block recovery");
+            let (_, folded) = MicroCompactor::new(storage).load_state().await?;
+            assert!(
+                folded.runs.is_empty(),
+                "{failure} must not rebuild from latest manifest"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_trigger_concurrent_replay_reconciles_one_identity_and_conflicts_on_changes()
+    -> Result<()> {
+        let (_, state, ctx, storage, request) = frozen_trigger_fixture().await?;
+        let (left, right) = tokio::join!(
+            trigger_run(
+                State(state.clone()),
+                ctx.clone(),
+                Path(ctx.workspace.clone()),
+                Json(request.clone())
+            ),
+            trigger_run(
+                State(state.clone()),
+                ctx.clone(),
+                Path(ctx.workspace.clone()),
+                Json(request.clone())
+            )
+        );
+        let left = left.map_err(|e| anyhow!("{e:?}"))?.into_response();
+        let right = right.map_err(|e| anyhow!("{e:?}"))?.into_response();
+        let left: TriggerRunResponse =
+            serde_json::from_slice(&axum::body::to_bytes(left.into_body(), 4096).await?)?;
+        let right: TriggerRunResponse =
+            serde_json::from_slice(&axum::body::to_bytes(right.into_body(), 4096).await?)?;
+        assert_eq!(left.run_id, right.run_id);
+        assert_eq!(left.plan_id, right.plan_id);
+        let (_, folded) = MicroCompactor::new(storage).load_state().await?;
+        assert_eq!(folded.runs.len(), 1);
+        let mut changed = request;
+        changed
+            .labels
+            .insert("changed-intent".into(), "true".into());
+        assert!(
+            trigger_run(
+                State(state),
+                ctx.clone(),
+                Path(ctx.workspace.clone()),
+                Json(changed)
+            )
+            .await
+            .is_err()
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_trigger_run_reemits_when_reservation_exists() -> Result<()> {
         let config = crate::config::Config {
@@ -8942,7 +9138,7 @@ mod tests {
         let partitioning = PartitioningSpec::default();
         let resolved_partition_key = resolve_partition_key(&request, &partitioning, None)
             .map_err(|err| anyhow!("{err:?}"))?;
-        let reservation = RunKeyReservation {
+        let mut reservation = RunKeyReservation {
             run_key: "daily:2024-01-01".to_string(),
             run_id: Ulid::new().to_string(),
             plan_id: Ulid::new().to_string(),
@@ -8957,8 +9153,43 @@ mod tests {
                     .find(|fp| fp != &primary)
                     .unwrap_or(primary)
             }),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
+
+        let context = load_run_plan_context(&storage, &request)
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        let tasks =
+            build_task_defs_for_request(&context, &request, resolved_partition_key.canonical())
+                .map_err(|e| anyhow!("{e:?}"))?;
+        let accepted = arco_flow::orchestration::accepted_plan::AcceptedRunPlan {
+            version: 1,
+            manifest: Some(context.accepted_manifest),
+            task_payloads: context.task_payloads,
+            events: build_run_events(
+                &ctx.tenant,
+                &ctx.workspace,
+                user_id_for_events(&ctx),
+                &reservation.run_id,
+                &reservation.plan_id,
+                Some(reservation.run_key.clone()),
+                request.labels.clone(),
+                Some("abc123".into()),
+                context.root_assets,
+                tasks,
+                Some(&RunEventOverrides {
+                    run_event_id: reservation.event_id.clone(),
+                    plan_event_id: reservation.plan_event_id.clone().expect("plan event"),
+                    created_at: reservation.created_at,
+                }),
+            ),
+        };
+        reservation.accepted_plan_sha256 = Some(
+            accepted
+                .persist(&storage, &reservation.run_id, &reservation.plan_id)
+                .await?,
+        );
 
         let reserved =
             reserve_run_key(&storage, &reservation, FingerprintPolicy::lenient()).await?;
@@ -9239,6 +9470,7 @@ mod tests {
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
             request_fingerprint: Some(legacy),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
 
@@ -9253,6 +9485,7 @@ mod tests {
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
             request_fingerprint: Some(primary),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
 
@@ -9322,6 +9555,7 @@ mod tests {
                 build_request_fingerprint(&request_a, &resolved_a)
                     .map_err(|err| anyhow!("{err:?}"))?,
             ),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
 
@@ -9497,6 +9731,7 @@ mod tests {
             event_id: Ulid::new().to_string(),
             plan_event_id: Some(Ulid::new().to_string()),
             request_fingerprint: None,
+            accepted_plan_sha256: None,
             created_at: cutoff - Duration::hours(1),
         };
 
@@ -9579,6 +9814,7 @@ mod tests {
                 build_request_fingerprint(&request_a, &resolved_a)
                     .map_err(|err| anyhow!("{err:?}"))?,
             ),
+            accepted_plan_sha256: None,
             created_at: Utc::now(),
         };
 

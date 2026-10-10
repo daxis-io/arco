@@ -56,13 +56,17 @@
 //! force-rebind escape hatch.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use arco_catalog::manifest::SnapshotInfo;
 use arco_catalog::state_store::projection_outbox_acks::{
     AckOnlyProjectionHandler, ProjectionOutboxWorker,
 };
@@ -72,6 +76,11 @@ use arco_catalog::state_store::shadow_replay::{
 use arco_catalog::{
     CATALOG_PARQUET_PROJECTION_CONSUMER_ID, CatalogError, CatalogProjectionMaterializer,
 };
+use arco_catalog::{
+    CatalogAuthorityKind, CatalogDomainManifest, DomainManifestPointer, is_projection_only_artifact,
+};
+use arco_core::storage::ObjectMeta;
+use arco_core::{CatalogDomain, CatalogPaths, ScopedStorage};
 
 use crate::context::RequestContext;
 use crate::error::ApiError;
@@ -88,6 +97,427 @@ pub fn routes() -> Router<Arc<AppState>> {
             post(projection_outbox_handler),
         )
         .route("/control-store/shadow-import", post(shadow_import_handler))
+        .route(
+            "/control-store/catalog-projection/urls",
+            post(catalog_projection_urls_handler),
+        )
+}
+
+const CATALOG_READ_DESCRIPTOR_VERSION: u32 = 1;
+const CATALOG_READ_URL_TTL_SECONDS: u64 = 900;
+const CATALOG_READ_FILES: [&str; 4] = [
+    "catalogs.parquet",
+    "namespaces.parquet",
+    "tables.parquet",
+    "columns.parquet",
+];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjectionReadDescriptor {
+    descriptor_version: u32,
+    scope: CatalogProjectionReadScope,
+    authority: CatalogProjectionReadAuthority,
+    projection: CatalogProjectionReadCut,
+    ttl_seconds: u64,
+    files: Vec<CatalogProjectionReadFile>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjectionReadScope {
+    tenant_id: String,
+    workspace_id: String,
+    domain: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjectionReadAuthority {
+    kind: &'static str,
+    manifest_id: String,
+    sequence: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjectionReadCut {
+    sequence: u64,
+    manifest_path: String,
+    manifest_checksum_sha256: String,
+    manifest_storage_version: String,
+    manifest_etag: Option<String>,
+    published_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogProjectionReadFile {
+    path: String,
+    format: &'static str,
+    checksum_sha256: String,
+    byte_size: u64,
+    row_count: u64,
+    storage_version: String,
+    etag: Option<String>,
+    url: String,
+}
+
+enum CatalogProjectionReadWitness {
+    Legacy {
+        pointer_path: String,
+        pointer_bytes: Bytes,
+    },
+    ControlV1,
+}
+
+struct CatalogProjectionReadSource {
+    authority_kind: &'static str,
+    authority_manifest_id: String,
+    authority_sequence: u64,
+    projection_sequence: u64,
+    manifest_path: String,
+    manifest_bytes: Bytes,
+    snapshot: SnapshotInfo,
+    witness: CatalogProjectionReadWitness,
+}
+
+/// Mint one complete, immutable catalog read set for a verified operator scope.
+async fn catalog_projection_urls_handler(
+    State(state): State<Arc<AppState>>,
+    ctx: RequestContext,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    authorize_operator(&state, &ctx, "control-store/catalog-projection/urls")?;
+    if !body.is_empty() && body.as_ref() != b"{}" {
+        return Err(ApiError::bad_request(
+            "catalog projection URL requests take no selectors",
+        ));
+    }
+    let storage = ctx.scoped_storage(state.storage_backend()?)?;
+    let source = load_catalog_read_source(&state, &ctx, &storage).await?;
+    validate_catalog_read_source(&source)?;
+
+    // Every allowlisted object must exist at the declared size before any URL
+    // is minted. The second metadata pass below fences replacements during the
+    // request without downloading whole Parquet objects.
+    let manifest_meta = checked_head(&storage, &source.manifest_path, None).await?;
+    let mut checked_files = Vec::with_capacity(CATALOG_READ_FILES.len());
+    for name in CATALOG_READ_FILES {
+        let file = source
+            .snapshot
+            .files
+            .iter()
+            .find(|file| file.path == name)
+            .ok_or_else(ApiError::catalog_projection_unavailable)?;
+        let path = format!(
+            "{}/{}",
+            source.snapshot.path.trim_end_matches('/'),
+            file.path
+        );
+        if is_projection_only_artifact(&path) {
+            return Err(ApiError::catalog_projection_unavailable());
+        }
+        let meta = checked_head(&storage, &path, Some(file.byte_size)).await?;
+        checked_files.push((file, path, meta));
+    }
+
+    let mut files = Vec::with_capacity(CATALOG_READ_FILES.len());
+    for (file, path, meta) in &checked_files {
+        files.push(CatalogProjectionReadFile {
+            path: path.clone(),
+            format: "parquet",
+            checksum_sha256: file.checksum_sha256.clone(),
+            byte_size: file.byte_size,
+            row_count: file.row_count,
+            storage_version: meta.version.clone(),
+            etag: meta.etag.clone(),
+            url: storage
+                .signed_url_raw(path, Duration::from_secs(CATALOG_READ_URL_TTL_SECONDS))
+                .await?,
+        });
+    }
+    verify_catalog_read_cut(&storage, &source, &manifest_meta, &checked_files).await?;
+
+    crate::metrics::record_signed_urls_minted(files.len());
+    Ok(Json(CatalogProjectionReadDescriptor {
+        descriptor_version: CATALOG_READ_DESCRIPTOR_VERSION,
+        scope: CatalogProjectionReadScope {
+            tenant_id: ctx.tenant.clone(),
+            workspace_id: ctx.workspace.clone(),
+            domain: "catalog",
+        },
+        authority: CatalogProjectionReadAuthority {
+            kind: source.authority_kind,
+            manifest_id: source.authority_manifest_id,
+            sequence: source.authority_sequence,
+        },
+        projection: CatalogProjectionReadCut {
+            sequence: source.projection_sequence,
+            manifest_path: source.manifest_path,
+            manifest_checksum_sha256: hex::encode(Sha256::digest(&source.manifest_bytes)),
+            manifest_storage_version: manifest_meta.version,
+            manifest_etag: manifest_meta.etag,
+            published_at: source.snapshot.published_at,
+        },
+        ttl_seconds: CATALOG_READ_URL_TTL_SECONDS,
+        files,
+    }))
+}
+
+async fn load_catalog_read_source(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+) -> Result<CatalogProjectionReadSource, ApiError> {
+    match state
+        .catalog_authority_bindings()
+        .resolve(&ctx.tenant, &ctx.workspace)
+    {
+        CatalogAuthorityKind::Legacy => {
+            let pointer_path = CatalogPaths::domain_manifest_pointer(CatalogDomain::Catalog);
+            let pointer_bytes = storage
+                .get_raw(&pointer_path)
+                .await
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            let pointer: DomainManifestPointer = serde_json::from_slice(&pointer_bytes)
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            let manifest_path = CatalogPaths::domain_manifest_snapshot(
+                CatalogDomain::Catalog,
+                &pointer.manifest_id,
+            );
+            if pointer.manifest_path != manifest_path {
+                return Err(ApiError::catalog_projection_unavailable());
+            }
+            let manifest_bytes = storage
+                .get_raw(&manifest_path)
+                .await
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            let manifest: CatalogDomainManifest = serde_json::from_slice(&manifest_bytes)
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            if manifest.manifest_id != pointer.manifest_id {
+                return Err(ApiError::catalog_projection_unavailable());
+            }
+            let snapshot = manifest
+                .snapshot
+                .ok_or_else(ApiError::catalog_projection_unavailable)?;
+            Ok(CatalogProjectionReadSource {
+                authority_kind: "legacy",
+                authority_manifest_id: pointer.manifest_id,
+                authority_sequence: manifest.snapshot_version,
+                projection_sequence: manifest.snapshot_version,
+                manifest_path,
+                manifest_bytes,
+                snapshot,
+                witness: CatalogProjectionReadWitness::Legacy {
+                    pointer_path,
+                    pointer_bytes,
+                },
+            })
+        }
+        CatalogAuthorityKind::ControlV1 => {
+            let materializer =
+                CatalogProjectionMaterializer::new(storage.clone()).map_err(control_store_error)?;
+            let status = materializer
+                .status()
+                .await
+                .map_err(control_store_error)?
+                .ok_or_else(ApiError::catalog_projection_unavailable)?;
+            let backlog = ProjectionOutboxWorker::new(
+                storage.clone(),
+                "catalog",
+                CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+            )
+            .map_err(control_store_error)?
+            .backlog()
+            .await
+            .map_err(control_store_error)?;
+            let sequence = status
+                .applied_authority_sequence()
+                .ok_or_else(ApiError::catalog_projection_unavailable)?;
+            if status.failure_state().is_some()
+                || status.observed_authority_sequence() != Some(sequence)
+                || backlog.committed_sequence != Some(sequence)
+                || !backlog.pending_record_ids.is_empty()
+            {
+                return Err(ApiError::catalog_projection_unavailable());
+            }
+            let manifest_path = status
+                .artifact_manifest_path()
+                .filter(|path| !path.contains(".."))
+                .ok_or_else(ApiError::catalog_projection_unavailable)?
+                .to_string();
+            let authority_manifest_id = control_projection_manifest_id(&manifest_path, sequence)
+                .ok_or_else(ApiError::catalog_projection_unavailable)?;
+            let manifest_bytes = storage
+                .get_raw(&manifest_path)
+                .await
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            let snapshot: SnapshotInfo = serde_json::from_slice(&manifest_bytes)
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            Ok(CatalogProjectionReadSource {
+                authority_kind: "controlV1",
+                authority_manifest_id,
+                authority_sequence: sequence,
+                projection_sequence: sequence,
+                manifest_path,
+                manifest_bytes,
+                snapshot,
+                witness: CatalogProjectionReadWitness::ControlV1,
+            })
+        }
+    }
+}
+
+fn validate_catalog_read_source(source: &CatalogProjectionReadSource) -> Result<(), ApiError> {
+    let directory = source
+        .manifest_path
+        .strip_suffix("manifest.json")
+        .unwrap_or_default();
+    let declared_bytes = source
+        .snapshot
+        .files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.byte_size));
+    let declared_rows = source
+        .snapshot
+        .files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.row_count));
+    if CATALOG_READ_FILES.iter().any(|name| {
+        source
+            .snapshot
+            .files
+            .iter()
+            .filter(|file| file.path == *name)
+            .count()
+            != 1
+    }) || source.snapshot.version != source.projection_sequence
+        || source.snapshot.files.iter().any(|file| {
+            file.path.contains('/')
+                || file.path.contains("..")
+                || !is_sha256_hex(&file.checksum_sha256)
+        })
+        || declared_bytes != Some(source.snapshot.total_bytes)
+        || declared_rows != Some(source.snapshot.total_rows)
+        || (source.manifest_path.starts_with("control/v1/") && source.snapshot.path != directory)
+        || (!source.manifest_path.starts_with("control/v1/")
+            && (!source
+                .snapshot
+                .path
+                .starts_with(&CatalogPaths::snapshot_dir(
+                    CatalogDomain::Catalog,
+                    source.snapshot.version,
+                ))
+                || !source.snapshot.path.ends_with('/')
+                || source.snapshot.path.contains("..")))
+    {
+        return Err(ApiError::catalog_projection_unavailable());
+    }
+    Ok(())
+}
+
+fn control_projection_manifest_id(path: &str, sequence: u64) -> Option<String> {
+    let directory = path
+        .strip_prefix("control/v1/projections/catalog-parquet/")?
+        .strip_suffix("/manifest.json")?;
+    let (encoded_sequence, manifest_id) = directory.split_once('-')?;
+    (encoded_sequence.len() == 20
+        && encoded_sequence.parse::<u64>().ok() == Some(sequence)
+        && !manifest_id.is_empty()
+        && !manifest_id.contains('/'))
+    .then(|| manifest_id.to_string())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn checked_head(
+    storage: &ScopedStorage,
+    path: &str,
+    expected_size: Option<u64>,
+) -> Result<ObjectMeta, ApiError> {
+    let meta = storage
+        .head_raw(path)
+        .await
+        .map_err(|_| ApiError::catalog_projection_unavailable())?
+        .ok_or_else(ApiError::catalog_projection_unavailable)?;
+    if meta.version.is_empty() || expected_size.is_some_and(|size| meta.size != size) {
+        return Err(ApiError::catalog_projection_unavailable());
+    }
+    Ok(meta)
+}
+
+async fn verify_catalog_read_cut(
+    storage: &ScopedStorage,
+    source: &CatalogProjectionReadSource,
+    manifest_meta: &ObjectMeta,
+    files: &[(&arco_catalog::manifest::SnapshotFile, String, ObjectMeta)],
+) -> Result<(), ApiError> {
+    let final_manifest_bytes = storage
+        .get_raw(&source.manifest_path)
+        .await
+        .map_err(|_| ApiError::catalog_projection_unavailable())?;
+    let final_manifest_meta = checked_head(storage, &source.manifest_path, None).await?;
+    if final_manifest_bytes != source.manifest_bytes
+        || final_manifest_meta.version != manifest_meta.version
+        || final_manifest_meta.size != manifest_meta.size
+        || final_manifest_meta.etag != manifest_meta.etag
+    {
+        return Err(ApiError::catalog_projection_unavailable());
+    }
+    for (file, path, initial) in files {
+        let final_meta = checked_head(storage, path, Some(file.byte_size)).await?;
+        if final_meta.version != initial.version
+            || final_meta.size != initial.size
+            || final_meta.etag != initial.etag
+        {
+            return Err(ApiError::catalog_projection_unavailable());
+        }
+    }
+    match &source.witness {
+        CatalogProjectionReadWitness::Legacy {
+            pointer_path,
+            pointer_bytes,
+        } => {
+            let final_pointer = storage
+                .get_raw(pointer_path)
+                .await
+                .map_err(|_| ApiError::catalog_projection_unavailable())?;
+            if final_pointer != *pointer_bytes {
+                return Err(ApiError::catalog_projection_unavailable());
+            }
+        }
+        CatalogProjectionReadWitness::ControlV1 => {
+            let materializer =
+                CatalogProjectionMaterializer::new(storage.clone()).map_err(control_store_error)?;
+            let status = materializer
+                .status()
+                .await
+                .map_err(control_store_error)?
+                .ok_or_else(ApiError::catalog_projection_unavailable)?;
+            let backlog = ProjectionOutboxWorker::new(
+                storage.clone(),
+                "catalog",
+                CATALOG_PARQUET_PROJECTION_CONSUMER_ID,
+            )
+            .map_err(control_store_error)?
+            .backlog()
+            .await
+            .map_err(control_store_error)?;
+            if status.failure_state().is_some()
+                || status.applied_authority_sequence() != Some(source.projection_sequence)
+                || status.observed_authority_sequence() != Some(source.projection_sequence)
+                || status.artifact_manifest_path() != Some(source.manifest_path.as_str())
+                || backlog.committed_sequence != Some(source.authority_sequence)
+                || !backlog.pending_record_ids.is_empty()
+            {
+                return Err(ApiError::catalog_projection_unavailable());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Operator request against one source domain's projection outbox.

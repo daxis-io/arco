@@ -22,9 +22,10 @@ use axum::http::header::HeaderName;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::context::{REQUEST_ID_HEADER, RequestContext};
 use crate::error::{ApiError, ApiErrorBody};
@@ -33,9 +34,9 @@ use crate::server::AppState;
 
 use arco_core::{TaskTokenClaims, TaskTokenConfig, decode_task_token};
 use arco_flow::orchestration::callbacks::{
-    CallbackContext, CallbackError, CallbackResult, TaskState as CallbackTaskState,
-    TaskStateLookup, TaskTokenValidator, handle_heartbeat, handle_task_completed,
-    handle_task_started,
+    CallbackContext, CallbackError, CallbackResult, ScopedStoragePublicationVerifier,
+    TaskState as CallbackTaskState, TaskStateLookup, TaskTokenValidator, handle_heartbeat,
+    handle_task_completed, handle_task_started,
 };
 use arco_flow::orchestration::compactor::{
     FoldState, MicroCompactor, TaskRow, TaskState as FoldTaskState,
@@ -43,8 +44,9 @@ use arco_flow::orchestration::compactor::{
 use arco_worker_contract::parse_callback_task_id;
 pub use arco_worker_contract::{
     CallbackErrorResponse, ErrorCategory, HeartbeatRequest, HeartbeatResponse,
-    TaskCompletedRequest, TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput,
-    TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+    PublicationDescriptor, PublicationOwnerEvidence, TaskCompletedRequest, TaskCompletedResponse,
+    TaskError, TaskMetrics, TaskOutput, TaskOutputVisibilityState, TaskStartedRequest,
+    TaskStartedResponse, WorkerOutcome,
 };
 use ulid::Ulid;
 
@@ -164,6 +166,38 @@ impl ParquetTaskStateLookup {
             run_id_scope,
         })
     }
+
+    fn get_task_row(&self, task_id: &str) -> Result<Option<TaskRow>, String> {
+        let parsed = parse_callback_task_id(task_id).ok();
+        if let Some(run_id) = &self.run_id_scope {
+            let task_key = match &parsed {
+                Some(parsed) if &parsed.run_id == run_id => &parsed.task_key,
+                Some(_) => return Ok(None),
+                None => task_id,
+            };
+            return Ok(self
+                .state
+                .tasks
+                .get(&(run_id.clone(), task_key.to_string()))
+                .cloned());
+        }
+        let matches: Vec<_> = self
+            .state
+            .tasks
+            .values()
+            .filter(|row| {
+                parsed.as_ref().map_or_else(
+                    || row.task_key == task_id,
+                    |parsed| row.run_id == parsed.run_id && row.task_key == parsed.task_key,
+                )
+            })
+            .cloned()
+            .collect();
+        if parsed.is_none() && matches.len() > 1 {
+            return Err(format!("task_id_ambiguous: {task_id}"));
+        }
+        Ok(matches.into_iter().next())
+    }
 }
 
 impl TaskStateLookup for ParquetTaskStateLookup {
@@ -215,6 +249,13 @@ impl TaskStateLookup for ParquetTaskStateLookup {
             Ok(Some(callback_task_state_from_row(&state, row)))
         }
     }
+
+    async fn get_task_publication(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<PublicationDescriptor>, String> {
+        Ok(self.get_task_row(task_id)?.and_then(|row| row.publication))
+    }
 }
 
 fn callback_task_state_from_row(state: &FoldState, row: &TaskRow) -> CallbackTaskState {
@@ -231,6 +272,7 @@ fn callback_task_state_from_row(state: &FoldState, row: &TaskRow) -> CallbackTas
         partition_key: row.partition_key.clone(),
         code_version,
         cancel_requested,
+        requires_visible_output: row.requires_visible_output,
     }
 }
 
@@ -420,6 +462,7 @@ async fn build_callback_dependencies(
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
     let lookup = ParquetTaskStateLookup::load(storage.clone(), run_id_scope).await?;
+    let verifier = Arc::new(ScopedStoragePublicationVerifier::new(storage.clone()));
     let ledger = Arc::new(CompactingLedgerWriter::new(storage, state.config.clone()));
     let debug_allowed = state.config.debug && state.config.posture.is_dev();
     let validator = Arc::new(JwtTaskTokenValidator::new(
@@ -429,7 +472,8 @@ async fn build_callback_dependencies(
         debug_allowed,
     )?);
     let callback_ctx =
-        CallbackContext::new(ledger, validator, ctx.tenant.clone(), ctx.workspace.clone());
+        CallbackContext::new(ledger, validator, ctx.tenant.clone(), ctx.workspace.clone())
+            .with_publication_verifier(verifier);
 
     Ok((callback_ctx, lookup))
 }
@@ -513,7 +557,14 @@ pub(crate) async fn task_started(
         }
     };
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
-    let result = handle_task_started(&callback_ctx, &task_id, &token, request, &lookup).await;
+    let result = Box::pin(handle_task_started(
+        &callback_ctx,
+        &task_id,
+        &token,
+        request,
+        &lookup,
+    ))
+    .await;
 
     callback_result_response(result)
 }
@@ -571,7 +622,14 @@ pub(crate) async fn task_heartbeat(
         }
     };
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
-    let result = handle_heartbeat(&callback_ctx, &task_id, &token, request, &lookup).await;
+    let result = Box::pin(handle_heartbeat(
+        &callback_ctx,
+        &task_id,
+        &token,
+        request,
+        &lookup,
+    ))
+    .await;
 
     callback_result_response(result)
 }
@@ -630,9 +688,95 @@ pub(crate) async fn task_completed(
         }
     };
     let (callback_ctx, lookup) = build_callback_dependencies(&ctx, &state, run_id_scope).await?;
-    let result = handle_task_completed(&callback_ctx, &task_id, &token, request, &lookup).await;
+    let result = Box::pin(handle_task_completed(
+        &callback_ctx,
+        &task_id,
+        &token,
+        request,
+        &lookup,
+    ))
+    .await;
 
     callback_result_response(result)
+}
+
+/// Owner-verified publication descriptor for one completed task attempt.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationInspectionResponse {
+    /// Run identifier.
+    pub run_id: String,
+    /// Semantic task key.
+    pub task_key: String,
+    /// Verified attempt number.
+    pub attempt: u32,
+    /// Verified attempt identifier.
+    pub attempt_id: String,
+    /// Immutable descriptor carrying owner verification evidence.
+    pub publication: PublicationDescriptor,
+}
+
+fn publication_inspection_from_row(
+    row: TaskRow,
+) -> Result<PublicationInspectionResponse, ApiError> {
+    if row.output_visibility_state
+        != Some(arco_flow::orchestration::events::OutputVisibilityState::Visible)
+    {
+        return Err(ApiError::conflict("publication is not owner verified"));
+    }
+    let publication = row
+        .publication
+        .filter(|publication| publication.owner_evidence.is_some())
+        .ok_or_else(|| ApiError::conflict("publication owner evidence is unavailable"))?;
+    let attempt_id = row
+        .attempt_id
+        .ok_or_else(|| ApiError::conflict("publication attempt identity is unavailable"))?;
+    Ok(PublicationInspectionResponse {
+        run_id: row.run_id,
+        task_key: row.task_key,
+        attempt: row.attempt,
+        attempt_id,
+        publication,
+    })
+}
+
+/// Returns a publication only after owner verification for the authenticated task scope.
+#[utoipa::path(
+    get,
+    path = "/api/v1/tasks/{task_id}/publication",
+    params(("task_id" = String, Path, description = "Task ID")),
+    responses(
+        (status = 200, description = "Owner-verified publication", body = PublicationInspectionResponse),
+        (status = 401, description = "Invalid or missing task token", body = ApiErrorBody),
+        (status = 404, description = "Task or verified publication not found", body = ApiErrorBody),
+        (status = 409, description = "Publication remains unverified", body = ApiErrorBody),
+    ),
+    tag = "Worker Callbacks",
+    security(("taskAuth" = []))
+)]
+pub(crate) async fn inspect_publication(
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
+    claims: Option<Extension<TaskTokenClaims>>,
+    Path(task_id): Path<String>,
+) -> Result<Json<PublicationInspectionResponse>, ApiError> {
+    let run_id_scope = scoped_run_id_from_claims(claims.as_ref(), &task_id)
+        .map_err(|error| ApiError::unauthorized(error.message))?;
+    let storage = ctx.scoped_storage(state.storage_backend()?)?;
+    let lookup = ParquetTaskStateLookup::load(storage, run_id_scope).await?;
+    let row = lookup
+        .get_task_row(&task_id)
+        .map_err(ApiError::bad_request)?
+        .ok_or_else(|| ApiError::not_found("task not found"))?;
+
+    if let Some(Extension(claims)) = claims {
+        if claims.attempt != Some(row.attempt)
+            || claims.attempt_id.as_deref() != row.attempt_id.as_deref()
+        {
+            return Err(ApiError::unauthorized("task attempt scope mismatch"));
+        }
+    }
+    Ok(Json(publication_inspection_from_row(row)?))
 }
 
 // ============================================================================
@@ -645,6 +789,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/tasks/:task_id/started", post(task_started))
         .route("/tasks/:task_id/heartbeat", post(task_heartbeat))
         .route("/tasks/:task_id/completed", post(task_completed))
+        .route("/tasks/:task_id/publication", get(inspect_publication))
 }
 
 #[cfg(test)]
@@ -697,6 +842,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: None,
             delta_version: None,
@@ -801,6 +947,7 @@ mod tests {
             output_visibility_state: Some(TaskOutputVisibilityState::Visible),
             published_at: Some(Utc::now()),
             publish_error: None,
+            publication: None,
         };
 
         assert_eq!(output.delta_table.as_deref(), Some("analytics.daily"));
@@ -810,6 +957,35 @@ mod tests {
             output.output_visibility_state,
             Some(TaskOutputVisibilityState::Visible)
         );
+    }
+
+    #[test]
+    fn publication_inspection_requires_visible_owner_evidence() {
+        let mut row = task_row("run-1", "extract");
+        let unverified = publication_inspection_from_row(row.clone()).unwrap_err();
+        assert_eq!(unverified.into_response().status(), StatusCode::CONFLICT);
+
+        row.output_visibility_state =
+            Some(arco_flow::orchestration::events::OutputVisibilityState::Visible);
+        row.publication = Some(PublicationDescriptor {
+            version: 1,
+            manifest_id: format!("sha256:{}", "a".repeat(64)),
+            object_path: "outputs/result.parquet".to_string(),
+            object_version: "7".to_string(),
+            checksum_sha256: "a".repeat(64),
+            byte_size: 4,
+            format: "parquet".to_string(),
+            schema_ref: format!("sha256:{}#parquet-schema", "a".repeat(64)),
+            owner_evidence: Some(PublicationOwnerEvidence {
+                verified_at: Utc::now(),
+                object_version: "7".to_string(),
+                etag: Some("etag-7".to_string()),
+            }),
+        });
+
+        let inspected = publication_inspection_from_row(row).expect("verified publication");
+        assert_eq!(inspected.run_id, "run-1");
+        assert_eq!(inspected.publication.object_version, "7");
     }
 
     #[tokio::test]
@@ -1400,6 +1576,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: None,
             delta_version: None,

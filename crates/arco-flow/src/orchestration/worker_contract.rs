@@ -120,6 +120,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: None,
             delta_version: None,

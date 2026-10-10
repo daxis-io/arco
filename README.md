@@ -28,8 +28,8 @@ catalog surfaces with compatibility and governance support growing over time.
 
 - **Object-store authority** - correctness-critical state and its open Parquet
   projections live in object storage without a mandatory catalog database.
-- **Query metadata with SQL** - catalog, lineage, and run history are exposed
-  as `system.*` tables.
+- **Queryable metadata** - catalog, lineage, and run history are published as
+  Parquet projections for an operator-supplied SQL engine.
 - **Real lineage** - captured from actual runs, not guessed from SQL parsing.
 - **Multi-tenant by design** - isolation is enforced at storage layout, service
   boundaries, and test gates.
@@ -77,7 +77,13 @@ arco-proto      Cross-language protobuf contracts
 arco-core       Shared primitives (tenant context, IDs, errors)
 ```
 
-Task execution runs in external workers via a canonical dispatch envelope. Arco mints scoped URLs for published files; clients choose their own query engine.
+Task execution runs in external workers via a canonical dispatch envelope.
+Arco's legacy catalog route mints scoped URLs for published files; clients
+choose their own query engine.
+The operator deploys Arco's catalog API and supplies the query engine and
+execution runtime. The documented Cloud Run split is one deployment recipe.
+The [operator-owned Flow dispatcher example](docs/runbooks/operator-owned-flow-dispatcher.md)
+shows a single-host durable queue without a GCP task transport.
 
 ## Proto compatibility
 

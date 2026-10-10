@@ -5,10 +5,11 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use arco_worker_contract::callback_task_id;
+use arco_worker_contract::{PublicationDescriptor, callback_task_id};
 
 use super::types::{
     CallbackError, CallbackResult, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
@@ -29,6 +30,7 @@ use crate::orchestration::events::{
 /// because a worker's clock drifted — but they are recorded as skew and never
 /// become the event's time.
 const MAX_WORKER_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+const PUBLICATION_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Returns the server receipt time for a callback and records observed skew.
 ///
@@ -79,6 +81,8 @@ pub struct CallbackContext<W: OrchestrationLedgerWriter, V: TaskTokenValidator> 
     pub tenant_id: String,
     /// Workspace ID from request context.
     pub workspace_id: String,
+    /// Owner-controlled publication verifier. Absence fails publication closed.
+    pub publication_verifier: Option<Arc<dyn super::PublicationVerifier>>,
 }
 
 impl<W: OrchestrationLedgerWriter, V: TaskTokenValidator> CallbackContext<W, V> {
@@ -95,7 +99,18 @@ impl<W: OrchestrationLedgerWriter, V: TaskTokenValidator> CallbackContext<W, V> 
             token_validator,
             tenant_id: tenant_id.into(),
             workspace_id: workspace_id.into(),
+            publication_verifier: None,
         }
+    }
+
+    /// Adds owner-controlled publication verification for this callback scope.
+    #[must_use]
+    pub fn with_publication_verifier(
+        mut self,
+        verifier: Arc<dyn super::PublicationVerifier>,
+    ) -> Self {
+        self.publication_verifier = Some(verifier);
+        self
     }
 }
 
@@ -120,6 +135,8 @@ pub struct TaskState {
     pub code_version: Option<String>,
     /// Whether cancellation has been requested.
     pub cancel_requested: bool,
+    /// Whether downstream progress requires a verified readable output.
+    pub requires_visible_output: bool,
 }
 
 impl TaskState {
@@ -144,6 +161,17 @@ pub trait TaskStateLookup: Send + Sync {
         &self,
         task_id: &str,
     ) -> impl Future<Output = Result<Option<TaskState>, String>> + Send;
+
+    /// Looks up a publication claim already bound to the current attempt.
+    ///
+    /// Legacy stores may return `None`; a later publication may then establish
+    /// the first immutable identity for an already successful attempt.
+    fn get_task_publication(
+        &self,
+        _task_id: &str,
+    ) -> impl Future<Output = Result<Option<PublicationDescriptor>, String>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// Trait for validating task tokens.
@@ -250,12 +278,27 @@ where
     }
 }
 
-fn map_output_visibility_state(state: TaskOutputVisibilityState) -> OutputVisibilityState {
-    match state {
-        TaskOutputVisibilityState::Pending => OutputVisibilityState::Pending,
-        TaskOutputVisibilityState::Visible => OutputVisibilityState::Visible,
-        TaskOutputVisibilityState::Failed => OutputVisibilityState::Failed,
-    }
+async fn verify_publication<W, V>(
+    ctx: &CallbackContext<W, V>,
+    descriptor: &mut PublicationDescriptor,
+) -> Result<(), String>
+where
+    W: OrchestrationLedgerWriter,
+    V: TaskTokenValidator,
+{
+    descriptor.owner_evidence = None;
+    let verifier = ctx
+        .publication_verifier
+        .as_ref()
+        .ok_or_else(|| "publication owner verifier is unavailable".to_string())?;
+    let evidence = tokio::time::timeout(
+        PUBLICATION_VERIFICATION_TIMEOUT,
+        verifier.verify(descriptor),
+    )
+    .await
+    .map_err(|_| "publication owner verification timed out".to_string())??;
+    descriptor.owner_evidence = Some(evidence);
+    Ok(())
 }
 
 /// Handles the `/v1/tasks/{task_id}/started` callback.
@@ -655,7 +698,7 @@ where
         traceparent,
         outcome: worker_outcome,
         completed_at,
-        output: request_output,
+        output: mut request_output,
         error: request_error,
         metrics: request_metrics,
         cancelled_during_phase,
@@ -704,14 +747,6 @@ where
         return result;
     }
 
-    // Check if task is already terminal
-    if state.is_terminal() {
-        return finish_callback(
-            "task_completed",
-            CallbackResult::Conflict(CallbackError::task_already_terminal(&state.state)),
-        );
-    }
-
     // Validate attempt number
     if attempt != state.attempt {
         return finish_callback(
@@ -730,6 +765,70 @@ where
         );
     }
 
+    // A lost response after successful computation may replay the exact
+    // completion solely to reconcile publication. Authentication and attempt
+    // fencing above run before any storage I/O.
+    if state.is_terminal() {
+        let publication = request_output
+            .as_mut()
+            .and_then(|output| output.publication.as_mut());
+        if state.state == "SUCCEEDED"
+            && worker_outcome == WorkerOutcome::Succeeded
+            && let Some(publication) = publication
+        {
+            match lookup.get_task_publication(task_id).await {
+                Ok(Some(existing)) if !existing.same_immutable_claim(publication) => {
+                    return finish_callback(
+                        "task_completed",
+                        CallbackResult::Conflict(CallbackError::invalid_argument(
+                            "output.publication",
+                            "does not match the publication already bound to this attempt",
+                        )),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => return lookup_error("task_completed", task_id, error),
+            }
+            let (visibility_state, published_at, publish_error) =
+                match verify_publication(ctx, publication).await {
+                    Ok(()) => (OutputVisibilityState::Visible, Some(Utc::now()), None),
+                    Err(error) => (OutputVisibilityState::Failed, None, Some(error)),
+                };
+            let event = OrchestrationEvent::new(
+                &ctx.tenant_id,
+                &ctx.workspace_id,
+                OrchestrationEventData::TaskOutputVisibilityChanged {
+                    run_id: state.run_id.clone(),
+                    task_key: state.task_key.clone(),
+                    attempt,
+                    attempt_id: state.attempt_id.clone(),
+                    visibility_state,
+                    published_at,
+                    publish_error,
+                    publication: Some(publication.clone()),
+                },
+            );
+            if let Err(error) = ctx.ledger.write_event(&event).await {
+                return finish_callback(
+                    "task_completed",
+                    CallbackResult::InternalError(format!("Failed to write event: {error}")),
+                );
+            }
+            return finish_callback(
+                "task_completed",
+                CallbackResult::Ok(TaskCompletedResponse {
+                    acknowledged: true,
+                    final_state: "SUCCEEDED".to_string(),
+                    server_time: Utc::now(),
+                }),
+            );
+        }
+        return finish_callback(
+            "task_completed",
+            CallbackResult::Conflict(CallbackError::task_already_terminal(&state.state)),
+        );
+    }
+
     // Map worker outcome to task outcome
     let outcome = match worker_outcome {
         WorkerOutcome::Succeeded => TaskOutcome::Succeeded,
@@ -742,11 +841,21 @@ where
         .as_ref()
         .and_then(|o| o.materialization_id.clone());
     let error_message = request_error.as_ref().map(|e| e.message.clone());
-    let visibility_update = request_output.as_ref().and_then(|output| {
-        output
-            .output_visibility_state
-            .map(|state| (state, output.published_at, output.publish_error.clone()))
-    });
+    if let Some(output) = request_output.as_mut() {
+        // Worker visibility and owner evidence are claims, never authority.
+        output.output_visibility_state = None;
+        output.published_at = None;
+        output.publish_error = None;
+        if let Some(publication) = output.publication.as_mut() {
+            publication.owner_evidence = None;
+            if worker_outcome == WorkerOutcome::Succeeded {
+                output.output_visibility_state = Some(TaskOutputVisibilityState::Pending);
+            }
+        }
+    }
+    let publication = request_output
+        .as_ref()
+        .and_then(|output| output.publication.clone());
     let output = request_output;
     let error_payload = request_error.as_ref().map(|value| {
         let mut normalized = value.clone();
@@ -772,25 +881,22 @@ where
         None => None,
     };
 
-    // Emit one durable completion fact. Output visibility, when present, is
-    // bound to the completion so object-store batch partial writes cannot make
-    // a completed task visible without its publication state.
+    // Persist computation success and the immutable, unverified publication
+    // identity before any potentially slow owner I/O. A lost response or
+    // process interruption can then retry publication without rerunning work.
     // `completedAt` is worker-reported observation metadata. Timing the
     // completion event from it let a skewed worker both defer its own retry
     // past any horizon and, on the final attempt, make its just-terminal run
     // look older than the retention window so retention erased it.
     let finished_at = server_receipt_time("task_completed", completed_at);
-    let output_visibility = if outcome == TaskOutcome::Succeeded {
-        visibility_update.map(|(visibility_state, published_at, publish_error)| {
-            OutputVisibilityUpdate {
-                visibility_state: map_output_visibility_state(visibility_state),
-                published_at,
-                publish_error,
-            }
-        })
-    } else {
-        None
-    };
+    let output_visibility = (outcome == TaskOutcome::Succeeded
+        && (publication.is_some() || state.requires_visible_output))
+        .then(|| OutputVisibilityUpdate {
+            visibility_state: OutputVisibilityState::Pending,
+            published_at: None,
+            publish_error: None,
+            publication: publication.clone(),
+        });
 
     let mut event = OrchestrationEvent::new(
         &ctx.tenant_id,
@@ -816,13 +922,42 @@ where
         },
     );
     event.timestamp = finished_at;
-    let events = vec![event];
 
-    if let Err(e) = ctx.ledger.write_events(events).await {
+    if let Err(e) = ctx.ledger.write_event(&event).await {
         return finish_callback(
             "task_completed",
             CallbackResult::InternalError(format!("Failed to write event: {e}")),
         );
+    }
+
+    if outcome == TaskOutcome::Succeeded
+        && let Some(mut publication) = publication
+    {
+        let (visibility_state, published_at, publish_error) =
+            match verify_publication(ctx, &mut publication).await {
+                Ok(()) => (OutputVisibilityState::Visible, Some(Utc::now()), None),
+                Err(error) => (OutputVisibilityState::Failed, None, Some(error)),
+            };
+        let visibility_event = OrchestrationEvent::new(
+            &ctx.tenant_id,
+            &ctx.workspace_id,
+            OrchestrationEventData::TaskOutputVisibilityChanged {
+                run_id: state.run_id.clone(),
+                task_key: state.task_key.clone(),
+                attempt,
+                attempt_id: state.attempt_id.clone(),
+                visibility_state,
+                published_at,
+                publish_error,
+                publication: Some(publication),
+            },
+        );
+        if let Err(error) = ctx.ledger.write_event(&visibility_event).await {
+            return finish_callback(
+                "task_completed",
+                CallbackResult::InternalError(format!("Failed to write event: {error}")),
+            );
+        }
     }
 
     // Determine final state string
@@ -847,6 +982,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     /// Mock ledger writer for testing.
     #[derive(Default)]
@@ -923,6 +1060,72 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockPublicationVerifier {
+        calls: AtomicUsize,
+    }
+
+    impl super::super::PublicationVerifier for MockPublicationVerifier {
+        fn verify<'a>(
+            &'a self,
+            descriptor: &'a PublicationDescriptor,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<super::super::types::PublicationOwnerEvidence, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(super::super::types::PublicationOwnerEvidence {
+                    verified_at: Utc::now(),
+                    object_version: descriptor.object_version.clone(),
+                    etag: None,
+                })
+            })
+        }
+    }
+
+    struct BlockingPublicationVerifier {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl super::super::PublicationVerifier for BlockingPublicationVerifier {
+        fn verify<'a>(
+            &'a self,
+            _descriptor: &'a PublicationDescriptor,
+        ) -> std::pin::Pin<
+            Box<
+                dyn Future<Output = Result<super::super::types::PublicationOwnerEvidence, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Err("released without publication".to_string())
+            })
+        }
+    }
+
+    fn publication_descriptor() -> PublicationDescriptor {
+        let checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        PublicationDescriptor {
+            version: 1,
+            manifest_id: format!("sha256:{checksum}"),
+            object_path: "outputs/result.parquet".to_string(),
+            object_version: "1".to_string(),
+            checksum_sha256: checksum.to_string(),
+            byte_size: 4,
+            format: "parquet".to_string(),
+            schema_ref: format!("sha256:{checksum}#parquet-schema"),
+            owner_evidence: None,
+        }
+    }
+
     struct RequiredTaskIdTokenValidator {
         accepted_task_ids: Vec<String>,
         seen_task_ids: Mutex<Vec<String>>,
@@ -962,23 +1165,36 @@ mod tests {
     /// Mock task state lookup for testing.
     struct MockTaskLookup {
         tasks: HashMap<String, TaskState>,
+        publications: HashMap<String, PublicationDescriptor>,
     }
 
     impl MockTaskLookup {
         fn new() -> Self {
             Self {
                 tasks: HashMap::new(),
+                publications: HashMap::new(),
             }
         }
 
         fn add_task(&mut self, task_id: &str, state: TaskState) {
             self.tasks.insert(task_id.to_string(), state);
         }
+
+        fn bind_publication(&mut self, task_id: &str, publication: PublicationDescriptor) {
+            self.publications.insert(task_id.to_string(), publication);
+        }
     }
 
     impl TaskStateLookup for MockTaskLookup {
         async fn get_task_state(&self, task_id: &str) -> Result<Option<TaskState>, String> {
             Ok(self.tasks.get(task_id).cloned())
+        }
+
+        async fn get_task_publication(
+            &self,
+            task_id: &str,
+        ) -> Result<Option<PublicationDescriptor>, String> {
+            Ok(self.publications.get(task_id).cloned())
         }
     }
 
@@ -1009,9 +1225,9 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
-
         let request = TaskStartedRequest {
             attempt: 1,
             attempt_id: "att-1".to_string(),
@@ -1113,6 +1329,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1163,6 +1380,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1205,6 +1423,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1250,6 +1469,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1294,6 +1514,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1334,6 +1555,7 @@ mod tests {
                     partition_key: None,
                     code_version: None,
                     cancel_requested: false,
+                    requires_visible_output: false,
                 },
             );
 
@@ -1392,6 +1614,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1434,6 +1657,7 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1476,6 +1700,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: true,
+                requires_visible_output: false,
             },
         );
 
@@ -1517,6 +1742,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1559,6 +1785,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: true, // Cancellation requested
+                requires_visible_output: false,
             },
         );
 
@@ -1603,6 +1830,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1645,6 +1873,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1687,6 +1916,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1730,6 +1960,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1779,6 +2010,7 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1800,6 +2032,7 @@ mod tests {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,
@@ -1843,7 +2076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_task_completed_emits_visibility_event_when_output_reports_visibility() {
+    async fn worker_visibility_claim_does_not_establish_verified_visibility() {
         let ledger = Arc::new(MockLedger::default());
         let validator = Arc::new(MockTokenValidator::allow_all());
         let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
@@ -1861,6 +2094,7 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: true,
             },
         );
 
@@ -1880,9 +2114,10 @@ mod tests {
                 delta_table: Some("analytics.daily".to_string()),
                 delta_version: Some(17),
                 delta_partition: Some("2025-01-15".to_string()),
-                output_visibility_state: Some(TaskOutputVisibilityState::Pending),
+                output_visibility_state: Some(TaskOutputVisibilityState::Visible),
                 published_at: Some(published_at),
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,
@@ -1903,23 +2138,19 @@ mod tests {
         assert_eq!(
             events.len(),
             1,
-            "task completion and output visibility must be one durable event"
+            "required output must remain pending without an owner-verifiable descriptor"
         );
         assert_eq!(events[0].event_type, "TaskCompletionRecorded");
         if let OrchestrationEventData::TaskCompletionRecorded {
             output_visibility, ..
         } = &events[0].data
         {
-            let output_visibility = output_visibility
-                .as_ref()
-                .expect("expected output visibility");
-            let OutputVisibilityUpdate {
-                visibility_state,
-                published_at: emitted_published_at,
-                ..
-            } = output_visibility;
-            assert_eq!(*visibility_state, OutputVisibilityState::Pending);
-            assert_eq!(*emitted_published_at, Some(published_at));
+            assert_eq!(
+                output_visibility
+                    .as_ref()
+                    .map(|update| update.visibility_state),
+                Some(OutputVisibilityState::Pending)
+            );
         } else {
             panic!("Expected TaskCompletionRecorded event");
         }
@@ -1944,6 +2175,7 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -1965,6 +2197,7 @@ mod tests {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,
@@ -1991,10 +2224,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_task_completed_writes_completion_and_visibility_as_single_event() {
+    async fn computation_completion_precedes_visibility_write() {
         let ledger = Arc::new(MockLedger::fail_after_writes(1));
         let validator = Arc::new(MockTokenValidator::allow_all());
-        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1");
+        let ctx = CallbackContext::new(ledger.clone(), validator, "tenant-1", "workspace-1")
+            .with_publication_verifier(Arc::new(MockPublicationVerifier::default()));
 
         let mut lookup = MockTaskLookup::new();
         lookup.add_task(
@@ -2009,6 +2243,7 @@ mod tests {
                 partition_key: Some("2025-01-15".to_string()),
                 code_version: Some("v1.2.3".to_string()),
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -2023,7 +2258,7 @@ mod tests {
             output: Some(super::super::types::TaskOutput {
                 materialization_id: Some("mat-123".to_string()),
                 row_count: Some(1000),
-                byte_size: Some(1024),
+                byte_size: Some(12),
                 output_path: None,
                 delta_table: Some("analytics.daily".to_string()),
                 delta_version: Some(17),
@@ -2031,6 +2266,7 @@ mod tests {
                 output_visibility_state: Some(TaskOutputVisibilityState::Pending),
                 published_at: Some(published_at),
                 publish_error: None,
+                publication: Some(publication_descriptor()),
             }),
             error: None,
             metrics: None,
@@ -2039,19 +2275,13 @@ mod tests {
         };
 
         let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
-        match result {
-            CallbackResult::Ok(response) => {
-                assert!(response.acknowledged);
-                assert_eq!(response.final_state, "SUCCEEDED");
-            }
-            other => panic!("Expected Ok, got {:?}", other),
-        }
+        assert!(matches!(result, CallbackResult::InternalError(_)));
 
         let events = ledger.events.lock().unwrap();
         assert_eq!(
             events.len(),
             1,
-            "completion and visibility must fit in one durable ledger write"
+            "computation completion must survive a later visibility write failure"
         );
         if let OrchestrationEventData::TaskCompletionRecorded {
             output_visibility, ..
@@ -2062,10 +2292,106 @@ mod tests {
                 output_visibility.visibility_state,
                 OutputVisibilityState::Pending
             );
-            assert_eq!(output_visibility.published_at, Some(published_at));
+            assert!(
+                output_visibility
+                    .publication
+                    .as_ref()
+                    .and_then(|publication| publication.owner_evidence.as_ref())
+                    .is_none(),
+                "completion must persist the unverified descriptor first"
+            );
+            assert!(output_visibility.published_at.is_none());
         } else {
             panic!("Expected TaskCompletionRecorded event");
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_owner_verification_preserves_pending_completion() {
+        let ledger = Arc::new(MockLedger::default());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let ctx = CallbackContext::new(
+            Arc::clone(&ledger),
+            Arc::new(MockTokenValidator::allow_all()),
+            "tenant-1",
+            "workspace-1",
+        )
+        .with_publication_verifier(Arc::new(BlockingPublicationVerifier {
+            entered: Arc::clone(&entered),
+            release,
+        }));
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "RUNNING".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+                requires_visible_output: true,
+            },
+        );
+        let request = TaskCompletedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            traceparent: None,
+            outcome: WorkerOutcome::Succeeded,
+            completed_at: None,
+            output: Some(super::super::types::TaskOutput {
+                materialization_id: Some("mat-1".to_string()),
+                row_count: None,
+                byte_size: Some(4),
+                output_path: None,
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                output_visibility_state: None,
+                published_at: None,
+                publish_error: None,
+                publication: Some(publication_descriptor()),
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+        };
+
+        let callback = tokio::spawn(async move {
+            handle_task_completed(&ctx, "task-1", "token", request, &lookup).await
+        });
+        entered.notified().await;
+
+        {
+            let events = ledger.events.lock().expect("events");
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0].data,
+                OrchestrationEventData::TaskCompletionRecorded {
+                    outcome: TaskOutcome::Succeeded,
+                    output_visibility: Some(OutputVisibilityUpdate {
+                        visibility_state: OutputVisibilityState::Pending,
+                        ..
+                    }),
+                    ..
+                }
+            ));
+        }
+
+        callback.abort();
+        assert!(
+            callback
+                .await
+                .expect_err("callback must be cancelled")
+                .is_cancelled()
+        );
+        assert_eq!(ledger.events.lock().expect("events").len(), 1);
     }
 
     #[tokio::test]
@@ -2087,6 +2413,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -2115,6 +2442,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_success_replay_verifies_publication_without_repeating_computation() {
+        let ledger = Arc::new(MockLedger::default());
+        let verifier = Arc::new(MockPublicationVerifier::default());
+        let ctx = CallbackContext::new(
+            Arc::clone(&ledger),
+            Arc::new(MockTokenValidator::allow_all()),
+            "tenant-1",
+            "workspace-1",
+        )
+        .with_publication_verifier(verifier.clone());
+        let mut lookup = MockTaskLookup::new();
+        lookup.add_task(
+            "task-1",
+            TaskState {
+                state: "SUCCEEDED".to_string(),
+                attempt: 1,
+                attempt_id: "att-1".to_string(),
+                run_id: "run-1".to_string(),
+                task_key: "task-1".to_string(),
+                asset_key: None,
+                partition_key: None,
+                code_version: None,
+                cancel_requested: false,
+                requires_visible_output: false,
+            },
+        );
+        lookup.bind_publication("task-1", publication_descriptor());
+        let request = TaskCompletedRequest {
+            attempt: 1,
+            attempt_id: "att-1".to_string(),
+            worker_id: "worker-1".to_string(),
+            traceparent: None,
+            outcome: WorkerOutcome::Succeeded,
+            completed_at: None,
+            output: Some(super::super::types::TaskOutput {
+                materialization_id: Some("mat-1".to_string()),
+                row_count: None,
+                byte_size: Some(4),
+                output_path: None,
+                delta_table: None,
+                delta_version: None,
+                delta_partition: None,
+                output_visibility_state: Some(TaskOutputVisibilityState::Visible),
+                published_at: None,
+                publish_error: None,
+                publication: Some(publication_descriptor()),
+            }),
+            error: None,
+            metrics: None,
+            cancelled_during_phase: None,
+            partial_progress: None,
+        };
+
+        let mut changed_request = request.clone();
+        changed_request
+            .output
+            .as_mut()
+            .and_then(|output| output.publication.as_mut())
+            .expect("publication")
+            .object_path = "outputs/different.parquet".to_string();
+        let result = handle_task_completed(&ctx, "task-1", "token", request, &lookup).await;
+        assert!(matches!(result, CallbackResult::Ok(_)));
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        {
+            let events = ledger.events.lock().expect("events");
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                events[0].data,
+                OrchestrationEventData::TaskOutputVisibilityChanged {
+                    visibility_state: OutputVisibilityState::Visible,
+                    ..
+                }
+            ));
+        }
+
+        let changed =
+            handle_task_completed(&ctx, "task-1", "token", changed_request, &lookup).await;
+        assert!(matches!(changed, CallbackResult::Conflict(_)));
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.events.lock().expect("events").len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_handle_task_completed_failure() {
         let ledger = Arc::new(MockLedger::default());
         let validator = Arc::new(MockTokenValidator::allow_all());
@@ -2133,6 +2543,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -2185,6 +2596,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
 
@@ -2206,6 +2618,7 @@ mod tests {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: Some(super::super::types::TaskError {
                 category: super::super::types::ErrorCategory::Infrastructure,
@@ -2248,6 +2661,7 @@ mod tests {
                 partition_key: None,
                 code_version: None,
                 cancel_requested: false,
+                requires_visible_output: false,
             },
         );
         let request = TaskStartedRequest {

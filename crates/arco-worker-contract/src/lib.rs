@@ -386,6 +386,65 @@ pub enum TaskOutputVisibilityState {
     Failed,
 }
 
+/// Immutable publication claim supplied by a worker and verified by the
+/// workspace storage owner before it becomes readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationDescriptor {
+    /// Descriptor schema version. Version 1 is the only supported value.
+    pub version: u32,
+    /// Content-addressed manifest identity (`sha256:<checksumSha256>`).
+    pub manifest_id: String,
+    /// Scope-relative immutable object path.
+    pub object_path: String,
+    /// Exact opaque object-store version observed by the worker.
+    pub object_version: String,
+    /// Lowercase hexadecimal SHA-256 digest of the object bytes.
+    pub checksum_sha256: String,
+    /// Exact object size in bytes.
+    pub byte_size: u64,
+    /// Output encoding, such as `parquet`.
+    pub format: String,
+    /// Immutable reference to the embedded schema. Version 1 requires
+    /// `<manifestId>#parquet-schema`.
+    pub schema_ref: String,
+    /// Storage-owner evidence. Worker-supplied values are discarded and this
+    /// field is populated only after owner-side verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_evidence: Option<PublicationOwnerEvidence>,
+}
+
+impl PublicationDescriptor {
+    /// Returns whether two descriptors name the same immutable publication.
+    ///
+    /// Owner evidence is deliberately excluded because it is minted after the
+    /// immutable worker claim has already been bound to an attempt.
+    #[must_use]
+    pub fn same_immutable_claim(&self, other: &Self) -> bool {
+        self.version == other.version
+            && self.manifest_id == other.manifest_id
+            && self.object_path == other.object_path
+            && self.object_version == other.object_version
+            && self.checksum_sha256 == other.checksum_sha256
+            && self.byte_size == other.byte_size
+            && self.format == other.format
+            && self.schema_ref == other.schema_ref
+    }
+}
+
+/// Evidence minted by the workspace storage owner after exact verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationOwnerEvidence {
+    /// Server time when verification completed.
+    pub verified_at: DateTime<Utc>,
+    /// Exact opaque object-store version verified by the owner.
+    pub object_version: String,
+    /// Object-store entity tag, when the adapter supplies one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+}
+
 /// Output from a successful task.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -420,6 +479,9 @@ pub struct TaskOutput {
     /// Publish failure details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_error: Option<String>,
+    /// Versioned immutable publication claim and owner verification evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationDescriptor>,
 }
 
 /// Error details from a failed task.

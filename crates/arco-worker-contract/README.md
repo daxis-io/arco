@@ -14,6 +14,24 @@ types, but should not redefine dispatch or callback payloads locally.
 - Completed callbacks accept legacy `result` as an alias for `output`.
 - Heartbeat `progressPct` is an integer from `0` through `100`.
 - Callback attempts are one-indexed.
+- Successful output may include a version-1 `publication` descriptor with a
+  scope-relative object path, exact opaque storage version, SHA-256 checksum,
+  byte size, format, and immutable schema reference. The 0.3.0 profile accepts
+  only Parquet and requires `schemaRef` to be
+  `<manifestId>#parquet-schema`; bounded Parquet footer parsing and the
+  whole-object checksum bind the embedded physical schema to that reference.
+  Semantic engine compatibility remains a consumer check. Workers cannot establish visibility:
+  Arco discards worker-supplied `ownerEvidence`, verifies the exact object from
+  authenticated workspace storage, and mints owner evidence.
+- Missing, changed, corrupt, or mismatched publication objects leave computation
+  completed but publication unverified. Replaying the same successful attempt
+  retries publication verification without rerunning computation. A verified
+  descriptor is available from `GET /api/v1/tasks/{taskId}/publication` with the
+  same task-scoped token.
+- Version 1 accepts objects up to 256 MiB. Owner verification has a 30-second
+  deadline and reads the object in bounded ranges. Arco durably records
+  successful computation and a pending immutable descriptor before performing
+  this I/O.
 - The orchestration-owned `partitionKey` is the ADR-011 canonical partition key planned
   for the task; workers accept `partition_key` while old envelopes without either field remain
   unpartitioned.

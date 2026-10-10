@@ -68,11 +68,11 @@ Authoritative mode is the production target. Mirror mode is useful for bootstrap
 migration, and mixed-writer environments, but it cannot provide full catalog
 governance if writers can bypass Arco.
 
-## Production Topology
+## Logical topology
 
 ```text
-Query engines
-  Spark / DataFusion / DuckDB / Flink / Trino adapter
+Operator-supplied query engines
+  Spark / DataFusion / DuckDB / Flink / Trino
       |
       | Arco Catalog API
       v
@@ -108,9 +108,10 @@ Data object store
   <table>/deletion-vector files
 ```
 
-The optional gateway or serverless function is not durable metadata. It can
-authenticate callers, vend scoped credentials, and emit audit records, but object
-storage remains the source of truth.
+An API layer is required to operate the catalog; its process and hosting model
+are the operator's choice. A gateway or serverless function can authenticate
+callers, vend scoped credentials, and emit audit records, but it is not durable
+metadata. Object storage remains the source of truth.
 
 ## Storage Layout
 

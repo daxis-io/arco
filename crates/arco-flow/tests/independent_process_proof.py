@@ -171,6 +171,8 @@ try:
     trigger = {'selection': ['analytics.daily'], 'runKey': 'reference-frozen-a'}
     run = request(API + '/api/v1/workspaces/flow/runs', trigger, token, 201)
     (ROOT / 'queue/mode').write_text('uncertain')
+    planned = request(DISPATCHER + '/run', {})
+    assert planned['ready_dispatch_emitted'] == 1 and planned['dispatch_actions'] == 0
     uncertain = request(DISPATCHER + '/run', {}, expected=500)
     assert uncertain['dispatch_failed'] == 1
     assert request(CONTROL + '/state')['pending'] == 1

@@ -10,7 +10,7 @@ cloud credentials; only the opt-in live lane can produce R2 provider evidence.
 | Profile | Status | Evidence |
 |---|---|---|
 | Deterministic S3-compatible adapter | Runnable in ordinary CI | Local HTTP fault probe plus object-store CAS, range, and paging tests |
-| Cloudflare R2 | **Blocked / unqualified** | No dedicated account, bucket, or credential scope has been assigned; no live campaign has run |
+| Cloudflare R2 | **Failed / unqualified** | Dedicated private bucket and protected credentials configured; [live attempt 2](https://github.com/daxis-io/arco/actions/runs/38072060598/attempts/2) on `e29d0ed4` failed duplicate-create version consistency; failed receipts and objects retained |
 | Amazon S3 | Separate existing gate | `.github/workflows/s3-conformance.yml`; its result does not qualify R2 |
 | GCS and Azure | Separate existing gates | Provider-owned workflows and adapters; their results do not qualify R2 |
 

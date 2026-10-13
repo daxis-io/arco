@@ -19,6 +19,7 @@ use ulid::Ulid;
 /// Verifies the conditional-write semantics required by Arco authority heads.
 pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>) {
     let path = format!("conformance/{name}/{}/head.json", Ulid::new());
+    println!("conditional-write probe: {path}");
     let first = backend
         .put(
             &path,
@@ -43,11 +44,14 @@ pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBack
         )
         .await
         .expect("duplicate create");
-    assert!(matches!(
-        duplicate,
-        WriteResult::PreconditionFailed { ref current_version }
-            if current_version == &first_version
-    ));
+    assert!(
+        matches!(
+            duplicate,
+            WriteResult::PreconditionFailed { ref current_version }
+                if current_version == &first_version
+        ),
+        "duplicate create at {path}: first version {first_version:?}, result {duplicate:?}"
+    );
 
     let second = backend
         .put(

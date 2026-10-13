@@ -10,7 +10,7 @@ cloud credentials; only the opt-in live lane can produce R2 provider evidence.
 | Profile | Status | Evidence |
 |---|---|---|
 | Deterministic S3-compatible adapter | Runnable in ordinary CI | Local HTTP fault probe plus object-store CAS, range, and paging tests |
-| Cloudflare R2 | **Failed / unqualified** | Dedicated private bucket and protected credentials configured; [live attempt 2](https://github.com/daxis-io/arco/actions/runs/38072060598/attempts/2) on `e29d0ed4` failed duplicate-create version consistency; failed receipts and objects retained |
+| Cloudflare R2 | Final-candidate receipt required | Dedicated private bucket and protected credentials configured; failed campaigns are retained and the gate is unqualified until the selected candidate passes owner review |
 | Amazon S3 | Separate existing gate | `.github/workflows/s3-conformance.yml`; its result does not qualify R2 |
 | GCS and Azure | Separate existing gates | Provider-owned workflows and adapters; their results do not qualify R2 |
 
@@ -21,12 +21,22 @@ those operations through its existing `S3StorageBackend`; it does not assume AWS
 bucket-owner headers, object versioning, or any other AWS-only behavior. See the current
 [R2 S3 API compatibility matrix](https://developers.cloudflare.com/r2/api/s3/api/).
 
+The [first executed live attempt](https://github.com/daxis-io/arco/actions/runs/38072060598/attempts/2)
+on `e29d0ed4` failed duplicate-create version consistency. The
+[diagnostic campaign](https://github.com/daxis-io/arco/actions/runs/38336557074) confirmed that
+R2 rejected the duplicate, returning the same ETag from HEAD but omitting PUT's internal
+version ID. The R2 endpoint profile now consistently encodes ETag-only version tokens for
+PUT, HEAD and listing, retaining the existing JSON shape and legacy CAS token decoding.
+AWS, GCS and Azure retain their existing version identities. These are current-object ETag
+preconditions; identical-content replacement does not establish a new generation identity.
+Failed receipts and their objects remain retained; this correction requires a new live receipt.
+
 ## CI profiles
 
 `.github/workflows/r2-provider-qualification.yml` has two independent jobs:
 
 1. `deterministic` runs for relevant pull requests and `main` changes. It validates R2
-   configuration admission, proves safe-read retry and single-attempt ambiguous conditional
+   configuration admission and R2 PUT/HEAD identity, proves safe-read retry and single-attempt ambiguous conditional
    writes against a local HTTP fixture, runs the shared adapter contract, and verifies that
    the ignored live probe is discoverable. Its receipt always says
    `live_provider_executed=false` and `provider_gate=unqualified`.

@@ -17,6 +17,10 @@ use tokio::sync::Barrier;
 use ulid::Ulid;
 
 /// Verifies the conditional-write semantics required by Arco authority heads.
+#[allow(
+    clippy::print_stdout,
+    reason = "retain disposable provider object paths in receipts"
+)]
 pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>) {
     let path = format!("conformance/{name}/{}/head.json", Ulid::new());
     println!("conditional-write probe: {path}");

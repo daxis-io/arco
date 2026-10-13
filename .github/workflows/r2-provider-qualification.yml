@@ -71,11 +71,10 @@ jobs:
           cargo test --locked -p arco-storage-s3 --test live_conformance r2_configuration \
             2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/configuration.log"
 
-      - name: Exercise retry and ambiguous-write boundary
+      - name: Exercise R2 identity, retry, and ambiguous writes
         run: |
           set -o pipefail
           cargo test --locked -p arco-storage-s3 --lib \
-            safe_get_retries_but_ambiguous_conditional_put_is_attempted_once \
             2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/transport.log"
 
       - name: Exercise adapter read, range, CAS, and paging contracts

@@ -13,7 +13,7 @@ use arco_storage_object_store::{ObjectStoreBackend, no_automatic_request_retries
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::DynObjectStore;
-use object_store::aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut};
+use object_store::aws::{AmazonS3, AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut};
 use object_store::signer::Signer as ObjectStoreSigner;
 
 /// Amazon S3 implementation of the Arco storage contract.
@@ -36,12 +36,15 @@ impl S3StorageBackend {
     /// Returns an error for an empty bucket or invalid S3 configuration.
     pub fn new(bucket: &str) -> Result<Self> {
         let bucket = normalize_bucket(bucket)?;
-        let (s3, conditional_s3) = build_s3_clients(
-            configured_s3_builder(&bucket),
-            configured_s3_builder(&bucket),
+        let builder = configured_s3_builder(&bucket);
+        let etag_version_tokens = uses_r2_version_tokens(&builder);
+        let (s3, conditional_s3) = build_s3_clients(builder.clone(), builder, &bucket)?;
+        Ok(Self::from_clients(
             &bucket,
-        )?;
-        Ok(Self::from_clients(&bucket, s3, conditional_s3))
+            s3,
+            conditional_s3,
+            etag_version_tokens,
+        ))
     }
 
     /// Creates a qualification adapter with bounded request time and ordinary retries.
@@ -64,6 +67,7 @@ impl S3StorageBackend {
                     ..Default::default()
                 })
         };
+        let etag_version_tokens = uses_r2_version_tokens(&builder());
         let (s3, conditional_s3) = build_s3_clients(builder(), builder(), &bucket)?;
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -88,23 +92,30 @@ impl S3StorageBackend {
                 Error::storage_with_source("failed to configure bounded listing", error)
             })?;
         let listing_conditional_store: Arc<DynObjectStore> = conditional_s3.clone();
-        let mut backend = Self::from_clients(&bucket, s3, conditional_s3);
+        let mut backend = Self::from_clients(&bucket, s3, conditional_s3, etag_version_tokens);
         let listing: Arc<DynObjectStore> = Arc::new(listing);
-        backend.qualification_listing = Some(
-            ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
-                listing,
-                listing_conditional_store,
-                None,
-            ),
+        let mut listing = ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
+            listing,
+            listing_conditional_store,
+            None,
         );
+        if etag_version_tokens {
+            listing = listing.with_etag_version_tokens();
+        }
+        backend.qualification_listing = Some(listing);
         Ok(backend)
     }
 
-    fn from_clients(bucket: &str, s3: Arc<AmazonS3>, conditional_s3: Arc<AmazonS3>) -> Self {
+    fn from_clients(
+        bucket: &str,
+        s3: Arc<AmazonS3>,
+        conditional_s3: Arc<AmazonS3>,
+        etag_version_tokens: bool,
+    ) -> Self {
         let store: Arc<DynObjectStore> = s3.clone();
         let conditional_write_store: Arc<DynObjectStore> = conditional_s3;
         let signer: Arc<dyn ObjectStoreSigner> = s3;
-        let inner = if supports_ordered_listing(bucket) {
+        let mut inner = if supports_ordered_listing(bucket) {
             ObjectStoreBackend::new_with_ordered_listing_and_conditional_write_store(
                 store,
                 conditional_write_store,
@@ -117,6 +128,9 @@ impl S3StorageBackend {
                 Some(signer),
             )
         };
+        if etag_version_tokens {
+            inner = inner.with_etag_version_tokens();
+        }
         Self {
             inner,
             #[cfg(feature = "qualification")]
@@ -129,6 +143,20 @@ impl S3StorageBackend {
     pub const fn ordered_listing_enabled(&self) -> bool {
         self.inner.ordered_listing_enabled()
     }
+}
+
+fn uses_r2_version_tokens(builder: &AmazonS3Builder) -> bool {
+    builder
+        .get_config_value(&AmazonS3ConfigKey::Endpoint)
+        .is_some_and(|endpoint| {
+            endpoint
+                .trim_end_matches('/')
+                .strip_prefix("https://")
+                .and_then(|host| host.strip_suffix(".r2.cloudflarestorage.com"))
+                .is_some_and(|account| {
+                    account.len() == 32 && account.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
 }
 
 fn configured_s3_builder(bucket: &str) -> AmazonS3Builder {
@@ -241,7 +269,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use arco_core::storage::{StorageBackend, WritePrecondition};
+    use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
     use arco_storage_object_store::ObjectStoreBackend;
     use bytes::Bytes;
     use object_store::DynObjectStore;
@@ -251,7 +279,7 @@ mod tests {
 
     use super::{
         S3StorageBackend, build_s3_clients, configured_s3_builder, normalize_bucket,
-        supports_ordered_listing,
+        supports_ordered_listing, uses_r2_version_tokens,
     };
 
     #[derive(Debug, Default)]
@@ -359,6 +387,94 @@ mod tests {
     fn directory_buckets_disable_ordered_listing() {
         assert!(supports_ordered_listing("ordinary-bucket"));
         assert!(!supports_ordered_listing("events--usw2-az1--x-s3"));
+    }
+
+    #[test]
+    fn r2_endpoints_select_etag_versions_without_changing_aws_versions() {
+        let account = "0123456789abcdef0123456789abcdef";
+        for endpoint in [
+            format!("https://{account}.r2.cloudflarestorage.com"),
+            format!("https://{account}.r2.cloudflarestorage.com/"),
+        ] {
+            assert!(uses_r2_version_tokens(
+                &configured_s3_builder("probe").with_endpoint(endpoint)
+            ));
+        }
+        for endpoint in [
+            "https://s3.us-east-1.amazonaws.com",
+            "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com.example.com",
+            "https://example.r2.cloudflarestorage.com",
+            "http://127.0.0.1:9000",
+        ] {
+            assert!(!uses_r2_version_tokens(
+                &configured_s3_builder("probe").with_endpoint(endpoint)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn r2_put_and_head_use_the_same_etag_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (method, response) in [
+                (
+                    "PUT",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"r2-v1\"\r\nx-amz-version-id: r2-internal-id\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "PUT",
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "HEAD",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nETag: \"r2-v1\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\n",
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut socket).await.unwrap();
+                assert!(request.starts_with(method));
+                if method == "PUT" {
+                    assert!(request.to_ascii_lowercase().contains("if-none-match: *"));
+                }
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let builder = || {
+            configured_s3_builder("r2-probe")
+                .with_endpoint(&endpoint)
+                .with_allow_http(true)
+                .with_access_key_id("test-access-key")
+                .with_secret_access_key("test-secret-key")
+                .with_region("auto")
+        };
+        let (normal, conditional) = build_s3_clients(builder(), builder(), "r2-probe").unwrap();
+        let backend = S3StorageBackend::from_clients("r2-probe", normal, conditional, true);
+        let first = backend
+            .put(
+                "head.json",
+                Bytes::from_static(b"v1"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let WriteResult::Success { version } = first else {
+            panic!("initial write must succeed");
+        };
+        let duplicate = backend
+            .put(
+                "head.json",
+                Bytes::from_static(b"duplicate"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&duplicate, WriteResult::PreconditionFailed { current_version } if current_version == &version),
+            "PUT version {version:?}, duplicate {duplicate:?}"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

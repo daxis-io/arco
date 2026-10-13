@@ -30,6 +30,13 @@ contract remains in `arco-core`; select the relevant provider features when
 embedding. Bare bucket names retain the historical GCS default; use `s3://` or
 `az://` to select another provider explicitly.
 
+The R2 endpoint profile uses ETag-only version tokens because R2 omits
+PUT's internal object version ID on HEAD and listing. The JSON token shape and
+legacy CAS token decoding remain compatible; AWS version identities are unchanged.
+R2 preconditions identify current content and do not detect replacement by identical
+bytes or provide historical version-addressed reads. Existing R2 publication metadata
+must be reverified against its current ETag before it can claim readable visibility.
+
 The API no longer requires `ARCO_COMPACTOR_URL` for production startup. Without
 it, enabled Iceberg CRUD uses the existing local Tier1 compactor with the same
 fencing and publication mechanisms. JWT, storage and posture requirements still

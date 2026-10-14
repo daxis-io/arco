@@ -89,6 +89,12 @@ jobs:
             grep -Fxc 'r2_backend_satisfies_storage_conformance: test')"
           test "$discovered" -eq 1
 
+      - name: Exercise native owner recovery harness without credentials
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --features qualification --test live_conformance \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deterministic/owner-recovery.log"
+
       - name: Record deterministic result
         if: always()
         run: |
@@ -199,5 +205,117 @@ jobs:
         with:
           name: r2-${{ github.run_id }}-${{ github.run_attempt }}-live
           path: receipts/r2-${{ github.run_id }}-${{ github.run_attempt }}-live
+          if-no-files-found: error
+          retention-days: 90
+
+  live-integration:
+    name: Native R2 API and owner recovery
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live
+    needs: live-r2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: r2-qualification
+    concurrency:
+      group: r2-provider-qualification-live
+      cancel-in-progress: false
+    env:
+      CARGO_TARGET_DIR: target/r2-integration-proof
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      ARCO_TEST_R2_ACCOUNT_ID: ${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}
+      ARCO_TEST_R2_BUCKET: ${{ vars.ARCO_TEST_R2_BUCKET }}
+      ARCO_TEST_R2_DENIED_BUCKET: ${{ vars.ARCO_TEST_R2_DENIED_BUCKET }}
+      ARCO_TEST_R2_SCOPE_ATTESTATION: ${{ vars.ARCO_TEST_R2_SCOPE_ATTESTATION }}
+      AWS_ENDPOINT: https://${{ vars.ARCO_TEST_R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      AWS_REGION: auto
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          cache-targets: 'false'
+      - name: Install proof dependencies
+        run: |
+          python -m pip install 'moto[server]==5.2.3' 'boto3==1.43.110'
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Record bounded native profile
+        # shortcut: physical requests and cost are estimates; meter before variable-size campaigns.
+        run: |
+          receipt_dir="receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration"
+          mkdir -p "$receipt_dir"
+          {
+            echo "source_sha=$(git rev-parse HEAD)"
+            echo "source_ref=${GITHUB_REF}"
+            rustc --version
+            cargo --version
+            sha256sum Cargo.lock rust-toolchain.toml
+            echo "provider=cloudflare-r2-s3"
+            echo "account_id=${ARCO_TEST_R2_ACCOUNT_ID}"
+            echo "write_bucket=${ARCO_TEST_R2_BUCKET}"
+            echo "denial_control_bucket=${ARCO_TEST_R2_DENIED_BUCKET}"
+            echo "profile=default API/Flow features; operator HTTP; native S3 owner tests with qualification feature"
+            echo "elapsed_ceiling_seconds=2700"
+            echo "declared_request_estimate_upper_bound=20000"
+            echo "declared_submitted_bytes_estimate_upper_bound=268435456"
+            echo "declared_cost_estimate_ceiling_microusd=100000"
+            echo "provider_gate=evidence-pending-review"
+          } > "$receipt_dir/identity.txt"
+          test -n "$ARCO_TEST_R2_DENIED_BUCKET"
+          test "$ARCO_TEST_R2_DENIED_BUCKET" != "$ARCO_TEST_R2_BUCKET"
+          python -c 'import os,pathlib; pathlib.Path("receipts/r2-"+os.environ["GITHUB_RUN_ID"]+"-"+os.environ["GITHUB_RUN_ATTEMPT"]+"-integration/scope-owner-attestation.json").write_text(os.environ["ARCO_TEST_R2_SCOPE_ATTESTATION"]+"\n")'
+          df -h .
+      - name: Verify provider credential scope
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --features qualification --test live_conformance \
+            r2_credentials_are_scoped_to_dedicated_bucket -- --ignored --exact --nocapture \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/credential-scope.log"
+      - name: Verify accepted-write recovery, retained readers and empty caches
+        run: |
+          set -o pipefail
+          cargo test --locked -p arco-storage-s3 --features qualification --test live_conformance \
+            r2_owner_recovers_accepted_writes_and_retained_reads -- --ignored --exact --nocapture \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/owner-recovery.log"
+      - name: Verify fixture guard regressions
+        run: python crates/arco-flow/tests/operator_fixture_contract.py
+      - name: Build the native packaged profile
+        run: |
+          set -o pipefail
+          cargo build --locked -p arco-api -p arco-flow \
+            --bin arco-api --bin arco_flow_dispatcher --bin arco_flow_sweeper \
+            --example pilot_flow_process_seed \
+            2>&1 | tee "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/build.log"
+          cargo metadata --locked --no-deps --format-version 1 \
+            > "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/metadata.json"
+      - name: Verify native catalog, Flow, task auth and publication recovery
+        run: |
+          target_dir="$(python -c "import json; print(json.load(open('receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/metadata.json'))['target_directory'])")"
+          python crates/arco-flow/tests/independent_process_proof.py \
+            "$target_dir/debug" "$RUNNER_TEMP/arco-native-r2-proof" --r2
+      - name: Record native result
+        if: always()
+        run: |
+          echo "job_status=${{ job.status }}" >> "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/identity.txt"
+          echo "provider_gate=${{ job.status == 'success' && 'evidence-pending-review' || 'failed' }}" \
+            >> "receipts/r2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-integration/identity.txt"
+      - name: Retain native receipts and sanitized logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: r2-${{ github.run_id }}-${{ github.run_attempt }}-integration
+          path: |
+            receipts/r2-${{ github.run_id }}-${{ github.run_attempt }}-integration/
+            ${{ runner.temp }}/arco-native-r2-proof/receipt.json
+            ${{ runner.temp }}/arco-native-r2-proof/*.log
           if-no-files-found: error
           retention-days: 90

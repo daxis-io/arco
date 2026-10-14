@@ -13,15 +13,35 @@ use arco_worker_contract::PublicationDescriptor;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+fn scope_from_values(
+    tenant: Option<&str>,
+    workspace: Option<&str>,
+) -> Result<(String, String), &'static str> {
+    let tenant = tenant.unwrap_or("pilot");
+    let workspace = workspace.unwrap_or("flow");
+    if tenant.is_empty() || workspace.is_empty() {
+        return Err("ARCO_TENANT_ID and ARCO_WORKSPACE_ID cannot be empty");
+    }
+    Ok((tenant.to_string(), workspace.to_string()))
+}
+
 #[tokio::main]
 #[allow(
     clippy::print_stdout,
     reason = "fixture stdout is the descriptor protocol consumed by the reference worker"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "fixture commands and their ordered event trace stay together"
+)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = std::env::args().nth(1).ok_or("run ID required")?;
     let backend = from_bucket(&std::env::var("ARCO_STORAGE_BUCKET")?)?;
-    let storage = ScopedStorage::new(backend, "pilot", "flow")?;
+    let (tenant, workspace) = scope_from_values(
+        std::env::var("ARCO_TENANT_ID").ok().as_deref(),
+        std::env::var("ARCO_WORKSPACE_ID").ok().as_deref(),
+    )?;
+    let storage = ScopedStorage::new(backend, tenant.clone(), workspace.clone())?;
     if run_id == "output" {
         let output_run = std::env::args().nth(2).ok_or("output run ID required")?;
         let value: i64 = std::env::args()
@@ -30,6 +50,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .parse()?;
         let descriptor = write_output(&storage, &output_run, value).await?;
         println!("{}", serde_json::to_string(&descriptor)?);
+        return Ok(());
+    }
+    if run_id == "corrupt-output" {
+        let output_run = std::env::args().nth(2).ok_or("output run ID required")?;
+        corrupt_output(&storage, &output_run).await?;
+        println!("corrupted {output_run}");
+        return Ok(());
+    }
+    if run_id == "remove-output" {
+        let output_run = std::env::args().nth(2).ok_or("output run ID required")?;
+        storage
+            .delete(&format!("outputs/{output_run}/result.parquet"))
+            .await?;
+        println!("removed {output_run}");
+        return Ok(());
+    }
+    if run_id == "repair-output" {
+        let output_run = std::env::args().nth(2).ok_or("output run ID required")?;
+        let value: i64 = std::env::args()
+            .nth(3)
+            .ok_or("output value required")?
+            .parse()?;
+        repair_output(&storage, &output_run, value).await?;
+        println!("repaired {output_run}");
         return Ok(());
     }
     let age_minutes: i64 = std::env::args()
@@ -42,8 +86,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ledger,
             None,
             vec![OrchestrationEvent::new(
-                "pilot",
-                "flow",
+                &tenant,
+                &workspace,
                 OrchestrationEventData::TimerRequested {
                     timer_id: "pilot-timer".into(),
                     timer_type: TimerType::Retry,
@@ -59,8 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let run = OrchestrationEvent::new(
-        "pilot",
-        "flow",
+        &tenant,
+        &workspace,
         OrchestrationEventData::RunTriggered {
             run_id: run_id.clone(),
             plan_id: format!("{run_id}-plan"),
@@ -74,8 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let plan = OrchestrationEvent::new(
-        "pilot",
-        "flow",
+        &tenant,
+        &workspace,
         OrchestrationEventData::PlanCreated {
             run_id: run_id.clone(),
             plan_id: format!("{run_id}-plan"),
@@ -91,8 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let mut dispatch = OrchestrationEvent::new(
-        "pilot",
-        "flow",
+        &tenant,
+        &workspace,
         OrchestrationEventData::DispatchRequested {
             run_id: run_id.clone(),
             task_key: "task".into(),
@@ -113,22 +157,7 @@ async fn write_output(
     run_id: &str,
     value: i64,
 ) -> Result<PublicationDescriptor, Box<dyn std::error::Error>> {
-    use arrow::array::{Int64Array, RecordBatch};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-    use std::sync::Arc;
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Int64,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(Int64Array::from(vec![value]))],
-    )?;
-    let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
-    writer.write(&batch)?;
-    let bytes = writer.into_inner()?;
+    let bytes = parquet_bytes(value)?;
     let path = format!("outputs/{run_id}/result.parquet");
     let checksum = hex::encode(Sha256::digest(&bytes));
     let byte_size = u64::try_from(bytes.len())?;
@@ -159,6 +188,65 @@ async fn write_output(
     })
 }
 
+fn parquet_bytes(value: i64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use std::sync::Arc;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![value]))],
+    )?;
+    let mut writer = ArrowWriter::try_new(Vec::new(), schema, None)?;
+    writer.write(&batch)?;
+    Ok(writer.into_inner()?)
+}
+
+async fn corrupt_output(
+    storage: &ScopedStorage,
+    run_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("outputs/{run_id}/result.parquet");
+    let meta = storage.head_raw(&path).await?.ok_or("output disappeared")?;
+    let result = storage
+        .put_raw(
+            &path,
+            Bytes::from_static(b"corrupt-parquet-output"),
+            WritePrecondition::MatchesVersion(meta.version),
+        )
+        .await?;
+    if matches!(result, WriteResult::PreconditionFailed { .. }) {
+        return Err("output changed before corruption".into());
+    }
+    Ok(())
+}
+
+async fn repair_output(
+    storage: &ScopedStorage,
+    run_id: &str,
+    value: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = format!("outputs/{run_id}/result.parquet");
+    let meta = storage.head_raw(&path).await?.ok_or("output disappeared")?;
+    let bytes = parquet_bytes(value)?;
+    let result = storage
+        .put_raw(
+            &path,
+            Bytes::from(bytes),
+            WritePrecondition::MatchesVersion(meta.version),
+        )
+        .await?;
+    if matches!(result, WriteResult::PreconditionFailed { .. }) {
+        return Err("output changed before repair".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +272,43 @@ mod tests {
             .expect("same output");
         assert!(descriptor.same_immutable_claim(&replay));
         assert!(write_output(&storage, "run-output", 9).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn repair_never_claims_the_original_publication_identity_on_a_new_generation() {
+        let storage =
+            ScopedStorage::new(Arc::new(arco_core::MemoryBackend::new()), "pilot", "flow")
+                .expect("scope");
+        let descriptor = write_output(&storage, "run-output", 7)
+            .await
+            .expect("output");
+        corrupt_output(&storage, "run-output")
+            .await
+            .expect("corrupt");
+        repair_output(&storage, "run-output", 7)
+            .await
+            .expect("repair");
+        let repaired = storage
+            .head_raw("outputs/run-output/result.parquet")
+            .await
+            .expect("head")
+            .expect("object");
+        assert_ne!(repaired.version, descriptor.object_version);
+        ScopedStoragePublicationVerifier::new(storage)
+            .verify(&descriptor)
+            .await
+            .expect_err("a new generation must not satisfy the old descriptor");
+    }
+
+    #[test]
+    fn explicit_seed_scope_replaces_only_the_local_defaults() {
+        assert_eq!(
+            scope_from_values(Some("tenant-r2"), Some("workspace-r2")).expect("scope"),
+            ("tenant-r2".to_string(), "workspace-r2".to_string())
+        );
+        assert_eq!(
+            scope_from_values(None, None).expect("default scope"),
+            ("pilot".to_string(), "flow".to_string())
+        );
     }
 }

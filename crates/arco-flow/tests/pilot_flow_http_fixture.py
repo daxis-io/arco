@@ -6,6 +6,7 @@ import subprocess
 import sys
 from contextlib import closing
 from urllib.parse import quote
+from urllib.error import HTTPError
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -22,6 +23,38 @@ for directory in (ROOT, PENDING, DONE):
 MODE = ROOT / 'mode'
 if not MODE.exists():
     MODE.write_text('accept')
+PUBLICATION_MODE = ROOT / 'publication-mode'
+if not PUBLICATION_MODE.exists():
+    PUBLICATION_MODE.write_text('normal')
+COMPUTE_COUNT = ROOT / 'compute-count'
+if not COMPUTE_COUNT.exists():
+    COMPUTE_COUNT.write_text('0')
+CALLBACK_ACK_MODE = ROOT / 'callback-ack-mode'
+if not CALLBACK_ACK_MODE.exists():
+    CALLBACK_ACK_MODE.write_text('normal')
+NETWORK_TIMEOUT = int(os.environ.get('ARCO_FLOW_FIXTURE_NETWORK_TIMEOUT', '10'))
+DRAIN_TIMEOUT = NETWORK_TIMEOUT if 'ARCO_FLOW_FIXTURE_NETWORK_TIMEOUT' in os.environ else 5
+SEED_TIMEOUT = NETWORK_TIMEOUT if 'ARCO_FLOW_FIXTURE_NETWORK_TIMEOUT' in os.environ else None
+
+
+def publication_claim(output, run_id, mode):
+    claim = dict(output)
+    # Owner evidence comes only from Arco's verifier, never from this worker fixture.
+    claim.pop('ownerEvidence', None)
+    return claim
+
+
+def callback_record_path(task_id):
+    return ROOT / ('callback-' + hashlib.sha256(task_id.encode()).hexdigest() + '.json')
+
+
+def pending_task_path(task_id):
+    return next((path for path in PENDING.glob('*.json')
+                 if json.loads(json.loads(path.read_text())['body'])['taskId'] == task_id), None)
+
+
+class CallbackAcknowledgmentDiscarded(Exception):
+    pass
 
 
 def immutable_task_hash(task):
@@ -52,12 +85,53 @@ class Handler(BaseHTTPRequestHandler):
                 'pending': len(list(PENDING.glob('*.json'))),
                 'done': len(list(DONE.glob('*.json'))),
                 'received': len(list(ROOT.glob('received-*.json'))),
+                'computeCount': int(COMPUTE_COUNT.read_text()),
+                'publicationMode': PUBLICATION_MODE.read_text().strip(),
             })
         self.respond(404)
 
     def do_POST(self):
         size = int(self.headers.get('Content-Length', '0'))
         body = self.rfile.read(size)
+        if self.path == '/publication-mode':
+            mode = json.loads(body).get('mode')
+            if mode not in ('normal', 'missing', 'corrupt'):
+                return self.respond(400, {'error': 'unsupported publication mode'})
+            PUBLICATION_MODE.write_text(mode)
+            return self.respond(200, {'mode': mode})
+        if self.path == '/callback-ack-mode':
+            mode = json.loads(body).get('mode')
+            if mode not in ('normal', 'discard-completed'):
+                return self.respond(400, {'error': 'unsupported callback acknowledgment mode'})
+            CALLBACK_ACK_MODE.write_text(mode)
+            return self.respond(200, {'mode': mode})
+        if self.path == '/replay':
+            replay = json.loads(body)
+            task_id = replay.get('taskId')
+            if not isinstance(task_id, str):
+                return self.respond(400, {'error': 'taskId is required'})
+            record_path = callback_record_path(task_id)
+            if not record_path.exists():
+                return self.respond(404, {'error': 'completion callback not found'})
+            record = json.loads(record_path.read_text())
+            payload = record['payload']
+            if replay.get('changeImmutableField') == 'objectPath':
+                payload = json.loads(json.dumps(payload))
+                payload['output']['publication']['objectPath'] = 'outputs/tampered/result.parquet'
+            request = Request(record['url'], data=json.dumps(payload).encode(),
+                              headers=record['headers'], method='POST')
+            try:
+                with urlopen(request, timeout=NETWORK_TIMEOUT) as response:
+                    assert response.status == 200
+            except HTTPError as error:
+                if replay.get('changeImmutableField'):
+                    return self.respond(200, {'replayed': False, 'status': error.code})
+                raise
+            pending = pending_task_path(task_id)
+            if pending is not None:
+                os.link(pending, DONE / pending.name)
+                os.unlink(pending)
+            return self.respond(200, {'replayed': True})
         if self.path == '/accept':
             if self.headers.get('Authorization') != 'Bearer ingress-secret':
                 return self.respond(403)
@@ -100,15 +174,39 @@ class Handler(BaseHTTPRequestHandler):
                 def callback_post(suffix, payload):
                     request = Request('http://127.0.0.1:5187/api/v1/tasks/' + quote(envelope['taskId'], safe='') + suffix,
                                       data=json.dumps(payload).encode(), headers=callback_headers, method='POST')
-                    with urlopen(request, timeout=10) as response:
+                    with urlopen(request, timeout=NETWORK_TIMEOUT) as response:
                         assert response.status == 200
+                    if suffix == '/completed' and CALLBACK_ACK_MODE.read_text().strip() == 'discard-completed':
+                        raise CallbackAcknowledgmentDiscarded()
                 callback_post('/started', identity)
                 with closing(sqlite3.connect(':memory:')) as connection:
                     rows = connection.execute('select :value', {k: v['value'] for k, v in parameters.items()}).fetchall()
                 assert len(rows) == 1 and len(rows[0]) == 1 and isinstance(rows[0][0], int)
                 result = rows[0][0]
-                output = json.loads(subprocess.check_output([os.environ['ARCO_FLOW_OUTPUT_SEED'], 'output', envelope['runId'], str(result)], text=True))
-                callback_post('/completed', {**identity, 'outcome': 'SUCCEEDED', 'output': {'rowCount': 1, 'byteSize': output['byteSize'], 'publication': output}})
+                output = json.loads(subprocess.check_output(
+                    [os.environ['ARCO_FLOW_OUTPUT_SEED'], 'output', envelope['runId'], str(result)],
+                    text=True, timeout=SEED_TIMEOUT))
+                mode = PUBLICATION_MODE.read_text().strip()
+                if mode == 'missing':
+                    subprocess.check_call(
+                        [os.environ['ARCO_FLOW_OUTPUT_SEED'], 'remove-output', envelope['runId']],
+                        timeout=SEED_TIMEOUT)
+                if mode == 'corrupt':
+                    subprocess.check_call(
+                        [os.environ['ARCO_FLOW_OUTPUT_SEED'], 'corrupt-output', envelope['runId']],
+                        timeout=SEED_TIMEOUT)
+                completion = {**identity, 'outcome': 'SUCCEEDED',
+                              'output': {'rowCount': 1, 'byteSize': output['byteSize'],
+                                         'publication': publication_claim(output, envelope['runId'], mode)}}
+                callback_record_path(envelope['taskId']).write_text(json.dumps({
+                    'url': 'http://127.0.0.1:5187/api/v1/tasks/' + quote(envelope['taskId'], safe='') + '/completed',
+                    'headers': callback_headers, 'payload': completion,
+                }))
+                COMPUTE_COUNT.write_text(str(int(COMPUTE_COUNT.read_text()) + 1))
+                try:
+                    callback_post('/completed', completion)
+                except CallbackAcknowledgmentDiscarded:
+                    return self.respond(502, {'apiAccepted': True, 'wireLoss': False})
             receipt = {
                 key: envelope[key]
                 for key in ('dispatchId', 'runId', 'taskId', 'attemptId', 'callbackBaseUrl')
@@ -130,9 +228,16 @@ class Handler(BaseHTTPRequestHandler):
                     headers={'Content-Type': 'application/json', **(task.get('headers') or {})},
                     method='POST',
                 )
-                with urlopen(request, timeout=5) as response:
-                    if response.status not in (200, 202, 204):
-                        raise RuntimeError(f'worker returned {response.status}')
+                try:
+                    with urlopen(request, timeout=DRAIN_TIMEOUT) as response:
+                        if response.status not in (200, 202, 204):
+                            raise RuntimeError(f'worker returned {response.status}')
+                except HTTPError as error:
+                    if error.code == 502:
+                        return self.respond(502, {
+                            'delivered': delivered, 'apiAccepted': True, 'wireLoss': False,
+                        })
+                    raise
                 os.link(path, DONE / path.name)
                 os.unlink(path)
                 delivered += 1

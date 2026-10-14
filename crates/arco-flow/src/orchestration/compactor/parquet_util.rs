@@ -94,6 +94,7 @@ fn tasks_schema() -> Arc<Schema> {
         Field::new("output_visibility_state", DataType::Utf8, true),
         Field::new("published_at", DataType::Int64, true),
         Field::new("publish_error", DataType::Utf8, true),
+        Field::new("publication_json", DataType::Utf8, true),
         Field::new("retry_not_before", DataType::Int64, true),
         Field::new("delta_table", DataType::Utf8, true),
         Field::new("delta_version", DataType::Int64, true),
@@ -703,6 +704,17 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             .map(|r| r.publish_error.as_deref())
             .collect::<Vec<_>>(),
     );
+    let publication_json = StringArray::from(
+        rows.iter()
+            .map(|row| {
+                row.publication
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Error::parquet(format!("publication JSON encode failed: {error}")))?,
+    );
     let retry_not_before = Int64Array::from(
         rows.iter()
             .map(|r| r.retry_not_before.map(|t| t.timestamp_millis()))
@@ -754,6 +766,7 @@ pub fn write_tasks(rows: &[TaskRow]) -> Result<Bytes> {
             Arc::new(output_visibility_states),
             Arc::new(published_at),
             Arc::new(publish_errors),
+            Arc::new(publication_json),
             Arc::new(retry_not_before),
             Arc::new(delta_tables),
             Arc::new(delta_versions),
@@ -2344,6 +2357,7 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
         let output_visibility_state = col_string_opt(&batch, "output_visibility_state");
         let published_at = col_i64_opt(&batch, "published_at");
         let publish_error = col_string_opt(&batch, "publish_error");
+        let publication_json = col_string_opt(&batch, "publication_json");
         let retry_not_before = col_i64_opt(&batch, "retry_not_before");
         let delta_table = col_string_opt(&batch, "delta_table");
         let delta_version = col_i64_opt(&batch, "delta_version");
@@ -2440,6 +2454,14 @@ pub fn read_tasks(bytes: &Bytes) -> Result<Vec<TaskRow>> {
                         Some(col.value(row).to_string())
                     }
                 }),
+                publication: publication_json
+                    .as_ref()
+                    .and_then(|col| (!col.is_null(row)).then(|| col.value(row)))
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        Error::parquet(format!("publication JSON decode failed: {error}"))
+                    })?,
                 retry_not_before: retry_not_before.and_then(|col| {
                     if col.is_null(row) {
                         None
@@ -3952,6 +3974,7 @@ mod tests {
             output_visibility_state: Some(OutputVisibilityState::Pending),
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: Some("analytics.extract".to_string()),
             delta_version: Some(9),
@@ -4050,6 +4073,7 @@ mod tests {
                 output_visibility_state: Some(OutputVisibilityState::Visible),
                 published_at: Some(published_at),
                 publish_error: None,
+                publication: None,
                 retry_not_before: None,
                 delta_table: Some("analytics.visible".to_string()),
                 delta_version: Some(42),
@@ -4079,6 +4103,7 @@ mod tests {
                 output_visibility_state: Some(OutputVisibilityState::Failed),
                 published_at: None,
                 publish_error: Some("publisher exhausted retries".to_string()),
+                publication: None,
                 retry_not_before: None,
                 delta_table: Some("analytics.failed".to_string()),
                 delta_version: Some(7),
@@ -4497,6 +4522,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
@@ -4538,6 +4564,7 @@ mod tests {
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Some("UNKNOWN_VISIBILITY")])),
                 Arc::new(Int64Array::from(vec![None])),
+                Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),
                 Arc::new(Int64Array::from(vec![None])),
                 Arc::new(StringArray::from(vec![Option::<&str>::None])),

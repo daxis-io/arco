@@ -1282,7 +1282,10 @@ fn task_has_failed_required_output(task: &TaskRow) -> bool {
 fn task_has_pending_required_output(task: &TaskRow) -> bool {
     task.requires_visible_output
         && task.state == FoldTaskState::Succeeded
-        && task.output_visibility_state == Some(OutputVisibilityState::Pending)
+        && matches!(
+            task.output_visibility_state,
+            None | Some(OutputVisibilityState::Pending)
+        )
 }
 
 fn lineage_from_labels(labels: &HashMap<String, String>) -> (Option<String>, Option<String>) {
@@ -2351,6 +2354,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: None,
             delta_version: None,
@@ -2718,6 +2722,7 @@ mod tests {
                 visibility_state,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             },
             timestamp_offset_seconds,
         )

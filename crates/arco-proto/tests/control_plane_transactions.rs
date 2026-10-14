@@ -1534,6 +1534,7 @@ fn sample_task_finished_event() -> OrchestrationEventEnvelope {
                     delta_table: Some("default.raw.events".to_string()),
                     delta_version: Some(7),
                     delta_partition: Some("date=d:2026-04-09".to_string()),
+                    publication: None,
                 }),
                 error: Some(TaskError {
                     category: TaskErrorCategory::UserCode as i32,

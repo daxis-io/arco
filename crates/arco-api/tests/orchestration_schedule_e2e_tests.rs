@@ -903,6 +903,7 @@ async fn lineage_metadata_flows_from_task_output_to_catalog_and_run_read_surface
                     output_visibility_state: None,
                     published_at: None,
                     publish_error: None,
+                    publication: None,
                 }),
                 error: None,
                 metrics: None,

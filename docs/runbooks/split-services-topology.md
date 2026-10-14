@@ -1,7 +1,8 @@
 # Split Services Topology
 
-This runbook documents the production split-services topology for Arco boundary-hardened
-deployments.
+This runbook documents one split-services deployment. Operators may
+choose another process and hosting layout while preserving the same catalog
+API, compactor write ownership, dispatch contract, and callback validation.
 
 ## Services
 
@@ -18,7 +19,8 @@ Required env:
 - `ARCO_API_PUBLIC`
 - `ARCO_DEBUG`
 - `ARCO_STORAGE_BUCKET`
-- `ARCO_COMPACTOR_URL`
+- Optional `ARCO_COMPACTOR_URL` (remote Tier1 compactor; when absent the API
+  uses local Tier1 compaction, including Iceberg CRUD)
 - `ARCO_ORCH_COMPACTOR_URL`
 - User JWT auth config: `ARCO_JWT_*`
 - Task callback token config: `ARCO_TASK_TOKEN_SECRET`, `ARCO_TASK_TOKEN_ISSUER`, `ARCO_TASK_TOKEN_AUDIENCE`, `ARCO_TASK_TOKEN_TTL_SECS`
@@ -72,7 +74,7 @@ HTTP:
 Responsibility:
 - Reads orchestration dispatch outbox
 - Emits canonical camelCase `WorkerDispatchEnvelope` with opaque `taskId` and semantic `taskKey`
-- Enqueues work through provider adapter (Cloud Tasks first)
+- Enqueues work through Cloud Tasks by default or an operator HTTP ingress
 
 Required env:
 - `ARCO_TENANT_ID`
@@ -85,9 +87,10 @@ Required env:
 - `ARCO_FLOW_TASK_TOKEN_AUDIENCE`
 - `ARCO_FLOW_TASK_TOKEN_TTL_SECS`
 - `ARCO_FLOW_TASK_TIMEOUT_SECS` (default `1800`; token TTL must be >= timeout + 300s callback grace)
-- `ARCO_GCP_PROJECT_ID`
-- `ARCO_GCP_LOCATION`
-- `ARCO_FLOW_QUEUE` (default `arco-flow-dispatch`)
+- Cloud Tasks mode: `ARCO_GCP_PROJECT_ID`, `ARCO_GCP_LOCATION`, and optional
+  `ARCO_FLOW_QUEUE` (default `arco-flow-dispatch`)
+- HTTP mode: `ARCO_FLOW_WORKER_TRANSPORT=http`, `ARCO_FLOW_HTTP_INGRESS_URL`,
+  `ARCO_FLOW_HTTP_INGRESS_TOKEN` (no GCP settings; scheduled timers unsupported)
 
 HTTP:
 - `GET /health`

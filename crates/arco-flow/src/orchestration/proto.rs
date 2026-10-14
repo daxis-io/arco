@@ -45,6 +45,7 @@ use crate::task::{
     TaskState as LegacyTaskState,
 };
 use crate::task_key::{TaskKey as LegacyTaskKey, TaskOperation as LegacyTaskOperation};
+use arco_worker_contract::{PublicationDescriptor, PublicationOwnerEvidence};
 
 /// Errors produced while converting between runtime orchestration types and proto types.
 #[derive(Debug, Error)]
@@ -473,6 +474,7 @@ fn event_data_to_proto(
             visibility_state,
             published_at,
             publish_error,
+            publication,
         } => orchestration_event_envelope::Event::TaskOutputVisibilityChanged(
             proto::TaskOutputVisibilityChanged {
                 run_id: run_id.clone(),
@@ -482,6 +484,7 @@ fn event_data_to_proto(
                 visibility_state: output_visibility_state_to_proto(*visibility_state) as i32,
                 published_at: published_at.map(chrono_to_protobuf),
                 publish_error: publish_error.clone(),
+                publication: publication.as_ref().map(publication_to_proto),
             },
         ),
         OrchestrationEventData::DispatchRequested {
@@ -767,7 +770,8 @@ fn proto_event_to_runtime(
             let output = event
                 .callback_output
                 .as_ref()
-                .map(callback_output_from_proto);
+                .map(callback_output_from_proto)
+                .transpose()?;
             let (error_message, error) = task_finished_error_from_proto(event.error.as_ref())?;
             OrchestrationEventData::TaskFinished {
                 run_id: event.run_id.clone(),
@@ -794,7 +798,8 @@ fn proto_event_to_runtime(
             let output = event
                 .callback_output
                 .as_ref()
-                .map(callback_output_from_proto);
+                .map(callback_output_from_proto)
+                .transpose()?;
             let (error_message, error) = task_finished_error_from_proto(event.error.as_ref())?;
             OrchestrationEventData::TaskCompletionRecorded {
                 run_id: event.run_id.clone(),
@@ -840,6 +845,11 @@ fn proto_event_to_runtime(
                     })
                     .transpose()?,
                 publish_error: event.publish_error.clone(),
+                publication: event
+                    .publication
+                    .as_ref()
+                    .map(publication_from_proto)
+                    .transpose()?,
             }
         }
         orchestration_event_envelope::Event::DispatchRequested(event) => {
@@ -1005,11 +1015,14 @@ fn callback_output_to_proto(output: &CallbackTaskOutput) -> proto::TaskCallbackO
         delta_table: output.delta_table.clone(),
         delta_version: output.delta_version,
         delta_partition: output.delta_partition.clone(),
+        publication: output.publication.as_ref().map(publication_to_proto),
     }
 }
 
-fn callback_output_from_proto(output: &proto::TaskCallbackOutput) -> CallbackTaskOutput {
-    CallbackTaskOutput {
+fn callback_output_from_proto(
+    output: &proto::TaskCallbackOutput,
+) -> Result<CallbackTaskOutput, OrchestrationProtoError> {
+    Ok(CallbackTaskOutput {
         materialization_id: output.materialization_id.clone(),
         row_count: output.row_count,
         byte_size: output.byte_size,
@@ -1020,7 +1033,61 @@ fn callback_output_from_proto(output: &proto::TaskCallbackOutput) -> CallbackTas
         output_visibility_state: None,
         published_at: None,
         publish_error: None,
+        publication: output
+            .publication
+            .as_ref()
+            .map(publication_from_proto)
+            .transpose()?,
+    })
+}
+
+fn publication_to_proto(descriptor: &PublicationDescriptor) -> proto::PublicationDescriptor {
+    proto::PublicationDescriptor {
+        version: descriptor.version,
+        manifest_id: descriptor.manifest_id.clone(),
+        object_path: descriptor.object_path.clone(),
+        object_version: descriptor.object_version.clone(),
+        checksum_sha256: descriptor.checksum_sha256.clone(),
+        byte_size: descriptor.byte_size,
+        format: descriptor.format.clone(),
+        schema_ref: descriptor.schema_ref.clone(),
+        owner_evidence: descriptor.owner_evidence.as_ref().map(|evidence| {
+            proto::PublicationOwnerEvidence {
+                verified_at: Some(chrono_to_protobuf(evidence.verified_at)),
+                object_version: evidence.object_version.clone(),
+                etag: evidence.etag.clone(),
+            }
+        }),
     }
+}
+
+fn publication_from_proto(
+    descriptor: &proto::PublicationDescriptor,
+) -> Result<PublicationDescriptor, OrchestrationProtoError> {
+    Ok(PublicationDescriptor {
+        version: descriptor.version,
+        manifest_id: descriptor.manifest_id.clone(),
+        object_path: descriptor.object_path.clone(),
+        object_version: descriptor.object_version.clone(),
+        checksum_sha256: descriptor.checksum_sha256.clone(),
+        byte_size: descriptor.byte_size,
+        format: descriptor.format.clone(),
+        schema_ref: descriptor.schema_ref.clone(),
+        owner_evidence: descriptor
+            .owner_evidence
+            .as_ref()
+            .map(|evidence| {
+                Ok(PublicationOwnerEvidence {
+                    verified_at: protobuf_to_chrono(
+                        evidence.verified_at.as_ref(),
+                        "publication.owner_evidence.verified_at",
+                    )?,
+                    object_version: evidence.object_version.clone(),
+                    etag: evidence.etag.clone(),
+                })
+            })
+            .transpose()?,
+    })
 }
 
 fn callback_error_to_proto(error: &CallbackTaskError) -> proto::TaskError {
@@ -1081,6 +1148,7 @@ fn task_finished_output_to_proto(
             delta_table: None,
             delta_version: None,
             delta_partition: None,
+            publication: None,
         }),
     }
 }
@@ -1243,6 +1311,7 @@ fn output_visibility_update_to_proto(
         visibility_state: output_visibility_state_to_proto(update.visibility_state) as i32,
         published_at: update.published_at.map(chrono_to_protobuf),
         publish_error: update.publish_error.clone(),
+        publication: update.publication.as_ref().map(publication_to_proto),
     }
 }
 
@@ -1262,6 +1331,11 @@ fn output_visibility_update_from_proto(
             })
             .transpose()?,
         publish_error: update.publish_error.clone(),
+        publication: update
+            .publication
+            .as_ref()
+            .map(publication_from_proto)
+            .transpose()?,
     })
 }
 

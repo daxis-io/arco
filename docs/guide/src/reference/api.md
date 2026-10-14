@@ -22,6 +22,14 @@ Parquet bytes with a client-supplied engine. For orchestration projections,
 resolve the published orchestration manifest or use the run/task REST API. The
 client runtime owns SQL planning, execution, and engine-specific tests.
 
+The API is required to operate the catalog; the operator chooses its deployment
+topology. The repository's Cloud Run split is one deployment recipe.
+
+The current signed-URL route serves allowlisted published files on legacy
+catalog roots. It rejects catalog roots bound to `control/v1` until the
+projection read and authorization path is qualified. A control-root pilot must
+not treat table metadata or a state token as a grant to read data.
+
 ## Service Implementation
 
 Primary API composition and routing live in:

@@ -2083,6 +2083,73 @@
         ]
       }
     },
+    "/api/v1/tasks/{task_id}/publication": {
+      "get": {
+        "tags": [
+          "Worker Callbacks"
+        ],
+        "summary": "Returns a publication only after owner verification for the authenticated task scope.",
+        "operationId": "inspect_publication",
+        "parameters": [
+          {
+            "name": "task_id",
+            "in": "path",
+            "description": "Task ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owner-verified publication",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationInspectionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid or missing task token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Task or verified publication not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Publication remains unverified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "taskAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/tasks/{task_id}/started": {
       "post": {
         "tags": [
@@ -3278,10 +3345,10 @@
             "description": "Aggregated log page",
             "headers": {
               "x-arco-next-cursor": {
-                "description": "Opaque cursor for the next log page",
                 "schema": {
                   "type": "string"
-                }
+                },
+                "description": "Opaque cursor for the next log page"
               }
             },
             "content": {
@@ -6439,6 +6506,130 @@
           }
         }
       },
+      "PublicationDescriptor": {
+        "type": "object",
+        "description": "Immutable publication claim supplied by a worker and verified by the\nworkspace storage owner before it becomes readable.",
+        "required": [
+          "version",
+          "manifestId",
+          "objectPath",
+          "objectVersion",
+          "checksumSha256",
+          "byteSize",
+          "format",
+          "schemaRef"
+        ],
+        "properties": {
+          "byteSize": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Exact object size in bytes.",
+            "minimum": 0
+          },
+          "checksumSha256": {
+            "type": "string",
+            "description": "Lowercase hexadecimal SHA-256 digest of the object bytes."
+          },
+          "format": {
+            "type": "string",
+            "description": "Output encoding, such as `parquet`."
+          },
+          "manifestId": {
+            "type": "string",
+            "description": "Content-addressed manifest identity (`sha256:<checksumSha256>`)."
+          },
+          "objectPath": {
+            "type": "string",
+            "description": "Scope-relative immutable object path."
+          },
+          "objectVersion": {
+            "type": "string",
+            "description": "Exact opaque object-store version observed by the worker."
+          },
+          "ownerEvidence": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublicationOwnerEvidence",
+                "description": "Storage-owner evidence. Worker-supplied values are discarded and this\nfield is populated only after owner-side verification."
+              }
+            ]
+          },
+          "schemaRef": {
+            "type": "string",
+            "description": "Immutable reference to the embedded schema. Version 1 requires\n`<manifestId>#parquet-schema`."
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Descriptor schema version. Version 1 is the only supported value.",
+            "minimum": 0
+          }
+        }
+      },
+      "PublicationInspectionResponse": {
+        "type": "object",
+        "description": "Owner-verified publication descriptor for one completed task attempt.",
+        "required": [
+          "runId",
+          "taskKey",
+          "attempt",
+          "attemptId",
+          "publication"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Verified attempt number.",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "description": "Verified attempt identifier."
+          },
+          "publication": {
+            "$ref": "#/components/schemas/PublicationDescriptor",
+            "description": "Immutable descriptor carrying owner verification evidence."
+          },
+          "runId": {
+            "type": "string",
+            "description": "Run identifier."
+          },
+          "taskKey": {
+            "type": "string",
+            "description": "Semantic task key."
+          }
+        }
+      },
+      "PublicationOwnerEvidence": {
+        "type": "object",
+        "description": "Evidence minted by the workspace storage owner after exact verification.",
+        "required": [
+          "verifiedAt",
+          "objectVersion"
+        ],
+        "properties": {
+          "etag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Object-store entity tag, when the adapter supplies one."
+          },
+          "objectVersion": {
+            "type": "string",
+            "description": "Exact opaque object-store version verified by the owner."
+          },
+          "verifiedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Server time when verification completed."
+          }
+        }
+      },
       "RegisterSchemaTableRequest": {
         "type": "object",
         "description": "Request to register a table in a schema.",
@@ -7941,6 +8132,17 @@
               {
                 "$ref": "#/components/schemas/TaskOutputVisibilityState",
                 "description": "Output visibility state."
+              }
+            ]
+          },
+          "publication": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PublicationDescriptor",
+                "description": "Versioned immutable publication claim and owner verification evidence."
               }
             ]
           },

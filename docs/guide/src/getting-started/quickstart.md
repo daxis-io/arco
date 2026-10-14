@@ -15,10 +15,11 @@ cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
 bash scripts/run_local_pipeline_uat.sh
 ```
 
-This no-cloud UAT writes sample Parquet data, registers and queries catalog
-tables, stages and commits a Delta table log, deploys a manifest, dispatches a
-task, completes the callback, and verifies the final run and task state. It
-does not use GCP, Cloud Run, Cloud Scheduler, Cloud Tasks, or GCS.
+This no-cloud UAT writes sample Parquet data, registers and reads catalog
+metadata, stages and commits a Delta table log, deploys a manifest, dispatches
+a task, completes the callback, and verifies the final run and task state. It
+does not execute SQL or use GCP, Cloud Run, Cloud Scheduler, Cloud Tasks, or
+GCS. SQL execution belongs in a client-supplied engine.
 
 To run the same no-cloud UAT inside a Linux container:
 

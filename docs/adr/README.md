@@ -48,7 +48,7 @@ Each ADR follows this structure:
 | [033](adr-033-internal-durability-modes.md) | Internal Durability Modes for Orchestration Compaction | Proposed |
 | [034](adr-034-fenced-head-published-control-plane-transactions.md) | Fenced Head-Published Control-Plane Transactions | Proposed |
 | [035](adr-035-system-catalog-tables.md) | System Catalog Tables | Superseded for SQL serving |
-| [036](adr-036-engine-boundaries.md) | Engine Boundaries and Split-Service Topology | Accepted |
+| [036](adr-036-engine-boundaries.md) | Engine Boundaries and Deployment Topology | Accepted |
 | [037](adr-037-arco-catalog-product-surface.md) | Arco Catalog Product Surface | Proposed |
 | [038](adr-038-catalog-threat-model.md) | Catalog Threat Model | Proposed |
 | [039](adr-039-catalog-consistency-model.md) | Catalog Consistency Model | Proposed |

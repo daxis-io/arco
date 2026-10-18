@@ -33,9 +33,12 @@
 //! - **ADR-021**: Cloud Tasks naming convention (dual-identifier pattern)
 //! - **ADR-022**: Per-edge dependency satisfaction for duplicate-safe readiness
 
+pub mod accepted_plan;
 pub mod callbacks;
 pub mod compactor;
 pub mod controllers;
+/// Operator-hosted Flow dispatcher routes.
+pub mod dispatcher_service;
 pub mod event_log;
 pub mod events;
 /// Helpers for Cloud Run flow controller services.
@@ -47,6 +50,8 @@ pub mod run_key;
 pub mod runtime;
 pub mod selection;
 pub mod state;
+/// Operator-hosted Flow sweeper routes.
+pub mod sweeper_service;
 pub mod worker_contract;
 
 pub use callbacks::{

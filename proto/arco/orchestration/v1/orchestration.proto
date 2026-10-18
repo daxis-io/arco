@@ -138,6 +138,26 @@ message TaskCallbackOutput {
   optional string delta_table = 5;
   optional int64 delta_version = 6;
   optional string delta_partition = 7;
+  PublicationDescriptor publication = 8;
+}
+
+// Immutable publication claim plus storage-owner verification evidence.
+message PublicationDescriptor {
+  uint32 version = 1;
+  string manifest_id = 2;
+  string object_path = 3;
+  string object_version = 4;
+  string checksum_sha256 = 5;
+  uint64 byte_size = 6;
+  string format = 7;
+  string schema_ref = 8;
+  PublicationOwnerEvidence owner_evidence = 9;
+}
+
+message PublicationOwnerEvidence {
+  google.protobuf.Timestamp verified_at = 1;
+  string object_version = 2;
+  optional string etag = 3;
 }
 
 // Published file metadata owned by the orchestration output contract.
@@ -293,6 +313,7 @@ message WorkerTaskOutput {
   WorkerOutputVisibilityState output_visibility_state = 8;
   google.protobuf.Timestamp published_at = 9;
   optional string publish_error = 10;
+  PublicationDescriptor publication = 11;
 }
 
 // Error details reported by workers on failure.
@@ -538,12 +559,14 @@ message TaskOutputVisibilityChanged {
   OutputVisibilityState visibility_state = 5;
   google.protobuf.Timestamp published_at = 6;
   optional string publish_error = 7;
+  PublicationDescriptor publication = 8;
 }
 
 message TaskOutputVisibilityUpdate {
   OutputVisibilityState visibility_state = 1;
   google.protobuf.Timestamp published_at = 2;
   optional string publish_error = 3;
+  PublicationDescriptor publication = 4;
 }
 
 message TaskCompletionRecorded {

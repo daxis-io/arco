@@ -20,6 +20,7 @@ use parquet::file::properties::WriterProperties;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
@@ -245,6 +246,15 @@ async fn local_pipeline_uat_writes_delta_catalogs_and_completes_run() {
         finished_task.output_visibility_state.as_deref(),
         Some("VISIBLE")
     );
+    let inspection_request = make_request(
+        Method::GET,
+        &format!("/api/v1/tasks/{}/publication", task.task_key),
+        None,
+        &[("Authorization", "Bearer local-uat-token")],
+    );
+    let inspection: Value = send_json(&app.router, inspection_request, StatusCode::OK).await;
+    assert_eq!(inspection["publication"]["objectPath"], delta_data_path);
+    assert!(inspection["publication"]["ownerEvidence"].is_object());
 }
 
 impl TestApp {
@@ -464,6 +474,14 @@ async fn post_task_completed(
     delta_version: i64,
     output_path: &str,
 ) {
+    let bytes = app.storage.get_raw(output_path).await.expect("read output");
+    let meta = app
+        .storage
+        .head_raw(output_path)
+        .await
+        .expect("stat output")
+        .expect("output exists");
+    let checksum = hex::encode(Sha256::digest(&bytes));
     let response: TaskCallbackResponse = post_json(
         &app.router,
         &format!("/api/v1/tasks/{task_key}/completed"),
@@ -476,14 +494,21 @@ async fn post_task_completed(
             "output": {
                 "materializationId": format!("mat-local-uat-{delta_version}"),
                 "rowCount": 3,
-                "byteSize": null,
+                "byteSize": meta.size,
                 "outputPath": output_path,
                 "deltaTable": delta_table,
                 "deltaVersion": delta_version,
                 "deltaPartition": null,
-                "outputVisibilityState": "VISIBLE",
-                "publishedAt": Utc::now(),
-                "publishError": null
+                "publication": {
+                    "version": 1,
+                    "manifestId": format!("sha256:{checksum}"),
+                    "objectPath": output_path,
+                    "objectVersion": meta.version,
+                    "checksumSha256": checksum,
+                    "byteSize": meta.size,
+                    "format": "parquet",
+                    "schemaRef": format!("sha256:{checksum}#parquet-schema")
+                }
             },
             "error": null,
             "metrics": {"ioWriteBytes": null},

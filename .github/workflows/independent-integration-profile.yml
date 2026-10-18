@@ -1,0 +1,90 @@
+name: Independent Integration Profile
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/independent-integration-profile.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'proto/**'
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - '.github/workflows/independent-integration-profile.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
+      - 'proto/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-http:
+    name: Packaged API and HTTP worker recovery
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/independent-proof
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
+        with:
+          toolchain: 1.88
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+      - name: Install local emulator dependencies
+        run: python -m pip install 'moto[server]==5.2.3' 'boto3==1.43.110'
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Verify fixture evidence guards
+        run: python crates/arco-flow/tests/operator_fixture_contract.py
+      - name: Record build identity and capacity
+        run: |
+          mkdir -p receipts
+          df -h .
+          {
+            echo "source_sha=$(git rev-parse HEAD)"
+            rustc --version
+            cargo --version
+            sha256sum Cargo.lock rust-toolchain.toml
+            echo 'profile=default API/Flow features; operator HTTP; disposable loopback S3 emulator'
+            echo 'dev_debug=0; incremental=0; jobs=2'
+            echo 'provider_qualification=untested'
+          } > receipts/identity.txt
+      - name: Build the exact packaged profile
+        run: |
+          set -o pipefail
+          cargo build --locked -p arco-api -p arco-flow \
+            --bin arco-api --bin arco_flow_dispatcher --bin arco_flow_sweeper \
+            --example pilot_flow_process_seed 2>&1 | tee receipts/build.log
+          cargo metadata --locked --no-deps --format-version 1 > receipts/metadata.json
+      - name: Exercise independent catalog, execution, publication and repair
+        run: |
+          target_dir="$(python -c "import json; print(json.load(open('receipts/metadata.json'))['target_directory'])")"
+          python crates/arco-flow/tests/independent_process_proof.py \
+            "$target_dir/debug" "$RUNNER_TEMP/arco-independent-proof"
+      - name: Retain sanitized receipts and process logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: independent-profile-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            receipts/
+            ${{ runner.temp }}/arco-independent-proof/receipt.json
+            ${{ runner.temp }}/arco-independent-proof/*.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record final capacity
+        if: always()
+        run: df -h .

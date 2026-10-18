@@ -3913,6 +3913,7 @@ impl TaskCompletion {
                     output_visibility_state: Some(TaskOutputVisibilityState::Visible),
                     published_at: Some(Utc::now()),
                     publish_error: None,
+                    publication: None,
                 }),
                 None,
             ),

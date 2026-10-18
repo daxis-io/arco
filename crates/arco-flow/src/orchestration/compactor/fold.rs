@@ -424,6 +424,9 @@ pub struct TaskRow {
     /// Publish failure, if output failed to become visible.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_error: Option<String>,
+    /// Immutable publication descriptor and owner evidence for this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<arco_worker_contract::PublicationDescriptor>,
     /// Earliest time anti-entropy may bootstrap the next retry attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_not_before: Option<DateTime<Utc>>,
@@ -1453,6 +1456,7 @@ impl FoldState {
                             update.visibility_state,
                             update.published_at,
                             update.publish_error.as_deref(),
+                            update.publication.as_ref(),
                             &event.event_id,
                             event.timestamp,
                         )
@@ -1478,6 +1482,7 @@ impl FoldState {
                 visibility_state,
                 published_at,
                 publish_error,
+                publication,
             } => {
                 let changed = self.fold_task_output_visibility_changed(
                     run_id,
@@ -1487,6 +1492,7 @@ impl FoldState {
                     *visibility_state,
                     *published_at,
                     publish_error.as_deref(),
+                    publication.as_ref(),
                     &event.event_id,
                     event.timestamp,
                 );
@@ -2004,6 +2010,7 @@ impl FoldState {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
                 retry_not_before: None,
                 delta_table: None,
                 delta_version: None,
@@ -2257,6 +2264,7 @@ impl FoldState {
 
                 task.materialization_id
                     .clone_from(&metadata.materialization_id);
+                task.publication = output.and_then(|output| output.publication.clone());
                 if task.output_visibility_state.is_none() {
                     task.published_at = None;
                     task.publish_error = None;
@@ -2269,6 +2277,7 @@ impl FoldState {
                 task.output_visibility_state = None;
                 task.published_at = None;
                 task.publish_error = None;
+                task.publication = None;
             }
 
             // Update run counters
@@ -2384,6 +2393,7 @@ impl FoldState {
         visibility_state: OutputVisibilityState,
         published_at: Option<DateTime<Utc>>,
         publish_error: Option<&str>,
+        publication: Option<&arco_worker_contract::PublicationDescriptor>,
         event_id: &str,
         timestamp: DateTime<Utc>,
     ) -> bool {
@@ -2399,15 +2409,29 @@ impl FoldState {
             return false;
         }
 
-        if matches!(
-            task.output_visibility_state,
-            Some(OutputVisibilityState::Visible | OutputVisibilityState::Failed)
-        ) && task.output_visibility_state != Some(visibility_state)
+        if task.output_visibility_state == Some(OutputVisibilityState::Visible)
+            && visibility_state != OutputVisibilityState::Visible
+        {
+            return false;
+        }
+
+        if let (Some(existing), Some(incoming)) = (&task.publication, publication)
+            && !existing.same_immutable_claim(incoming)
         {
             return false;
         }
 
         task.output_visibility_state = Some(visibility_state);
+        if let Some(publication) = publication {
+            let should_enrich = publication.owner_evidence.is_some()
+                || task
+                    .publication
+                    .as_ref()
+                    .is_none_or(|existing| existing.owner_evidence.is_none());
+            if should_enrich {
+                task.publication = Some(publication.clone());
+            }
+        }
         task.row_version = event_id.to_string();
         match visibility_state {
             OutputVisibilityState::Pending => {
@@ -3973,6 +3997,7 @@ mod tests {
         OrchestrationEventData, OutputVisibilityState, OutputVisibilityUpdate, SourceRef,
         TimerType as EventTimerType, TriggerInfo, TriggerSource,
     };
+    use arco_worker_contract::{PublicationDescriptor, PublicationOwnerEvidence};
     use ulid::Ulid;
 
     fn make_event(data: OrchestrationEventData) -> OrchestrationEvent {
@@ -4163,7 +4188,27 @@ mod tests {
             visibility_state,
             published_at,
             publish_error: publish_error.map(ToString::to_string),
+            publication: None,
         })
+    }
+
+    fn publication_descriptor(label: &str) -> PublicationDescriptor {
+        let checksum = match label {
+            "a" => "a".repeat(64),
+            "b" => "b".repeat(64),
+            _ => panic!("unsupported publication label"),
+        };
+        PublicationDescriptor {
+            version: 1,
+            manifest_id: format!("sha256:{checksum}"),
+            object_path: format!("outputs/{label}.parquet"),
+            object_version: format!("version-{label}"),
+            checksum_sha256: checksum.clone(),
+            byte_size: 4,
+            format: "parquet".to_string(),
+            schema_ref: format!("sha256:{checksum}#parquet-schema"),
+            owner_evidence: None,
+        }
     }
 
     fn dispatch_requested_event(
@@ -4885,6 +4930,7 @@ mod tests {
                     visibility_state: OutputVisibilityState::Visible,
                     published_at: Some(published_at),
                     publish_error: None,
+                    publication: None,
                 }),
             },
         ));
@@ -4901,6 +4947,169 @@ mod tests {
         );
         assert_eq!(task.published_at, Some(published_at));
         assert!(task.publish_error.is_none());
+    }
+
+    #[test]
+    fn publication_identity_is_immutable_across_duplicate_completion_and_visibility_race() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: None,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+
+        let completion = |publication: PublicationDescriptor| {
+            make_event(OrchestrationEventData::TaskCompletionRecorded {
+                run_id: "run1".into(),
+                task_key: "analytics.daily".into(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                worker_id: "worker-1".into(),
+                outcome: TaskOutcome::Succeeded,
+                materialization_id: Some("mat-01".into()),
+                error_message: None,
+                output: None,
+                error: None,
+                metrics: None,
+                cancelled_during_phase: None,
+                partial_progress_json: None,
+                asset_key: Some("analytics.daily".into()),
+                partition_key: None,
+                code_version: Some("code-v1".into()),
+                output_visibility: Some(OutputVisibilityUpdate {
+                    visibility_state: OutputVisibilityState::Pending,
+                    published_at: None,
+                    publish_error: None,
+                    publication: Some(publication),
+                }),
+            })
+        };
+        let publication_a = publication_descriptor("a");
+        let publication_b = publication_descriptor("b");
+        state.fold_event(&completion(publication_a.clone()));
+        state.fold_event(&completion(publication_b.clone()));
+
+        let visible_event = |publication: PublicationDescriptor| {
+            make_event(OrchestrationEventData::TaskOutputVisibilityChanged {
+                run_id: "run1".into(),
+                task_key: "analytics.daily".into(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                visibility_state: OutputVisibilityState::Visible,
+                published_at: Some(Utc::now()),
+                publish_error: None,
+                publication: Some(publication),
+            })
+        };
+        state.fold_event(&visible_event(publication_b));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .expect("task");
+        assert_eq!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Pending)
+        );
+        assert_eq!(task.publication.as_ref(), Some(&publication_a));
+
+        let mut verified_a = publication_a;
+        verified_a.owner_evidence = Some(PublicationOwnerEvidence {
+            verified_at: Utc::now(),
+            object_version: verified_a.object_version.clone(),
+            etag: Some("etag-a".to_string()),
+        });
+        state.fold_event(&visible_event(verified_a.clone()));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .expect("task");
+        assert_eq!(
+            task.output_visibility_state,
+            Some(OutputVisibilityState::Visible)
+        );
+        assert_eq!(task.publication.as_ref(), Some(&verified_a));
+    }
+
+    #[test]
+    fn first_terminal_publication_binding_cannot_be_replaced() {
+        let mut state = FoldState::new();
+        let attempt_id = Ulid::new().to_string();
+        state.fold_event(&run_triggered_event("run1"));
+        state.fold_event(&plan_created_event(
+            "run1",
+            vec![TaskDef {
+                key: "analytics.daily".into(),
+                depends_on: vec![],
+                asset_key: Some("analytics.daily".into()),
+                partition_key: None,
+                max_attempts: 1,
+                heartbeat_timeout_sec: 300,
+                requires_visible_output: true,
+            }],
+        ));
+        state.fold_event(&task_started_event(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+        ));
+        state.fold_event(&task_finished_success_with_materialization(
+            "run1",
+            "analytics.daily",
+            1,
+            &attempt_id,
+            "mat-01",
+        ));
+
+        let mut publication_a = publication_descriptor("a");
+        publication_a.owner_evidence = Some(PublicationOwnerEvidence {
+            verified_at: Utc::now(),
+            object_version: publication_a.object_version.clone(),
+            etag: None,
+        });
+        let mut publication_b = publication_descriptor("b");
+        publication_b.owner_evidence = Some(PublicationOwnerEvidence {
+            verified_at: Utc::now(),
+            object_version: publication_b.object_version.clone(),
+            etag: None,
+        });
+        let visible = |publication: PublicationDescriptor| {
+            make_event(OrchestrationEventData::TaskOutputVisibilityChanged {
+                run_id: "run1".into(),
+                task_key: "analytics.daily".into(),
+                attempt: 1,
+                attempt_id: attempt_id.clone(),
+                visibility_state: OutputVisibilityState::Visible,
+                published_at: Some(Utc::now()),
+                publish_error: None,
+                publication: Some(publication),
+            })
+        };
+        state.fold_event(&visible(publication_a.clone()));
+        state.fold_event(&visible(publication_b));
+
+        let task = state
+            .tasks
+            .get(&("run1".into(), "analytics.daily".into()))
+            .expect("task");
+        assert_eq!(task.publication.as_ref(), Some(&publication_a));
     }
 
     #[test]
@@ -5047,6 +5256,7 @@ mod tests {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
             retry_not_before: None,
             delta_table: None,
             delta_version: None,
@@ -6938,6 +7148,7 @@ mod tests {
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,

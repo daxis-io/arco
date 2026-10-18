@@ -43,6 +43,7 @@ pub struct ObjectStoreBackend {
     conditional_write_store: Arc<DynObjectStore>,
     signer: Option<Arc<dyn ObjectStoreSigner>>,
     ordered_listing: bool,
+    etag_version_tokens: bool,
 }
 
 impl ObjectStoreBackend {
@@ -64,6 +65,7 @@ impl ObjectStoreBackend {
             conditional_write_store,
             signer,
             ordered_listing: false,
+            etag_version_tokens: false,
         }
     }
 
@@ -84,6 +86,7 @@ impl ObjectStoreBackend {
             conditional_write_store,
             signer,
             ordered_listing: true,
+            etag_version_tokens: false,
         }
     }
 
@@ -91,6 +94,16 @@ impl ObjectStoreBackend {
     #[must_use]
     pub const fn ordered_listing_enabled(&self) -> bool {
         self.ordered_listing
+    }
+
+    /// Uses `ETags` as version identity for stores without readable object versions.
+    ///
+    /// R2 returns a version ID on PUT but omits it on HEAD and listing. Its
+    /// conditional writes use `ETags`, so all returned tokens must omit that ID.
+    #[must_use]
+    pub const fn with_etag_version_tokens(mut self) -> Self {
+        self.etag_version_tokens = true;
+        self
     }
 }
 
@@ -174,8 +187,15 @@ fn is_write_precondition_failure(
     }
 }
 
-fn object_store_meta_to_meta(meta: object_store::ObjectMeta) -> ObjectMeta {
-    let version = VersionToken::from_parts(meta.e_tag.clone(), meta.version.clone()).encode();
+fn object_store_meta_to_meta(
+    meta: object_store::ObjectMeta,
+    etag_version_tokens: bool,
+) -> ObjectMeta {
+    let version = VersionToken::from_parts(
+        meta.e_tag.clone(),
+        meta.version.filter(|_| !etag_version_tokens),
+    )
+    .encode();
     ObjectMeta {
         path: meta.location.to_string(),
         size: u64::try_from(meta.size).unwrap_or(u64::MAX),
@@ -306,7 +326,11 @@ impl StorageBackend for ObjectStoreBackend {
         };
         match write_store.put_opts(&location, data.into(), options).await {
             Ok(result) => Ok(WriteResult::Success {
-                version: VersionToken::from_parts(result.e_tag, result.version).encode(),
+                version: VersionToken::from_parts(
+                    result.e_tag,
+                    result.version.filter(|_| !self.etag_version_tokens),
+                )
+                .encode(),
             }),
             Err(error) if is_write_precondition_failure(&precondition, &error) => {
                 let current_version = self
@@ -331,7 +355,12 @@ impl StorageBackend for ObjectStoreBackend {
             .list(Some(&ObjectStorePath::from(prefix)))
             .try_collect::<Vec<_>>()
             .await
-            .map(|metas| metas.into_iter().map(object_store_meta_to_meta).collect())
+            .map(|metas| {
+                metas
+                    .into_iter()
+                    .map(|meta| object_store_meta_to_meta(meta, self.etag_version_tokens))
+                    .collect()
+            })
             .map_err(map_object_store_error)
     }
 
@@ -368,7 +397,7 @@ impl StorageBackend for ObjectStoreBackend {
             .await
             .map_err(map_object_store_error)?
             .into_iter()
-            .map(object_store_meta_to_meta)
+            .map(|meta| object_store_meta_to_meta(meta, self.etag_version_tokens))
             .collect::<Vec<_>>();
         validate_ordered_page(prefix, start_after, limit, &objects)?;
         let next_start_after = next_start_after(&objects, limit);
@@ -380,7 +409,10 @@ impl StorageBackend for ObjectStoreBackend {
 
     async fn head(&self, path: &str) -> Result<Option<ObjectMeta>> {
         match self.store.head(&ObjectStorePath::from(path)).await {
-            Ok(meta) => Ok(Some(object_store_meta_to_meta(meta))),
+            Ok(meta) => Ok(Some(object_store_meta_to_meta(
+                meta,
+                self.etag_version_tokens,
+            ))),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(error) => Err(map_object_store_error(error)),
         }
@@ -402,7 +434,7 @@ impl StorageBackend for ObjectStoreBackend {
 mod tests {
     use std::io;
 
-    use super::is_write_precondition_failure;
+    use super::{VersionToken, is_write_precondition_failure, object_store_meta_to_meta};
     use arco_core::storage::WritePrecondition;
 
     fn s3_generic_error(message: &str) -> object_store::Error {
@@ -410,6 +442,32 @@ mod tests {
             store: "S3",
             source: Box::new(io::Error::other(message.to_string())),
         }
+    }
+
+    #[test]
+    fn version_metadata_preserves_default_and_legacy_tokens() {
+        let meta = object_store::ObjectMeta {
+            location: "head.json".into(),
+            size: 2,
+            last_modified: "2026-10-13T00:00:00Z".parse().unwrap(),
+            e_tag: Some("\"etag\"".to_string()),
+            version: Some("object-version".to_string()),
+        };
+        let default = object_store_meta_to_meta(meta.clone(), false);
+        assert_eq!(
+            default.version,
+            r#"{"e_tag":"\"etag\"","version":"object-version"}"#
+        );
+        let etag = object_store_meta_to_meta(meta, true);
+        assert_eq!(etag.version, r#"{"e_tag":"\"etag\"","version":null}"#);
+        // Previously persisted R2 tokens still carry the ETag required for CAS.
+        let legacy = VersionToken::decode(&default.version).to_update_version();
+        assert_eq!(legacy.e_tag.as_deref(), Some("\"etag\""));
+        assert_eq!(legacy.version.as_deref(), Some("object-version"));
+        assert_eq!(
+            VersionToken::decode("raw-generation").version.as_deref(),
+            Some("raw-generation")
+        );
     }
 
     #[test]

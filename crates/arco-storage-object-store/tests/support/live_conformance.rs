@@ -17,8 +17,13 @@ use tokio::sync::Barrier;
 use ulid::Ulid;
 
 /// Verifies the conditional-write semantics required by Arco authority heads.
+#[allow(
+    clippy::print_stdout,
+    reason = "retain disposable provider object paths in receipts"
+)]
 pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBackend>) {
     let path = format!("conformance/{name}/{}/head.json", Ulid::new());
+    println!("conditional-write probe: {path}");
     let first = backend
         .put(
             &path,
@@ -43,11 +48,14 @@ pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBack
         )
         .await
         .expect("duplicate create");
-    assert!(matches!(
-        duplicate,
-        WriteResult::PreconditionFailed { ref current_version }
-            if current_version == &first_version
-    ));
+    assert!(
+        matches!(
+            duplicate,
+            WriteResult::PreconditionFailed { ref current_version }
+                if current_version == &first_version
+        ),
+        "duplicate create at {path}: first version {first_version:?}, result {duplicate:?}"
+    );
 
     let second = backend
         .put(
@@ -101,6 +109,17 @@ pub async fn assert_storage_conformance(name: &str, backend: Arc<dyn StorageBack
     };
     assert_ne!(recreated_version, first_version);
     assert_ne!(recreated_version, second_version);
+    assert_eq!(
+        backend.get(&path).await.expect("read recreated object"),
+        Bytes::from_static(b"v3")
+    );
+    assert_eq!(
+        backend
+            .get_range(&path, 0..1)
+            .await
+            .expect("range read recreated object"),
+        Bytes::from_static(b"v")
+    );
 
     for token in [first_version, "not-a-backend-version-token".to_string()] {
         let rejected = backend

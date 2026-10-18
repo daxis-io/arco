@@ -73,6 +73,7 @@ fn make_reservation(run_key: &str, fingerprint: &str) -> RunKeyReservation {
         event_id: ulid::Ulid::new().to_string(),
         plan_event_id: Some(ulid::Ulid::new().to_string()),
         request_fingerprint: Some(fingerprint.to_string()),
+        accepted_plan_sha256: None,
         created_at: Utc::now(),
     }
 }

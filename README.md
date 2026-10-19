@@ -1,49 +1,29 @@
 # Arco
 
-**File-native lakehouse catalog and orchestration.** A catalog and metastore
-for open table formats, with Delta Lake as the first-class managed format.
+Lakehouse catalog and orchestration built on object storage.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
-![Status](https://img.shields.io/badge/status-incubating-yellow.svg)
 
-> Arco is incubating and not yet production ready. APIs may change. Early feedback welcome.
+Arco manages table metadata, tracks lineage, and schedules data pipelines.
+It publishes catalog and run metadata as Parquet files for your query engine.
+You supply the query engine and task workers.
 
-## What is Arco?
+**Status:** Incubating. Arco is not yet production ready, and APIs may change.
 
-Arco's accepted architecture stores authoritative transactional control state
-as versioned object-store artifacts selected by exact compare-and-swap heads,
-then publishes open, watermarked Parquet projections for SQL and operational
-reads. Existing roots still use the ADR-018 ledger plus synchronous Parquet
-path; the default-disabled ADR-043 `control/v1` catalog route is a cutover
-candidate, not a deployed authority. There is no mandatory always-on database
-or proprietary catalog service.
+- **Catalog:** Table identity, schemas, and storage locations. New table
+  registrations default to Delta Lake; Iceberg and plain Parquet have
+  [documented support levels](docs/guide/src/reference/control-plane-scope.md).
+- **Orchestration:** Planning, scheduling, and run history. External workers
+  execute tasks and report results to Arco.
+- **Metadata:** Catalog, lineage, and run history in open Parquet files.
+  The legacy catalog API provides scoped signed URLs for published files.
 
-At the catalog layer, Arco manages table identity, locations, schemas, lineage,
-and operational metadata for open lakehouse table formats. New Arco table
-registrations default to Delta Lake; Iceberg and plain Parquet are explicit
-catalog surfaces with compatibility and governance support growing over time.
+## Getting started
 
-## Why Arco?
+You need Rust 1.88+ and the Protocol Buffers compiler (`protoc`).
 
-- **Object-store authority** - correctness-critical state and its open Parquet
-  projections live in object storage without a mandatory catalog database.
-- **Queryable metadata** - catalog, lineage, and run history are published as
-  Parquet projections for an operator-supplied SQL engine.
-- **Real lineage** - captured from actual runs, not guessed from SQL parsing.
-- **Multi-tenant by design** - isolation is enforced at storage layout, service
-  boundaries, and test gates.
-- **Open table formats** - Delta Lake is the primary managed format; Iceberg
-  and plain Parquet are modeled in catalog contracts.
-
-## Get Started
-
-### Prerequisites
-
-- Rust 1.88+ (Edition 2024)
-- Protocol Buffers compiler (`protoc`)
-
-### Build and test
+Clone, build, and test:
 
 ```bash
 git clone https://github.com/daxis-io/arco.git
@@ -53,45 +33,25 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-### Browse the docs
+Follow the [quick start](docs/guide/src/getting-started/quickstart.md) to run a
+local pipeline that registers tables, commits Delta data, and executes a task.
+
+## Documentation
+
+- [Installation](docs/guide/src/getting-started/installation.md)
+- [Architecture](docs/guide/src/concepts/architecture.md)
+- [Published metadata](docs/guide/src/reference/system-catalog.md)
+- [Integration guide](docs/guide/src/reference/integration-profile-030.md)
+- [Flow dispatcher example](docs/runbooks/operator-owned-flow-dispatcher.md)
+- [API Reference](docs/guide/src/reference/api.md)
+- [Documentation Index](docs/guide/src/reference/documentation-map.md)
+
+To browse the guide locally:
 
 ```bash
 cargo install mdbook --version 0.4.52 --locked
 cd docs/guide && mdbook build --open
 ```
-
-Or jump straight to:
-
-- [Quick Start](docs/guide/src/getting-started/quickstart.md)
-- [Architecture](docs/guide/src/concepts/architecture.md)
-- [Published Projections](docs/guide/src/reference/system-catalog.md)
-
-## How it fits together
-
-```
-arco-api        HTTP/gRPC control-plane and catalog entry point
-arco-catalog    Table format catalog, lineage, Parquet metadata snapshots
-arco-flow       Planning, scheduling, run state
-arco-compactor  Tier-2 event consolidation
-arco-proto      Cross-language protobuf contracts
-arco-core       Shared primitives (tenant context, IDs, errors)
-```
-
-Task execution runs in external workers via a canonical dispatch envelope.
-Arco's legacy catalog route mints scoped URLs for published files; clients
-choose their own query engine.
-The operator deploys Arco's catalog API and supplies the query engine and
-execution runtime. The documented Cloud Run split is one deployment recipe.
-The [operator-owned Flow dispatcher example](docs/runbooks/operator-owned-flow-dispatcher.md)
-shows a single-host durable queue without a GCP task transport.
-
-## Proto compatibility
-
-The pre-freeze hard cut is complete. The current `arco.*.v1` packages are the
-durable public proto surface represented by the frozen post-cut baseline. New
-`v1` changes must be additive and must preserve binary and ProtoJSON
-compatibility. Run `cargo xtask proto-breaking-check` before merging proto
-changes.
 
 ## Contributing
 
@@ -99,6 +59,10 @@ changes.
 - [Code of conduct](CODE_OF_CONDUCT.md)
 - [Security policy](SECURITY.md)
 - [Community & support](COMMUNITY.md)
+
+For protobuf changes, follow the
+[compatibility policy](docs/guide/src/reference/schema-evolution-policy.md)
+and run `cargo xtask proto-breaking-check`.
 
 ## License
 

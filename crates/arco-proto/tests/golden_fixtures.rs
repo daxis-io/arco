@@ -80,10 +80,11 @@ fn partition_dimensions_use_explicit_messages_instead_of_maps() {
 #[test]
 fn docs_name_the_frozen_v1_proto_baseline_policy() {
     let readme = include_str!("../../../README.md");
+    let policy = include_str!("../../../docs/guide/src/reference/schema-evolution-policy.md");
     let style = include_str!("../../../proto/STYLE.md");
 
-    assert!(readme.contains("pre-freeze hard cut is complete"));
-    assert!(readme.contains("durable public proto surface"));
+    assert!(readme.contains("docs/guide/src/reference/schema-evolution-policy.md"));
+    assert!(policy.contains("proto-baselines/post-hard-cut-v1.binpb"));
     assert!(readme.contains("cargo xtask proto-breaking-check"));
     assert!(style.contains("pre-freeze hard cut is complete"));
     assert!(style.contains("v1 changes must be additive"));

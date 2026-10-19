@@ -225,6 +225,7 @@ fn parity_m3_successful_materialization_links_execution_lineage_to_delta_version
                 output_visibility_state: None,
                 published_at: None,
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: None,

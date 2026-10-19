@@ -6,7 +6,8 @@ Lakehouse catalog and orchestration built on object storage.
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
 
 Arco manages table metadata, tracks lineage, and schedules data pipelines.
-It publishes catalog and run metadata as Parquet files for query engines to read.
+It publishes catalog and run metadata as Parquet files for your query engine.
+You supply the query engine and task workers.
 
 **Status:** Incubating. Arco is not yet production ready, and APIs may change.
 
@@ -16,7 +17,7 @@ It publishes catalog and run metadata as Parquet files for query engines to read
 - **Orchestration:** Planning, scheduling, and run history. External workers
   execute tasks and report results to Arco.
 - **Metadata:** Catalog, lineage, and run history in open Parquet files.
-  Clients can read published files through scoped signed URLs.
+  The legacy catalog API provides scoped signed URLs for published files.
 
 ## Getting started
 
@@ -39,7 +40,9 @@ local pipeline that registers tables, commits Delta data, and executes a task.
 
 - [Installation](docs/guide/src/getting-started/installation.md)
 - [Architecture](docs/guide/src/concepts/architecture.md)
-- [System Catalog](docs/guide/src/reference/system-catalog.md)
+- [Published metadata](docs/guide/src/reference/system-catalog.md)
+- [Integration guide](docs/guide/src/reference/integration-profile-030.md)
+- [Flow dispatcher example](docs/runbooks/operator-owned-flow-dispatcher.md)
 - [API Reference](docs/guide/src/reference/api.md)
 - [Documentation Index](docs/guide/src/reference/documentation-map.md)
 

@@ -1,4 +1,4 @@
-# ADR-036: Engine Boundaries and Split-Service Topology
+# ADR-036: Engine Boundaries and Deployment Topology
 
 ## Status
 
@@ -15,8 +15,8 @@ ownership concerns can drift over time:
 3. Worker dispatch contracts may become provider-specific and tightly coupled.
 4. Legacy orchestration paths may remain ambiguous in production.
 
-This ADR hardens runtime boundaries for split-service deployment and clarifies
-what this cycle does not include.
+This ADR hardens runtime boundaries and clarifies what this cycle does not
+include.
 
 ## Decision
 
@@ -25,16 +25,23 @@ what this cycle does not include.
 - **Orchestrator control plane (`arco-api`, `arco-flow`)**:
   event APIs, run/task state transitions, callback validation, and dispatch intent.
   No direct state Parquet writes.
-- **Compactors (`arco-compactor`, `arco_flow_compactor`)**:
-  sole writers for materialized state/snapshot Parquet paths.
+- **Compaction capability (`arco-api` local Tier1, `arco-compactor`, or
+  `arco_flow_compactor`)**: publishes materialized state/snapshot Parquet
+  through the same fencing and storage preconditions.
 - **Client query engines**:
   choose their own runtime for reads through Arco's scoped, signed URLs.
 - **ETL compute runtime (external workers)**:
   executes task payloads and reports lifecycle callbacks to API.
 
-### 2. Split-service topology is the production model
+### 2. The operator deploys the API
 
-Services are independently deployable and communicate over explicit HTTP contracts:
+Arco needs an API layer to operate the catalog. The operator chooses where and
+how to deploy that API, its compactors, and its dispatch controllers. Process
+placement does not change write ownership: compactors alone publish materialized
+Parquet state, and callers use the same API and worker contracts.
+
+The current split-service deployment is one documented topology. Its components
+communicate over explicit HTTP contracts:
 
 - `arco-api`
 - `arco-compactor`
@@ -43,10 +50,22 @@ Services are independently deployable and communicate over explicit HTTP contrac
 - `arco_flow_sweeper`
 - external worker runtime(s)
 
+`ARCO_COMPACTOR_URL` selects the remote catalog compactor. Without it, the API
+uses local Tier1 compaction, including enabled Iceberg CRUD. The split Cloud
+Run deployment remains a recipe. The packaged Flow dispatcher and sweeper
+default to Cloud Tasks and can use an operator HTTP ingress.
+
 ### 3. Dispatch contract is provider-agnostic and canonical
 
 Dispatcher/sweeper emit a canonical `WorkerDispatchEnvelope` to workers.
-Cloud Tasks is the first adapter, but the payload contract is transport/provider agnostic.
+The packaged binaries default to Cloud Tasks. The actual worker-send path uses
+`HttpTaskEnqueuer` and `enqueue_worker_dispatch`. The public
+`dispatcher_service::router` and `sweeper_service::router` let an operator
+host both controllers with the same durable queue without changing the worker envelope. With
+`ARCO_FLOW_WORKER_TRANSPORT=http`, the packaged binaries send to a durable
+operator ingress. Scheduled timers are unsupported by that transport.
+The Cloud Tasks-compatible task ID and event field names remain for wire
+compatibility; they do not require Cloud Tasks as the transport.
 
 ### 4. ADR-020 is the production orchestration path
 
@@ -70,4 +89,5 @@ Workers must parse `WorkerDispatchEnvelope`.
 - Arco does not host SQL execution. Clients supply their own query runtime.
 - Production behavior is less ambiguous (ADR-020 path by default).
 - Dispatch payload migration requires coordinated worker + dispatcher/sweeper rollout.
-- Split-service operations require explicit environment contract management.
+- Every deployment must preserve the same compaction and callback authority
+  boundaries, whether components share a host or run as separate services.

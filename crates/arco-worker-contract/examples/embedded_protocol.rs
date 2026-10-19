@@ -85,6 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_visibility_state: None,
             published_at: None,
             publish_error: None,
+            publication: None,
         }),
         error: None,
         metrics: None,

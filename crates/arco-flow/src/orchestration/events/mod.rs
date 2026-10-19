@@ -442,6 +442,9 @@ pub enum OrchestrationEventData {
         /// Publish failure details, if applicable.
         #[serde(skip_serializing_if = "Option::is_none")]
         publish_error: Option<String>,
+        /// Owner-verified immutable publication descriptor.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        publication: Option<arco_worker_contract::PublicationDescriptor>,
     },
 
     // ========================================================================
@@ -1063,6 +1066,9 @@ pub struct OutputVisibilityUpdate {
     /// Publish failure details, if applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub publish_error: Option<String>,
+    /// Owner-verified immutable publication descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<arco_worker_contract::PublicationDescriptor>,
 }
 
 /// Task completion outcome.
@@ -1217,6 +1223,7 @@ mod tests {
             visibility_state: OutputVisibilityState::Visible,
             published_at: Some(Utc::now()),
             publish_error: None,
+            publication: None,
         };
 
         assert_eq!(

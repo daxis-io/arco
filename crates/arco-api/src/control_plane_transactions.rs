@@ -3348,10 +3348,42 @@ impl OrchestrationBatchMutation {
     }
 
     fn from_parts(events: &[OrchestrationEventEnvelope]) -> Result<Self, ApiError> {
+        use arco_proto::arco::orchestration::v1::{
+            OutputVisibilityState, orchestration_event_envelope::Event,
+        };
         if events.is_empty() {
             return Err(ApiError::bad_request(
                 "orchestration batch must include at least one event",
             ));
+        }
+
+        for envelope in events {
+            let publication_claim = match envelope.event.as_ref() {
+                Some(Event::TaskFinished(event)) => event
+                    .callback_output
+                    .as_ref()
+                    .is_some_and(|output| output.publication.is_some()),
+                Some(Event::TaskCompletionRecorded(event)) => {
+                    event
+                        .callback_output
+                        .as_ref()
+                        .is_some_and(|output| output.publication.is_some())
+                        || event.output_visibility.as_ref().is_some_and(|update| {
+                            update.publication.is_some()
+                                || update.visibility_state == OutputVisibilityState::Visible as i32
+                        })
+                }
+                Some(Event::TaskOutputVisibilityChanged(event)) => {
+                    event.publication.is_some()
+                        || event.visibility_state == OutputVisibilityState::Visible as i32
+                }
+                _ => false,
+            };
+            if publication_claim {
+                return Err(ApiError::bad_request(
+                    "publication claims must use task-scoped callbacks and owner verification",
+                ));
+            }
         }
 
         Ok(Self {

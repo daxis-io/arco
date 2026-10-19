@@ -1,9 +1,9 @@
 //! Request and response types for worker callbacks per ADR-023.
 
 pub use arco_worker_contract::{
-    ErrorCategory, HeartbeatRequest, HeartbeatResponse, TaskCompletedRequest,
-    TaskCompletedResponse, TaskError, TaskMetrics, TaskOutput, TaskOutputVisibilityState,
-    TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
+    ErrorCategory, HeartbeatRequest, HeartbeatResponse, PublicationDescriptor,
+    PublicationOwnerEvidence, TaskCompletedRequest, TaskCompletedResponse, TaskError, TaskMetrics,
+    TaskOutput, TaskOutputVisibilityState, TaskStartedRequest, TaskStartedResponse, WorkerOutcome,
 };
 use serde::{Deserialize, Serialize};
 
@@ -265,6 +265,7 @@ mod tests {
                 output_visibility_state: Some(TaskOutputVisibilityState::Visible),
                 published_at: Some(Utc::now()),
                 publish_error: None,
+                publication: None,
             }),
             error: None,
             metrics: Some(TaskMetrics {
@@ -293,6 +294,52 @@ mod tests {
             output.output_visibility_state,
             Some(TaskOutputVisibilityState::Visible)
         );
+    }
+
+    #[test]
+    fn task_output_decodes_publication_descriptor_without_breaking_legacy_output() {
+        let request: TaskCompletedRequest = serde_json::from_str(
+            r#"{
+                "attempt":1,
+                "attemptId":"att-1",
+                "workerId":"worker-1",
+                "outcome":"SUCCEEDED",
+                "output":{
+                    "materializationId":"mat-1",
+                    "publication":{
+                        "version":1,
+                        "manifestId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "objectPath":"outputs/run-1/result.parquet",
+                        "objectVersion":"7",
+                        "checksumSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "byteSize":4,
+                        "format":"parquet",
+                        "schemaRef":"schema://analytics.daily/v1"
+                    }
+                }
+            }"#,
+        )
+        .expect("decode publication descriptor");
+
+        let publication = request
+            .output
+            .expect("output")
+            .publication
+            .expect("publication");
+        assert_eq!(publication.version, 1);
+        assert_eq!(publication.object_version, "7");
+
+        let legacy: TaskCompletedRequest = serde_json::from_str(
+            r#"{
+                "attempt":1,
+                "attemptId":"att-1",
+                "workerId":"worker-1",
+                "outcome":"SUCCEEDED",
+                "output":{"materializationId":"mat-1"}
+            }"#,
+        )
+        .expect("decode legacy output");
+        assert!(legacy.output.expect("output").publication.is_none());
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! This module provides:
 //!
-//! - [`TaskQueue`]: Trait for enqueueing tasks to execution backends
-//! - [`TaskEnvelope`]: Serializable task dispatch payload
+//! - [`HttpTaskEnqueuer`]: Canonical Flow worker handoff
+//! - [`TaskQueue`]: Older task-envelope queue abstraction
+//! - [`TaskEnvelope`]: Older task dispatch payload
 //! - [`InMemoryTaskQueue`]: In-memory queue for testing
 //! - [`CloudTasksDispatcher`]: Google Cloud Tasks integration (gcp feature, placeholder)
 //!
@@ -14,11 +15,17 @@
 //! - **Structured payloads**: JSON-serializable task envelopes
 
 pub mod cloud_tasks;
+mod http_task;
 pub mod memory;
+#[cfg(feature = "http-client")]
+mod operator_http;
 pub mod worker_auth;
 
 pub use cloud_tasks::CloudTasksDispatcher;
+pub use http_task::{HttpTaskEnqueuer, enqueue_worker_dispatch};
 pub use memory::InMemoryTaskQueue;
+#[cfg(feature = "http-client")]
+pub use operator_http::OperatorHttpEnqueuer;
 
 use std::time::Duration;
 

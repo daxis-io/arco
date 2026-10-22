@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-08
+## [0.3.0] - 2026-10-21
 
 ### Integration interfaces
 - Add operator-owned HTTP dispatch for packaged Flow dispatcher and sweeper, with durable acceptance, stable task identity, uncertain-response recovery, and explicit timer/priority refusal.
@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add a typed manifest-pinned catalog read descriptor for the default-off operator route, with verified scope, exact Parquet files and authority/projection fencing.
 - Allow standalone production API operation with local Tier1 compaction when no remote compactor is configured.
 - Prepare Arco-owned deterministic and opt-in R2 provider conformance CI. Live provider qualification remains a separate gate.
+- Record the owner-reviewed R2 static-S3/operator-HTTP campaign and its source-bound limits; require requalification after security dependency updates.
 - Align the existing Python packages and CLI scaffolds to 0.3.0, and document adapter relocation and authority-format migration.
 
 ### Added
@@ -56,6 +57,7 @@ All state-store program surfaces above are landed with CI-run test suites but ar
 - **Breaking for `control/v1` roots:** authority format 9 is a hard cut from format 7. Every canonical digest frames the new format number, format-7 artifacts and eight-column format-1 segments fail closed, and there is no conversion or dual reader (no production root existed on format 7; format 8 remains the test-only bounded authority).
 
 ### Fixed
+- Update certificate-validation/root dependencies and Python `anyio`, `certifi`, and `virtualenv` for current security advisories. Re-review the blocked quick-xml exceptions with a 2026-11-20 deadline and an explicit R2 reachability assessment.
 - Writer-authority claims are fenced by claim id, so an ambiguous claim adopts only its exact claimed bytes.
 - Catalog operation ids are family-qualified, so operations of different families can no longer share an id.
 - Range-empty assertions ignore tombstoned rows, so a range holding only deletions counts as empty.

@@ -38,12 +38,30 @@ the result through its read-only `Security Audit Status` check and job summary.
 RUSTSEC-2026-0194 and RUSTSEC-2026-0195 affect quick-xml before 0.41.0. The
 frozen lock contains quick-xml 0.37.5 through object_store 0.11.2 and quick-xml
 0.38.4 through opendal 0.54.1 and iceberg 0.6.0. These paths parse XML returned
-by authenticated S3/Azure-compatible storage endpoints; Arco's frozen deployed
-configuration uses the GCS JSON API. The direct end-user reachability is
-therefore low, while a hostile or compromised storage endpoint remains the
-residual risk.
+by authenticated S3/Azure-compatible storage endpoints. The 0.3.0 integration
+profile includes R2, so the assessment cannot rely on a GCS-only deployment.
+Storage endpoints and credentials are operator-configured; API callers cannot
+submit raw XML to these parsers. A hostile or compromised provider can still
+return XML that consumes excessive CPU or memory. Provider qualification does
+not remove that risk.
 
-Tracking issue: #327. Granted: 2026-07-05. Review by: 2026-09-30.
+Tracking issue: [#327](https://github.com/daxis-io/arco/issues/327).
+The original grant expired on 2026-09-30. Reviewed and re-granted on 2026-10-21;
+review by 2026-11-20. This is a 30-day exception, not a fixed vulnerability.
+
+Both lockfile-only probes failed on `main@274a3877` on 2026-10-21:
+
+```text
+cargo update -p quick-xml@0.37.5 --precise 0.41.0
+  blocked by quick-xml ^0.37.0 in vendored object_store 0.11.2
+cargo update -p quick-xml@0.38.4 --precise 0.41.0
+  blocked by quick-xml ^0.38 in opendal 0.54.1 through iceberg 0.6.0
+```
+
+The probes exit 101 without changing the lockfile. Upgrading or backporting those
+dependency chains requires its own compatibility and security review; extending
+the exception does not qualify those changes. Review this grant explicitly in the
+0.3.0 security follow-up rather than treating a green audit as absence of advisories.
 
 At review time, try upgrading each locked quick-xml line to 0.41 or later and
 inspect the constraint Cargo reports. Retire this exception when the relevant

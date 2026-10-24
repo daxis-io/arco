@@ -10,7 +10,7 @@ cloud credentials; only the opt-in live lane can produce R2 provider evidence.
 | Profile | Status | Evidence |
 |---|---|---|
 | Deterministic S3-compatible adapter | Runnable in ordinary CI | Local HTTP fault probe plus object-store CAS, range, and paging tests |
-| Cloudflare R2 | Native campaign pending | The limited storage conformance passed at `869eadc8`; native API/Flow and owner-recovery receipts remain required for the final candidate |
+| Cloudflare R2 | Passed on `e9181eb1`; requalification required after dependency changes | [Owner-reviewed campaign](https://github.com/daxis-io/arco/actions/runs/39173326683), including storage, credential scope, owner recovery and all 13 native API/Flow cases |
 | Amazon S3 | Separate existing gate | `.github/workflows/s3-conformance.yml`; its result does not qualify R2 |
 | GCS and Azure | Separate existing gates | Provider-owned workflows and adapters; their results do not qualify R2 |
 
@@ -32,6 +32,17 @@ preconditions; identical-content replacement does not establish a new generation
 Failed receipts and their objects remain retained. The corrected limited storage conformance
 passed at `869eadc8`, but that receipt is not the native integration campaign described below.
 
+The [native campaign](https://github.com/daxis-io/arco/actions/runs/39173326683) on
+`e9181eb16a3d725de457ce3b03f199c891c22da5` passed and was owner-reviewed on
+2026-10-18. The independent denial-control object was unchanged before and after
+the run, and the scoped S3 credential received typed `PermissionDenied` before
+native writes. Owner recovery used 212 logical calls and 23,627 submitted bytes
+within its 512-call/32 MiB limits. All 13 native process cases passed. Both attempts
+of the [earlier scope-failing campaign](https://github.com/daxis-io/arco/actions/runs/38500363914)
+remain retained; updated bucket-scoped credentials resolved that failure without
+changing the guard. The certificate dependency changes in the security follow-up
+require a new campaign; this passing receipt does not qualify new binaries.
+
 ## CI profiles
 
 `.github/workflows/r2-provider-qualification.yml` has three jobs with dependency ordering:
@@ -50,8 +61,8 @@ passed at `869eadc8`, but that receipt is not the native integration campaign de
    a private marker in the denied-control bucket, then exercises accepted-CAS response loss
    at the client boundary, fresh caches and a retained reader. It builds the native API/Flow
    profile and runs catalog, task-authentication, frozen-intent, publication and recovery
-   cases against R2. Its first campaign is untested and no provider claim follows from the
-   deterministic harness.
+   cases against R2. Its owner-reviewed campaign is recorded above; each later candidate
+   still needs its own receipt. No provider claim follows from the deterministic harness.
 
 Each artifact name includes the GitHub run ID and attempt. Its identity receipt records the
 source SHA/ref, Rust and Cargo versions, `Cargo.lock` SHA-256, package/features, provider
@@ -124,13 +135,14 @@ outside the campaign.
    a deterministic green job is still `unqualified`; a failed live job is `failed` and its
    objects must be reconciled before retry.
 
-Passing this limited live storage probe does not pass the following independent gates:
+Passing only the limited storage probe does not pass the native gates. The reviewed
+campaign on `e9181eb1` has the following results; repeat them for changed dependencies:
 
-| Gate | Status until separately executed |
+| Gate | Owner-reviewed status on `e9181eb1` |
 |---|---|
-| Native accepted-CAS response loss, fresh caches and retained-reader recovery | Untested pending the first `live-integration` receipt |
-| Authorization and credential-scope enforcement | Untested pending fresh owner attestation plus typed denied-bucket response |
-| Native catalog, Flow, task-authentication, frozen-intent and publication recovery | Untested pending the first `live-integration` receipt |
+| Native accepted-CAS response loss, fresh caches and retained-reader recovery | Passed; client-boundary response loss only |
+| Authorization and credential-scope enforcement | Passed; fresh owner attestation plus typed denied-bucket response |
+| Native catalog, Flow, task-authentication, frozen-intent and publication recovery | Passed; all 13 process cases |
 
 ## Limits
 

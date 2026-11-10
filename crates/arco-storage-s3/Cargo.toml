@@ -37,7 +37,7 @@ tokio = { workspace = true }
 ulid = { workspace = true }
 
 [features]
-qualification = ["dep:arco-catalog", "dep:serde_json", "dep:serde", "dep:sha2", "dep:futures", "dep:http", "dep:chrono", "dep:tokio", "dep:ulid"]
+qualification = ["dep:arco-catalog", "arco-catalog/test-utils", "dep:serde_json", "dep:serde", "dep:sha2", "dep:futures", "dep:http", "dep:chrono", "dep:tokio", "dep:ulid"]
 
 [[bin]]
 name = "arco-state-store-qualification"

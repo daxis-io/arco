@@ -252,7 +252,22 @@ impl StorageBackend for Backend {
         {
             return Err(arco_core::Error::storage("reconciliation read denied"));
         }
-        self.inner.get_range(path, range).await
+        let bytes = self.inner.get_range(path, range).await?;
+        let range_armed = self
+            .armed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|schedule| schedule.needle.starts_with("RANGE "));
+        if range_armed {
+            if let Some(schedule) = self.take(&format!("RANGE {path}")) {
+                assert!(matches!(schedule.fault, Fault::PauseAfter));
+                schedule.issued.notify_one();
+                schedule.respond.acquire().await.unwrap().forget();
+                schedule.finished.notify_one();
+            }
+        }
+        Ok(bytes)
     }
     async fn put(
         &self,
@@ -461,6 +476,510 @@ impl EventArchiveProvider for EmptyProviders {
         EventArchiveCapture::new(DomainEventArchive::empty(authority.domain())?, Vec::new())
     }
 }
+#[tokio::test]
+async fn authority8_genesis_survives_lost_lock_release_response() {
+    confirmed_publication_survives_lost_lock_release_response(true).await;
+}
+
+#[tokio::test]
+async fn authority8_commit_survives_lost_lock_release_response() {
+    confirmed_publication_survives_lost_lock_release_response(false).await;
+}
+
+async fn mark_edge_fixture() -> (Arc<Backend>, ControlMvpStateStore, DateTime<Utc>) {
+    let backend = Backend::new();
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let store = ControlMvpStateStore::new_synthetic_bounded(
+        storage.clone(),
+        StateScope::new("tenant", "workspace", "catalog"),
+    )
+    .unwrap();
+    let now = *backend.now.lock().unwrap();
+    *backend.now.lock().unwrap() = now - chrono::Duration::days(8);
+    let orphan = format!(
+        "{}/physical/descriptors/{}.json",
+        store.paths().base_prefix(),
+        "ab".repeat(32)
+    );
+    storage
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"detached"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    *backend.now.lock().unwrap() = now;
+    store
+        .install_synthetic_genesis(
+            "mark-edge",
+            1,
+            1,
+            [arco_catalog::state_store::SyntheticKvEntry {
+                key: b"key".to_vec(),
+                generation: 1,
+                value: Some(b"value".to_vec()),
+            }],
+            0,
+            std::iter::empty(),
+        )
+        .await
+        .unwrap();
+    (backend, store, now)
+}
+
+#[tokio::test]
+async fn authority8_mark_lost_put_response_uses_exact_readback_and_never_resends_head() {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let seed = worker.begin_gc_mark_at(now).await.unwrap();
+    let page_path = format!(
+        "{}/gc-marks/v1/{seed}/pages/00000000000000000000.json",
+        store.paths().base_prefix()
+    );
+    let head = store.current_state_token().await.unwrap();
+    backend.trace.lock().unwrap().clear();
+    let schedule = backend.arm(page_path.clone(), 0, Fault::LostResponse);
+    let advance = worker.advance_gc_mark(&seed, None).await.unwrap();
+    schedule.finished.notified().await;
+    assert!(advance.continuation.is_some());
+    {
+        let trace = backend.trace.lock().unwrap();
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|entry| entry.starts_with("ISSUE PUT ") && entry.contains(&page_path))
+                .count(),
+            1
+        );
+        assert!(
+            trace
+                .iter()
+                .any(|entry| entry.starts_with("RANGE ") && entry.contains(&page_path))
+        );
+        assert!(
+            !trace.iter().any(
+                |entry| entry.starts_with("ISSUE PUT ") && entry.contains("/head/current.json")
+            )
+        );
+        drop(trace);
+    }
+    assert_eq!(store.current_state_token().await.unwrap(), head);
+}
+
+#[tokio::test]
+async fn authority8_mark_rejects_invalid_resume_header_before_metadata_io() {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let seed = worker.begin_gc_mark_at(now).await.unwrap();
+    let cursor = serde_json::from_value(serde_json::json!({
+        "ordinal": 0, "manifest": 0, "role": 3, "after": null, "previous": seed,
+    }))
+    .unwrap();
+    backend.trace.lock().unwrap().clear();
+    assert!(worker.advance_gc_mark(&seed, Some(&cursor)).await.is_err());
+    assert!(
+        backend.trace.lock().unwrap().is_empty(),
+        "invalid resume input must be rejected before metadata I/O"
+    );
+}
+
+#[tokio::test]
+async fn authority8_mark_rejects_overflowing_manifest_before_metadata_io() {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let seed = worker.begin_gc_mark_at(now).await.unwrap();
+    let cursor = serde_json::from_value(serde_json::json!({
+        "ordinal":1,"manifest":usize::MAX,"role":0,"after":null,"previous":seed,
+    }))
+    .unwrap();
+    backend.trace.lock().unwrap().clear();
+    assert!(worker.advance_gc_mark(&seed, Some(&cursor)).await.is_err());
+    assert!(backend.trace.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn authority8_mark_cancelled_page_put_restarts_without_a_completion_shortcut() {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let seed = worker.begin_gc_mark_at(now).await.unwrap();
+    let page_path = format!(
+        "{}/gc-marks/v1/{seed}/pages/00000000000000000000.json",
+        store.paths().base_prefix()
+    );
+    let head = store.current_state_token().await.unwrap();
+    let schedule = backend.arm(page_path, 0, Fault::PauseAfter);
+    let cloned = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let digest = seed.clone();
+    let task = tokio::spawn(async move { cloned.advance_gc_mark(&digest, None).await });
+    schedule.issued().await;
+    guard(schedule.applied.notified()).await;
+    task.abort();
+    let _ = task.await;
+    schedule.finish().await;
+    let resumed = worker.advance_gc_mark(&seed, None).await.unwrap();
+    assert!(resumed.continuation.is_some());
+    let mut cursor = resumed.continuation;
+    while let Some(next) = cursor {
+        cursor = worker
+            .advance_gc_mark(&seed, Some(&next))
+            .await
+            .unwrap()
+            .continuation;
+    }
+    let mut verifier = worker.begin_gc_mark_verification(&seed).await.unwrap();
+    assert!(!verifier.is_complete());
+    while !verifier.is_complete() {
+        worker
+            .advance_gc_mark_verification(&mut verifier)
+            .await
+            .unwrap();
+    }
+    assert_eq!(verifier.verified_pages(), 3);
+    assert_eq!(store.current_state_token().await.unwrap(), head);
+    assert!(worker.collect_gc_at(now, Vec::new()).await.is_err());
+}
+
+#[tokio::test]
+async fn authority8_gc_protects_physical_edges_without_reading_payload_rows() {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let token = store.current_state_token().await.unwrap();
+    let orphan = format!(
+        "{}/physical/descriptors/{}.json",
+        store.paths().base_prefix(),
+        "ab".repeat(32)
+    );
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    *backend.denied.lock().unwrap() = Some(".arrow".into());
+    let plan = worker
+        .plan_gc_page_at(now, Vec::new(), None)
+        .await
+        .expect("authenticated descriptor/index endpoints suffice for conservative protection");
+    assert_eq!(plan.candidates().len(), 1);
+    assert_eq!(plan.candidates()[0].path(), orphan);
+    *backend.denied.lock().unwrap() = Some(".idx".into());
+    assert!(
+        worker.plan_gc_page_at(now, Vec::new(), None).await.is_err(),
+        "index evidence remains mandatory"
+    );
+    *backend.denied.lock().unwrap() = None;
+    assert_eq!(
+        store
+            .read_at(token)
+            .await
+            .unwrap()
+            .get(b"key")
+            .await
+            .unwrap()
+            .unwrap(),
+        Bytes::from_static(b"value")
+    );
+}
+
+async fn marked_candidate_fixture() -> (
+    Arc<Backend>,
+    ControlMvpStateStore,
+    ControlMvpMaintenanceWorker,
+    String,
+    DateTime<Utc>,
+) {
+    let (backend, store, now) = mark_edge_fixture().await;
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let seed = worker.begin_gc_mark_at(now).await.unwrap();
+    let mut cursor = None;
+    loop {
+        cursor = worker
+            .advance_gc_mark(&seed, cursor.as_ref())
+            .await
+            .unwrap()
+            .continuation;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    (backend, store, worker, seed, now)
+}
+
+#[tokio::test]
+async fn authority8_marked_gc_cancelled_replay_preserves_progress_and_reads_no_payload() {
+    let (backend, store, worker, seed, now) = marked_candidate_fixture().await;
+    let mut planning = worker.begin_marked_gc_plan(&seed, [], None).await.unwrap();
+    *backend.denied.lock().unwrap() = Some(".arrow".into());
+    backend.trace.lock().unwrap().clear();
+    let suffix = format!("/gc-marks/v1/{seed}/pages/00000000000000000000.json");
+    let proof = backend
+        .inner
+        .list("")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|o| o.path.ends_with(&suffix))
+        .unwrap();
+    let schedule = backend.arm(format!("RANGE {}", proof.path), 0, Fault::PauseAfter);
+    let mut advance = Box::pin(worker.advance_marked_gc_plan(&mut planning));
+    tokio::select! {
+        () = schedule.issued() => {},
+        result = &mut advance => panic!("replay did not pause: {}", result.is_ok()),
+    }
+    drop(advance);
+    schedule.respond.add_permits(1);
+    assert_eq!(planning.verified_pages(), 0);
+    loop {
+        if let Some(plan) = worker.advance_marked_gc_plan(&mut planning).await.unwrap() {
+            assert_eq!(plan.candidates().len(), 1);
+            break;
+        }
+    }
+    assert_eq!(planning.verified_pages(), 3);
+    assert!(worker.collect_gc_at(now, []).await.is_err());
+    assert!(store.current_state_token().await.is_ok());
+    let trace = backend.trace.lock().unwrap();
+    assert!(
+        !trace
+            .iter()
+            .any(|e| (e.starts_with("RANGE ") || e.starts_with("GET ")) && e.contains(".arrow"))
+    );
+    assert!(!trace.iter().any(|e| e.starts_with("ISSUE DELETE")
+        || (e.starts_with("ISSUE PUT") && e.contains("/head/current.json"))));
+    drop(trace);
+}
+
+#[tokio::test]
+async fn authority8_native_mark_unavailable_reads_and_cancellation_preserve_progress() {
+    for denied in ["/physical/descriptors/", ".idx", "/directory/v1/"] {
+        let (backend, _, worker, seed, _) = marked_candidate_fixture().await;
+        let mut planning = worker.begin_marked_gc_plan(&seed, [], None).await.unwrap();
+        *backend.denied.lock().unwrap() = Some(denied.into());
+        let before = planning.last_admission();
+        for _ in 0..2 {
+            assert!(worker.advance_marked_gc_plan(&mut planning).await.is_err());
+        }
+        assert_eq!(planning.verified_pages(), 0);
+        assert_eq!(planning.last_admission(), before);
+        *backend.denied.lock().unwrap() = None;
+        while worker
+            .advance_marked_gc_plan(&mut planning)
+            .await
+            .unwrap()
+            .is_none()
+        {}
+        assert_eq!(planning.verified_pages(), 3);
+    }
+    let (backend, _, worker, seed, _) = marked_candidate_fixture().await;
+    let mut planning = worker.begin_marked_gc_plan(&seed, [], None).await.unwrap();
+    let object = backend
+        .inner
+        .list("")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|object| object.path.contains("/physical/descriptors/"))
+        .unwrap();
+    let schedule = backend.arm(format!("RANGE {}", object.path), 0, Fault::PauseAfter);
+    let mut advance = Box::pin(worker.advance_marked_gc_plan(&mut planning));
+    tokio::select! { () = schedule.issued() => {}, result = &mut advance => panic!("did not pause: {}",result.is_ok()), }
+    drop(advance);
+    schedule.respond.add_permits(1);
+    assert_eq!(planning.verified_pages(), 0);
+    while worker
+        .advance_marked_gc_plan(&mut planning)
+        .await
+        .unwrap()
+        .is_none()
+    {}
+    assert_eq!(planning.verified_pages(), 3);
+}
+
+#[tokio::test]
+async fn authority8_marked_gc_mid_page_head_change_denies_the_whole_plan() {
+    let (backend, store, worker, seed, _) = marked_candidate_fixture().await;
+    let mut planning = worker.begin_marked_gc_plan(&seed, [], None).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            worker
+                .advance_marked_gc_plan(&mut planning)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let suffix = format!("/gc-marks/v1/{seed}/pages/00000000000000000002.json");
+    let objects = backend.inner.list("").await.unwrap();
+    let proof = objects.iter().find(|o| o.path.ends_with(&suffix)).unwrap();
+    let head = objects
+        .iter()
+        .find(|o| o.path.ends_with("/head/current.json"))
+        .unwrap()
+        .path
+        .clone();
+    let schedule = backend.arm(format!("RANGE {}", proof.path), 0, Fault::PauseAfter);
+    let task = tokio::spawn(async move {
+        let result = worker.advance_marked_gc_plan(&mut planning).await;
+        (result, planning)
+    });
+    schedule.issued().await;
+    let raw = backend.inner.get(&head).await.unwrap();
+    backend
+        .inner
+        .put(&head, raw, WritePrecondition::None)
+        .await
+        .unwrap();
+    schedule.finish().await;
+    let (result, planning) = guard(task).await.unwrap();
+    assert!(result.is_err());
+    assert_eq!(planning.verified_pages(), 2);
+    assert!(store.current_state_token().await.is_ok());
+}
+
+#[tokio::test]
+async fn authority8_marked_gc_lost_completion_put_response_uses_exact_readback() {
+    let (backend, _, worker, seed, now) = marked_candidate_fixture().await;
+    let mut planning = worker.begin_marked_gc_plan(&seed, [], None).await.unwrap();
+    backend.trace.lock().unwrap().clear();
+    let complete = format!("/gc-marks/v1/{seed}/complete.json");
+    let schedule = backend.arm(complete.clone(), 0, Fault::LostResponse);
+    loop {
+        if let Some(plan) = worker.advance_marked_gc_plan(&mut planning).await.unwrap() {
+            assert_eq!(plan.candidates().len(), 1);
+            break;
+        }
+    }
+    schedule.finish().await;
+    assert!(worker.collect_gc_at(now, []).await.is_err());
+    let trace = backend.trace.lock().unwrap();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|e| e.starts_with("ISSUE PUT") && e.contains(&complete))
+            .count(),
+        1
+    );
+    assert!(
+        trace
+            .iter()
+            .any(|e| e.starts_with("RANGE ") && e.contains(&complete))
+    );
+    assert!(!trace.iter().any(|e| e.starts_with("ISSUE DELETE")
+        || (e.starts_with("ISSUE PUT") && e.contains("/head/current.json"))));
+    drop(trace);
+}
+
+#[tokio::test]
+async fn authority8_gc_refences_both_physical_endpoints_after_index_validation() {
+    for suffix in [".arrow", ".idx"] {
+        let (backend, store, now) = mark_edge_fixture().await;
+        let inventory = backend.inner.list("").await.unwrap();
+        let index = inventory
+            .iter()
+            .find(|object| {
+                std::path::Path::new(&object.path).extension() == Some(std::ffi::OsStr::new("idx"))
+            })
+            .unwrap();
+        let endpoint = inventory
+            .iter()
+            .find(|object| object.path.ends_with(suffix))
+            .unwrap();
+        // Capture index bytes before either final endpoint HEAD can observe the mutation.
+        let read = backend.arm(format!("RANGE {}", index.path), 0, Fault::PauseAfter);
+        let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+        let task = tokio::spawn(async move { worker.plan_gc_page_at(now, Vec::new(), None).await });
+        read.issued().await;
+        assert!(
+            backend
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("RANGE ") && event.contains(&index.path))
+        );
+        backend.inner.delete(&endpoint.path).await.unwrap();
+        read.finish().await;
+        let error = guard(task)
+            .await
+            .unwrap()
+            .expect_err("changed endpoint must deny the entire plan");
+        assert!(
+            error.to_string().contains("physical object"),
+            "{suffix}: {error:?}"
+        );
+    }
+}
+
+async fn confirmed_publication_survives_lost_lock_release_response(genesis: bool) {
+    let backend = Backend::new();
+    let storage = ScopedStorage::new(backend.clone(), "tenant", "workspace").unwrap();
+    let store = Arc::new(
+        ControlMvpStateStore::new_synthetic_bounded(
+            storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap(),
+    );
+    let head_path = store.paths().current_pointer();
+    let txn = if genesis {
+        None
+    } else {
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation_v2("release-response", "fault-test", &"bc".repeat(32))
+            .unwrap();
+        txn.put(b"key", Bytes::from_static(b"value")).await.unwrap();
+        Some(txn)
+    };
+    let prior_events = backend.trace.lock().unwrap().len();
+    let head = backend.arm(head_path.clone(), 0, Fault::PauseAfter);
+    let publisher = store.clone();
+    let task = tokio::spawn(async move {
+        if genesis {
+            publisher
+                .install_synthetic_genesis(
+                    "release-response",
+                    1,
+                    0,
+                    std::iter::empty(),
+                    0,
+                    std::iter::empty(),
+                )
+                .await
+        } else {
+            txn.unwrap()
+                .commit_v2()
+                .await
+                .map(|outcome| outcome.token().clone())
+        }
+    });
+    head.issued().await;
+    guard(head.applied.notified()).await;
+    // Arm after HEAD applies so only release can consume the lock fault.
+    let release = backend.arm(RETENTION_GC_LOCK_PATH.into(), 0, Fault::DelayedError);
+    head.finish().await;
+    release.issued().await;
+    let outcome = guard(task).await.unwrap();
+    release.finish().await;
+    assert!(storage.head_raw(&head_path).await.unwrap().is_some());
+    let token = store.current_state_token().await.unwrap();
+    assert_eq!(token.logical_sequence(), 1);
+    assert_eq!(
+        backend
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(prior_events)
+            .filter(|event| event.starts_with("ISSUE PUT") && event.contains(&head_path))
+            .count(),
+        1,
+        "release uncertainty must never resend publication"
+    );
+    assert!(
+        outcome.is_ok(),
+        "confirmed publication must preserve its committed token (genesis={genesis}): {outcome:?}"
+    );
+    assert_eq!(outcome.unwrap(), token);
+}
+
 struct Fixture {
     backend: Arc<Backend>,
     storage: ScopedStorage,

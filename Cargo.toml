@@ -21,7 +21,12 @@ members = [
     "crates/arco-storage",
     "tools/xtask",
 ]
-exclude = ["vendor/thrift-0.17.1", "vendor/object_store-0.11.2"]
+exclude = [
+    "vendor/thrift-0.17.1",
+    "vendor/object_store-0.11.2",
+    "vendor/arrow-data-54.3.1",
+    "vendor/arrow-data-55.2.0",
+]
 
 [workspace.package]
 version = "0.3.0"
@@ -172,3 +177,7 @@ object_store = { path = "vendor/object_store-0.11.2" }
 # Backport apache/thrift@d5152211af61f850ec393604316804096dd4632e while
 # crates.io has no fixed Rust release for GHSA-2f9f-gq7v-9h6m.
 thrift = { path = "vendor/thrift-0.17.1" }
+# Backport apache/arrow-rs@a9455d4a269d1edce4891c0927fed1c2bf24fb72
+# for RUSTSEC-2026-0442; Arrow 54/55 have no patched registry release.
+arrow-data-54 = { package = "arrow-data", path = "vendor/arrow-data-54.3.1" }
+arrow-data-55 = { package = "arrow-data", path = "vendor/arrow-data-55.2.0" }

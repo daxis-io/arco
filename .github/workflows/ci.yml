@@ -165,6 +165,10 @@ jobs:
           tmpdir="$(mktemp -d)"
           cp -R vendor/thrift-0.17.1 "$tmpdir/thrift-0.17.1"
           cargo test --manifest-path "$tmpdir/thrift-0.17.1/Cargo.toml" read_bytes_rejects -- --nocapture
+      - name: Test vendored Arrow run-end validation
+        run: |
+          cargo test -p arrow-data@54.3.1 --lib
+          cargo test -p arrow-data@55.2.0 --lib
   test-api-flow:
     name: API and Flow Tests
     runs-on: ubuntu-latest

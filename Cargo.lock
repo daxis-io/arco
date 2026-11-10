@@ -789,8 +789,6 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "54.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61cfdd7d99b4ff618f167e548b2411e5dd2c98c0ddebedd7df433d34c20a4429"
 dependencies = [
  "arrow-buffer 54.3.1",
  "arrow-schema 54.3.1",
@@ -801,8 +799,6 @@ dependencies = [
 [[package]]
 name = "arrow-data"
 version = "55.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8de1ce212d803199684b658fc4ba55fb2d7e87b213de5af415308d2fee3619c2"
 dependencies = [
  "arrow-buffer 55.2.0",
  "arrow-schema 55.2.0",

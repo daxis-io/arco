@@ -4408,6 +4408,24 @@ async fn bounded_v2_frozen_patch_reexecutes_after_competing_cas_with_same_identi
         result = &mut pending => panic!("bounded command finished before the CAS gate: {result:?}"),
         () = backend.paused.notified() => {},
     }
+    // The paused send owns the retention lock. Expire its lease to admit a
+    // competing writer while keeping that original-condition send in flight.
+    let lock_path = "locks/workspace-retention-gc.lock.json";
+    let lock_meta = storage.head(lock_path).await.unwrap().unwrap();
+    let mut lock: arco_core::lock::LockInfo =
+        serde_json::from_slice(&storage.get(lock_path).await.unwrap()).unwrap();
+    lock.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    assert!(matches!(
+        storage
+            .put(
+                lock_path,
+                Bytes::from(serde_json::to_vec(&lock).unwrap()),
+                WritePrecondition::MatchesVersion(lock_meta.version),
+            )
+            .await
+            .unwrap(),
+        WriteResult::Success { .. }
+    ));
     authority
         .patch_catalog(
             "analytics",

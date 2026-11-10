@@ -15,6 +15,721 @@ fn store() -> ControlMvpStateStore {
     .unwrap()
 }
 
+#[tokio::test]
+async fn authority8_gc_dry_run_bounds_reads_across_historical_manifests() {
+    let store = store();
+    for ordinal in 0_u64..512 {
+        let mut txn = transaction(&store, &format!("gc-inventory-{ordinal}")).await;
+        txn.put(b"live", Bytes::copy_from_slice(&ordinal.to_be_bytes()))
+            .await
+            .unwrap();
+        txn.commit_v2().await.unwrap();
+    }
+    let orphan = store.paths.state_object(&"ee".repeat(32));
+    store
+        .retention
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    assert!(
+        matches!(
+            worker
+                .plan_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+                .await,
+            Err(CatalogError::MaintenanceBackpressure { .. })
+        ),
+        "one GC page must share its read ceiling across every protected manifest"
+    );
+    assert!(store.retention.head_raw(&orphan).await.unwrap().is_some());
+    assert_eq!(
+        store.get(b"live").await.unwrap(),
+        Some(Bytes::copy_from_slice(&511_u64.to_be_bytes()))
+    );
+}
+
+#[tokio::test]
+async fn authority8_gc_dry_run_protects_current_directory_closure() {
+    let store = store();
+    store
+        .install_synthetic_genesis(
+            "gc-current-closure",
+            1,
+            1,
+            [SyntheticKvEntry {
+                key: b"live".to_vec(),
+                generation: 1,
+                value: Some(b"value".to_vec()),
+            }],
+            0,
+            std::iter::empty(),
+        )
+        .await
+        .expect("synthetic authority");
+    let orphans = [
+        format!(
+            "control/directory/v1/domains/{}/pages/{}",
+            store.scope.domain(),
+            "aa".repeat(32)
+        ),
+        format!(
+            "{}/physical/descriptors/{}.json",
+            store.paths.base_prefix(),
+            "bb".repeat(32)
+        ),
+        store.paths.state_object(&"cc".repeat(32)),
+        store.paths.segment_index(&"dd".repeat(32)),
+    ];
+    for path in &orphans {
+        store
+            .retention
+            .put_raw(
+                path,
+                Bytes::from_static(b"orphan"),
+                arco_core::storage::WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("orphan object");
+    }
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let mut found = Vec::new();
+    let mut cursor = None;
+    loop {
+        let plan = worker
+            .plan_gc_page_at(
+                Utc::now() + ChronoDuration::days(40),
+                Vec::new(),
+                cursor.as_deref(),
+            )
+            .await
+            .expect("authority-8 dry run");
+        found.extend(
+            plan.candidates()
+                .iter()
+                .map(|candidate| candidate.path().to_owned()),
+        );
+        cursor = plan.continuation().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    let mut expected = orphans.to_vec();
+    expected.sort();
+    found.sort();
+    assert_eq!(
+        found, expected,
+        "current closure is protected and both orphan prefixes are eligible"
+    );
+    assert_eq!(
+        store.get(b"live").await.expect("current value"),
+        Some(Bytes::from_static(b"value"))
+    );
+    assert!(matches!(
+        worker
+            .collect_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+            .await,
+        Err(CatalogError::UnsupportedAuthorityFormat { .. })
+    ));
+    for path in &orphans {
+        assert!(
+            store
+                .retention
+                .head_raw(path)
+                .await
+                .expect("orphan HEAD")
+                .is_some(),
+            "dry-run must not authorize deletion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn authority8_gc_dry_run_fails_closed_on_missing_live_descriptor() {
+    let store = store();
+    store
+        .install_synthetic_genesis(
+            "gc-missing-descriptor",
+            1,
+            1,
+            [SyntheticKvEntry {
+                key: b"live".to_vec(),
+                generation: 1,
+                value: Some(b"value".to_vec()),
+            }],
+            0,
+            std::iter::empty(),
+        )
+        .await
+        .expect("synthetic authority");
+    let descriptor_prefix = format!("{}/physical/descriptors/", store.paths.base_prefix());
+    let page = store
+        .retention
+        .list_page_meta(&descriptor_prefix, None, 1)
+        .await
+        .expect("descriptor inventory");
+    let descriptor = page
+        .objects
+        .first()
+        .expect("live descriptor")
+        .path
+        .to_string();
+    store
+        .retention
+        .delete(&descriptor)
+        .await
+        .expect("remove descriptor");
+    let orphan = store.paths.state_object(&"ee".repeat(32));
+    store
+        .retention
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("orphan object");
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    assert!(
+        worker
+            .plan_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .retention
+            .head_raw(&orphan)
+            .await
+            .expect("orphan HEAD")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authority8_gc_dry_run_rejects_corrupt_retained_selector() {
+    let store = store().with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+    store
+        .install_synthetic_genesis("gc-corrupt-retained", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let orphan = store.paths.state_object(&"ee".repeat(32));
+    store
+        .retention
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("orphan object");
+    store
+        .retention
+        .put_raw(
+            &format!("{}/retained/v1/current.json", store.paths.base_prefix()),
+            Bytes::from_static(b"{"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("corrupt retained selector");
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    assert!(
+        worker
+            .plan_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+            .await
+            .is_err(),
+        "a corrupt retained selector cannot authorize an orphan candidate"
+    );
+    assert!(
+        store
+            .retention
+            .head_raw(&orphan)
+            .await
+            .expect("orphan HEAD")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authority8_gc_dry_run_rejects_corrupt_workspace_pin() {
+    let store = store();
+    store
+        .install_synthetic_genesis("gc-corrupt-pin", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let orphan = store.paths.state_object(&"ef".repeat(32));
+    store
+        .retention
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("orphan object");
+    store
+        .retention
+        .put_raw(
+            "retention/pins/corrupt/latest.json",
+            Bytes::from_static(b"{"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("corrupt pin selector");
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    assert!(
+        worker
+            .plan_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+            .await
+            .is_err(),
+        "an invalid workspace pin cannot authorize a GC candidate"
+    );
+    assert!(
+        store
+            .retention
+            .head_raw(&orphan)
+            .await
+            .expect("orphan HEAD")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn authority8_gc_dry_run_rejects_unresolved_armed_restore_without_prepared_bytes() {
+    use crate::retention_coordination::{
+        ArmedRestorePublicationIntent, RetainedPointerIntentPrecondition, RetentionMutationEpoch,
+        RetentionMutationKind,
+    };
+    use crate::workspace_io_budget::WorkspaceIoBudget;
+
+    let store = store();
+    store
+        .install_synthetic_genesis("gc-armed-restore", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let orphan = store.paths.state_object(&"ef".repeat(32));
+    store
+        .retention
+        .put_raw(
+            &orphan,
+            Bytes::from_static(b"orphan"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("old orphan");
+    let scoped = store
+        .retention
+        .as_legacy_scoped()
+        .expect("workspace root")
+        .clone();
+    let mut budget = WorkspaceIoBudget::new();
+    let mut guard = budget
+        .acquire_retention_lock(scoped.clone(), "gc-armed-restore")
+        .await
+        .expect("retention lock");
+    let mut epoch = RetentionMutationEpoch::claim_bounded(
+        scoped,
+        &mut guard,
+        RetentionMutationKind::WorkspaceRestoreApply,
+        "gc-armed-restore",
+        &mut budget,
+    )
+    .await
+    .expect("restore epoch");
+    let candidate = "22".repeat(32);
+    let mut mutation = epoch.begin_bounded_mutation();
+    mutation
+        .arm_restore_publication(
+            ArmedRestorePublicationIntent {
+                intent_type: "arco.restore.publication-intent".into(),
+                version: 1,
+                domain: store.scope.domain().into(),
+                plan_sha256: "11".repeat(32),
+                owner_generation: 1,
+                candidate_id: candidate.clone(),
+                prepared_path: format!(
+                    "{}/restore/v7/{candidate}/prepared.json",
+                    store.paths.base_prefix()
+                ),
+                prepared_sha256: "33".repeat(32),
+                precondition: RetainedPointerIntentPrecondition::DoesNotExist {},
+            },
+            &mut guard,
+            &mut budget,
+        )
+        .await
+        .expect("arm restore publication");
+    mutation
+        .finish(Ok(()))
+        .expect("leave armed epoch in flight");
+
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    assert!(
+        worker
+            .plan_gc_at(Utc::now() + ChronoDuration::days(40), Vec::new())
+            .await
+            .is_err(),
+        "an unresolved restore publication must block GC even without prepared bytes"
+    );
+    assert!(store.retention.head_raw(&orphan).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn authority8_commit_waits_for_retention_gc_lock_before_staging_reusable_pages() {
+    let store = store();
+    store
+        .install_synthetic_genesis(
+            "gc-writer-lock",
+            1,
+            0,
+            std::iter::empty(),
+            0,
+            std::iter::empty(),
+        )
+        .await
+        .expect("synthetic authority");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin transaction");
+    txn.set_logical_operation_v2("gc-lock-op", "kv", &"11".repeat(32))
+        .expect("operation");
+    txn.put(b"live", Bytes::from_static(b"value"))
+        .await
+        .expect("stage write");
+    let guard = DistributedLock::new(Arc::new(store.retention.clone()), RETENTION_GC_LOCK_PATH)
+        .acquire_with_operation(
+            RETENTION_GC_LOCK_TTL,
+            RETENTION_GC_LOCK_MAX_RETRIES,
+            Some("authority8-gc-lock-test".into()),
+        )
+        .await
+        .expect("hold GC lock");
+    let mut commit = tokio::spawn(async move { txn.commit_v2().await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut commit)
+            .await
+            .is_err(),
+        "bounded commit must wait while GC owns the retention lock"
+    );
+    guard.release().await.expect("release GC lock");
+    commit
+        .await
+        .expect("join commit")
+        .expect("commit after lock release");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the post-fence trim and reusable-object inventory are one regression"
+)]
+async fn authority8_gc_refuses_reusable_empty_pages_and_key_objects() {
+    let store = store();
+    let intent = ProjectionIntentV2::new(
+        "gc-notice",
+        "catalog",
+        store.scope.clone(),
+        1,
+        "a1".repeat(32),
+        0,
+        b"notice",
+    )
+    .expect("intent");
+    store
+        .install_synthetic_genesis(
+            "gc-reused-empty-page",
+            1,
+            1,
+            [SyntheticKvEntry {
+                key: b"live".to_vec(),
+                generation: 1,
+                value: Some(b"value".to_vec()),
+            }],
+            1,
+            [intent.clone()],
+        )
+        .await
+        .expect("synthetic authority");
+    let directory =
+        directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+    let empty = directory.empty_root().await.expect("unattached empty page");
+    let encoded = empty.encode();
+    let orphan = format!(
+        "control/directory/v1/domains/{}/pages/{}",
+        store.scope.domain(),
+        hex::encode(&encoded[encoded.len() - 32..])
+    );
+    let key_object = format!(
+        "control/directory/v1/domains/{}/keys/{}",
+        store.scope.domain(),
+        "cc".repeat(32)
+    );
+    store
+        .retention
+        .put_raw(
+            &key_object,
+            Bytes::from_static(b"unattached long key"),
+            arco_core::storage::WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("unattached key object");
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let now = Utc::now() + ChronoDuration::days(40);
+    let mut cursor = None;
+    let mut planned = Vec::new();
+    loop {
+        let page = worker
+            .plan_gc_page_at(now, Vec::new(), cursor.as_deref())
+            .await
+            .expect("dry-run page");
+        planned.extend(
+            page.candidates()
+                .iter()
+                .map(|candidate| candidate.path().to_owned()),
+        );
+        cursor = page.continuation().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(
+        !planned.contains(&orphan),
+        "empty page can be reused after a GC fence"
+    );
+    assert!(
+        !planned.contains(&key_object),
+        "long-key object can be reused after a GC fence"
+    );
+    let head_version = store
+        .retention
+        .head_raw(&store.paths.current_pointer())
+        .await
+        .expect("HEAD")
+        .expect("selected HEAD")
+        .version;
+    worker
+        .fence_reclamation(&head_version)
+        .await
+        .expect("GC fence");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin after fence");
+    txn.set_logical_operation_v2("gc-trim-notice", "projection_trim", &"12".repeat(32))
+        .expect("operation");
+    txn.trim_projection_intents_v2(&[intent])
+        .await
+        .expect("stage trim");
+    txn.commit_v2().await.expect("publish post-fence successor");
+    assert!(
+        store
+            .projection_outbox_page_v2(None, None, 1)
+            .await
+            .expect("post-fence outbox read")
+            .records()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn authority8_post_fence_successor_survives_delayed_empty_page_delete() {
+    let store = store();
+    let intent = ProjectionIntentV2::new(
+        "gc-notice",
+        "catalog",
+        store.scope.clone(),
+        1,
+        "a1".repeat(32),
+        0,
+        b"notice",
+    )
+    .expect("intent");
+    store
+        .install_synthetic_genesis(
+            "gc-delayed-empty-page",
+            1,
+            1,
+            [SyntheticKvEntry {
+                key: b"live".to_vec(),
+                generation: 1,
+                value: Some(b"value".to_vec()),
+            }],
+            1,
+            [intent.clone()],
+        )
+        .await
+        .expect("synthetic authority");
+    let directory =
+        directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+    let empty = directory
+        .empty_root()
+        .await
+        .expect("old unattached empty page");
+    let encoded = empty.encode();
+    let orphan = format!(
+        "control/directory/v1/domains/{}/pages/{}",
+        store.scope.domain(),
+        hex::encode(encoded.get(encoded.len() - 32..).expect("root digest"))
+    );
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let head_version = store
+        .retention
+        .head_raw(&store.paths.current_pointer())
+        .await
+        .expect("HEAD")
+        .expect("current HEAD")
+        .version;
+    worker
+        .fence_reclamation(&head_version)
+        .await
+        .expect("GC fence");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin after fence");
+    txn.set_logical_operation_v2("gc-trim-notice", "projection_trim", &"12".repeat(32))
+        .expect("operation");
+    txn.trim_projection_intents_v2(&[intent])
+        .await
+        .expect("stage trim");
+    txn.commit_v2().await.expect("post-fence successor");
+    store
+        .retention
+        .delete(&orphan)
+        .await
+        .expect("delayed DELETE");
+    assert!(
+        store
+            .projection_outbox_page_v2(None, None, 1)
+            .await
+            .expect("current read after delayed DELETE")
+            .records()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn authority8_transaction_manifest_binds_v2_directory_objects() {
+    let store = store();
+    store
+        .install_synthetic_genesis("directory-version-binding", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("transaction");
+    txn.set_logical_operation_v2("directory-version", "kv", &"11".repeat(32))
+        .expect("operation");
+    txn.put(b"live", Bytes::from_static(b"value"))
+        .await
+        .expect("staging");
+    let candidate_id = txn.candidate_manifest_id().to_owned();
+    txn.commit_v2().await.expect("publish");
+    let bytes = store
+        .storage
+        .get(&store.paths.manifest_object(&candidate_id))
+        .await
+        .expect("manifest");
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest JSON");
+    assert_eq!(wire["directory_object_version"], 2);
+}
+
+#[tokio::test]
+async fn authority8_synthetic_genesis_manifest_binds_v2_directory_objects() {
+    let store = store();
+    store
+        .install_synthetic_genesis("genesis-directory-version", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let bytes = store
+        .storage
+        .get(
+            &store
+                .paths
+                .manifest_object("synthetic-genesis-directory-version"),
+        )
+        .await
+        .expect("manifest");
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("manifest JSON");
+    assert_eq!(wire["directory_object_version"], 2);
+}
+
+#[tokio::test]
+async fn authority8_post_fence_successor_survives_delayed_long_key_delete() {
+    let store = store();
+    store
+        .install_synthetic_genesis("gc-delayed-long-key", 1, 0, [], 0, [])
+        .await
+        .expect("synthetic authority");
+    let key = vec![b'k'; 100];
+    let directory =
+        directory::Directory::new(store.retention.clone(), &store.scope).expect("directory");
+    let mut orphan_builder = directory.builder();
+    orphan_builder
+        .push(directory::Leaf {
+            first: key.clone(),
+            last: key.clone(),
+            rows: 1,
+            bytes: 100,
+            digest: [7; 32],
+        })
+        .await
+        .expect("unattached leaf");
+    orphan_builder.finish().await.expect("unattached old root");
+    let prefix = format!(
+        "control/directory/v1/domains/{}/keys/",
+        store.scope.domain()
+    );
+    let page = store
+        .retention
+        .list_page_meta(&prefix, None, 2)
+        .await
+        .expect("old key object");
+    let [old_key] = page.objects.as_slice() else {
+        panic!("expected one unattached V1 key object");
+    };
+    let orphan = old_key.path.to_string();
+    let worker = ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+    let head_version = store
+        .retention
+        .head_raw(&store.paths.current_pointer())
+        .await
+        .expect("HEAD")
+        .expect("current HEAD")
+        .version;
+    worker
+        .fence_reclamation(&head_version)
+        .await
+        .expect("GC fence");
+    let mut txn = store
+        .begin_control_txn(TxnOptions::default())
+        .await
+        .expect("begin after fence");
+    txn.set_logical_operation_v2("gc-put-long-key", "kv", &"13".repeat(32))
+        .expect("operation");
+    txn.put(&key, Bytes::from_static(b"value"))
+        .await
+        .expect("stage put");
+    txn.commit_v2().await.expect("post-fence successor");
+    store
+        .retention
+        .delete(&orphan)
+        .await
+        .expect("delayed DELETE");
+    assert_eq!(
+        store
+            .get(&key)
+            .await
+            .expect("current read after delayed DELETE"),
+        Some(Bytes::from_static(b"value"))
+    );
+}
+
 #[cfg(feature = "test-utils")]
 #[tokio::test]
 async fn authority8_narrow_delivery_page_stays_bounded_above_sixteen_blocks() {
@@ -1062,4 +1777,102 @@ async fn authority8_plan7_retries_keep_original_logical_identity_and_reject_tamp
             "accepted changed {field}"
         );
     }
+}
+
+#[tokio::test]
+async fn authority8_genesis_waits_for_retention_gc_lock_before_staging() {
+    use arco_core::StorageBackend as _;
+
+    let store = store();
+    let guard = DistributedLock::new(Arc::new(store.retention.clone()), RETENTION_GC_LOCK_PATH)
+        .acquire_with_operation(
+            RETENTION_GC_LOCK_TTL,
+            RETENTION_GC_LOCK_MAX_RETRIES,
+            Some("authority8-genesis-gc-lock-test".into()),
+        )
+        .await
+        .expect("hold GC lock");
+    let writer = store.clone();
+    let mut genesis = tokio::spawn(async move {
+        writer
+            .install_synthetic_genesis("gc-genesis-lock", 1, 0, [], 0, [])
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut genesis)
+            .await
+            .is_err(),
+        "synthetic genesis must wait while GC owns the retention lock"
+    );
+    for prefix in [
+        format!("{}/", store.paths.base_prefix()),
+        format!("control/directory/v1/domains/{}/", store.scope.domain()),
+    ] {
+        assert!(
+            store
+                .retention
+                .list_page(&prefix, None, 256)
+                .await
+                .unwrap()
+                .objects
+                .is_empty(),
+            "synthetic genesis must not stage authority or directory artifacts under the GC lock"
+        );
+    }
+    assert!(
+        store
+            .retention
+            .head_raw(&store.paths.current_pointer())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    guard.release().await.expect("release GC lock");
+    genesis
+        .await
+        .expect("join genesis")
+        .expect("genesis after lock release");
+    assert!(
+        store
+            .retention
+            .head_raw(&store.paths.current_pointer())
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn authority8_genesis_renews_retention_lease_during_streamed_construction() {
+    use arco_core::test_inputs::FixedInputs;
+
+    let store = store();
+    let started = Utc::now();
+    let mut clock = Some(FixedInputs::at(started));
+    let rows = (0_u64..768).map(|ordinal| {
+        if ordinal % 256 == 0 {
+            drop(clock.take());
+            clock = Some(FixedInputs::at(
+                started + ChronoDuration::seconds(i64::try_from(ordinal / 256).unwrap() * 20),
+            ));
+        }
+        SyntheticKvEntry {
+            key: format!("receipt/{ordinal:04}").into_bytes(),
+            generation: 1,
+            value: Some(b"live".to_vec()),
+        }
+    });
+    let result = store
+        .install_synthetic_genesis("gc-genesis-renewal", 1, 768, rows, 0, [])
+        .await;
+    assert!(
+        result.is_ok(),
+        "streamed genesis must renew its 30-second retention lease: {result:?}"
+    );
+    assert_eq!(
+        store.get(b"receipt/0767").await.unwrap(),
+        Some(Bytes::from_static(b"live"))
+    );
+    drop(clock.take());
 }

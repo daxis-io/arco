@@ -157,11 +157,13 @@ mod restore_key_policy;
 mod retained;
 #[cfg(feature = "test-utils")]
 pub use bounded::SyntheticKvEntry;
+#[cfg(feature = "test-utils")]
+pub use bounded::marking::{GcMarkAdvance, GcMarkCursor, GcMarkVerifier, GcMarkedPlan};
 pub use bounded::restore::{ControlMvpRestoreFenceWitness, ControlMvpRestorePlanV7};
 pub use bounded::{CandidateRecoveryV2, ProjectionContinuationV2, ProjectionPageV2};
 pub use restore_key_policy::RestoreKeyPolicy;
 pub(crate) use retained::{RetainedSourcePublication, VerifiedRetainedPointer};
-#[cfg(test)]
+#[cfg(all(test, feature = "test-utils"))]
 mod authority8_tests;
 mod read_cache;
 pub use read_cache::{
@@ -4003,6 +4005,17 @@ impl ControlMvpMaintenanceWorker {
         }
     }
 
+    /// Constructs the synthetic worker for local authority-8 GC qualification.
+    /// Authority-8 active deletion remains unsupported.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn new_synthetic_bounded(store: &ControlMvpStateStore) -> Self {
+        Self {
+            store: store.clone().without_read_cache(),
+            lifecycle: store.retention.clone(),
+        }
+    }
+
     /// Builds a bounded, read-only GC plan at the supplied clock cut.
     ///
     /// All manifests and checkpoints younger than 30 days are treated as
@@ -4043,11 +4056,336 @@ impl ControlMvpMaintenanceWorker {
         additional_protected_paths: impl IntoIterator<Item = String>,
         continuation: Option<&str>,
     ) -> Result<ControlMvpGcPlan> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.store.authority_format == 8 {
+            return self
+                .plan_gc_page_bounded(now, additional_protected_paths, continuation)
+                .await;
+        }
         self.store
             .require_physical_lifecycle("plan_gc_page_at")
             .await?;
         self.plan_gc_page_inner(now, additional_protected_paths, continuation)
             .await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn plan_gc_page_bounded(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+        continuation: Option<&str>,
+    ) -> Result<ControlMvpGcPlan> {
+        let scoped = self
+            .lifecycle
+            .as_legacy_scoped()
+            .ok_or_else(|| invariant_violation("bounded GC requires a workspace root"))?;
+        let mut io = crate::workspace_io_budget::WorkspaceIoBudget::for_control_gc();
+        let epoch_version =
+            RetentionMutationEpoch::gc_dry_run_epoch_version_bounded(scoped, &mut io).await?;
+        let (mut plan, pointer) = self
+            .inventory_gc_page_bounded(now, additional_protected_paths, continuation, &mut io)
+            .await?;
+        let candidates = &mut plan.candidates;
+        if !candidates.is_empty() {
+            let mut paths = candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect::<BTreeSet<_>>();
+            crate::workspace_restore::deny_gc_while_restore_journal_protected(
+                scoped,
+                self.store.scope.domain(),
+                &mut io,
+            )
+            .await?;
+            retained::protect_gc_selected_pointer(
+                &self.store,
+                &mut paths,
+                &mut retained::ReadBudget::for_gc(&mut io),
+            )
+            .await?;
+            self.protect_gc_workspace_roots(now, &mut paths, &mut io)
+                .await?;
+            let mut budget = retained::ReadBudget::for_gc(&mut io);
+            bounded::protect_gc_manifest(
+                &self.store,
+                &pointer.manifest_id,
+                Some(&pointer.manifest_checksum_sha256),
+                &mut paths,
+                &mut budget,
+            )
+            .await?;
+            let manifest_prefix = format!("{}/manifests/", self.store.paths.base_prefix());
+            let mut cursor = None;
+            loop {
+                let page = budget
+                    .list_gc_manifests(
+                        &self.lifecycle,
+                        &manifest_prefix,
+                        cursor.as_deref(),
+                        CONTROL_MVP_GC_PAGE_SIZE,
+                    )
+                    .await?;
+                for object in &page.objects {
+                    let path = object.path.to_string();
+                    let id = path
+                        .strip_prefix(&manifest_prefix)
+                        .and_then(|path| path.strip_suffix(".json"))
+                        .filter(|id| !id.contains('/'))
+                        .ok_or_else(|| {
+                            invariant_violation("invalid bounded manifest inventory path")
+                        })?;
+                    if id != pointer.manifest_id {
+                        bounded::protect_gc_manifest(
+                            &self.store,
+                            id,
+                            None,
+                            &mut paths,
+                            &mut budget,
+                        )
+                        .await?;
+                    }
+                }
+                match page.next_start_after {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            candidates.retain(|candidate| paths.contains(&candidate.path));
+        }
+        let after = io
+            .head(&self.lifecycle, &self.store.paths.current_pointer())
+            .await?
+            .ok_or_else(|| invariant_violation("bounded GC HEAD disappeared"))?;
+        if after.version != plan.head_version {
+            return Err(CatalogError::CasFailed {
+                message: "bounded GC HEAD changed during closure scan".into(),
+            });
+        }
+        if RetentionMutationEpoch::gc_dry_run_epoch_version_bounded(scoped, &mut io).await?
+            != epoch_version
+        {
+            return Err(CatalogError::CasFailed {
+                message: "bounded GC retention epoch changed during closure scan".into(),
+            });
+        }
+        Ok(plan)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded inventory page shares exact cursor, class, age and version validation"
+    )]
+    async fn inventory_gc_page_bounded(
+        &self,
+        now: DateTime<Utc>,
+        additional_protected_paths: impl IntoIterator<Item = String>,
+        continuation: Option<&str>,
+        io: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<(ControlMvpGcPlan, ControlMvpPointer)> {
+        let authority_prefix = format!("{}/", self.store.paths.base_prefix());
+        let directory_prefix = format!(
+            "control/directory/v1/domains/{}/",
+            self.store.scope.domain()
+        );
+        let (prefix, start_after, directory_phase) = match continuation {
+            None => (authority_prefix.as_str(), None, false),
+            Some("v8:directory:") => (directory_prefix.as_str(), None, true),
+            Some(cursor) if cursor.starts_with("v8:authority:") => {
+                let start = &cursor["v8:authority:".len()..];
+                if !start.starts_with(&authority_prefix) {
+                    return Err(validation_failed("invalid bounded GC authority cursor"));
+                }
+                (authority_prefix.as_str(), Some(start), false)
+            }
+            Some(cursor) if cursor.starts_with("v8:directory:") => {
+                let start = &cursor["v8:directory:".len()..];
+                if !start.starts_with(&directory_prefix) {
+                    return Err(validation_failed("invalid bounded GC directory cursor"));
+                }
+                (directory_prefix.as_str(), Some(start), true)
+            }
+            _ => return Err(validation_failed("invalid bounded GC cursor")),
+        };
+        let mut protected = BTreeSet::new();
+        for path in additional_protected_paths {
+            io.reserve_bytes(path.capacity() + 128)?;
+            io.charge_operations(1)?;
+            ScopedStorage::validate_path(&path)?;
+            if !path.starts_with(&authority_prefix) && !path.starts_with(&directory_prefix) {
+                return Err(validation_failed(
+                    "bounded GC protected path is outside scope",
+                ));
+            }
+            protected.insert(path);
+        }
+        let inventory = io
+            .list_page(
+                &self.lifecycle,
+                prefix,
+                start_after,
+                CONTROL_MVP_GC_PAGE_SIZE,
+            )
+            .await?;
+        io.charge_operations(inventory.objects.len())?;
+        for object in &inventory.objects {
+            io.reserve_bytes(size_of::<ControlMvpGcCandidate>() + object.path.len())?;
+        }
+        let next = inventory.next_start_after.map_or_else(
+            || (!directory_phase).then(|| "v8:directory:".to_owned()),
+            |cursor| {
+                Some(format!(
+                    "v8:{}:{cursor}",
+                    if directory_phase {
+                        "directory"
+                    } else {
+                        "authority"
+                    }
+                ))
+            },
+        );
+        let (pointer_bytes, head_version) = io
+            .read_stable(
+                &self.lifecycle,
+                &self.store.paths.current_pointer(),
+                MAX_HEAD_JSON_BYTES,
+            )
+            .await?
+            .ok_or_else(|| invariant_violation("bounded GC requires an authority HEAD"))?;
+        validate_version_header(
+            &pointer_bytes,
+            self.store.authority_format,
+            "control MVP HEAD",
+        )?;
+        let pointer: ControlMvpPointer = decode_json_limited(
+            &pointer_bytes,
+            MAX_HEAD_JSON_BYTES,
+            "control MVP mutable head",
+        )?;
+        pointer.validate_versioned(&self.store.scope, self.store.authority_format)?;
+        let cutoff = now - ChronoDuration::days(CONTROL_MVP_ORPHAN_MIN_AGE_DAYS);
+        // ponytail: retain reusable key objects until a versioned key path can
+        // prevent a delayed DELETE from removing a later attachment.
+        // The canonical empty page and long-key objects can be attached by a
+        // later writer even after a generation fence. Delayed DELETE responses
+        // therefore have no safe reclamation authority for these paths.
+        let empty_root = directory::Directory::new(self.lifecycle.clone(), &self.store.scope)?
+            .empty_root_reference()?
+            .encode();
+        let empty_digest = empty_root
+            .get(empty_root.len().saturating_sub(32)..)
+            .filter(|digest| digest.len() == 32)
+            .ok_or_else(|| invariant_violation("invalid empty directory root digest"))?;
+        let empty_page = format!("{directory_prefix}pages/{}", hex::encode(empty_digest));
+        let candidates = inventory
+            .objects
+            .into_iter()
+            .filter_map(|object| {
+                let path = object.path.to_string();
+                let suffix = if directory_phase {
+                    path.strip_prefix(&directory_prefix)
+                        .and_then(|path| path.strip_prefix("pages/"))
+                        .filter(|suffix| valid_raw_digest(suffix))
+                } else {
+                    path.strip_prefix(&authority_prefix).and_then(|path| {
+                        path.strip_prefix("physical/descriptors/")
+                            .and_then(|path| path.strip_suffix(".json"))
+                            .filter(|suffix| valid_raw_digest(suffix))
+                            .or_else(|| {
+                                path.strip_prefix("segments/l1/")
+                                    .and_then(|path| path.strip_suffix(".arrow"))
+                                    .filter(|suffix| integrity::valid_immutable_id(suffix))
+                            })
+                            .or_else(|| {
+                                path.strip_prefix("indexes/")
+                                    .and_then(|path| path.strip_suffix(".idx"))
+                                    .filter(|suffix| integrity::valid_immutable_id(suffix))
+                            })
+                    })
+                };
+                if suffix.is_none()
+                    || path == empty_page
+                    || protected.contains(&path)
+                    || object
+                        .last_modified
+                        .is_none_or(|modified| modified > cutoff)
+                {
+                    return None;
+                }
+                Some(ControlMvpGcCandidate {
+                    path,
+                    version: object.version,
+                    size: object.size,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            ControlMvpGcPlan {
+                head_version,
+                candidates,
+                continuation: next,
+            },
+            pointer,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn protect_gc_workspace_roots(
+        &self,
+        now: DateTime<Utc>,
+        candidates: &mut BTreeSet<String>,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<()> {
+        let mut roots = RetainedAuthorityRoots::new(&self.lifecycle, now);
+        let mut seen = 0_usize;
+        while let Some(root) = roots.next_bounded(budget).await? {
+            seen = seen
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC retained root count overflow".into(),
+                })?;
+            if seen > 4096 {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC exceeds 4096 selected workspace roots".into(),
+                });
+            }
+            for path in root.required_paths {
+                candidates.remove(&path);
+            }
+            for prefix in root.protected_prefixes {
+                candidates.retain(|path| !path.starts_with(&prefix));
+            }
+            for reference in root.authorities {
+                if reference.scope() != &self.store.scope {
+                    continue;
+                }
+                reference.validate()?;
+                if reference.implementation() != IMPLEMENTATION
+                    || reference.reference_kind() != PersistedAuthorityKind::StateToken
+                    || reference.manifest_path()
+                        != self.store.paths.manifest_object(reference.manifest_id())
+                {
+                    return Err(invariant_violation(
+                        "bounded GC retained authority differs from exact scope",
+                    ));
+                }
+                let digest = reference
+                    .manifest_sha256()
+                    .strip_prefix("sha256:")
+                    .filter(|digest| valid_raw_digest(digest))
+                    .ok_or_else(|| invariant_violation("bounded GC retained digest is invalid"))?;
+                bounded::protect_gc_manifest(
+                    &self.store,
+                    reference.manifest_id(),
+                    Some(digest),
+                    candidates,
+                    &mut retained::ReadBudget::for_gc(budget),
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Executes conservative active GC under the workspace retention lock and
@@ -7146,6 +7484,10 @@ impl StateRestoreParticipant for ControlMvpRestoreParticipant {
         Ok(PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
             bounded::restore::plan(&self.store, source, identity, context).await?,
         )))
+    }
+
+    fn supports_bounded_restore_advance(&self) -> bool {
+        self.store.authority_format == 8 && self.key_policy.excludes_nothing()
     }
 
     #[allow(

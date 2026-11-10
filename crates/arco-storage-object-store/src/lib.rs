@@ -15,7 +15,10 @@ use futures::{StreamExt, TryStreamExt};
 use http::Method;
 use object_store::path::Path as ObjectStorePath;
 use object_store::signer::Signer as ObjectStoreSigner;
-use object_store::{DynObjectStore, PutMode, PutOptions, RetryConfig, UpdateVersion};
+use object_store::{
+    DynObjectStore, GetOptions, GetRange, GetResult, PutMode, PutOptions, RetryConfig,
+    UpdateVersion,
+};
 
 /// Returns an upstream request policy with automatic retries disabled.
 ///
@@ -262,6 +265,41 @@ fn next_start_after(objects: &[ObjectMeta], limit: usize) -> Option<String> {
     }
 }
 
+/// Bound allocation and body collection even if an upstream stream ignores Range.
+async fn collect_range(result: GetResult, requested: Range<usize>) -> Result<Bytes> {
+    let expected = requested.start..requested.end.min(result.meta.size);
+    if expected.end < expected.start || result.range != expected {
+        return Err(Error::storage("upstream returned a different byte range"));
+    }
+    let length = expected.end - expected.start;
+    let mut bytes = Vec::new();
+    let mut stream = result.into_stream();
+    while let Some(chunk) = stream.try_next().await.map_err(map_object_store_error)? {
+        if chunk.len() > length - bytes.len() {
+            return Err(Error::storage(
+                "upstream range body exceeds requested length",
+            ));
+        }
+        let needed = bytes.len() + chunk.len();
+        if needed > bytes.capacity() {
+            // Metadata alone must not allocate; growth follows received bytes and stays in range.
+            let capacity = bytes.capacity().saturating_mul(2).max(needed).min(length);
+            bytes
+                .try_reserve_exact(capacity - bytes.len())
+                .map_err(|error| {
+                    Error::storage_with_source("bounded range allocation failed", error)
+                })?;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != length {
+        return Err(Error::storage(
+            "upstream range body is shorter than its metadata",
+        ));
+    }
+    Ok(bytes.into())
+}
+
 #[async_trait]
 impl StorageBackend for ObjectStoreBackend {
     async fn get(&self, path: &str) -> Result<Bytes> {
@@ -275,33 +313,52 @@ impl StorageBackend for ObjectStoreBackend {
     }
 
     async fn get_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        if range.start < range.end {
+            if let Ok(start) = usize::try_from(range.start) {
+                let end = usize::try_from(range.end).unwrap_or(usize::MAX);
+                let options = GetOptions {
+                    range: Some(GetRange::Bounded(start..end)),
+                    ..Default::default()
+                };
+                match self
+                    .store
+                    .get_opts(&ObjectStorePath::from(path), options)
+                    .await
+                {
+                    Ok(result) => return collect_range(result, start..end).await,
+                    Err(error @ object_store::Error::NotFound { .. }) => {
+                        return Err(map_object_store_error(error));
+                    }
+                    Err(error) => {
+                        // Native range requests reject EOF/empty objects; Arco accepts empty ranges.
+                        let Some(meta) = self.head(path).await? else {
+                            return Err(Error::NotFound(format!("object not found: {path}")));
+                        };
+                        if range.start == meta.size {
+                            return Ok(Bytes::new());
+                        }
+                        if range.start > meta.size {
+                            return Err(Error::InvalidInput(format!(
+                                "range start {} exceeds object length {}",
+                                range.start, meta.size
+                            )));
+                        }
+                        return Err(map_object_store_error(error));
+                    }
+                }
+            }
+        }
         let meta = self
             .head(path)
             .await?
             .ok_or_else(|| Error::NotFound(format!("object not found: {path}")))?;
-        let size = usize::try_from(meta.size).map_err(|_| {
-            Error::InvalidInput(format!(
-                "object size too large for range requests: {}",
+        if range.start > range.end.min(meta.size) {
+            return Err(Error::InvalidInput(format!(
+                "invalid range {range:?} for object length {}",
                 meta.size
-            ))
-        })?;
-        let start = usize::try_from(range.start)
-            .map_err(|_| Error::InvalidInput(format!("range start too large: {}", range.start)))?;
-        if start > size {
-            return Err(Error::InvalidInput(format!(
-                "range start {start} exceeds object length {size}"
             )));
         }
-        let end = usize::try_from(range.end).unwrap_or(usize::MAX).min(size);
-        if end < start {
-            return Err(Error::InvalidInput(format!(
-                "range end {end} is before start {start}"
-            )));
-        }
-        self.store
-            .get_range(&ObjectStorePath::from(path), start..end)
-            .await
-            .map_err(map_object_store_error)
+        Ok(Bytes::new())
     }
 
     async fn put(

@@ -1937,9 +1937,7 @@ impl WorkspaceSnapshotService {
             .await?
         {
             let snapshot = self.validate_snapshot_retry(request, &bytes)?;
-            return self
-                .retry_bounded_snapshot(request, snapshot, &mut budget)
-                .await;
+            return Box::pin(self.retry_bounded_snapshot(request, snapshot, &mut budget)).await;
         }
         let mut guard = budget
             .acquire_retention_lock(self.storage.clone(), "workspace-snapshot-finalize")

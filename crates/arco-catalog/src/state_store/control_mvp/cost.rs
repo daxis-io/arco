@@ -118,6 +118,10 @@ impl NativeWork {
                 &mut self.bounded.streaming_builder_inputs,
                 work.streaming_builder_inputs,
             ),
+            (&mut self.bounded.gc_probe_batches, work.gc_probe_batches),
+            (&mut self.bounded.gc_probe_requests, work.gc_probe_requests),
+            (&mut self.bounded.gc_head_batches, work.gc_head_batches),
+            (&mut self.bounded.gc_head_requests, work.gc_head_requests),
         ] {
             add(total, count, &mut self.overflow);
         }
@@ -145,6 +149,14 @@ pub struct BoundedWork {
     pub directory_references: u64,
     /// Inputs presented to the streaming directory builder, including rejections.
     pub streaming_builder_inputs: u64,
+    /// Independently counted bounded GC concurrency work.
+    pub gc_probe_batches: u64,
+    /// Independently counted bounded GC concurrency work.
+    pub gc_probe_requests: u64,
+    /// Independently counted bounded GC concurrency work.
+    pub gc_head_batches: u64,
+    /// Independently counted bounded GC concurrency work.
+    pub gc_head_requests: u64,
 }
 
 /// Records authority-8 bounded work without consuming historical slot space.
@@ -163,6 +175,10 @@ pub(super) fn bounded_work(work: BoundedWork) {
         total.rewritten_blocks += work.rewritten_blocks;
         total.directory_references += work.directory_references;
         total.streaming_builder_inputs += work.streaming_builder_inputs;
+        total.gc_probe_batches += work.gc_probe_batches;
+        total.gc_probe_requests += work.gc_probe_requests;
+        total.gc_head_batches += work.gc_head_batches;
+        total.gc_head_requests += work.gc_head_requests;
     });
     #[cfg(not(feature = "test-utils"))]
     let _ = work;
@@ -318,6 +334,7 @@ mod tests {
             rewritten_blocks: 5,
             directory_references: 6,
             streaming_builder_inputs: 7,
+            ..Default::default()
         });
         bounded_work(BoundedWork {
             decoded_rows: 20,
@@ -326,6 +343,7 @@ mod tests {
             rewritten_blocks: 50,
             directory_references: 60,
             streaming_builder_inputs: 70,
+            ..Default::default()
         });
 
         assert!(take().is_empty());
@@ -338,6 +356,7 @@ mod tests {
                 rewritten_blocks: 55,
                 directory_references: 66,
                 streaming_builder_inputs: 77,
+                ..Default::default()
             }
         );
     }
@@ -367,6 +386,7 @@ mod native_tests {
             rewritten_blocks: n + 3,
             directory_references: n + 4,
             streaming_builder_inputs: n + 5,
+            ..Default::default()
         }
     }
 
@@ -403,7 +423,8 @@ mod native_tests {
                 selected_blocks: 8,
                 rewritten_blocks: 10,
                 directory_references: 12,
-                streaming_builder_inputs: 14
+                streaming_builder_inputs: 14,
+                ..Default::default()
             }
         );
         assert!(!total.overflow);
@@ -449,6 +470,10 @@ mod native_tests {
             rewritten_blocks: u64::MAX,
             directory_references: u64::MAX,
             streaming_builder_inputs: u64::MAX,
+            gc_probe_batches: u64::MAX,
+            gc_probe_requests: u64::MAX,
+            gc_head_batches: u64::MAX,
+            gc_head_requests: u64::MAX,
         };
         let capture = NativeCapture::begin();
         bounded_work(max);

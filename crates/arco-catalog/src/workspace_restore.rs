@@ -14,7 +14,9 @@ use sha2::{Digest as _, Sha256};
 use ulid::Ulid;
 
 use crate::error::{CatalogError, Result};
-use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
+use crate::retention_coordination::{
+    ArmedRestorePublicationIntent, RetentionMutationEpoch, RetentionMutationKind,
+};
 use crate::state_store::{
     PersistedAuthorityKind, PersistedRestoreParticipantPlan, RestoreAttemptIdentity,
     RestoreBoundedInspectionContext, RestoreParticipantInspection, RestorePlanningContext,
@@ -680,6 +682,135 @@ impl WorkspaceRestoreJournal {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded inventory shares its I/O budget across attempt and journal records"
+)]
+pub(crate) async fn deny_gc_while_restore_journal_protected(
+    storage: &ScopedStorage,
+    domain: &str,
+    budget: &mut WorkspaceIoBudget,
+) -> Result<()> {
+    let mut cursor = None;
+    let mut seen = 0_usize;
+    loop {
+        let page = budget
+            .list_page(storage, "transactions/restores/", cursor.as_deref(), 128)
+            .await?;
+        if page.objects.len() > 128 {
+            return Err(validation(
+                "bounded GC restore inventory page exceeds 128 objects",
+            ));
+        }
+        for object in &page.objects {
+            if object.path.as_str().len() > 1024
+                || object.version.len() > 4096
+                || object.etag.as_ref().is_some_and(|etag| etag.len() > 1024)
+            {
+                return Err(validation(
+                    "bounded GC restore inventory metadata is oversized",
+                ));
+            }
+            seen = seen
+                .checked_add(1)
+                .ok_or_else(|| CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC restore inventory count overflow".into(),
+                })?;
+            if seen > 4096 {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC exceeds 4096 restore inventory objects".into(),
+                });
+            }
+            let path = object.path.as_str();
+            let Some((id, suffix)) = path
+                .strip_prefix("transactions/restores/")
+                .and_then(|path| path.split_once('/'))
+            else {
+                continue;
+            };
+            let attempt_number = if let Some(number) = suffix
+                .strip_prefix("attempts/")
+                .and_then(|suffix| suffix.strip_suffix(".plan.json"))
+            {
+                Some(
+                    number
+                        .parse::<u64>()
+                        .map_err(|_| validation("bounded GC restore attempt path is malformed"))?,
+                )
+            } else if suffix == "journal.json" {
+                None
+            } else {
+                continue;
+            };
+            let (bytes, version) = budget
+                .read_exact_stable_record(storage, path, RECORD_BYTES)
+                .await?;
+            if version != object.version {
+                return Err(precondition_failed(
+                    "bounded GC restore record changed during inventory",
+                ));
+            }
+            if let Some(number) = attempt_number {
+                if restore_attempt_plan_path(id, number)? != path {
+                    return Err(validation("bounded GC restore attempt path differs"));
+                }
+                let attempt = decode_attempt_record(&bytes, "restore attempt")?;
+                attempt.validate()?;
+                if attempt.restore_id != id
+                    || attempt.aggregate_attempt != number
+                    || attempt.scope.tenant_id() != storage.scope().tenant_id()
+                    || attempt.scope.workspace_id() != storage.workspace_id()
+                    || canonical_bytes(&attempt, "restore attempt")?.as_slice() != bytes.as_ref()
+                {
+                    return Err(validation(
+                        "bounded GC restore attempt differs from workspace",
+                    ));
+                }
+                if attempt
+                    .participants
+                    .iter()
+                    .any(|participant| participant.domain == domain)
+                {
+                    return Err(precondition_failed(
+                        "bounded GC has a protected restore attempt",
+                    ));
+                }
+                continue;
+            }
+            if restore_journal_path(id)? != path {
+                return Err(validation("bounded GC restore journal path differs"));
+            }
+            let journal: WorkspaceRestoreJournal = decode_record(&bytes, "restore journal")?;
+            journal.validate()?;
+            if journal.restore_id != id
+                || journal.scope.tenant_id() != storage.scope().tenant_id()
+                || journal.scope.workspace_id() != storage.workspace_id()
+                || canonical_bytes(&journal, "restore journal")?.as_slice() != bytes.as_ref()
+            {
+                return Err(validation(
+                    "bounded GC restore journal differs from workspace",
+                ));
+            }
+            if journal
+                .participants
+                .iter()
+                .any(|participant| participant.domain == domain)
+            {
+                // ponytail: keep the whole job protected until an independent
+                // terminal proof reader can release its exact artifacts.
+                return Err(precondition_failed(
+                    "bounded GC has a protected restore journal",
+                ));
+            }
+        }
+        match page.next_start_after {
+            Some(next) => cursor = Some(next),
+            None => return Ok(()),
+        }
+    }
+}
+
 /// One stable participant entry in the opt-in read manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRestoreReadParticipant {
@@ -892,17 +1023,51 @@ struct RestoreAdvanceFence<'a> {
     journal: &'a WorkspaceRestoreJournal,
     journal_version: &'a str,
     adapter: &'a dyn crate::state_store::StateRestoreParticipant,
-    epoch: &'a RetentionMutationEpoch,
+    epoch: &'a mut dyn RestoreAdvanceEpoch,
     guard: &'a mut LockGuard<ScopedStorage>,
     budget: &'a mut WorkspaceIoBudget,
 }
 
+#[async_trait::async_trait]
+trait RestoreAdvanceEpoch: Send {
+    async fn refence(
+        &mut self,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()>;
+
+    async fn arm(
+        &mut self,
+        intent: ArmedRestorePublicationIntent,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl RestoreAdvanceEpoch for RetentionMutationEpoch {
+    async fn refence(
+        &mut self,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        self.refence_bounded(guard, budget).await
+    }
+
+    async fn arm(
+        &mut self,
+        _intent: ArmedRestorePublicationIntent,
+        _guard: &mut LockGuard<ScopedStorage>,
+        _budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        Err(validation(
+            "restore publication requires a bounded mutation",
+        ))
+    }
+}
+
 /// Borrows one selected workspace record and its invocation budget together.
 /// It conveys selection provenance only; store/root validation is separate.
-#[allow(
-    dead_code,
-    reason = "native bounded advance integration remains disabled"
-)]
 pub(crate) struct RestoreUnitSelection<'a> {
     observed_now: DateTime<Utc>,
     plan: &'a PersistedRestoreParticipantPlan,
@@ -910,10 +1075,6 @@ pub(crate) struct RestoreUnitSelection<'a> {
     budget: &'a mut WorkspaceIoBudget,
 }
 
-#[allow(
-    dead_code,
-    reason = "native bounded advance integration remains disabled"
-)]
 impl RestoreUnitSelection<'_> {
     pub(crate) const fn observed_now(&self) -> DateTime<Utc> {
         self.observed_now
@@ -968,10 +1129,6 @@ impl RestoreAdvanceContext<'_> {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "native bounded advance integration remains disabled"
-    )]
     pub(crate) async fn unit_selection(
         &mut self,
         supplied: &PersistedRestoreParticipantPlan,
@@ -999,50 +1156,99 @@ impl RestoreAdvanceContext<'_> {
                 "legacy restore has no bounded publication capability",
             ));
         };
-        fence.validate_selection()?;
-        fence.validate_deadlines()?;
-        let mut io = RestoreInvocationIo::Bounded(fence.budget);
-        let attempt = fence
-            .service
-            .load_selected_attempt(fence.request, fence.journal, &mut io)
-            .await?;
-        if attempt != *fence.attempt {
+        fence.refence(false).await
+    }
+
+    pub(crate) async fn refence_final(&mut self) -> Result<()> {
+        let RestoreAdvanceMode::Bounded(fence) = &mut self.mode else {
+            return Err(validation("legacy restore has no final refence"));
+        };
+        fence.refence(true).await
+    }
+
+    pub(crate) async fn arm_restore_publication(
+        &mut self,
+        intent: ArmedRestorePublicationIntent,
+    ) -> Result<()> {
+        self.refence().await?;
+        let RestoreAdvanceMode::Bounded(fence) = &mut self.mode else {
+            return Err(validation("legacy restore has no publication capability"));
+        };
+        let selected_digest = fence
+            .participant
+            .plan_sha256
+            .strip_prefix("sha256:")
+            .ok_or_else(|| validation("selected restore plan digest lacks SHA-256 prefix"))?;
+        if intent.domain != fence.participant.domain
+            || intent.plan_sha256 != selected_digest
+            || intent.owner_generation != fence.participant.participant_attempt
+        {
             return Err(validation(
-                "selected restore attempt changed during advance",
+                "restore publication intent differs from selection",
             ));
         }
-        fence
-            .service
-            .require_active_source_pin(
-                &fence.request.source()?,
-                fence.request.scope(),
-                fence.service.now(),
-                &mut io,
-            )
-            .await?;
-        fence
-            .epoch
-            .refence_bounded(fence.guard, fence.budget)
-            .await?;
-        // Selection is the final awaited control read: pin/attempt checks must
-        // not leave a later window for an undetected journal replacement.
-        let (journal, version) = fence
-            .service
-            .load_journal(
-                fence.request.restore_id(),
-                &mut RestoreInvocationIo::Bounded(fence.budget),
-            )
-            .await?;
-        if version != fence.journal_version || journal != *fence.journal {
-            return Err(precondition_failed(
-                "selected restore journal changed during advance",
+        let PersistedRestoreParticipantPlan::ControlMvpV7(plan) = &fence.participant.plan else {
+            return Err(validation("restore publication requires selected Plan7"));
+        };
+        if intent.candidate_id != plan.candidate_id()
+            || intent.precondition != plan.publication_precondition()
+        {
+            return Err(validation(
+                "restore publication candidate or original HEAD condition differs",
             ));
         }
-        fence.validate_deadlines()
+        fence.epoch.arm(intent, fence.guard, fence.budget).await
     }
 }
 
 impl RestoreAdvanceFence<'_> {
+    async fn refence(&mut self, final_pass: bool) -> Result<()> {
+        self.validate_selection()?;
+        self.validate_deadlines()?;
+        let mut final_budget = WorkspaceIoBudget::new();
+        {
+            let budget = if final_pass {
+                &mut final_budget
+            } else {
+                &mut *self.budget
+            };
+            let mut io = RestoreInvocationIo::Bounded(budget);
+            let attempt = self
+                .service
+                .load_selected_attempt(self.request, self.journal, &mut io)
+                .await?;
+            if attempt != *self.attempt {
+                return Err(validation(
+                    "selected restore attempt changed during advance",
+                ));
+            }
+            self.service
+                .require_active_source_pin(
+                    &self.request.source()?,
+                    self.request.scope(),
+                    self.service.now(),
+                    &mut io,
+                )
+                .await?;
+            self.epoch.refence(self.guard, budget).await?;
+            // Selection is the final awaited control read: pin/attempt checks must
+            // not leave a later window for an undetected journal replacement.
+            let (journal, version) = self
+                .service
+                .load_journal(
+                    self.request.restore_id(),
+                    &mut RestoreInvocationIo::Bounded(budget),
+                )
+                .await?;
+            if version != self.journal_version || journal != *self.journal {
+                return Err(precondition_failed(
+                    "selected restore journal changed during advance",
+                ));
+            }
+        }
+        self.validate_deadlines()
+    }
+
     fn validate_deadlines(&self) -> Result<()> {
         let deadline = self
             .request
@@ -1114,13 +1320,6 @@ enum RestoreApplyEpoch<'a> {
 }
 
 impl RestoreApplyEpoch<'_> {
-    fn epoch(&self) -> &RetentionMutationEpoch {
-        match self {
-            Self::Legacy(epoch) => epoch,
-            Self::Bounded(mutation) => mutation.epoch(),
-        }
-    }
-
     fn mark_uncertain(&mut self) {
         match self {
             Self::Legacy(epoch) => epoch.mark_uncertain(),
@@ -1132,6 +1331,36 @@ impl RestoreApplyEpoch<'_> {
         match self {
             Self::Legacy(_) => result,
             Self::Bounded(mutation) => mutation.finish(result),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RestoreAdvanceEpoch for RestoreApplyEpoch<'_> {
+    async fn refence(
+        &mut self,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        match self {
+            Self::Legacy(epoch) => epoch.refence_bounded(guard, budget).await,
+            Self::Bounded(mutation) => mutation.epoch().refence_bounded(guard, budget).await,
+        }
+    }
+
+    async fn arm(
+        &mut self,
+        intent: ArmedRestorePublicationIntent,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        match self {
+            Self::Legacy(_) => Err(validation("legacy restore cannot arm bounded publication")),
+            Self::Bounded(mutation) => {
+                mutation
+                    .arm_restore_publication(intent, guard, budget)
+                    .await
+            }
         }
     }
 }
@@ -1346,8 +1575,15 @@ impl WorkspaceRestoreService {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "armed restore settlement keeps exact receipt validation under one held lock"
+    )]
     async fn settle_terminal_apply_coordination(
         &self,
+        request: &WorkspaceRestoreRequestRecord,
+        attempt: &WorkspaceRestoreAttemptPlan,
+        journal: &WorkspaceRestoreJournal,
         terminal_operation_ids: &BTreeSet<String>,
 
         io: &mut RestoreInvocationIo<'_>,
@@ -1364,6 +1600,98 @@ impl WorkspaceRestoreService {
         let mut guard = self
             .acquire_restore_lock("workspace-restore-recovery", io)
             .await?;
+        let armed_result = if let Some(budget) = io.bounded() {
+            RetentionMutationEpoch::load_armed_restore_bounded(
+                self.storage.clone(),
+                terminal_operation_ids,
+                budget,
+            )
+            .await
+        } else {
+            Ok(None)
+        };
+        let armed = match armed_result {
+            Ok(armed) => armed,
+            Err(error) => {
+                let _ = Self::release_restore_lock(guard, io).await;
+                return Err(error);
+            }
+        };
+        if let Some(epoch) = armed {
+            let settlement = async {
+                let (participant, evidence) = journal
+                    .participants
+                    .iter()
+                    .find_map(|recorded| {
+                        let participant = attempt
+                            .participants
+                            .iter()
+                            .find(|p| p.domain == recorded.domain)?;
+                        (restore_apply_operation_id(
+                            request.restore_id(),
+                            participant.participant_attempt,
+                            &participant.domain,
+                            &participant.plan_sha256,
+                        ) == epoch.operation_id())
+                        .then_some((participant, recorded.evidence.as_ref()))
+                    })
+                    .ok_or_else(|| {
+                        validation("armed restore has no matching durable terminal participant")
+                    })?;
+                let adapter = self
+                    .snapshots
+                    .registry()
+                    .get(&participant.domain)
+                    .and_then(|binding| binding.restore_participant())
+                    .ok_or_else(|| validation("restore recovery adapter is not configured"))?;
+                let observed = self
+                    .inspect_participant(adapter.as_ref(), participant, io)
+                    .await?;
+                let proof = match (&observed, evidence) {
+                    (
+                        RestoreParticipantInspection::Visible {
+                            evidence: actual, ..
+                        },
+                        Some(expected),
+                    ) if actual == expected => Some(expected),
+                    (RestoreParticipantInspection::Superseded, None)
+                        if journal.status == WorkspaceRestoreStatus::RepairRequired
+                            && journal.failure_category
+                                == Some(RestoreFailureCategory::CasLost) =>
+                    {
+                        None
+                    }
+                    _ => {
+                        return Err(validation(
+                            "armed restore terminal state is not authenticated",
+                        ));
+                    }
+                };
+                let budget = io
+                    .bounded()
+                    .ok_or_else(|| validation("armed restore requires bounded recovery"))?;
+                epoch
+                    .settle_recovered_restore_bounded(
+                        proof,
+                        &participant.plan_sha256,
+                        &restore_apply_operation_id(
+                            request.restore_id(),
+                            participant.participant_attempt,
+                            &participant.domain,
+                            &participant.plan_sha256,
+                        ),
+                        &mut guard,
+                        budget,
+                    )
+                    .await
+            }
+            .await;
+            let release = Self::release_restore_lock(guard, io).await;
+            return match (settlement, release) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            };
+        }
         let settlement = if let Some(budget) = io.bounded() {
             RetentionMutationEpoch::settle_terminal_matching_bounded(
                 &self.storage,
@@ -1481,8 +1809,14 @@ impl WorkspaceRestoreService {
         let terminal_operation_ids = self
             .durable_receipt_operation_ids(request, &selected_attempt, journal, io)
             .await?;
-        self.settle_terminal_apply_coordination(&terminal_operation_ids, io)
-            .await
+        self.settle_terminal_apply_coordination(
+            request,
+            &selected_attempt,
+            journal,
+            &terminal_operation_ids,
+            io,
+        )
+        .await
     }
 
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
@@ -1523,8 +1857,14 @@ impl WorkspaceRestoreService {
                 {
                     self.validate_completed_receipts(request, &attempt, &journal, io)
                         .await?;
-                    self.settle_terminal_apply_coordination(&terminal_operation_ids, io)
-                        .await?;
+                    self.settle_terminal_apply_coordination(
+                        request,
+                        &attempt,
+                        &journal,
+                        &terminal_operation_ids,
+                        io,
+                    )
+                    .await?;
                 }
                 return self.outcome(&journal, io).await;
             }
@@ -1605,8 +1945,14 @@ impl WorkspaceRestoreService {
                 let terminal_operation_ids = self
                     .durable_receipt_operation_ids(request, &attempt, &journal, io)
                     .await?;
-                self.settle_terminal_apply_coordination(&terminal_operation_ids, io)
-                    .await?;
+                self.settle_terminal_apply_coordination(
+                    request,
+                    &attempt,
+                    &journal,
+                    &terminal_operation_ids,
+                    io,
+                )
+                .await?;
                 return self
                     .resume_attempt(request, attempt, journal, version, io)
                     .await;
@@ -2731,7 +3077,7 @@ impl WorkspaceRestoreService {
                         journal: &journal,
                         journal_version: &version,
                         adapter: adapter.as_ref(),
-                        epoch: &epoch,
+                        epoch: &mut epoch,
                         guard: &mut guard,
                         budget,
                     }),
@@ -2757,7 +3103,7 @@ impl WorkspaceRestoreService {
                                     journal: &journal,
                                     journal_version: &version,
                                     adapter: adapter.as_ref(),
-                                    epoch: mutation.epoch(),
+                                    epoch: &mut mutation,
                                     guard: &mut guard,
                                     budget,
                                 })
@@ -2872,6 +3218,65 @@ impl WorkspaceRestoreService {
             mutation.finish(advanced_operation)
         }
         .await;
+        if epoch.armed_restore().is_some() {
+            let proof = operation
+                .as_ref()
+                .ok()
+                .and_then(|(winner, _)| {
+                    winner
+                        .participants
+                        .get(journal_index)
+                        .map(|recorded| (winner, recorded))
+                })
+                .and_then(|(winner, recorded)| {
+                    recorded.evidence.clone().map(|evidence| (winner, evidence))
+                });
+            let settlement = if let Some((winner, evidence)) = proof {
+                match self
+                    .validate_recorded_receipts(request, attempt, winner, io)
+                    .await
+                {
+                    Ok(()) => {
+                        let operation_id = epoch.operation_id().to_owned();
+                        let Some(budget) = io.bounded() else {
+                            return Err(validation("armed restore requires bounded coordination"));
+                        };
+                        epoch
+                            .settle_recovered_restore_bounded(
+                                Some(&evidence),
+                                &participant.plan_sha256,
+                                &operation_id,
+                                &mut guard,
+                                budget,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                // A durable repair outcome can be returned while the armed epoch
+                // remains in flight. It does not authorize another publication.
+                let release = Self::release_restore_lock(guard, io).await;
+                return match (operation, release) {
+                    (Ok(value), Ok(()))
+                        if value.0.status == WorkspaceRestoreStatus::RepairRequired =>
+                    {
+                        Ok(value)
+                    }
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                    (Ok(_), Ok(())) => Err(CatalogError::AmbiguousAuthorityOutcome {
+                        message: "armed restore has no authenticated durable receipt".into(),
+                    }),
+                };
+            };
+            let release = Self::release_restore_lock(guard, io).await;
+            return match (operation, settlement, release) {
+                (Ok(value), Ok(()), Ok(())) => Ok(value),
+                (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => {
+                    Err(error)
+                }
+            };
+        }
         Self::finish_apply_coordination(guard, epoch, operation, io).await
     }
 
@@ -3599,7 +4004,7 @@ impl WorkspaceRestoreService {
         }
         self.validate_recorded_receipts(request, &attempt, &journal, io)
             .await?;
-        self.settle_terminal_apply_coordination(&terminal_ids, io)
+        self.settle_terminal_apply_coordination(request, &attempt, &journal, &terminal_ids, io)
             .await?;
         if superseded || pending_legacy {
             return self.outcome(&journal, io).await.map(Some);
@@ -3764,8 +4169,14 @@ impl WorkspaceRestoreService {
             return self.outcome(&durable_journal, io).await.map(Some);
         }
         if !discovered && !superseded {
-            self.settle_terminal_apply_coordination(&visible_terminal_ids, io)
-                .await?;
+            self.settle_terminal_apply_coordination(
+                request,
+                &attempt,
+                &journal,
+                &visible_terminal_ids,
+                io,
+            )
+            .await?;
             return Ok(None);
         }
         if journal.status == WorkspaceRestoreStatus::RepairRequired
@@ -3774,8 +4185,14 @@ impl WorkspaceRestoreService {
         {
             if superseded && journal.failure_category == Some(RestoreFailureCategory::CasLost) {
                 visible_terminal_ids.extend(superseded_terminal_ids);
-                self.settle_terminal_apply_coordination(&visible_terminal_ids, io)
-                    .await?;
+                self.settle_terminal_apply_coordination(
+                    request,
+                    &attempt,
+                    &journal,
+                    &visible_terminal_ids,
+                    io,
+                )
+                .await?;
             }
             return Ok(None);
         }
@@ -3805,14 +4222,20 @@ impl WorkspaceRestoreService {
                 RestoreFailureCategory::StorageUncertain
             };
             let outcome = self
-                .persist_repair_required(winner, &winner_version, category, io)
+                .persist_repair_required(winner.clone(), &winner_version, category, io)
                 .await?;
             let mut terminal_operation_ids = visible_terminal_ids;
             if category == RestoreFailureCategory::CasLost {
                 terminal_operation_ids.extend(superseded_terminal_ids);
             }
-            self.settle_terminal_apply_coordination(&terminal_operation_ids, io)
-                .await?;
+            self.settle_terminal_apply_coordination(
+                request,
+                &attempt,
+                &winner,
+                &terminal_operation_ids,
+                io,
+            )
+            .await?;
             return Ok(Some(outcome));
         }
         if discovered {
@@ -3830,8 +4253,14 @@ impl WorkspaceRestoreService {
             }
             terminal_operation_ids.extend(superseded_terminal_ids);
         }
-        self.settle_terminal_apply_coordination(&terminal_operation_ids, io)
-            .await?;
+        self.settle_terminal_apply_coordination(
+            request,
+            &attempt,
+            &winner,
+            &terminal_operation_ids,
+            io,
+        )
+        .await?;
         if winner.status == WorkspaceRestoreStatus::Visible {
             return self.outcome(&winner, io).await.map(Some);
         }
@@ -4841,8 +5270,9 @@ mod plan7_tests {
     #![allow(clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     use crate::state_store::{
-        ArcoStateTxn, ControlMvpRestoreParticipant, ControlMvpStateStore, DurableAuthorityBinding,
-        PersistedAuthorityAdapter, StateRestoreParticipant, StateScope, TxnOptions,
+        ArcoStateReader, ArcoStateTxn, ControlMvpRestoreFenceWitness, ControlMvpRestoreParticipant,
+        ControlMvpStateStore, DurableAuthorityBinding, PersistedAuthorityAdapter,
+        StateRestoreParticipant, StateScope, TxnOptions,
     };
 
     // The adapters below are fixture-only routing probes. A still builds an
@@ -5462,6 +5892,571 @@ mod plan7_tests {
     }
 
     #[cfg(feature = "test-utils")]
+    struct RestoreHeadProbe {
+        inner: arco_core::MemoryBackend,
+        sends: AtomicUsize,
+        lose_next_response: std::sync::atomic::AtomicBool,
+        fail_next_send: std::sync::atomic::AtomicBool,
+        conflict_next_send: std::sync::atomic::AtomicBool,
+        conditions: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[async_trait::async_trait]
+    impl arco_core::StorageBackend for RestoreHeadProbe {
+        async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+            self.inner.get(path).await
+        }
+        async fn get_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<Bytes> {
+            self.inner.get_range(path, range).await
+        }
+        async fn get_range_with_ownership(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> arco_core::Result<arco_core::storage::ClassifiedBytes> {
+            self.inner.get_range_with_ownership(path, range).await
+        }
+        async fn put(
+            &self,
+            path: &str,
+            data: Bytes,
+            condition: WritePrecondition,
+        ) -> arco_core::Result<WriteResult> {
+            let restore_head = path.ends_with("/domains/catalog/head/current.json");
+            if restore_head {
+                self.sends.fetch_add(1, Ordering::SeqCst);
+                self.conditions
+                    .lock()
+                    .expect("conditions")
+                    .push(format!("{condition:?}"));
+            }
+            if restore_head && self.fail_next_send.swap(false, Ordering::SeqCst) {
+                return Err(arco_core::Error::Storage {
+                    message: "injected restore HEAD transport failure".into(),
+                    source: None,
+                });
+            }
+            if restore_head && self.conflict_next_send.swap(false, Ordering::SeqCst) {
+                let original = self.inner.get(path).await?;
+                self.inner
+                    .put(path, original, WritePrecondition::None)
+                    .await?;
+            }
+            let result = self.inner.put(path, data, condition).await;
+            if restore_head && self.lose_next_response.swap(false, Ordering::SeqCst) {
+                return Err(arco_core::Error::Storage {
+                    message: "injected lost restore HEAD response".into(),
+                    source: None,
+                });
+            }
+            result
+        }
+        async fn delete(&self, path: &str) -> arco_core::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn list(&self, path: &str) -> arco_core::Result<Vec<arco_core::ObjectMeta>> {
+            self.inner.list(path).await
+        }
+        async fn head(&self, path: &str) -> arco_core::Result<Option<arco_core::ObjectMeta>> {
+            self.inner.head(path).await
+        }
+        async fn signed_url(&self, path: &str, duration: Duration) -> arco_core::Result<String> {
+            self.inner.signed_url(path, duration).await
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn plan7_lost_head_response_reconciles_without_a_second_send() {
+        let backend = Arc::new(RestoreHeadProbe {
+            inner: arco_core::MemoryBackend::new(),
+            sends: AtomicUsize::new(0),
+            lose_next_response: std::sync::atomic::AtomicBool::new(false),
+            fail_next_send: std::sync::atomic::AtomicBool::new(false),
+            conflict_next_send: std::sync::atomic::AtomicBool::new(false),
+            conditions: std::sync::Mutex::new(Vec::new()),
+        });
+        let fixture = mixed_selected_resume_fixture_with_backend(
+            MixedAInspection::AdvanceNativeUnit,
+            backend.clone(),
+        )
+        .await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        for _ in 0..2 {
+            fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await
+                .expect("unit");
+        }
+        backend.sends.store(0, Ordering::SeqCst);
+        backend.conditions.lock().expect("conditions").clear();
+        backend.lose_next_response.store(true, Ordering::SeqCst);
+        let outcome = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await
+            .expect("lost response reconciled");
+        assert_eq!(outcome.status(), WorkspaceRestoreStatus::Applying);
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 1);
+        assert!(backend.conditions.lock().expect("conditions")[0].starts_with("MatchesVersion"));
+        let _ = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await
+            .expect("restart reads committed candidate without a send");
+        assert_eq!(
+            backend.sends.load(Ordering::SeqCst),
+            1,
+            "restart must never resend HEAD"
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn plan7_prepared_original_head_is_unresolved_and_never_resends() {
+        let backend = Arc::new(RestoreHeadProbe {
+            inner: arco_core::MemoryBackend::new(),
+            sends: AtomicUsize::new(0),
+            lose_next_response: std::sync::atomic::AtomicBool::new(false),
+            fail_next_send: std::sync::atomic::AtomicBool::new(false),
+            conflict_next_send: std::sync::atomic::AtomicBool::new(false),
+            conditions: std::sync::Mutex::new(Vec::new()),
+        });
+        let fixture = mixed_selected_resume_fixture_with_backend(
+            MixedAInspection::AdvanceNativeUnit,
+            backend.clone(),
+        )
+        .await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        for _ in 0..2 {
+            fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await
+                .expect("unit");
+        }
+        let head_path =
+            crate::state_store::control_mvp::ControlMvpPaths::new("catalog").current_pointer();
+        let original = fixture
+            .service
+            .storage
+            .get_raw(&head_path)
+            .await
+            .expect("original HEAD");
+        backend.sends.store(0, Ordering::SeqCst);
+        backend.fail_next_send.store(true, Ordering::SeqCst);
+        let first = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await;
+        assert!(
+            first.is_ok(),
+            "uncertain send remains a workspace repair outcome: {first:?}"
+        );
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .service
+                .storage
+                .get_raw(&head_path)
+                .await
+                .expect("HEAD"),
+            original
+        );
+        let _ = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await;
+        assert_eq!(
+            backend.sends.load(Ordering::SeqCst),
+            1,
+            "prepared restart must not resend HEAD"
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn plan7_direct_precondition_conflict_repairs_and_settles_without_retry() {
+        let backend = Arc::new(RestoreHeadProbe {
+            inner: arco_core::MemoryBackend::new(),
+            sends: AtomicUsize::new(0),
+            lose_next_response: std::sync::atomic::AtomicBool::new(false),
+            fail_next_send: std::sync::atomic::AtomicBool::new(false),
+            conflict_next_send: std::sync::atomic::AtomicBool::new(false),
+            conditions: std::sync::Mutex::new(Vec::new()),
+        });
+        let fixture = mixed_selected_resume_fixture_with_backend(
+            MixedAInspection::AdvanceNativeUnit,
+            backend.clone(),
+        )
+        .await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        for _ in 0..2 {
+            fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await
+                .expect("unit");
+        }
+        backend.sends.store(0, Ordering::SeqCst);
+        backend.conflict_next_send.store(true, Ordering::SeqCst);
+        let direct = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await
+            .expect("direct conflict repair");
+        assert_eq!(direct.status(), WorkspaceRestoreStatus::RepairRequired);
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 1);
+        let restart = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await
+            .expect("read-only supersession");
+        assert_eq!(restart.status(), WorkspaceRestoreStatus::RepairRequired);
+        assert_eq!(backend.sends.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn plan7_present_and_absent_reach_workspace_visible_read_manifest() {
+        for scenario in ["different", "absent"] {
+            let (service, request) = detached_plan7_fixture(scenario).await;
+            let attempt = decode_attempt_record(
+                &service
+                    .storage
+                    .get_raw(
+                        &restore_attempt_plan_path(request.restore_id(), 1).expect("attempt path"),
+                    )
+                    .await
+                    .expect("attempt"),
+                "attempt",
+            )
+            .expect("selected Plan7");
+            let plan_wire =
+                serde_json::to_value(&attempt.participants[0].plan).expect("Plan7 wire");
+            assert_eq!(
+                plan_wire["target"]["kind"],
+                if scenario == "absent" {
+                    "absent"
+                } else {
+                    "present"
+                },
+                "{scenario} target mode",
+            );
+            let mut journal = selected_plan7_journal(&attempt);
+            journal.status = WorkspaceRestoreStatus::Applying;
+            service
+                .storage
+                .put_raw(
+                    &restore_journal_path(request.restore_id()).expect("journal path"),
+                    Bytes::from(canonical_bytes(&journal, "journal").expect("journal bytes")),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("journal");
+            let mut visible = false;
+            for _ in 0..16 {
+                let outcome = service
+                    .recover_restore(request.restore_id())
+                    .await
+                    .expect("bounded recovery");
+                if outcome.status() == WorkspaceRestoreStatus::Visible {
+                    visible = true;
+                    assert!(
+                        outcome.read_manifest().is_some(),
+                        "visible workspace needs a read manifest"
+                    );
+                    let store = ControlMvpStateStore::new_synthetic_bounded(
+                        service.storage.clone(),
+                        StateScope::new("tenant", "workspace", "catalog"),
+                    )
+                    .expect("reader")
+                    .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+                    assert_eq!(
+                        store.get(b"key").await.expect("restored key"),
+                        Some(Bytes::from_static(b"value"))
+                    );
+                    assert_eq!(
+                        store.get(b"extra").await.expect("removed target-only key"),
+                        None
+                    );
+                    let candidate = plan_wire["candidate_id"]
+                        .as_str()
+                        .expect("selected candidate");
+                    let paths = crate::state_store::control_mvp::ControlMvpPaths::new("catalog");
+                    let manifest: Value = serde_json::from_slice(
+                        &service
+                            .storage
+                            .get_raw(&paths.manifest_object(candidate))
+                            .await
+                            .expect("published restore manifest"),
+                    )
+                    .expect("manifest JSON");
+                    assert_eq!(manifest["directory_object_version"], 2);
+                    break;
+                }
+                assert_eq!(outcome.status(), WorkspaceRestoreStatus::Applying);
+                assert!(
+                    outcome.read_manifest().is_none(),
+                    "partial restore cannot expose a read manifest"
+                );
+            }
+            assert!(visible, "{scenario} Plan7 restore never became visible");
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn plan7_applying_journal_blocks_authority8_gc_before_publication_arming() {
+        let (service, request) = detached_plan7_fixture("different").await;
+        let attempt = decode_attempt_record(
+            &service
+                .storage
+                .get_raw(&restore_attempt_plan_path(request.restore_id(), 1).expect("path"))
+                .await
+                .expect("attempt"),
+            "attempt",
+        )
+        .expect("Plan7 attempt");
+        let mut journal = selected_plan7_journal(&attempt);
+        journal.status = WorkspaceRestoreStatus::Applying;
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            service.storage.clone(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("authority-8 store")
+        .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+        let orphan = store.paths().state_object(&"ef".repeat(32));
+        service
+            .storage
+            .put_raw(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("old orphan");
+        let worker = crate::state_store::ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+        assert!(
+            worker
+                .plan_gc_at(Utc::now() + chrono::Duration::days(40), Vec::new())
+                .await
+                .is_err(),
+            "an unpublished restore attempt must block GC before its journal exists"
+        );
+        service
+            .storage
+            .put_raw(
+                &restore_journal_path(request.restore_id()).expect("path"),
+                Bytes::from(canonical_bytes(&journal, "journal").expect("journal bytes")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("Applying journal");
+        assert!(
+            worker
+                .plan_gc_at(Utc::now() + chrono::Duration::days(40), Vec::new())
+                .await
+                .is_err(),
+            "an Applying restore journal must block GC before publication is armed"
+        );
+        assert!(service.storage.head_raw(&orphan).await.unwrap().is_some());
+        let mut visible = false;
+        for _ in 0..16 {
+            let outcome = service
+                .recover_restore(request.restore_id())
+                .await
+                .expect("finish selected restore");
+            if outcome.status() == WorkspaceRestoreStatus::Visible {
+                visible = true;
+                break;
+            }
+        }
+        assert!(visible, "selected restore never became visible");
+        assert!(
+            worker
+                .plan_gc_at(
+                    Utc::now() + chrono::Duration::days(7) + chrono::Duration::hours(1),
+                    Vec::new(),
+                )
+                .await
+                .is_err(),
+            "recent visible restore artifacts stay protected"
+        );
+        assert!(
+            worker
+                .plan_gc_at(Utc::now() + chrono::Duration::days(40), Vec::new())
+                .await
+                .is_err(),
+            "visible restore stays protected until terminal proof is authenticated"
+        );
+        service
+            .storage
+            .put_raw(
+                &restore_journal_path(request.restore_id()).expect("journal path"),
+                Bytes::from_static(b"{"),
+                WritePrecondition::None,
+            )
+            .await
+            .expect("corrupt journal");
+        assert!(
+            worker
+                .plan_gc_at(Utc::now() + chrono::Duration::days(40), Vec::new())
+                .await
+                .is_err(),
+            "corrupt selected journal cannot authorize GC"
+        );
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both public restore modes share one independent visible-state oracle"
+    )]
+    async fn plan7_public_restore_matches_independent_visible_kv_oracle() {
+        use crate::state_store::ScanRequest;
+
+        for scenario in ["oracle_present", "oracle_absent"] {
+            let (service, request) = detached_plan7_fixture(scenario).await;
+            let mut journal = selected_plan7_journal(
+                &decode_attempt_record(
+                    &service
+                        .storage
+                        .get_raw(
+                            &restore_attempt_plan_path(request.restore_id(), 1)
+                                .expect("attempt path"),
+                        )
+                        .await
+                        .expect("attempt"),
+                    "attempt",
+                )
+                .expect("selected Plan7"),
+            );
+            journal.status = WorkspaceRestoreStatus::Applying;
+            service
+                .storage
+                .put_raw(
+                    &restore_journal_path(request.restore_id()).expect("journal path"),
+                    Bytes::from(canonical_bytes(&journal, "journal").expect("journal bytes")),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("journal");
+            let mut visible = false;
+            for _ in 0..32 {
+                let outcome = service
+                    .recover_restore(request.restore_id())
+                    .await
+                    .expect("bounded recovery");
+                if outcome.status() == WorkspaceRestoreStatus::Visible {
+                    assert!(outcome.read_manifest().is_some());
+                    visible = true;
+                    break;
+                }
+                assert_eq!(outcome.status(), WorkspaceRestoreStatus::Applying);
+                assert!(outcome.read_manifest().is_none());
+            }
+            assert!(visible, "{scenario} never became visible");
+            let store = ControlMvpStateStore::new_synthetic_bounded(
+                service.storage.clone(),
+                StateScope::new("tenant", "workspace", "catalog"),
+            )
+            .expect("reader")
+            .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+            let page = store
+                .scan(ScanRequest::new(b"").with_limits(32, 1024 * 1024, 32))
+                .await
+                .expect("visible KV page");
+            assert!(page.continuation().is_none());
+            let sequence = page
+                .observed_token()
+                .expect("visible token")
+                .logical_sequence();
+            assert_eq!(
+                sequence,
+                if scenario == "oracle_present" { 3 } else { 2 },
+                "{scenario} result sequence"
+            );
+            assert_eq!(store.get(b"extra").await.expect("target-only key"), None);
+            let expected = [
+                (b"key".to_vec(), (b"value".to_vec(), sequence)),
+                (
+                    b"same".to_vec(),
+                    (
+                        b"stable".to_vec(),
+                        if scenario == "oracle_present" {
+                            2
+                        } else {
+                            sequence
+                        },
+                    ),
+                ),
+                (b"source-only".to_vec(), (b"source".to_vec(), sequence)),
+                (vec![0, 255], (vec![255, 0, 128], sequence)),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+            let actual = page
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.key().to_vec(),
+                        (
+                            entry.value().bytes().to_vec(),
+                            entry.value().generation().expect("generation"),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(actual, expected, "{scenario} visible KV oracle");
+            let outbox = store
+                .projection_outbox_page_v2(page.observed_token().cloned(), None, 2)
+                .await
+                .expect("visible restore notice");
+            assert_eq!(outbox.records().len(), 1);
+            assert!(outbox.continuation().is_none());
+            assert_eq!(
+                outbox.records()[0].intent_id(),
+                format!("restore-{}", request.restore_id())
+            );
+            let head_path = crate::state_store::ControlMvpPaths::new("catalog").current_pointer();
+            let head_before = service
+                .storage
+                .get_raw(&head_path)
+                .await
+                .expect("visible HEAD");
+            assert_eq!(
+                service
+                    .recover_restore(request.restore_id())
+                    .await
+                    .expect("idempotent recovery")
+                    .status(),
+                WorkspaceRestoreStatus::Visible
+            );
+            assert_eq!(
+                service
+                    .storage
+                    .get_raw(&head_path)
+                    .await
+                    .expect("stable HEAD"),
+                head_before,
+                "visible restart must not send HEAD again"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn native_restore_driver_refences_after_immutable_staging() {
         for ordinal in [0, 1] {
@@ -5572,6 +6567,42 @@ mod plan7_tests {
                 .await
                 .expect("same HEAD"),
             head_before
+        );
+    }
+
+    #[tokio::test]
+    async fn native_restore_driver_publishes_verified_terminal_candidate() {
+        let fixture = mixed_selected_resume_fixture(MixedAInspection::AdvanceNativeUnit).await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        let paths = crate::state_store::control_mvp::ControlMvpPaths::new("catalog");
+        let original = fixture
+            .service
+            .storage
+            .get_raw(&paths.current_pointer())
+            .await
+            .expect("original HEAD");
+        for _ in 0..2 {
+            fixture
+                .service
+                .recover_restore(fixture.request.restore_id())
+                .await
+                .expect("selected unit");
+        }
+        let outcome = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await
+            .expect("terminal verification and publication");
+        assert_eq!(outcome.status(), WorkspaceRestoreStatus::Applying);
+        assert_ne!(
+            fixture
+                .service
+                .storage
+                .get_raw(&paths.current_pointer())
+                .await
+                .expect("published HEAD"),
+            original
         );
     }
 
@@ -6005,6 +7036,7 @@ mod plan7_tests {
 
     #[allow(
         clippy::too_many_lines,
+        clippy::cognitive_complexity,
         reason = "the optional test adapter preserves the single real fixture path"
     )]
     async fn detached_plan7_fixture_with_script(
@@ -6021,11 +7053,47 @@ mod plan7_tests {
         )
         .expect("storage");
         let scope = StateScope::new("tenant", "workspace", "catalog");
-        let store = Arc::new(
+        let mut configured =
             ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
                 .expect("store")
-                .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32])),
-        );
+                .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32]));
+        if matches!(mismatch, "absent" | "oracle_absent") {
+            let path = format!(
+                "{}/external-restore-fence.json",
+                crate::state_store::ControlMvpPaths::new("catalog").base_prefix()
+            );
+            let raw = canonical_bytes(
+                &serde_json::json!({
+                    "record_type": "control_mvp_restore_fence", "version": 1,
+                    "scope": scope.clone(),
+                    "durable_authority_binding": DurableAuthorityBinding::new([41; 32]),
+                    "writer_epoch": 0, "reclamation_generation": 0,
+                }),
+                "absent fence",
+            )
+            .expect("fence bytes");
+            let version = match storage
+                .put_raw(
+                    &path,
+                    Bytes::from(raw.clone()),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .expect("fence")
+            {
+                WriteResult::Success { version } => version,
+                WriteResult::PreconditionFailed { .. } => panic!("fence collision"),
+            };
+            configured = configured.with_absent_restore_fence(ControlMvpRestoreFenceWitness {
+                scope: scope.clone(),
+                durable_authority_binding: DurableAuthorityBinding::new([41; 32]),
+                path,
+                byte_size: raw.len() as u64,
+                sha256: prefixed_sha256(&raw),
+                object_version: version,
+            });
+        }
+        let store = Arc::new(configured);
         let mut txn = store
             .begin_control_txn(TxnOptions::default())
             .await
@@ -6035,6 +7103,17 @@ mod plan7_tests {
         txn.put(b"key", Bytes::from_static(b"value"))
             .await
             .expect("put");
+        if mismatch.starts_with("oracle_") {
+            txn.put(b"same", Bytes::from_static(b"stable"))
+                .await
+                .expect("equal source value");
+            txn.put(b"source-only", Bytes::from_static(b"source"))
+                .await
+                .expect("source-only value");
+            txn.put(&[0, 255], Bytes::from_static(&[255, 0, 128]))
+                .await
+                .expect("binary source value");
+        }
         txn.commit_v2().await.expect("commit");
         let concrete = Arc::new(ControlMvpRestoreParticipant::new(store.as_ref().clone()));
         let adapter: Arc<dyn StateRestoreParticipant> = match scripted {
@@ -6078,6 +7157,44 @@ mod plan7_tests {
             )
             .await
             .expect("snapshot");
+        if matches!(mismatch, "different" | "oracle_present") {
+            let mut target = store
+                .begin_control_txn(TxnOptions::default())
+                .await
+                .expect("target txn");
+            target
+                .set_logical_operation("target-after-snapshot", "test", &"cd".repeat(32))
+                .expect("target operation");
+            target
+                .put(b"key", Bytes::from_static(b"target"))
+                .await
+                .expect("changed key");
+            target
+                .put(b"extra", Bytes::from_static(b"extra"))
+                .await
+                .expect("target-only key");
+            if mismatch == "oracle_present" {
+                target
+                    .delete(b"source-only")
+                    .await
+                    .expect("target deletes source value");
+                target
+                    .put(b"same", Bytes::from_static(b"stable"))
+                    .await
+                    .expect("same value with a later target generation");
+                target
+                    .put(&[0, 255], Bytes::from_static(b"target-binary"))
+                    .await
+                    .expect("changed binary value");
+            }
+            target.commit_v2().await.expect("target commit");
+        }
+        if matches!(mismatch, "absent" | "oracle_absent") {
+            storage
+                .delete(&crate::state_store::ControlMvpPaths::new("catalog").current_pointer())
+                .await
+                .expect("synthetic absent target");
+        }
         let source = RestoreSource::snapshot(snapshot_id, pin_id).expect("source");
         let request = WorkspaceRestoreRequestRecord::new(
             format!("rst_{}", Ulid::from(712_u128)),
@@ -6257,13 +7374,13 @@ mod plan7_tests {
         assert_eq!(before, plan7_inventory(&service).await);
     }
     #[tokio::test]
-    async fn plan7_valid_orphan_prepares_but_cannot_enter_legacy_apply() {
+    async fn plan7_valid_orphan_starts_bounded_advance_without_legacy_apply() {
         let (service, request) = detached_plan7_fixture("valid").await;
-        let result = service.recover_restore(request.restore_id()).await;
-        assert!(matches!(
-            result,
-            Err(CatalogError::UnsupportedOperation { .. })
-        ));
+        let result = service
+            .recover_restore(request.restore_id())
+            .await
+            .expect("bounded advance");
+        assert_eq!(result.status(), WorkspaceRestoreStatus::Applying);
         let outcome = service
             .get_restore(request.restore_id())
             .await
@@ -6779,12 +7896,104 @@ mod plan7_tests {
                     journal: &self.journal,
                     journal_version: &self.journal_version,
                     adapter: adapter.as_ref(),
-                    epoch: &self.epoch,
+                    epoch: &mut self.epoch,
                     guard: &mut self.guard,
                     budget: &mut self.budget,
                 }),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn plan7_arm_rejects_another_candidate_before_epoch_mutation() {
+        use crate::retention_coordination::RetainedPointerIntentPrecondition;
+
+        let mut fixture = live_fence_fixture().await;
+        let selected = &fixture.attempt.participants[0];
+        let candidate_id = "aa".repeat(32);
+        let intent = ArmedRestorePublicationIntent {
+            intent_type: "arco.restore.publication-intent".into(),
+            version: 1,
+            domain: selected.domain.clone(),
+            plan_sha256: selected
+                .plan_sha256
+                .strip_prefix("sha256:")
+                .expect("selected digest")
+                .to_owned(),
+            owner_generation: selected.participant_attempt,
+            prepared_path: format!(
+                "control/v1/domains/{}/restore/v7/{candidate_id}/prepared.json",
+                selected.domain
+            ),
+            candidate_id,
+            prepared_sha256: "bb".repeat(32),
+            precondition: RetainedPointerIntentPrecondition::DoesNotExist {},
+        };
+        assert!(matches!(
+            fixture.context().arm_restore_publication(intent).await,
+            Err(CatalogError::Validation { message }) if message.contains("candidate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn plan7_selected_mutation_arms_once_and_stays_uncertain() {
+        let mut fixture = live_fence_fixture().await;
+        let selected = &fixture.attempt.participants[0];
+        let PersistedRestoreParticipantPlan::ControlMvpV7(plan) = &selected.plan else {
+            panic!("selected Plan7");
+        };
+        let candidate_id = plan.candidate_id().to_owned();
+        let intent = ArmedRestorePublicationIntent {
+            intent_type: "arco.restore.publication-intent".into(),
+            version: 1,
+            domain: selected.domain.clone(),
+            plan_sha256: selected
+                .plan_sha256
+                .strip_prefix("sha256:")
+                .expect("selected digest")
+                .to_owned(),
+            owner_generation: selected.participant_attempt,
+            prepared_path: format!(
+                "control/v1/domains/{}/restore/v7/{candidate_id}/prepared.json",
+                selected.domain
+            ),
+            candidate_id,
+            prepared_sha256: "bb".repeat(32),
+            precondition: plan.publication_precondition(),
+        };
+        let adapter = fixture
+            .service
+            .snapshots
+            .registry()
+            .get(&selected.domain)
+            .expect("catalog")
+            .restore_participant()
+            .expect("adapter")
+            .clone();
+        let mut mutation = RestoreApplyEpoch::Bounded(fixture.epoch.begin_bounded_mutation());
+        {
+            let mut context = RestoreAdvanceContext {
+                mode: RestoreAdvanceMode::Bounded(RestoreAdvanceFence {
+                    service: &fixture.service,
+                    request: &fixture.request,
+                    attempt: &fixture.attempt,
+                    participant: selected,
+                    journal: &fixture.journal,
+                    journal_version: &fixture.journal_version,
+                    adapter: adapter.as_ref(),
+                    epoch: &mut mutation,
+                    guard: &mut fixture.guard,
+                    budget: &mut fixture.budget,
+                }),
+            };
+            context
+                .arm_restore_publication(intent.clone())
+                .await
+                .expect("first verified invocation arm");
+            assert!(context.arm_restore_publication(intent).await.is_err());
+        }
+        mutation.finish(Ok(())).expect("finish invocation");
+        assert!(!fixture.epoch.can_settle_bounded());
     }
 
     #[tokio::test]
@@ -6874,6 +8083,44 @@ mod plan7_tests {
             .settle_bounded(&mut fixture.guard, &mut fixture.budget)
             .await
             .expect("settle");
+    }
+
+    #[tokio::test]
+    async fn plan7_final_refence_uses_bounded_fresh_metadata_budget() {
+        let mut fixture = live_fence_fixture().await;
+        fixture
+            .budget
+            .charge_operations(
+                crate::workspace_io_budget::OPERATIONS - fixture.budget.test_accounting().1,
+            )
+            .expect("fill invocation metadata admission");
+        assert!(matches!(
+            fixture.context().refence().await,
+            Err(CatalogError::MaintenanceBackpressure { .. })
+        ));
+        fixture
+            .context()
+            .refence_final()
+            .await
+            .expect("final stream refence keeps fencing with its own bounded admission");
+        assert_eq!(
+            fixture.budget.test_accounting().1,
+            crate::workspace_io_budget::OPERATIONS
+        );
+        fixture
+            .service
+            .storage
+            .put_raw(
+                &restore_journal_path(fixture.request.restore_id()).expect("path"),
+                Bytes::from(canonical_bytes(&fixture.journal, "journal").expect("bytes")),
+                WritePrecondition::MatchesVersion(fixture.journal_version.clone()),
+            )
+            .await
+            .expect("replace selected journal version");
+        assert!(matches!(
+            fixture.context().refence_final().await,
+            Err(CatalogError::PreconditionFailed { .. })
+        ));
     }
 
     #[tokio::test]
@@ -6997,6 +8244,78 @@ mod plan7_tests {
     }
 
     #[tokio::test]
+    async fn plan7_recovery_refuses_key_policy_before_apply_coordination() {
+        use crate::workspace_snapshot_service::WorkspaceDomainBinding;
+        let (service, request) = detached_plan7_fixture("valid").await;
+        let storage = service.storage.clone();
+        let attempt = decode_attempt_record(
+            &storage
+                .get_raw(&restore_attempt_plan_path(request.restore_id(), 1).expect("attempt path"))
+                .await
+                .expect("attempt"),
+            "attempt",
+        )
+        .expect("attempt");
+        let mut journal = selected_plan7_journal(&attempt);
+        journal.status = WorkspaceRestoreStatus::Applying;
+        journal.validate().expect("journal");
+        storage
+            .put_raw(
+                &restore_journal_path(request.restore_id()).expect("journal path"),
+                Bytes::from(canonical_bytes(&journal, "journal").expect("journal bytes")),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("selected journal");
+        let scope = StateScope::new("tenant", "workspace", "catalog");
+        let store = Arc::new(
+            ControlMvpStateStore::new_synthetic_bounded(storage.clone(), scope.clone())
+                .expect("store")
+                .with_durable_authority_binding(DurableAuthorityBinding::new([41; 32])),
+        );
+        let adapter = Arc::new(
+            ControlMvpRestoreParticipant::new(store.as_ref().clone()).with_key_policy(
+                crate::state_store::RestoreKeyPolicy::excluding([[0x03_u8]]).expect("policy"),
+            ),
+        );
+        let registry = WorkspaceDomainRegistry::new(
+            WorkspaceScope::new("tenant", "workspace").expect("scope"),
+            vec![
+                WorkspaceDomainBinding::new(
+                    scope,
+                    store.clone(),
+                    store,
+                    Arc::new(EmptyCapture),
+                    Arc::new(EmptyCapture),
+                )
+                .expect("binding")
+                .with_restore_participant(adapter.clone())
+                .expect("restore binding"),
+            ],
+        )
+        .expect("registry");
+        let restarted = WorkspaceRestoreService::new(storage.clone(), registry).expect("service");
+        let inventory = |objects: Vec<arco_core::storage::ObjectMeta>| {
+            objects
+                .into_iter()
+                .map(|object| (object.path, object.version))
+                .collect::<BTreeSet<_>>()
+        };
+        let before = inventory(storage.backend().list("").await.expect("before"));
+        let outcome = restarted.recover_restore(request.restore_id()).await;
+        assert!(
+            matches!(outcome, Err(CatalogError::UnsupportedOperation { .. })),
+            "policy must refuse bounded recovery: {outcome:?}"
+        );
+        assert_eq!(
+            inventory(storage.backend().list("").await.expect("after")),
+            before,
+            "configuration refusal must not claim an apply epoch or mutate its lock/journal"
+        );
+        assert!(!adapter.supports_bounded_restore_advance());
+    }
+
+    #[tokio::test]
     #[allow(
         clippy::too_many_lines,
         reason = "the terminal check crosses two separately fenced workspace invocations"
@@ -7050,7 +8369,7 @@ mod plan7_tests {
         let participant = &attempt.participants[0];
         for expected_units in 2..=32 {
             let mut next_budget = WorkspaceIoBudget::new();
-            let (mut guard, epoch) = service
+            let (mut guard, mut epoch) = service
                 .acquire_apply_coordination(
                     request.restore_id(),
                     participant.participant_attempt,
@@ -7070,7 +8389,7 @@ mod plan7_tests {
                         journal: &journal,
                         journal_version: &journal_version,
                         adapter: adapter.as_ref(),
-                        epoch: &epoch,
+                        epoch: &mut epoch,
                         guard: &mut guard,
                         budget: &mut next_budget,
                     }),
@@ -7089,8 +8408,8 @@ mod plan7_tests {
                     .await
                     .expect("finish selected unit invocation");
                 }
-                Err(CatalogError::UnsupportedOperation { message })
-                    if message == "terminal restore candidate publication is not implemented" =>
+                Err(CatalogError::Validation { message })
+                    if message == "restore publication requires a bounded mutation" =>
                 {
                     assert_eq!(
                         service
@@ -7106,9 +8425,36 @@ mod plan7_tests {
                             .difference(&before_terminal)
                             .any(|(path, _, _)| { path.contains("/projection-sources/") })
                     );
+                    let PersistedRestoreParticipantPlan::ControlMvpV7(plan7) = &plan else {
+                        panic!("selected Plan7");
+                    };
+                    let paths = crate::state_store::control_mvp::ControlMvpPaths::new("catalog");
+                    let prefix = format!(
+                        "{}/restore/v7/{}",
+                        paths.base_prefix(),
+                        plan7.candidate_id()
+                    );
+                    for path in [
+                        format!("{prefix}/plan.json"),
+                        format!("{prefix}/certificate.json"),
+                        format!("{prefix}/seal.json"),
+                        paths.manifest_object(plan7.candidate_id()),
+                    ] {
+                        assert!(service.storage.get_raw(&path).await.is_ok(), "{path}");
+                    }
+                    assert!(
+                        service
+                            .storage
+                            .get_raw(&format!("{prefix}/prepared.json"))
+                            .await
+                            .is_err(),
+                        "staging alone must not publish prepared authority"
+                    );
                     return;
                 }
-                other => panic!("terminal progress must stage notice then stop: {other:?}"),
+                other => {
+                    panic!("unarmed terminal progress must stage without publishing: {other:?}")
+                }
             }
         }
         panic!("small fixture never reached terminal progress");
@@ -7255,7 +8601,7 @@ mod plan7_tests {
             journal_version,
             mut budget,
             mut guard,
-            epoch,
+            mut epoch,
         } = live_fence_fixture().await;
         let participant = &attempt.participants[0];
         let registered = service
@@ -7279,7 +8625,7 @@ mod plan7_tests {
                 journal: &journal,
                 journal_version: &journal_version,
                 adapter: &probe,
-                epoch: &epoch,
+                epoch: &mut epoch,
                 guard: &mut guard,
                 budget: &mut budget,
             }),
@@ -7307,7 +8653,7 @@ mod plan7_tests {
             journal_version,
             mut budget,
             mut guard,
-            epoch,
+            mut epoch,
         } = live_fence_fixture().await;
         let deadline = request.requested_at + ChronoDuration::hours(24);
         service.clock = Some(Arc::new(move || deadline));
@@ -7328,7 +8674,7 @@ mod plan7_tests {
                 journal: &journal,
                 journal_version: &journal_version,
                 adapter: adapter.as_ref(),
-                epoch: &epoch,
+                epoch: &mut epoch,
                 guard: &mut guard,
                 budget: &mut budget,
             }),
@@ -7353,7 +8699,7 @@ mod plan7_tests {
             journal_version,
             mut budget,
             mut guard,
-            epoch,
+            mut epoch,
         } = live_fence_fixture().await;
         let participant = &attempt.participants[0];
         let adapter = service
@@ -7382,7 +8728,7 @@ mod plan7_tests {
                 journal: &journal,
                 journal_version: &journal_version,
                 adapter: adapter.as_ref(),
-                epoch: &epoch,
+                epoch: &mut epoch,
                 guard: &mut guard,
                 budget: &mut budget,
             }),
@@ -7417,16 +8763,21 @@ mod plan7_tests {
 
     #[tokio::test]
     async fn plan7_advance_default_denial_preserves_apply_coordination_objects() {
-        let (service, request) = detached_plan7_fixture("valid").await;
-        let before = apply_coordination_inventory(&service).await;
+        let fixture = mixed_selected_resume_fixture(MixedAInspection::Ready).await;
+        fixture.v6.superseded_attempt.store(0, Ordering::SeqCst);
+        install_mixed_selected_attempt(&fixture, false).await;
+        let before = apply_coordination_inventory(&fixture.service).await;
 
-        let result = service.recover_restore(request.restore_id()).await;
+        let result = fixture
+            .service
+            .recover_restore(fixture.request.restore_id())
+            .await;
         assert!(matches!(
             result,
             Err(CatalogError::UnsupportedOperation { .. })
         ));
         assert_eq!(
-            apply_coordination_inventory(&service).await,
+            apply_coordination_inventory(&fixture.service).await,
             before,
             "default bounded-advance denial must precede apply lock and epoch claim"
         );

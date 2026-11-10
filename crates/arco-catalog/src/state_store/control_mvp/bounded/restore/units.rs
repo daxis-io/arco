@@ -3422,7 +3422,7 @@ mod behavioral_tests {
             for at in 3..=5 {
                 for after in [false, true] {
                     for pending in [false, true] {
-                        durable_unit_fault_case(final_route, at, after, pending).await;
+                        Box::pin(durable_unit_fault_case(final_route, at, after, pending)).await;
                     }
                 }
             }
@@ -3603,7 +3603,7 @@ mod behavioral_tests {
         {
             let final_route = false; // Control transport is ordinary-only; rejection has separate coverage.
             for case in 0..7 {
-                durable_unit_observation_case(final_route, case).await;
+                Box::pin(durable_unit_observation_case(final_route, case)).await;
             }
         }
     }

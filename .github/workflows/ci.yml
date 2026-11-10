@@ -148,6 +148,18 @@ jobs:
       - run: cargo test --workspace --all-features --exclude arco-flow --exclude arco-api
       - name: Control state operation-cost smoke (no latency thresholds)
         run: cargo test -p arco-catalog --test control_cost_smoke --locked
+      - name: Authority-8 GC transport and process-restart rehearsal
+        run: |
+          cargo build --locked -p arco-storage-s3 --features qualification --bin arco-state-store-qualification
+          python3 scripts/tests/gate7_s3_loopback.py "$CARGO_TARGET_DIR/debug/arco-state-store-qualification" \
+            "$RUNNER_TEMP/authority8-gc-loopback" --provider-source "$GITHUB_WORKSPACE" --gc
+      - name: Retain authority-8 GC rehearsal evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: authority8-gc-loopback
+          path: ${{ runner.temp }}/authority8-gc-loopback
+          if-no-files-found: ignore
       - name: Test vendored thrift protocol guards
         run: |
           tmpdir="$(mktemp -d)"

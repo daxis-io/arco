@@ -2,17 +2,21 @@
 
 use super::{
     CatalogError, ControlMvpPointer, ControlMvpSegmentLevel, ControlMvpSegmentRow,
-    ControlMvpStateStore, ControlMvpTxn, ControlMvpWriteEntry, Result, StagedWrite, StateScope,
-    StateToken, StoredValue, TransactionBase, decode_json, directory, encode_json,
-    encode_json_limited, encode_segment, invariant_violation, logical_v2, next_logical_sequence,
-    physical, precondition_failed, put_immutable_matching, retained, sha256_hex, valid_raw_digest,
+    ControlMvpStateStore, ControlMvpTxn, ControlMvpWriteEntry, RETENTION_GC_LOCK_MAX_RETRIES,
+    RETENTION_GC_LOCK_PATH, RETENTION_GC_LOCK_TTL, Result, StagedWrite, StateScope, StateToken,
+    StoredValue, TransactionBase, decode_json, directory, encode_json, encode_json_limited,
+    encode_segment, invariant_violation, logical_v2, next_logical_sequence, physical,
+    precondition_failed, put_immutable_matching, retained, sha256_hex, valid_raw_digest,
     validate_raw_checksum,
 };
-use arco_core::{AuthorityWritePrecondition, WriteResult};
+use arco_core::lock::{DistributedLock, LockGuard};
+use arco_core::{AuthorityWritePrecondition, RootStorage, WriteResult};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) mod marking;
 pub(super) mod restore;
 mod synthetic;
 #[cfg(feature = "test-utils")]
@@ -92,6 +96,12 @@ struct Manifest8 {
     transition: Option<ArtifactRef>,
     genesis_witness: Option<ArtifactRef>,
     projection_source: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_plan: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    restore_certificate: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory_object_version: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +109,7 @@ struct Manifest8 {
 enum ManifestKind8 {
     Transaction,
     SyntheticGenesis,
+    Restore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +248,9 @@ impl Manifest8 {
             || !super::integrity::valid_immutable_id(&self.manifest_id)
             || self.logical_sequence == 0
             || !valid_raw_digest(&self.logical_history)
+            || self
+                .directory_object_version
+                .is_some_and(|version| version != 2)
             || self.writer_epoch == u64::MAX
             || self
                 .projection_source
@@ -251,7 +265,9 @@ impl Manifest8 {
             ManifestKind8::Transaction
                 if self.transaction.as_ref().is_some_and(valid_artifact_ref)
                     && self.transition.as_ref().is_some_and(valid_artifact_ref)
-                    && self.genesis_witness.is_none() => {}
+                    && self.genesis_witness.is_none()
+                    && self.restore_plan.is_none()
+                    && self.restore_certificate.is_none() => {}
             ManifestKind8::SyntheticGenesis
                 if self
                     .genesis_witness
@@ -259,8 +275,38 @@ impl Manifest8 {
                     .is_some_and(valid_artifact_ref)
                     && self.transaction.is_none()
                     && self.transition.is_none()
+                    && self.restore_plan.is_none()
+                    && self.restore_certificate.is_none()
                     && self.parent_manifest_id.is_none()
                     && self.parent_manifest_sha256.is_none() => {}
+            ManifestKind8::Restore
+                if self.transaction.is_none()
+                    && self.transition.is_none()
+                    && self.genesis_witness.is_none()
+                    && self
+                        .projection_source
+                        .as_ref()
+                        .is_some_and(valid_artifact_ref)
+                    && self.parent_manifest_id.is_some()
+                    && self.parent_manifest_sha256.is_some()
+                    && self.restore_plan.as_ref().is_some_and(|reference| {
+                        valid_artifact_ref(reference)
+                            && reference.path
+                                == format!(
+                                    "control/v1/domains/{}/restore/v7/{}/plan.json",
+                                    self.scope.domain(),
+                                    self.manifest_id
+                                )
+                    })
+                    && self.restore_certificate.as_ref().is_some_and(|reference| {
+                        valid_artifact_ref(reference)
+                            && reference.path
+                                == format!(
+                                    "control/v1/domains/{}/restore/v7/{}/certificate.json",
+                                    self.scope.domain(),
+                                    self.manifest_id
+                                )
+                    }) => {}
             _ => {
                 return Err(invariant_violation(
                     "bounded manifest kind and artifacts are inconsistent",
@@ -449,6 +495,98 @@ fn decode_roots(
     ))
 }
 
+/// Removes paths authenticated by one authority-8 manifest from a bounded GC
+/// candidate page. The caller must also protect every retained manifest.
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) async fn protect_gc_manifest(
+    store: &ControlMvpStateStore,
+    manifest_id: &str,
+    expected_digest: Option<&str>,
+    candidates: &mut BTreeSet<String>,
+    budget: &mut retained::ReadBudget<'_>,
+) -> Result<()> {
+    let path = store.paths.manifest_object(manifest_id);
+    let bytes = retained::read_bounded_json(
+        store,
+        budget,
+        &path,
+        super::MAX_CONTROL_JSON_BYTES,
+        "bounded GC manifest",
+    )
+    .await?;
+    let digest = sha256_hex(&bytes);
+    validate_raw_checksum(&bytes, expected_digest, "bounded GC manifest checksum")?;
+    let manifest: Manifest8 = decode_json(&bytes, "bounded GC manifest")?;
+    manifest.validate(&store.scope, manifest_id)?;
+    let token = store
+        .token(manifest_id.to_owned(), manifest.logical_sequence)
+        .with_manifest_witness(digest);
+    let base = store
+        .bounded_base_from_manifest(&token, &bytes, Some(budget), None)
+        .await?;
+    candidates.remove(&path);
+    for reference in [
+        manifest.transaction.as_ref(),
+        manifest.transition.as_ref(),
+        manifest.genesis_witness.as_ref(),
+        manifest.projection_source.as_ref(),
+        manifest.restore_plan.as_ref(),
+        manifest.restore_certificate.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.remove(&reference.path);
+    }
+    let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
+    for (role, root) in [
+        (physical::Role::Kv, &base.kv_root),
+        (physical::Role::ActiveId, &base.active_id_root),
+        (physical::Role::DeliveryOrder, &base.delivery_order_root),
+    ] {
+        let mut cursor = None;
+        let mut leaves_seen = 0_usize;
+        loop {
+            let mut scan_budget = directory::ReadBudget::tracking_with_retained(budget);
+            let page = directory
+                .scan(root, b"", None, 128, cursor.as_ref(), &mut scan_budget)
+                .await?;
+            for path in scan_budget.take_authenticated_paths() {
+                candidates.remove(&path);
+            }
+            drop(scan_budget);
+            leaves_seen = leaves_seen.checked_add(page.leaves.len()).ok_or_else(|| {
+                CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC leaf count overflow".into(),
+                }
+            })?;
+            if leaves_seen > 16_384 {
+                return Err(CatalogError::MaintenanceBackpressure {
+                    message: "bounded GC closure exceeds 16384 leaves per role".into(),
+                });
+            }
+            for leaf in &page.leaves {
+                let descriptor = store
+                    .resolve_physical_mark_edge_bounded(role, leaf, budget)
+                    .await?;
+                let descriptor_path = format!(
+                    "{}/physical/descriptors/{}.json",
+                    store.paths.base_prefix(),
+                    hex::encode(leaf.digest)
+                );
+                candidates.remove(&descriptor_path);
+                candidates.remove(&store.paths.state_object(&descriptor.segment.segment_id));
+                candidates.remove(&store.paths.segment_index(&descriptor.segment.segment_id));
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 fn base_from_manifest(
     directory: &directory::Directory,
     manifest: Manifest8,
@@ -518,6 +656,16 @@ async fn validate_manifest_artifacts_with_budget(
             roots,
             budget.as_deref_mut(),
         )
+        .await;
+    }
+    if manifest.kind == ManifestKind8::Restore {
+        let mut local_budget = retained::ReadBudget::new();
+        return Box::pin(restore::validate_manifest_artifacts(
+            store,
+            manifest,
+            roots,
+            budget.as_deref_mut().unwrap_or(&mut local_budget),
+        ))
         .await;
     }
     let transaction_ref = manifest
@@ -721,6 +869,11 @@ async fn validate_prepared_candidate(
                 ));
             }
         }
+        ManifestKind8::Restore => {
+            return Err(invariant_violation(
+                "ordinary prepared candidate cannot contain a restore manifest",
+            ));
+        }
     }
     match &prepared.original_head {
         Some(original) => {
@@ -840,6 +993,11 @@ async fn prepared_candidate(
             Some(decode_json::<Transition8>(&bytes, "candidate transition")?.roles)
         }
         ManifestKind8::SyntheticGenesis => None,
+        ManifestKind8::Restore => {
+            return Err(invariant_violation(
+                "ordinary candidate preparation cannot contain restore",
+            ));
+        }
     };
     Ok(PreparedCandidateV1 {
         record_type: PREPARED_CANDIDATE_RECORD_TYPE.to_owned(),
@@ -860,6 +1018,7 @@ async fn publish_manifest_candidate(
     store: &ControlMvpStateStore,
     base: &Base,
     manifest: Manifest8,
+    guard: &mut LockGuard<RootStorage>,
 ) -> Result<StateToken> {
     manifest.validate(&store.scope, &manifest.manifest_id)?;
     let manifest_path = store.paths.manifest_object(&manifest.manifest_id);
@@ -917,6 +1076,10 @@ async fn publish_manifest_candidate(
         "bounded prepared candidate already exists with different bytes",
     )
     .await?;
+    guard
+        .extend(RETENTION_GC_LOCK_TTL)
+        .await
+        .map_err(CatalogError::from)?;
     let precondition = base
         .pointer_version()
         .map_or(AuthorityWritePrecondition::DoesNotExist, |version| {
@@ -964,6 +1127,12 @@ async fn recovery_manifest(
     validate_raw_checksum(&bytes, Some(digest), "bounded recovery manifest checksum")?;
     let manifest: Manifest8 = decode_json(&bytes, "bounded recovery manifest")?;
     manifest.validate(&store.scope, manifest_id)?;
+    if manifest.kind == ManifestKind8::Restore {
+        let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
+        let roots = decode_roots(&directory, &manifest)?;
+        validate_manifest_artifacts(store, &manifest, (&roots.0, &roots.1, &roots.2)).await?;
+        return Ok(manifest);
+    }
     for reference in [
         manifest.transaction.as_ref(),
         manifest.transition.as_ref(),
@@ -1040,6 +1209,7 @@ fn leaf_from_proof(proof: &LeafProof8) -> Result<directory::Leaf> {
 async fn verify_candidate_transition(
     store: &ControlMvpStateStore,
     base: &Base,
+    directory_publication_id: Option<&str>,
     candidate_kv: &directory::Root,
     candidate_active: &directory::Root,
     candidate_delivery: &directory::Root,
@@ -1079,7 +1249,10 @@ async fn verify_candidate_transition(
             "candidate logical commit ID differs from frozen operation",
         ));
     }
-    let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
+    let mut directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
+    if let Some(candidate_id) = directory_publication_id {
+        directory = directory.for_publication(candidate_id)?;
+    }
     let expected = [
         (physical::Role::Kv, &base.kv_root, candidate_kv),
         (
@@ -2157,6 +2330,7 @@ impl Base {
         verify_candidate_transition(
             store,
             parent,
+            (child.directory_object_version == Some(2)).then_some(child.manifest_id.as_str()),
             &self.kv_root,
             &self.active_id_root,
             &self.delivery_order_root,
@@ -3019,10 +3193,6 @@ impl ControlMvpStateStore {
         Ok(CandidateRecoveryV2::Unresolved)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "candidate construction binds all immutable artifacts before one CAS"
-    )]
     pub(super) async fn commit_bounded(
         &self,
         txn: ControlMvpTxn,
@@ -3032,6 +3202,42 @@ impl ControlMvpStateStore {
                 message: "bounded commit requires explicit authority format 8".into(),
             });
         }
+        let mut guard = DistributedLock::new(
+            std::sync::Arc::new(self.retention.clone()),
+            RETENTION_GC_LOCK_PATH,
+        )
+        .acquire_with_operation(
+            RETENTION_GC_LOCK_TTL,
+            RETENTION_GC_LOCK_MAX_RETRIES,
+            Some(format!(
+                "control-v8-commit:{}:{}",
+                self.scope.domain(),
+                txn.manifest_id
+            )),
+        )
+        .await
+        .map_err(CatalogError::from)?;
+        let result = self.commit_bounded_locked(txn, &mut guard).await;
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (result, release) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(outcome), Err(error)) => {
+                tracing::warn!(%error, "authority-8 commit succeeded but retention lock release failed");
+                Ok(outcome)
+            }
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "candidate construction binds all immutable artifacts before one CAS"
+    )]
+    async fn commit_bounded_locked(
+        &self,
+        txn: ControlMvpTxn,
+        guard: &mut LockGuard<RootStorage>,
+    ) -> Result<(StateToken, Vec<logical_v2::ProjectionIntentV2>, String)> {
         txn.validate_bounded_preconditions().await?;
         if !txn.outbox.is_empty() || !txn.outbox_trim.is_empty() {
             return Err(CatalogError::UnsupportedAuthorityFormat {
@@ -3125,7 +3331,8 @@ impl ControlMvpStateStore {
             additions: additions.clone(),
             trims: trims.clone(),
         };
-        let directory = directory::Directory::new(self.retention.clone(), &self.scope)?;
+        let directory = directory::Directory::new(self.retention.clone(), &self.scope)?
+            .for_publication(&txn.manifest_id)?;
         let mut work = BoundedCommitWork::default();
         let (kv_root, kv_edits) = rewrite_kv(
             self,
@@ -3215,6 +3422,7 @@ impl ControlMvpStateStore {
         verify_candidate_transition(
             self,
             base,
+            Some(&txn.manifest_id),
             &kv_root,
             &active_id_root,
             &delivery_order_root,
@@ -3289,8 +3497,11 @@ impl ControlMvpStateStore {
             transition: Some(transition_ref),
             genesis_witness: None,
             projection_source,
+            restore_plan: None,
+            restore_certificate: None,
+            directory_object_version: Some(2),
         };
-        let token = publish_manifest_candidate(self, base, manifest).await?;
+        let token = Box::pin(publish_manifest_candidate(self, base, manifest, guard)).await?;
         Ok((token, additions, logical_commit_id))
     }
 
@@ -3506,6 +3717,7 @@ impl ControlMvpStateStore {
         let writes = verify_candidate_transition(
             self,
             &parent,
+            (manifest.directory_object_version == Some(2)).then_some(manifest.manifest_id.as_str()),
             &candidate.kv_root,
             &candidate.active_id_root,
             &candidate.delivery_order_root,
@@ -3663,6 +3875,62 @@ mod tests {
 
     use super::*;
     use crate::state_store::{ArcoStateTxn, StateScope, TxnOptions};
+
+    #[tokio::test]
+    async fn restore_manifest_shape_requires_private_plan_and_certificate() {
+        let storage = ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace")
+            .expect("storage");
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            storage,
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .expect("store");
+        let mut txn = store
+            .begin_control_txn(TxnOptions::default())
+            .await
+            .expect("transaction");
+        txn.set_logical_operation("source", "catalog", &"11".repeat(32))
+            .expect("operation");
+        store.commit_bounded(txn).await.expect("source commit");
+        let base = store.pin_bounded_base().await.expect("source base");
+        let source = base.manifest.as_ref().expect("source manifest");
+        let candidate = "cd".repeat(32);
+        let prefix = format!("{}/restore/v7/{candidate}", store.paths.base_prefix());
+        let mut wire = serde_json::to_value(source).expect("manifest JSON");
+        wire["kind"] = serde_json::Value::String("restore".into());
+        wire["manifest_id"] = serde_json::Value::String(candidate);
+        wire["logical_sequence"] = serde_json::Value::from(2);
+        wire["logical_history"] = serde_json::Value::String("ef".repeat(32));
+        wire["parent_manifest_id"] = serde_json::Value::String(source.manifest_id.clone());
+        wire["parent_manifest_sha256"] =
+            serde_json::Value::String(base.manifest_digest.expect("source digest"));
+        wire["transaction"] = serde_json::Value::Null;
+        wire["transition"] = serde_json::Value::Null;
+        wire["projection_source"] = serde_json::json!({
+            "path": format!("{}/projection-sources/{}.json", store.paths.base_prefix(), "cc".repeat(32)),
+            "sha256": "cc".repeat(32)
+        });
+        wire["restore_plan"] = serde_json::json!({
+            "path": format!("{prefix}/plan.json"), "sha256": "aa".repeat(32)
+        });
+        wire["restore_certificate"] = serde_json::json!({
+            "path": format!("{prefix}/certificate.json"), "sha256": "bb".repeat(32)
+        });
+        let restore: Manifest8 = serde_json::from_value(wire.clone()).expect("restore kind");
+        restore
+            .validate(&store.scope, &restore.manifest_id)
+            .expect("dedicated restore artifacts");
+        for missing in ["restore_plan", "restore_certificate"] {
+            let mut invalid = wire.clone();
+            invalid[missing] = serde_json::Value::Null;
+            let decoded: Manifest8 = serde_json::from_value(invalid).expect("restore envelope");
+            assert!(
+                decoded
+                    .validate(&store.scope, &decoded.manifest_id)
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn restore_notice_outputs_are_readable_in_both_outbox_roles() {
@@ -3824,6 +4092,7 @@ mod tests {
         let edit = splice_restore_notice_role(
             &mut io,
             &mut totals,
+            None,
             role,
             &root,
             &selected,
@@ -3981,6 +4250,7 @@ mod tests {
         let edit = splice_restore_notice_role(
             &mut io,
             &mut totals,
+            None,
             physical::Role::ActiveId,
             &root,
             &selected,
@@ -4354,6 +4624,7 @@ mod tests {
             verify_candidate_transition(
                 &store,
                 &base,
+                None,
                 &candidate_kv,
                 &base.active_id_root,
                 &base.delivery_order_root,
@@ -4378,6 +4649,7 @@ mod tests {
             verify_candidate_transition(
                 &store,
                 &base,
+                None,
                 &candidate_kv,
                 &base.active_id_root,
                 &base.delivery_order_root,

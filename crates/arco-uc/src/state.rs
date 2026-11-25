@@ -19,6 +19,10 @@ pub struct UnityCatalogConfig {
     pub request_timeout: Option<Duration>,
     /// Optional concurrency limit for handlers.
     pub concurrency_limit: Option<usize>,
+    /// Whether the bounded Arco-native table-read extension is mounted.
+    pub table_reads_enabled: bool,
+    /// Canonical configured backend root for table reads, if safely mappable.
+    pub table_read_storage_root: Option<String>,
 }
 
 /// Shared state for Unity Catalog facade handlers.

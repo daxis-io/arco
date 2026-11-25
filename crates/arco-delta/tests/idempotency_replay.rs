@@ -15,7 +15,7 @@ use arco_core::storage::{
 };
 use arco_core::{Error as CoreError, Result as CoreResult, ScopedStorage};
 use arco_delta::{
-    CommitDeltaRequest, DeltaCommitCoordinator, DeltaCoordinatorState, InflightCommit,
+    CommitDeltaRequest, DeltaCommitCoordinator, DeltaCoordinatorState, DeltaError, InflightCommit,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -253,8 +253,9 @@ async fn crash_after_idempotency_marker_before_finalize_recovers_and_clears_infl
     let table_id = Uuid::now_v7();
     let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
 
+    let payload = Bytes::from_static(b"{\"commitInfo\":{\"ts\":2}}\n");
     let staged = coordinator
-        .stage_commit_payload(Bytes::from_static(b"{\"commitInfo\":{\"ts\":2}}\n"))
+        .stage_commit_payload(payload.clone())
         .await
         .expect("stage payload");
 
@@ -275,9 +276,14 @@ async fn crash_after_idempotency_marker_before_finalize_recovers_and_clears_infl
         "first attempt should fail on injected finalize write"
     );
 
+    assert!(matches!(
+        coordinator.pinned_log_digests(0).await,
+        Err(DeltaError::NotFound { .. })
+    ));
     let replay = coordinator
-        .commit(request.clone(), Utc::now())
+        .replay_committed(&request)
         .await
+        .expect("native retry should recover the finalization")
         .expect("retry should replay committed response");
     assert_eq!(replay.version, 0);
     assert_eq!(replay.delta_log_path, delta_log_relative_path(table_id, 0));
@@ -290,6 +296,13 @@ async fn crash_after_idempotency_marker_before_finalize_recovers_and_clears_infl
         serde_json::from_slice(&state_bytes).expect("deserialize coordinator state");
     assert_eq!(state.latest_version, 0);
     assert!(state.inflight.is_none(), "replay must clear stale inflight");
+    assert_eq!(
+        coordinator
+            .pinned_log_digests(0)
+            .await
+            .expect("finalized digests"),
+        vec![sha256_hex(&payload)]
+    );
 
     let replay_again = coordinator
         .commit(request, Utc::now())
@@ -501,4 +514,8 @@ async fn recover_retry_replays_after_transient_idempotency_write_failure() {
         serde_json::from_slice(&state_bytes).expect("deserialize coordinator state");
     assert_eq!(state.latest_version, 0);
     assert!(state.inflight.is_none());
+    assert!(matches!(
+        coordinator.pinned_log_digests(0).await,
+        Err(DeltaError::Conflict { message }) if message == "delta_read_commit_identity_unavailable"
+    ));
 }

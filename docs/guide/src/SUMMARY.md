@@ -25,6 +25,7 @@
 - [Frozen Flow Intent](./reference/frozen-flow-intent.md)
 - [Publication Contract](./reference/publication-contract-030.md)
 - [Catalog Read Handoff](./reference/catalog-read-handoff-030.md)
+- [Bounded Table-Read Extension](./reference/table-read-extension.md)
 - [Orchestration Embedding](./reference/orchestration-embedding.md)
 - [Catalog Run Index](./reference/catalog-run-index.md)
 - [Catalog Privilege Matrix](./reference/catalog-privilege-matrix.md)

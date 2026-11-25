@@ -27,6 +27,7 @@ use arco_iceberg::{
     CredentialProvider, IcebergError, IcebergState, SharedCompactorFactory, Tier1CompactorFactory,
     iceberg_router,
 };
+use arco_storage::{StorageProvider, provider_for_bucket};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
 use arco_uc::{MetastorePermissionSource, UnityCatalogState, unity_catalog_router};
@@ -42,6 +43,38 @@ use arco_core::Result;
 use arco_core::audit::AuditEmitter;
 
 const PUBLIC_PROTOCOL_RATE_LIMIT_TENANT: &str = "__public__";
+
+fn table_read_storage_root(bucket: Option<&str>) -> Option<String> {
+    let configured = bucket?.trim();
+    let provider = provider_for_bucket(configured).ok()?;
+    let without_scheme = match provider {
+        StorageProvider::S3 => configured
+            .strip_prefix("s3://")
+            .or_else(|| configured.strip_prefix("s3a://"))?,
+        StorageProvider::Gcs => configured
+            .strip_prefix("gs://")
+            .or_else(|| configured.strip_prefix("gcs://"))
+            .unwrap_or(configured),
+        // The configured Azure adapter names only a container. Its governed
+        // `abfss://` authority also needs an account, so no safe exact mapping
+        // exists without a separate owner configuration.
+        StorageProvider::Azure => return None,
+    };
+    let authority = without_scheme
+        .split_once('/')
+        .map_or(without_scheme, |(authority, _)| authority)
+        .trim();
+    if authority.is_empty() || authority.contains('?') || authority.contains('#') {
+        return None;
+    }
+
+    let scheme = match provider {
+        StorageProvider::S3 => "s3",
+        StorageProvider::Gcs => "gs",
+        StorageProvider::Azure => return None,
+    };
+    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
 
 // ============================================================================
 // Health and Ready Responses
@@ -582,6 +615,7 @@ fn api_error_to_unity_catalog_response(
 
     let uc_error = match status {
         StatusCode::BAD_REQUEST => UnityCatalogError::BadRequest { message },
+        StatusCode::PAYLOAD_TOO_LARGE => UnityCatalogError::PayloadTooLarge { message },
         StatusCode::UNAUTHORIZED => UnityCatalogError::Unauthorized { message },
         StatusCode::FORBIDDEN => UnityCatalogError::Forbidden { message },
         StatusCode::NOT_FOUND => UnityCatalogError::NotFound { message },
@@ -938,7 +972,14 @@ impl Server {
             // the storage-governance recovery routes are unreachable in a
             // deployed server. Wire the per-scope metastore-backed source; it
             // stays fail-closed when a scope's ledger cannot be read.
-            let uc_state = UnityCatalogState::new(Arc::clone(&state.storage))
+            let uc_config = arco_uc::UnityCatalogConfig {
+                table_reads_enabled: state.config.unity_catalog.table_reads_enabled,
+                table_read_storage_root: table_read_storage_root(
+                    state.config.storage.bucket.as_deref(),
+                ),
+                ..arco_uc::UnityCatalogConfig::default()
+            };
+            let uc_state = UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
                 .with_catalog_authority_bindings(state.catalog_authority_bindings())
                 .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
                     &state.storage,

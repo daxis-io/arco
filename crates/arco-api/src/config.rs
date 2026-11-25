@@ -549,6 +549,10 @@ pub struct UnityCatalogApiConfig {
     #[serde(default)]
     pub enabled: bool,
 
+    /// Enable the bounded Arco-native table-read extension.
+    #[serde(default)]
+    pub table_reads_enabled: bool,
+
     /// Mount prefix for UC endpoints (must start with `/`).
     #[serde(default = "default_unity_catalog_mount_prefix")]
     pub mount_prefix: String,
@@ -563,6 +567,7 @@ impl Default for UnityCatalogApiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            table_reads_enabled: false,
             mount_prefix: default_unity_catalog_mount_prefix(),
         }
     }
@@ -626,6 +631,7 @@ impl Config {
     /// - `ARCO_ICEBERG_CONCURRENCY_LIMIT`
     /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
     /// - `ARCO_UNITY_CATALOG_ENABLED`
+    /// - `ARCO_UNITY_CATALOG_TABLE_READS_ENABLED`
     /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
     /// - `ARCO_CATALOG_CONTROL_V1_TENANT_ID`
     /// - `ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID`
@@ -795,6 +801,9 @@ impl Config {
         }
         if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_ENABLED")? {
             config.unity_catalog.enabled = enabled;
+        }
+        if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_TABLE_READS_ENABLED")? {
+            config.unity_catalog.table_reads_enabled = enabled;
         }
         if let Some(prefix) = env_string("ARCO_UNITY_CATALOG_MOUNT_PREFIX") {
             config.unity_catalog.mount_prefix = prefix;

@@ -36,6 +36,9 @@ macro_rules! emit {
     }};
 }
 
+#[path = "qualification/gc.rs"]
+mod gc;
+
 const INVENTORY: &[&str] = &[
     "scoped-conditional-storage-conformance",
     "bounded-list-1001-objects",
@@ -523,11 +526,12 @@ async fn scenarios(
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
-        [command, manifest, expected] if ["provider", "provider-validate", "provider-rehearsal", "provider-rehearsal-listing-probe", "provider-rehearsal-put-307", "provider-rehearsal-put-308"].contains(&command.as_str()) => {
+        [command, manifest, expected] if ["gc-rehearsal", "provider", "provider-validate", "provider-rehearsal", "provider-rehearsal-listing-probe", "provider-rehearsal-put-307", "provider-rehearsal-put-308"].contains(&command.as_str()) => {
             let manifest_path = std::path::Path::new(manifest);
             let config = Arc::new(provider::Manifest::load(manifest_path, expected)?);
-            let real = !command.starts_with("provider-rehearsal");
-            config.validate(real)?;
+            let is_gc = command == "gc-rehearsal";
+            let real = !command.starts_with("provider-rehearsal") && !is_gc;
+            if is_gc { config.validate_gc()?; } else { config.validate(real)?; }
             if command == "provider-validate" {
                 emit!("{}", json!({"kind":"configuration-validated", "traffic":false}));
                 return Ok(());
@@ -552,6 +556,16 @@ async fn main() -> Result<()> {
             journal.record(&json!({"kind":"verified-identity", "identity":identity, "provider":real}), true)?;
             let backend: Arc<dyn StorageBackend> = Arc::new(provider::Observed {
                 inner: Arc::new(S3StorageBackend::for_qualification(&config.bucket, &config.listing_proxy)?), journal:journal.clone() });
+            if is_gc {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(config.ceilings.elapsed_seconds),
+                    std::panic::AssertUnwindSafe(gc::run(backend, &config)).catch_unwind()).await;
+                let success = matches!(&result, Ok(Ok(Ok(()))));
+                journal.state(if success { "completed-evidence-pending-validation" } else { "failed-recovery-required" })?;
+                return match result {
+                    Ok(Ok(value)) => value,
+                    other => Err(format!("GC rehearsal failed; retain evidence: {other:?}").into()),
+                };
+            }
             if let Some(status) = command.strip_prefix("provider-rehearsal-put-") {
                 let result = backend.put(&(config.prefix(0) + "conformance/fault/" + status), Bytes::from_static(b"redirect-candidate"), WritePrecondition::DoesNotExist).await;
                 journal.state("failed-recovery-required")?;
@@ -591,7 +605,7 @@ async fn main() -> Result<()> {
             emit!("{}", json!({"kind":"provider-execution-completed", "provider":real, "repetitions":5, "pilot_qualified":false, "qualification":"evidence-pending-validation"}));
             journal.state("completed-evidence-pending-validation")?;
         },
-        [command] if command == "inventory" => emit!("{}", json!({"common":INVENTORY,"loopback_transport":LOOPBACK_INVENTORY,"provider":provider::inventory(),"pilot":[]})),
+        [command] if command == "inventory" => emit!("{}", json!({"common":INVENTORY,"loopback_transport":LOOPBACK_INVENTORY,"provider":provider::inventory(),"gc":gc::inventory(),"pilot":[]})),
         [command] if command == "local" => {
             let tenant = format!("gate7-{}", ulid::Ulid::new().to_string().to_ascii_lowercase());
             Box::pin(scenarios(Arc::new(MemoryBackend::new()), &tenant, "qualification", None)).await?;

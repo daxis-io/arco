@@ -1,6 +1,8 @@
 //! Bounded restore planning and the exact Plan7 wire contract.
 mod certificate;
 mod fence;
+mod prepared;
+mod seal;
 mod units;
 use super::super::{
     CatalogError, ControlMvpPaths, ControlMvpPointer, ControlMvpStateStore,
@@ -8,8 +10,8 @@ use super::super::{
     PersistedAuthorityReference, RestoreAttemptIdentity, Result, StateScope, decode_json,
     encode_json, invariant_violation, prefixed_sha256, valid_raw_digest, validation_failed,
 };
-use super::{directory, logical_v2, retained};
-use crate::state_store::RestorePlanningContext;
+use super::{Manifest8, directory, logical_v2, retained};
+use crate::state_store::{PersistedRestoreParticipantPlan, RestorePlanningContext};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -203,6 +205,26 @@ fn tagged<T: Serialize>(tag: &[u8], body: &T) -> Result<String> {
 }
 
 impl ControlMvpRestorePlanV7 {
+    pub(crate) fn candidate_id(&self) -> &str {
+        &self.fields.candidate_id
+    }
+
+    pub(crate) fn publication_precondition(
+        &self,
+    ) -> crate::retention_coordination::RetainedPointerIntentPrecondition {
+        use crate::retention_coordination::RetainedPointerIntentPrecondition;
+
+        match &self.fields.target {
+            Target::Present {
+                current_pointer_version,
+                ..
+            } => RetainedPointerIntentPrecondition::MatchesVersion {
+                version: current_pointer_version.clone(),
+            },
+            Target::Absent { .. } => RetainedPointerIntentPrecondition::DoesNotExist {},
+        }
+    }
+
     /// Returns the exact retained authority source.
     #[must_use]
     pub const fn source(&self) -> &PersistedAuthorityReference {
@@ -707,10 +729,186 @@ pub(in super::super) async fn plan(
 )]
 pub(in super::super) async fn advance(
     store: &ControlMvpStateStore,
-    plan: &super::super::PersistedRestoreParticipantPlan,
+    plan: &PersistedRestoreParticipantPlan,
     context: &mut crate::state_store::RestoreAdvanceContext<'_>,
 ) -> Result<crate::state_store::RestoreParticipantAdvance> {
     units::advance(store, plan, context).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::suspicious_operation_groupings,
+    reason = "the restore manifest cross-bindings compare Plan7 fields to distinct manifest fields"
+)]
+pub(super) async fn validate_manifest_artifacts(
+    store: &ControlMvpStateStore,
+    manifest: &Manifest8,
+    roots: (&directory::Root, &directory::Root, &directory::Root),
+    budget: &mut retained::ReadBudget<'_>,
+) -> Result<()> {
+    budget.allow_restore_artifacts();
+    let plan_ref = manifest
+        .restore_plan
+        .as_ref()
+        .ok_or_else(|| invariant_violation("restore manifest lacks plan"))?;
+    let certificate_ref = manifest
+        .restore_certificate
+        .as_ref()
+        .ok_or_else(|| invariant_violation("restore manifest lacks certificate"))?;
+    let plan_bytes = retained::read_bounded_json(
+        store,
+        budget,
+        &plan_ref.path,
+        4 * 1024 * 1024,
+        "restore manifest plan",
+    )
+    .await?;
+    super::super::validate_raw_checksum(
+        &plan_bytes,
+        Some(&plan_ref.sha256),
+        "restore manifest plan checksum",
+    )?;
+    let plan: ControlMvpRestorePlanV7 = decode_json(&plan_bytes, "restore manifest plan")?;
+    if serde_jcs::to_vec(&plan)
+        .map_err(|_| invariant_violation("restore plan JCS encoding failed"))?
+        != plan_bytes
+    {
+        return Err(invariant_violation(
+            "restore manifest plan is not canonical",
+        ));
+    }
+    plan.validate_roots(store)?;
+    let selected_plan_sha256 = prefixed_sha256(
+        &serde_jcs::to_vec(&PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(
+            plan.clone(),
+        )))
+        .map_err(|_| invariant_violation("selected restore plan JCS encoding failed"))?,
+    );
+    let fields = &plan.fields;
+    if fields.candidate_id != manifest.manifest_id
+        || fields.scope != manifest.scope
+        || fields.result_logical_sequence != manifest.logical_sequence
+    {
+        return Err(invariant_violation("restore manifest differs from Plan7"));
+    }
+    let source_bytes = retained::read_bounded_json(
+        store,
+        budget,
+        &fields.source_manifest.path,
+        MAX_CONTROL_JSON_BYTES,
+        "restore manifest source",
+    )
+    .await?;
+    if source_bytes.len() as u64 != fields.source_manifest.byte_size
+        || prefixed_sha256(&source_bytes) != fields.source_manifest.sha256
+    {
+        return Err(invariant_violation(
+            "restore manifest source witness differs",
+        ));
+    }
+    let source: Manifest8 = decode_json(&source_bytes, "restore manifest source")?;
+    source.validate(&store.scope, fields.source.manifest_id())?;
+    let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
+    let source_roots = super::decode_roots(&directory, &source)?;
+    if source.logical_sequence != fields.source_logical_sequence
+        || source.logical_history != raw_digest(&fields.source_history_sha256)?
+        || source_roots.0.encode() != binary(&fields.source_kv_root_b64)?
+        || source_roots.1.encode() != binary(&fields.source_active_id_root_b64)?
+        || source_roots.2.encode() != binary(&fields.source_delivery_order_root_b64)?
+    {
+        return Err(invariant_violation("restore manifest source roots differ"));
+    }
+    let (parent_id, parent_digest, expected_writer, expected_reclamation) = match &fields.target {
+        Target::Present {
+            current_pointer_raw_b64,
+            writer_epoch,
+            reclamation_generation,
+            manifest: target,
+            ..
+        } => {
+            let pointer: ControlMvpPointer =
+                decode_json(&binary(current_pointer_raw_b64)?, "restore target HEAD")?;
+            let target_bytes = retained::read_bounded_json(
+                store,
+                budget,
+                &target.path,
+                MAX_CONTROL_JSON_BYTES,
+                "restore manifest target",
+            )
+            .await?;
+            if target_bytes.len() as u64 != target.byte_size
+                || prefixed_sha256(&target_bytes) != target.sha256
+            {
+                return Err(invariant_violation("restore target witness differs"));
+            }
+            let parent: Manifest8 = decode_json(&target_bytes, "restore target manifest")?;
+            parent.validate(&store.scope, &pointer.manifest_id)?;
+            let parent_roots = super::decode_roots(&directory, &parent)?;
+            if parent.logical_sequence != fields.base_logical_sequence
+                || parent.logical_history != raw_digest(&fields.base_history_sha256)?
+                || parent_roots.0.encode() != binary(&fields.base_kv_root_b64)?
+                || parent_roots.1.encode() != binary(&fields.base_active_id_root_b64)?
+                || parent_roots.2.encode() != binary(&fields.base_delivery_order_root_b64)?
+            {
+                return Err(invariant_violation("restore target base differs"));
+            }
+            (
+                pointer.manifest_id,
+                raw_digest(&target.sha256)?.to_owned(),
+                *writer_epoch,
+                *reclamation_generation,
+            )
+        }
+        Target::Absent {
+            observed_writer_epoch,
+            observed_reclamation_generation,
+            ..
+        } => (
+            source.manifest_id,
+            raw_digest(&fields.source_manifest.sha256)?.to_owned(),
+            *observed_writer_epoch,
+            *observed_reclamation_generation,
+        ),
+    };
+    if manifest.parent_manifest_id.as_deref() != Some(parent_id.as_str())
+        || manifest.parent_manifest_sha256.as_deref() != Some(parent_digest.as_str())
+        || manifest.writer_epoch != expected_writer
+        || manifest.reclamation_generation != expected_reclamation
+        || Some(manifest.logical_sequence) != fields.base_logical_sequence.checked_add(1)
+    {
+        return Err(invariant_violation(
+            "restore manifest parent or fence differs",
+        ));
+    }
+    let certificate = certificate::RestoreCertificateV1::read_bounded(
+        store,
+        budget,
+        &plan,
+        &selected_plan_sha256,
+        certificate_ref,
+    )
+    .await?;
+    certificate.validate_manifest(manifest, roots)?;
+    let manifest_ref = super::ArtifactRef {
+        path: store.paths.manifest_object(&manifest.manifest_id),
+        sha256: super::super::sha256_hex(&super::super::encode_json_limited(
+            manifest,
+            MAX_CONTROL_JSON_BYTES,
+            "restore sealed manifest",
+        )?),
+    };
+    seal::FinalSealV1::read_bounded(
+        store,
+        budget,
+        &plan,
+        &selected_plan_sha256,
+        manifest,
+        &manifest_ref,
+        certificate_ref,
+        &certificate,
+    )
+    .await?;
+    Ok(())
 }
 
 #[allow(
@@ -719,7 +917,7 @@ pub(in super::super) async fn advance(
 )]
 pub(in super::super) async fn inspect(
     store: &ControlMvpStateStore,
-    persisted: &super::super::PersistedRestoreParticipantPlan,
+    persisted: &PersistedRestoreParticipantPlan,
     context: &mut crate::state_store::RestoreBoundedInspectionContext<'_>,
 ) -> Result<super::super::RestoreParticipantInspection> {
     use super::super::{PersistedRestoreParticipantPlan, RestoreParticipantInspection};
@@ -757,9 +955,7 @@ pub(in super::super) async fn inspect(
         .await?
         .is_some()
     {
-        return Err(CatalogError::AmbiguousAuthorityOutcome {
-            message: "prepared Plan7 requires exact candidate reconciliation".into(),
-        });
+        return reconcile_prepared(store, plan, &selected_digest, io).await;
     }
     let has_progress = io
         .head(&store.retention, &format!("{prefix}/selector.json"))
@@ -869,6 +1065,142 @@ pub(in super::super) async fn inspect(
     Ok(RestoreParticipantInspection::Ready)
 }
 
+/// A persisted descriptor only identifies what to read. It never permits another send.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one bounded authenticated candidate ancestry walk"
+)]
+async fn reconcile_prepared(
+    store: &ControlMvpStateStore,
+    plan: &ControlMvpRestorePlanV7,
+    selected_digest: &str,
+    io: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+) -> Result<super::super::RestoreParticipantInspection> {
+    use super::super::RestoreParticipantInspection;
+    let mut budget = retained::ReadBudget::for_recovery(io);
+    let prepared =
+        prepared::PreparedRestoreV1::read_bounded(store, &mut budget, plan, selected_digest)
+            .await?;
+    let candidate_head = prepared.candidate_head_bytes()?;
+    let candidate_token = store
+        .token(
+            plan.fields.candidate_id.clone(),
+            plan.fields.result_logical_sequence,
+        )
+        .with_manifest_witness(prepared.manifest_digest().to_owned());
+    let Some((pointer, version, head_bytes)) =
+        retained::load_current_pointer(store, &mut budget).await?
+    else {
+        return Err(CatalogError::AmbiguousAuthorityOutcome {
+            message: "prepared restore has no readable HEAD".into(),
+        });
+    };
+    if let Target::Present {
+        current_pointer_raw_b64,
+        current_pointer_version,
+        ..
+    } = &plan.fields.target
+        && version == *current_pointer_version
+        && head_bytes.as_ref() == binary(current_pointer_raw_b64)?
+    {
+        return Err(CatalogError::AmbiguousAuthorityOutcome {
+            message: "prepared restore still observes original HEAD".into(),
+        });
+    }
+    let manifest_path = store.paths.manifest_object(&pointer.manifest_id);
+    let manifest_bytes = retained::read_bounded_json(
+        store,
+        &mut budget,
+        &manifest_path,
+        MAX_CONTROL_JSON_BYTES,
+        "restore reconciliation current manifest",
+    )
+    .await?;
+    let current_token = store
+        .token(pointer.manifest_id.clone(), pointer.logical_sequence)
+        .with_manifest_witness(pointer.manifest_checksum_sha256.clone());
+    let mut child = store
+        .read_bounded_current_from_manifest(
+            &current_token,
+            &manifest_bytes,
+            &pointer,
+            version,
+            head_bytes.clone(),
+            &mut budget,
+        )
+        .await?;
+    for depth in 0..32 {
+        if child.manifest.as_ref().is_some_and(|manifest| {
+            manifest.manifest_id == plan.fields.candidate_id
+                && child.manifest_digest.as_deref() == Some(prepared.manifest_digest())
+        }) {
+            if depth == 0 && head_bytes != candidate_head {
+                return Err(invariant_violation(
+                    "restore candidate HEAD bytes differ from prepared descriptor",
+                ));
+            }
+            let evidence = crate::state_store::RestoredAuthorityEvidence::new(
+                IMPLEMENTATION,
+                store.scope.clone(),
+                &plan.fields.candidate_id,
+                &plan.fields.candidate_id,
+                store.paths.manifest_object(&plan.fields.candidate_id),
+                format!("sha256:{}", prepared.manifest_digest()),
+                plan.fields.result_logical_sequence,
+                plan.fields.identity.attempt(),
+            )?;
+            return Ok(RestoreParticipantInspection::Visible {
+                token: candidate_token,
+                evidence,
+            });
+        }
+        if let Target::Present { manifest, .. } = &plan.fields.target
+            && child.manifest.as_ref().is_some_and(|current| {
+                current.manifest_id
+                    == manifest
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .and_then(|name| name.strip_suffix(".json"))
+                        .unwrap_or_default()
+                    && child.manifest_digest.as_deref()
+                        == Some(raw_digest(&manifest.sha256).unwrap_or_default())
+            })
+        {
+            return Ok(RestoreParticipantInspection::Superseded);
+        }
+        let Some(parent_token) = child.parent_token(store)? else {
+            return if matches!(plan.fields.target, Target::Absent { .. }) {
+                Ok(RestoreParticipantInspection::Superseded)
+            } else {
+                Err(CatalogError::AmbiguousAuthorityOutcome {
+                    message: "prepared restore ancestry does not reach its original target".into(),
+                })
+            };
+        };
+        let parent_bytes = retained::read_bounded_json(
+            store,
+            &mut budget,
+            &store
+                .paths
+                .manifest_object(parent_token.authority_manifest_id()),
+            MAX_CONTROL_JSON_BYTES,
+            "restore reconciliation ancestor",
+        )
+        .await?;
+        let parent = store
+            .read_bounded_token_from_manifest(&parent_token, &parent_bytes, &mut budget)
+            .await?;
+        child
+            .verify_parent_transition(store, &parent, &mut budget)
+            .await?;
+        child = parent;
+    }
+    Err(CatalogError::AmbiguousAuthorityOutcome {
+        message: "prepared restore ancestry exceeds 32 manifests".into(),
+    })
+}
+
 impl ControlMvpRestorePlanV7 {
     async fn verify_inspected_manifest_roots(
         &self,
@@ -904,8 +1236,7 @@ impl ControlMvpRestorePlanV7 {
         {
             return Err(invariant_violation("Plan7 source manifest witness differs"));
         }
-        let source_manifest: super::Manifest8 =
-            decode_json(&source_bytes, "Plan7 source manifest")?;
+        let source_manifest: Manifest8 = decode_json(&source_bytes, "Plan7 source manifest")?;
         source_manifest.validate(&store.scope, p.source.manifest_id())?;
         let directory = directory::Directory::new(store.retention.clone(), &store.scope)?;
         let roots = super::decode_roots(&directory, &source_manifest)?;
@@ -1033,8 +1364,7 @@ mod tests {
         usize,
     ) {
         let identity = plan.fields.identity.clone();
-        let persisted =
-            super::super::super::PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(plan));
+        let persisted = PersistedRestoreParticipantPlan::ControlMvpV7(Box::new(plan));
         let mut budget = crate::workspace_io_budget::WorkspaceIoBudget::new();
         let mut context = crate::state_store::RestoreBoundedInspectionContext::new(
             identity.restore_id().into(),

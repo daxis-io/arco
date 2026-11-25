@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Utc};
 use sha2::{Digest as _, Sha256};
 
-use arco_core::RootStorage;
+use arco_core::{RootStorage, StorageBackend};
 
 use crate::error::{CatalogError, Result};
 use crate::state_store::PersistedAuthorityReference;
@@ -267,6 +267,7 @@ pub struct RetainedAuthorityRoots<'a> {
     cursor: Option<String>,
     pending: VecDeque<String>,
     exhausted: bool,
+    record_versions: Vec<(String, String, u64)>,
 }
 
 impl<'a> RetainedAuthorityRoots<'a> {
@@ -277,18 +278,55 @@ impl<'a> RetainedAuthorityRoots<'a> {
             cursor: None,
             pending: VecDeque::new(),
             exhausted: false,
+            record_versions: Vec::new(),
         }
     }
 
-    #[allow(clippy::too_many_lines)] // Each retained-root variant is validated at the same streaming boundary.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn take_record_versions(&mut self) -> Vec<(String, String, u64)> {
+        std::mem::take(&mut self.record_versions)
+    }
+
     pub(crate) async fn next(&mut self) -> Result<Option<RetainedAuthorityRoot>> {
+        self.next_inner(None).await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) async fn next_bounded(
+        &mut self,
+        budget: &mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Result<Option<RetainedAuthorityRoot>> {
+        self.next_inner(Some(budget)).await
+    }
+
+    #[allow(clippy::too_many_lines)] // Each retained-root variant is validated at the same streaming boundary.
+    async fn next_inner(
+        &mut self,
+        mut budget: Option<&mut crate::workspace_io_budget::WorkspaceIoBudget>,
+    ) -> Result<Option<RetainedAuthorityRoot>> {
         loop {
             if let Some(pin_id) = self.pending.pop_front() {
-                let selected = load_selected_retention_pin(self.storage, &pin_id).await?;
-                if let RetentionTarget::Maintenance(id) = selected.latest_revision()?.target() {
-                    if selected.status_at(self.now)? != RetentionStatus::Active {
+                let (initial, latest, selected) = if let Some(budget) = budget.as_deref_mut() {
+                    let scoped = self.storage.as_legacy_scoped().ok_or_else(|| {
+                        validation("bounded pin inventory requires a workspace root")
+                    })?;
+                    let (initial, latest) = budget.read_pin(scoped, &pin_id).await?;
+                    (initial, latest, None)
+                } else {
+                    let selected = load_selected_retention_pin(self.storage, &pin_id).await?;
+                    (
+                        selected.initial_revision()?.clone(),
+                        selected.latest_revision()?.clone(),
+                        Some(selected),
+                    )
+                };
+                if let RetentionTarget::Maintenance(id) = latest.target() {
+                    if latest.status_at(self.now)? != RetentionStatus::Active {
                         continue;
                     }
+                    let selected = selected.ok_or_else(|| CatalogError::UnsupportedOperation {
+                        message: "bounded GC maintenance-pin protection is not admitted".into(),
+                    })?;
                     return crate::state_store::control_mvp::maintenance::retention_root(
                         self.storage,
                         id,
@@ -297,60 +335,89 @@ impl<'a> RetainedAuthorityRoots<'a> {
                     .await
                     .map(Some);
                 }
-                if selected.status_at(self.now)? != RetentionStatus::Active {
+                if latest.status_at(self.now)? != RetentionStatus::Active {
                     continue;
                 }
-                let (kind, id, scope, domains, required_paths) =
-                    match selected.latest_revision()?.target() {
-                        RetentionTarget::Snapshot(id) => {
-                            let bytes = self.storage.get_raw(&snapshot_record_path(id)?).await?;
-                            let snapshot =
-                                crate::workspace_snapshot::decode_workspace_snapshot(&bytes)?;
-                            validate_snapshot_pin_binding(&selected, &snapshot)?;
-                            (
-                                RetainedRootKind::Snapshot,
-                                id.clone(),
-                                snapshot.scope().clone(),
-                                snapshot.domains().to_vec(),
-                                snapshot
-                                    .required_objects()
-                                    .iter()
-                                    .map(|object| object.relative_path().to_owned())
-                                    .chain(
-                                        snapshot
-                                            .compatibility_artifacts()
-                                            .iter()
-                                            .map(|artifact| artifact.relative_path().to_owned()),
-                                    )
-                                    .collect(),
-                            )
-                        }
-                        RetentionTarget::Export(id) => {
-                            let bytes = self.storage.get_raw(&export_record_path(id)?).await?;
-                            let export = crate::workspace_snapshot::decode_export_manifest(&bytes)?;
-                            validate_export_pin_binding(&selected, &export)?;
-                            (
-                                RetainedRootKind::Export,
-                                id.clone(),
-                                export.scope().clone(),
-                                export.domains().to_vec(),
-                                export
-                                    .required_objects()
-                                    .iter()
-                                    .map(|object| object.relative_path().to_owned())
-                                    .chain(
-                                        export
-                                            .compatibility_artifacts()
-                                            .iter()
-                                            .map(|artifact| artifact.relative_path().to_owned()),
-                                    )
-                                    .collect(),
-                            )
-                        }
-                        RetentionTarget::Maintenance(_) => {
-                            return Err(validation("maintenance target dispatch mismatch"));
-                        }
-                    };
+                let (kind, id, scope, domains, required_paths) = match latest.target() {
+                    RetentionTarget::Snapshot(id) => {
+                        let path = snapshot_record_path(id)?;
+                        let bytes = if let Some(budget) = budget.as_deref_mut() {
+                            let (bytes, version) = budget
+                                .read_exact_stable_record(
+                                    self.storage,
+                                    &path,
+                                    crate::workspace_io_budget::RECORD_BYTES,
+                                )
+                                .await?;
+                            budget.reserve_bytes(path.len() + version.len() + 128)?;
+                            self.record_versions
+                                .push((path.clone(), version, bytes.len() as u64));
+                            bytes
+                        } else {
+                            self.storage.get_raw(&path).await?
+                        };
+                        let snapshot =
+                            crate::workspace_snapshot::decode_workspace_snapshot(&bytes)?;
+                        validate_snapshot_pin_bounds(&initial, &latest, &snapshot)?;
+                        (
+                            RetainedRootKind::Snapshot,
+                            id.clone(),
+                            snapshot.scope().clone(),
+                            snapshot.domains().to_vec(),
+                            snapshot
+                                .required_objects()
+                                .iter()
+                                .map(|object| object.relative_path().to_owned())
+                                .chain(
+                                    snapshot
+                                        .compatibility_artifacts()
+                                        .iter()
+                                        .map(|artifact| artifact.relative_path().to_owned()),
+                                )
+                                .collect(),
+                        )
+                    }
+                    RetentionTarget::Export(id) => {
+                        let path = export_record_path(id)?;
+                        let bytes = if let Some(budget) = budget.as_deref_mut() {
+                            let (bytes, version) = budget
+                                .read_exact_stable_record(
+                                    self.storage,
+                                    &path,
+                                    crate::workspace_io_budget::RECORD_BYTES,
+                                )
+                                .await?;
+                            budget.reserve_bytes(path.len() + version.len() + 128)?;
+                            self.record_versions
+                                .push((path.clone(), version, bytes.len() as u64));
+                            bytes
+                        } else {
+                            self.storage.get_raw(&path).await?
+                        };
+                        let export = crate::workspace_snapshot::decode_export_manifest(&bytes)?;
+                        validate_export_pin_bounds(&initial, &latest, &export)?;
+                        (
+                            RetainedRootKind::Export,
+                            id.clone(),
+                            export.scope().clone(),
+                            export.domains().to_vec(),
+                            export
+                                .required_objects()
+                                .iter()
+                                .map(|object| object.relative_path().to_owned())
+                                .chain(
+                                    export
+                                        .compatibility_artifacts()
+                                        .iter()
+                                        .map(|artifact| artifact.relative_path().to_owned()),
+                                )
+                                .collect(),
+                        )
+                    }
+                    RetentionTarget::Maintenance(_) => {
+                        return Err(validation("maintenance target dispatch mismatch"));
+                    }
+                };
                 // Retained snapshot/export cuts are workspace-owned records. They
                 // are only meaningful under the exact workspace root that produced
                 // them; any other root fails closed rather than aliasing a
@@ -378,10 +445,15 @@ impl<'a> RetainedAuthorityRoots<'a> {
             if self.exhausted {
                 return Ok(None);
             }
-            let page = self
-                .storage
-                .list_page_meta("retention/pins/", self.cursor.as_deref(), 256)
-                .await?;
+            let page = if let Some(budget) = budget.as_deref_mut() {
+                budget
+                    .list_page(self.storage, "retention/pins/", self.cursor.as_deref(), 256)
+                    .await?
+            } else {
+                self.storage
+                    .list_page("retention/pins/", self.cursor.as_deref(), 256)
+                    .await?
+            };
             for object in page.objects {
                 let path = object.path.as_str();
                 if !path.ends_with("/latest.json") {
@@ -518,6 +590,18 @@ fn validate_snapshot_pin_binding(
     selected: &SelectedRetentionPin,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<()> {
+    validate_snapshot_pin_bounds(
+        selected.initial_revision()?,
+        selected.latest_revision()?,
+        snapshot,
+    )
+}
+
+fn validate_snapshot_pin_bounds(
+    initial: &RetentionPinRevision,
+    latest: &RetentionPinRevision,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<()> {
     let expected = RetentionPinRevision::new(
         snapshot.target_pin_id(),
         1,
@@ -526,11 +610,28 @@ fn validate_snapshot_pin_binding(
         snapshot.retained_until(),
         None,
     )?;
-    validate_active_pin_binding(selected, &expected, snapshot.usable_retention_deadline())
+    validate_active_pin_bounds(
+        initial,
+        latest,
+        &expected,
+        snapshot.usable_retention_deadline(),
+    )
 }
 
 fn validate_export_pin_binding(
     selected: &SelectedRetentionPin,
+    export: &ExportManifest,
+) -> Result<()> {
+    validate_export_pin_bounds(
+        selected.initial_revision()?,
+        selected.latest_revision()?,
+        export,
+    )
+}
+
+fn validate_export_pin_bounds(
+    initial: &RetentionPinRevision,
+    latest: &RetentionPinRevision,
     export: &ExportManifest,
 ) -> Result<()> {
     let expected = RetentionPinRevision::new(
@@ -541,17 +642,23 @@ fn validate_export_pin_binding(
         export.retained_until(),
         None,
     )?;
-    validate_active_pin_binding(selected, &expected, export.usable_retention_deadline())
+    validate_active_pin_bounds(
+        initial,
+        latest,
+        &expected,
+        export.usable_retention_deadline(),
+    )
 }
 
-fn validate_active_pin_binding(
-    selected: &SelectedRetentionPin,
+fn validate_active_pin_bounds(
+    initial: &RetentionPinRevision,
+    latest: &RetentionPinRevision,
     expected: &RetentionPinRevision,
     usable_retention_deadline: DateTime<Utc>,
 ) -> Result<()> {
-    if selected.initial_revision()? != expected
-        || selected.latest_revision()?.target() != expected.target()
-        || selected.latest_revision()?.retained_until() > usable_retention_deadline
+    if initial != expected
+        || latest.target() != expected.target()
+        || latest.retained_until() > usable_retention_deadline
     {
         return Err(validation(
             "active retention pin does not match its immutable target record",

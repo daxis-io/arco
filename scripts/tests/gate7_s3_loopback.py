@@ -13,11 +13,12 @@ import ssl
 from pathlib import Path
 import subprocess
 import threading
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 
-def run(executable, evidence, provider_source=None, listing_probe=None, tls=False):
+def run(executable, evidence, provider_source=None, listing_probe=None, tls=False, gc=False):
     objects = {}
     trace = []
     lock = threading.Lock()
@@ -25,6 +26,7 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
     attempts = {}
     pending = {}
     connections = 0
+    gc_control = {"stage": "setup", "fault": None}
 
     expected_tenant = None
     if provider_source is not None:
@@ -43,6 +45,7 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
             with lock:
                 connections += 1
                 self.connection_id = connections
+            self.trace_row = None
 
         def log_message(self, *_):
             pass
@@ -53,9 +56,16 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
                 self.send_header(key, value)
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Connection', 'keep-alive' if listing_probe else 'close')
+            if self.trace_row is not None:
+                self.trace_row.update(status=code, response_headers_bytes=sum(map(len, self._headers_buffer))+2,
+                                      response_body_bytes=0 if head else len(body), finished_ns=time.monotonic_ns())
             self.end_headers()
             if not head:
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    if self.trace_row is not None:
+                        self.trace_row['response_lost'] = True
             self.close_connection = not listing_probe
 
         def error(self, code, name):
@@ -63,6 +73,9 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
             self.respond(code, body, {'Content-Type': 'application/xml'})
 
         def dispatch(self):
+            started_ns = time.monotonic_ns()
+            if gc and self.command in ('GET', 'HEAD'):
+                time.sleep(0.002)
             parsed = urllib.parse.urlsplit(self.path)
             path = urllib.parse.unquote(parsed.path)
             query = urllib.parse.parse_qs(parsed.query)
@@ -76,6 +89,10 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
                     trace.append(dict(method=self.command, path=path, query=query, rejected=True))
                     self.error(403, 'AccessDenied')
                     return
+                if gc and len(trace) >= 50_000:
+                    trace.append(dict(method=self.command, path=path, query=query, stage=gc_control['stage'], rejected=True, reason='local transport cap'))
+                    self.trace_row = trace[-1]
+                    self.error(429, 'LocalRehearsalRequestCap'); return
                 namespace.add(addressed.split('/workspace=')[0])
                 if len(namespace) != 1:
                     self.error(403, 'AccessDenied')
@@ -83,12 +100,18 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
                 trace.append(dict(method=self.command, path=path, query=query,
                                   connection=self.connection_id,
                                   alpn=self.connection.selected_alpn_protocol() if tls else None,
+                                  stage=gc_control['stage'], started_ns=started_ns, range=self.headers.get('Range'),
+                                  request_headers_bytes=len(self.raw_requestline)+sum(len(k)+len(v)+4 for k,v in self.headers.items())+2,
                                   if_match=self.headers.get('If-Match'),
                                   if_none_match=self.headers.get('If-None-Match')))
+                self.trace_row = trace[-1]
                 attempt_key = (self.command, key)
                 attempts[attempt_key] = attempts.get(attempt_key, 0) + 1
                 attempt = attempts[attempt_key]
                 fault = key.rsplit('/conformance/fault/', 1)[-1] if '/conformance/fault/' in key else None
+                if gc and gc_control['fault'] == 'unavailable' and self.command == 'GET' and '/physical/descriptors/' in key:
+                    self.trace_row['injected_status'] = 503
+                    self.error(503, 'SlowDown'); return
                 if self.command == 'GET' and fault == 'read-retry' and attempt == 1:
                     trace[-1]['injected_status'] = 503
                     self.error(503, 'SlowDown')
@@ -159,9 +182,17 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
                                            ('ETag', etag), ('Size', str(len(value))), ('StorageClass', 'STANDARD')]:
                             ET.SubElement(node, name).text = data
                     trace[-1]['returned_objects'] = len(page)
+                    if gc and gc_control['fault'] == 'candidate-version' and after and prefix.endswith('control/v1/domains/catalog/'):
+                        candidate = next((name for name in page if '/000-orphan-' in name), None)
+                        if candidate is not None:
+                            gc_control['changed_candidate'] = (candidate, objects[candidate])
+                            objects[candidate] = (objects[candidate][0], '"changed-after-list"')
+                            self.trace_row['injected_candidate_version_change'] = candidate
+                            gc_control['fault'] = None
                     self.respond(200, ET.tostring(root), {'Content-Type': 'application/xml'})
                 elif self.command == 'PUT':
                     length = int(self.headers.get('Content-Length', '0'))
+                    self.trace_row['request_body_bytes'] = length
                     if not 0 <= length <= 64 * 1024**2:
                         self.error(413, 'EntityTooLarge')
                         return
@@ -174,8 +205,12 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
                     elif self.headers.get('If-Match') and self.headers['If-Match'] != existing[1]:
                         self.error(412, 'PreconditionFailed')
                     else:
-                        etag = '"' + hashlib.md5(body, usedforsecurity=False).hexdigest() + '"'
+                        etag = '"' + (hashlib.sha256(body + str(len(trace)).encode()).hexdigest() if gc else hashlib.md5(body, usedforsecurity=False).hexdigest()) + '"'
                         objects[key] = (body, etag)
+                        if gc and gc_control['fault'] == 'lost-completion' and key.endswith('/complete.json'):
+                            gc_control['fault'] = None
+                            self.trace_row['injected_lost_response_after_application'] = True
+                            self.close_connection = True; return
                         self.respond(200, headers={'ETag': etag})
                 elif self.command == 'DELETE':
                     objects.pop(key, None)
@@ -243,10 +278,22 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
             used += size
         proxy = ListingProxy(f'127.0.0.1:{server.server_port}', 3 if listing_probe == 'cap' else 100_000,
                              evidence / 'listing-connections.jsonl', reserve, loopback=not tls, tls_fixture=tls)
-        command = provider_command(executable, evidence, provider_source, expected_tenant, proxy.url)
+        if not gc:
+            command = provider_command(executable, evidence, provider_source, expected_tenant, proxy.url)
         if listing_probe:
             command[1] = 'provider-rehearsal-' + listing_probe if listing_probe.startswith('put-') else 'provider-rehearsal-listing-probe'
         environment['AWS_REGION'] = 'us-east-2'
+    if gc:
+        try:
+            from authority8_gc_loopback import exercise
+            exercise(executable, evidence, provider_source, expected_tenant, proxy, environment,
+                     objects, trace, gc_control, lock, provider_command)
+        finally:
+            if proxy is not None:
+                proxy.close()
+            server.shutdown(); server.server_close(); thread.join(timeout=5)
+            (evidence / 'transport.json').write_text(json.dumps(trace, indent=2))
+        return
     try:
         with (evidence / 'observations.jsonl').open('w') as output, (evidence / 'stderr.log').open('w') as errors:
             result = subprocess.run(command, env=environment, stdout=output,
@@ -321,11 +368,12 @@ def run(executable, evidence, provider_source=None, listing_probe=None, tls=Fals
     print(json.dumps(summary))
 
 
-def provider_command(executable, evidence, source, tenant, listing_proxy):
+def provider_command(executable, evidence, source, tenant, listing_proxy, gc_stage=None, gc_seed=None):
     """Bind the actual candidate and executable for a credential-free provider rehearsal."""
     import datetime
     import stat
     source = source.resolve(strict=True)
+    source_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=source, text=True).strip()
     def sha(path):
         with path.open('rb') as stream:
             return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -352,7 +400,8 @@ def provider_command(executable, evidence, source, tenant, listing_proxy):
     source = snapshot.resolve()
     build = evidence / 'build-inputs.json'
     build.write_text(json.dumps(dict(rust='1.88.0', target='credential-free-rehearsal', cargo_lock_sha256=sha(source / 'Cargo.lock'))))
-    inventory = json.loads(subprocess.check_output([str(executable), 'inventory']))['provider']
+    inventories = json.loads(subprocess.check_output([str(executable), 'inventory']))
+    inventory = inventories['gc'] if gc_stage else inventories['provider']
     config = dict(schema=1, phase='provider', run_id=tenant, base_sha='92fd19f11a547ece5004ac94cad83a3527471812',
                   source_root=str(source), source_manifest=artifact(source_manifest), binary_patch=artifact(patch_file),
                   contract=artifact(source / 'docs' / 'plans' / '2026-09-10-state-store-vnext-gate-7.md'), build_inputs=artifact(build),
@@ -365,8 +414,12 @@ def provider_command(executable, evidence, source, tenant, listing_proxy):
                   ceilings=dict(elapsed_seconds=21600, requests=2000000, submitted_bytes=20*1024**3, cost_microusd=25000000, evidence_bytes=512*1024**2),
                   fixed_cost_microusd=13000000, request_cost_microusd=5, stored_byte_cost_picousd=44,
                   aws_cli=artifact(Path('/usr/bin/true')))
+    if gc_stage:
+        config.update(phase='authority8-gc-loopback', base_sha=source_head, gc_stage=gc_stage, gc_seed=gc_seed,
+                      contract=artifact(source / 'docs' / 'plans' / '2026-10-24-authority8-gc-integration.md'))
+        config['ceilings'].update(elapsed_seconds=1800, requests=150000, submitted_bytes=64*1024**2, evidence_bytes=32*1024**2)
     path = evidence / 'provider-rehearsal.json'; path.write_text(json.dumps(config, indent=2))
-    return [str(executable), 'provider-rehearsal', str(path.resolve()), sha(path)]
+    return [str(executable), 'gc-rehearsal' if gc_stage else 'provider-rehearsal', str(path.resolve()), sha(path)]
 
 
 if __name__ == '__main__':
@@ -376,5 +429,6 @@ if __name__ == '__main__':
     parser.add_argument('--provider-source', type=Path)
     parser.add_argument('--listing-probe', choices=['empty', 'retry', 'redirect', 'body-error', 'cap', 'put-307', 'put-308'])
     parser.add_argument('--tls', action='store_true')
+    parser.add_argument('--gc', action='store_true')
     args = parser.parse_args()
-    run(args.executable.resolve(strict=True), args.evidence.resolve(), args.provider_source, args.listing_probe, args.tls)
+    run(args.executable.resolve(strict=True), args.evidence.resolve(), args.provider_source, args.listing_probe, args.tls, args.gc)

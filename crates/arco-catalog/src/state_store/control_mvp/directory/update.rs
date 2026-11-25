@@ -12,7 +12,7 @@ pub(in super::super) struct Edit {
 
 struct Change {
     key: Vec<u8>,
-    old: Option<Node>,
+    old: Option<Leaf>,
     new: Vec<Node>,
 }
 
@@ -157,6 +157,9 @@ impl Directory {
         }
         let mut changes = Vec::new();
         for edit in edits {
+            if let Some(old) = &edit.old {
+                self.leaf_node(old)?;
+            }
             let anchor = edit
                 .old
                 .as_ref()
@@ -172,11 +175,7 @@ impl Directory {
             }
             changes.push(Change {
                 key: anchor.first.clone(),
-                old: edit
-                    .old
-                    .as_ref()
-                    .map(|leaf| self.leaf_node(leaf))
-                    .transpose()?,
+                old: edit.old.clone(),
                 new: edit
                     .new
                     .iter()
@@ -223,21 +222,7 @@ impl Directory {
         changes: &[&Change],
         budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
-        let mut removed = Vec::new();
-        for change in changes {
-            if let Some(old) = change.old {
-                let slot = leaves
-                    .iter()
-                    .position(|node| *node == old)
-                    .ok_or_else(|| invariant_violation("replaced leaf is absent from old root"))?;
-                if removed.contains(&slot) {
-                    return Err(invariant_violation(
-                        "multiple replacements claim one old directory leaf",
-                    ));
-                }
-                removed.push(slot);
-            }
-        }
+        let removed = self.removed_leaves(&leaves, changes, budget).await?;
         let mut leaves = leaves
             .into_iter()
             .enumerate()
@@ -374,21 +359,7 @@ impl Directory {
         changes: &[&Change],
         budget: &mut ReadBudget<'_>,
     ) -> Result<Vec<Node>> {
-        let mut removed = Vec::new();
-        for change in changes {
-            if let Some(old) = change.old {
-                let slot = leaves
-                    .iter()
-                    .position(|node| *node == old)
-                    .ok_or_else(|| invariant_violation("replaced leaf is absent from old root"))?;
-                if removed.contains(&slot) {
-                    return Err(invariant_violation(
-                        "multiple replacements claim one old directory leaf",
-                    ));
-                }
-                removed.push(slot);
-            }
-        }
+        let removed = self.removed_leaves(&leaves, changes, budget).await?;
         let mut result = leaves
             .into_iter()
             .enumerate()
@@ -405,6 +376,41 @@ impl Directory {
         let result = keyed.into_iter().map(|(_, leaf)| leaf).collect::<Vec<_>>();
         self.verify_order(&result, budget).await?;
         Ok(result)
+    }
+
+    async fn removed_leaves(
+        &self,
+        leaves: &[Node],
+        changes: &[&Change],
+        budget: &mut ReadBudget<'_>,
+    ) -> Result<Vec<usize>> {
+        let mut removed = Vec::new();
+        for change in changes {
+            if let Some(old) = &change.old {
+                let mut found = None;
+                for (slot, node) in leaves.iter().enumerate() {
+                    if node.depth == 0
+                        && node.bytes == old.bytes
+                        && node.rows == old.rows
+                        && node.digest == old.digest
+                        && self.read_key(node.first, budget).await?.as_ref() == old.first
+                        && self.read_key(node.last, budget).await?.as_ref() == old.last
+                    {
+                        found = Some(slot);
+                        break;
+                    }
+                }
+                let slot = found
+                    .ok_or_else(|| invariant_violation("replaced leaf is absent from old root"))?;
+                if removed.contains(&slot) {
+                    return Err(invariant_violation(
+                        "multiple replacements claim one old directory leaf",
+                    ));
+                }
+                removed.push(slot);
+            }
+        }
+        Ok(removed)
     }
 
     async fn verify_order(&self, nodes: &[Node], budget: &mut ReadBudget<'_>) -> Result<()> {

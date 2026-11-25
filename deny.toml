@@ -45,6 +45,8 @@ allow = [
 confidence-threshold = 0.93
 exceptions = [
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+    # Existing Iceberg credential dependency; keep CC0 scoped to the reviewed release.
+    { allow = ["CC0-1.0"], crate = "tiny-keccak@2.0.2" },
 ]
 
 # Workspace crates are private (not published) - exempt from license checks

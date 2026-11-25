@@ -3,7 +3,7 @@
 mod bounded;
 mod restore_intent;
 pub(crate) use bounded::{BoundedMutation, RetainedPointerSend};
-use restore_intent::ArmedRestorePublicationIntent;
+pub(crate) use restore_intent::ArmedRestorePublicationIntent;
 
 use std::collections::BTreeSet;
 use std::future::Future;

@@ -18,7 +18,9 @@ use arco_catalog::{
     ControlMvpMaintenanceWorker, ControlMvpStateStore, ScanRequest, StateScope, StateToken,
     TxnOptions,
 };
-use arco_core::storage::{ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult};
+use arco_core::storage::{
+    ClassifiedBytes, ListPage, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 use arco_core::{MemoryBackend, ScopedStorage};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -78,6 +80,10 @@ pub struct BackendCounts {
     pub directory_references: u64,
     /// Leaves presented to the streaming directory builder.
     pub streaming_builder_inputs: u64,
+    pub gc_probe_batches: u64,
+    pub gc_probe_requests: u64,
+    pub gc_head_batches: u64,
+    pub gc_head_requests: u64,
     pub decoder_scratch_allocation_calls: u64,
     pub decoder_scratch_allocation_bytes: u64,
     pub request_copy_allocation_calls: u64,
@@ -121,6 +127,8 @@ pub struct BackendCounts {
     pub object_reads: BTreeMap<String, ObjectReadCounts>,
     /// Per-path-class physical I/O. Historical `object_reads` remains intact.
     pub object_class_io: BTreeMap<String, ObjectClassCounts>,
+    /// Actual addressed paths, kept separate from the legacy per-class read map.
+    pub object_io: BTreeMap<String, ObjectClassCounts>,
     pub object_writes: BTreeMap<String, u64>,
     pub requested_ranges: BTreeMap<String, u64>,
     pub logical_storage_calls: u64,
@@ -134,6 +142,9 @@ pub struct BackendCounts {
     pub put_attempts: u64,
     pub list_attempts: u64,
     pub list_page_attempts: u64,
+    pub list_returned_objects: u64,
+    /// Owned metadata records and strings returned by LIST; not HTTP wire bytes.
+    pub list_metadata_bytes: u64,
     pub delete_attempts: u64,
     pub head_cas_attempts: u64,
     pub head_cas_attempt_bytes: u64,
@@ -224,6 +235,10 @@ impl BackendCounts {
             + self.delete_attempts
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat named counters keep each measured operation visible"
+    )]
     fn add(&mut self, other: &Self) {
         self.decoded_rows += other.decoded_rows;
         self.transition_proof_rows += other.transition_proof_rows;
@@ -231,6 +246,10 @@ impl BackendCounts {
         self.rewritten_blocks += other.rewritten_blocks;
         self.directory_references += other.directory_references;
         self.streaming_builder_inputs += other.streaming_builder_inputs;
+        self.gc_probe_batches += other.gc_probe_batches;
+        self.gc_probe_requests += other.gc_probe_requests;
+        self.gc_head_batches += other.gc_head_batches;
+        self.gc_head_requests += other.gc_head_requests;
         self.decoder_scratch_allocation_calls += other.decoder_scratch_allocation_calls;
         self.decoder_scratch_allocation_bytes += other.decoder_scratch_allocation_bytes;
         self.request_copy_allocation_calls += other.request_copy_allocation_calls;
@@ -280,18 +299,23 @@ impl BackendCounts {
             entry.returned_bytes += read.returned_bytes;
             entry.failures += read.failures;
         }
-        for (class, io) in &other.object_class_io {
-            let total = self.object_class_io.entry(class.clone()).or_default();
-            total.full_get_attempts += io.full_get_attempts;
-            total.range_get_attempts += io.range_get_attempts;
-            total.read_bytes += io.read_bytes;
-            total.read_failures += io.read_failures;
-            total.head_attempts += io.head_attempts;
-            total.head_metadata_bytes += io.head_metadata_bytes;
-            total.head_missing += io.head_missing;
-            total.head_failures += io.head_failures;
-            total.put_attempts += io.put_attempts;
-            total.write_attempt_bytes += io.write_attempt_bytes;
+        for (target, source) in [
+            (&mut self.object_class_io, &other.object_class_io),
+            (&mut self.object_io, &other.object_io),
+        ] {
+            for (class, io) in source {
+                let total = target.entry(class.clone()).or_default();
+                total.full_get_attempts += io.full_get_attempts;
+                total.range_get_attempts += io.range_get_attempts;
+                total.read_bytes += io.read_bytes;
+                total.read_failures += io.read_failures;
+                total.head_attempts += io.head_attempts;
+                total.head_metadata_bytes += io.head_metadata_bytes;
+                total.head_missing += io.head_missing;
+                total.head_failures += io.head_failures;
+                total.put_attempts += io.put_attempts;
+                total.write_attempt_bytes += io.write_attempt_bytes;
+            }
         }
         for (path, bytes) in &other.object_writes {
             *self.object_writes.entry(path.clone()).or_default() += bytes;
@@ -309,6 +333,8 @@ impl BackendCounts {
         self.put_attempts += other.put_attempts;
         self.list_attempts += other.list_attempts;
         self.list_page_attempts += other.list_page_attempts;
+        self.list_returned_objects += other.list_returned_objects;
+        self.list_metadata_bytes += other.list_metadata_bytes;
         self.delete_attempts += other.delete_attempts;
         self.head_cas_attempts += other.head_cas_attempts;
         self.head_cas_attempt_bytes += other.head_cas_attempt_bytes;
@@ -335,6 +361,16 @@ pub struct CountingBackend {
     fixture_head_resets: AtomicUsize,
     pause_cache_payload: AtomicBool,
     cache_payload_release: tokio::sync::Notify,
+    pub gc_probe_yield: AtomicBool,
+    gc_inflight_probes: AtomicUsize,
+    pub gc_max_probes: AtomicUsize,
+}
+
+fn metadata_owned_bytes(meta: &ObjectMeta) -> u64 {
+    (size_of::<ObjectMeta>()
+        + meta.path.capacity()
+        + meta.version.capacity()
+        + meta.etag.as_ref().map_or(0, String::capacity)) as u64
 }
 
 impl CountingBackend {
@@ -355,6 +391,9 @@ impl CountingBackend {
             fixture_head_resets: AtomicUsize::new(0),
             pause_cache_payload: AtomicBool::new(false),
             cache_payload_release: tokio::sync::Notify::new(),
+            gc_probe_yield: AtomicBool::new(false),
+            gc_inflight_probes: AtomicUsize::new(0),
+            gc_max_probes: AtomicUsize::new(0),
         }
     }
     fn count(&self, update: impl Fn(&mut BackendCounts)) {
@@ -460,6 +499,10 @@ impl CountingBackend {
                 result.rewritten_blocks += work.rewritten_blocks;
                 result.directory_references += work.directory_references;
                 result.streaming_builder_inputs += work.streaming_builder_inputs;
+                result.gc_probe_batches += work.gc_probe_batches;
+                result.gc_probe_requests += work.gc_probe_requests;
+                result.gc_head_batches += work.gc_head_batches;
+                result.gc_head_requests += work.gc_head_requests;
 
                 let phase = result.phases.entry(name.to_string()).or_default();
                 phase.decoded_rows += work.decoded_rows;
@@ -468,6 +511,10 @@ impl CountingBackend {
                 phase.rewritten_blocks += work.rewritten_blocks;
                 phase.directory_references += work.directory_references;
                 phase.streaming_builder_inputs += work.streaming_builder_inputs;
+                phase.gc_probe_batches += work.gc_probe_batches;
+                phase.gc_probe_requests += work.gc_probe_requests;
+                phase.gc_head_batches += work.gc_head_batches;
+                phase.gc_head_requests += work.gc_head_requests;
             }
             result.sha256_helper_calls = calls;
             result.sha256_helper_bytes = bytes;
@@ -579,14 +626,18 @@ impl StorageBackend for CountingBackend {
                     Ok(bytes) => read.returned_bytes += bytes.len() as u64,
                     Err(_) => read.failures += 1,
                 }
-                let io = count
-                    .object_class_io
-                    .entry(physical_object_class(path).to_string())
-                    .or_default();
-                io.full_get_attempts += 1;
-                match &result {
-                    Ok(bytes) => io.read_bytes += bytes.len() as u64,
-                    Err(_) => io.read_failures += 1,
+                for io in [
+                    count
+                        .object_class_io
+                        .entry(physical_object_class(path).to_string())
+                        .or_default(),
+                    count.object_io.entry(path.to_owned()).or_default(),
+                ] {
+                    io.full_get_attempts += 1;
+                    match &result {
+                        Ok(bytes) => io.read_bytes += bytes.len() as u64,
+                        Err(_) => io.read_failures += 1,
+                    }
                 }
             });
             if let Ok(bytes) = &result {
@@ -596,6 +647,30 @@ impl StorageBackend for CountingBackend {
         result
     }
     async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        Ok(self.get_range_with_ownership(path, range).await?.bytes)
+    }
+    async fn get_range_with_ownership(
+        &self,
+        path: &str,
+        range: Range<u64>,
+    ) -> arco_core::Result<ClassifiedBytes> {
+        struct Inflight<'a>(&'a AtomicUsize);
+        impl Drop for Inflight<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _inflight = if self.gc_probe_yield.load(Ordering::SeqCst)
+            && path.contains("/physical/descriptors/")
+        {
+            let active = self.gc_inflight_probes.fetch_add(1, Ordering::SeqCst) + 1;
+            let guard = Inflight(&self.gc_inflight_probes);
+            self.gc_max_probes.fetch_max(active, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Some(guard)
+        } else {
+            None
+        };
         if self.pause_cache_payload.load(Ordering::SeqCst)
             && matches!(object_class(path), "transaction" | "directory" | "data")
         {
@@ -616,7 +691,9 @@ impl StorageBackend for CountingBackend {
         for _ in 0..repetitions {
             self.count(|count| count.range_get_attempts += 1);
             let (value, allocations) = self
-                .measure_backend_allocations(self.inner.get_range(path, range.clone()))
+                .measure_backend_allocations(
+                    self.inner.get_range_with_ownership(path, range.clone()),
+                )
                 .await;
             result = value;
             self.count(|count| {
@@ -631,21 +708,27 @@ impl StorageBackend for CountingBackend {
                     .or_default();
                 read.ranges += 1;
                 match &result {
-                    Ok(bytes) => read.returned_bytes += bytes.len() as u64,
+                    Ok(response) => read.returned_bytes += response.bytes.len() as u64,
                     Err(_) => read.failures += 1,
                 }
-                let io = count
-                    .object_class_io
-                    .entry(physical_object_class(path).to_string())
-                    .or_default();
-                io.range_get_attempts += 1;
-                match &result {
-                    Ok(bytes) => io.read_bytes += bytes.len() as u64,
-                    Err(_) => io.read_failures += 1,
+                for io in [
+                    count
+                        .object_class_io
+                        .entry(physical_object_class(path).to_string())
+                        .or_default(),
+                    count.object_io.entry(path.to_owned()).or_default(),
+                ] {
+                    io.range_get_attempts += 1;
+                    match &result {
+                        Ok(response) => io.read_bytes += response.bytes.len() as u64,
+                        Err(_) => io.read_failures += 1,
+                    }
                 }
             });
-            if let Ok(bytes) = &result {
-                self.count(|count| count.read_bytes += u64::try_from(bytes.len()).unwrap());
+            if let Ok(response) = &result {
+                self.count(|count| {
+                    count.read_bytes += u64::try_from(response.bytes.len()).unwrap();
+                });
             }
         }
         result
@@ -671,12 +754,16 @@ impl StorageBackend for CountingBackend {
             count.put_attempts += 1;
             count.write_attempt_bytes += u64::try_from(bytes.len()).unwrap();
             *count.object_writes.entry(path.to_string()).or_default() += bytes.len() as u64;
-            let io = count
-                .object_class_io
-                .entry(physical_object_class(path).to_string())
-                .or_default();
-            io.put_attempts += 1;
-            io.write_attempt_bytes += bytes.len() as u64;
+            for io in [
+                count
+                    .object_class_io
+                    .entry(physical_object_class(path).to_string())
+                    .or_default(),
+                count.object_io.entry(path.to_owned()).or_default(),
+            ] {
+                io.put_attempts += 1;
+                io.write_attempt_bytes += bytes.len() as u64;
+            }
             if head {
                 count.head_cas_attempts += 1;
                 count.head_cas_attempt_bytes += bytes.len() as u64;
@@ -722,36 +809,44 @@ impl StorageBackend for CountingBackend {
             count.backend_allocation_bytes += allocations.bytes;
             match &result {
                 Ok(Some(meta)) => {
-                    let metadata_bytes = (size_of::<ObjectMeta>()
-                        + meta.path.capacity()
-                        + meta.version.capacity()
-                        + meta.etag.as_ref().map_or(0, String::capacity))
-                        as u64;
+                    let metadata_bytes = metadata_owned_bytes(meta);
                     count.head_metadata_bytes += metadata_bytes;
-                    let io = count
-                        .object_class_io
-                        .entry(physical_object_class(path).to_string())
-                        .or_default();
-                    io.head_attempts += 1;
-                    io.head_metadata_bytes += metadata_bytes;
+                    for io in [
+                        count
+                            .object_class_io
+                            .entry(physical_object_class(path).to_string())
+                            .or_default(),
+                        count.object_io.entry(path.to_owned()).or_default(),
+                    ] {
+                        io.head_attempts += 1;
+                        io.head_metadata_bytes += metadata_bytes;
+                    }
                 }
                 Ok(None) => {
                     count.head_missing += 1;
-                    let io = count
-                        .object_class_io
-                        .entry(physical_object_class(path).to_string())
-                        .or_default();
-                    io.head_attempts += 1;
-                    io.head_missing += 1;
+                    for io in [
+                        count
+                            .object_class_io
+                            .entry(physical_object_class(path).to_string())
+                            .or_default(),
+                        count.object_io.entry(path.to_owned()).or_default(),
+                    ] {
+                        io.head_attempts += 1;
+                        io.head_missing += 1;
+                    }
                 }
                 Err(_) => {
                     count.head_failures += 1;
-                    let io = count
-                        .object_class_io
-                        .entry(physical_object_class(path).to_string())
-                        .or_default();
-                    io.head_attempts += 1;
-                    io.head_failures += 1;
+                    for io in [
+                        count
+                            .object_class_io
+                            .entry(physical_object_class(path).to_string())
+                            .or_default(),
+                        count.object_io.entry(path.to_owned()).or_default(),
+                    ] {
+                        io.head_attempts += 1;
+                        io.head_failures += 1;
+                    }
                 }
             }
         });
@@ -762,7 +857,14 @@ impl StorageBackend for CountingBackend {
             count.logical_storage_calls += 1;
             count.list_attempts += 1;
         });
-        self.inner.list(prefix).await
+        let result = self.inner.list(prefix).await;
+        if let Ok(objects) = &result {
+            self.count(|count| {
+                count.list_returned_objects += objects.len() as u64;
+                count.list_metadata_bytes += objects.iter().map(metadata_owned_bytes).sum::<u64>();
+            });
+        }
+        result
     }
     async fn list_page(
         &self,
@@ -774,7 +876,15 @@ impl StorageBackend for CountingBackend {
             count.logical_storage_calls += 1;
             count.list_page_attempts += 1;
         });
-        self.inner.list_page(prefix, start_after, limit).await
+        let result = self.inner.list_page(prefix, start_after, limit).await;
+        if let Ok(page) = &result {
+            self.count(|count| {
+                count.list_returned_objects += page.objects.len() as u64;
+                count.list_metadata_bytes +=
+                    page.objects.iter().map(metadata_owned_bytes).sum::<u64>();
+            });
+        }
+        result
     }
     async fn delete(&self, path: &str) -> arco_core::Result<()> {
         self.count(|count| {
@@ -873,6 +983,63 @@ mod request_peak_tests {
     use super::{CountingBackend, measure_request_allocations};
     use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn head_accounting_preserves_the_legacy_class_map() {
+        let backend = CountingBackend::new(1);
+        backend
+            .put(
+                "some/file",
+                Bytes::from_static(b"metadata"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        backend.take();
+        backend.head("some/file").await.unwrap();
+        backend.get_range("some/file", 0..4).await.unwrap();
+        backend.list_page("some/", None, 2).await.unwrap();
+        let counts = backend.take();
+        let object = counts.object_io.get("some/file").unwrap();
+        assert_eq!(
+            (
+                object.head_attempts,
+                object.range_get_attempts,
+                object.read_bytes
+            ),
+            (1, 1, 4)
+        );
+        assert_eq!(counts.list_returned_objects, 1);
+        assert!(counts.list_metadata_bytes > 0);
+        assert!(
+            counts.object_reads.keys().all(|key| !key.contains('/')),
+            "per-object paths must not be mixed into the historical per-class map"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_backend_listing_owns_only_the_bounded_page() {
+        let backend = arco_core::MemoryBackend::new();
+        for n in 0..4096 {
+            backend
+                .put(
+                    &format!("inventory/{n:08}"),
+                    Bytes::from_static(b"tiny"),
+                    WritePrecondition::DoesNotExist,
+                )
+                .await
+                .unwrap();
+        }
+        let (page, allocations) =
+            measure_request_allocations(backend.list_page("inventory/", None, 16)).await;
+        let page = page.unwrap();
+        assert_eq!(page.objects.len(), 16);
+        assert_eq!(page.next_start_after.as_deref(), Some("inventory/00000015"));
+        assert!(
+            allocations.bytes < 64 * 1024,
+            "page materialized the retained inventory: {allocations:?}"
+        );
+    }
 
     #[tokio::test]
     async fn memory_backend_insertion_does_not_copy_retained_inventory() {

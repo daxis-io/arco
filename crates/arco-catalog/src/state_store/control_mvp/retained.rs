@@ -14,6 +14,8 @@ use arco_core::{AuthorityWritePrecondition, WriteResult};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::BTreeSet;
 
 const POINTER_RECORD_TYPE: &str = "arco.retained-source.pointer";
 const DESCRIPTOR_RECORD_TYPE: &str = "arco.retained-source.descriptor";
@@ -24,6 +26,8 @@ const DIRECTORY_PAGE_LIMIT: usize = 64 * 1024;
 const DIRECTORY_DEPTH: usize = 8;
 const READ_OBJECT_LIMIT: usize = 16;
 const READ_BYTE_LIMIT: usize = 8 * 1024 * 1024;
+// Two notice directory proofs can read indirect outbox fence keys.
+const RESTORE_READ_OBJECT_LIMIT: usize = 2048;
 
 /// Private prepared path-copy publication. Only authenticated capture constructs it.
 pub struct RetainedSourcePublication {
@@ -116,6 +120,15 @@ impl RetainedSourcePublication {
                 RetainedPointerIntentPrecondition::DoesNotExist {},
             ),
         };
+        let previous_generation = previous.as_ref().map_or(0, |pointer| pointer.generation);
+        let generation = previous_generation
+            .checked_add(1)
+            .ok_or_else(|| invariant_violation("retained generation overflow"))?;
+        let publication_id = format!(
+            "retained-{capture_epoch}-{generation}-{}",
+            sha256_hex(operation_id.as_bytes())
+        );
+        let directory = directory.for_publication(&publication_id)?;
         let descriptor = RetainedDescriptor {
             record_type: DESCRIPTOR_RECORD_TYPE.into(),
             version: RECORD_VERSION,
@@ -180,7 +193,6 @@ impl RetainedSourcePublication {
             })
             .await?;
         let root_bytes = root.encode();
-        let previous_generation = previous.as_ref().map_or(0, |pointer| pointer.generation);
         let pointer = RetainedPointer {
             record_type: POINTER_RECORD_TYPE.into(),
             version: RECORD_VERSION,
@@ -189,12 +201,11 @@ impl RetainedSourcePublication {
             directory_root_hex: hex::encode(&root_bytes),
             previous_generation,
             previous_root_sha256: previous.map(|pointer| pointer.root_sha256),
-            generation: previous_generation
-                .checked_add(1)
-                .ok_or_else(|| invariant_violation("retained generation overflow"))?,
+            generation,
             root_sha256: sha256_hex(&root_bytes),
             last_operation_id: operation_id,
             capture_epoch,
+            directory_object_version: Some(2),
         };
         let bytes = encode_json_limited(&pointer, POINTER_LIMIT, "retained source pointer")?;
         let intent = ArmedRetainedPointerIntent {
@@ -448,6 +459,8 @@ pub(super) struct ReadBudget<'a> {
     objects: usize,
     bytes: usize,
     operations: usize,
+    object_limit: usize,
+    byte_limit: usize,
     workspace: Option<&'a mut crate::workspace_io_budget::WorkspaceIoBudget>,
 }
 
@@ -457,6 +470,8 @@ impl<'a> ReadBudget<'a> {
             objects: 0,
             bytes: 0,
             operations: 0,
+            object_limit: READ_OBJECT_LIMIT,
+            byte_limit: READ_BYTE_LIMIT,
             workspace: None,
         }
     }
@@ -468,6 +483,55 @@ impl<'a> ReadBudget<'a> {
             workspace: Some(workspace),
             ..Self::new()
         }
+    }
+
+    pub(super) fn for_recovery(
+        workspace: &'a mut crate::workspace_io_budget::WorkspaceIoBudget,
+    ) -> Self {
+        Self {
+            object_limit: RESTORE_READ_OBJECT_LIMIT,
+            byte_limit: 64 * 1024 * 1024,
+            workspace: Some(workspace),
+            ..Self::new()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn for_gc(workspace: &'a mut crate::workspace_io_budget::WorkspaceIoBudget) -> Self {
+        Self {
+            object_limit: 4096,
+            byte_limit: 64 * 1024 * 1024,
+            workspace: Some(workspace),
+            ..Self::new()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) async fn list_gc_manifests(
+        &mut self,
+        storage: &arco_core::RootStorage,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<arco_core::storage::ListPage> {
+        self.workspace
+            .as_mut()
+            .ok_or_else(|| invariant_violation("GC requires its invocation invoice"))?
+            .list_page(storage, prefix, cursor, limit)
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn gc_should_yield(&self) -> bool {
+        self.workspace.as_deref().is_some_and(|io| {
+            let (bytes, operations, _, _) = io.test_accounting();
+            bytes > 32 * 1024 * 1024 || operations > 2500
+        })
+    }
+
+    pub(super) fn allow_restore_artifacts(&mut self) {
+        self.object_limit = self.object_limit.max(RESTORE_READ_OBJECT_LIMIT);
+        self.byte_limit = 64 * 1024 * 1024;
     }
 
     pub(super) fn charge_head(&mut self, meta: &arco_core::storage::ObjectMeta) -> Result<()> {
@@ -486,9 +550,9 @@ impl<'a> ReadBudget<'a> {
             .bytes
             .checked_add(bytes)
             .ok_or_else(|| invariant_violation("retained source read byte count overflows"))?;
-        if objects > READ_OBJECT_LIMIT || bytes > READ_BYTE_LIMIT {
+        if objects > self.object_limit || bytes > self.byte_limit {
             return Err(CatalogError::MaintenanceBackpressure {
-                message: "retained source resolution exceeds its 16-object or 8 MiB budget".into(),
+                message: "retained source resolution exceeds its bounded read budget".into(),
             });
         }
         if let Some(workspace) = &mut self.workspace {
@@ -537,6 +601,8 @@ struct RetainedPointer {
     root_sha256: String,
     last_operation_id: String,
     capture_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    directory_object_version: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,7 +629,7 @@ fn retained_prefix(store: &ControlMvpStateStore) -> String {
     format!("{}/retained/v1", store.paths.base_prefix())
 }
 
-fn pointer_path(store: &ControlMvpStateStore) -> String {
+pub(super) fn pointer_path(store: &ControlMvpStateStore) -> String {
     format!("{}/current.json", retained_prefix(store))
 }
 
@@ -743,6 +809,121 @@ async fn load_selected_pointer(
     })
 }
 
+/// Validates every selected retained member before a private authority-8 GC
+/// page can treat an immutable object as unattached.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::too_many_lines,
+    reason = "selected pointer and descriptor authentication share one refenced GC read boundary"
+)]
+pub(super) async fn protect_gc_selected_pointer(
+    store: &ControlMvpStateStore,
+    candidates: &mut BTreeSet<String>,
+    budget: &mut ReadBudget<'_>,
+) -> Result<()> {
+    let pointer_path = pointer_path(store);
+    budget.operation()?;
+    let Some(before) = store.retention.head_raw(&pointer_path).await? else {
+        return Ok(());
+    };
+    if before.version.is_empty() {
+        return Err(invariant_violation(
+            "selected retained pointer has no version",
+        ));
+    }
+    let binding = store.durable_authority8_binding()?;
+    budget.charge_head(&before)?;
+    let pointer = load_selected_pointer(store, budget, binding).await?;
+    let directory =
+        super::directory::Directory::retained_reference(store.retention.clone(), &store.scope)?;
+    let root = directory.decode_root(&decode_root_hex(
+        &pointer.directory_root_hex,
+        "retained source pointer",
+    )?)?;
+    let mut cursor = None;
+    loop {
+        let mut scan_budget = super::directory::ReadBudget::tracking_with_retained(budget);
+        let page = directory
+            .scan(&root, b"", None, 128, cursor.as_ref(), &mut scan_budget)
+            .await?;
+        for path in scan_budget.take_authenticated_paths() {
+            candidates.remove(&path);
+        }
+        drop(scan_budget);
+        for leaf in &page.leaves {
+            if leaf.first != leaf.last
+                || leaf.rows != 1
+                || leaf.bytes == 0
+                || leaf.bytes as usize > DESCRIPTOR_LIMIT
+            {
+                return Err(invariant_violation("invalid selected retained leaf"));
+            }
+            let digest = hex::encode(leaf.digest);
+            let path = descriptor_path(store, &digest);
+            let bytes = read_immutable_json(
+                store,
+                budget,
+                &path,
+                DESCRIPTOR_LIMIT,
+                Some(leaf.bytes as usize),
+                "selected retained descriptor",
+            )
+            .await?;
+            if sha256_hex(&bytes) != digest {
+                return Err(invariant_violation(
+                    "selected retained descriptor digest differs",
+                ));
+            }
+            let descriptor: RetainedDescriptor =
+                canonical(&bytes, DESCRIPTOR_LIMIT, "selected retained descriptor")?;
+            let reference = &descriptor.reference;
+            reference.validate()?;
+            validate_descriptor(&descriptor, reference, binding)?;
+            if leaf.first != reference_key(reference)?
+                || reference.scope() != &store.scope
+                || reference.manifest_path() != store.paths.manifest_object(reference.manifest_id())
+            {
+                return Err(invariant_violation(
+                    "selected retained member differs from scope",
+                ));
+            }
+            candidates.remove(&path);
+            let manifest = read_immutable_json(
+                store,
+                budget,
+                reference.manifest_path(),
+                MAX_CONTROL_JSON_BYTES,
+                None,
+                "selected retained source manifest",
+            )
+            .await?;
+            if prefixed_sha256(&manifest) != reference.manifest_sha256() {
+                return Err(invariant_violation(
+                    "selected retained source manifest digest differs",
+                ));
+            }
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    budget.operation()?;
+    let after = store
+        .retention
+        .head_raw(&pointer_path)
+        .await?
+        .ok_or_else(|| invariant_violation("selected retained pointer disappeared"))?;
+    budget.charge_head(&after)?;
+    if before.version != after.version {
+        return Err(invariant_violation(
+            "selected retained pointer changed during GC scan",
+        ));
+    }
+    candidates.remove(&pointer_path);
+    Ok(())
+}
+
 fn validate_pointer(
     store: &ControlMvpStateStore,
     binding: DurableAuthorityBinding,
@@ -757,6 +938,9 @@ fn validate_pointer(
         || pointer.generation == 0
         || pointer.capture_epoch == 0
         || pointer.last_operation_id.is_empty()
+        || pointer
+            .directory_object_version
+            .is_some_and(|version| version != 2)
         || !valid_raw_digest(&pointer.root_sha256)
         || pointer.root_sha256 != sha256_hex(&root)
         || (pointer.previous_generation == 0) != pointer.previous_root_sha256.is_none()
@@ -1253,6 +1437,7 @@ impl ControlMvpStateStore {
             root_sha256: root_digest,
             last_operation_id: "test-retained-source".into(),
             capture_epoch: 1,
+            directory_object_version: None,
         };
         let pointer_bytes =
             encode_json_limited(&pointer, POINTER_LIMIT, "retained source pointer")?;
@@ -1480,6 +1665,129 @@ mod tests {
         backend.range_objects.store(0, Ordering::Relaxed);
         backend.directory_objects.store(0, Ordering::Relaxed);
         (store, reference, backend)
+    }
+
+    #[tokio::test]
+    async fn selected_retained_pointer_binds_v2_directory_objects() {
+        use crate::retention_coordination::{RetentionMutationEpoch, RetentionMutationKind};
+        use crate::workspace_io_budget::WorkspaceIoBudget;
+        let (store, _, _) = fixture().await;
+        let mut budget = WorkspaceIoBudget::new();
+        let mut guard = budget
+            .acquire_retention_lock(
+                store
+                    .retention
+                    .as_legacy_scoped()
+                    .expect("workspace root")
+                    .clone(),
+                "retained-directory-version",
+            )
+            .await
+            .expect("retention lock");
+        let mut epoch = RetentionMutationEpoch::claim_bounded(
+            store
+                .retention
+                .as_legacy_scoped()
+                .expect("workspace root")
+                .clone(),
+            &mut guard,
+            RetentionMutationKind::WorkspaceSnapshotFinalize,
+            "retained-directory-version",
+            &mut budget,
+        )
+        .await
+        .expect("epoch");
+        let prepared = prepare(
+            &store,
+            &mut RetainedSourceCaptureContext::new(
+                store.scope.clone(),
+                "retained-directory-version".into(),
+                &mut epoch,
+                &mut budget,
+            ),
+            chrono::Utc::now() + chrono::Duration::days(1),
+        )
+        .await
+        .expect("prepare source");
+        prepared
+            .publish(&mut epoch, &mut guard, &mut budget)
+            .await
+            .expect("publish selector");
+        let bytes = store
+            .retention
+            .get_raw(&pointer_path(&store))
+            .await
+            .expect("selected pointer");
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).expect("pointer JSON");
+        assert_eq!(wire["directory_object_version"], 2);
+    }
+
+    #[tokio::test]
+    async fn gc_dry_run_rejects_missing_selected_retained_descriptor() {
+        let store = ControlMvpStateStore::new_synthetic_bounded(
+            ScopedStorage::new(Arc::new(MemoryBackend::new()), "tenant", "workspace").unwrap(),
+            StateScope::new("tenant", "workspace", "catalog"),
+        )
+        .unwrap()
+        .with_durable_authority_binding(DurableAuthorityBinding::new([22; 32]));
+        let mut txn = store
+            .begin_control_txn(super::super::TxnOptions::default())
+            .await
+            .unwrap();
+        txn.set_logical_operation("gc-retained-source", "test", &"a1".repeat(32))
+            .unwrap();
+        let source = txn.commit_v2().await.unwrap();
+        let reference = store
+            .persist_state_reference(
+                source.token(),
+                chrono::Utc::now() + chrono::Duration::days(1),
+            )
+            .await
+            .unwrap();
+        store
+            .install_test_retained_source(&reference)
+            .await
+            .unwrap();
+        let prefix = format!("{}/descriptors/", retained_prefix(&store));
+        let page = store
+            .retention
+            .list_page_meta(&prefix, None, 1)
+            .await
+            .unwrap();
+        let descriptor = page
+            .objects
+            .first()
+            .expect("selected descriptor")
+            .path
+            .to_string();
+        let orphan = store.paths.state_object(&"ef".repeat(32));
+        store
+            .retention
+            .put_raw(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .unwrap();
+        let worker = super::super::ControlMvpMaintenanceWorker::new_synthetic_bounded(&store);
+        let now = chrono::Utc::now() + chrono::Duration::days(40);
+        let valid = worker
+            .plan_gc_at(now, Vec::new())
+            .await
+            .expect("valid retained selector");
+        assert!(
+            valid
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.path() == orphan)
+        );
+        store.retention.delete(&descriptor).await.unwrap();
+        assert!(
+            worker.plan_gc_at(now, Vec::new()).await.is_err(),
+            "a missing selected retained descriptor cannot authorize a GC candidate"
+        );
+        assert!(store.retention.head_raw(&orphan).await.unwrap().is_some());
     }
 
     #[tokio::test]

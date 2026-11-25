@@ -8,7 +8,9 @@ use super::{
     validate_raw_checksum, write_projection_source,
 };
 use crate::state_store::ProjectionIntentV2;
+use arco_core::{DistributedLock, LockGuard, RootStorage};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 const SYNTHETIC_WITNESS_RECORD_TYPE: &str = "arco_control_synthetic_genesis";
 const SYNTHETIC_WITNESS_ENCODING: u32 = 1;
@@ -80,12 +82,17 @@ impl RoleWriter {
         store: &ControlMvpStateStore,
         logical_sequence: u64,
         rows: Vec<ControlMvpSegmentRow>,
+        guard: &mut LockGuard<RootStorage>,
     ) -> Result<()> {
         let mut pending = vec![rows];
         while let Some(mut part) = pending.pop() {
             if part.is_empty() {
                 continue;
             }
+            guard
+                .extend(super::RETENTION_GC_LOCK_TTL)
+                .await
+                .map_err(CatalogError::from)?;
             match persist_role_rows(
                 store,
                 self.role,
@@ -134,7 +141,14 @@ impl RoleWriter {
         Ok(())
     }
 
-    async fn finish(self) -> Result<(directory::Root, u64, u64)> {
+    async fn finish(
+        self,
+        guard: &mut LockGuard<RootStorage>,
+    ) -> Result<(directory::Root, u64, u64)> {
+        guard
+            .extend(super::RETENTION_GC_LOCK_TTL)
+            .await
+            .map_err(CatalogError::from)?;
         Ok((self.builder.finish().await?, self.rows, self.blocks))
     }
 }
@@ -214,6 +228,59 @@ impl ControlMvpStateStore {
         if rows_per_part == 0 {
             return Err(invariant_violation("synthetic fixture part size is zero"));
         }
+        let mut guard = DistributedLock::new(
+            Arc::new(self.retention.clone()),
+            super::RETENTION_GC_LOCK_PATH,
+        )
+        .acquire_with_operation(
+            super::RETENTION_GC_LOCK_TTL,
+            super::RETENTION_GC_LOCK_MAX_RETRIES,
+            Some(format!(
+                "control-v8-genesis:{}:{fixture_id}",
+                self.scope.domain()
+            )),
+        )
+        .await
+        .map_err(CatalogError::from)?;
+        let result = self
+            .install_synthetic_genesis_locked(
+                fixture_id,
+                logical_sequence,
+                declared_kv_count,
+                ordered_kv,
+                declared_intent_count,
+                ordered_intents,
+                rows_per_part,
+                &mut guard,
+            )
+            .await;
+        let release = guard.release().await.map_err(CatalogError::from);
+        match (result, release) {
+            (Ok(token), Ok(())) => Ok(token),
+            (Ok(token), Err(error)) => {
+                tracing::warn!(%error, fixture_id, "authority-8 genesis committed but retention lock release failed");
+                Ok(token)
+            }
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn install_synthetic_genesis_locked<K, I>(
+        &self,
+        fixture_id: &str,
+        logical_sequence: u64,
+        declared_kv_count: u64,
+        ordered_kv: K,
+        declared_intent_count: u64,
+        ordered_intents: I,
+        rows_per_part: usize,
+        guard: &mut LockGuard<RootStorage>,
+    ) -> Result<super::StateToken>
+    where
+        K: IntoIterator<Item = SyntheticKvEntry>,
+        I: IntoIterator<Item = ProjectionIntentV2>,
+    {
         let base = self.pin_bounded_base().await?;
         if base.logical_sequence() != 0 || base.manifest.is_some() {
             return Err(CatalogError::PreconditionFailed {
@@ -221,7 +288,9 @@ impl ControlMvpStateStore {
             });
         }
 
-        let directory = directory::Directory::new(self.retention.clone(), &self.scope)?;
+        let manifest_id = format!("synthetic-{fixture_id}");
+        let directory = directory::Directory::new(self.retention.clone(), &self.scope)?
+            .for_publication(&manifest_id)?;
         let mut history = logical_v2::SyntheticGenesisHistory::new(
             &self.scope,
             logical_sequence,
@@ -250,12 +319,14 @@ impl ControlMvpStateStore {
                 .ok_or_else(|| invariant_violation("synthetic KV ordinal overflows"))?;
             if kv_part.len() == rows_per_part {
                 kv_writer
-                    .push_rows(self, logical_sequence, std::mem::take(&mut kv_part))
+                    .push_rows(self, logical_sequence, std::mem::take(&mut kv_part), guard)
                     .await?;
             }
         }
-        kv_writer.push_rows(self, logical_sequence, kv_part).await?;
-        let (kv_root, kv_rows, kv_blocks) = kv_writer.finish().await?;
+        kv_writer
+            .push_rows(self, logical_sequence, kv_part, guard)
+            .await?;
+        let (kv_root, kv_rows, kv_blocks) = kv_writer.finish(guard).await?;
 
         let mut active_writer = RoleWriter::new(&directory, physical::Role::ActiveId, fixture_id);
         let mut delivery_writer =
@@ -264,6 +335,10 @@ impl ControlMvpStateStore {
         let mut delivery_part = Vec::with_capacity(rows_per_part);
         for intent in ordered_intents {
             history.push_intent(&intent)?;
+            guard
+                .extend(super::RETENTION_GC_LOCK_TTL)
+                .await
+                .map_err(CatalogError::from)?;
             let source = write_projection_source(
                 self,
                 intent.source_logical_sequence(),
@@ -307,25 +382,35 @@ impl ControlMvpStateStore {
             });
             if active_part.len() == rows_per_part {
                 active_writer
-                    .push_rows(self, logical_sequence, std::mem::take(&mut active_part))
+                    .push_rows(
+                        self,
+                        logical_sequence,
+                        std::mem::take(&mut active_part),
+                        guard,
+                    )
                     .await?;
                 delivery_writer
-                    .push_rows(self, logical_sequence, std::mem::take(&mut delivery_part))
+                    .push_rows(
+                        self,
+                        logical_sequence,
+                        std::mem::take(&mut delivery_part),
+                        guard,
+                    )
                     .await?;
             }
         }
         active_writer
-            .push_rows(self, logical_sequence, active_part)
+            .push_rows(self, logical_sequence, active_part, guard)
             .await?;
         delivery_writer
-            .push_rows(self, logical_sequence, delivery_part)
+            .push_rows(self, logical_sequence, delivery_part, guard)
             .await?;
-        let (active_id_root, active_id_rows, active_id_blocks) = active_writer.finish().await?;
+        let (active_id_root, active_id_rows, active_id_blocks) =
+            active_writer.finish(guard).await?;
         let (delivery_order_root, delivery_order_rows, delivery_order_blocks) =
-            delivery_writer.finish().await?;
+            delivery_writer.finish(guard).await?;
         let logical_history = history.finish()?;
 
-        let manifest_id = format!("synthetic-{fixture_id}");
         let witness = SyntheticGenesisWitness8 {
             record_type: SYNTHETIC_WITNESS_RECORD_TYPE.to_owned(),
             encoding_version: SYNTHETIC_WITNESS_ENCODING,
@@ -356,6 +441,10 @@ impl ControlMvpStateStore {
             path: witness_path.clone(),
             sha256: sha256_hex(&witness_bytes),
         };
+        guard
+            .extend(super::RETENTION_GC_LOCK_TTL)
+            .await
+            .map_err(CatalogError::from)?;
         put_immutable_matching(
             &self.storage,
             &witness_path,
@@ -382,6 +471,9 @@ impl ControlMvpStateStore {
             transition: None,
             genesis_witness: Some(witness_ref),
             projection_source: None,
+            restore_plan: None,
+            restore_certificate: None,
+            directory_object_version: Some(2),
         };
         manifest.validate(&self.scope, &manifest_id)?;
         validate_manifest_witness(
@@ -390,7 +482,7 @@ impl ControlMvpStateStore {
             (&kv_root, &active_id_root, &delivery_order_root),
         )
         .await?;
-        publish_manifest_candidate(self, &base, manifest).await
+        Box::pin(publish_manifest_candidate(self, &base, manifest, guard)).await
     }
 }
 
@@ -534,6 +626,9 @@ mod tests {
             transition: None,
             genesis_witness: Some(witness),
             projection_source: None,
+            restore_plan: None,
+            restore_certificate: None,
+            directory_object_version: None,
         }
     }
 

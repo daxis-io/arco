@@ -9,13 +9,13 @@
 
 use std::fmt;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arco_core::storage::{StorageBackend, WritePrecondition, WriteResult};
 use arco_storage_object_store::{ObjectStoreBackend, no_automatic_request_retries};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::{FutureExt as _, stream::BoxStream};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
@@ -24,28 +24,35 @@ use object_store::{
 };
 
 #[derive(Debug, Default)]
-struct NotFoundOnWriteStore {
+struct TestStore {
     inner: InMemory,
+    reject_writes: bool,
+    reads: Mutex<Vec<GetOptions>>,
+    extra_range_body: Option<Bytes>,
+    range_size_override: Option<usize>,
 }
 
-impl fmt::Display for NotFoundOnWriteStore {
+impl fmt::Display for TestStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("not-found-on-write")
+        formatter.write_str("test-store")
     }
 }
 
 #[async_trait]
-impl ObjectStore for NotFoundOnWriteStore {
+impl ObjectStore for TestStore {
     async fn put_opts(
         &self,
         location: &ObjectStorePath,
-        _payload: PutPayload,
-        _options: PutOptions,
+        payload: PutPayload,
+        options: PutOptions,
     ) -> object_store::Result<PutResult> {
-        Err(object_store::Error::NotFound {
-            path: location.to_string(),
-            source: Box::new(io::Error::new(io::ErrorKind::NotFound, "missing root")),
-        })
+        if self.reject_writes {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: Box::new(io::Error::new(io::ErrorKind::NotFound, "missing root")),
+            });
+        }
+        self.inner.put_opts(location, payload, options).await
     }
 
     async fn put_multipart_opts(
@@ -61,7 +68,29 @@ impl ObjectStore for NotFoundOnWriteStore {
         location: &ObjectStorePath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
+        self.reads.lock().unwrap().push(options.clone());
+        let requested = options.range.clone();
+        let range = requested.is_some();
+        let mut result = self.inner.get_opts(location, options).await?;
+        if range {
+            if let Some(extra) = &self.extra_range_body {
+                let bytes = result.bytes().await?;
+                result = self.inner.get_opts(location, GetOptions::default()).await?;
+                result.range = 0..bytes.len();
+                result.payload =
+                    object_store::GetResultPayload::Stream(Box::pin(futures::stream::iter([
+                        Ok(bytes),
+                        Ok(extra.clone()),
+                    ])));
+            }
+        }
+        if let Some(size) = self.range_size_override {
+            if let Some(object_store::GetRange::Bounded(range)) = requested {
+                result.meta.size = size;
+                result.range = range.start..range.end.min(size);
+            }
+        }
+        Ok(result)
     }
 
     async fn delete(&self, location: &ObjectStorePath) -> object_store::Result<()> {
@@ -247,7 +276,10 @@ async fn generic_adapter_fails_closed_for_bounded_listing() {
 
 #[tokio::test]
 async fn non_cas_not_found_writes_remain_operational_errors() {
-    let store: Arc<DynObjectStore> = Arc::new(NotFoundOnWriteStore::default());
+    let store: Arc<DynObjectStore> = Arc::new(TestStore {
+        reject_writes: true,
+        ..Default::default()
+    });
     let backend = ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store, None);
     for precondition in [WritePrecondition::DoesNotExist, WritePrecondition::None] {
         let write = backend
@@ -261,5 +293,123 @@ async fn non_cas_not_found_writes_remain_operational_errors() {
             write.is_err(),
             "NotFound must not become a CAS loser: {write:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn bounded_ranges_use_one_native_get_without_preliminary_head() {
+    let store = Arc::new(TestStore::default());
+    store
+        .inner
+        .put(
+            &ObjectStorePath::from("range"),
+            Bytes::from_static(b"abcd").into(),
+        )
+        .await
+        .unwrap();
+    let backend =
+        ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store.clone(), None);
+    assert_eq!(
+        backend.get_range("range", 1..100).await.unwrap(),
+        Bytes::from_static(b"bcd")
+    );
+    let reads = store.reads.lock().unwrap();
+    assert_eq!(reads.len(), 1, "a bounded probe must be one native GET");
+    assert!(!reads[0].head);
+    assert_eq!(
+        reads[0].range,
+        Some(object_store::GetRange::Bounded(1..100))
+    );
+    drop(reads);
+}
+
+#[tokio::test]
+async fn bounded_ranges_reject_oversized_response_body() {
+    let store = Arc::new(TestStore {
+        extra_range_body: Some(Bytes::from_static(b"overflow")),
+        ..Default::default()
+    });
+    store
+        .inner
+        .put(
+            &ObjectStorePath::from("range"),
+            Bytes::from_static(b"abcd").into(),
+        )
+        .await
+        .unwrap();
+    let backend = ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store, None);
+    assert!(
+        backend.get_range("range", 0..2).await.is_err(),
+        "oversized range body must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn bounded_ranges_preserve_arco_eof_and_invalid_input_contract() {
+    let backend = ordered_memory_adapter();
+    backend
+        .put(
+            "range",
+            Bytes::from_static(b"abcd"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    backend
+        .put("empty", Bytes::new(), WritePrecondition::DoesNotExist)
+        .await
+        .unwrap();
+    for range in [0..0, 2..2, 4..4, 4..100] {
+        assert_eq!(
+            backend.get_range("range", range).await.unwrap(),
+            Bytes::new()
+        );
+    }
+    assert_eq!(
+        backend.get_range("empty", 0..1).await.unwrap(),
+        Bytes::new()
+    );
+    for range in [5..6, std::ops::Range { start: 3, end: 2 }] {
+        assert!(matches!(
+            backend.get_range("range", range).await,
+            Err(arco_core::Error::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        backend.get_range("missing", 0..1).await,
+        Err(arco_core::Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn bounded_ranges_do_not_allocate_from_untrusted_reported_size() {
+    for reported in [Some(usize::MAX), None] {
+        let store = Arc::new(TestStore {
+            range_size_override: reported,
+            ..Default::default()
+        });
+        store
+            .inner
+            .put(
+                &ObjectStorePath::from("range"),
+                Bytes::from_static(b"abcd").into(),
+            )
+            .await
+            .unwrap();
+        let backend =
+            ObjectStoreBackend::new_with_conditional_write_store(store.clone(), store, None);
+        let outcome = std::panic::AssertUnwindSafe(backend.get_range("range", 0..u64::MAX))
+            .catch_unwind()
+            .await;
+        assert!(
+            outcome.is_ok(),
+            "provider metadata must not select an enormous allocation"
+        );
+        let result = outcome.unwrap();
+        if reported.is_some() {
+            assert!(result.is_err(), "short body must be rejected");
+        } else {
+            assert_eq!(result.unwrap(), Bytes::from_static(b"abcd"));
+        }
     }
 }

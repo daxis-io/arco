@@ -22,8 +22,10 @@ use arco_iceberg::types::{
     PartitionSpec, Schema, SchemaField, SortOrder, TableMetadata, TableUuid,
 };
 use bytes::Bytes;
-use iceberg::{Catalog, NamespaceIdent, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
@@ -39,15 +41,15 @@ async fn seed_iceberg_table(state: &IcebergState, namespace: &str, table: &str) 
         .expect("create namespace");
 
     let table_name = table.to_string();
+    let location =
+        format!("memory://localhost/tenant=acme/workspace=analytics/warehouse/{table_name}");
     let table_record = writer
         .register_table(
             RegisterTableRequest {
                 namespace: namespace.to_string(),
                 name: table_name.clone(),
                 description: None,
-                location: Some(format!(
-                    "tenant=acme/workspace=analytics/warehouse/{table_name}"
-                )),
+                location: Some(location.clone()),
                 format: Some("iceberg".to_string()),
                 columns: vec![],
             },
@@ -57,10 +59,8 @@ async fn seed_iceberg_table(state: &IcebergState, namespace: &str, table: &str) 
         .expect("register table");
 
     let table_uuid = uuid::Uuid::parse_str(&table_record.id).expect("table uuid");
-    let metadata_location = format!(
-        "tenant=acme/workspace=analytics/warehouse/{table_name}/metadata/00000.metadata.json"
-    );
-    let pointer = IcebergTablePointer::new(table_uuid, metadata_location.clone());
+    let metadata_location = format!("{location}/metadata/00000.metadata.json");
+    let pointer = IcebergTablePointer::new(table_uuid, metadata_location);
     let pointer_path = IcebergTablePointer::storage_path(&table_uuid);
     let pointer_bytes = serde_json::to_vec(&pointer).expect("serialize pointer");
     storage
@@ -75,7 +75,7 @@ async fn seed_iceberg_table(state: &IcebergState, namespace: &str, table: &str) 
     let metadata = TableMetadata {
         format_version: 2,
         table_uuid: TableUuid::new(table_uuid),
-        location: format!("tenant=acme/workspace=analytics/warehouse/{table_name}"),
+        location,
         last_sequence_number: 0,
         last_updated_ms: 1_234_567_890_000,
         last_column_id: 1,
@@ -142,16 +142,22 @@ async fn test_rest_catalog_roundtrip() {
     });
     let server_handle = tokio::spawn(server.into_future());
 
-    let mut props = HashMap::new();
-    props.insert("header.x-tenant-id".to_string(), "acme".to_string());
-    props.insert("header.x-workspace-id".to_string(), "analytics".to_string());
-
-    let config = RestCatalogConfig::builder()
-        .uri(format!("http://{addr}/iceberg"))
-        .warehouse("memory://localhost".to_string())
-        .props(props)
-        .build();
-    let catalog = RestCatalog::new(config);
+    let props = HashMap::from([
+        (
+            REST_CATALOG_PROP_URI.to_string(),
+            format!("http://{addr}/iceberg"),
+        ),
+        (
+            REST_CATALOG_PROP_WAREHOUSE.to_string(),
+            "memory://localhost".to_string(),
+        ),
+        ("header.x-tenant-id".to_string(), "acme".to_string()),
+        ("header.x-workspace-id".to_string(), "analytics".to_string()),
+    ]);
+    let catalog = RestCatalogBuilder::default()
+        .load("arco", props)
+        .await
+        .expect("load REST catalog");
 
     let namespace = NamespaceIdent::from_strs(["sales"]).expect("namespace");
     let table_ident = TableIdent::new(namespace.clone(), "orders".to_string());

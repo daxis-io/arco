@@ -129,8 +129,8 @@ arrow = { version = "54", features = ["chrono-tz"] }
 flatbuffers = "=24.12.23"
 arrow-json = { version = "54" }
 bytes = "1"
-iceberg = "0.6"
-iceberg-catalog-rest = "0.6"
+iceberg = "0.8"
+iceberg-catalog-rest = "0.8"
 serde_jcs = "0.1"
 
 # HTTP/gRPC
@@ -178,6 +178,5 @@ object_store = { path = "vendor/object_store-0.11.2" }
 # crates.io has no fixed Rust release for GHSA-2f9f-gq7v-9h6m.
 thrift = { path = "vendor/thrift-0.17.1" }
 # Backport apache/arrow-rs@a9455d4a269d1edce4891c0927fed1c2bf24fb72
-# for RUSTSEC-2026-0442; Arrow 54/55 have no patched registry release.
+# for RUSTSEC-2026-0442. Arrow 54 has no patched registry release.
 arrow-data-54 = { package = "arrow-data", path = "vendor/arrow-data-54.3.1" }
-arrow-data-55 = { package = "arrow-data", path = "vendor/arrow-data-55.2.0" }

@@ -35,6 +35,136 @@ pub(super) async fn build(dir: &Directory, count: u64) -> Root {
 }
 
 #[tokio::test]
+async fn publication_identity_separates_pages_and_long_keys_without_losing_v1_reads() {
+    let legacy = directory("publication-identity");
+    let first = legacy.clone().with_publication_salt([1; 32]);
+    let second = legacy.clone().with_publication_salt([2; 32]);
+    let old_empty = legacy.empty_root().await.unwrap();
+    let first_empty = first.empty_root().await.unwrap();
+    let second_empty = second.empty_root().await.unwrap();
+    assert_ne!(old_empty.node.digest, first_empty.node.digest);
+    assert_ne!(first_empty.node.digest, second_empty.node.digest);
+
+    for root in [&old_empty, &first_empty, &second_empty] {
+        assert!(
+            legacy
+                .lookup(root, b"", &mut ReadBudget::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut long = leaf(1);
+    long.first = vec![b'k'; 100_000];
+    long.last = long.first.clone();
+    let mut roots = Vec::new();
+    for writer in [&legacy, &first, &second] {
+        let mut builder = writer.builder();
+        builder.push(long.clone()).await.unwrap();
+        roots.push(builder.finish().await.unwrap());
+    }
+    assert_ne!(roots[0].node.first.digest, roots[1].node.first.digest);
+    assert_ne!(roots[1].node.first.digest, roots[2].node.first.digest);
+    for root in &roots {
+        assert_eq!(
+            legacy
+                .lookup(root, &long.first, &mut ReadBudget::default())
+                .await
+                .unwrap(),
+            Some(long.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn publication_v2_wire_vector() {
+    // Independently generated with Python hashlib/struct from the frozen V2 framing.
+    let directory = directory("catalog")
+        .for_publication("candidate-one")
+        .unwrap();
+    assert_eq!(
+        hex::encode(directory.publication_salt.as_ref().unwrap().as_ref()),
+        "890501a0222b23066e75c5007f3dc2ed9c0e9789f07e01fdeea4e3e667810286"
+    );
+    let (empty, page) = directory.page_node(1, &[]).unwrap();
+    assert_eq!(
+        hex::encode(page),
+        "4152434f44495232c8ef5da2efd4880551bb4b99ac381598b72f03f62eb9d3ded7e792923a0d2fb1010000890501a0222b23066e75c5007f3dc2ed9c0e9789f07e01fdeea4e3e667810286"
+    );
+    assert_eq!(
+        hex::encode(empty.digest),
+        "b5a662810c7d16cc6e308f5b4fc97ce01f9f2ed59a6714ff16a3dc5ca49c471b"
+    );
+    let key = directory.key_ref(&[b'k'; 100]).unwrap();
+    assert_eq!(
+        hex::encode(key.digest),
+        "999e569c122bde7c1adfd1355834ca88e27551ce4b1b28010cd72aa94475399a"
+    );
+    assert_eq!(key.bytes, KEY_V2_FLAG | 100);
+}
+
+#[tokio::test]
+async fn salted_path_copy_replaces_a_legacy_long_key_leaf() {
+    let legacy = directory("salted-path-copy");
+    let writer = legacy.clone().with_publication_salt([3; 32]);
+    let mut old = leaf(1);
+    old.first = vec![b'k'; 100_000];
+    old.last = old.first.clone();
+    let mut builder = legacy.builder();
+    builder.push(old.clone()).await.unwrap();
+    let root = builder.finish().await.unwrap();
+    let mut replacement = old.clone();
+    replacement.digest = Sha256::digest(b"replacement").into();
+    let edits = [update::Edit {
+        old: Some(old),
+        new: vec![replacement.clone()],
+    }];
+    let next = writer
+        .update(&root, &edits, &mut ReadBudget::default())
+        .await
+        .unwrap();
+    writer
+        .verify_update(&root, &next, &edits, &mut ReadBudget::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy
+            .lookup(&next, &replacement.first, &mut ReadBudget::default())
+            .await
+            .unwrap(),
+        Some(replacement)
+    );
+}
+
+#[test]
+fn salted_page_counts_its_header_against_the_probe_ceiling() {
+    let directory = directory("salted-probe-ceiling").with_publication_salt([4; 32]);
+    let children = 8;
+    let length = (PAGE_PROBE_LIMIT
+        - (HEADER_BYTES + 1 + children * NODE_BYTES)
+        - 2 * children * (KEY_V2_HEADER_BYTES + 1))
+        / (2 * children);
+    let key = KeyRef {
+        digest: [1; 32],
+        bytes: KEY_V2_FLAG | u32::try_from(length).unwrap(),
+        inline: [0; INLINE_KEY_BYTES],
+    };
+    let child = Node {
+        depth: 0,
+        bytes: 100,
+        rows: 1,
+        first: key,
+        last: key,
+        digest: [2; 32],
+    };
+    assert!(matches!(
+        directory.page_node(1, &vec![child; children]),
+        Err(CatalogError::MaintenanceBackpressure { message })
+            if message == "directory page fence-probe budget exceeded"
+    ));
+}
+
+#[tokio::test]
 async fn streams_multiple_levels_and_paginates_without_omission() {
     let dir = directory("catalog");
     let root = build(&dir, 513).await;

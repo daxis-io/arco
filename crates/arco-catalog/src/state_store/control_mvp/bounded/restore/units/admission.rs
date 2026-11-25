@@ -23,7 +23,21 @@ pub(super) async fn observe(
     selected: &WorkingValue<OwnedSelectedPlan>,
     now: DateTime<Utc>,
 ) -> Result<Observation> {
-    let result = observe_inner(io, route, selected, now).await;
+    let result = observe_inner(io, route, selected, now, None).await;
+    if result.is_err() {
+        io.stop(route);
+    }
+    result
+}
+
+pub(super) async fn observe_after_prepared(
+    io: &mut RestorePhysicalIo<'_>,
+    route: &mut RestorePhysicalRoute<'_, '_>,
+    selected: &WorkingValue<OwnedSelectedPlan>,
+    now: DateTime<Utc>,
+    expected_prepared: &[u8],
+) -> Result<Observation> {
+    let result = observe_inner(io, route, selected, now, Some(expected_prepared)).await;
     if result.is_err() {
         io.stop(route);
     }
@@ -39,6 +53,7 @@ async fn observe_inner(
     route: &mut RestorePhysicalRoute<'_, '_>,
     selected: &WorkingValue<OwnedSelectedPlan>,
     now: DateTime<Utc>,
+    expected_prepared: Option<&[u8]>,
 ) -> Result<Observation> {
     let store = io.store();
     let owned = selected.is_owned_by(io);
@@ -75,14 +90,18 @@ async fn observe_inner(
     drop(reservation);
     let prepared =
         read_restore_gate_record(io, route, RestoreGateRecord::Prepared(&f.candidate_id)).await?;
-    drop(decode_with_reservation(io, route, Some(64 * 1024), || {
-        if prepared.is_some() {
-            return Err(CatalogError::AmbiguousAuthorityOutcome {
-                message: "prepared restore requires read-only candidate reconciliation".into(),
-            });
-        }
-        Ok(())
-    })?);
+    drop(decode_with_reservation(
+        io,
+        route,
+        Some(64 * 1024),
+        || match (expected_prepared, prepared.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(expected), Some((actual, _))) if actual.as_slice() == expected => Ok(()),
+            _ => Err(CatalogError::AmbiguousAuthorityOutcome {
+                message: "prepared restore requires exact same-invocation reconciliation".into(),
+            }),
+        },
+    )?);
     if let Target::Present {
         current_pointer_raw_b64,
         current_pointer_version,

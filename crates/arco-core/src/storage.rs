@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::ops::{Bound, Range};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicI64, Ordering},
@@ -458,13 +458,23 @@ impl StorageBackend for MemoryBackend {
             return Ok(ListPage::empty());
         }
 
-        let mut objects = self.list(prefix).await?;
-        objects.sort_by(|left, right| left.path.cmp(&right.path));
-        if let Some(start_after) = start_after {
-            let first = objects.partition_point(|meta| meta.path.as_str() <= start_after);
-            objects.drain(..first);
-        }
-        objects.truncate(limit);
+        let stored = self.objects.read().map_err(|_| Error::Internal {
+            message: "lock poisoned".into(),
+        })?;
+        let lower = start_after.map_or(Bound::Included(prefix), Bound::Excluded);
+        let objects = stored
+            .range::<str, _>((lower, Bound::Unbounded))
+            .take_while(|(path, _)| path.starts_with(prefix))
+            .take(limit)
+            .map(|(path, obj)| ObjectMeta {
+                path: path.clone(),
+                size: obj.data.len() as u64,
+                version: obj.version.to_string(),
+                last_modified: Some(obj.last_modified),
+                etag: Some(format!("\"{}\"", obj.version)),
+            })
+            .collect::<Vec<_>>();
+        drop(stored);
         validate_ordered_page(prefix, start_after, limit, &objects)?;
 
         let next_start_after = next_start_after(&objects, limit);

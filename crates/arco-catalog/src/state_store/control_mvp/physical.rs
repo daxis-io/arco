@@ -11,6 +11,9 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(test, feature = "test-utils"))]
+use bytes::Bytes;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Role {
@@ -30,6 +33,17 @@ pub(super) struct Descriptor {
     pub index_version: String,
     pub block: ControlMvpBlock,
 }
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) type GcIndexCache = std::collections::BTreeMap<
+    String,
+    (ControlMvpSegmentRef, String, String, ControlMvpSegmentIndex),
+>;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) const GC_PROBE_WIDTH: usize = directory::GcWalk::PENDING_LIMIT;
+#[cfg(any(test, feature = "test-utils"))]
+const GC_DESCRIPTOR_PROBE: usize = 4096;
 
 impl ControlMvpStateStore {
     pub(super) async fn resolve_physical_block(
@@ -117,39 +131,18 @@ impl ControlMvpStateStore {
         Ok(rows)
     }
 
-    /// Opens one transition-proof physical leaf under the retained-source
-    /// invoice.  This intentionally bypasses the ordinary read cache: a
-    /// retained proof must charge every descriptor, index, block, and version
-    /// fence to the one capture invocation.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the bounded descriptor, index, block, and version fences are one proof boundary"
-    )]
-    pub(super) async fn resolve_physical_block_bounded(
+    fn decode_physical_descriptor(
         &self,
         role: Role,
         leaf: &directory::Leaf,
-        budget: &mut retained::ReadBudget<'_>,
-    ) -> Result<Vec<ControlMvpSegmentRow>> {
-        let path = format!(
-            "{}/physical/descriptors/{}.json",
-            self.paths.base_prefix(),
-            hex::encode(leaf.digest)
-        );
-        let bytes = retained::read_bounded_json(
-            self,
-            budget,
-            &path,
-            MAX_CONTROL_JSON_BYTES,
-            "bounded transition physical descriptor",
-        )
-        .await?;
+        bytes: &[u8],
+    ) -> Result<Descriptor> {
         validate_raw_checksum(
-            &bytes,
+            bytes,
             Some(&hex::encode(leaf.digest)),
             "bounded transition physical descriptor",
         )?;
-        let descriptor: Descriptor = decode_json(&bytes, "bounded transition physical descriptor")?;
+        let descriptor: Descriptor = decode_json(bytes, "bounded transition physical descriptor")?;
         if descriptor.encoding_version != 1
             || descriptor.scope != self.scope
             || descriptor.role != role
@@ -167,6 +160,29 @@ impl ControlMvpStateStore {
             ));
         }
         read_cache::validate_owner(&descriptor.segment)?;
+        Ok(descriptor)
+    }
+
+    async fn load_physical_descriptor_bounded(
+        &self,
+        role: Role,
+        leaf: &directory::Leaf,
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<Descriptor> {
+        let path = format!(
+            "{}/physical/descriptors/{}.json",
+            self.paths.base_prefix(),
+            hex::encode(leaf.digest)
+        );
+        let bytes = retained::read_bounded_json(
+            self,
+            budget,
+            &path,
+            MAX_CONTROL_JSON_BYTES,
+            "bounded transition physical descriptor",
+        )
+        .await?;
+        let descriptor = self.decode_physical_descriptor(role, leaf, &bytes)?;
         let objects = [
             (
                 self.paths.state_object(&descriptor.segment.segment_id),
@@ -195,6 +211,225 @@ impl ControlMvpStateStore {
                 "bounded transition descriptor block is absent from authenticated index",
             ));
         }
+        Ok(descriptor)
+    }
+
+    /// Authenticates object edges for conservative GC protection, without value equivalence.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) async fn resolve_physical_mark_edge_bounded(
+        &self,
+        role: Role,
+        leaf: &directory::Leaf,
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<Descriptor> {
+        self.gc_mark_edge(role, leaf, budget, &mut GcIndexCache::new())
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) async fn gc_mark_edge(
+        &self,
+        role: Role,
+        leaf: &directory::Leaf,
+        budget: &mut retained::ReadBudget<'_>,
+        indexes: &mut GcIndexCache,
+    ) -> Result<Descriptor> {
+        self.gc_mark_edges_bounded(role, std::slice::from_ref(leaf), budget, indexes)
+            .await?
+            .pop()
+            .ok_or_else(|| invariant_violation("missing GC descriptor"))
+    }
+
+    /// All probes are prepaid; no asynchronous child owns an independent invoice.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) async fn gc_mark_edges_bounded(
+        &self,
+        role: Role,
+        leaves: &[directory::Leaf],
+        budget: &mut retained::ReadBudget<'_>,
+        indexes: &mut GcIndexCache,
+    ) -> Result<Vec<Descriptor>> {
+        if leaves.is_empty() || leaves.len() > GC_PROBE_WIDTH {
+            return Err(invariant_violation("invalid GC probe batch width"));
+        }
+        budget.reserve(0, leaves.len().saturating_mul(size_of::<Descriptor>()))?;
+        for _ in leaves {
+            budget.reserve(1, 3 * (GC_DESCRIPTOR_PROBE + 1))?;
+            budget.operation()?;
+        }
+        super::cost::bounded_work(super::cost::BoundedWork {
+            gc_probe_batches: 1,
+            ..Default::default()
+        });
+        let probes = futures::future::try_join_all(leaves.iter().map(|leaf| async move {
+            let path = format!(
+                "{}/physical/descriptors/{}.json",
+                self.paths.base_prefix(),
+                hex::encode(leaf.digest)
+            );
+            super::cost::bounded_work(super::cost::BoundedWork {
+                gc_probe_requests: 1,
+                ..Default::default()
+            });
+            let probe_length = (GC_DESCRIPTOR_PROBE + 1) as u64;
+            self.storage.get_range(&path, 0..probe_length).await
+        }))
+        .await?;
+        let mut descriptors = Vec::with_capacity(leaves.len());
+        for (leaf, bytes) in leaves.iter().zip(probes) {
+            descriptors.push(
+                self.gc_mark_edge_probed(role, leaf, bytes, budget, indexes)
+                    .await?,
+            );
+            if budget.gc_should_yield() {
+                break;
+            }
+        }
+        Ok(descriptors)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated edge owns index reuse and exact endpoint versions"
+    )]
+    async fn gc_mark_edge_probed(
+        &self,
+        role: Role,
+        leaf: &directory::Leaf,
+        mut bytes: Bytes,
+        budget: &mut retained::ReadBudget<'_>,
+        indexes: &mut GcIndexCache,
+    ) -> Result<Descriptor> {
+        if bytes.len() > GC_DESCRIPTOR_PROBE {
+            let path = format!(
+                "{}/physical/descriptors/{}.json",
+                self.paths.base_prefix(),
+                hex::encode(leaf.digest)
+            );
+            bytes = retained::read_bounded_json(
+                self,
+                budget,
+                &path,
+                MAX_CONTROL_JSON_BYTES,
+                "large GC descriptor",
+            )
+            .await?;
+            budget.reserve(0, bytes.len().saturating_mul(2))?;
+        }
+        budget.operation()?;
+        let descriptor = self.decode_physical_descriptor(role, leaf, &bytes)?;
+        let reference = &descriptor.segment;
+        if reference.index_size_bytes == 0
+            || reference.index_size_bytes > MAX_SEGMENT_INDEX_BYTES as u64
+        {
+            return Err(invariant_violation("invalid GC index length"));
+        }
+        if let Some((previous, segment_version, index_version, index)) =
+            indexes.get(&reference.segment_id)
+        {
+            if previous != reference
+                || segment_version != &descriptor.segment_version
+                || index_version != &descriptor.index_version
+            {
+                return Err(invariant_violation("conflicting GC segment witnesses"));
+            }
+            if index
+                .blocks
+                .iter()
+                .filter(|block| **block == descriptor.block)
+                .count()
+                != 1
+            {
+                return Err(invariant_violation(
+                    "GC block is absent from authenticated index",
+                ));
+            }
+            return Ok(descriptor);
+        }
+        let length = usize::try_from(reference.index_size_bytes)
+            .map_err(|_| invariant_violation("GC index size overflow"))?;
+        budget.reserve(1, length.saturating_mul(4).saturating_add(1024))?;
+        budget.operation()?;
+        let probe_end = reference.index_size_bytes + 1;
+        let bytes = self
+            .storage
+            .get_range(
+                &self.paths.segment_index(&reference.segment_id),
+                0..probe_end,
+            )
+            .await?;
+        if bytes.len() != length {
+            return Err(invariant_violation("GC index length differs"));
+        }
+        budget.operation()?;
+        validate_raw_checksum(&bytes, Some(&reference.index_checksum_sha256), "GC index")?;
+        validate_version_header(&bytes, SEGMENT_FORMAT_VERSION, "GC index")?;
+        let index: ControlMvpSegmentIndex = decode_json(&bytes, "GC index")?;
+        validate_segment_index_identity(&index, reference, &self.scope)?;
+        validate_segment_index_key_metadata(&index)?;
+        if index
+            .blocks
+            .iter()
+            .filter(|block| **block == descriptor.block)
+            .count()
+            != 1
+        {
+            return Err(invariant_violation(
+                "GC block is absent from authenticated index",
+            ));
+        }
+        // Both identities are checked after the authenticated read, once per invocation/segment.
+        self.validate_gc_endpoint_versions(
+            &[
+                (
+                    self.paths.state_object(&reference.segment_id),
+                    reference.segment_size_bytes,
+                    &descriptor.segment_version,
+                ),
+                (
+                    self.paths.segment_index(&reference.segment_id),
+                    reference.index_size_bytes,
+                    &descriptor.index_version,
+                ),
+            ],
+            budget,
+        )
+        .await?;
+        indexes.insert(
+            reference.segment_id.clone(),
+            (
+                reference.clone(),
+                descriptor.segment_version.clone(),
+                descriptor.index_version.clone(),
+                index,
+            ),
+        );
+        Ok(descriptor)
+    }
+
+    /// Opens one transition-proof physical leaf under the shared retained-source invoice.
+    pub(super) async fn resolve_physical_block_bounded(
+        &self,
+        role: Role,
+        leaf: &directory::Leaf,
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<Vec<ControlMvpSegmentRow>> {
+        let descriptor = self
+            .load_physical_descriptor_bounded(role, leaf, budget)
+            .await?;
+        let objects = [
+            (
+                self.paths.state_object(&descriptor.segment.segment_id),
+                descriptor.segment.segment_size_bytes,
+                descriptor.segment_version.as_str(),
+            ),
+            (
+                self.paths.segment_index(&descriptor.segment.segment_id),
+                descriptor.segment.index_size_bytes,
+                descriptor.index_version.as_str(),
+            ),
+        ];
         let end = descriptor
             .block
             .offset
@@ -289,6 +524,57 @@ impl ControlMvpStateStore {
         validate_segment_index_identity(&index, reference, &self.scope)?;
         validate_segment_index_key_metadata(&index)?;
         Ok(index)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    async fn validate_gc_endpoint_versions(
+        &self,
+        objects: &[(String, u64, &str)],
+        budget: &mut retained::ReadBudget<'_>,
+    ) -> Result<()> {
+        let [first, second] = objects else {
+            return Err(invariant_violation("GC requires two physical endpoints"));
+        };
+        budget.reserve(
+            0,
+            1024 + first.0.len() + first.2.len() + second.0.len() + second.2.len(),
+        )?;
+        budget.operation()?;
+        budget.operation()?;
+        super::cost::bounded_work(super::cost::BoundedWork {
+            gc_head_batches: 1,
+            ..Default::default()
+        });
+        let head = |path| async move {
+            super::cost::bounded_work(super::cost::BoundedWork {
+                gc_head_requests: 1,
+                ..Default::default()
+            });
+            self.storage.head(path).await
+        };
+        let results: [_; 2] = futures::join!(head(&first.0), head(&second.0)).into();
+        // Both responses have arrived; account both before propagating a charge failure.
+        let charges = results.each_ref().map(|result| {
+            result
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .map_or(Ok(()), |meta| budget.charge_head(meta))
+        });
+        for charge in charges {
+            charge?;
+        }
+        for (result, (_, size, version)) in results.into_iter().zip(objects) {
+            let meta = result?.ok_or_else(|| {
+                invariant_violation("bounded transition physical object is missing")
+            })?;
+            if meta.version.is_empty() || meta.version != *version || meta.size != *size {
+                return Err(invariant_violation(
+                    "bounded transition physical object version or size changed",
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn validate_physical_versions_bounded(
@@ -424,6 +710,54 @@ mod tests {
             bytes: u32::try_from(descriptor.block.length).unwrap(),
             digest,
         }
+    }
+
+    #[tokio::test]
+    async fn gc_prefetch_yields_a_processed_prefix_before_budget_exhaustion() {
+        let (store, _, leaf) = fixture().await;
+        let leaves = vec![leaf; GC_PROBE_WIDTH];
+        let mut io = crate::workspace_io_budget::WorkspaceIoBudget::for_control_gc();
+        io.charge_operations(2490).unwrap();
+        let processed = store
+            .gc_mark_edges_bounded(
+                Role::Kv,
+                &leaves,
+                &mut retained::ReadBudget::for_gc(&mut io),
+                &mut GcIndexCache::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !processed.is_empty() && processed.len() < leaves.len(),
+            "a prepaid batch must yield at a safe prefix rather than force all leaves: {}",
+            processed.len()
+        );
+        assert!(io.test_accounting().1 <= 4096);
+        let directory = directory::Directory::new(store.retention.clone(), &store.scope).unwrap();
+        let root = directory.empty_root().await.unwrap();
+        let mut walk = directory::GcWalk::new(&root);
+        let mut fresh = crate::workspace_io_budget::WorkspaceIoBudget::for_control_gc();
+        while !walk.is_complete() {
+            walk.step(&directory, &mut retained::ReadBudget::for_gc(&mut fresh))
+                .await
+                .unwrap();
+        }
+        walk.defer_leaves(leaves.into_iter().skip(processed.len()))
+            .unwrap();
+        assert!(
+            !walk.is_complete(),
+            "pending authenticated leaves must prevent completion"
+        );
+        for _ in processed.len()..GC_PROBE_WIDTH {
+            assert!(
+                walk.step(&directory, &mut retained::ReadBudget::for_gc(&mut fresh))
+                    .await
+                    .unwrap()
+                    .0
+                    .is_some()
+            );
+        }
+        assert!(walk.is_complete());
     }
 
     #[tokio::test]

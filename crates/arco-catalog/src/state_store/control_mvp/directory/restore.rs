@@ -5,9 +5,10 @@ use super::super::physical::restore_io::{
     write_directory_output,
 };
 use super::{
-    DEPTH, Directory, FANOUT, HEADER_BYTES, INLINE_KEY_BYTES, KeyRef, Leaf, MAX_BLOCK_BYTES, Node,
-    PAGE_LIMIT, PAGE_PROBE_LIMIT, Result, Root, decode_page, invariant_violation, page_probe_bytes,
-    validate_key_shape, validate_node,
+    DEPTH, Directory, FANOUT, HEADER_BYTES, INLINE_KEY_BYTES, KEY_V2_FLAG, KEY_V2_HEADER_BYTES,
+    KeyRef, Leaf, MAX_BLOCK_BYTES, Node, PAGE_LIMIT, PAGE_MAGIC_V2, PAGE_PROBE_LIMIT,
+    PUBLICATION_SALT_BYTES, Result, Root, decode_page, invariant_violation, key_contents,
+    key_object_bytes, key_raw_bytes, page_probe_bytes, validate_key_shape, validate_node,
 };
 
 pub(in super::super) struct Position {
@@ -75,7 +76,7 @@ impl NativePathCopy {
                 return Err(invariant_violation("notice path copy position differs"));
             }
             (CopyPhase::Read, 0)
-        } else if *root == directory.empty_root_reference()? {
+        } else if directory.is_empty_root_shape(root)? {
             (CopyPhase::Write, 1)
         } else {
             return Err(invariant_violation("notice path copy lost selected leaf"));
@@ -183,15 +184,15 @@ impl NativePathCopy {
         )?);
         if self.read_index == selected.path.len() {
             let leaf = &selected.leaf;
-            let expected = Node {
-                depth: 0,
-                first: self.directory.key_ref(&leaf.first)?,
-                last: self.directory.key_ref(&leaf.last)?,
-                rows: leaf.rows,
-                bytes: leaf.bytes,
-                digest: leaf.digest,
-            };
-            if self.cursor != expected {
+            let first = read_fence(io, route, &self.directory, &self.cursor.first).await?;
+            let last = read_fence(io, route, &self.directory, &self.cursor.last).await?;
+            if self.cursor.depth != 0
+                || self.cursor.rows != leaf.rows
+                || self.cursor.bytes != leaf.bytes
+                || self.cursor.digest != leaf.digest
+                || first.as_slice() != leaf.first
+                || last.as_slice() != leaf.last
+            {
                 return Err(invariant_violation("notice selected leaf differs"));
             }
             self.write_index = self.read_index;
@@ -369,7 +370,15 @@ async fn write_key_native(
         directory.key_ref(bytes)
     })?;
     if bytes.len() > INLINE_KEY_BYTES {
-        write_directory_output(io, route, true, &key.value().digest, bytes).await?;
+        if directory.publication_salt.is_some() {
+            let payload =
+                encode_with_reservation(io, route, KEY_V2_HEADER_BYTES + bytes.len(), || {
+                    Ok(directory.key_payload(bytes))
+                })?;
+            write_directory_output(io, route, true, &key.value().digest, payload.value()).await?;
+        } else {
+            write_directory_output(io, route, true, &key.value().digest, bytes).await?;
+        }
     }
     Ok(*key.value())
 }
@@ -565,7 +574,14 @@ fn decode_children(directory: &Directory, node: Node, bytes: &[u8]) -> Result<Ve
         ));
     }
     let children = decode_page(bytes, &directory.scope, node.depth)?;
-    if page_probe_bytes(&children)? > PAGE_PROBE_LIMIT {
+    if page_probe_bytes(&children)?
+        + if bytes.starts_with(PAGE_MAGIC_V2) {
+            PUBLICATION_SALT_BYTES
+        } else {
+            0
+        }
+        > PAGE_PROBE_LIMIT
+    {
         return Err(invariant_violation(
             "directory page fence-probe budget exceeded",
         ));
@@ -593,13 +609,13 @@ fn decode_children(directory: &Directory, node: Node, bytes: &[u8]) -> Result<Ve
 
 enum Fence<'key> {
     Inline(&'key [u8]),
-    External(AccountedBytes),
+    External(AccountedBytes, usize),
 }
 impl Fence<'_> {
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Inline(bytes) => bytes,
-            Self::External(bytes) => bytes.as_slice(),
+            Self::External(bytes, offset) => bytes.as_slice().get(*offset..).unwrap_or_default(),
         }
     }
 }
@@ -612,13 +628,13 @@ async fn read_fence<'key>(
 ) -> Result<Fence<'key>> {
     // Page validation has already checked padding and length, but no exclusions
     // rely on its inline fence digest until it is checked here too.
-    if key.bytes as usize <= INLINE_KEY_BYTES {
+    if key_raw_bytes(*key) <= INLINE_KEY_BYTES {
         let checked =
             decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
                 validate_key_shape(*key)?;
                 let bytes = key
                     .inline
-                    .get(..key.bytes as usize)
+                    .get(..key_raw_bytes(*key))
                     .ok_or_else(|| invariant_violation("inline fence length"))?;
                 if directory.digest(b"keys", bytes) != key.digest {
                     return Err(invariant_violation(
@@ -630,21 +646,29 @@ async fn read_fence<'key>(
         return Ok(Fence::Inline(checked.value()));
     }
     let bytes = io
-        .directory_object(route, true, &key.digest, key.bytes as usize)
+        .directory_object(route, true, &key.digest, key_object_bytes(*key))
         .await?;
     let checked =
         decode_with_reservation(io, route, Some(DIRECTORY_FIXED_ALLOCATION_BYTES), || {
-            if bytes.as_slice().len() != key.bytes as usize
+            if bytes.as_slice().len() != key_object_bytes(*key)
                 || directory.digest(b"keys", bytes.as_slice()) != key.digest
             {
                 return Err(invariant_violation(
                     "directory fence length or digest mismatch",
                 ));
             }
+            key_contents(*key, bytes.as_slice())?;
             Ok(())
         })?;
     drop(checked);
-    Ok(Fence::External(bytes))
+    Ok(Fence::External(
+        bytes,
+        if key.bytes & KEY_V2_FLAG == 0 {
+            0
+        } else {
+            KEY_V2_HEADER_BYTES
+        },
+    ))
 }
 
 #[cfg(test)]

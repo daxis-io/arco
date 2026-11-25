@@ -13,16 +13,23 @@ use crate::state_store::StateScope;
 use arco_core::{AuthorityRoot, RootStorage, ScopedAuthorityStore, ScopedStorage};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::BTreeMap;
 
 pub(super) mod restore;
 pub(super) mod update;
 
 const PAGE_MAGIC: &[u8; 8] = b"ARCODIR1";
+const PAGE_MAGIC_V2: &[u8; 8] = b"ARCODIR2";
+const KEY_MAGIC_V2: &[u8; 8] = b"ARCOKEY2";
 const ROOT_MAGIC: &[u8; 8] = b"ARCOROT1";
 const FANOUT: usize = 128;
 const DEPTH: usize = 8;
 const PAGE_LIMIT: usize = 64 * 1024;
 const HEADER_BYTES: usize = 43;
+const PUBLICATION_SALT_BYTES: usize = 32;
+const KEY_V2_FLAG: u32 = 1 << 31;
+const KEY_V2_HEADER_BYTES: usize = 8 + PUBLICATION_SALT_BYTES;
 const INLINE_KEY_BYTES: usize = 64;
 const NODE_BYTES: usize = 245;
 const ROOT_BYTES: usize = 40 + NODE_BYTES;
@@ -37,6 +44,7 @@ const _: () = assert!(
         <= 256 * 1024
 );
 
+#[derive(Clone, Debug)]
 struct CachedKey {
     scope: [u8; 32],
     digest: [u8; 32],
@@ -102,6 +110,7 @@ pub struct Directory {
     storage: ScopedAuthorityStore,
     scope: [u8; 32],
     prefix: String,
+    publication_salt: Option<Box<[u8; PUBLICATION_SALT_BYTES]>>,
 }
 /// Streaming writer. A failed storage operation poisons the writer; rebuild from
 /// the ordered input to reconcile immutable objects without publishing partial work.
@@ -118,6 +127,12 @@ pub struct Cursor {
     upper: Option<Vec<u8>>,
     after: Vec<u8>,
 }
+impl Cursor {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn after(&self) -> &[u8] {
+        &self.after
+    }
+}
 #[derive(Debug)]
 pub struct Page {
     pub leaves: Vec<Leaf>,
@@ -132,9 +147,26 @@ pub struct ReadBudget<'a> {
     byte_limit: usize,
     pub objects: usize,
     pub bytes: usize,
+    // Paths enter here only after the corresponding immutable object is authenticated.
+    authenticated_paths: Option<Vec<String>>,
     // Authenticated immutable fence bytes live only for this bounded read operation.
     cached_keys: Vec<CachedKey>,
     cached_key_bytes: usize,
+    #[cfg(any(test, feature = "test-utils"))]
+    proof_io: ProofIo<'a>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+enum ProofIo<'a> {
+    #[default]
+    None,
+    #[allow(
+        clippy::box_collection,
+        reason = "the capture control block must not enlarge every directory coroutine frame"
+    )]
+    Capture(Box<BTreeMap<String, Bytes>>),
+    Replay(&'a BTreeMap<String, Bytes>),
 }
 
 /// Charges a directory probe to an enclosing authority-specific read budget.
@@ -151,14 +183,43 @@ impl Default for ReadBudget<'_> {
             byte_limit: MAX_SEGMENT_BYTES,
             objects: 0,
             bytes: 0,
+            authenticated_paths: None,
             cached_keys: Vec::new(),
             cached_key_bytes: 0,
             workspace: None,
             retained: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            proof_io: ProofIo::None,
         }
     }
 }
 impl<'a> ReadBudget<'a> {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn capturing(retained: &'a mut (dyn ReadInvoice + Send)) -> Self {
+        Self {
+            proof_io: ProofIo::Capture(Box::default()),
+            ..Self::tracking_with_retained(retained)
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn replaying(
+        retained: &'a mut (dyn ReadInvoice + Send),
+        objects: &'a BTreeMap<String, Bytes>,
+    ) -> Self {
+        Self {
+            proof_io: ProofIo::Replay(objects),
+            ..Self::tracking_with_retained(retained)
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn take_captured_objects(&mut self) -> BTreeMap<String, Bytes> {
+        match &mut self.proof_io {
+            ProofIo::Capture(objects) => std::mem::take(objects.as_mut()),
+            _ => BTreeMap::new(),
+        }
+    }
     pub(in super::super) fn with_workspace(
         workspace: &'a mut crate::workspace_io_budget::WorkspaceIoBudget,
     ) -> Self {
@@ -186,10 +247,13 @@ impl<'a> ReadBudget<'a> {
             byte_limit: bytes,
             objects: 0,
             bytes: 0,
+            authenticated_paths: None,
             cached_keys: Vec::new(),
             cached_key_bytes: 0,
             workspace: None,
             retained: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            proof_io: ProofIo::None,
         })
     }
     fn charge(&mut self, bytes: usize) -> Result<()> {
@@ -206,9 +270,139 @@ impl<'a> ReadBudget<'a> {
         self.bytes += bytes;
         Ok(())
     }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn tracking_with_retained(
+        retained: &'a mut (dyn ReadInvoice + Send),
+    ) -> Self {
+        Self {
+            retained: Some(retained),
+            authenticated_paths: Some(Vec::new()),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn take_authenticated_paths(&mut self) -> Vec<String> {
+        self.authenticated_paths
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
+/// Opaque bounded DFS progress. Only authenticated parent pages can add nodes.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Debug)]
+pub(in super::super) struct GcWalk {
+    stack: Vec<Node>,
+    pending: Vec<Leaf>,
+    keys: Vec<CachedKey>,
+    key_bytes: usize,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl GcWalk {
+    pub(in super::super) const PENDING_LIMIT: usize = 8;
+
+    pub(in super::super) fn new(root: &Root) -> Self {
+        Self {
+            stack: vec![root.node],
+            pending: Vec::new(),
+            keys: Vec::new(),
+            key_bytes: 0,
+        }
+    }
+
+    pub(in super::super) fn is_complete(&self) -> bool {
+        self.stack.is_empty() && self.pending.is_empty()
+    }
+
+    pub(in super::super) fn defer_leaves(
+        &mut self,
+        leaves: impl DoubleEndedIterator<Item = Leaf> + ExactSizeIterator,
+    ) -> Result<()> {
+        if self.pending.len().saturating_add(leaves.len()) > Self::PENDING_LIMIT {
+            return Err(capacity("GC pending leaf limit exceeded"));
+        }
+        self.pending.extend(leaves.rev());
+        Ok(())
+    }
+
+    pub(in super::super) fn owned_bytes(&self) -> usize {
+        self.stack.capacity() * size_of::<Node>()
+            + self.pending.capacity() * size_of::<Leaf>()
+            + self
+                .pending
+                .iter()
+                .map(|leaf| leaf.first.capacity() + leaf.last.capacity())
+                .sum::<usize>()
+            + self.keys.capacity() * size_of::<CachedKey>()
+            + self.key_bytes
+    }
+
+    pub(in super::super) async fn step(
+        &mut self,
+        directory: &Directory,
+        invoice: &mut (dyn ReadInvoice + Send),
+    ) -> Result<(Option<Leaf>, Vec<String>)> {
+        if !self.pending.is_empty() {
+            invoice.charge_directory_probe(0)?;
+            return Ok((self.pending.pop(), Vec::new()));
+        }
+        let node = self
+            .stack
+            .pop()
+            .ok_or_else(|| invariant_violation("GC walk is complete"))?;
+        let mut budget = ReadBudget::tracking_with_retained(invoice);
+        budget.cached_keys = std::mem::take(&mut self.keys);
+        budget.cached_key_bytes = self.key_bytes;
+        // A full cache must keep admitting the next subtree's fences.
+        if node.depth > 0 && budget.cached_keys.len() > KEY_CACHE_ENTRIES - 2 * FANOUT {
+            budget.cached_keys.clear();
+            budget.cached_key_bytes = 0;
+        }
+        let leaf = if node.depth > 0 {
+            let children = directory
+                .read_page(node, b"", None, None, &mut budget)
+                .await?;
+            if self.stack.len() + children.len() > DEPTH * FANOUT {
+                return Err(capacity(
+                    "GC directory frontier exceeds its depth/fanout bound",
+                ));
+            }
+            self.stack.extend(children.into_iter().rev());
+            None
+        } else {
+            Some(Leaf {
+                first: directory.read_key(node.first, &mut budget).await?.to_vec(),
+                last: directory.read_key(node.last, &mut budget).await?.to_vec(),
+                rows: node.rows,
+                bytes: node.bytes,
+                digest: node.digest,
+            })
+        };
+        let paths = budget.take_authenticated_paths();
+        self.keys = std::mem::take(&mut budget.cached_keys);
+        self.key_bytes = budget.cached_key_bytes;
+        Ok((leaf, paths))
+    }
 }
 
 impl Directory {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(in super::super) fn mark_cursor(&self, root: &Root, after: &[u8]) -> Result<Cursor> {
+        self.decode_root(&root.encode())?;
+        if after.len() > MAX_BLOCK_BYTES {
+            return Err(validation_failed("mark cursor exceeds directory key limit"));
+        }
+        Ok(Cursor {
+            root: root.clone(),
+            lower: Vec::new(),
+            upper: None,
+            after: after.to_vec(),
+        })
+    }
     pub fn new(storage: impl Into<RootStorage>, scope: &StateScope) -> Result<Self> {
         Self::with_role(
             storage,
@@ -278,7 +472,27 @@ impl Directory {
             storage: ScopedAuthorityStore::new(storage),
             scope: hash.finalize().into(),
             prefix,
+            publication_salt: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_publication_salt(mut self, salt: [u8; PUBLICATION_SALT_BYTES]) -> Self {
+        self.publication_salt = Some(Box::new(salt));
+        self
+    }
+
+    pub(in super::super) fn for_publication(mut self, candidate_id: &str) -> Result<Self> {
+        if !super::integrity::valid_immutable_id(candidate_id) {
+            return Err(validation_failed("invalid directory publication identity"));
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"arco.directory.publication.v2\0");
+        hash.update(self.scope);
+        hash.update((candidate_id.len() as u64).to_le_bytes());
+        hash.update(candidate_id.as_bytes());
+        self.publication_salt = Some(Box::new(hash.finalize().into()));
+        Ok(self)
     }
     pub fn builder(&self) -> Builder {
         Builder {
@@ -309,6 +523,10 @@ impl Directory {
             scope: self.scope,
             node: self.page_node(1, &[])?.0,
         })
+    }
+    pub(in super::super) fn is_empty_root_shape(&self, root: &Root) -> Result<bool> {
+        validate_node(&root.node, true)?;
+        Ok(root.scope == self.scope && root.node.depth == 1 && root.node.rows == 0)
     }
     /// Structural parsing only; the enclosing authority must authenticate these bytes.
     pub fn decode_root(&self, bytes: &[u8]) -> Result<Root> {
@@ -349,10 +567,18 @@ impl Directory {
         format!("{}/{kind}/{}", self.prefix, hex::encode(digest))
     }
     fn key_ref(&self, bytes: &[u8]) -> Result<KeyRef> {
-        let digest = self.digest(b"keys", bytes);
-        if bytes.len() > MAX_BLOCK_BYTES {
+        if bytes.len() > MAX_BLOCK_BYTES
+            || (self.publication_salt.is_some()
+                && bytes.len() > INLINE_KEY_BYTES
+                && bytes.len() > MAX_BLOCK_BYTES - KEY_V2_HEADER_BYTES)
+        {
             return Err(validation_failed("directory fence exceeds limit"));
         }
+        let digest = if self.publication_salt.is_some() && bytes.len() > INLINE_KEY_BYTES {
+            self.digest(b"keys", &self.key_payload(bytes))
+        } else {
+            self.digest(b"keys", bytes)
+        };
         let mut inline = [0; INLINE_KEY_BYTES];
         if bytes.len() <= INLINE_KEY_BYTES {
             let prefix = inline
@@ -364,8 +590,27 @@ impl Directory {
             inline,
             digest,
             bytes: u32::try_from(bytes.len())
-                .map_err(|_| capacity("directory object length overflow"))?,
+                .map_err(|_| capacity("directory object length overflow"))?
+                | if bytes.len() > INLINE_KEY_BYTES && self.publication_salt.is_some() {
+                    KEY_V2_FLAG
+                } else {
+                    0
+                },
         })
+    }
+    fn key_payload(&self, bytes: &[u8]) -> Vec<u8> {
+        let Some(salt) = self
+            .publication_salt
+            .as_ref()
+            .filter(|_| bytes.len() > INLINE_KEY_BYTES)
+        else {
+            return bytes.to_vec();
+        };
+        let mut encoded = Vec::with_capacity(KEY_V2_HEADER_BYTES + bytes.len());
+        encoded.extend_from_slice(KEY_MAGIC_V2);
+        encoded.extend_from_slice(salt.as_ref());
+        encoded.extend_from_slice(bytes);
+        encoded
     }
     async fn write_key(&self, bytes: &[u8]) -> Result<KeyRef> {
         let reference = self.key_ref(bytes)?;
@@ -373,7 +618,7 @@ impl Directory {
             put_immutable_matching(
                 &self.storage,
                 &self.path("keys", &reference.digest),
-                Bytes::copy_from_slice(bytes),
+                Bytes::from(self.key_payload(bytes)),
                 "directory key collision",
             )
             .await?;
@@ -390,7 +635,7 @@ impl Directory {
             self.write_object_budgeted(
                 "keys",
                 &reference.digest,
-                Bytes::copy_from_slice(bytes),
+                Bytes::from(self.key_payload(bytes)),
                 budget,
             )
             .await?;
@@ -473,24 +718,55 @@ impl Directory {
         let probe = length
             .checked_add(1)
             .ok_or_else(|| capacity("directory probe overflow"))?;
-        budget.charge(probe)?;
-        let bytes = self
-            .storage
-            .get_range(&self.path(kind, digest), 0..probe as u64)
-            .await?;
+        #[cfg(any(test, feature = "test-utils"))]
+        let probe_admission = if matches!(&budget.proof_io, ProofIo::Capture(_)) {
+            probe
+                .checked_add(length + 256)
+                .ok_or_else(|| capacity("directory capture overflow"))?
+        } else {
+            probe
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let probe_admission = probe;
+        budget.charge(probe_admission)?;
+        let path = self.path(kind, digest);
+        #[cfg(any(test, feature = "test-utils"))]
+        let bytes = if let ProofIo::Replay(objects) = &budget.proof_io {
+            objects
+                .get(&path)
+                .cloned()
+                .ok_or_else(|| invariant_violation("captured directory proof is incomplete"))?
+        } else {
+            self.storage.get_range(&path, 0..probe as u64).await?
+        };
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let bytes = self.storage.get_range(&path, 0..probe as u64).await?;
         if bytes.len() != length || self.digest(kind.as_bytes(), &bytes) != *digest {
             return Err(invariant_violation(
                 "directory object length or digest mismatch",
             ));
         }
+        if let Some(paths) = &mut budget.authenticated_paths {
+            paths.push(path.clone());
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        if let ProofIo::Capture(objects) = &mut budget.proof_io {
+            objects
+                .entry(path)
+                .or_insert_with(|| Bytes::copy_from_slice(&bytes));
+        }
         Ok(bytes)
     }
     async fn read_key(&self, key: KeyRef, budget: &mut ReadBudget<'_>) -> Result<Bytes> {
         validate_key_shape(key)?;
-        if key.bytes as usize <= INLINE_KEY_BYTES {
+        if key_raw_bytes(key) <= INLINE_KEY_BYTES {
+            #[cfg(any(test, feature = "test-utils"))]
+            if !matches!(&budget.proof_io, ProofIo::None) {
+                budget.charge(0)?;
+            }
             let bytes = key
                 .inline
-                .get(..key.bytes as usize)
+                .get(..key_raw_bytes(key))
                 .ok_or_else(|| invariant_violation("inline fence length"))?;
             if key.digest != self.digest(b"keys", bytes) {
                 return Err(invariant_violation(
@@ -507,16 +783,17 @@ impl Directory {
             .get(slot)
             .filter(|cached| cached.scope == self.scope && cached.digest == key.digest)
         {
-            if cached.bytes.len() != key.bytes as usize {
+            if cached.bytes.len() != key_object_bytes(key) {
                 return Err(invariant_violation(
                     "cached directory fence length mismatch",
                 ));
             }
-            return Ok(Bytes::copy_from_slice(&cached.bytes));
+            return Ok(Bytes::copy_from_slice(key_contents(key, &cached.bytes)?));
         }
         let bytes = self
-            .read_object("keys", &key.digest, key.bytes as usize, budget)
+            .read_object("keys", &key.digest, key_object_bytes(key), budget)
             .await?;
+        key_contents(key, &bytes)?;
         if budget.cached_keys.len() < KEY_CACHE_ENTRIES
             && bytes.len() <= KEY_CACHE_PAYLOAD_BYTES.saturating_sub(budget.cached_key_bytes)
         {
@@ -535,13 +812,23 @@ impl Directory {
                 },
             );
         }
-        Ok(bytes)
+        Ok(if key.bytes & KEY_V2_FLAG == 0 {
+            bytes
+        } else {
+            bytes.slice(KEY_V2_HEADER_BYTES..)
+        })
     }
     fn page_node(&self, depth: u8, children: &[Node]) -> Result<(Node, Vec<u8>)> {
         if depth == 0 || depth as usize > DEPTH || children.len() > FANOUT {
             return Err(capacity("directory page fanout or depth exceeded"));
         }
-        if page_probe_bytes(children)? > PAGE_PROBE_LIMIT {
+        if page_probe_bytes(children)?
+            + self
+                .publication_salt
+                .as_ref()
+                .map_or(0, |_| PUBLICATION_SALT_BYTES)
+            > PAGE_PROBE_LIMIT
+        {
             return Err(capacity("directory page fence-probe budget exceeded"));
         }
         let mut rows = 0_u64;
@@ -554,13 +841,27 @@ impl Directory {
                 .checked_add(child.rows)
                 .ok_or_else(|| capacity("directory row count overflow"))?;
         }
-        let mut bytes = Vec::with_capacity(HEADER_BYTES + children.len() * NODE_BYTES);
-        bytes.extend_from_slice(PAGE_MAGIC);
+        let mut bytes = Vec::with_capacity(
+            HEADER_BYTES
+                + children.len() * NODE_BYTES
+                + self
+                    .publication_salt
+                    .as_ref()
+                    .map_or(0, |_| PUBLICATION_SALT_BYTES),
+        );
+        bytes.extend_from_slice(if self.publication_salt.is_some() {
+            PAGE_MAGIC_V2
+        } else {
+            PAGE_MAGIC
+        });
         bytes.extend_from_slice(&self.scope);
         bytes.push(depth);
         let count =
             u16::try_from(children.len()).map_err(|_| capacity("directory count overflow"))?;
         bytes.extend_from_slice(&count.to_le_bytes());
+        if let Some(salt) = &self.publication_salt {
+            bytes.extend_from_slice(salt.as_ref());
+        }
         for node in children {
             encode_node(&mut bytes, node);
         }
@@ -625,7 +926,14 @@ impl Directory {
             .read_object("pages", &node.digest, node.bytes as usize, budget)
             .await?;
         let children = decode_page(&bytes, &self.scope, node.depth)?;
-        if page_probe_bytes(&children)? > PAGE_PROBE_LIMIT {
+        if page_probe_bytes(&children)?
+            + if bytes.starts_with(PAGE_MAGIC_V2) {
+                PUBLICATION_SALT_BYTES
+            } else {
+                0
+            }
+            > PAGE_PROBE_LIMIT
+        {
             return Err(invariant_violation(
                 "directory page fence-probe budget exceeded",
             ));
@@ -916,12 +1224,15 @@ fn capacity(message: &str) -> CatalogError {
     }
 }
 fn validate_key_shape(key: KeyRef) -> Result<()> {
-    if key.bytes as usize > MAX_BLOCK_BYTES {
+    let length = key_raw_bytes(key);
+    if key_object_bytes(key) > MAX_BLOCK_BYTES
+        || (key.bytes & KEY_V2_FLAG != 0 && length <= INLINE_KEY_BYTES)
+    {
         return Err(invariant_violation("oversized directory fence"));
     }
-    let padding = if key.bytes as usize <= INLINE_KEY_BYTES {
+    let padding = if length <= INLINE_KEY_BYTES {
         key.inline
-            .get(key.bytes as usize..)
+            .get(length..)
             .ok_or_else(|| invariant_violation("inline fence length"))?
     } else {
         &key.inline
@@ -936,8 +1247,8 @@ fn validate_node(node: &Node, empty: bool) -> Result<()> {
     validate_key_shape(node.last)?;
     if node.depth as usize > DEPTH
         || (node.rows == 0 && !(empty && node.depth == 1))
-        || node.first.bytes as usize > MAX_BLOCK_BYTES
-        || node.last.bytes as usize > MAX_BLOCK_BYTES
+        || key_raw_bytes(node.first) > MAX_BLOCK_BYTES
+        || key_raw_bytes(node.last) > MAX_BLOCK_BYTES
         || node.bytes == 0
         || (node.depth == 0
             && (node.bytes as usize > MAX_SEGMENT_BYTES
@@ -956,12 +1267,37 @@ fn page_probe_bytes(children: &[Node]) -> Result<usize> {
     for child in children {
         validate_node(child, false)?;
         for key in [child.first, child.last] {
-            if key.bytes as usize > INLINE_KEY_BYTES {
-                total += key.bytes as usize + 1;
+            if key_raw_bytes(key) > INLINE_KEY_BYTES {
+                total += key_object_bytes(key) + 1;
             }
         }
     }
     Ok(total)
+}
+fn key_raw_bytes(key: KeyRef) -> usize {
+    (key.bytes & !KEY_V2_FLAG) as usize
+}
+fn key_object_bytes(key: KeyRef) -> usize {
+    key_raw_bytes(key)
+        + if key.bytes & KEY_V2_FLAG != 0 {
+            KEY_V2_HEADER_BYTES
+        } else {
+            0
+        }
+}
+fn key_contents(key: KeyRef, bytes: &[u8]) -> Result<&[u8]> {
+    if bytes.len() != key_object_bytes(key) {
+        return Err(invariant_violation("directory fence length mismatch"));
+    }
+    if key.bytes & KEY_V2_FLAG == 0 {
+        return Ok(bytes);
+    }
+    if bytes.get(..8) != Some(KEY_MAGIC_V2) {
+        return Err(invariant_violation("invalid directory fence version"));
+    }
+    bytes
+        .get(KEY_V2_HEADER_BYTES..)
+        .ok_or_else(|| invariant_violation("truncated directory fence version"))
 }
 fn encode_node(out: &mut Vec<u8>, node: &Node) {
     #[cfg(any(test, feature = "test-utils"))]
@@ -1016,7 +1352,8 @@ fn decode_page(bytes: &[u8], scope: &[u8; 32], depth: u8) -> Result<Vec<Node>> {
         return Err(invariant_violation("invalid directory page length"));
     }
     let mut input = bytes;
-    if take::<8>(&mut input)? != *PAGE_MAGIC
+    let magic = take::<8>(&mut input)?;
+    if (magic != *PAGE_MAGIC && magic != *PAGE_MAGIC_V2)
         || take::<32>(&mut input)? != *scope
         || take::<1>(&mut input)?[0] != depth
         || depth == 0
@@ -1025,7 +1362,19 @@ fn decode_page(bytes: &[u8], scope: &[u8; 32], depth: u8) -> Result<Vec<Node>> {
         return Err(invariant_violation("invalid directory page header"));
     }
     let count = usize::from(u16::from_le_bytes(take(&mut input)?));
-    if count > FANOUT || bytes.len() != HEADER_BYTES + count * NODE_BYTES {
+    if magic == *PAGE_MAGIC_V2 {
+        let _salt = take::<PUBLICATION_SALT_BYTES>(&mut input)?;
+    }
+    if count > FANOUT
+        || bytes.len()
+            != HEADER_BYTES
+                + count * NODE_BYTES
+                + if magic == *PAGE_MAGIC_V2 {
+                    PUBLICATION_SALT_BYTES
+                } else {
+                    0
+                }
+    {
         return Err(invariant_violation(
             "invalid directory page count or length",
         ));

@@ -1249,7 +1249,7 @@ pub(in super::super) struct FinalStreamTotals {
 }
 
 impl FinalStreamTotals {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(in super::super) fn evidence(&self) -> (u64, u64, u64, usize, usize) {
         (
             self.total_operations,
@@ -6494,6 +6494,7 @@ impl<T> Drop for WorkingValue<T> {
 pub(in super::super) fn new_directory_builder(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
+    publication_id: Option<&str>,
 ) -> CatalogResult<WorkingValue<super::super::directory::restore::NativeBuilder>> {
     use super::super::directory::{Directory, restore::NativeBuilder};
     let store = io.store;
@@ -6507,10 +6508,11 @@ pub(in super::super) fn new_directory_builder(
                 "native builder requires final authority-8 stream",
             ));
         }
-        Ok(NativeBuilder::new(Directory::new(
-            store.retention.clone(),
-            &store.scope,
-        )?))
+        let mut directory = Directory::new(store.retention.clone(), &store.scope)?;
+        if let Some(id) = publication_id {
+            directory = directory.for_publication(id)?;
+        }
+        Ok(NativeBuilder::new(directory))
     })
 }
 
@@ -6560,6 +6562,7 @@ impl WorkingValue<super::super::directory::restore::NativeBuilder> {
 pub(in super::super) fn new_directory_path_copy(
     io: &mut RestorePhysicalIo<'_>,
     route: &mut RestorePhysicalRoute<'_, '_>,
+    publication_id: Option<&str>,
     root: &super::super::directory::Root,
     position: &WorkingValue<Option<super::super::directory::restore::Position>>,
     replacements: &WorkingValue<Vec<super::super::directory::Leaf>>,
@@ -6576,8 +6579,13 @@ pub(in super::super) fn new_directory_path_copy(
                 "notice path copy owner or phase differs",
             ));
         }
+        let mut directory =
+            super::super::directory::Directory::new(store.retention.clone(), &store.scope)?;
+        if let Some(id) = publication_id {
+            directory = directory.for_publication(id)?;
+        }
         super::super::directory::restore::NativePathCopy::new(
-            super::super::directory::Directory::new(store.retention.clone(), &store.scope)?,
+            directory,
             root,
             position.value().as_ref(),
             replacements.value(),
@@ -7407,6 +7415,7 @@ pub(in super::super) struct NoticeRoleEdit {
 pub(in super::super) async fn splice_restore_notice_role(
     io: &mut RestorePhysicalIo<'_>,
     totals: &mut FinalStreamTotals,
+    publication_id: Option<&str>,
     role: super::Role,
     root: &super::super::directory::Root,
     selected: &WorkingValue<Option<super::super::directory::restore::Position>>,
@@ -7433,7 +7442,7 @@ pub(in super::super) async fn splice_restore_notice_role(
                         store.retention.clone(),
                         &store.scope,
                     )?;
-                    if *root != directory.empty_root_reference()? {
+                    if !directory.is_empty_root_shape(root)? {
                         return Err(physical_backpressure(
                             "notice insertion has no predecessor in a nonempty root",
                         ));
@@ -7595,7 +7604,14 @@ pub(in super::super) async fn splice_restore_notice_role(
                 .ok_or_else(|| physical_backpressure("notice output leaf is absent"))
         })?;
         drop(output_leaves);
-        let mut copy = new_directory_path_copy(io, &mut route, root, selected, &replacements)?;
+        let mut copy = new_directory_path_copy(
+            io,
+            &mut route,
+            publication_id,
+            root,
+            selected,
+            &replacements,
+        )?;
         let _ = chunk.finish();
         loop {
             let mut chunk = FinalMicrochunk::begin(totals, 0, io)?;
@@ -10699,6 +10715,7 @@ mod native_directory_tests {
             new_directory_builder(
                 &mut io,
                 &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                None,
             )
             .expect("admitted native builder")
         };
@@ -10793,6 +10810,7 @@ mod native_directory_tests {
                     new_directory_builder(
                         &mut io,
                         &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                        None,
                     )
                     .expect("builder")
                 };
@@ -10903,6 +10921,7 @@ mod native_directory_tests {
                 let result = new_directory_builder(
                     &mut io,
                     &mut RestorePhysicalRoute::FinalMicrochunk(&mut chunk),
+                    None,
                 );
                 assert_eq!(result.is_ok(), limit == reservation);
                 assert_eq!(io.reading_evidence(), (0, 0, 0));
@@ -10928,7 +10947,8 @@ mod native_directory_tests {
                 &mut RestorePhysicalRoute::OrdinaryUnit {
                     workspace: &mut workspace,
                     payload: &mut payload
-                }
+                },
+                None,
             )
             .is_err()
         );
@@ -10944,7 +10964,7 @@ mod native_directory_tests {
             let mut totals = FinalStreamTotals::new();
             let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-            let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+            let mut builder = new_directory_builder(&mut io, &mut route, None).expect("builder");
             let input = decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
                 let mut leaf = Leaf {
                     first: b"a".to_vec(),
@@ -11015,7 +11035,8 @@ mod native_directory_tests {
                 {
                     let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                     let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-                    let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                    let mut builder =
+                        new_directory_builder(&mut io, &mut route, None).expect("builder");
                     let input =
                         decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
                             Ok(fixture.clone())
@@ -11067,7 +11088,8 @@ mod native_directory_tests {
                 {
                     let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                     let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-                    let builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                    let builder =
+                        new_directory_builder(&mut io, &mut route, None).expect("builder");
                     let mut future = Box::pin(builder.finish_directory(&mut io, &mut route));
                     let result = future
                         .as_mut()
@@ -11104,7 +11126,7 @@ mod native_directory_tests {
                 let mut chunk =
                     FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("constructor");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-                let builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                let builder = new_directory_builder(&mut io, &mut route, None).expect("builder");
                 let input = decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
                     Ok(Leaf {
                         first: vec![1],
@@ -11154,7 +11176,7 @@ mod native_directory_tests {
             let mut totals = FinalStreamTotals::new();
             let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
             let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-            let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+            let mut builder = new_directory_builder(&mut io, &mut route, None).expect("builder");
             let mut oracle =
                 decode_with_reservation(&mut io, &mut route, Some(1024 * 1024), || {
                     builder.value.seed_depth_frontier(overflow)
@@ -11253,7 +11275,8 @@ mod native_directory_tests {
                 let mut totals = FinalStreamTotals::new();
                 let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
                 let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
-                let mut builder = new_directory_builder(&mut io, &mut route).expect("builder");
+                let mut builder =
+                    new_directory_builder(&mut io, &mut route, None).expect("builder");
                 if key {
                     let input =
                         decode_with_reservation(&mut io, &mut route, Some(16 * 1024), || {
@@ -11689,7 +11712,7 @@ mod native_directory_tests {
                 let replacements =
                     decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || Ok(leaves))
                         .expect("owned replacements");
-                new_directory_path_copy(&mut io, &mut route, &old, &position, &replacements)
+                new_directory_path_copy(&mut io, &mut route, None, &old, &position, &replacements)
                     .expect("admitted path copy")
             };
             let result = loop {
@@ -11738,6 +11761,80 @@ mod native_directory_tests {
             assert!(io.work.write_attempts > 0);
             drop(result);
             assert!(io.ledger.lock().expect("ledger").report().passing());
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_notice_path_copy_accepts_v2_source_long_key() {
+        let (store, _) = native_counter_fixture().await;
+        let source = Directory::new(store.retention.clone(), &store.scope)
+            .expect("directory")
+            .for_publication("source-candidate")
+            .expect("source identity");
+        let destination = Directory::new(store.retention.clone(), &store.scope)
+            .expect("directory")
+            .for_publication("restore-candidate")
+            .expect("destination identity");
+        let key = vec![b'k'; 100];
+        let old_leaf = Leaf {
+            first: key.clone(),
+            last: key.clone(),
+            rows: 1,
+            bytes: 100,
+            digest: [7; 32],
+        };
+        let mut builder = source.builder();
+        builder.push(old_leaf.clone()).await.expect("old leaf");
+        let old = builder.finish().await.expect("source root");
+        let replacement = Leaf {
+            digest: [8; 32],
+            ..old_leaf.clone()
+        };
+        let expected = destination
+            .update(
+                &old,
+                &[super::super::directory::update::Edit {
+                    old: Some(old_leaf),
+                    new: vec![replacement.clone()],
+                }],
+                &mut super::super::directory::ReadBudget::default(),
+            )
+            .await
+            .expect("ordinary cross-publication copy");
+        let mut io = RestorePhysicalIo::new(&store, FINAL_MICROCHUNK_BYTES, FINAL_MICROCHUNK_BYTES);
+        let mut totals = FinalStreamTotals::new();
+        let mut copy = {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            let position = restore::floor_at_or_before(&mut io, &mut route, &old, &key)
+                .await
+                .expect("source position");
+            let replacements =
+                decode_with_reservation(&mut io, &mut route, Some(64 * 1024), || {
+                    Ok(vec![replacement])
+                })
+                .expect("replacement");
+            new_directory_path_copy(
+                &mut io,
+                &mut route,
+                Some("restore-candidate"),
+                &old,
+                &position,
+                &replacements,
+            )
+            .expect("copy")
+        };
+        loop {
+            let mut chunk = FinalMicrochunk::begin(&mut totals, 0, &mut io).expect("chunk");
+            let mut route = RestorePhysicalRoute::FinalMicrochunk(&mut chunk);
+            match copy.advance_directory_path_copy(&mut io, &mut route).await {
+                Ok(Some(actual)) => {
+                    assert_eq!(*actual.value(), expected);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => panic!("cross-publication path copy: {error:?}"),
+            }
         }
     }
 

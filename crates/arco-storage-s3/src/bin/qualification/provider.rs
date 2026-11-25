@@ -37,6 +37,8 @@ pub struct Artifact {
 #[allow(clippy::struct_field_names)]
 pub struct Manifest {
     schema: u32,
+    pub gc_stage: Option<String>,
+    pub gc_seed: Option<String>,
     phase: String,
     pub run_id: String,
     base_sha: String,
@@ -145,10 +147,38 @@ impl Manifest {
         Ok(serde_json::from_slice(&fs::read(path)?)?)
     }
     pub fn validate(&self, real: bool) -> Result<()> {
+        self.validate_workload(real, false)
+    }
+    pub fn validate_gc(&self) -> Result<()> {
+        self.validate_workload(false, true)
+    }
+    fn validate_workload(&self, real: bool, gc: bool) -> Result<()> {
+        let workload_valid = if gc {
+            self.phase == "authority8-gc-loopback"
+                && self.base_sha.len() == 40
+                && self
+                    .base_sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && self.scenarios == super::gc::inventory()
+                && matches!(
+                    self.gc_stage.as_deref(),
+                    Some("fixture" | "interrupt" | "sweep")
+                )
+                && if self.gc_stage.as_deref() == Some("fixture") {
+                    self.gc_seed.is_none()
+                } else {
+                    self.gc_seed.as_deref().is_some_and(digest)
+                }
+        } else {
+            self.phase == "provider"
+                && self.base_sha == BASE
+                && self.scenarios == inventory()
+                && self.gc_stage.is_none()
+                && self.gc_seed.is_none()
+        };
         if self.schema != 1
-            || self.phase != "provider"
-            || self.base_sha != BASE
-            || self.scenarios != inventory()
+            || !workload_valid
             || !token(&self.run_id)
             || !self.run_id.starts_with("gate7-")
             || !token(&self.tenant)
@@ -547,6 +577,20 @@ fn contained(path: &str, prefixes: &[String]) -> bool {
         && !path.split('/').any(|part| matches!(part, "." | ".."))
 }
 
+fn gc_operation_allowed(operation: &str, path: &str, stage: &str, prefix: &str) -> bool {
+    if !path.starts_with(prefix) || operation == "delete" {
+        return false;
+    }
+    if stage == "fixture" {
+        return true;
+    }
+    if matches!(operation, "get" | "range") && path.contains("/segments/l1/") {
+        return false;
+    }
+    operation != "put"
+        || path.starts_with(&format!("{prefix}control/v1/domains/catalog/gc-marks/v1/"))
+}
+
 pub struct Observed {
     pub inner: Arc<dyn StorageBackend>,
     pub journal: Arc<Journal>,
@@ -569,6 +613,14 @@ impl Observed {
             return Err(arco_core::Error::InvalidInput(
                 "disposable namespace escape".into(),
             ));
+        }
+        if let Some(stage) = self.journal.manifest.gc_stage.as_deref() {
+            let prefix = self.journal.manifest.prefix(0);
+            if !gc_operation_allowed(operation, path, stage, &prefix) {
+                return Err(arco_core::Error::InvalidInput(
+                    "GC rehearsal forbids this operation".into(),
+                ));
+            }
         }
         let id = self.journal.admit(requests, bytes)?;
         self.journal
@@ -735,6 +787,8 @@ mod tests {
         };
         let manifest = Manifest {
             schema: 1,
+            gc_stage: None,
+            gc_seed: None,
             phase: "provider".into(),
             run_id: "gate7-test".into(),
             base_sha: BASE.into(),
@@ -771,6 +825,30 @@ mod tests {
         };
         Journal::create(Arc::new(manifest), &config, &hash(&config).unwrap()).unwrap()
     }
+    #[test]
+    fn gc_rehearsal_permissions_confine_writes_and_payload_reads() {
+        let prefix = "tenant=gate7-test/workspace=qualification-r0/";
+        let head = format!("{prefix}control/v1/domains/catalog/head/current.json");
+        let payload = format!("{prefix}control/v1/domains/catalog/segments/l1/data.arrow");
+        let proof = format!("{prefix}control/v1/domains/catalog/gc-marks/v1/seed/complete.json");
+        for stage in ["interrupt", "sweep"] {
+            assert!(!gc_operation_allowed("delete", &proof, stage, prefix));
+            assert!(!gc_operation_allowed("put", &head, stage, prefix));
+            assert!(!gc_operation_allowed("get", &payload, stage, prefix));
+            assert!(!gc_operation_allowed("range", &payload, stage, prefix));
+            assert!(gc_operation_allowed("head", &payload, stage, prefix));
+            assert!(gc_operation_allowed("put", &proof, stage, prefix));
+            assert!(!gc_operation_allowed(
+                "put",
+                &proof.replace("-r0/", "-r1/"),
+                stage,
+                prefix
+            ));
+        }
+        assert!(gc_operation_allowed("put", &head, "fixture", prefix));
+        assert!(!gc_operation_allowed("delete", &head, "fixture", prefix));
+    }
+
     #[tokio::test]
     async fn failed_intent_write_does_not_leave_phantom_in_flight_work() {
         let journal = fixture();

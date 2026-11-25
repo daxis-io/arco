@@ -111,6 +111,7 @@ fn catalog_error_owned_bytes(error: &CatalogError) -> Option<usize> {
 
 pub struct WorkspaceIoBudget {
     bytes: usize,
+    byte_limit: usize,
     operations: usize,
     head_owned_bytes: usize,
     write_owned_bytes: usize,
@@ -119,7 +120,7 @@ pub struct WorkspaceIoBudget {
 }
 
 impl WorkspaceIoBudget {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub const fn test_accounting(&self) -> (usize, usize, usize, usize) {
         (
             self.bytes,
@@ -132,6 +133,7 @@ impl WorkspaceIoBudget {
     pub const fn new() -> Self {
         Self {
             bytes: 0,
+            byte_limit: METADATA_BYTES,
             operations: 0,
             head_owned_bytes: 0,
             write_owned_bytes: 0,
@@ -140,12 +142,49 @@ impl WorkspaceIoBudget {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) const fn for_control_gc() -> Self {
+        Self {
+            byte_limit: 64 * 1024 * 1024,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) async fn list_page<S: StorageBackend + ?Sized>(
+        &mut self,
+        storage: &S,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<arco_core::storage::ListPage> {
+        self.charge_operations(1)?;
+        let page = storage.list_page(prefix, cursor, limit).await?;
+        let mut owned = size_of::<arco_core::storage::ListPage>()
+            .checked_add(
+                page.objects
+                    .capacity()
+                    .saturating_mul(size_of::<ObjectMeta>()),
+            )
+            .and_then(|n| n.checked_add(page.next_start_after.as_ref().map_or(0, String::capacity)))
+            .ok_or_else(backpressure)?;
+        for meta in &page.objects {
+            owned = owned
+                .checked_add(object_meta_owned_bytes(meta)? - size_of::<ObjectMeta>())
+                .ok_or_else(backpressure)?;
+        }
+        self.reserve_bytes(owned)?;
+        if page.objects.len() > limit {
+            return Err(validation("bounded inventory exceeds its page limit"));
+        }
+        Ok(page)
+    }
+
     pub(crate) fn reserve_bytes(&mut self, bytes: usize) -> Result<()> {
         if self.stopped {
             return Err(self.stopped_error());
         }
         let next = self.bytes.checked_add(bytes).ok_or_else(backpressure)?;
-        if next > METADATA_BYTES {
+        if next > self.byte_limit {
             return Err(backpressure());
         }
         self.bytes = next;
@@ -158,7 +197,7 @@ impl WorkspaceIoBudget {
         let owned = catalog_error_owned_bytes(error).unwrap_or(usize::MAX);
         self.error_owned_bytes = self.error_owned_bytes.saturating_add(owned);
         self.bytes = self.bytes.saturating_add(owned);
-        self.stopped |= self.bytes > METADATA_BYTES;
+        self.stopped |= self.bytes > self.byte_limit;
         if self.stopped { Err(()) } else { Ok(()) }
     }
 
@@ -192,7 +231,7 @@ impl WorkspaceIoBudget {
             .checked_add(owned)
             .ok_or_else(backpressure)?;
         self.bytes = self.bytes.checked_add(owned).ok_or_else(backpressure)?;
-        if self.bytes > METADATA_BYTES {
+        if self.bytes > self.byte_limit {
             return Err(backpressure());
         }
         Ok(())
@@ -211,7 +250,7 @@ impl WorkspaceIoBudget {
             .checked_add(owned)
             .ok_or_else(backpressure)?;
         self.bytes = self.bytes.checked_add(owned).ok_or_else(backpressure)?;
-        if self.bytes > METADATA_BYTES {
+        if self.bytes > self.byte_limit {
             return Err(backpressure());
         }
         Ok(())
@@ -522,7 +561,7 @@ fn missing_record(path: &str) -> CatalogError {
 }
 fn backpressure() -> CatalogError {
     CatalogError::MaintenanceBackpressure {
-        message: "workspace metadata exceeds its 32 MiB or 4096-operation admission".into(),
+        message: "workspace I/O exceeds its byte or 4096-operation admission".into(),
     }
 }
 

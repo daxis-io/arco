@@ -1,10 +1,11 @@
 //! Private restore candidate certificate. It is not publication authority.
-use super::super::{ArtifactRef, RoleTransition8, physical};
+use super::super::{ArtifactRef, Manifest8, RoleTransition8, directory, physical};
 use super::{
     ControlMvpPaths, ControlMvpRestorePlanV7, Result, binary, invariant_violation, prefixed_sha256,
     raw_digest, tagged, valid_raw_digest,
 };
 use crate::state_store::{RestoreAttemptIdentity, StateScope};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 const RECORD_TYPE: &str = "control_mvp_restore_certificate";
@@ -54,6 +55,31 @@ pub(super) struct RestoreCertificateV1 {
 }
 
 impl RestoreCertificateV1 {
+    pub(super) fn terminal(&self) -> &Terminal {
+        &self.terminal
+    }
+
+    pub(super) fn validate_manifest(
+        &self,
+        manifest: &Manifest8,
+        roots: (&directory::Root, &directory::Root, &directory::Root),
+    ) -> Result<()> {
+        if self.candidate_id != manifest.manifest_id
+            || self.logical.result_sequence != manifest.logical_sequence
+            || self.logical.restore_history_sha256 != manifest.logical_history
+            || self.output_kv_root_b64
+                != base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(roots.0.encode())
+            || self.active.new_root_hex != hex::encode(roots.1.encode())
+            || self.delivery.new_root_hex != hex::encode(roots.2.encode())
+            || manifest.projection_source.as_ref() != Some(&self.projection_source)
+        {
+            return Err(invariant_violation(
+                "restore certificate differs from manifest",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn read_bounded(
         store: &super::ControlMvpStateStore,
         budget: &mut super::retained::ReadBudget<'_>,
@@ -110,7 +136,8 @@ impl RestoreCertificateV1 {
                 "restore certificate projection source differs",
             ));
         }
-        let directory = super::directory::Directory::new(store.retention.clone(), &store.scope)?;
+        let directory = directory::Directory::new(store.retention.clone(), &store.scope)?
+            .for_publication(&fields.candidate_id)?;
         for (proof, inherited) in [
             (&value.active, &fields.base_active_id_root_b64),
             (&value.delivery, &fields.base_delivery_order_root_b64),
@@ -124,7 +151,7 @@ impl RestoreCertificateV1 {
                 .edits
                 .first()
                 .ok_or_else(|| invariant_violation("restore notice edit is absent"))?;
-            let edit = super::directory::update::Edit {
+            let edit = directory::update::Edit {
                 old: edit
                     .old
                     .as_ref()
@@ -141,7 +168,7 @@ impl RestoreCertificateV1 {
                     &old,
                     &new,
                     &[edit],
-                    &mut super::directory::ReadBudget::with_retained(budget),
+                    &mut directory::ReadBudget::with_retained(budget),
                 )
                 .await?;
         }

@@ -835,7 +835,11 @@ impl<'a, 'p, 't> StandardStream<'a, 'p, 't> {
             plan,
             selected.progress.value().cumulative_counts.mutations,
         )?;
-        let builder = physical::restore_io::new_directory_builder(io, &mut final_route)?;
+        let builder = physical::restore_io::new_directory_builder(
+            io,
+            &mut final_route,
+            Some(&plan.value().plan.fields.candidate_id),
+        )?;
         Ok(Self {
             prefix,
             plan,

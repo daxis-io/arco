@@ -87,10 +87,6 @@ pub struct BoundedMutation<'a> {
 impl BoundedMutation<'_> {
     /// Arming is sticky even when the caller handles an error or finishes successfully.
     /// This only records the reconciliation boundary; it cannot send authority HEAD.
-    #[allow(
-        dead_code,
-        reason = "restore publication remains disabled pending finalization qualification"
-    )]
     pub(crate) async fn arm_restore_publication(
         &mut self,
         intent: super::ArmedRestorePublicationIntent,
@@ -142,6 +138,24 @@ impl BoundedMutation<'_> {
 }
 
 impl RetentionMutationEpoch {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) async fn gc_dry_run_epoch_version_bounded(
+        storage: &ScopedStorage,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<Option<String>> {
+        let Some((record, version)) = read_epoch(storage, budget).await? else {
+            return Ok(None);
+        };
+        // ponytail: dry runs reject every in-flight epoch; active GC will need
+        // to prove its own exact claimed epoch before reusing this planner.
+        if record.state == RetentionMutationState::InFlight {
+            return Err(CatalogError::PreconditionFailed {
+                message: "bounded GC has an unresolved retention mutation epoch".into(),
+            });
+        }
+        Ok(Some(version))
+    }
+
     fn bounded_storage(&self) -> Result<&ScopedStorage> {
         self.storage
             .as_legacy_scoped()
@@ -211,6 +225,84 @@ impl RetentionMutationEpoch {
 
     pub(crate) fn armed_pointer(&self) -> Option<&ArmedRetainedPointerIntent> {
         self.record.armed_retained_pointer.as_ref()
+    }
+
+    pub(crate) fn armed_restore(&self) -> Option<&super::ArmedRestorePublicationIntent> {
+        self.record.armed_restore_publication.as_deref()
+    }
+
+    pub(crate) async fn load_armed_restore_bounded(
+        storage: ScopedStorage,
+        operation_ids: &std::collections::BTreeSet<String>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<Option<Self>> {
+        let Some((record, claimed_version)) = read_epoch(&storage, budget).await? else {
+            return Ok(None);
+        };
+        if record.state != RetentionMutationState::InFlight
+            || record.operation_kind != RetentionMutationKind::WorkspaceRestoreApply
+            || !operation_ids.contains(&record.operation_id)
+            || record.armed_restore_publication.is_none()
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            storage: storage.into(),
+            record,
+            claimed_version,
+            uncertain_mutation: true,
+        }))
+    }
+
+    /// Clear an armed restore epoch only after workspace has authenticated either
+    /// visible receipt or definitive supersession and persisted that terminal state.
+    pub(crate) async fn settle_recovered_restore_bounded(
+        self,
+        evidence: Option<&crate::state_store::RestoredAuthorityEvidence>,
+        selected_plan_sha256: &str,
+        operation_id: &str,
+        guard: &mut LockGuard<ScopedStorage>,
+        budget: &mut WorkspaceIoBudget,
+    ) -> Result<()> {
+        let intent = self
+            .record
+            .armed_restore_publication
+            .as_deref()
+            .ok_or_else(|| validation("restore settlement requires an armed publication intent"))?;
+        if let Some(evidence) = evidence {
+            evidence.validate()?;
+            if intent.domain != evidence.scope().domain()
+                || intent.candidate_id != evidence.manifest_id()
+            {
+                return Err(validation("armed restore visible evidence differs"));
+            }
+        }
+        if self.record.operation_id != operation_id
+            || selected_plan_sha256.strip_prefix("sha256:") != Some(intent.plan_sha256.as_str())
+        {
+            return Err(validation("armed restore settlement proof differs"));
+        }
+        budget.extend_retention_lock(guard).await?;
+        match read_epoch(self.bounded_storage()?, budget).await? {
+            Some((record, version)) if record == self.record && version == self.claimed_version => {
+            }
+            _ => {
+                return Err(CatalogError::PreconditionFailed {
+                    message: "restore recovery epoch changed before settlement".into(),
+                });
+            }
+        }
+        let mut cleared = self.record.clone();
+        cleared.armed_restore_publication = None;
+        cleared.version = super::VERSION;
+        publish_epoch(
+            self.bounded_storage()?,
+            &cleared.completed()?,
+            WritePrecondition::MatchesVersion(self.claimed_version.clone()),
+            budget,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Loads an exact prior snapshot epoch for read-only terminal reconciliation.

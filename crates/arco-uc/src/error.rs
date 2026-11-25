@@ -31,6 +31,12 @@ pub enum UnityCatalogError {
         /// Human readable message.
         message: String,
     },
+    /// Request or selected object exceeds a bounded payload limit.
+    #[error("{message}")]
+    PayloadTooLarge {
+        /// Human readable message.
+        message: String,
+    },
     /// Authentication required or invalid.
     #[error("{message}")]
     Unauthorized {
@@ -93,102 +99,42 @@ pub enum UnityCatalogError {
 
 impl UnityCatalogError {
     fn to_status_and_payload(&self) -> (StatusCode, UnityCatalogErrorResponse) {
-        match self {
-            Self::BadRequest { message } => (
-                StatusCode::BAD_REQUEST,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "BAD_REQUEST".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::Unauthorized { message } => (
-                StatusCode::UNAUTHORIZED,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "UNAUTHORIZED".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::Forbidden { message } => (
-                StatusCode::FORBIDDEN,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "FORBIDDEN".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::NotFound { message } => (
-                StatusCode::NOT_FOUND,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "NOT_FOUND".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::Conflict { message } => (
-                StatusCode::CONFLICT,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "CONFLICT".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::NotImplemented { message } => (
-                StatusCode::NOT_IMPLEMENTED,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "NOT_SUPPORTED".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
+        let (status, error_code, message) = match self {
+            Self::BadRequest { message } => (StatusCode::BAD_REQUEST, "BAD_REQUEST", message),
+            Self::PayloadTooLarge { message } => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE", message)
+            }
+            Self::Unauthorized { message } => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", message),
+            Self::Forbidden { message } => (StatusCode::FORBIDDEN, "FORBIDDEN", message),
+            Self::NotFound { message } => (StatusCode::NOT_FOUND, "NOT_FOUND", message),
+            Self::Conflict { message } => (StatusCode::CONFLICT, "CONFLICT", message),
+            Self::NotImplemented { message } => {
+                (StatusCode::NOT_IMPLEMENTED, "NOT_SUPPORTED", message)
+            }
             Self::ServiceUnavailable { message } => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "SERVICE_UNAVAILABLE".to_string(),
-                        message: message.clone(),
-                    },
-                },
+                "SERVICE_UNAVAILABLE",
+                message,
             ),
             Self::CatalogAuthorityUnavailable {
                 error_code,
                 message,
                 ..
-            } => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: (*error_code).to_string(),
-                        message: message.clone(),
-                    },
+            } => (StatusCode::SERVICE_UNAVAILABLE, *error_code, message),
+            Self::TooManyRequests { message } => {
+                (StatusCode::TOO_MANY_REQUESTS, "TOO_MANY_REQUESTS", message)
+            }
+            Self::Internal { message } => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message),
+        };
+        (
+            status,
+            UnityCatalogErrorResponse {
+                error: UnityCatalogErrorDetail {
+                    error_code: error_code.to_string(),
+                    message: message.clone(),
                 },
-            ),
-            Self::TooManyRequests { message } => (
-                StatusCode::TOO_MANY_REQUESTS,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "TOO_MANY_REQUESTS".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-            Self::Internal { message } => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                UnityCatalogErrorResponse {
-                    error: UnityCatalogErrorDetail {
-                        error_code: "INTERNAL".to_string(),
-                        message: message.clone(),
-                    },
-                },
-            ),
-        }
+            },
+        )
     }
 }
 

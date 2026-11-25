@@ -19,8 +19,9 @@ use crate::state::UnityCatalogState;
 pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     let request_timeout = state.config.request_timeout;
     let concurrency_limit = state.config.concurrency_limit;
+    let table_reads_enabled = state.config.table_reads_enabled;
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route(
             "/openapi.json",
             axum::routing::get(routes::openapi::get_openapi_json),
@@ -33,7 +34,13 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
         .merge(routes::external_locations::routes())
         .merge(routes::credentials::routes())
         .merge(routes::delta_commits::routes())
-        .merge(routes::delta::config::routes())
+        .merge(routes::delta::config::routes());
+
+    if table_reads_enabled {
+        router = router.merge(routes::table_reads::routes());
+    }
+
+    let router = router
         .fallback(not_found)
         .layer(middleware::from_fn(context_middleware))
         .layer(TraceLayer::new_for_http());
@@ -100,6 +107,7 @@ mod tests {
         let config = UnityCatalogConfig {
             request_timeout: Some(Duration::from_secs(30)),
             concurrency_limit: Some(100),
+            ..UnityCatalogConfig::default()
         };
         let state = UnityCatalogState::with_config(storage, config);
         let _router = unity_catalog_router(state);

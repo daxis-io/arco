@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::storage::{StorageBackend as _, WritePrecondition, WriteResult};
 use arco_core::{DeltaPaths, ScopedStorage};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -18,6 +18,20 @@ use crate::error::{DeltaError, Result};
 use crate::types::{
     CommitDeltaRequest, CommitDeltaResponse, DeltaCoordinatorState, InflightCommit, StagedCommit,
 };
+
+/// Last version supported by bounded reads that replay from version zero.
+pub const MAX_PINNED_DELTA_VERSION: i64 = 15;
+const MAX_PINNED_COORDINATOR_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct StoredCoordinatorState {
+    #[serde(flatten)]
+    core: DeltaCoordinatorState,
+    // The reservation CAS binds the staged bytes to the incarnation's canonical
+    // root. Only entries covered by latest_version have finalized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    canonical_log_sha256: Vec<String>,
+}
 
 /// Coordinator configuration.
 #[derive(Debug, Clone)]
@@ -80,6 +94,45 @@ impl DeltaCommitCoordinator {
         self
     }
 
+    /// Returns the committed log digests from zero through exactly `version`.
+    ///
+    /// # Errors
+    ///
+    /// Fails for noncanonical roots, older state without digests, versions
+    /// outside the bounded profile, and versions the coordinator has yet to finalize.
+    pub async fn pinned_log_digests(&self, version: i64) -> Result<Vec<String>> {
+        if !(0..=MAX_PINNED_DELTA_VERSION).contains(&version) || !self.is_canonical_root() {
+            return Err(DeltaError::bad_request(
+                "pinned_delta_version_or_root_unsupported",
+            ));
+        }
+        let path = self.paths.coordinator_state();
+        let Some(meta) = self.storage.head_raw(&path).await? else {
+            return Err(DeltaError::not_found("delta_read_version_not_committed"));
+        };
+        if meta.size == 0 || meta.size > MAX_PINNED_COORDINATOR_BYTES {
+            return Err(DeltaError::serialization(
+                "pinned Delta coordinator state size invalid",
+            ));
+        }
+        let bytes = self.storage.get_range(&path, 0..meta.size).await?;
+        let state = decode_state(&bytes)?;
+        if version > state.core.latest_version {
+            return Err(DeltaError::not_found("delta_read_version_not_committed"));
+        }
+        let count = usize::try_from(version + 1)
+            .map_err(|_| DeltaError::bad_request("pinned_delta_version_or_root_unsupported"))?;
+        state
+            .canonical_log_sha256
+            .get(..count)
+            .map(<[String]>::to_vec)
+            .ok_or_else(|| DeltaError::conflict("delta_read_commit_identity_unavailable"))
+    }
+
+    fn is_canonical_root(&self) -> bool {
+        self.paths == DeltaPaths::legacy(self.paths.table_id())
+    }
+
     /// Returns a committed response for `req` when an idempotency marker already exists.
     ///
     /// # Errors
@@ -93,26 +146,23 @@ impl DeltaCommitCoordinator {
         validate_uuidv7(&req.idempotency_key)?;
         self.validate_staged_path(&req.staged_path)?;
 
+        let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? else {
+            return Ok(None);
+        };
         let legacy_hash = legacy_request_hash(req)?;
-        if let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? {
-            if record.request_hash == legacy_hash {
-                return Ok(Some(response_from_idempotency_record(record)));
-            }
-
+        if record.request_hash != legacy_hash {
             let payload = self
                 .read_staged_payload(&req.staged_path, &req.staged_version)
                 .await?;
-            let request_hash = request_hash(req, &payload)?;
-            if record.request_hash == request_hash {
-                return Ok(Some(response_from_idempotency_record(record)));
+            if record.request_hash != request_hash(req, &payload)? {
+                return Err(DeltaError::conflict(
+                    "Idempotency-Key already used with different request body".to_string(),
+                ));
             }
-
-            return Err(DeltaError::conflict(
-                "Idempotency-Key already used with different request body".to_string(),
-            ));
         }
-
-        Ok(None)
+        self.finalize_replayed_commit(&req.idempotency_key, record.version)
+            .await?;
+        Ok(Some(response_from_idempotency_record(record)))
     }
 
     async fn replay_committed_with_hashes(
@@ -218,7 +268,7 @@ impl DeltaCommitCoordinator {
                 return Ok(recovered.response);
             }
         }
-        let reserved = self.reserve_or_resume_inflight(&req, now).await?;
+        let reserved = self.reserve_or_resume_inflight(&req, &payload, now).await?;
 
         let delta_log_path = self.paths.delta_log_json(reserved.version)?;
 
@@ -274,23 +324,20 @@ impl DeltaCommitCoordinator {
         Ok(self.storage.get_raw(staged_path).await?)
     }
 
-    async fn load_state(&self) -> Result<(DeltaCoordinatorState, Option<String>)> {
+    async fn load_state(&self) -> Result<(StoredCoordinatorState, Option<String>)> {
         let path = self.paths.coordinator_state();
         let meta = self.storage.head_raw(&path).await?;
         let Some(meta) = meta else {
-            return Ok((DeltaCoordinatorState::default(), None));
+            return Ok((StoredCoordinatorState::default(), None));
         };
 
         let bytes = self.storage.get_raw(&path).await?;
-        let state: DeltaCoordinatorState = serde_json::from_slice(&bytes).map_err(|e| {
-            DeltaError::serialization(format!("failed to deserialize coordinator state: {e}"))
-        })?;
-        Ok((state, Some(meta.version)))
+        Ok((decode_state(&bytes)?, Some(meta.version)))
     }
 
     async fn store_state(
         &self,
-        state: &DeltaCoordinatorState,
+        state: &StoredCoordinatorState,
         expected_version: Option<&str>,
     ) -> Result<WriteResult> {
         let path = self.paths.coordinator_state();
@@ -315,7 +362,7 @@ impl DeltaCommitCoordinator {
                 return Ok(None);
             };
 
-            let Some(inflight) = state.inflight.clone() else {
+            let Some(inflight) = state.core.inflight.clone() else {
                 return Ok(None);
             };
 
@@ -326,26 +373,31 @@ impl DeltaCommitCoordinator {
             let commit_exists = self.storage.head_raw(&delta_log_path).await?.is_some();
 
             if commit_exists || now_ms >= inflight.expires_at_ms {
+                let payload = self
+                    .read_staged_payload(&inflight.staged_path, &inflight.staged_version)
+                    .await?;
+                let pinned = self.verify_reserved_log(&state, inflight.version, &payload)?;
                 if !commit_exists {
                     // Attempt to materialize the inflight commit from its staged payload.
-                    let payload = self
-                        .read_staged_payload(&inflight.staged_path, &inflight.staged_version)
-                        .await?;
                     let write = self
                         .storage
-                        .put_raw(&delta_log_path, payload, WritePrecondition::DoesNotExist)
+                        .put_raw(
+                            &delta_log_path,
+                            payload.clone(),
+                            WritePrecondition::DoesNotExist,
+                        )
                         .await?;
                     match write {
                         WriteResult::PreconditionFailed { .. } | WriteResult::Success { .. } => {}
                     }
                 }
+                if pinned && self.storage.get_raw(&delta_log_path).await? != payload {
+                    return Err(DeltaError::conflict("reserved Delta log identity changed"));
+                }
 
                 let read_version = inflight
                     .read_version
                     .unwrap_or_else(|| inflight.version.saturating_sub(1));
-                let payload = self
-                    .read_staged_payload(&inflight.staged_path, &inflight.staged_version)
-                    .await?;
                 let recovered_request_hash = request_hash(
                     &CommitDeltaRequest {
                         read_version,
@@ -370,8 +422,8 @@ impl DeltaCommitCoordinator {
                 .await?;
 
                 let mut updated = state.clone();
-                updated.latest_version = inflight.version.max(state.latest_version);
-                updated.inflight = None;
+                updated.core.latest_version = inflight.version.max(state.core.latest_version);
+                updated.core.inflight = None;
 
                 let put = self.store_state(&updated, Some(current_version)).await?;
                 match put {
@@ -397,6 +449,7 @@ impl DeltaCommitCoordinator {
     async fn reserve_or_resume_inflight(
         &self,
         req: &CommitDeltaRequest,
+        payload: &[u8],
         now: DateTime<Utc>,
     ) -> Result<ReservedCommit> {
         let now_ms = now.timestamp_millis();
@@ -407,7 +460,7 @@ impl DeltaCommitCoordinator {
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
 
-            if let Some(inflight) = &state.inflight {
+            if let Some(inflight) = &state.core.inflight {
                 if now_ms < inflight.expires_at_ms {
                     if inflight.commit_id == req.idempotency_key {
                         if inflight.staged_path != req.staged_path
@@ -428,13 +481,14 @@ impl DeltaCommitCoordinator {
                             }
                         }
 
-                        if state.latest_version != req.read_version {
+                        if state.core.latest_version != req.read_version {
                             return Err(DeltaError::conflict(format!(
                                 "stale read_version: expected {}, got {}",
-                                state.latest_version, req.read_version
+                                state.core.latest_version, req.read_version
                             )));
                         }
 
+                        self.verify_reserved_log(&state, inflight.version, payload)?;
                         return Ok(ReservedCommit {
                             version: inflight.version,
                         });
@@ -450,14 +504,15 @@ impl DeltaCommitCoordinator {
                 continue;
             }
 
-            if state.latest_version != req.read_version {
+            if state.core.latest_version != req.read_version {
                 return Err(DeltaError::conflict(format!(
                     "stale read_version: expected {}, got {}",
-                    state.latest_version, req.read_version
+                    state.core.latest_version, req.read_version
                 )));
             }
 
             let new_version = state
+                .core
                 .latest_version
                 .checked_add(1)
                 .ok_or_else(|| DeltaError::conflict("delta version overflow".to_string()))?;
@@ -472,8 +527,14 @@ impl DeltaCommitCoordinator {
                 expires_at_ms,
             };
 
-            let mut updated = state.clone();
-            updated.inflight = Some(inflight);
+            let mut updated = state;
+            updated.core.inflight = Some(inflight);
+            if new_version <= MAX_PINNED_DELTA_VERSION
+                && usize::try_from(new_version).ok() == Some(updated.canonical_log_sha256.len())
+                && self.is_canonical_root()
+            {
+                updated.canonical_log_sha256.push(sha256_hex(payload));
+            }
 
             let put = self.store_state(&updated, version.as_deref()).await?;
             match put {
@@ -491,6 +552,24 @@ impl DeltaCommitCoordinator {
         ))
     }
 
+    fn verify_reserved_log(
+        &self,
+        state: &StoredCoordinatorState,
+        version: i64,
+        payload: &[u8],
+    ) -> Result<bool> {
+        let expected = usize::try_from(version)
+            .ok()
+            .and_then(|index| state.canonical_log_sha256.get(index));
+        let Some(expected) = expected else {
+            return Ok(false);
+        };
+        if !self.is_canonical_root() || *expected != sha256_hex(payload) {
+            return Err(DeltaError::conflict("reserved Delta log identity changed"));
+        }
+        Ok(true)
+    }
+
     async fn finalize_inflight(&self, commit_id: &str, committed_version: i64) -> Result<()> {
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
@@ -500,11 +579,11 @@ impl DeltaCommitCoordinator {
                 ));
             };
 
-            if state.inflight.is_none() && state.latest_version >= committed_version {
+            if state.core.inflight.is_none() && state.core.latest_version >= committed_version {
                 return Ok(());
             }
 
-            if let Some(inflight) = &state.inflight {
+            if let Some(inflight) = &state.core.inflight {
                 if inflight.commit_id != commit_id {
                     return Err(DeltaError::conflict(
                         "coordinator inflight changed during finalize; retry".to_string(),
@@ -513,8 +592,8 @@ impl DeltaCommitCoordinator {
             }
 
             let mut updated = state.clone();
-            updated.latest_version = committed_version.max(state.latest_version);
-            updated.inflight = None;
+            updated.core.latest_version = committed_version.max(state.core.latest_version);
+            updated.core.inflight = None;
 
             let put = self.store_state(&updated, Some(&version)).await?;
             match put {
@@ -539,13 +618,13 @@ impl DeltaCommitCoordinator {
                 return Ok(());
             };
 
-            let Some(inflight) = &state.inflight else {
-                if state.latest_version >= committed_version {
+            let Some(inflight) = &state.core.inflight else {
+                if state.core.latest_version >= committed_version {
                     return Ok(());
                 }
 
                 let mut updated = state.clone();
-                updated.latest_version = committed_version;
+                updated.core.latest_version = committed_version;
 
                 let put = self.store_state(&updated, Some(&version)).await?;
                 match put {
@@ -559,8 +638,8 @@ impl DeltaCommitCoordinator {
             }
 
             let mut updated = state.clone();
-            updated.latest_version = committed_version.max(inflight.version);
-            updated.inflight = None;
+            updated.core.latest_version = committed_version.max(inflight.version);
+            updated.core.inflight = None;
 
             let put = self.store_state(&updated, Some(&version)).await?;
             match put {
@@ -629,6 +708,12 @@ impl DeltaCommitCoordinator {
         }
         Ok(())
     }
+}
+
+fn decode_state(bytes: &[u8]) -> Result<StoredCoordinatorState> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        DeltaError::serialization(format!("failed to deserialize coordinator state: {e}"))
+    })
 }
 
 #[derive(Debug)]

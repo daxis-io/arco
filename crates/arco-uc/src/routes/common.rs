@@ -42,6 +42,7 @@ pub(crate) fn known_but_unsupported(
 fn unity_catalog_error_for_status(http_status: u16, message: String) -> UnityCatalogError {
     match http_status {
         400 => UnityCatalogError::BadRequest { message },
+        413 => UnityCatalogError::PayloadTooLarge { message },
         401 => UnityCatalogError::Unauthorized { message },
         403 => UnityCatalogError::Forbidden { message },
         404 => UnityCatalogError::NotFound { message },

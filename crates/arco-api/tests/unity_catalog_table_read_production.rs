@@ -597,6 +597,58 @@ async fn production_owner_path_rejects_unsupported_format() {
 }
 
 #[tokio::test]
+async fn production_native_delta_stage_requires_modify() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (fixture, router, _) = managed_delta_fixture(backend, STORAGE_ROOT, WORKSPACE).await;
+    let token = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    set_fixture_modify(&fixture, LifecycleState::Deleted).await;
+    let before = fixture_object_versions(&fixture).await;
+    let (status, body) = post_json(
+        &router,
+        &format!("/api/v1/delta/tables/{}/commits/stage", fixture.table_id),
+        &token,
+        json!({"payload": "{\"commitInfo\":{}}\n"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(fixture_object_versions(&fixture).await, before);
+}
+
+#[tokio::test]
+async fn production_native_delta_commit_rechecks_modify_after_stage() {
+    let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (fixture, router, paths) = managed_delta_fixture(backend, STORAGE_ROOT, WORKSPACE).await;
+    let token = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    let log = delta_orders_commit(&fixture, &paths, 0, &[1_000], None).await;
+    let path = format!("/api/v1/delta/tables/{}/commits", fixture.table_id);
+    let (status, staged) = post_json(
+        &router,
+        &format!("{path}/stage"),
+        &token,
+        json!({"payload": log}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{staged}");
+
+    set_fixture_modify(&fixture, LifecycleState::Deleted).await;
+    let before = fixture_object_versions(&fixture).await;
+    let commit = json!({
+        "read_version": -1,
+        "staged_path": staged.get("staged_path").expect("staged path"),
+        "staged_version": staged.get("staged_version").expect("staged version"),
+    });
+    let (status, body) = post_json(&router, &path, &token, commit.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(fixture_object_versions(&fixture).await, before);
+
+    set_fixture_modify(&fixture, LifecycleState::Active).await;
+    let (status, body) = post_json(&router, &path, &token, commit).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.get("version").and_then(Value::as_i64), Some(0));
+}
+
+#[tokio::test]
 async fn production_owner_path_describes_a_committed_managed_delta_version() {
     let backend: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     exercise_delta_owner_reads(backend, STORAGE_ROOT, None).await;
@@ -1696,6 +1748,44 @@ async fn revoke_fixture_select(fixture: &TableReadFixture, principal: &str) {
         .expect("publish revoked projection");
 }
 
+async fn set_fixture_modify(fixture: &TableReadFixture, lifecycle_state: LifecycleState) {
+    let scope = ControlPlaneScope::workspace_alias(&fixture.tenant, &fixture.workspace)
+        .expect("fixture scope");
+    let ledger = MetastoreLedger::new(fixture.storage.clone()).expect("metastore ledger");
+    let sequence = next_fixture_sequence(&ledger).await;
+    ledger
+        .append_event(&MetastoreEvent::new_scoped(
+            &scope,
+            format!("table_write_modify_{sequence}"),
+            sequence,
+            MetastoreMutation::GrantUpserted(GrantRecord {
+                grant_id: "grant_table_write_modify".to_string(),
+                object_id: fixture.table_id.clone(),
+                object_type: "TABLE".to_string(),
+                principal_id: READER.to_string(),
+                privilege: "MODIFY".to_string(),
+                owner: "owner".to_string(),
+                lifecycle_state,
+                updated_at_ms: 1_800_000_000_000 + sequence.cast_signed(),
+                properties: BTreeMap::new(),
+                identity_cut: None,
+            }),
+        ))
+        .await
+        .expect("append table MODIFY update");
+}
+
+async fn fixture_object_versions(fixture: &TableReadFixture) -> BTreeMap<String, String> {
+    fixture
+        .storage
+        .list_meta("")
+        .await
+        .expect("list scoped objects")
+        .into_iter()
+        .map(|object| (object.path.as_str().to_string(), object.version))
+        .collect()
+}
+
 async fn append_unrelated_principal(fixture: &TableReadFixture) {
     append_unrelated_principal_with_publication(fixture, true).await;
 }
@@ -1832,7 +1922,15 @@ async fn managed_delta_fixture(
         )
         .await
         .expect("register managed orders");
-    seed_table_read_authority(&storage, storage_root, &table.id, &table.name, READER, true).await;
+    seed_table_read_authority(
+        &storage,
+        storage_root,
+        &table.id,
+        &table.name,
+        READER,
+        false,
+    )
+    .await;
     let paths = DeltaPaths::legacy(Uuid::parse_str(&table.id).unwrap());
     let fixture = TableReadFixture {
         tenant: TENANT.to_string(),
@@ -1841,6 +1939,10 @@ async fn managed_delta_fixture(
         parquet: Bytes::new(),
         storage,
     };
+    set_fixture_modify(&fixture, LifecycleState::Active).await;
+    publish_current_metastore_projection(&fixture.storage, &ProjectionRegistry::default())
+        .await
+        .expect("publish managed Delta fixture authority");
     (
         fixture,
         production_rs256_router(backend, storage_root),

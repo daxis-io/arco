@@ -31,7 +31,8 @@ use arco_storage::{StorageProvider, provider_for_bucket};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
 use arco_uc::{
-    MetastorePermissionSource, UnityCatalogState, event_stream_router, unity_catalog_router,
+    CompiledPermissionSource, MetastorePermissionSource, UnityCatalogState, event_stream_router,
+    unity_catalog_router,
 };
 
 use crate::compactor_client::CompactorClient;
@@ -134,6 +135,8 @@ pub struct AppState {
     pub config: Config,
     /// Storage backend for tenant data.
     storage: Arc<dyn arco_core::storage::StorageBackend>,
+    /// Authoritative catalog permissions shared by the native and UC routers.
+    pub(crate) catalog_permissions: Arc<dyn CompiledPermissionSource>,
     /// Rate limiting state (shared across tenants).
     rate_limit: Arc<RateLimitState>,
     /// Sync compaction client (Tier-1 DDL).
@@ -151,6 +154,7 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("config", &self.config)
             .field("storage", &"<StorageBackend>")
+            .field("catalog_permissions", &"<CompiledPermissionSource>")
             .field("rate_limit", &"<RateLimitState>")
             .field("sync_compactor", &self.sync_compactor.is_some())
             .field("sensor_evaluator", &"<SensorEvaluator>")
@@ -206,6 +210,7 @@ impl AppState {
         let audit = audit_emitter.unwrap_or_else(|| Arc::new(AuditEmitter::with_tracing()));
         Self {
             config,
+            catalog_permissions: Arc::new(MetastorePermissionSource::new(Arc::clone(&storage))),
             storage,
             rate_limit,
             sync_compactor,
@@ -227,30 +232,11 @@ impl AppState {
         config: Config,
         sensor_evaluator: Arc<dyn SensorEvaluator>,
     ) -> Self {
-        let mut config = config;
-        config.audit.prepare();
-        if config.audit.actor_hmac_key_invalid() {
-            tracing::warn!(
-                "ARCO_AUDIT_ACTOR_HMAC_KEY is set but is not valid base64; falling back to SHA-256 pseudonymization"
-            );
-        }
-
-        let sync_compactor = config.compactor_url.as_ref().map(|url| {
-            let client: Arc<dyn SyncCompactor> = Arc::new(CompactorClient::new_with_auth(
-                url.clone(),
-                config.compactor_auth.clone(),
-            ));
-            client
-        });
-        Self {
-            rate_limit: Arc::new(RateLimitState::new(config.rate_limit.clone())),
+        Self::new_with_evaluator(
             config,
-            storage: Arc::new(arco_core::storage::MemoryBackend::new()),
-            sync_compactor,
+            Arc::new(arco_core::storage::MemoryBackend::new()),
             sensor_evaluator,
-            audit: Arc::new(AuditEmitter::with_tracing()),
-            catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
-        }
+        )
     }
 
     /// Returns the storage backend.
@@ -1003,9 +989,7 @@ impl Server {
             };
             let uc_state = UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
                 .with_catalog_authority_bindings(state.catalog_authority_bindings())
-                .with_permission_source(Arc::new(MetastorePermissionSource::new(Arc::clone(
-                    &state.storage,
-                ))));
+                .with_permission_source(Arc::clone(&state.catalog_permissions));
 
             if events_enabled {
                 let event_service = ServiceBuilder::new()

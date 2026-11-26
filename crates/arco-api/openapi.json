@@ -857,7 +857,7 @@
         "tags": [
           "delta"
         ],
-        "summary": "Commit a staged Delta payload.",
+        "summary": "Commit a staged Delta payload with current table MODIFY.",
         "description": "POST `/api/v1/delta/tables/{table_id}/commits`",
         "operationId": "commit_staged",
         "parameters": [
@@ -921,6 +921,16 @@
               }
             }
           },
+          "403": {
+            "description": "Delta write permission denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
           "404": {
             "description": "Not found",
             "content": {
@@ -964,7 +974,7 @@
         "tags": [
           "delta"
         ],
-        "summary": "Stage a Delta commit payload.",
+        "summary": "Stage a Delta commit payload with current table MODIFY.",
         "description": "POST `/api/v1/delta/tables/{table_id}/commits/stage`",
         "operationId": "stage_commit_payload",
         "parameters": [
@@ -1011,6 +1021,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Delta write permission denied",
             "content": {
               "application/json": {
                 "schema": {

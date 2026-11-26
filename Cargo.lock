@@ -429,6 +429,7 @@ dependencies = [
  "arco-flow",
  "arco-iceberg",
  "arco-storage",
+ "arco-test-utils",
  "arrow",
  "axum 0.7.9",
  "bytes",

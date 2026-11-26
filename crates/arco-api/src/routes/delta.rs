@@ -18,6 +18,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use arco_catalog::CatalogAuthority;
+use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
+use arco_catalog::authz::privileges::Privilege;
 use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
 use arco_uc::is_event_stream_table;
 
@@ -51,7 +53,7 @@ pub(crate) struct StageCommitResponse {
     staged_version: String,
 }
 
-/// Stage a Delta commit payload.
+/// Stage a Delta commit payload with current table MODIFY.
 ///
 /// POST `/api/v1/delta/tables/{table_id}/commits/stage`
 #[utoipa::path(
@@ -66,6 +68,7 @@ pub(crate) struct StageCommitResponse {
         (status = 200, description = "Payload staged", body = StageCommitResponse),
         (status = 400, description = "Bad request", body = ApiErrorBody),
         (status = 401, description = "Unauthorized", body = ApiErrorBody),
+        (status = 403, description = "Delta write permission denied", body = ApiErrorBody),
         (status = 409, description = "Conflict", body = ApiErrorBody),
         (status = 500, description = "Internal error", body = ApiErrorBody),
     ),
@@ -90,6 +93,7 @@ pub(crate) async fn stage_commit_payload(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
     reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
+    require_delta_modify(&state, &ctx, table_id).await?;
 
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
     let staged = coordinator
@@ -122,7 +126,7 @@ pub(crate) struct CommitResponse {
     delta_log_path: String,
 }
 
-/// Commit a staged Delta payload.
+/// Commit a staged Delta payload with current table MODIFY.
 ///
 /// POST `/api/v1/delta/tables/{table_id}/commits`
 #[utoipa::path(
@@ -138,6 +142,7 @@ pub(crate) struct CommitResponse {
         (status = 200, description = "Commit succeeded", body = CommitResponse),
         (status = 400, description = "Bad request", body = ApiErrorBody),
         (status = 401, description = "Unauthorized", body = ApiErrorBody),
+        (status = 403, description = "Delta write permission denied", body = ApiErrorBody),
         (status = 404, description = "Not found", body = ApiErrorBody),
         (status = 409, description = "Conflict", body = ApiErrorBody),
         (status = 500, description = "Internal error", body = ApiErrorBody),
@@ -174,6 +179,7 @@ pub(crate) async fn commit_staged(
         resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
     let committed = if let Some(paths) = paths {
         reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
+        require_delta_modify(&state, &ctx, table_id).await?;
         let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
         if let Some(replayed) = coordinator.replay_committed(&commit_request).await? {
             replayed
@@ -181,10 +187,14 @@ pub(crate) async fn commit_staged(
             coordinator.commit(commit_request, Utc::now()).await?
         }
     } else {
+        let not_found = || ApiError::not_found(format!("table not found: {table_id}"));
+        require_delta_modify(&state, &ctx, table_id)
+            .await
+            .map_err(|_| not_found())?;
         arco_delta::DeltaCommitCoordinator::new(storage, table_id)
             .replay_finalized_commit(&commit_request)
             .await?
-            .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?
+            .ok_or_else(not_found)?
     };
 
     Ok((
@@ -194,6 +204,33 @@ pub(crate) async fn commit_staged(
             delta_log_path: committed.delta_log_path,
         }),
     ))
+}
+
+async fn require_delta_modify(
+    state: &AppState,
+    ctx: &RequestContext,
+    table_id: Uuid,
+) -> Result<(), ApiError> {
+    let denied = || ApiError::forbidden("delta_modify_required");
+    let principal = ctx.user_id.as_deref().ok_or_else(denied)?;
+    let permissions = state
+        .catalog_permissions
+        .compiled_permissions(&ctx.tenant, &ctx.workspace)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                internal_error = %error,
+                request_id = %ctx.request_id,
+                "Delta write permissions unavailable"
+            );
+            denied()
+        })?;
+    let request = AuthzRequest::new(principal, table_id.to_string(), "TABLE", Privilege::Modify)
+        .with_request_id(&ctx.request_id);
+    if AuthzDecision::evaluate(&request, &permissions).outcome == DecisionOutcome::Deny {
+        return Err(denied());
+    }
+    Ok(())
 }
 
 async fn reject_event_stream_target(

@@ -488,6 +488,7 @@ async fn run_engine_flow(engine: &str) {
     assert_eq!(native_create_table.status, StatusCode::CREATED);
     let native_table: NativeTable =
         serde_json::from_value(native_create_table.body).expect("native table response");
+    arco_test_utils::seed_table_owner(&catalog_storage, &native_table.id, SMOKE_PRINCIPAL).await;
 
     let committed =
         commit_through_native_api(&router, tenant, workspace, &native_table.id, -1).await;

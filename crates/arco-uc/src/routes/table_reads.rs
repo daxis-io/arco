@@ -485,7 +485,7 @@ fn physical_schema_sha256(bytes: &Bytes) -> UnityCatalogResult<String> {
 
 /// Rejects metadata that could make Parquet's generated Compact-Thrift reader
 /// allocate based on attacker-controlled list lengths before it reaches EOF.
-fn preflight_parquet_footer(bytes: &Bytes) -> UnityCatalogResult<()> {
+pub(super) fn preflight_parquet_footer(bytes: &Bytes) -> UnityCatalogResult<()> {
     let bytes = bytes.as_ref();
     if bytes.len() < 12 || !bytes.starts_with(PARQUET_MAGIC) || !bytes.ends_with(PARQUET_MAGIC) {
         return Err(invalid_parquet());

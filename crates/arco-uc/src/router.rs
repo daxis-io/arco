@@ -22,6 +22,13 @@ pub fn event_stream_router(state: UnityCatalogState) -> Router {
         .with_state(state)
 }
 
+/// Creates the native hourly usage owner routes for authenticated ingress.
+pub fn usage_router(state: UnityCatalogState) -> Router {
+    routes::usage::routes()
+        .layer(middleware::from_fn(context_middleware))
+        .with_state(state)
+}
+
 /// Creates the Unity Catalog facade router.
 pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     let request_timeout = state.config.request_timeout;

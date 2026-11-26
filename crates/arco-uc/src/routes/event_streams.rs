@@ -328,7 +328,7 @@ fn columns(schema: &EventSchema) -> impl Iterator<Item = (&str, &str, DataType, 
         }))
 }
 
-async fn load_stream_root(
+pub(super) async fn load_stream_root(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     binding: &StreamBinding,

@@ -202,6 +202,15 @@ async fn reject_event_stream_target(
     storage: &ScopedStorage,
     table_id: Uuid,
 ) -> Result<(), ApiError> {
+    if state
+        .config
+        .usage_bindings
+        .table_id(&ctx.tenant, &ctx.workspace)
+        == Some(table_id)
+        || arco_uc::is_usage_table(storage, table_id).await?
+    {
+        return Err(ApiError::forbidden("usage_table_requires_owner_api"));
+    }
     let configured = state
         .config
         .event_tables_in_scope(&ctx.tenant, &ctx.workspace)

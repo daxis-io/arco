@@ -26,6 +26,81 @@ use uuid::Uuid;
 const TENANT: &str = "acme";
 const WORKSPACE: &str = "analytics";
 
+#[tokio::test]
+async fn owner_replacement_fences_the_observed_head_and_replays_the_selected_log() {
+    let storage =
+        ScopedStorage::new(Arc::new(MemoryBackend::new()), TENANT, WORKSPACE).expect("scope");
+    let coordinator = DeltaCommitCoordinator::new(storage, Uuid::now_v7());
+    let key = Uuid::now_v7().to_string();
+    let payload = Bytes::from_static(b"{\"commitInfo\":{}}\n");
+    let first = coordinator
+        .commit_owner_replacement(&key, -1, payload.clone(), Utc::now())
+        .await
+        .expect("first owner write");
+    assert_eq!(first.version, 0);
+    assert!(matches!(
+        coordinator
+            .commit_owner_replacement(&Uuid::now_v7().to_string(), -1, payload.clone(), Utc::now())
+            .await,
+        Err(DeltaError::Conflict { .. })
+    ));
+    assert_eq!(
+        coordinator
+            .recover_owner_replacement(&key)
+            .await
+            .expect("original receipt"),
+        Some((0, payload))
+    );
+    assert_eq!(coordinator.finalized_version().await.expect("head"), 0);
+}
+
+#[tokio::test]
+async fn owner_replacement_receipt_is_readable_after_coordinator_recovery() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scope");
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage, table_id);
+    let key = Uuid::now_v7().to_string();
+    let log = Bytes::from_static(b"{\"commitInfo\":{}}\n");
+    // Root binding and reservation precede finalization.
+    backend
+        .fail_future_put_on_exact_path(&scoped_path(&coordinator_state_relative_path(table_id)), 3);
+
+    assert!(
+        coordinator
+            .commit_owner_replacement(&key, -1, log.clone(), Utc::now())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        coordinator
+            .read_owner_replacement(&key)
+            .await
+            .expect("pending receipt"),
+        None
+    );
+    assert_eq!(
+        coordinator.finalized_version().await.expect("pending head"),
+        -1
+    );
+
+    let receipt = Some((0, log));
+    assert_eq!(
+        coordinator
+            .recover_owner_replacement(&key)
+            .await
+            .expect("recover"),
+        receipt
+    );
+    assert_eq!(
+        coordinator
+            .read_owner_replacement(&key)
+            .await
+            .expect("read finalized"),
+        receipt
+    );
+}
+
 #[derive(Debug, Default)]
 struct FailOnceBackend {
     inner: MemoryBackend,

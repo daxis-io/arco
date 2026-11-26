@@ -215,6 +215,7 @@ struct EventStreamAddon;
 impl Modify for EventStreamAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         openapi.merge(arco_uc::EventStreamApiDoc::openapi());
+        openapi.merge(arco_uc::UsageApiDoc::openapi());
     }
 }
 

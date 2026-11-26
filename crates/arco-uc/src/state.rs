@@ -42,6 +42,8 @@ pub struct UnityCatalogConfig {
     pub table_read_storage_root: Option<String>,
     /// Approved event streams, including the existing Logfood table bindings.
     pub event_streams: Arc<EventStreamBindings>,
+    /// Approved hourly usage table destinations.
+    pub usage_bindings: Arc<crate::UsageBindings>,
     /// Whether the verified JWT ingress serves the native activity extension.
     pub activity_events_enabled: bool,
 }

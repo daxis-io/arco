@@ -371,3 +371,43 @@ nullable. The schema version is 1. The supported stage and outcome pairs are
 `admission` with `admitted` or `denied`, `execution` with `succeeded` or
 `failed`, and `delivery` with `authorized` or `denied`. Delivery records the
 server decision. Turntable owns its investigation grant and capture coverage.
+
+## Hourly Logfood Usage
+
+Register a governed, managed Delta table named `surface_usage_hourly` in
+the same Workspace as `query-activity`. Its column order matches the Flow
+artifact. Use `string` for `workspace_id`, `surface_id`, and `release_id`,
+and `long` for the remaining columns. Only `release_id` is nullable.
+
+```text
+workspace_id, hour_start_ms, surface_id, release_id, source_delta_version,
+admitted, admission_denied, executed, execution_failed, delivery_authorized, delivery_denied
+```
+
+Set `ARCO_USAGE_TABLE_BINDINGS` to a JSON array with `tenant`, `workspace`,
+`table_id`, and `transform_sha256` for each destination. Use the SHA-256 of
+the approved transform and a distinct `query-activity` source table. Apply
+the binding on every writer. Grant the publisher `TABLE MODIFY` and the
+Usage reader `TABLE SELECT` on the destination table.
+
+`POST /api/v1/usage/hourly` takes `{"run_id":"…","attempt_id":"…"}`.
+The accepted Flow plan for `analytics.surface_usage_hourly` carries
+`inputIdentity`, `inputSha256`, `hourStartMs`, and `transformSha256` in its
+execution payload. Arco requires a visible, successful attempt and a verified
+Parquet artifact. It checks the pinned Activity scope and version and the
+approved transform. A single Delta commit selects the new file and removes
+the previous file for that UTC hour. Other hours retain their selected files.
+The receipt includes the source and destination table versions and the Flow
+attempt. Repeat a publication to retrieve its original receipt. A stale
+attempt, an older unpublished source version, or a changed output for a
+published source version returns `409`.
+
+`GET /api/v1/usage/hourly` reads the latest published hour by default. Pass
+`hour_start_ms` and `published_version` to read a specific hour from a fixed
+Delta snapshot. Continue with its `next_offset` and the same hour and version.
+The default page size is 25 and the maximum is 50. Use `GET
+/api/v1/usage/hourly/receipt?hour_start_ms=…&source_delta_version=…` to look up
+an original finalized receipt. The Usage watermark tracks committed
+materializations. The source watermark tracks the Activity rows included in
+the calculation. The initial profile supports up to 4,096 groups per hour and
+an 8 MiB Parquet artifact.

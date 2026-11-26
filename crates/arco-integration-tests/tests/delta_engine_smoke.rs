@@ -254,6 +254,78 @@ async fn commit_through_native_api(
     serde_json::from_value(committed.body).expect("native commit response")
 }
 
+async fn assert_mixed_delta_history(
+    router: &axum::Router,
+    storage: &ScopedStorage,
+    table_id: &str,
+    table_uri: &str,
+    table_root: &str,
+) {
+    let tenant = storage.tenant_id();
+    let workspace = storage.workspace_id();
+    let native_append = commit_through_native_api(router, tenant, workspace, table_id, 0).await;
+    assert_eq!(native_append.version, 1);
+    assert_eq!(
+        native_append.delta_log_path,
+        format!("{table_root}/_delta_log/00000000000000000001.json")
+    );
+    for version in [0, 1] {
+        let key = format!("{table_root}/_delta_log/{version:020}.json");
+        assert!(
+            storage
+                .head_raw(&key)
+                .await
+                .expect("log metadata")
+                .is_some(),
+            "both APIs must publish to the registered root, missing {key}"
+        );
+    }
+    assert!(
+        storage
+            .list(&format!("tables/{table_id}/_delta_log/"))
+            .await
+            .expect("list legacy log prefix")
+            .is_empty()
+    );
+
+    let uc_get_commits = send_json(
+        router,
+        Method::GET,
+        "/api/2.1/unity-catalog/delta/preview/commits",
+        tenant,
+        workspace,
+        json!({
+            "table_id": table_id,
+            "table_uri": table_uri,
+            "start_version": 0
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(uc_get_commits.status, StatusCode::OK);
+    assert_eq!(
+        uc_get_commits
+            .body
+            .get("latest_table_version")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+    let versions = uc_get_commits
+        .body
+        .get("commits")
+        .and_then(Value::as_array)
+        .expect("commits")
+        .iter()
+        .map(|commit| {
+            commit
+                .get("version")
+                .and_then(Value::as_i64)
+                .expect("commit version")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(versions, [0, 1]);
+}
+
 async fn run_engine_flow(engine: &str) {
     let tenant = "acme";
     let workspace = "analytics";
@@ -375,52 +447,14 @@ async fn run_engine_flow(engine: &str) {
     .await;
     assert_eq!(uc_commit.status, StatusCode::OK);
 
-    let native_append =
-        commit_through_native_api(&router, tenant, workspace, &uc_table_id, 0).await;
-    assert_eq!(native_append.version, 1);
-    assert_eq!(
-        native_append.delta_log_path,
-        format!("{table_root}/_delta_log/00000000000000000001.json")
-    );
-    for version in [0, 1] {
-        let key = format!("{table_root}/_delta_log/{version:020}.json");
-        assert!(
-            catalog_storage
-                .head_raw(&key)
-                .await
-                .expect("log metadata")
-                .is_some(),
-            "both APIs must publish to the registered root, missing {key}"
-        );
-    }
-    assert!(
-        catalog_storage
-            .list(&format!("tables/{uc_table_id}/_delta_log/"))
-            .await
-            .expect("list legacy log prefix")
-            .is_empty()
-    );
-
-    let uc_get_commits = send_json(
+    assert_mixed_delta_history(
         &router,
-        Method::GET,
-        &format!("{uc_prefix}/delta/preview/commits"),
-        tenant,
-        workspace,
-        json!({
-            "table_id": &uc_table_id,
-            "table_uri": &uc_table_uri,
-            "start_version": 0
-        }),
-        None,
+        &catalog_storage,
+        &uc_table_id,
+        &uc_table_uri,
+        &table_root,
     )
     .await;
-    assert_eq!(uc_get_commits.status, StatusCode::OK);
-    let commits = uc_get_commits.body["commits"].as_array().expect("commits");
-    assert_eq!(uc_get_commits.body["latest_table_version"], 1);
-    assert_eq!(commits.len(), 2);
-    assert_eq!(commits[0]["version"], 0);
-    assert_eq!(commits[1]["version"], 1);
 
     let native_namespace = format!("{engine}_ns");
     let native_create_namespace = send_json(

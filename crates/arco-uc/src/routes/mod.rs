@@ -5,6 +5,7 @@ pub mod common;
 pub mod credentials;
 pub mod delta;
 pub mod delta_commits;
+pub(crate) mod event_streams;
 pub mod external_locations;
 pub mod openapi;
 pub mod permissions;

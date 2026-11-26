@@ -206,9 +206,17 @@ use utoipa::{Modify, OpenApi};
         (name = "Manifests", description = "Manifest deployment operations"),
         (name = "Worker Callbacks", description = "Worker task lifecycle callbacks"),
     ),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &EventStreamAddon),
 )]
 pub struct ApiDoc;
+
+struct EventStreamAddon;
+
+impl Modify for EventStreamAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi.merge(arco_uc::EventStreamApiDoc::openapi());
+    }
+}
 
 struct SecurityAddon;
 

@@ -151,6 +151,110 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn owner_append_recovers_the_log_before_acknowledgement_and_keeps_its_version() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).unwrap();
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+    let event_id = Uuid::now_v7().to_string();
+    let payload = Bytes::from_static(b"{\"commitInfo\":{\"ts\":1}}\n");
+    let record_path = idempotency_record_relative_path(table_id, &event_id);
+    backend.fail_next_put_on_exact_path(&scoped_path(&record_path));
+
+    assert!(
+        coordinator
+            .commit_owner_append(&event_id, payload.clone(), Utc::now())
+            .await
+            .is_err()
+    );
+    let log_path = delta_log_relative_path(table_id, 0);
+    assert_eq!(storage.get_raw(&log_path).await.unwrap(), payload);
+    assert_eq!(coordinator.finalized_version().await.unwrap(), -1);
+
+    let recovered = DeltaCommitCoordinator::new(storage, table_id);
+    let receipt = recovered
+        .commit_owner_append(&event_id, payload.clone(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(receipt.version, 0);
+    assert_eq!(receipt.delta_log_path, log_path);
+
+    let other_id = Uuid::now_v7().to_string();
+    assert_eq!(
+        recovered
+            .commit_owner_append(&other_id, payload.clone(), Utc::now())
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(
+        recovered
+            .commit_owner_append(&event_id, payload, Utc::now())
+            .await
+            .unwrap(),
+        receipt
+    );
+    let changed = Bytes::from_static(b"{\"commitInfo\":{\"ts\":2}}\n");
+    assert!(matches!(
+        recovered
+            .commit_owner_append(&event_id, changed, Utc::now())
+            .await,
+        Err(DeltaError::Conflict { .. })
+    ));
+    assert_eq!(recovered.finalized_version().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn owner_recovery_rejects_mismatched_log_beyond_pinned_versions() {
+    let backend = Arc::new(FailOnceBackend::new());
+    let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).unwrap();
+    let table_id = Uuid::now_v7();
+    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
+    let payload = Bytes::from_static(b"{\"commitInfo\":{\"ts\":1}}\n");
+    let pinned_max = arco_delta::coordinator::MAX_PINNED_DELTA_VERSION;
+    for version in 0..=pinned_max {
+        let key = Uuid::now_v7().to_string();
+        let response = coordinator
+            .commit_owner_append(&key, payload.clone(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(response.version, version);
+    }
+
+    let event = Uuid::now_v7().to_string();
+    let record = idempotency_record_relative_path(table_id, &event);
+    backend.fail_next_put_on_exact_path(&scoped_path(&record));
+    assert!(
+        coordinator
+            .commit_owner_append(&event, payload.clone(), Utc::now())
+            .await
+            .is_err()
+    );
+
+    let log = delta_log_relative_path(table_id, pinned_max + 1);
+    assert_eq!(storage.get_raw(&log).await.unwrap(), payload);
+    storage
+        .put_raw(
+            &log,
+            Bytes::from_static(b"{\"commitInfo\":{\"ts\":2}}\n"),
+            WritePrecondition::None,
+        )
+        .await
+        .unwrap();
+
+    let recovered = coordinator
+        .commit_owner_append(&event, payload, Utc::now())
+        .await;
+    assert!(
+        matches!(recovered, Err(DeltaError::Conflict { .. })),
+        "{recovered:?}"
+    );
+    assert_eq!(coordinator.finalized_version().await.unwrap(), pinned_max);
+    assert!(storage.head_raw(&record).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn crash_after_reservation_before_delta_log_write_replays_same_version_and_path() {
     let backend = Arc::new(FailOnceBackend::new());
     let storage = ScopedStorage::new(backend.clone(), TENANT, WORKSPACE).expect("scoped storage");

@@ -248,6 +248,10 @@ pub struct Config {
     #[serde(default)]
     pub unity_catalog: UnityCatalogApiConfig,
 
+    /// Operator-approved event streams in authenticated Workspace scopes.
+    #[serde(default)]
+    pub event_streams: arco_uc::EventStreamBindings,
+
     /// Optional exact synthetic metastore root bound to `control/v1`.
     ///
     /// Every other root remains on the legacy authority. Wildcards and lists
@@ -418,6 +422,7 @@ impl Default for Config {
             code_version: None,
             iceberg: IcebergApiConfig::default(),
             unity_catalog: UnityCatalogApiConfig::default(),
+            event_streams: arco_uc::EventStreamBindings::default(),
             catalog_control_v1_root: None,
             catalog_control_v1_cursor_key: None,
             audit: AuditConfig::default(),
@@ -553,6 +558,10 @@ pub struct UnityCatalogApiConfig {
     #[serde(default)]
     pub table_reads_enabled: bool,
 
+    /// Operator-approved activity table UUIDs keyed by `tenant/workspace`.
+    #[serde(default)]
+    pub activity_tables: arco_uc::state::ActivityTableBindings,
+
     /// Mount prefix for UC endpoints (must start with `/`).
     #[serde(default = "default_unity_catalog_mount_prefix")]
     pub mount_prefix: String,
@@ -568,6 +577,7 @@ impl Default for UnityCatalogApiConfig {
         Self {
             enabled: false,
             table_reads_enabled: false,
+            activity_tables: arco_uc::state::ActivityTableBindings::default(),
             mount_prefix: default_unity_catalog_mount_prefix(),
         }
     }
@@ -632,6 +642,8 @@ impl Config {
     /// - `ARCO_ICEBERG_ENABLE_CREDENTIAL_VENDING`
     /// - `ARCO_UNITY_CATALOG_ENABLED`
     /// - `ARCO_UNITY_CATALOG_TABLE_READS_ENABLED`
+    /// - `ARCO_ACTIVITY_TABLE_BINDINGS`
+    /// - `ARCO_EVENT_STREAM_BINDINGS`
     /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
     /// - `ARCO_CATALOG_CONTROL_V1_TENANT_ID`
     /// - `ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID`
@@ -805,6 +817,20 @@ impl Config {
         if let Some(enabled) = env_bool("ARCO_UNITY_CATALOG_TABLE_READS_ENABLED")? {
             config.unity_catalog.table_reads_enabled = enabled;
         }
+        if let Some(bindings) = env_string("ARCO_ACTIVITY_TABLE_BINDINGS") {
+            config.unity_catalog.activity_tables =
+                serde_json::from_str(&bindings).map_err(|_| {
+                    Error::InvalidInput(
+                        "ARCO_ACTIVITY_TABLE_BINDINGS must map tenant/workspace to table UUIDs"
+                            .to_string(),
+                    )
+                })?;
+        }
+        if let Some(bindings) = env_string("ARCO_EVENT_STREAM_BINDINGS") {
+            config.event_streams = serde_json::from_str(&bindings).map_err(|error| {
+                Error::InvalidInput(format!("invalid ARCO_EVENT_STREAM_BINDINGS: {error}"))
+            })?;
+        }
         if let Some(prefix) = env_string("ARCO_UNITY_CATALOG_MOUNT_PREFIX") {
             config.unity_catalog.mount_prefix = prefix;
         }
@@ -864,7 +890,26 @@ impl Config {
                 .to_string();
         }
 
+        config.event_stream_bindings()?;
         Ok(config)
+    }
+
+    pub(crate) fn event_stream_bindings(&self) -> Result<arco_uc::EventStreamBindings> {
+        self.event_streams
+            .with_activity_tables(&self.unity_catalog.activity_tables)
+            .map_err(Error::InvalidInput)
+    }
+
+    pub(crate) fn event_tables_in_scope<'a>(
+        &'a self,
+        tenant: &'a str,
+        workspace: &'a str,
+    ) -> impl Iterator<Item = uuid::Uuid> + 'a {
+        self.event_streams.table_ids(tenant, workspace).chain(
+            self.unity_catalog
+                .activity_tables
+                .resolve(tenant, workspace),
+        )
     }
 
     /// Returns the idempotency stale timeout as a `chrono::Duration`.

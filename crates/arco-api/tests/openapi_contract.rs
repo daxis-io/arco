@@ -22,3 +22,27 @@ fn contract_openapi_matches_implementation() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn event_stream_contract_uses_native_camel_case() -> Result<()> {
+    let spec = serde_json::to_value(arco_api::openapi::openapi())?;
+    let path = "/paths/~1api~1v1~1event-streams~1{streamId}~1events";
+    anyhow::ensure!(spec.pointer(&format!("{path}/post")).is_some());
+    anyhow::ensure!(spec.pointer(&format!("{path}/get")).is_some());
+    for (schema, property) in [
+        ("StreamEvent", "sourceEventId"),
+        ("StreamReceipt", "commitVersion"),
+        ("StreamPage", "publishedVersion"),
+        ("StreamRow", "workspaceId"),
+        ("StreamErrorBody", "code"),
+    ] {
+        anyhow::ensure!(
+            spec.pointer(&format!(
+                "/components/schemas/{schema}/properties/{property}"
+            ))
+            .is_some(),
+            "missing {schema}.{property}"
+        );
+    }
+    Ok(())
+}

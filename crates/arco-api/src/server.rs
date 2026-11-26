@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{Extension, FromRequestParts, State};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -30,7 +30,9 @@ use arco_iceberg::{
 use arco_storage::{StorageProvider, provider_for_bucket};
 use arco_uc::context::UnityCatalogRequestContext;
 use arco_uc::error::UnityCatalogError;
-use arco_uc::{MetastorePermissionSource, UnityCatalogState, unity_catalog_router};
+use arco_uc::{
+    MetastorePermissionSource, UnityCatalogState, event_stream_router, unity_catalog_router,
+};
 
 use crate::compactor_client::CompactorClient;
 use crate::config::{Config, CorsConfig};
@@ -507,14 +509,7 @@ async fn unity_catalog_auth_middleware(
 
     crate::audit::emit_auth_allow(&state, &ctx, &resource);
 
-    let uc_ctx = UnityCatalogRequestContext {
-        tenant: ctx.tenant.clone(),
-        workspace: ctx.workspace.clone(),
-        request_id: ctx.request_id.clone(),
-        user_id: ctx.user_id.clone(),
-        idempotency_key: ctx.idempotency_key.clone(),
-    };
-    parts.extensions.insert(uc_ctx);
+    parts.extensions.insert(unity_catalog_context(&ctx));
 
     if let Some(response) = unity_catalog_rate_limit_response(&state, &ctx, &resource).await {
         return response;
@@ -525,6 +520,25 @@ async fn unity_catalog_auth_middleware(
 
 fn unity_catalog_public_route(method: &Method, path: &str) -> bool {
     matches!(*method, Method::GET | Method::HEAD) && path == "/openapi.json"
+}
+
+fn unity_catalog_context(ctx: &RequestContext) -> UnityCatalogRequestContext {
+    UnityCatalogRequestContext {
+        tenant: ctx.tenant.clone(),
+        workspace: ctx.workspace.clone(),
+        request_id: ctx.request_id.clone(),
+        user_id: ctx.user_id.clone(),
+        idempotency_key: ctx.idempotency_key.clone(),
+    }
+}
+
+async fn event_stream_context(
+    Extension(ctx): Extension<RequestContext>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    request.extensions_mut().insert(unity_catalog_context(&ctx));
+    next.run(request).await
 }
 
 fn normalize_metrics_secret(secret: Option<&str>) -> Option<&str> {
@@ -834,7 +848,7 @@ impl Server {
     }
 
     /// Creates the router with all routes and middleware.
-    #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity, clippy::expect_used)]
     fn create_router(
         &self,
         state: Arc<AppState>,
@@ -874,8 +888,8 @@ impl Server {
             .nest(
                 "/api/v1",
                 crate::routes::api_v1_routes()
-                    .route_layer(rate_limit_layer)
-                    .layer(auth_layer),
+                    .route_layer(rate_limit_layer.clone())
+                    .layer(auth_layer.clone()),
             )
             .nest(
                 "/api/v1",
@@ -964,8 +978,14 @@ impl Server {
             router = router.nest_service("/iceberg", iceberg_service);
         }
 
-        // Mount Unity Catalog facade if enabled
-        if state.config.unity_catalog.enabled {
+        let event_streams = Arc::new(
+            state
+                .config
+                .event_stream_bindings()
+                .expect("server configuration must validate before mounting event streams"),
+        );
+        let events_enabled = !state.config.debug && !event_streams.is_empty();
+        if state.config.unity_catalog.enabled || events_enabled {
             // Without an authoritative permission source the UC facade has no
             // compiled permission view to evaluate, so `require_authz` denies
             // every principal (including a METASTORE Manage administrator) and
@@ -977,6 +997,8 @@ impl Server {
                 table_read_storage_root: table_read_storage_root(
                     state.config.storage.bucket.as_deref(),
                 ),
+                activity_events_enabled: events_enabled && event_streams.has_logfood(),
+                event_streams,
                 ..arco_uc::UnityCatalogConfig::default()
             };
             let uc_state = UnityCatalogState::with_config(Arc::clone(&state.storage), uc_config)
@@ -985,16 +1007,25 @@ impl Server {
                     &state.storage,
                 ))));
 
-            let uc_service = ServiceBuilder::new()
-                .layer(middleware::from_fn_with_state(
-                    Arc::clone(&state),
-                    unity_catalog_auth_middleware,
-                ))
-                .service(unity_catalog_router(uc_state).into_service::<Body>());
-
-            let mount_prefix = state.config.unity_catalog.mount_prefix.clone();
-            tracing::info!("Unity Catalog facade enabled at {mount_prefix}/*");
-            router = router.nest_service(mount_prefix.as_str(), uc_service);
+            if events_enabled {
+                let event_service = ServiceBuilder::new()
+                    .layer(auth_layer)
+                    .layer(rate_limit_layer)
+                    .layer(middleware::from_fn(event_stream_context))
+                    .service(event_stream_router(uc_state.clone()).into_service::<Body>());
+                router = router.nest_service("/api/v1/event-streams", event_service);
+            }
+            if state.config.unity_catalog.enabled {
+                let uc_service = ServiceBuilder::new()
+                    .layer(middleware::from_fn_with_state(
+                        Arc::clone(&state),
+                        unity_catalog_auth_middleware,
+                    ))
+                    .service(unity_catalog_router(uc_state).into_service::<Body>());
+                let mount_prefix = &state.config.unity_catalog.mount_prefix;
+                tracing::info!("Unity Catalog facade enabled at {mount_prefix}/*");
+                router = router.nest_service(mount_prefix.as_str(), uc_service);
+            }
         }
 
         router
@@ -1219,6 +1250,7 @@ impl Server {
     #[allow(clippy::too_many_lines)]
     fn validate_config(&self) -> Result<()> {
         self.config.catalog_authority_bindings()?;
+        self.config.event_stream_bindings()?;
 
         if !self.config.posture.is_dev() && self.config.debug {
             return Err(arco_core::Error::InvalidInput(

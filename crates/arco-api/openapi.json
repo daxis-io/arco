@@ -1047,6 +1047,246 @@
         ]
       }
     },
+    "/api/v1/event-streams/{streamId}/events": {
+      "get": {
+        "tags": [
+          "event-streams"
+        ],
+        "operationId": "stream_read",
+        "parameters": [
+          {
+            "name": "streamId",
+            "in": "path",
+            "description": "Approved Workspace stream ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size from 1 to 50, default 25",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "beforeVersion",
+            "in": "query",
+            "description": "Exclusive continuation version",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "publishedVersion",
+            "in": "query",
+            "description": "Published version from the first page",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authorized event page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid page bounds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "JWT authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing stream binding or table SELECT grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stream identity conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Tenant rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Event stream is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "event-streams"
+        ],
+        "operationId": "stream_append",
+        "parameters": [
+          {
+            "name": "streamId",
+            "in": "path",
+            "description": "Approved Workspace stream ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StreamEvent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Finalized event receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Event failed schema validation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "JWT authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing stream binding or table MODIFY grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Event or stream binding conflicts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Event body exceeds the size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Tenant rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Event commit is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/lineage/edges": {
       "post": {
         "tags": [
@@ -7772,6 +8012,116 @@
           }
         }
       },
+      "StreamErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "StreamEvent": {
+        "type": "object",
+        "required": [
+          "schemaVersion",
+          "sourceEventId",
+          "occurredAtMs",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "type": "object",
+            "description": "Fields defined and validated by the bound stream schema.",
+            "additionalProperties": {},
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "occurredAtMs": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "schemaVersion": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "sourceEventId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamPage": {
+        "type": "object",
+        "required": [
+          "events",
+          "publishedVersion"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamRow"
+            }
+          },
+          "nextBeforeVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "publishedVersion": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "StreamReceipt": {
+        "type": "object",
+        "required": [
+          "sourceEventId",
+          "commitVersion"
+        ],
+        "properties": {
+          "commitVersion": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sourceEventId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "StreamRow": {
+        "type": "object",
+        "required": [
+          "workspaceId",
+          "commitVersion",
+          "event"
+        ],
+        "properties": {
+          "commitVersion": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "event": {
+            "$ref": "#/components/schemas/StreamEvent"
+          },
+          "workspaceId": {
+            "type": "string"
+          }
+        }
+      },
       "TableResponse": {
         "type": "object",
         "description": "Table response.",
@@ -8744,6 +9094,10 @@
     {
       "name": "Worker Callbacks",
       "description": "Worker task lifecycle callbacks"
+    },
+    {
+      "name": "event-streams",
+      "description": "Workspace-bound typed event streams"
     }
   ]
 }

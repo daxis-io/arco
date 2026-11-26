@@ -15,6 +15,13 @@ use crate::error::{UnityCatalogError, UnityCatalogErrorDetail, UnityCatalogError
 use crate::routes;
 use crate::state::UnityCatalogState;
 
+/// Creates the native event stream router for an authenticated ingress.
+pub fn event_stream_router(state: UnityCatalogState) -> Router {
+    routes::event_streams::routes()
+        .layer(middleware::from_fn(context_middleware))
+        .with_state(state)
+}
+
 /// Creates the Unity Catalog facade router.
 pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
     let request_timeout = state.config.request_timeout;
@@ -38,6 +45,9 @@ pub fn unity_catalog_router(state: UnityCatalogState) -> Router {
 
     if table_reads_enabled {
         router = router.merge(routes::table_reads::routes());
+    }
+    if state.config.activity_events_enabled {
+        router = router.merge(routes::event_streams::activity_routes());
     }
 
     let router = router

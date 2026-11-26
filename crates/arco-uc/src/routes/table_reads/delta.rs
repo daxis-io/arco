@@ -175,13 +175,13 @@ async fn disclose_snapshot(
     }
 }
 
-struct DeltaRoot {
-    paths: DeltaPaths,
-    uri: String,
+pub(in crate::routes) struct DeltaRoot {
+    pub(in crate::routes) paths: DeltaPaths,
+    pub(in crate::routes) uri: String,
 }
 
 impl DeltaRoot {
-    fn resolve(
+    pub(in crate::routes) fn resolve(
         state: &UnityCatalogState,
         ctx: &UnityCatalogRequestContext,
         table: &Table,

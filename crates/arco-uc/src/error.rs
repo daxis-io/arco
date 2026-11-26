@@ -98,7 +98,7 @@ pub enum UnityCatalogError {
 }
 
 impl UnityCatalogError {
-    fn to_status_and_payload(&self) -> (StatusCode, UnityCatalogErrorResponse) {
+    pub(crate) fn to_status_and_payload(&self) -> (StatusCode, UnityCatalogErrorResponse) {
         let (status, error_code, message) = match self {
             Self::BadRequest { message } => (StatusCode::BAD_REQUEST, "BAD_REQUEST", message),
             Self::PayloadTooLarge { message } => {
@@ -136,12 +136,7 @@ impl UnityCatalogError {
             },
         )
     }
-}
-
-impl IntoResponse for UnityCatalogError {
-    fn into_response(self) -> Response {
-        let (status, payload) = self.to_status_and_payload();
-        let mut response = (status, axum::Json(payload)).into_response();
+    pub(crate) fn with_retry_after(&self, mut response: Response) -> Response {
         if let Self::CatalogAuthorityUnavailable {
             retry_after_seconds,
             ..
@@ -152,6 +147,13 @@ impl IntoResponse for UnityCatalogError {
             }
         }
         response
+    }
+}
+
+impl IntoResponse for UnityCatalogError {
+    fn into_response(self) -> Response {
+        let (status, payload) = self.to_status_and_payload();
+        self.with_retry_after((status, axum::Json(payload)).into_response())
     }
 }
 

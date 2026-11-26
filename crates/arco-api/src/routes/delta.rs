@@ -18,7 +18,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use arco_catalog::CatalogAuthority;
-use arco_core::{DeltaPaths, TableFormat};
+use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
+use arco_uc::is_event_stream_table;
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
@@ -81,12 +82,13 @@ pub(crate) async fn stage_commit_payload(
     catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
     let table_id =
         Uuid::parse_str(&table_id).map_err(|_| ApiError::bad_request("table_id must be a UUID"))?;
-
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    reject_event_stream_target(&state, &ctx, &storage, table_id).await?;
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
     let paths =
         resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
+    reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
 
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
     let staged = coordinator
@@ -152,13 +154,13 @@ pub(crate) async fn commit_staged(
     catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
     let table_id =
         Uuid::parse_str(&table_id).map_err(|_| ApiError::bad_request("table_id must be a UUID"))?;
-
     let Some(idempotency_key) = ctx.idempotency_key.clone() else {
         return Err(ApiError::bad_request("Idempotency-Key is required"));
     };
 
     let backend = state.storage_backend()?;
     let storage = ctx.scoped_storage(backend)?;
+    reject_event_stream_target(&state, &ctx, &storage, table_id).await?;
     let commit_request = arco_delta::CommitDeltaRequest {
         read_version: req.read_version,
         staged_path: req.staged_path,
@@ -184,6 +186,7 @@ pub(crate) async fn commit_staged(
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
     let paths =
         resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
+    reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
 
     let committed = coordinator
@@ -198,6 +201,42 @@ pub(crate) async fn commit_staged(
             delta_log_path: committed.delta_log_path,
         }),
     ))
+}
+
+async fn reject_event_stream_target(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+    table_id: Uuid,
+) -> Result<(), ApiError> {
+    let configured = state
+        .config
+        .event_tables_in_scope(&ctx.tenant, &ctx.workspace)
+        .any(|bound| bound == table_id);
+    if configured || is_event_stream_table(storage, table_id).await? {
+        return Err(ApiError::forbidden("event_stream_table_requires_owner_api"));
+    }
+    Ok(())
+}
+
+async fn reject_stream_table_alias(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: &ScopedStorage,
+    paths: &DeltaPaths,
+) -> Result<(), ApiError> {
+    let mut segments = paths
+        .table_root()
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    if let (Some("tables"), Some(id), None) = (segments.next(), segments.next(), segments.next())
+        && let Ok(table_id) = id.parse::<Uuid>()
+        && id == table_id.to_string()
+        && table_id != paths.table_id()
+    {
+        reject_event_stream_target(state, ctx, storage, table_id).await?;
+    }
+    Ok(())
 }
 
 async fn resolve_delta_table_paths(

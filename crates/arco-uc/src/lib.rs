@@ -20,6 +20,7 @@ pub mod context;
 #[cfg(test)]
 mod contract;
 pub mod error;
+mod event_streams;
 pub mod openapi;
 pub mod permissions;
 pub mod router;
@@ -27,8 +28,10 @@ pub mod routes;
 pub mod state;
 pub mod support;
 
+pub use event_streams::{EventStreamBindings, is_event_stream_table};
 pub use openapi::{UnityCatalogApiDoc, openapi, openapi_json};
 pub use permissions::{CompiledPermissionSource, MetastorePermissionSource};
-pub use router::unity_catalog_router;
+pub use router::{event_stream_router, unity_catalog_router};
 pub use routes::delta::config::SUPPORTED_PROTOCOL_VERSIONS as SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS;
+pub use routes::event_streams::EventStreamApiDoc;
 pub use state::{UnityCatalogConfig, UnityCatalogState};

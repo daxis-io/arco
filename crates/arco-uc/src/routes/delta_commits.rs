@@ -131,9 +131,23 @@ fn table_uri_mismatch_error(table_id: Uuid) -> UnityCatalogError {
 async fn require_catalog_managed_delta_table(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
+    storage: &ScopedStorage,
     table_id: Uuid,
     table_uri: &str,
 ) -> UnityCatalogResult<()> {
+    if state
+        .config
+        .event_streams
+        .table_ids(&ctx.tenant, &ctx.workspace)
+        .any(|bound| bound == table_id)
+        || crate::is_event_stream_table(storage, table_id)
+            .await
+            .map_err(|error| map_internal_error("check event stream table ownership", error))?
+    {
+        return Err(UnityCatalogError::Forbidden {
+            message: "event_stream_table_requires_owner_api".to_string(),
+        });
+    }
     let table_id_text = table_id.to_string();
     let reader = common::authoritative_catalog_reader(state, ctx)
         .await?
@@ -691,7 +705,7 @@ pub(crate) async fn get_delta_preview_commits(
     })?;
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, table_id, &table_uri).await?;
+    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
     let coordinator_state = load_coordinator_state(&storage, table_id).await?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
     let log_objects = load_delta_log_objects(&storage, table_id).await?;
@@ -935,7 +949,7 @@ pub(crate) async fn post_delta_preview_commits(
     }
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, table_id, &table_uri).await?;
+    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
 
     if let Some(commit_info) = commit_info {
         handle_commit_registration(

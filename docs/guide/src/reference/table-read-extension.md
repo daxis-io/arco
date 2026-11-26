@@ -282,3 +282,92 @@ and metastore records, and MinIO through the S3 adapter. The native reader
 test materializes the owner's JSON bundle and calls `DeltaTable(path,
 version=...)` through delta-rs. The proof exercises the two published orders
 versions after the append and validates the resulting revenue and row counts.
+
+## Workspace event streams
+
+`POST` and `GET /api/v1/event-streams/{streamId}/events` append and read
+structured events. Arco uses verified JWT claims to resolve an exact tenant
+and Workspace and an operator-approved binding for the stream. Grant
+`TABLE MODIFY` to the producer and `TABLE SELECT` to the reader on the
+stream's table. Use a managed Delta table in governed S3 storage with an
+unset location or `s3://<bucket>/tenant=<tenant>/workspace=<workspace>/tables/<table-id>/`.
+
+Set `ARCO_EVENT_STREAM_BINDINGS` to a JSON array of bindings. For example,
+an integration can record sync results with this binding.
+
+```json
+[
+  {
+    "tenant": "example",
+    "workspace": "acme",
+    "stream_id": "integration-syncs",
+    "table_id": "018e2567-1234-7cd1-8001-123456789aba",
+    "schema": {
+      "profile": "custom",
+      "version": 1,
+      "fields": [
+        {"name": "connector_id", "type": "identifier"},
+        {"name": "outcome", "type": "enum", "values": ["succeeded", "failed"]},
+        {"name": "records_written", "type": "integer"},
+        {"name": "full_refresh", "type": "boolean", "nullable": true}
+      ]
+    }
+  }
+]
+```
+
+Register the four required columns below in order, followed by the approved
+fields in configuration order. Identifier and enum fields use Delta `string`,
+signed 64-bit integers use `long`, and booleans use `boolean`. Enums allow
+only configured values. Identifiers start with an ASCII letter or digit and
+contain up to 128 letters, digits, underscores, or hyphens. Nullable fields
+can be omitted or supplied as `null`. Arco rejects extra, duplicate, and
+invalid fields. Stream IDs and field names start with a lowercase ASCII
+letter and contain up to 64 lowercase letters, digits, or underscores.
+Stream IDs can also contain hyphens.
+
+| Column | Delta type |
+| --- | --- |
+| `workspace_id` | `string` |
+| `schema_version` | `integer` |
+| `source_event_id` | `string` |
+| `occurred_at_ms` | `long` |
+
+Send the approved fields in `fields` alongside `schemaVersion`,
+`sourceEventId`, and `occurredAtMs`. Use the binding's schema version, a stable
+UUIDv7, and UTC epoch milliseconds. Arco derives the Workspace from the
+authenticated scope.
+
+The `200` receipt contains `sourceEventId` and `commitVersion`. Arco
+returns it after the Delta version finalizes. Repeat the same event after an
+uncertain response or a retryable `503`. Replaying its canonical body returns
+the original receipt. A different body under the same ID in the same stream
+returns `409`. Each stream gets its own idempotency scope. The first append
+pins the table and schema, and a conflicting binding returns `409`. Arco
+protects the pinned table from raw Delta commit routes across restarts and
+binding changes. Apply the same bindings on every replica. A new schema or
+table incarnation uses a new stream ID.
+
+`GET` returns `events` in descending commit order, `publishedVersion`, and
+`nextBeforeVersion`. Each row contains `workspaceId`, `commitVersion`, and the
+accepted `event`. Arco verifies the committed log and data file before returning
+a row. The optional `limit` defaults to 25 and ranges from 1 to 50. To continue
+a page, pass its `publishedVersion` and use `nextBeforeVersion` as
+`beforeVersion`. Version 0 represents an empty stream. The watermark measures
+finalized Arco commits. The current write profile commits one event at a time.
+
+### Turntable query activity
+
+Use `{"profile":"logfood_v1"}` with stream ID `query-activity` and a managed
+table named `activity_events`. The existing `ARCO_ACTIVITY_TABLE_BINDINGS`
+mapping from `tenant/workspace` to table UUID also defines this stream. With
+the UC facade enabled, `/api/2.1/unity-catalog/extensions/activity-events`
+serves the same rows and receipts with the activity adapter's flat snake-case
+request and response format.
+
+After the four required columns, add `stage`, `outcome`, `surface_id`,
+`release_id`, and `operation_id` in that order as strings. `release_id` is
+nullable. The schema version is 1. The supported stage and outcome pairs are
+`admission` with `admitted` or `denied`, `execution` with `succeeded` or
+`failed`, and `delivery` with `authorized` or `denied`. Delivery records the
+server decision. Turntable owns its investigation grant and capture coverage.

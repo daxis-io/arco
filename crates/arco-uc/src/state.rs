@@ -1,5 +1,6 @@
 //! Shared state and configuration for Unity Catalog facade handlers.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -7,10 +8,26 @@ use std::time::Duration;
 use arco_catalog::CatalogAuthorityBindings;
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::event_streams::EventStreamBindings;
 use crate::permissions::CompiledPermissionSource;
 use arco_core::audit::AuditEmitter;
 use arco_core::storage::StorageBackend;
+
+/// Operator-approved activity tables keyed by `tenant/workspace`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ActivityTableBindings(pub(crate) BTreeMap<String, Uuid>);
+
+impl ActivityTableBindings {
+    /// Looks up the table bound to the exact authenticated scope.
+    #[must_use]
+    pub fn resolve(&self, tenant: &str, workspace: &str) -> Option<Uuid> {
+        self.0.get(&format!("{tenant}/{workspace}")).copied()
+    }
+}
 
 /// Server-side configuration for the Unity Catalog facade.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +40,10 @@ pub struct UnityCatalogConfig {
     pub table_reads_enabled: bool,
     /// Canonical configured backend root for table reads, if safely mappable.
     pub table_read_storage_root: Option<String>,
+    /// Approved event streams, including the existing Logfood table bindings.
+    pub event_streams: Arc<EventStreamBindings>,
+    /// Whether the verified JWT ingress serves the native activity extension.
+    pub activity_events_enabled: bool,
 }
 
 /// Shared state for Unity Catalog facade handlers.

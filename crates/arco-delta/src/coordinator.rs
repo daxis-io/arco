@@ -133,6 +133,105 @@ impl DeltaCommitCoordinator {
         self.paths == DeltaPaths::legacy(self.paths.table_id())
     }
 
+    /// Returns the last finalized version, or `-1` before the first commit.
+    ///
+    /// # Errors
+    /// Returns an error when coordinator state cannot be loaded.
+    pub async fn finalized_version(&self) -> Result<i64> {
+        Ok(self.load_state().await?.0.core.latest_version)
+    }
+
+    /// Appends an owner-prepared Delta payload whose identity is stable across retries.
+    /// The caller must durably prepare any data files referenced by the payload first.
+    ///
+    /// # Errors
+    /// Returns an error on changed payload, storage failure, or a concurrent commit.
+    pub async fn commit_owner_append(
+        &self,
+        key: &str,
+        payload: Bytes,
+        now: DateTime<Utc>,
+    ) -> Result<CommitDeltaResponse> {
+        let staged = self.stage_idempotent_payload(key, payload.clone()).await?;
+        let latest = self.finalized_version().await?;
+        let read_version = if let Some(record) = self.read_idempotency_record(key).await? {
+            let path = self.paths.delta_log_json(record.version)?;
+            self.require_materialized_log(&path, &payload).await?;
+            record.version.saturating_sub(1)
+        } else {
+            latest
+        };
+        self.commit(
+            CommitDeltaRequest {
+                read_version,
+                staged_path: staged.staged_path,
+                staged_version: staged.staged_version,
+                idempotency_key: key.to_string(),
+            },
+            now,
+        )
+        .await
+    }
+
+    /// Verifies an owner append's log against its stored receipt for the exact version.
+    ///
+    /// # Errors
+    /// Returns an error if the receipt is absent, has a different identity, or cannot be read.
+    pub async fn verify_owner_commit(&self, key: &str, version: i64, payload: &[u8]) -> Result<()> {
+        let record = self
+            .read_idempotency_record(key)
+            .await?
+            .ok_or_else(|| DeltaError::conflict("owner append receipt is absent"))?;
+        let expected = request_hash(
+            key,
+            version.saturating_sub(1),
+            &self.paths.staging_payload(key),
+            payload,
+        )?;
+        if record.version != version
+            || record.delta_log_path != self.paths.delta_log_json(version)?
+            || record.request_hash != expected
+        {
+            return Err(DeltaError::conflict("owner append log identity changed"));
+        }
+        Ok(())
+    }
+
+    async fn stage_idempotent_payload(&self, key: &str, payload: Bytes) -> Result<StagedCommit> {
+        validate_uuidv7(key)?;
+        let staged_path = self.paths.staging_payload(key);
+        let staged_version = match self
+            .storage
+            .put_raw(
+                &staged_path,
+                payload.clone(),
+                WritePrecondition::DoesNotExist,
+            )
+            .await?
+        {
+            WriteResult::Success { version } => version,
+            WriteResult::PreconditionFailed { .. } => {
+                let meta = self.storage.head_raw(&staged_path).await?.ok_or_else(|| {
+                    DeltaError::conflict("staged payload disappeared after concurrent write")
+                })?;
+                if self
+                    .read_staged_payload(&staged_path, &meta.version)
+                    .await?
+                    != payload
+                {
+                    return Err(DeltaError::conflict(
+                        "Idempotency-Key already used with different request body",
+                    ));
+                }
+                meta.version
+            }
+        };
+        Ok(StagedCommit {
+            staged_path,
+            staged_version,
+        })
+    }
+
     /// Returns a committed response for `req` when an idempotency marker already exists.
     ///
     /// # Errors
@@ -154,7 +253,14 @@ impl DeltaCommitCoordinator {
             let payload = self
                 .read_staged_payload(&req.staged_path, &req.staged_version)
                 .await?;
-            if record.request_hash != request_hash(req, &payload)? {
+            if record.request_hash
+                != request_hash(
+                    &req.idempotency_key,
+                    req.read_version,
+                    &req.staged_path,
+                    &payload,
+                )?
+            {
                 return Err(DeltaError::conflict(
                     "Idempotency-Key already used with different request body".to_string(),
                 ));
@@ -243,7 +349,12 @@ impl DeltaCommitCoordinator {
         now: DateTime<Utc>,
     ) -> Result<CommitDeltaResponse> {
         let payload = self.read_validated_staged_payload(&req).await?;
-        let request_hash = request_hash(&req, &payload)?;
+        let request_hash = request_hash(
+            &req.idempotency_key,
+            req.read_version,
+            &req.staged_path,
+            &payload,
+        )?;
         let legacy_hash = legacy_request_hash(&req)?;
 
         if let Some(response) = self
@@ -284,12 +395,8 @@ impl DeltaCommitCoordinator {
             WriteResult::Success { .. } => {}
             WriteResult::PreconditionFailed { .. } => {
                 // Another actor may have completed the same commit; verify payload matches.
-                let existing = self.storage.get_raw(&delta_log_path).await?;
-                if existing != payload {
-                    return Err(DeltaError::conflict(
-                        "delta log version already exists with different contents".to_string(),
-                    ));
-                }
+                self.require_materialized_log(&delta_log_path, &payload)
+                    .await?;
             }
         }
 
@@ -305,6 +412,29 @@ impl DeltaCommitCoordinator {
             .await?;
 
         Ok(response)
+    }
+
+    async fn require_materialized_log(&self, path: &str, payload: &[u8]) -> Result<()> {
+        let expected_size = u64::try_from(payload.len())
+            .map_err(|_| DeltaError::conflict("invalid Delta log size"))?;
+        if self
+            .storage
+            .head_raw(path)
+            .await?
+            .is_none_or(|meta| meta.size != expected_size)
+            || (!payload.is_empty()
+                && self
+                    .storage
+                    .get_range(path, 0..expected_size)
+                    .await?
+                    .as_ref()
+                    != payload)
+        {
+            return Err(DeltaError::conflict(
+                "delta log version already exists with different contents",
+            ));
+        }
+        Ok(())
     }
 
     async fn read_staged_payload(&self, staged_path: &str, staged_version: &str) -> Result<Bytes> {
@@ -376,8 +506,10 @@ impl DeltaCommitCoordinator {
                 let payload = self
                     .read_staged_payload(&inflight.staged_path, &inflight.staged_version)
                     .await?;
-                let pinned = self.verify_reserved_log(&state, inflight.version, &payload)?;
-                if !commit_exists {
+                self.verify_reserved_log(&state, inflight.version, &payload)?;
+                let compare_log = if commit_exists {
+                    true
+                } else {
                     // Attempt to materialize the inflight commit from its staged payload.
                     let write = self
                         .storage
@@ -387,24 +519,20 @@ impl DeltaCommitCoordinator {
                             WritePrecondition::DoesNotExist,
                         )
                         .await?;
-                    match write {
-                        WriteResult::PreconditionFailed { .. } | WriteResult::Success { .. } => {}
-                    }
-                }
-                if pinned && self.storage.get_raw(&delta_log_path).await? != payload {
-                    return Err(DeltaError::conflict("reserved Delta log identity changed"));
+                    matches!(write, WriteResult::PreconditionFailed { .. })
+                };
+                if compare_log {
+                    self.require_materialized_log(&delta_log_path, &payload)
+                        .await?;
                 }
 
                 let read_version = inflight
                     .read_version
                     .unwrap_or_else(|| inflight.version.saturating_sub(1));
                 let recovered_request_hash = request_hash(
-                    &CommitDeltaRequest {
-                        read_version,
-                        staged_path: inflight.staged_path.clone(),
-                        staged_version: inflight.staged_version.clone(),
-                        idempotency_key: inflight.commit_id.clone(),
-                    },
+                    &inflight.commit_id,
+                    read_version,
+                    &inflight.staged_path,
                     &payload,
                 )?;
 
@@ -557,17 +685,17 @@ impl DeltaCommitCoordinator {
         state: &StoredCoordinatorState,
         version: i64,
         payload: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let expected = usize::try_from(version)
             .ok()
             .and_then(|index| state.canonical_log_sha256.get(index));
         let Some(expected) = expected else {
-            return Ok(false);
+            return Ok(());
         };
         if !self.is_canonical_root() || *expected != sha256_hex(payload) {
             return Err(DeltaError::conflict("reserved Delta log identity changed"));
         }
-        Ok(true)
+        Ok(())
     }
 
     async fn finalize_inflight(&self, commit_id: &str, committed_version: i64) -> Result<()> {
@@ -738,12 +866,17 @@ struct DeltaCommitIdempotencyRecord {
     committed_at_ms: i64,
 }
 
-fn request_hash(req: &CommitDeltaRequest, staged_payload: &[u8]) -> Result<String> {
+fn request_hash(
+    key: &str,
+    read_version: i64,
+    staged_path: &str,
+    staged_payload: &[u8],
+) -> Result<String> {
     let staged_payload_sha256 = sha256_hex(staged_payload);
     let value = serde_json::json!({
-        "idempotency_key": &req.idempotency_key,
-        "read_version": req.read_version,
-        "staged_path": &req.staged_path,
+        "idempotency_key": key,
+        "read_version": read_version,
+        "staged_path": staged_path,
         "staged_payload_sha256": staged_payload_sha256,
     });
     let value = serde_json::to_value(value).map_err(|e| {

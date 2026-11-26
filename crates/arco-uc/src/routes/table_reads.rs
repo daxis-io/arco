@@ -3,7 +3,7 @@
 //! Returns one verified Parquet object or a bounded, pinned Delta snapshot.
 //! Both profiles reuse UC credential authorization and fence disclosure.
 
-mod delta;
+pub(super) mod delta;
 
 use std::collections::BTreeMap;
 
@@ -296,7 +296,7 @@ async fn parse_table_read_request(request: Request) -> UnityCatalogResult<TableR
     Ok(payload)
 }
 
-async fn load_table(
+pub(super) async fn load_table(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     table_id: &str,
@@ -926,7 +926,7 @@ fn dataset_descriptor_response(
     json_response(&descriptor)
 }
 
-fn json_response(value: &impl Serialize) -> UnityCatalogResult<Response> {
+pub(super) fn json_response(value: &impl Serialize) -> UnityCatalogResult<Response> {
     let body = serde_json::to_vec(value).map_err(|_| UnityCatalogError::Internal {
         message: "table_descriptor_response_unavailable".to_string(),
     })?;

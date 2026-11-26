@@ -569,6 +569,7 @@ dependencies = [
  "arco-catalog",
  "arco-core",
  "arco-delta",
+ "arrow",
  "async-trait",
  "axum 0.7.9",
  "base64",

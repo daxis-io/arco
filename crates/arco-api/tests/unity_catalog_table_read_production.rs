@@ -44,6 +44,9 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+#[path = "support/event_streams.rs"]
+mod event_streams;
+
 const TENANT: &str = "tenant1";
 const WORKSPACE: &str = "workspace1";
 const READER: &str = "user_reader";
@@ -305,7 +308,7 @@ async fn production_owner_path_descriptor_reports_owner_semantics() {
         )
         .await
         .unwrap();
-    seed_table_read_authority(&storage, STORAGE_ROOT, &table.id, READER, true).await;
+    seed_table_read_authority(&storage, STORAGE_ROOT, &table.id, &table.name, READER, true).await;
     let router = production_router(backend);
     let response = router
         .oneshot(table_descriptor_request(
@@ -1308,6 +1311,14 @@ fn production_router_with_gate(backend: Arc<MemoryBackend>, table_reads_enabled:
 }
 
 fn production_rs256_router(backend: Arc<dyn StorageBackend>, storage_root: &str) -> Router {
+    ServerBuilder::new()
+        .config(production_rs256_config(storage_root))
+        .storage_backend(backend)
+        .build()
+        .test_router()
+}
+
+fn production_rs256_config(storage_root: &str) -> Config {
     let mut config = Config {
         debug: false,
         posture: Posture::Private,
@@ -1323,11 +1334,7 @@ fn production_rs256_router(backend: Arc<dyn StorageBackend>, storage_root: &str)
         ..JwtConfig::default()
     };
 
-    ServerBuilder::new()
-        .config(config)
-        .storage_backend(backend)
-        .build()
-        .test_router()
+    config
 }
 
 fn table_read_request(table_id: &str, principal: &str, body: &Value) -> Request<Body> {
@@ -1514,6 +1521,7 @@ async fn seed_table_read_fixture_in_scope(
         &storage,
         STORAGE_ROOT,
         &table.id,
+        &table.name,
         READER,
         publish_projection,
     )
@@ -1553,6 +1561,7 @@ async fn seed_table_read_authority(
     storage: &ScopedStorage,
     storage_root: &str,
     table_id: &str,
+    table_name: &str,
     reader: &str,
     publish_projection: bool,
 ) {
@@ -1577,7 +1586,7 @@ async fn seed_table_read_authority(
             MetastoreMutation::CatalogObjectUpserted(CatalogObjectRecord {
                 object_id: table_id.to_string(),
                 object_type: "TABLE".to_string(),
-                qualified_name: "analytics.orders".to_string(),
+                qualified_name: format!("analytics.{table_name}"),
                 owner: "owner".to_string(),
                 lifecycle_state: LifecycleState::Active,
                 updated_at_ms: 1_800_000_000_001,
@@ -1823,7 +1832,7 @@ async fn managed_delta_fixture(
         )
         .await
         .expect("register managed orders");
-    seed_table_read_authority(&storage, storage_root, &table.id, READER, true).await;
+    seed_table_read_authority(&storage, storage_root, &table.id, &table.name, READER, true).await;
     let paths = DeltaPaths::legacy(Uuid::parse_str(&table.id).unwrap());
     let fixture = TableReadFixture {
         tenant: TENANT.to_string(),
@@ -1949,15 +1958,19 @@ async fn post_json(router: &Router, path: &str, token: &str, body: Value) -> (St
         .unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
     let status = response.status();
-    if path.contains("/extensions/") && status.is_success() {
+    if (path.contains("/extensions/") || path.starts_with("/api/v1/event-streams/"))
+        && status.is_success()
+    {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
     let bytes = to_bytes(response.into_body(), 12 * 1024 * 1024)
         .await
         .unwrap();
-    (
-        status,
-        serde_json::from_slice(&bytes).expect("JSON API response"),
-    )
+    let body = if bytes.is_empty() && !status.is_success() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("JSON API response")
+    };
+    (status, body)
 }

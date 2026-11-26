@@ -38,6 +38,7 @@ const CATALOG: &str = "analytics";
 const SCHEMA_NAME: &str = "sales";
 const PARQUET_TABLE: &str = "raw_orders";
 const DELTA_TABLE: &str = "orders_delta";
+const DELTA_WRITER: &str = "pipeline-writer";
 const DELTA_LOCATION: &str = "warehouse/local_pipeline/orders_delta";
 const DELTA_DATA_FILE: &str = "part-00000-local-uat.parquet";
 const RAW_PARQUET_PATH: &str = "warehouse/local_pipeline/raw_orders.parquet";
@@ -152,6 +153,7 @@ async fn local_pipeline_uat_writes_delta_catalogs_and_completes_run() {
     )
     .await;
     assert_eq!(delta_table.format, "delta");
+    arco_test_utils::seed_table_owner(&app.storage, &delta_table.id, DELTA_WRITER).await;
 
     let delta_data_path = format!("{DELTA_LOCATION}/{DELTA_DATA_FILE}");
     app.storage
@@ -572,6 +574,7 @@ fn make_request(
         .uri(uri)
         .header("X-Tenant-Id", TENANT)
         .header("X-Workspace-Id", WORKSPACE)
+        .header("X-User-Id", DELTA_WRITER)
         .header(header::CONTENT_TYPE, "application/json");
 
     for (key, value) in headers {

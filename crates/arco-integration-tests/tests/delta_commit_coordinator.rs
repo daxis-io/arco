@@ -19,6 +19,8 @@ use chrono::Utc;
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
+const DELTA_WRITER: &str = "delta-writer";
+
 #[derive(Debug, serde::Serialize)]
 struct StageCommitRequest {
     payload: String,
@@ -152,6 +154,9 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
     .await;
     assert_eq!(created.format, "delta");
     let table_id = Uuid::parse_str(&created.id).unwrap();
+    let backend = state.storage_backend().expect("backend");
+    let storage = ScopedStorage::new(backend, tenant, workspace).expect("scoped storage");
+    arco_test_utils::seed_table_owner(&storage, &created.id, DELTA_WRITER).await;
 
     let payload_v0 = "{\"commitInfo\":{\"timestamp\":1}}\n".to_string();
     let stage_body = serde_json::to_vec(&StageCommitRequest {
@@ -165,6 +170,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .body(Body::from(stage_body))
         .unwrap();
 
@@ -189,6 +195,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .header("Idempotency-Key", idempotency_key_v0.clone())
         .body(Body::from(commit_body.clone()))
         .unwrap();
@@ -205,8 +212,6 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         "warehouse/sales/orders_delta/_delta_log/00000000000000000000.json"
     );
 
-    let backend = state.storage_backend().expect("backend");
-    let storage = ScopedStorage::new(backend, tenant, workspace).expect("scoped storage");
     let written = storage.get_raw(&committed.delta_log_path).await.unwrap();
     assert_eq!(written, Bytes::from(payload_v0));
 
@@ -222,6 +227,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .body(Body::from(stage_body_v1))
         .unwrap();
     let stage_resp_v1 = app.clone().oneshot(stage_req_v1).await.unwrap();
@@ -243,6 +249,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .header("Idempotency-Key", Uuid::now_v7().to_string())
         .body(Body::from(stale_commit_body))
         .unwrap();
@@ -256,6 +263,7 @@ async fn delta_commit_writes_delta_log_enforces_occ_and_replays_idempotency() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .header("Idempotency-Key", idempotency_key_v0)
         .body(Body::from(commit_body))
         .unwrap();
@@ -293,6 +301,9 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
     .await;
     assert_eq!(created.format, "delta");
     let table_id = Uuid::parse_str(&created.id).unwrap();
+    let backend = state.storage_backend().expect("backend");
+    let storage = ScopedStorage::new(backend, tenant, workspace).expect("scoped storage");
+    arco_test_utils::seed_table_owner(&storage, &created.id, DELTA_WRITER).await;
 
     // Stage a payload.
     let payload = "{\"commitInfo\":{\"timestamp\":3}}\n".to_string();
@@ -306,6 +317,7 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .body(Body::from(stage_body))
         .unwrap();
     let stage_resp = app.clone().oneshot(stage_req).await.unwrap();
@@ -316,9 +328,6 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
     let staged: StageCommitResponse = serde_json::from_slice(&stage_bytes).unwrap();
 
     // Seed an expired inflight reservation in the coordinator state.
-    let backend = state.storage_backend().expect("backend");
-    let storage = ScopedStorage::new(backend, tenant, workspace).expect("scoped storage");
-
     let now_ms = Utc::now().timestamp_millis();
     let inflight_key = Uuid::now_v7().to_string();
     let state = serde_json::json!({
@@ -358,6 +367,7 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .header("Idempotency-Key", Uuid::now_v7().to_string())
         .body(Body::from(commit_body))
         .unwrap();
@@ -447,6 +457,7 @@ async fn delta_commit_stage_rejects_non_delta_table() {
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-Tenant-Id", tenant)
         .header("X-Workspace-Id", workspace)
+        .header("X-User-Id", DELTA_WRITER)
         .body(Body::from(
             serde_json::to_vec(&StageCommitRequest {
                 payload: "{\"commitInfo\":{\"timestamp\":1}}\n".to_string(),

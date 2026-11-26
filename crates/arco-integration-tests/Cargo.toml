@@ -55,3 +55,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
+
+[dev-dependencies]
+arco-test-utils = { path = "../arco-test-utils", default-features = false }

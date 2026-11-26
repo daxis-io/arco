@@ -2,9 +2,15 @@
 //!
 //! Provides factory functions to create test data with sensible defaults.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arco_core::{AssetId, TaskId};
+use arco_catalog::metastore::events::{
+    CatalogObjectRecord, LifecycleState, MetastoreEvent, MetastoreMutation, PrincipalKind,
+    PrincipalRecord,
+};
+use arco_catalog::metastore::ledger::MetastoreLedger;
+use arco_core::{AssetId, ControlPlaneScope, ScopedStorage, TaskId};
 use arco_flow::events::{EventBuilder, EventEnvelope};
 use arco_flow::plan::{AssetKey, Plan, PlanBuilder, ResourceRequirements, TaskSpec};
 use arco_flow::run::{Run, RunState};
@@ -54,6 +60,48 @@ impl TestContext {
 impl Default for TestContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Registers an active table owner in a fixture's authoritative permission ledger.
+pub async fn seed_table_owner(storage: &ScopedStorage, table_id: &str, owner: &str) {
+    let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
+        .expect("fixture scope");
+    let ledger = MetastoreLedger::new(storage.clone()).expect("fixture permission ledger");
+    let sequence = ledger
+        .latest_watermark()
+        .await
+        .expect("fixture ledger watermark")
+        .map_or(1, |watermark| watermark.sequence + 1);
+    let principal = MetastoreMutation::PrincipalUpserted(PrincipalRecord {
+        principal_id: owner.to_string(),
+        name: owner.to_string(),
+        principal_kind: PrincipalKind::User,
+        owner: owner.to_string(),
+        lifecycle_state: LifecycleState::Active,
+        updated_at_ms: sequence.cast_signed(),
+        properties: BTreeMap::new(),
+    });
+    let table = MetastoreMutation::CatalogObjectUpserted(CatalogObjectRecord {
+        object_id: table_id.to_string(),
+        object_type: "TABLE".to_string(),
+        qualified_name: table_id.to_string(),
+        owner: owner.to_string(),
+        lifecycle_state: LifecycleState::Active,
+        updated_at_ms: (sequence + 1).cast_signed(),
+        properties: BTreeMap::new(),
+    });
+    for (sequence, mutation) in [(sequence, principal), (sequence + 1, table)] {
+        let event = MetastoreEvent::new_scoped(
+            &scope,
+            format!("test_table_owner_{sequence}"),
+            sequence,
+            mutation,
+        );
+        ledger
+            .append_event(&event)
+            .await
+            .expect("append table owner");
     }
 }
 

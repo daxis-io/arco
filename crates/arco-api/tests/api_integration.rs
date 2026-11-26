@@ -1199,6 +1199,7 @@ mod catalogs {
 mod delta {
     use super::*;
     use serde::Deserialize;
+    use std::sync::Arc;
     use uuid::Uuid;
 
     #[derive(Debug, Deserialize)]
@@ -1381,7 +1382,16 @@ mod delta {
 
     #[tokio::test]
     async fn test_delta_commit_replay_succeeds_after_table_drop() -> Result<()> {
-        let router = test_router();
+        const WRITER: &str = "delta-writer";
+        let backend: Arc<dyn arco_core::storage::StorageBackend> =
+            Arc::new(arco_core::storage::MemoryBackend::new());
+        let storage =
+            arco_core::ScopedStorage::new(Arc::clone(&backend), "test-tenant", "test-workspace")?;
+        let router = ServerBuilder::new()
+            .debug(true)
+            .storage_backend(backend)
+            .build()
+            .test_router();
 
         let (status, _): (_, serde_json::Value) = helpers::post_json(
             router.clone(),
@@ -1402,18 +1412,25 @@ mod delta {
         .await?;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(table.format, "delta");
+        arco_test_utils::seed_table_owner(&storage, &table.id, WRITER).await;
 
-        let (status, staged): (_, StageCommitResponse) = helpers::post_json(
+        let commit_path = format!("/api/v1/delta/tables/{}/commits", table.id);
+        let (status, staged): (_, StageCommitResponse) = helpers::post_json_with_headers(
             router.clone(),
-            &format!("/api/v1/delta/tables/{}/commits/stage", table.id),
+            &format!("{commit_path}/stage"),
             serde_json::json!({
                 "payload": "{\"commitInfo\":{\"timestamp\":42}}\\n"
             }),
+            &[("X-User-Id", WRITER)],
         )
         .await?;
         assert_eq!(status, StatusCode::OK);
 
         let idempotency_key = Uuid::now_v7().to_string();
+        let writer_headers = [
+            ("X-User-Id", WRITER),
+            ("Idempotency-Key", idempotency_key.as_str()),
+        ];
         let commit_body = serde_json::json!({
             "read_version": -1,
             "staged_path": staged.staged_path,
@@ -1422,9 +1439,9 @@ mod delta {
 
         let (status, committed): (_, CommitResponse) = helpers::post_json_with_headers(
             router.clone(),
-            &format!("/api/v1/delta/tables/{}/commits", table.id),
+            &commit_path,
             commit_body.clone(),
-            &[("Idempotency-Key", &idempotency_key)],
+            &writer_headers,
         )
         .await?;
         assert_eq!(status, StatusCode::OK);
@@ -1437,14 +1454,23 @@ mod delta {
         assert_eq!(status, StatusCode::NO_CONTENT);
 
         let (status, replayed): (_, CommitResponse) = helpers::post_json_with_headers(
-            router,
-            &format!("/api/v1/delta/tables/{}/commits", table.id),
-            commit_body,
-            &[("Idempotency-Key", &idempotency_key)],
+            router.clone(),
+            &commit_path,
+            commit_body.clone(),
+            &writer_headers,
         )
         .await?;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(replayed, committed);
+
+        let (status, _): (_, serde_json::Value) = helpers::post_json_with_headers(
+            router,
+            &commit_path,
+            commit_body,
+            &[("Idempotency-Key", &idempotency_key)],
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
 
         Ok(())
     }

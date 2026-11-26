@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
+use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::{
     CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
 };
 use arco_core::ScopedStorage;
 use arco_core::storage::{MemoryBackend, WritePrecondition};
-use arco_uc::{UnityCatalogState, unity_catalog_router};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -17,6 +17,9 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+#[path = "support/delta_preview.rs"]
+mod delta_preview;
 
 #[derive(Debug)]
 struct UcResponse {
@@ -30,12 +33,16 @@ struct Harness {
     storage: ScopedStorage,
 }
 
-fn make_harness() -> Harness {
+async fn make_harness(location: &str) -> Result<(Harness, Uuid), String> {
     let backend = Arc::new(MemoryBackend::new());
-    let state = UnityCatalogState::new(backend.clone());
-    let router = unity_catalog_router(state);
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
-    Harness { router, storage }
+    let table_id = seed_managed_delta_table(&storage, location).await?;
+    let router = delta_preview::router_with_table_privileges(
+        &storage,
+        &[&table_id.to_string()],
+        &[Privilege::Select, Privilege::Modify],
+    );
+    Ok((Harness { router, storage }, table_id))
 }
 
 fn catalog_writer(storage: &ScopedStorage) -> CatalogWriter {
@@ -98,6 +105,12 @@ async fn uc_request(
     request_id: Option<&str>,
 ) -> Result<UcResponse, String> {
     let mut builder = Request::builder()
+        .extension(delta_preview::trusted_context(
+            "tenant1",
+            "workspace1",
+            idempotency_key,
+            request_id,
+        ))
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
@@ -156,8 +169,7 @@ fn commit_info(version: i64) -> Value {
 
 #[tokio::test]
 async fn idempotency_replay_is_deduplicated_in_get_commits() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
     let key = Uuid::now_v7().to_string();
 
     let commit_body = json!({
@@ -225,8 +237,7 @@ async fn idempotency_replay_is_deduplicated_in_get_commits() -> Result<(), Strin
 
 #[tokio::test]
 async fn stale_read_rejected_as_conflict() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
 
     let first = uc_request(
         &harness.router,
@@ -272,8 +283,7 @@ async fn stale_read_rejected_as_conflict() -> Result<(), String> {
 
 #[tokio::test]
 async fn invalid_idempotency_key_is_rejected_without_staging_side_effects() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
 
     let response = uc_request(
         &harness.router,
@@ -313,8 +323,7 @@ async fn invalid_idempotency_key_is_rejected_without_staging_side_effects() -> R
 
 #[tokio::test]
 async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path-a").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path-a").await?;
 
     let commit = uc_request(
         &harness.router,
@@ -380,13 +389,9 @@ async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), Str
 
 #[tokio::test]
 async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
     let coordinator_path = format!("delta/coordinator/{table_id}.json");
-    let state = arco_delta::DeltaCoordinatorState {
-        latest_version: 999,
-        inflight: None,
-    };
+    let state = json!({"table_root": "path", "latest_version": 999, "inflight": null});
     harness
         .storage
         .put_raw(
@@ -438,8 +443,7 @@ async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), Str
 
 #[tokio::test]
 async fn successful_commit_cleans_staged_payload() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
     let idempotency_key = Uuid::now_v7().to_string();
 
     let response = uc_request(
@@ -472,8 +476,7 @@ async fn successful_commit_cleans_staged_payload() -> Result<(), String> {
 
 #[tokio::test]
 async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result<(), String> {
-    let harness = make_harness();
-    let table_id = seed_managed_delta_table(&harness.storage, "gs://bucket/path").await?;
+    let (harness, table_id) = make_harness("gs://bucket/path").await?;
     let inflight_key = Uuid::now_v7().to_string();
     let staged_path = format!("delta/staging/{table_id}/{inflight_key}.json");
     let staged_payload = json!({
@@ -498,9 +501,10 @@ async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result
     };
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let state = arco_delta::DeltaCoordinatorState {
-        latest_version: -1,
-        inflight: Some(arco_delta::InflightCommit {
+    let state = json!({
+        "table_root": "path",
+        "latest_version": -1,
+        "inflight": arco_delta::InflightCommit {
             commit_id: inflight_key.clone(),
             read_version: Some(-1),
             version: 0,
@@ -508,8 +512,8 @@ async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result
             staged_version,
             started_at_ms: now_ms - 60_000,
             expires_at_ms: now_ms - 1_000,
-        }),
-    };
+        },
+    });
 
     harness
         .storage

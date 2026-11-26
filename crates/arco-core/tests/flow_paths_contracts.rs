@@ -173,6 +173,17 @@ fn rejects_negative_delta_log_versions() {
 }
 
 #[test]
+fn identifies_reserved_table_root_independently_of_catalog_id() -> Result<(), arco_core::Error> {
+    let table_id = Uuid::now_v7();
+    let root_id = Uuid::now_v7();
+    let canonical = DeltaPaths::new(table_id, format!("tables/{root_id}"))?;
+    let custom = DeltaPaths::new(table_id, format!("warehouse/{root_id}"))?;
+    assert_eq!(canonical.canonical_root_table_id(), Some(root_id));
+    assert_eq!(custom.canonical_root_table_id(), None);
+    Ok(())
+}
+
+#[test]
 fn rejects_invalid_table_location_paths() {
     let table_id = Uuid::nil();
 

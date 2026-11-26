@@ -321,9 +321,10 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
 
     let now_ms = Utc::now().timestamp_millis();
     let inflight_key = Uuid::now_v7().to_string();
-    let state_json = serde_json::to_vec(&arco_delta::DeltaCoordinatorState {
-        latest_version: -1,
-        inflight: Some(arco_delta::InflightCommit {
+    let state = serde_json::json!({
+        "table_root": "warehouse/sales/recovery_delta",
+        "latest_version": -1,
+        "inflight": arco_delta::InflightCommit {
             commit_id: inflight_key.clone(),
             read_version: Some(-1),
             version: 0,
@@ -331,15 +332,14 @@ async fn expired_inflight_commit_is_recovered_but_not_acked_for_unrelated_idempo
             staged_version: staged.staged_version.clone(),
             started_at_ms: now_ms - 30_000,
             expires_at_ms: now_ms - 10_000,
-        }),
-    })
-    .unwrap();
+        },
+    });
 
     storage
         .put_raw(
             &format!("delta/coordinator/{table_id}.json"),
-            Bytes::from(state_json),
-            WritePrecondition::DoesNotExist,
+            Bytes::from(state.to_string()),
+            WritePrecondition::None,
         )
         .await
         .unwrap();

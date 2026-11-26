@@ -10,10 +10,11 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 
-use arco_core::ScopedStorage;
+use arco_catalog::authz::privileges::Privilege;
 use arco_core::error::Error as CoreError;
 use arco_core::storage::{WritePrecondition, WriteResult};
-use arco_delta::{CommitDeltaRequest, DeltaCommitCoordinator, DeltaCoordinatorState, DeltaError};
+use arco_core::{DeltaPaths, ScopedStorage};
+use arco_delta::{CommitDeltaRequest, DeltaCommitCoordinator, DeltaError};
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -101,14 +102,6 @@ fn delta_preview_backfill_path(table_id: Uuid) -> String {
     format!("uc/delta_preview/{table_id}.json")
 }
 
-fn coordinator_path(table_id: Uuid) -> String {
-    format!("delta/coordinator/{table_id}.json")
-}
-
-fn delta_log_prefix(table_id: Uuid) -> String {
-    format!("tables/{table_id}/_delta_log/")
-}
-
 fn deterministic_staged_path(table_id: Uuid, idempotency_key: &str) -> String {
     format!("delta/staging/{table_id}/{idempotency_key}.json")
 }
@@ -128,12 +121,11 @@ fn table_uri_mismatch_error(table_id: Uuid) -> UnityCatalogError {
     }
 }
 
-async fn require_catalog_managed_delta_table(
+async fn reject_event_stream_target(
     state: &UnityCatalogState,
     ctx: &UnityCatalogRequestContext,
     storage: &ScopedStorage,
     table_id: Uuid,
-    table_uri: &str,
 ) -> UnityCatalogResult<()> {
     if state
         .config
@@ -148,6 +140,18 @@ async fn require_catalog_managed_delta_table(
             message: "event_stream_table_requires_owner_api".to_string(),
         });
     }
+    Ok(())
+}
+
+async fn require_catalog_managed_delta_table(
+    state: &UnityCatalogState,
+    ctx: &UnityCatalogRequestContext,
+    storage: &ScopedStorage,
+    table_id: Uuid,
+    table_uri: &str,
+    privilege: Privilege,
+) -> UnityCatalogResult<DeltaPaths> {
+    reject_event_stream_target(state, ctx, storage, table_id).await?;
     let table_id_text = table_id.to_string();
     let reader = common::authoritative_catalog_reader(state, ctx)
         .await?
@@ -161,6 +165,16 @@ async fn require_catalog_managed_delta_table(
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("table not found: {table_id_text}"),
         })?;
+
+    common::require_authz(
+        state,
+        ctx,
+        &table_id_text,
+        "TABLE",
+        privilege,
+        "delta_preview_denied",
+    )
+    .await?;
 
     let is_delta = table
         .format
@@ -188,7 +202,17 @@ async fn require_catalog_managed_delta_table(
         return Err(table_uri_mismatch_error(table_id));
     }
 
-    Ok(())
+    let paths =
+        DeltaPaths::from_table_location(table_id, Some(location), &ctx.tenant, &ctx.workspace)
+            .map_err(|_| UnityCatalogError::BadRequest {
+                message: "registered Delta table location is invalid".to_string(),
+            })?;
+    if let Some(root_table_id) = paths.canonical_root_table_id()
+        && root_table_id != table_id
+    {
+        reject_event_stream_target(state, ctx, storage, root_table_id).await?;
+    }
+    Ok(paths)
 }
 
 fn validate_idempotency_key(idempotency_key: &str) -> UnityCatalogResult<()> {
@@ -401,28 +425,6 @@ async fn store_backfill_state(
     })
 }
 
-async fn load_coordinator_state(
-    storage: &ScopedStorage,
-    table_id: Uuid,
-) -> UnityCatalogResult<Option<DeltaCoordinatorState>> {
-    let path = coordinator_path(table_id);
-    let meta = storage
-        .head_raw(&path)
-        .await
-        .map_err(|err| map_internal_error("read delta coordinator metadata", err))?;
-    if meta.is_none() {
-        return Ok(None);
-    }
-
-    let bytes = storage
-        .get_raw(&path)
-        .await
-        .map_err(|err| map_internal_error("read delta coordinator state", err))?;
-    let state = serde_json::from_slice::<DeltaCoordinatorState>(&bytes)
-        .map_err(|err| map_internal_error("deserialize delta coordinator state", err))?;
-    Ok(Some(state))
-}
-
 async fn stage_payload_for_idempotency(
     storage: &ScopedStorage,
     table_id: Uuid,
@@ -559,10 +561,10 @@ fn parse_commit_info_from_payload(version: i64, payload: &[u8]) -> DeltaCommitIn
 
 async fn load_delta_log_objects(
     storage: &ScopedStorage,
-    table_id: Uuid,
+    paths: &DeltaPaths,
 ) -> UnityCatalogResult<Vec<DeltaLogObject>> {
     let paths = storage
-        .list(&delta_log_prefix(table_id))
+        .list(&paths.delta_log_prefix())
         .await
         .map_err(|err| map_internal_error("list delta log objects", err))?;
 
@@ -665,7 +667,7 @@ async fn list_commits(
     Ok(commits)
 }
 
-/// Lists unbackfilled Delta commits.
+/// Lists unbackfilled Delta commits for callers with table `SELECT`.
 ///
 /// # Errors
 ///
@@ -705,10 +707,22 @@ pub(crate) async fn get_delta_preview_commits(
     })?;
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
-    let coordinator_state = load_coordinator_state(&storage, table_id).await?;
+    let paths = require_catalog_managed_delta_table(
+        &state,
+        &ctx,
+        &storage,
+        table_id,
+        &table_uri,
+        Privilege::Select,
+    )
+    .await?;
+    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
+    let coordinator_state = coordinator
+        .state_for_root()
+        .await
+        .map_err(map_delta_error)?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
-    let log_objects = load_delta_log_objects(&storage, table_id).await?;
+    let log_objects = load_delta_log_objects(&storage, &paths).await?;
 
     if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
         return Err(UnityCatalogError::NotFound {
@@ -750,12 +764,13 @@ pub(crate) async fn get_delta_preview_commits(
 async fn handle_commit_registration(
     storage: &ScopedStorage,
     ctx: &UnityCatalogRequestContext,
-    table_id: Uuid,
+    paths: &DeltaPaths,
     table_uri: &str,
     commit_info: DeltaCommitInfo,
     metadata: Option<&Value>,
     uniform: Option<&Value>,
 ) -> UnityCatalogResult<()> {
+    let table_id = paths.table_id();
     validate_commit_info(&commit_info)?;
 
     let idempotency_key =
@@ -766,15 +781,18 @@ async fn handle_commit_registration(
             })?;
     validate_idempotency_key(&idempotency_key)?;
 
+    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
+    let coordinator_state = coordinator
+        .state_for_root()
+        .await
+        .map_err(map_delta_error)?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
-    let log_objects = load_delta_log_objects(storage, table_id).await?;
+    let log_objects = load_delta_log_objects(storage, paths).await?;
     let existing_table_uri =
         expected_table_uri(storage, backfill_state.as_ref(), &log_objects).await?;
     ensure_table_uri_matches(table_id, table_uri, existing_table_uri.as_deref())?;
 
-    let coordinator_latest = load_coordinator_state(storage, table_id)
-        .await?
-        .map_or(-1, |state| state.latest_version);
+    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
     let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
     let latest_table_version = coordinator_latest.max(logs_latest);
     let latest_backfilled = backfill_state
@@ -792,12 +810,15 @@ async fn handle_commit_registration(
     }
 
     let payload = build_commit_payload(table_uri, &commit_info, metadata, uniform)?;
+    coordinator
+        .ensure_root_authority()
+        .await
+        .map_err(map_delta_error)?;
     let staged =
         stage_payload_for_idempotency(storage, table_id, &idempotency_key, payload).await?;
     let staged_path = staged.staged_path.clone();
     let staged_version = staged.staged_version.clone();
 
-    let coordinator = DeltaCommitCoordinator::new(storage.clone(), table_id);
     let committed = coordinator
         .commit(
             CommitDeltaRequest {
@@ -845,7 +866,7 @@ async fn handle_commit_registration(
 
 async fn handle_backfill_registration(
     storage: &ScopedStorage,
-    table_id: Uuid,
+    paths: &DeltaPaths,
     table_uri: &str,
     backfilled: i64,
 ) -> UnityCatalogResult<()> {
@@ -855,9 +876,14 @@ async fn handle_backfill_registration(
         });
     }
 
-    let coordinator_state = load_coordinator_state(storage, table_id).await?;
+    let table_id = paths.table_id();
+    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
+    let coordinator_state = coordinator
+        .state_for_root()
+        .await
+        .map_err(map_delta_error)?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
-    let log_objects = load_delta_log_objects(storage, table_id).await?;
+    let log_objects = load_delta_log_objects(storage, paths).await?;
 
     if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
         return Err(UnityCatalogError::NotFound {
@@ -880,6 +906,10 @@ async fn handle_backfill_registration(
         });
     }
 
+    coordinator
+        .ensure_root_authority()
+        .await
+        .map_err(map_delta_error)?;
     store_backfill_state(
         storage,
         table_id,
@@ -893,7 +923,7 @@ async fn handle_backfill_registration(
     Ok(())
 }
 
-/// Commits changes to a Delta table.
+/// Commits or backfills changes for callers with table `MODIFY`.
 ///
 /// # Errors
 ///
@@ -949,13 +979,21 @@ pub(crate) async fn post_delta_preview_commits(
     }
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
+    let paths = require_catalog_managed_delta_table(
+        &state,
+        &ctx,
+        &storage,
+        table_id,
+        &table_uri,
+        Privilege::Modify,
+    )
+    .await?;
 
     if let Some(commit_info) = commit_info {
         handle_commit_registration(
             &storage,
             &ctx,
-            table_id,
+            &paths,
             &table_uri,
             commit_info,
             metadata.as_ref(),
@@ -967,7 +1005,7 @@ pub(crate) async fn post_delta_preview_commits(
     }
 
     if let Some(backfilled) = latest_backfilled_version {
-        handle_backfill_registration(&storage, table_id, &table_uri, backfilled).await?;
+        handle_backfill_registration(&storage, &paths, &table_uri, backfilled).await?;
 
         return Ok((StatusCode::OK, Json(json!({}))));
     }

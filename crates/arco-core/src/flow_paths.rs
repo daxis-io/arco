@@ -314,6 +314,21 @@ impl DeltaPaths {
         &self.table_root
     }
 
+    /// Returns the UUID encoded by a legacy table root, independently of the registered table.
+    #[must_use]
+    pub fn canonical_root_table_id(&self) -> Option<Uuid> {
+        let mut segments = self
+            .table_root
+            .split('/')
+            .filter(|segment| !segment.is_empty());
+        let (Some("tables"), Some(id), None) = (segments.next(), segments.next(), segments.next())
+        else {
+            return None;
+        };
+        let table_id = id.parse::<Uuid>().ok()?;
+        (id == table_id.to_string()).then_some(table_id)
+    }
+
     /// Returns the staging payload path for a ULID.
     #[must_use]
     pub fn staging_payload(&self, ulid: &str) -> String {
@@ -343,6 +358,12 @@ impl DeltaPaths {
         self.idempotency_marker_from_hash(&key_hash)
     }
 
+    /// Returns the scoped directory prefix for this table's Delta transaction log.
+    #[must_use]
+    pub fn delta_log_prefix(&self) -> String {
+        format!("{}/_delta_log/", self.table_root)
+    }
+
     /// Returns `_delta_log` JSON path for a specific Delta log version.
     ///
     /// # Errors
@@ -355,7 +376,7 @@ impl DeltaPaths {
             });
         }
 
-        Ok(format!("{}/_delta_log/{version:020}.json", self.table_root))
+        Ok(format!("{}{version:020}.json", self.delta_log_prefix()))
     }
 }
 

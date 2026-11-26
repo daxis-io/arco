@@ -86,8 +86,9 @@ pub(crate) async fn stage_commit_payload(
     let storage = ctx.scoped_storage(backend)?;
     reject_event_stream_target(&state, &ctx, &storage, table_id).await?;
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
-    let paths =
-        resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
+    let paths = resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
     reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
 
     let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
@@ -168,31 +169,23 @@ pub(crate) async fn commit_staged(
         idempotency_key,
     };
 
-    let replay_coordinator = arco_delta::DeltaCommitCoordinator::new(storage.clone(), table_id);
-    if let Some(replayed) = replay_coordinator
-        .replay_committed(&commit_request)
-        .await
-        .map_err(ApiError::from)?
-    {
-        return Ok((
-            StatusCode::OK,
-            Json(CommitResponse {
-                version: replayed.version,
-                delta_log_path: replayed.delta_log_path,
-            }),
-        ));
-    }
-
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
     let paths =
         resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
-    reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
-    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
-
-    let committed = coordinator
-        .commit(commit_request, Utc::now())
-        .await
-        .map_err(ApiError::from)?;
+    let committed = if let Some(paths) = paths {
+        reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
+        let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+        if let Some(replayed) = coordinator.replay_committed(&commit_request).await? {
+            replayed
+        } else {
+            coordinator.commit(commit_request, Utc::now()).await?
+        }
+    } else {
+        arco_delta::DeltaCommitCoordinator::new(storage, table_id)
+            .replay_finalized_commit(&commit_request)
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?
+    };
 
     Ok((
         StatusCode::OK,
@@ -225,13 +218,7 @@ async fn reject_stream_table_alias(
     storage: &ScopedStorage,
     paths: &DeltaPaths,
 ) -> Result<(), ApiError> {
-    let mut segments = paths
-        .table_root()
-        .split('/')
-        .filter(|segment| !segment.is_empty());
-    if let (Some("tables"), Some(id), None) = (segments.next(), segments.next(), segments.next())
-        && let Ok(table_id) = id.parse::<Uuid>()
-        && id == table_id.to_string()
+    if let Some(table_id) = paths.canonical_root_table_id()
         && table_id != paths.table_id()
     {
         reject_event_stream_target(state, ctx, storage, table_id).await?;
@@ -244,12 +231,14 @@ async fn resolve_delta_table_paths(
     tenant: &str,
     workspace: &str,
     table_id: Uuid,
-) -> Result<DeltaPaths, ApiError> {
-    let table = authority
+) -> Result<Option<DeltaPaths>, ApiError> {
+    let Some(table) = authority
         .get_table_by_id(&table_id.to_string())
         .await
         .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
+    else {
+        return Ok(None);
+    };
 
     let format = TableFormat::effective(table.format.as_deref()).map_err(|err| {
         ApiError::internal(format!(
@@ -264,6 +253,7 @@ async fn resolve_delta_table_paths(
     }
 
     DeltaPaths::from_table_location(table_id, table.location.as_deref(), tenant, workspace)
+        .map(Some)
         .map_err(ApiError::from)
 }
 

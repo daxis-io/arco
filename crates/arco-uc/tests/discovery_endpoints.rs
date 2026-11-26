@@ -108,6 +108,7 @@ async fn seeded_router() -> SeededRouter {
             vec![
                 permission_row(&table.id, "TABLE", Privilege::Manage),
                 permission_row(&table.id, "TABLE", Privilege::Select),
+                permission_row(&table.id, "TABLE", Privilege::Modify),
             ],
         ));
     SeededRouter {
@@ -270,7 +271,7 @@ async fn test_get_permissions_returns_success() {
         .get("privilege_assignments")
         .and_then(serde_json::Value::as_array)
         .expect("permission assignments");
-    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments.len(), 3);
     assert_eq!(assignments[0]["principal"], "user_alice");
     assert_eq!(assignments[0]["privileges"][0], "MANAGE");
 }
@@ -461,6 +462,7 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
     let table_uri_for_final_get = seeded.table_uri.clone();
     let app = seeded.app;
 
+    let idempotency_key = Uuid::now_v7().to_string();
     let commit_response = app
         .clone()
         .oneshot(
@@ -470,7 +472,11 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
-                .header("Idempotency-Key", Uuid::now_v7().to_string())
+                .header("Idempotency-Key", &idempotency_key)
+                .extension(UnityCatalogRequestContext {
+                    idempotency_key: Some(idempotency_key),
+                    ..trusted_context()
+                })
                 .body(Body::from(
                     json!({
                         "table_id": table_id,
@@ -500,6 +506,7 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
+                .extension(trusted_context())
                 .body(Body::from(
                     json!({
                         "table_id": table_id_for_get,
@@ -540,6 +547,7 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
+                .extension(trusted_context())
                 .body(Body::from(
                     json!({
                         "table_id": table_id_for_backfill,
@@ -562,6 +570,7 @@ async fn test_delta_commit_and_get_commits_roundtrip() {
                 .header("content-type", "application/json")
                 .header("X-Tenant-Id", "tenant1")
                 .header("X-Workspace-Id", "workspace1")
+                .extension(trusted_context())
                 .body(Body::from(
                     json!({
                         "table_id": table_id_for_final_get,

@@ -1092,6 +1092,15 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "pinId",
+            "in": "query",
+            "description": "Arco-issued pin. Use in place of publishedVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1127,6 +1136,16 @@
           },
           "403": {
             "description": "Missing stream binding or table SELECT grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pin was not found in this Workspace",
             "content": {
               "application/json": {
                 "schema": {
@@ -1271,6 +1290,112 @@
           },
           "503": {
             "description": "Event commit is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/event-streams/{streamId}/pins": {
+      "post": {
+        "tags": [
+          "event-streams"
+        ],
+        "operationId": "create",
+        "parameters": [
+          {
+            "name": "streamId",
+            "in": "path",
+            "description": "Approved Workspace stream ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable pin for one finalized stream version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Requested version is invalid or unpublished",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "JWT authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing stream binding or table SELECT grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stream or pin identity conflicts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Tenant rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Event stream is unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -2605,7 +2730,7 @@
             "description": "Missing Workspace binding or table MODIFY grant"
           },
           "404": {
-            "description": "Flow run or task unavailable in the Workspace"
+            "description": "Flow run, task, or stream pin unavailable in the Workspace"
           },
           "409": {
             "description": "Attempt, artifact, binding, source version, or destination head conflicts"
@@ -5604,6 +5729,19 @@
           }
         }
       },
+      "CreatePin": {
+        "type": "object",
+        "properties": {
+          "publishedVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateSchemaRequest": {
         "type": "object",
         "description": "Request to create a schema in a catalog.",
@@ -8276,6 +8414,22 @@
               "null"
             ],
             "format": "int64"
+          },
+          "publishedVersion": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "StreamPin": {
+        "type": "object",
+        "required": [
+          "pinId",
+          "publishedVersion"
+        ],
+        "properties": {
+          "pinId": {
+            "type": "string"
           },
           "publishedVersion": {
             "type": "integer",

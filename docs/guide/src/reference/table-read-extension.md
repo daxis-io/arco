@@ -356,6 +356,20 @@ a page, pass its `publishedVersion` and use `nextBeforeVersion` as
 `beforeVersion`. Version 0 represents an empty stream. The watermark measures
 finalized Arco commits. The current write profile commits one event at a time.
 
+### Pin a stream for a Flow run
+
+Send `POST /api/v1/event-streams/{streamId}/pins` with `{}` to pin the
+current published version, or send `{"publishedVersion":16}` to select
+an exact version. Arco returns `pinId` and `publishedVersion`. Repeating
+the request for the same version of the same stream returns the same pin.
+
+Read `GET /api/v1/event-streams/{streamId}/events?pinId=<pin-id>` and
+continue with the same pin and `beforeVersion` from `nextBeforeVersion`.
+Every page checks the reader's current `TABLE SELECT` and storage
+governance. The pin binds the version to the Workspace stream, table,
+schema and storage root. This uses the event reader's page limit and works
+beyond the bounded Delta descriptor's version limit.
+
 ### Turntable query activity
 
 Use `{"profile":"logfood_v1"}` with stream ID `query-activity` and a managed
@@ -390,13 +404,21 @@ the approved transform and a distinct `query-activity` source table. Apply
 the binding on every writer. Grant the publisher `TABLE MODIFY` and the
 Usage reader `TABLE SELECT` on the destination table.
 
-`POST /api/v1/usage/hourly` takes `{"run_id":"…","attempt_id":"…"}`.
-The accepted Flow plan for `analytics.surface_usage_hourly` carries
-`inputIdentity`, `inputSha256`, `hourStartMs`, and `transformSha256` in its
-execution payload. Arco requires a visible, successful attempt and a verified
-Parquet artifact. It checks the pinned Activity scope and version and the
-approved transform. A single Delta commit selects the new file and removes
-the previous file for that UTC hour. Other hours retain their selected files.
+For a manual materialization, pin `query-activity` and set the execution
+payload for `analytics.surface_usage_hourly` before triggering the Flow run.
+The accepted plan preserves these values for every attempt.
+
+```json
+{"streamPinId":"<pin-id>","hourStartMs":1800000000000,"transformSha256":"<approved-sha256>"}
+```
+
+The worker reads all pages at that pin under its own Activity reader
+credential. Existing plans can still use `inputIdentity` and `inputSha256`.
+After the worker completes, send `POST /api/v1/usage/hourly` with
+`{"run_id":"…","attempt_id":"…"}`. Arco checks the pinned Activity scope
+and version, the approved transform, and the visible, successful attempt
+with its verified Parquet artifact. A single Delta commit selects the new file
+and removes the previous file for that UTC hour. Other hours retain their selected files.
 The receipt includes the source and destination table versions and the Flow
 attempt. Repeat a publication to retrieve its original receipt. A stale
 attempt, an older unpublished source version, or a changed output for a

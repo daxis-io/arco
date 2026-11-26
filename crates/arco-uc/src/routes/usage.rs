@@ -34,7 +34,7 @@ use crate::routes::common::{reject_table_commit_for_control_v1, scoped_storage};
 use crate::routes::credentials::{
     authorize_path_access, authorize_table_access, revalidate_observed_watermark,
 };
-use crate::routes::event_streams::load_stream_root;
+use crate::routes::event_streams::{load_pin, load_stream_root};
 use crate::routes::table_reads::{
     delta::DeltaRoot, json_response, load_table, preflight_parquet_footer,
 };
@@ -179,8 +179,9 @@ struct UsagePublishRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct InputPin {
-    input_identity: Source,
-    input_sha256: String,
+    stream_pin_id: Option<String>,
+    input_identity: Option<Source>,
+    input_sha256: Option<String>,
     hour_start_ms: i64,
     transform_sha256: String,
 }
@@ -328,7 +329,7 @@ async fn usage_root(
         (status = 400, description = "Invalid publication request"),
         (status = 401, description = "JWT authentication required"),
         (status = 403, description = "Missing Workspace binding or table MODIFY grant"),
-        (status = 404, description = "Flow run or task unavailable in the Workspace"),
+        (status = 404, description = "Flow run, task, or stream pin unavailable in the Workspace"),
         (status = 409, description = "Attempt, artifact, binding, source version, or destination head conflicts"),
         (status = 413, description = "Materialization exceeds the supported size"),
         (status = 503, description = "Usage owner unavailable"),
@@ -350,13 +351,14 @@ async fn publish(
         authorize(&state, &ctx, Privilege::Modify, CredentialOperation::Write).await?;
     let storage = scoped_storage(&state, &ctx)?;
     let (pin, publication) = verified_run(&storage, &request).await?;
-    let source_table_id = verify_input(&state, &ctx, &storage, binding, &pin).await?;
+    let (source_table_id, source_delta_version) =
+        verify_input(&state, &ctx, &storage, binding, &pin).await?;
     let checksum = &publication.checksum_sha256;
     let effect = effect_id(
         binding.table_id,
         source_table_id,
         pin.hour_start_ms,
-        pin.input_identity.delta_version,
+        source_delta_version,
     );
     let effect_key = effect.to_string();
     let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), root.paths.clone());
@@ -396,9 +398,7 @@ async fn publish(
         revalidate_observed_watermark(&state, &ctx, &observed).await?;
         return json_response(&entry.receipt);
     }
-    if previous
-        .is_some_and(|entry| entry.receipt.source_delta_version >= pin.input_identity.delta_version)
-    {
+    if previous.is_some_and(|entry| entry.receipt.source_delta_version >= source_delta_version) {
         return Err(conflict("usage_source_version_stale"));
     }
     let artifact = read_verified_artifact(&storage, &publication).await?;
@@ -406,7 +406,7 @@ async fn publish(
         &artifact,
         &ctx.workspace,
         pin.hour_start_ms,
-        pin.input_identity.delta_version,
+        source_delta_version,
     )?;
     let receipt = UsageReceipt {
         table_id: binding.table_id,
@@ -415,7 +415,7 @@ async fn publish(
             .filter(|v| valid_version(*v))
             .ok_or_else(unavailable)?,
         source_table_id,
-        source_delta_version: pin.input_identity.delta_version,
+        source_delta_version,
         hour_start_ms: pin.hour_start_ms,
         run_id: request.run_id,
         attempt_id: request.attempt_id,
@@ -481,32 +481,44 @@ async fn verify_input(
     storage: &ScopedStorage,
     binding: &Binding,
     pin: &InputPin,
-) -> Result<Uuid> {
+) -> Result<(Uuid, i64)> {
     let source = state
         .config
         .event_streams
         .resolve(&ctx.tenant, &ctx.workspace, LOGFOOD_STREAM)
         .ok_or_else(|| conflict("usage_source_not_bound"))?;
-    if pin.input_identity.table_id != source.table_id
-        || pin.input_identity.tenant != ctx.tenant
-        || pin.input_identity.workspace != ctx.workspace
-        || pin.input_identity.stream_id != LOGFOOD_STREAM
-        || !valid_hour(pin.hour_start_ms)
-        || !valid_version(pin.input_identity.delta_version)
-        || !is_sha256(&pin.input_sha256)
-        || pin.transform_sha256 != binding.transform_sha256
-    {
+    if !valid_hour(pin.hour_start_ms) || pin.transform_sha256 != binding.transform_sha256 {
         return Err(conflict("usage_accepted_input_mismatch"));
     }
     let source_root = load_stream_root(state, ctx, source).await?;
+    let version = match (
+        pin.stream_pin_id.as_deref(),
+        pin.input_identity.as_ref(),
+        pin.input_sha256.as_deref(),
+    ) {
+        (Some(id), None, None) => load_pin(storage, source, &source_root, id).await?,
+        (None, Some(identity), Some(digest))
+            if identity.table_id == source.table_id
+                && identity.tenant == ctx.tenant
+                && identity.workspace == ctx.workspace
+                && identity.stream_id == LOGFOOD_STREAM
+                && is_sha256(digest) =>
+        {
+            identity.delta_version
+        }
+        _ => return Err(conflict("usage_accepted_input_mismatch")),
+    };
+    if !valid_version(version) {
+        return Err(conflict("usage_accepted_input_mismatch"));
+    }
     let source_head = DeltaCommitCoordinator::with_paths(storage.clone(), source_root.paths)
         .finalized_version()
         .await
         .map_err(|error| delta_error(&error))?;
-    if pin.input_identity.delta_version > source_head.max(0) {
+    if version > source_head.max(0) {
         return Err(conflict("usage_source_version_unpublished"));
     }
-    Ok(source.table_id)
+    Ok((source.table_id, version))
 }
 
 async fn ensure_destination(

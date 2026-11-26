@@ -8,6 +8,8 @@
 use super::*;
 use arco_core::{TaskTokenConfig, mint_task_token_for_attempt};
 use arco_flow::orchestration::LedgerWriter;
+use arco_flow::orchestration::accepted_plan::{ACCEPTED_PLAN_SHA256_LABEL, load_accepted_run_plan};
+use arco_flow::orchestration::compactor::MicroCompactor;
 use arco_flow::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use arco_flow::orchestration::flow_service::append_events_and_compact;
 use arco_worker_contract::callback_task_id;
@@ -15,6 +17,8 @@ use arco_worker_contract::callback_task_id;
 const HOUR: i64 = 1_800_000_000_000;
 const USAGE: &str = "/api/v1/usage/hourly";
 const STREAM: &str = "/api/2.1/unity-catalog/extensions/activity-events";
+const PINS: &str = "/api/v1/event-streams/query-activity/pins";
+const NATIVE_STREAM: &str = "/api/v1/event-streams/query-activity/events";
 const PUBLISHER: &str = "usage_publisher";
 const USAGE_READER: &str = "usage_reader";
 const RECORDER: &str = "activity_recorder";
@@ -31,7 +35,14 @@ async fn production_usage_replaces_one_hour_and_keeps_the_original_receipt() {
 #[ignore = "requires fresh MinIO"]
 async fn production_usage_owner_minio() {
     let root = std::env::var("ARCO_DELTA_PROOF_BUCKET").expect("a fresh MinIO bucket");
-    exercise_usage(arco_storage::from_bucket(&root).unwrap(), &root).await;
+    let fixture = exercise_usage(arco_storage::from_bucket(&root).unwrap(), &root).await;
+    if let Some(dir) = std::env::var_os("ARCO_DELTA_PROOF_EVIDENCE") {
+        std::fs::write(
+            Path::new(&dir).join("usage-pin-replay.json"),
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 #[allow(
@@ -39,7 +50,7 @@ async fn production_usage_owner_minio() {
     clippy::cognitive_complexity,
     reason = "The ordered acceptance scenario runs unchanged against memory and MinIO"
 )]
-async fn exercise_usage(backend: Arc<dyn StorageBackend>, root: &str) {
+async fn exercise_usage(backend: Arc<dyn StorageBackend>, root: &str) -> Value {
     let activity =
         event_streams::seed_activity_table(backend.clone(), root, WORKSPACE, RECORDER).await;
     let table_id = seed_usage_table(&activity.storage).await;
@@ -142,10 +153,24 @@ async fn exercise_usage(backend: Arc<dyn StorageBackend>, root: &str) {
         post_json(&router, USAGE, &publisher, other_hour).await.1["table_version"],
         2
     );
-    let update = verified_rollup(&router, &activity, &config, HOUR, 16, "revenue", 15).await;
-    let (status, replacement) = post_json(&router, USAGE, &publisher, update).await;
+    let pin_id = issue_stream_pin(&router, &activity_reader, &recorder, &other).await;
+    let update = verify_usage_run(
+        &router,
+        &activity,
+        &config,
+        json!({"streamPinId":pin_id,"hourStartMs":HOUR,"transformSha256":TRANSFORM}),
+        None,
+    )
+    .await;
+    let (status, replacement) = post_json(&router, USAGE, &publisher, update.clone()).await;
     assert_eq!(status, StatusCode::OK, "{replacement}");
     assert_eq!(replacement["table_version"], 3);
+    assert_eq!(replacement["source_delta_version"], 16);
+    router = open(config.clone());
+    assert_eq!(
+        post_json(&router, USAGE, &publisher, update.clone()).await,
+        (StatusCode::OK, replacement.clone())
+    );
 
     let stale = verified_rollup(&router, &activity, &config, HOUR, 1, "revenue", 1).await;
     let (code, body) = post_json(&router, USAGE, &publisher, stale).await;
@@ -234,6 +259,129 @@ async fn exercise_usage(backend: Arc<dyn StorageBackend>, root: &str) {
         "table_id":table_id, "table_uri":format!("{root}/tenant={TENANT}/workspace={WORKSPACE}/{}",paths.table_root()),
         "latest_backfilled_version":3
     })).await.0, StatusCode::FORBIDDEN);
+    json!({"tenant":TENANT,"workspace":WORKSPACE,"sourceTableId":activity.table_id,
+        "usageTableId":table_id,"pinId":pin_id,"transformSha256":TRANSFORM,
+        "publishRequest":update,"receipt":replacement})
+}
+
+async fn issue_stream_pin(router: &Router, reader: &str, recorder: &str, other: &str) -> String {
+    let (status, pin) = post_json(router, PINS, reader, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{pin}");
+    assert_eq!(pin["publishedVersion"], 16);
+    let id = pin["pinId"].as_str().unwrap();
+    assert_eq!(
+        post_json(router, PINS, recorder, json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, receipt) = post_json(
+        router,
+        STREAM,
+        recorder,
+        json!({
+            "schema_version":1,"source_event_id":Uuid::now_v7(),"occurred_at_ms":HOUR+17,
+            "stage":"execution","outcome":"succeeded","surface_id":"revenue",
+            "release_id":"rel_revenue","operation_id":"req_17",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["commit_version"], 17);
+    assert_eq!(
+        post_json(router, PINS, reader, json!({"publishedVersion":16})).await,
+        (StatusCode::OK, pin.clone())
+    );
+    let path = format!("{NATIVE_STREAM}?pinId={id}&limit=8");
+    assert_eq!(
+        read_json(router, &path, other).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        read_json(router, &path, recorder).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        read_json(router, &format!("{path}&publishedVersion=16"), reader)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        read_json(
+            router,
+            &format!("{NATIVE_STREAM}?pinId={}", "0".repeat(64)),
+            reader
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post_json(router, PINS, reader, json!({"publishedVersion":18}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    id.to_string()
+}
+
+async fn materialize_pinned_hour(
+    router: &Router,
+    source: &TableReadFixture,
+    run_id: &str,
+    plan_id: &str,
+) -> Vec<u8> {
+    let (_, fold) = MicroCompactor::new(source.storage.clone())
+        .load_state()
+        .await
+        .unwrap();
+    let hash = &fold.runs[run_id].labels[ACCEPTED_PLAN_SHA256_LABEL];
+    let plan = load_accepted_run_plan(&source.storage, run_id, plan_id, hash)
+        .await
+        .unwrap();
+    let payload = plan.task_payloads[TASK]
+        .pointer("/asset/execution/payload")
+        .unwrap();
+    let pin_id = payload["streamPinId"].as_str().unwrap();
+    let hour = payload["hourStartMs"].as_i64().unwrap();
+    let reader = table_read_rs256_jwt(TENANT, WORKSPACE, READER);
+    let path = format!("{NATIVE_STREAM}?pinId={pin_id}&limit=8");
+    let (status, first) = read_json(router, &path, &reader).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["publishedVersion"], 16);
+    let (status, second) = read_json(
+        router,
+        &format!("{path}&beforeVersion={}", first["nextBeforeVersion"]),
+        &reader,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["publishedVersion"], 16);
+    assert!(second["nextBeforeVersion"].is_null());
+    let rows = [first, second];
+    let events = rows
+        .iter()
+        .flat_map(|page| page["events"].as_array().unwrap());
+    let versions = events
+        .clone()
+        .map(|row| row["commitVersion"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(versions, (1..=16).rev().collect::<Vec<_>>());
+    let executions = events
+        .filter(|row| {
+            let event = &row["event"];
+            (hour..hour + 3_600_000).contains(&event["occurredAtMs"].as_i64().unwrap())
+                && event["fields"]["stage"] == "execution"
+                && event["fields"]["outcome"] == "succeeded"
+        })
+        .map(|row| row["event"]["fields"]["operation_id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(executions.len(), 15);
+    usage_parquet_fixture(
+        hour,
+        16,
+        "revenue",
+        i64::try_from(executions.len()).unwrap(),
+    )
 }
 
 const COLUMNS: [(&str, DataType, bool); 11] = [
@@ -354,12 +502,29 @@ async fn verified_rollup(
     surface: &str,
     executions: i64,
 ) -> Value {
-    let publisher = table_read_rs256_jwt(TENANT, WORKSPACE, PUBLISHER);
-    let workspace = format!("/api/v1/workspaces/{WORKSPACE}");
-    let code_version = Uuid::now_v7().to_string();
     let pin = json!({"inputIdentity":{"tenant":TENANT,"workspace":WORKSPACE,"table_id":source.table_id,
         "delta_version":version,"stream_id":"query-activity"}, "inputSha256":"a".repeat(64),
         "hourStartMs":hour,"transformSha256":TRANSFORM});
+    verify_usage_run(
+        router,
+        source,
+        config,
+        pin,
+        Some(usage_parquet_fixture(hour, version, surface, executions)),
+    )
+    .await
+}
+
+async fn verify_usage_run(
+    router: &Router,
+    source: &TableReadFixture,
+    config: &Config,
+    pin: Value,
+    data: Option<Vec<u8>>,
+) -> Value {
+    let publisher = table_read_rs256_jwt(TENANT, WORKSPACE, PUBLISHER);
+    let workspace = format!("/api/v1/workspaces/{WORKSPACE}");
+    let code_version = Uuid::now_v7().to_string();
     let (status, manifest) = post_json(router, &format!("{workspace}/manifests"), &publisher, json!({
         "manifestVersion":"1.0","codeVersionId":code_version,
         "assets":[{"key":{"namespace":"analytics","name":"surface_usage_hourly"},"id":"usage_asset",
@@ -423,7 +588,12 @@ async fn verified_rollup(
         StatusCode::CONFLICT
     );
 
-    let data = usage_parquet_fixture(hour, version, surface, executions);
+    let data = match data {
+        Some(fixture) => fixture,
+        None => {
+            materialize_pinned_hour(router, source, run_id, run["planId"].as_str().unwrap()).await
+        }
+    };
     let size = data.len();
     let hash = hex::encode(Sha256::digest(&data));
     let path = format!("outputs/usage/{run_id}.parquet");

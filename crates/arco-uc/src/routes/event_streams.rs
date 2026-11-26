@@ -18,7 +18,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -45,6 +45,9 @@ use crate::routes::credentials::{
 use crate::routes::table_reads::{delta::DeltaRoot, json_response, load_table};
 use crate::state::UnityCatalogState;
 
+mod pins;
+pub(super) use pins::load_pin;
+
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_OBJECT_BYTES: u64 = 64 * 1024;
 const MAX_PAGE_SIZE: i64 = 50;
@@ -62,7 +65,7 @@ const EVENT_COLUMNS: [(&str, &str, DataType, bool); 4] = [
 /// Native Arco event-stream API.
 #[derive(OpenApi)]
 #[openapi(
-    paths(stream_append, stream_read),
+    paths(stream_append, stream_read, pins::create),
     tags((name = "event-streams", description = "Workspace-bound typed event streams"))
 )]
 pub struct EventStreamApiDoc;
@@ -71,6 +74,7 @@ pub struct EventStreamApiDoc;
 pub fn routes() -> Router<UnityCatalogState> {
     Router::new()
         .route("/:stream_id/events", get(stream_read).post(stream_append))
+        .route("/:stream_id/pins", post(pins::create))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
@@ -157,6 +161,7 @@ struct StreamPageQuery {
     limit: Option<i64>,
     before_version: Option<i64>,
     published_version: Option<i64>,
+    pin_id: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -475,12 +480,14 @@ async fn append(
         ("limit" = Option<i64>, Query, description = "Page size from 1 to 50, default 25"),
         ("beforeVersion" = Option<i64>, Query, description = "Exclusive continuation version"),
         ("publishedVersion" = Option<i64>, Query, description = "Published version from the first page"),
+        ("pinId" = Option<String>, Query, description = "Arco-issued pin. Use in place of publishedVersion"),
     ),
     responses(
         (status = 200, description = "Authorized event page", body = StreamPage),
         (status = 400, description = "Invalid page bounds", body = StreamErrorBody),
         (status = 401, description = "JWT authentication required", body = StreamErrorBody),
         (status = 403, description = "Missing stream binding or table SELECT grant", body = StreamErrorBody),
+        (status = 404, description = "Pin was not found in this Workspace", body = StreamErrorBody),
         (status = 409, description = "Stream identity conflict", body = StreamErrorBody),
         (status = 429, description = "Tenant rate limit exceeded", body = StreamErrorBody),
         (status = 503, description = "Event stream is unavailable", body = StreamErrorBody),
@@ -503,6 +510,7 @@ async fn stream_read(
             before_version: query.before_version,
             published_version: query.published_version,
         },
+        query.pin_id.as_deref(),
     )
     .await?;
     json_response(&StreamPage {
@@ -527,7 +535,7 @@ async fn activity_read(
     query: Result<Query<PageQuery>, QueryRejection>,
 ) -> UnityCatalogResult<Response> {
     let Query(query) = query.map_err(|_| bad_request("event_page_invalid"))?;
-    let page = read_page(&state, &ctx, LOGFOOD_STREAM, query).await?;
+    let page = read_page(&state, &ctx, LOGFOOD_STREAM, query, None).await?;
     json_response(&page)
 }
 
@@ -536,6 +544,7 @@ async fn read_page(
     ctx: &UnityCatalogRequestContext,
     stream_id: &str,
     query: PageQuery,
+    pin_id: Option<&str>,
 ) -> UnityCatalogResult<ActivityPage> {
     let limit = query.limit.unwrap_or(25);
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
@@ -551,24 +560,19 @@ async fn read_page(
     )
     .await?;
     let storage = scoped_storage(state, ctx)?;
-    let fingerprint = binding_fingerprint(binding)?;
-    validate_binding(&storage, &stream_binding_path(binding), &fingerprint, false).await?;
-    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), root.paths.clone());
-    let finalized = coordinator
-        .finalized_version()
-        .await
-        .map_err(|_| unavailable())?;
-    let head = finalized.max(0);
-    let through = query.published_version.unwrap_or(head);
+    let (coordinator, head) = published_head(&storage, &root.paths, binding).await?;
+    let through = match pin_id {
+        Some(id) if query.published_version.is_none() => {
+            load_pin(&storage, binding, &root, id).await?
+        }
+        Some(_) => return Err(bad_request("event_page_invalid")),
+        None => query.published_version.unwrap_or(head),
+    };
     let newest_bound = through.saturating_add(1);
     let before = query.before_version.unwrap_or(newest_bound);
     if through < 0 || through > head || before < 1 || before > newest_bound {
         return Err(bad_request("event_page_invalid"));
     }
-    if finalized >= 0 {
-        verify_bootstrap(&storage, &root.paths, &bootstrap_log(binding, &fingerprint)).await?;
-    }
-
     let last = through.min(before - 1);
     let first = (last - limit + 1).max(1);
     let mut events = Vec::new();
@@ -592,6 +596,24 @@ async fn read_page(
         published_version: through,
         next_before_version: (first > 1).then_some(first),
     })
+}
+
+async fn published_head(
+    storage: &ScopedStorage,
+    paths: &DeltaPaths,
+    binding: &StreamBinding,
+) -> UnityCatalogResult<(DeltaCommitCoordinator, i64)> {
+    let fingerprint = binding_fingerprint(binding)?;
+    validate_binding(storage, &stream_binding_path(binding), &fingerprint, false).await?;
+    let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
+    let finalized = coordinator
+        .finalized_version()
+        .await
+        .map_err(|_| unavailable())?;
+    if finalized >= 0 {
+        verify_bootstrap(storage, paths, &bootstrap_log(binding, &fingerprint)).await?;
+    }
+    Ok((coordinator, finalized.max(0)))
 }
 
 fn binding_fingerprint(binding: &StreamBinding) -> UnityCatalogResult<String> {

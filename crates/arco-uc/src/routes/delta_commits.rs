@@ -12,7 +12,7 @@ use axum::routing::get;
 
 use arco_catalog::authz::privileges::Privilege;
 use arco_core::error::Error as CoreError;
-use arco_core::storage::{WritePrecondition, WriteResult};
+use arco_core::storage::{StorageBackend as _, WritePrecondition, WriteResult};
 use arco_core::{DeltaPaths, ScopedStorage};
 use arco_delta::{CommitDeltaRequest, DeltaCommitCoordinator, DeltaError};
 use bytes::Bytes;
@@ -91,12 +91,9 @@ struct DeltaPreviewBackfillState {
 
 const BACKFILL_STATE_CAS_RETRIES: usize = 16;
 const MAX_UNBACKFILLED_COMMITS_PER_TABLE: i64 = 1000;
-
-#[derive(Debug, Clone)]
-struct DeltaLogObject {
-    version: i64,
-    path: String,
-}
+// shortcut: cap ranges at 100 entries and 8 MiB, add cursor pagination if clients need automatic traversal.
+const MAX_PREVIEW_HISTORY_VERSIONS: i64 = 100;
+const MAX_PREVIEW_HISTORY_BYTES: u64 = 8 * 1024 * 1024;
 
 fn delta_preview_backfill_path(table_id: Uuid) -> String {
     format!("uc/delta_preview/{table_id}.json")
@@ -520,15 +517,6 @@ fn build_commit_payload(
     Ok(Bytes::from(body))
 }
 
-fn parse_delta_log_version(path: &str) -> Option<i64> {
-    let file_name = path.rsplit('/').next()?;
-    let version_part = file_name.strip_suffix(".json")?;
-    version_part
-        .parse::<u64>()
-        .ok()
-        .and_then(|value| i64::try_from(value).ok())
-}
-
 fn default_commit_info_for_payload(version: i64, payload_len: usize) -> DeltaCommitInfo {
     DeltaCommitInfo {
         version,
@@ -559,63 +547,28 @@ fn parse_commit_info_from_payload(version: i64, payload: &[u8]) -> DeltaCommitIn
     info
 }
 
-async fn load_delta_log_objects(
+async fn preview_finalized_version(
+    coordinator: &DeltaCommitCoordinator,
     storage: &ScopedStorage,
     paths: &DeltaPaths,
-) -> UnityCatalogResult<Vec<DeltaLogObject>> {
-    let paths = storage
-        .list(&paths.delta_log_prefix())
+) -> UnityCatalogResult<Option<i64>> {
+    if let Some(state) = coordinator
+        .state_for_root()
         .await
-        .map_err(|err| map_internal_error("list delta log objects", err))?;
-
-    let mut objects = paths
-        .into_iter()
-        .filter_map(|path| {
-            let path = path.to_string();
-            parse_delta_log_version(&path).map(|version| DeltaLogObject { version, path })
-        })
-        .collect::<Vec<_>>();
-    objects.sort_unstable_by_key(|entry| entry.version);
-    Ok(objects)
-}
-
-fn latest_version_from_log_objects(log_objects: &[DeltaLogObject]) -> Option<i64> {
-    log_objects.last().map(|entry| entry.version)
-}
-
-fn parse_table_uri_from_payload(payload: &[u8]) -> Option<String> {
-    let parsed = serde_json::from_slice::<Value>(payload).ok()?;
-    parsed
-        .get("tableUri")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-}
-
-async fn existing_table_uri_from_logs(
-    storage: &ScopedStorage,
-    log_objects: &[DeltaLogObject],
-) -> UnityCatalogResult<Option<String>> {
-    for log in log_objects.iter().rev() {
-        let payload = storage
-            .get_raw(&log.path)
-            .await
-            .map_err(|err| map_internal_error("read delta log payload", err))?;
-        if let Some(table_uri) = parse_table_uri_from_payload(&payload) {
-            return Ok(Some(table_uri));
-        }
+        .map_err(map_delta_error)?
+    {
+        return Ok(Some(state.latest_version));
+    }
+    let existing = storage
+        .list_page_meta(&paths.delta_log_prefix(), None, 1)
+        .await
+        .map_err(|err| map_internal_error("check for uncoordinated Delta logs", err))?;
+    if !existing.objects.is_empty() || existing.next_start_after.is_some() {
+        return Err(UnityCatalogError::Conflict {
+            message: "delta_preview_log_migration_required".to_string(),
+        });
     }
     Ok(None)
-}
-
-async fn expected_table_uri(
-    storage: &ScopedStorage,
-    backfill_state: Option<&DeltaPreviewBackfillState>,
-    log_objects: &[DeltaLogObject],
-) -> UnityCatalogResult<Option<String>> {
-    if let Some(table_uri) = backfill_state.and_then(|state| state.table_uri.clone()) {
-        return Ok(Some(table_uri));
-    }
-    existing_table_uri_from_logs(storage, log_objects).await
 }
 
 fn ensure_table_uri_matches(
@@ -634,7 +587,7 @@ fn ensure_table_uri_matches(
 
 async fn list_commits(
     storage: &ScopedStorage,
-    log_objects: &[DeltaLogObject],
+    paths: &DeltaPaths,
     start_version: i64,
     end_version: Option<i64>,
     latest_version: i64,
@@ -647,27 +600,53 @@ async fn list_commits(
     if upper_bound < start_version {
         return Ok(Vec::new());
     }
+    if upper_bound.saturating_sub(start_version) >= MAX_PREVIEW_HISTORY_VERSIONS {
+        return Err(UnityCatalogError::BadRequest {
+            message: format!(
+                "Delta preview history accepts at most {MAX_PREVIEW_HISTORY_VERSIONS} versions per request"
+            ),
+        });
+    }
 
     let mut commits = Vec::new();
-    for log in log_objects
-        .iter()
-        .filter(|entry| entry.version >= start_version && entry.version <= upper_bound)
-    {
+    let mut bytes_read = 0u64;
+    for version in start_version..=upper_bound {
+        let path = paths
+            .delta_log_json(version)
+            .map_err(|err| map_internal_error("derive Delta log path", err))?;
+        let metadata = storage
+            .head_raw(&path)
+            .await
+            .map_err(|err| map_internal_error("inspect finalized Delta log", err))?
+            .filter(|metadata| metadata.size > 0)
+            .ok_or_else(|| UnityCatalogError::Conflict {
+                message: format!("finalized Delta log unavailable for version {version}"),
+            })?;
+        bytes_read = bytes_read.saturating_add(metadata.size);
+        if bytes_read > MAX_PREVIEW_HISTORY_BYTES {
+            return Err(UnityCatalogError::BadRequest {
+                message: "Delta preview history exceeds 8 MiB. Request a smaller range."
+                    .to_string(),
+            });
+        }
         let payload = storage
-            .get_raw(&log.path)
+            .get_range(&path, 0..metadata.size)
             .await
             .map_err(|err| map_internal_error("read delta log payload", err))?;
-        if payload.is_empty() {
-            continue;
+        if payload.len() as u64 != metadata.size {
+            return Err(UnityCatalogError::Conflict {
+                message: format!("finalized Delta log changed for version {version}"),
+            });
         }
-
-        commits.push(parse_commit_info_from_payload(log.version, &payload));
+        commits.push(parse_commit_info_from_payload(version, &payload));
     }
 
     Ok(commits)
 }
 
-/// Lists unbackfilled Delta commits for callers with table `SELECT`.
+/// Lists finalized, unbackfilled Delta commits for callers with table `SELECT`.
+///
+/// Select a version range of up to 100 entries and 8 MiB of Delta logs.
 ///
 /// # Errors
 ///
@@ -717,26 +696,19 @@ pub(crate) async fn get_delta_preview_commits(
     )
     .await?;
     let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
-    let coordinator_state = coordinator
-        .state_for_root()
-        .await
-        .map_err(map_delta_error)?;
+    let finalized = preview_finalized_version(&coordinator, &storage, &paths).await?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
-    let log_objects = load_delta_log_objects(&storage, &paths).await?;
-
-    if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
+    if finalized.is_none() && backfill_state.is_none() {
         return Err(UnityCatalogError::NotFound {
             message: format!("table not found: {table_id}"),
         });
     }
 
-    let expected_table_uri =
-        expected_table_uri(&storage, backfill_state.as_ref(), &log_objects).await?;
-    ensure_table_uri_matches(table_id, &table_uri, expected_table_uri.as_deref())?;
-
-    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
-    let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
-    let latest_table_version = coordinator_latest.max(logs_latest);
+    let expected_uri = backfill_state
+        .as_ref()
+        .and_then(|state| state.table_uri.as_deref());
+    ensure_table_uri_matches(table_id, &table_uri, expected_uri)?;
+    let latest_table_version = finalized.unwrap_or(-1);
 
     let backfilled = backfill_state.and_then(|state| state.latest_backfilled_version);
 
@@ -744,14 +716,7 @@ pub(crate) async fn get_delta_preview_commits(
         .unwrap_or(0)
         .max(backfilled.map_or(0, |version| version.saturating_add(1)));
 
-    let commits = list_commits(
-        &storage,
-        &log_objects,
-        start,
-        end_version,
-        latest_table_version,
-    )
-    .await?;
+    let commits = list_commits(&storage, &paths, start, end_version, latest_table_version).await?;
 
     let payload = json!({
         "latest_table_version": latest_table_version,
@@ -782,19 +747,13 @@ async fn handle_commit_registration(
     validate_idempotency_key(&idempotency_key)?;
 
     let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
-    let coordinator_state = coordinator
-        .state_for_root()
-        .await
-        .map_err(map_delta_error)?;
+    let finalized = preview_finalized_version(&coordinator, storage, paths).await?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
-    let log_objects = load_delta_log_objects(storage, paths).await?;
-    let existing_table_uri =
-        expected_table_uri(storage, backfill_state.as_ref(), &log_objects).await?;
-    ensure_table_uri_matches(table_id, table_uri, existing_table_uri.as_deref())?;
-
-    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
-    let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
-    let latest_table_version = coordinator_latest.max(logs_latest);
+    let expected_uri = backfill_state
+        .as_ref()
+        .and_then(|state| state.table_uri.as_deref());
+    ensure_table_uri_matches(table_id, table_uri, expected_uri)?;
+    let latest_table_version = finalized.unwrap_or(-1);
     let latest_backfilled = backfill_state
         .as_ref()
         .and_then(|state| state.latest_backfilled_version)
@@ -878,26 +837,19 @@ async fn handle_backfill_registration(
 
     let table_id = paths.table_id();
     let coordinator = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone());
-    let coordinator_state = coordinator
-        .state_for_root()
-        .await
-        .map_err(map_delta_error)?;
+    let finalized = preview_finalized_version(&coordinator, storage, paths).await?;
     let backfill_state = load_backfill_state(storage, table_id).await?;
-    let log_objects = load_delta_log_objects(storage, paths).await?;
-
-    if coordinator_state.is_none() && backfill_state.is_none() && log_objects.is_empty() {
+    if finalized.is_none() && backfill_state.is_none() {
         return Err(UnityCatalogError::NotFound {
             message: format!("table not found: {table_id}"),
         });
     }
 
-    let existing_table_uri =
-        expected_table_uri(storage, backfill_state.as_ref(), &log_objects).await?;
-    ensure_table_uri_matches(table_id, table_uri, existing_table_uri.as_deref())?;
-
-    let coordinator_latest = coordinator_state.map_or(-1, |state| state.latest_version);
-    let logs_latest = latest_version_from_log_objects(&log_objects).unwrap_or(-1);
-    let latest_table_version = coordinator_latest.max(logs_latest);
+    let expected_uri = backfill_state
+        .as_ref()
+        .and_then(|state| state.table_uri.as_deref());
+    ensure_table_uri_matches(table_id, table_uri, expected_uri)?;
+    let latest_table_version = finalized.unwrap_or(-1);
     if backfilled > latest_table_version {
         return Err(UnityCatalogError::BadRequest {
             message: format!(

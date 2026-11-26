@@ -2,14 +2,18 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::{
     CatalogWriter, ColumnDefinition, RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
 };
 use arco_core::ScopedStorage;
-use arco_core::storage::{MemoryBackend, WritePrecondition};
+use arco_core::storage::{
+    ListPage, MemoryBackend, ObjectMeta, StorageBackend, WritePrecondition, WriteResult,
+};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
@@ -34,7 +38,13 @@ struct Harness {
 }
 
 async fn make_harness(location: &str) -> Result<(Harness, Uuid), String> {
-    let backend = Arc::new(MemoryBackend::new());
+    make_harness_with_backend(location, Arc::new(MemoryBackend::new())).await
+}
+
+async fn make_harness_with_backend(
+    location: &str,
+    backend: Arc<dyn StorageBackend>,
+) -> Result<(Harness, Uuid), String> {
     let storage = ScopedStorage::new(backend, "tenant1", "workspace1").expect("scoped storage");
     let table_id = seed_managed_delta_table(&storage, location).await?;
     let router = delta_preview::router_with_table_privileges(
@@ -165,6 +175,243 @@ fn commit_info(version: i64) -> Value {
         "file_size": 42,
         "file_modification_timestamp": 1
     })
+}
+
+#[derive(Debug, Default)]
+struct BoundedLogBackend(MemoryBackend);
+
+#[async_trait::async_trait]
+impl StorageBackend for BoundedLogBackend {
+    async fn get(&self, path: &str) -> arco_core::Result<Bytes> {
+        self.0.get(path).await
+    }
+
+    async fn get_range(&self, path: &str, range: Range<u64>) -> arco_core::Result<Bytes> {
+        self.0.get_range(path, range).await
+    }
+
+    async fn put(
+        &self,
+        path: &str,
+        data: Bytes,
+        precondition: WritePrecondition,
+    ) -> arco_core::Result<WriteResult> {
+        self.0.put(path, data, precondition).await
+    }
+
+    async fn delete(&self, path: &str) -> arco_core::Result<()> {
+        self.0.delete(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> arco_core::Result<Vec<ObjectMeta>> {
+        if prefix.contains("/_delta_log/") {
+            return Err(arco_core::Error::storage(
+                "unbounded Delta history enumeration",
+            ));
+        }
+        self.0.list(prefix).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> arco_core::Result<ListPage> {
+        self.0.list_page(prefix, start_after, limit).await
+    }
+
+    async fn head(&self, path: &str) -> arco_core::Result<Option<ObjectMeta>> {
+        self.0.head(path).await
+    }
+
+    async fn signed_url(&self, path: &str, expiry: Duration) -> arco_core::Result<String> {
+        self.0.signed_url(path, expiry).await
+    }
+}
+
+#[tokio::test]
+async fn normal_delta_preview_operations_need_no_unbounded_log_listing() -> Result<(), String> {
+    let location = "gs://bucket/path";
+    let (harness, id) =
+        make_harness_with_backend(location, Arc::new(BoundedLogBackend::default())).await?;
+    let commit = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location, "commit_info": commit_info(0)}),
+        Some(&Uuid::now_v7().to_string()),
+        None,
+    )
+    .await?;
+    assert_eq!(commit.status, StatusCode::OK, "{}", commit.body);
+
+    let history = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location}),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(history.status, StatusCode::OK, "{}", history.body);
+    assert_eq!(
+        history
+            .body
+            .get("latest_table_version")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        history
+            .body
+            .pointer("/commits/0/version")
+            .and_then(Value::as_i64),
+        Some(0)
+    );
+
+    let backfill = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location, "latest_backfilled_version": 0}),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(backfill.status, StatusCode::OK, "{}", backfill.body);
+    Ok(())
+}
+
+#[tokio::test]
+async fn delta_preview_history_bounds_the_range_to_finalized_versions() -> Result<(), String> {
+    let location = "gs://bucket/path";
+    let (harness, id) = make_harness(location).await?;
+    let finalized = 10_000;
+    harness
+        .storage
+        .put_raw(
+            &format!("delta/coordinator/{id}.json"),
+            Bytes::from(
+                json!({"table_root": "path", "latest_version": finalized, "inflight": null})
+                    .to_string(),
+            ),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("seed finalized coordinator state");
+    for version in [finalized - 1, finalized, finalized + 1] {
+        harness
+            .storage
+            .put_raw(
+                &format!("path/_delta_log/{version:020}.json"),
+                Bytes::from(json!({"commitInfo": commit_info(version)}).to_string()),
+                WritePrecondition::DoesNotExist,
+            )
+            .await
+            .expect("seed Delta log");
+    }
+    let wide = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location}),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(wide.status, StatusCode::BAD_REQUEST, "{}", wide.body);
+    let bounded = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({
+            "table_id": id, "table_uri": location,
+            "start_version": finalized - 1, "end_version": finalized + 1,
+        }),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(bounded.status, StatusCode::OK, "{}", bounded.body);
+    assert_eq!(
+        bounded
+            .body
+            .get("latest_table_version")
+            .and_then(Value::as_i64),
+        Some(finalized)
+    );
+    let commits = bounded
+        .body
+        .get("commits")
+        .and_then(Value::as_array)
+        .expect("Delta history");
+    let versions = commits
+        .iter()
+        .map(|commit| commit.get("version").and_then(Value::as_i64))
+        .collect::<Vec<_>>();
+    assert_eq!(versions, [Some(finalized - 1), Some(finalized)]);
+
+    harness
+        .storage
+        .put_raw(
+            &format!("path/_delta_log/{finalized:020}.json"),
+            Bytes::from(vec![b' '; 8 * 1024 * 1024 + 1]),
+            WritePrecondition::None,
+        )
+        .await
+        .expect("seed oversized log");
+    let oversized = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location, "start_version": finalized}),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(
+        oversized.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        oversized.body
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delta_preview_log_only_history_requires_explicit_migration() -> Result<(), String> {
+    let location = "gs://bucket/path";
+    let (harness, id) =
+        make_harness_with_backend(location, Arc::new(BoundedLogBackend::default())).await?;
+    harness
+        .storage
+        .put_raw(
+            "path/_delta_log/00000000000000000000.json",
+            Bytes::from(json!({"commitInfo": commit_info(0)}).to_string()),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .expect("seed an unmanaged log");
+    let history = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({"table_id": id, "table_uri": location, "end_version": 0}),
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(history.status, StatusCode::CONFLICT, "{}", history.body);
+    assert_eq!(
+        history
+            .body
+            .pointer("/error/message")
+            .and_then(Value::as_str),
+        Some("delta_preview_log_migration_required")
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -494,8 +741,8 @@ async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result
         .map_err(|err| format!("seed staged payload: {err}"))?;
 
     let staged_version = match staged_write {
-        arco_core::storage::WriteResult::Success { version } => version,
-        arco_core::storage::WriteResult::PreconditionFailed { .. } => {
+        WriteResult::Success { version } => version,
+        WriteResult::PreconditionFailed { .. } => {
             return Err("unexpected staged precondition failure".to_string());
         }
     };

@@ -101,6 +101,51 @@ async fn seed_create_table_authority(
     }
 }
 
+async fn seed_delta_preview_grants(storage: &ScopedStorage, table_id: &str, qualified_name: &str) {
+    let scope = ControlPlaneScope::workspace_alias(storage.tenant_id(), storage.workspace_id())
+        .expect("control scope");
+    let ledger = MetastoreLedger::new(storage.clone()).expect("metastore ledger");
+    let table = MetastoreEvent::new_scoped(
+        &scope,
+        "event_engine_smoke_table",
+        4,
+        MetastoreMutation::CatalogObjectUpserted(CatalogObjectRecord {
+            object_id: table_id.to_string(),
+            object_type: "TABLE".to_string(),
+            qualified_name: qualified_name.to_string(),
+            owner: "test-owner".to_string(),
+            lifecycle_state: LifecycleState::Active,
+            updated_at_ms: 4,
+            properties: BTreeMap::new(),
+        }),
+    );
+    ledger
+        .append_event(&table)
+        .await
+        .expect("seed table authority");
+    for (sequence, privilege) in [(5, "SELECT"), (6, "MODIFY")] {
+        let grant_id = format!("grant_engine_smoke_{}", privilege.to_ascii_lowercase());
+        let event = MetastoreEvent::new_scoped(
+            &scope,
+            format!("event_{grant_id}"),
+            sequence,
+            MetastoreMutation::GrantUpserted(GrantRecord {
+                grant_id,
+                object_id: table_id.to_string(),
+                object_type: "TABLE".to_string(),
+                principal_id: SMOKE_PRINCIPAL.to_string(),
+                privilege: privilege.to_string(),
+                owner: "test-owner".to_string(),
+                lifecycle_state: LifecycleState::Active,
+                updated_at_ms: sequence.cast_signed(),
+                properties: BTreeMap::new(),
+                identity_cut: None,
+            }),
+        );
+        ledger.append_event(&event).await.expect("seed table grant");
+    }
+}
+
 #[derive(Debug)]
 struct JsonResponse {
     status: StatusCode,
@@ -250,12 +295,13 @@ async fn run_engine_flow(engine: &str) {
 
     let catalog_storage =
         ScopedStorage::new(backend.clone(), tenant, workspace).expect("scoped storage");
-    let uc_table = CatalogReader::new(catalog_storage)
+    let uc_table = CatalogReader::new(catalog_storage.clone())
         .get_table_in_schema(&catalog_name, &schema_name, &table_name)
         .await
         .expect("read created UC table")
         .expect("created UC table");
     let uc_table_id = uc_table.id;
+    seed_delta_preview_grants(&catalog_storage, &uc_table_id, &full_table_name).await;
     let uc_table_uri = uc_table
         .location
         .unwrap_or_else(|| storage_location.clone());

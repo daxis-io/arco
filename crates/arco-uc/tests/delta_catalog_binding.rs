@@ -2,8 +2,10 @@
 
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::{
     CatalogAuthorityBinding, CatalogAuthorityBindings, CatalogWriter, ColumnDefinition,
     RegisterTableInSchemaRequest, Tier1Compactor, WriteOptions,
@@ -18,6 +20,9 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+#[path = "support/delta_preview.rs"]
+mod delta_preview;
 
 const TENANT: &str = "tenant1";
 const WORKSPACE: &str = "workspace1";
@@ -123,6 +128,12 @@ async fn uc_request(
     request_id: Option<&str>,
 ) -> Result<UcResponse, String> {
     let mut builder = Request::builder()
+        .extension(delta_preview::trusted_context(
+            TENANT,
+            WORKSPACE,
+            idempotency_key,
+            request_id,
+        ))
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
@@ -198,8 +209,9 @@ async fn assert_no_delta_side_effects(
 ) -> Result<(), String> {
     for prefix in [
         format!("delta/staging/{table_id}/"),
-        format!("delta/coordinator/{table_id}"),
-        format!("uc/delta_preview/{table_id}"),
+        format!("delta/coordinator/{table_id}.json"),
+        format!("delta/idempotency/{table_id}/"),
+        format!("uc/delta_preview/{table_id}.json"),
         format!("tables/{table_id}/_delta_log/"),
     ] {
         let paths = storage
@@ -211,6 +223,130 @@ async fn assert_no_delta_side_effects(
             "unexpected side effects under {prefix}: {paths:?}"
         );
     }
+    Ok(())
+}
+
+async fn managed_orders_harness(privileges: &[Privilege]) -> Result<(Harness, Uuid), String> {
+    let Harness { storage, .. } = make_harness();
+    initialize_catalog(&storage).await?;
+    let table = seed_table(
+        &storage,
+        "orders",
+        "gs://bucket/orders",
+        "delta",
+        Some("MANAGED"),
+    )
+    .await?;
+    let table_id = Uuid::parse_str(&table.id).map_err(|err| format!("parse table id: {err}"))?;
+    let router = delta_preview::router_with_table_privileges(&storage, &[&table.id], privileges);
+    Ok((Harness { router, storage }, table_id))
+}
+
+async fn seed_committed_version(storage: &ScopedStorage, table_id: Uuid) -> Result<(), String> {
+    storage
+        .put_raw(
+            &format!("delta/coordinator/{table_id}.json"),
+            Bytes::from_static(br#"{"latest_version":0,"inflight":null}"#),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|err| format!("seed coordinator: {err}"))?;
+    Ok(())
+}
+
+async fn stored_object_versions(
+    storage: &ScopedStorage,
+) -> Result<BTreeMap<String, String>, String> {
+    let objects = storage
+        .list_meta("")
+        .await
+        .map_err(|err| format!("list stored objects: {err}"))?;
+    Ok(objects
+        .into_iter()
+        .map(|object| (object.path.as_str().to_string(), object.version))
+        .collect())
+}
+
+#[tokio::test]
+async fn uc_delta_history_requires_select() -> Result<(), String> {
+    let (harness, table_id) = managed_orders_harness(&[Privilege::Modify]).await?;
+    seed_committed_version(&harness.storage, table_id).await?;
+
+    let response = uc_request(
+        &harness.router,
+        Method::GET,
+        "/delta/preview/commits",
+        json!({"table_id": table_id, "table_uri": "gs://bucket/orders", "start_version": 0}),
+        None,
+        Some("req-no-select"),
+    )
+    .await?;
+
+    assert_error(
+        &response,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "req-no-select",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn uc_delta_commit_requires_modify_without_side_effects() -> Result<(), String> {
+    let (harness, table_id) = managed_orders_harness(&[Privilege::Select]).await?;
+    let before = stored_object_versions(&harness.storage).await?;
+
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/orders",
+            "commit_info": commit_info(0)
+        }),
+        Some(&Uuid::now_v7().to_string()),
+        Some("req-no-modify"),
+    )
+    .await?;
+
+    assert_error(
+        &response,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "req-no-modify",
+    );
+    assert_eq!(stored_object_versions(&harness.storage).await?, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn uc_delta_backfill_requires_modify_without_side_effects() -> Result<(), String> {
+    let (harness, table_id) = managed_orders_harness(&[Privilege::Select]).await?;
+    seed_committed_version(&harness.storage, table_id).await?;
+    let before = stored_object_versions(&harness.storage).await?;
+
+    let response = uc_request(
+        &harness.router,
+        Method::POST,
+        "/delta/preview/commits",
+        json!({
+            "table_id": table_id,
+            "table_uri": "gs://bucket/orders",
+            "latest_backfilled_version": 0
+        }),
+        None,
+        Some("req-backfill-no-modify"),
+    )
+    .await?;
+
+    assert_error(
+        &response,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+        "req-backfill-no-modify",
+    );
+    assert_eq!(stored_object_versions(&harness.storage).await?, before);
     Ok(())
 }
 
@@ -328,6 +464,11 @@ async fn uc_delta_preview_rejects_non_delta_and_unmanaged_tables_without_side_ef
     )
     .await?;
 
+    let router = delta_preview::router_with_table_privileges(
+        &harness.storage,
+        &[&non_delta.id, &external_delta.id],
+        &[Privilege::Modify],
+    );
     for (table, request_id) in [
         (&non_delta, "req-non-delta"),
         (&external_delta, "req-external-delta"),
@@ -335,7 +476,7 @@ async fn uc_delta_preview_rejects_non_delta_and_unmanaged_tables_without_side_ef
         let table_id =
             Uuid::parse_str(&table.id).map_err(|err| format!("parse table id: {err}"))?;
         let response = uc_request(
-            &harness.router,
+            &router,
             Method::POST,
             "/delta/preview/commits",
             json!({
@@ -369,8 +510,13 @@ async fn uc_delta_preview_rejects_table_uri_mismatch_against_catalog_location() 
     .await?;
     let table_id = Uuid::parse_str(&table.id).map_err(|err| format!("parse table id: {err}"))?;
 
+    let router = delta_preview::router_with_table_privileges(
+        &harness.storage,
+        &[&table.id],
+        &[Privilege::Modify],
+    );
     let response = uc_request(
-        &harness.router,
+        &router,
         Method::POST,
         "/delta/preview/commits",
         json!({

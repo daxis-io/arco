@@ -10,6 +10,7 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 
+use arco_catalog::authz::privileges::Privilege;
 use arco_core::ScopedStorage;
 use arco_core::error::Error as CoreError;
 use arco_core::storage::{WritePrecondition, WriteResult};
@@ -134,6 +135,7 @@ async fn require_catalog_managed_delta_table(
     storage: &ScopedStorage,
     table_id: Uuid,
     table_uri: &str,
+    privilege: Privilege,
 ) -> UnityCatalogResult<()> {
     if state
         .config
@@ -161,6 +163,16 @@ async fn require_catalog_managed_delta_table(
         .ok_or_else(|| UnityCatalogError::NotFound {
             message: format!("table not found: {table_id_text}"),
         })?;
+
+    common::require_authz(
+        state,
+        ctx,
+        &table_id_text,
+        "TABLE",
+        privilege,
+        "delta_preview_denied",
+    )
+    .await?;
 
     let is_delta = table
         .format
@@ -665,7 +677,7 @@ async fn list_commits(
     Ok(commits)
 }
 
-/// Lists unbackfilled Delta commits.
+/// Lists unbackfilled Delta commits for callers with table `SELECT`.
 ///
 /// # Errors
 ///
@@ -705,7 +717,15 @@ pub(crate) async fn get_delta_preview_commits(
     })?;
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
+    require_catalog_managed_delta_table(
+        &state,
+        &ctx,
+        &storage,
+        table_id,
+        &table_uri,
+        Privilege::Select,
+    )
+    .await?;
     let coordinator_state = load_coordinator_state(&storage, table_id).await?;
     let backfill_state = load_backfill_state(&storage, table_id).await?;
     let log_objects = load_delta_log_objects(&storage, table_id).await?;
@@ -893,7 +913,7 @@ async fn handle_backfill_registration(
     Ok(())
 }
 
-/// Commits changes to a Delta table.
+/// Commits or backfills changes for callers with table `MODIFY`.
 ///
 /// # Errors
 ///
@@ -949,7 +969,15 @@ pub(crate) async fn post_delta_preview_commits(
     }
 
     let storage = ctx.scoped_storage(state.storage.clone())?;
-    require_catalog_managed_delta_table(&state, &ctx, &storage, table_id, &table_uri).await?;
+    require_catalog_managed_delta_table(
+        &state,
+        &ctx,
+        &storage,
+        table_id,
+        &table_uri,
+        Privilege::Modify,
+    )
+    .await?;
 
     if let Some(commit_info) = commit_info {
         handle_commit_registration(

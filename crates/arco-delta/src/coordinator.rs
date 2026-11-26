@@ -22,11 +22,17 @@ use crate::types::{
 /// Last version supported by bounded reads that replay from version zero.
 pub const MAX_PINNED_DELTA_VERSION: i64 = 15;
 const MAX_PINNED_COORDINATOR_BYTES: u64 = 16 * 1024;
+// shortcut: inspect up to 64 legacy log entries, use an explicit migration for longer histories.
+const MAX_UNBOUND_ROOT_LOGS: i64 = 64;
+const ROOT_MISMATCH: &str = "delta_coordinator_root_mismatch";
+const ROOT_MIGRATION_REQUIRED: &str = "delta_coordinator_root_migration_required";
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct StoredCoordinatorState {
     #[serde(flatten)]
     core: DeltaCoordinatorState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    table_root: Option<String>,
     // The reservation CAS binds the staged bytes to the incarnation's canonical
     // root. Only entries covered by latest_version have finalized.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -117,6 +123,9 @@ impl DeltaCommitCoordinator {
         }
         let bytes = self.storage.get_range(&path, 0..meta.size).await?;
         let state = decode_state(&bytes)?;
+        if state.table_root.is_some() {
+            self.require_bound_root(&state)?;
+        }
         if version > state.core.latest_version {
             return Err(DeltaError::not_found("delta_read_version_not_committed"));
         }
@@ -138,7 +147,10 @@ impl DeltaCommitCoordinator {
     /// # Errors
     /// Returns an error when coordinator state cannot be loaded.
     pub async fn finalized_version(&self) -> Result<i64> {
-        Ok(self.load_state().await?.0.core.latest_version)
+        Ok(self
+            .state_for_root()
+            .await?
+            .map_or(-1, |state| state.latest_version))
     }
 
     /// Appends an owner-prepared Delta payload whose identity is stable across retries.
@@ -248,6 +260,47 @@ impl DeltaCommitCoordinator {
         let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? else {
             return Ok(None);
         };
+        Self::require_record_root(&self.paths, &record)?;
+        self.ensure_root_authority().await?;
+        self.verify_replay_request(req, &record).await?;
+        self.finalize_replayed_commit(&req.idempotency_key, record.version)
+            .await?;
+        Ok(Some(response_from_idempotency_record(record)))
+    }
+
+    /// Replays an already-finalized receipt when the table has been dropped.
+    /// The persisted root supplies the receipt's identity without recovery or writes.
+    /// # Errors
+    /// Returns an error for an invalid request or an unverifiable receipt or root.
+    pub async fn replay_finalized_commit(
+        &self,
+        req: &CommitDeltaRequest,
+    ) -> Result<Option<CommitDeltaResponse>> {
+        validate_uuidv7(&req.idempotency_key)?;
+        self.validate_staged_path(&req.staged_path)?;
+        let Some(record) = self.read_idempotency_record(&req.idempotency_key).await? else {
+            return Ok(None);
+        };
+        let (state, _) = self.load_state().await?;
+        if state.core.latest_version < record.version {
+            return Ok(None);
+        }
+        let paths = if let Some(root) = state.table_root.as_deref() {
+            DeltaPaths::new(self.paths.table_id(), root)?
+        } else {
+            self.validate_state_root(&state).await?;
+            self.paths.clone()
+        };
+        Self::require_record_root(&paths, &record)?;
+        self.verify_replay_request(req, &record).await?;
+        Ok(Some(response_from_idempotency_record(record)))
+    }
+
+    async fn verify_replay_request(
+        &self,
+        req: &CommitDeltaRequest,
+        record: &DeltaCommitIdempotencyRecord,
+    ) -> Result<()> {
         let legacy_hash = legacy_request_hash(req)?;
         if record.request_hash != legacy_hash {
             let payload = self
@@ -266,9 +319,17 @@ impl DeltaCommitCoordinator {
                 ));
             }
         }
-        self.finalize_replayed_commit(&req.idempotency_key, record.version)
-            .await?;
-        Ok(Some(response_from_idempotency_record(record)))
+        Ok(())
+    }
+
+    fn require_record_root(
+        paths: &DeltaPaths,
+        record: &DeltaCommitIdempotencyRecord,
+    ) -> Result<()> {
+        if record.delta_log_path != paths.delta_log_json(record.version)? {
+            return Err(DeltaError::conflict(ROOT_MISMATCH));
+        }
+        Ok(())
     }
 
     async fn replay_committed_with_hashes(
@@ -280,6 +341,7 @@ impl DeltaCommitCoordinator {
             return Ok(None);
         };
 
+        Self::require_record_root(&self.paths, &record)?;
         if request_hashes.contains(&record.request_hash) {
             return Ok(Some(response_from_idempotency_record(record)));
         }
@@ -292,6 +354,7 @@ impl DeltaCommitCoordinator {
     async fn read_validated_staged_payload(&self, req: &CommitDeltaRequest) -> Result<Bytes> {
         validate_uuidv7(&req.idempotency_key)?;
         self.validate_staged_path(&req.staged_path)?;
+        self.ensure_root_authority().await?;
         let payload = self
             .read_staged_payload(&req.staged_path, &req.staged_version)
             .await?;
@@ -307,6 +370,7 @@ impl DeltaCommitCoordinator {
     /// Returns an error if the staged payload cannot be written due to a storage
     /// failure or a precondition conflict.
     pub async fn stage_commit_payload(&self, payload: Bytes) -> Result<StagedCommit> {
+        self.ensure_root_authority().await?;
         let ulid = Ulid::new().to_string();
         let staged_path = self.paths.staging_payload(&ulid);
 
@@ -483,11 +547,87 @@ impl DeltaCommitCoordinator {
             .await?)
     }
 
+    /// Reads coordinator state once the catalog-selected root is verified.
+    /// # Errors
+    /// Returns an error if the state belongs to a different or ambiguous root.
+    pub async fn state_for_root(&self) -> Result<Option<DeltaCoordinatorState>> {
+        let (state, version) = self.load_state().await?;
+        self.validate_state_root(&state).await?;
+        // Staging binds the root before there is commit state for preview readers.
+        if state.table_root.is_some() && state.core == DeltaCoordinatorState::default() {
+            return Ok(None);
+        }
+        Ok(version.map(|_| state.core))
+    }
+
+    /// Binds the catalog-selected root before staging, recovering or mutating commits.
+    /// # Errors
+    /// Returns an error if the root cannot be verified and persisted.
+    pub async fn ensure_root_authority(&self) -> Result<()> {
+        for _ in 0..self.config.max_cas_retries {
+            let (mut state, version) = self.load_state().await?;
+            self.validate_state_root(&state).await?;
+            if state.table_root.is_some() {
+                return Ok(());
+            }
+            state.table_root = Some(self.paths.table_root().to_string());
+            if matches!(
+                self.store_state(&state, version.as_deref()).await?,
+                WriteResult::Success { .. }
+            ) {
+                return Ok(());
+            }
+        }
+        Err(DeltaError::conflict(
+            "failed to bind Delta coordinator root after retries",
+        ))
+    }
+
+    fn require_bound_root(&self, state: &StoredCoordinatorState) -> Result<()> {
+        match state.table_root.as_deref() {
+            Some(root) if root == self.paths.table_root() => Ok(()),
+            Some(_) => Err(DeltaError::conflict(ROOT_MISMATCH)),
+            None => Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED)),
+        }
+    }
+
+    async fn validate_state_root(&self, state: &StoredCoordinatorState) -> Result<()> {
+        if state.table_root.is_some() {
+            return self.require_bound_root(state);
+        }
+        let latest = state.core.latest_version;
+        if state.core.inflight.is_some() || !(-1..MAX_UNBOUND_ROOT_LOGS).contains(&latest) {
+            return Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED));
+        }
+        if !self.is_canonical_root() {
+            if !state.canonical_log_sha256.is_empty() {
+                return Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED));
+            }
+            let legacy = DeltaPaths::legacy(self.paths.table_id());
+            let page = self
+                .storage
+                .list_page_meta(&legacy.delta_log_prefix(), None, 1)
+                .await?;
+            if !page.objects.is_empty() || page.next_start_after.is_some() {
+                return Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED));
+            }
+        }
+        // The latest log alone cannot show that earlier commits used this root.
+        for version in 0..=latest {
+            let path = self.paths.delta_log_json(version)?;
+            if self.storage.head_raw(&path).await?.is_none() {
+                return Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED));
+            }
+        }
+        Ok(())
+    }
+
     async fn recover_inflight(&self, now: DateTime<Utc>) -> Result<Option<RecoveredInflight>> {
         let now_ms = now.timestamp_millis();
 
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
+            self.require_bound_root(&state)?;
             let Some(current_version) = version.as_deref() else {
                 return Ok(None);
             };
@@ -587,6 +727,7 @@ impl DeltaCommitCoordinator {
 
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
+            self.require_bound_root(&state)?;
 
             if let Some(inflight) = &state.core.inflight {
                 if now_ms < inflight.expires_at_ms {
@@ -701,6 +842,7 @@ impl DeltaCommitCoordinator {
     async fn finalize_inflight(&self, commit_id: &str, committed_version: i64) -> Result<()> {
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
+            self.require_bound_root(&state)?;
             let Some(version) = version else {
                 return Err(DeltaError::conflict(
                     "coordinator state missing during finalize".to_string(),
@@ -742,6 +884,7 @@ impl DeltaCommitCoordinator {
     ) -> Result<()> {
         for _ in 0..self.config.max_cas_retries {
             let (state, version) = self.load_state().await?;
+            self.require_bound_root(&state)?;
             let Some(version) = version else {
                 return Ok(());
             };

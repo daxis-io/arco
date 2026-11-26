@@ -46,13 +46,20 @@ impl FailOnceBackend {
             .insert(path.to_string());
     }
 
-    fn fail_put_attempt_on_exact_path(&self, path: &str, attempt: usize) {
-        assert!(attempt > 0, "attempt must be 1-based");
+    fn fail_future_put_on_exact_path(&self, path: &str, offset: usize) {
+        assert!(offset > 0, "offset must be 1-based");
+        let completed_attempts = self
+            .put_attempts
+            .lock()
+            .expect("lock")
+            .get(path)
+            .copied()
+            .unwrap_or_default();
         let mut fail_put_attempts = self.fail_put_attempts.lock().expect("lock");
         fail_put_attempts
             .entry(path.to_string())
             .or_default()
-            .push_back(attempt);
+            .push_back(completed_attempts + offset);
     }
 
     fn should_fail_put(&self, path: &str) -> bool {
@@ -372,18 +379,41 @@ async fn crash_after_idempotency_marker_before_finalize_recovers_and_clears_infl
     };
 
     let state_path = coordinator_state_relative_path(table_id);
-    backend.fail_put_attempt_on_exact_path(&scoped_path(&state_path), 2);
+    backend.fail_future_put_on_exact_path(&scoped_path(&state_path), 2);
 
     let first = coordinator.commit(request.clone(), Utc::now()).await;
     assert!(
         first.is_err(),
         "first attempt should fail on injected finalize write"
     );
+    assert!(
+        storage
+            .head_raw(&idempotency_record_relative_path(
+                table_id,
+                &idempotency_key
+            ))
+            .await
+            .expect("look up idempotency marker")
+            .is_some(),
+        "the marker must already be durable when finalization fails"
+    );
 
     assert!(matches!(
         coordinator.pinned_log_digests(0).await,
         Err(DeltaError::NotFound { .. })
     ));
+    let pending = storage.get_raw(&state_path).await.expect("pending state");
+    assert!(
+        coordinator
+            .replay_finalized_commit(&request)
+            .await
+            .expect("read-only receipt check")
+            .is_none()
+    );
+    assert_eq!(
+        storage.get_raw(&state_path).await.expect("pending state"),
+        pending
+    );
     let replay = coordinator
         .replay_committed(&request)
         .await
@@ -575,11 +605,13 @@ async fn recover_retry_replays_after_transient_idempotency_write_failure() {
             expires_at_ms: now_ms - 10_000,
         }),
     };
+    let mut persisted = serde_json::to_value(seed_state).expect("serialize seed state");
+    persisted["table_root"] = serde_json::json!(format!("tables/{table_id}"));
     storage
         .put_raw(
             &format!("delta/coordinator/{table_id}.json"),
-            Bytes::from(serde_json::to_vec(&seed_state).expect("serialize seed state")),
-            WritePrecondition::DoesNotExist,
+            Bytes::from(persisted.to_string()),
+            WritePrecondition::None,
         )
         .await
         .expect("seed coordinator state");

@@ -351,6 +351,59 @@ async fn uc_delta_backfill_requires_modify_without_side_effects() -> Result<(), 
 }
 
 #[tokio::test]
+async fn preview_routes_reject_a_catalog_location_that_disagrees_with_the_bound_root()
+-> Result<(), String> {
+    let (harness, table_id) =
+        managed_orders_harness(&[Privilege::Select, Privilege::Modify]).await?;
+    harness
+        .storage
+        .put_raw(
+            &format!("delta/coordinator/{table_id}.json"),
+            Bytes::from_static(
+                br#"{"table_root":"warehouse/previous","latest_version":0,"inflight":null}"#,
+            ),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .map_err(|err| format!("seed bound coordinator: {err}"))?;
+    let before = stored_object_versions(&harness.storage).await?;
+    let request = json!({"table_id": table_id, "table_uri": "gs://bucket/orders"});
+    let mut write = request.clone();
+    write["commit_info"] = commit_info(1);
+    let mut backfill = request.clone();
+    backfill["latest_backfilled_version"] = json!(0);
+    let key = Uuid::now_v7().to_string();
+
+    for (method, body, idempotency_key) in [
+        (Method::GET, request, None),
+        (Method::POST, write, Some(key.as_str())),
+        (Method::POST, backfill, None),
+    ] {
+        let response = uc_request(
+            &harness.router,
+            method,
+            "/delta/preview/commits",
+            body,
+            idempotency_key,
+            Some("req-mismatched-root"),
+        )
+        .await?;
+        assert_error(
+            &response,
+            StatusCode::CONFLICT,
+            "CONFLICT",
+            "req-mismatched-root",
+        );
+        assert_eq!(
+            response.body["error"]["message"],
+            "delta_coordinator_root_mismatch"
+        );
+    }
+    assert_eq!(stored_object_versions(&harness.storage).await?, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn uc_delta_preview_rejects_unknown_table_before_existing_state() -> Result<(), String> {
     let harness = make_harness();
     let table_id = Uuid::now_v7();

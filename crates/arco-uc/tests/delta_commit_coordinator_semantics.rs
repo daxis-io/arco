@@ -391,10 +391,7 @@ async fn table_uri_mismatch_is_rejected_for_get_and_backfill() -> Result<(), Str
 async fn unbackfilled_commit_limit_returns_too_many_requests() -> Result<(), String> {
     let (harness, table_id) = make_harness("gs://bucket/path").await?;
     let coordinator_path = format!("delta/coordinator/{table_id}.json");
-    let state = arco_delta::DeltaCoordinatorState {
-        latest_version: 999,
-        inflight: None,
-    };
+    let state = json!({"table_root": "path", "latest_version": 999, "inflight": null});
     harness
         .storage
         .put_raw(
@@ -504,9 +501,10 @@ async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result
     };
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let state = arco_delta::DeltaCoordinatorState {
-        latest_version: -1,
-        inflight: Some(arco_delta::InflightCommit {
+    let state = json!({
+        "table_root": "path",
+        "latest_version": -1,
+        "inflight": arco_delta::InflightCommit {
             commit_id: inflight_key.clone(),
             read_version: Some(-1),
             version: 0,
@@ -514,8 +512,8 @@ async fn expired_inflight_is_recovered_and_unrelated_key_is_conflict() -> Result
             staged_version,
             started_at_ms: now_ms - 60_000,
             expires_at_ms: now_ms - 1_000,
-        }),
-    };
+        },
+    });
 
     harness
         .storage

@@ -205,11 +205,53 @@ struct StagedCommit {
 #[derive(Debug, Deserialize)]
 struct NativeCommit {
     version: i64,
+    delta_log_path: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct NativeTable {
     id: String,
+}
+
+async fn commit_through_native_api(
+    router: &axum::Router,
+    tenant: &str,
+    workspace: &str,
+    table_id: &str,
+    read_version: i64,
+) -> NativeCommit {
+    let path = format!("/api/v1/delta/tables/{table_id}/commits");
+    let staged = send_json(
+        router,
+        Method::POST,
+        &format!("{path}/stage"),
+        tenant,
+        workspace,
+        json!({"payload": "{\"commitInfo\":{\"timestamp\":1}}\n"}),
+        None,
+    )
+    .await;
+    assert_eq!(staged.status, StatusCode::OK);
+    let staged: StagedCommit = serde_json::from_value(staged.body).expect("stage response");
+    let committed = send_json(
+        router,
+        Method::POST,
+        &path,
+        tenant,
+        workspace,
+        json!({
+            "read_version": read_version,
+            "staged_path": staged.staged_path,
+            "staged_version": staged.staged_version
+        }),
+        Some(BTreeMap::from([(
+            "Idempotency-Key",
+            Uuid::now_v7().to_string(),
+        )])),
+    )
+    .await;
+    assert_eq!(committed.status, StatusCode::OK, "{}", committed.body);
+    serde_json::from_value(committed.body).expect("native commit response")
 }
 
 async fn run_engine_flow(engine: &str) {
@@ -231,7 +273,8 @@ async fn run_engine_flow(engine: &str) {
 
     let table_name = format!("{engine}_events");
     let full_table_name = format!("{catalog_name}.{schema_name}.{table_name}");
-    let storage_location = format!("gs://smoke/{tenant}/{workspace}/{engine}/events");
+    let table_root = format!("warehouse/{catalog_name}/{schema_name}/{table_name}");
+    let storage_location = format!("gs://smoke/tenant={tenant}/workspace={workspace}/{table_root}");
 
     let create_catalog = send_json(
         &router,
@@ -332,6 +375,32 @@ async fn run_engine_flow(engine: &str) {
     .await;
     assert_eq!(uc_commit.status, StatusCode::OK);
 
+    let native_append =
+        commit_through_native_api(&router, tenant, workspace, &uc_table_id, 0).await;
+    assert_eq!(native_append.version, 1);
+    assert_eq!(
+        native_append.delta_log_path,
+        format!("{table_root}/_delta_log/00000000000000000001.json")
+    );
+    for version in [0, 1] {
+        let key = format!("{table_root}/_delta_log/{version:020}.json");
+        assert!(
+            catalog_storage
+                .head_raw(&key)
+                .await
+                .expect("log metadata")
+                .is_some(),
+            "both APIs must publish to the registered root, missing {key}"
+        );
+    }
+    assert!(
+        catalog_storage
+            .list(&format!("tables/{uc_table_id}/_delta_log/"))
+            .await
+            .expect("list legacy log prefix")
+            .is_empty()
+    );
+
     let uc_get_commits = send_json(
         &router,
         Method::GET,
@@ -347,14 +416,11 @@ async fn run_engine_flow(engine: &str) {
     )
     .await;
     assert_eq!(uc_get_commits.status, StatusCode::OK);
-    assert_eq!(
-        uc_get_commits
-            .body
-            .get("commits")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(1)
-    );
+    let commits = uc_get_commits.body["commits"].as_array().expect("commits");
+    assert_eq!(uc_get_commits.body["latest_table_version"], 1);
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0]["version"], 0);
+    assert_eq!(commits[1]["version"], 1);
 
     let native_namespace = format!("{engine}_ns");
     let native_create_namespace = send_json(
@@ -389,44 +455,8 @@ async fn run_engine_flow(engine: &str) {
     let native_table: NativeTable =
         serde_json::from_value(native_create_table.body).expect("native table response");
 
-    let native_stage = send_json(
-        &router,
-        Method::POST,
-        &format!(
-            "{native_prefix}/delta/tables/{}/commits/stage",
-            native_table.id
-        ),
-        tenant,
-        workspace,
-        json!({
-            "payload": format!("{{\"commitInfo\":{{\"engine\":\"{engine}\",\"ts\":1}}}}\\n")
-        }),
-        None,
-    )
-    .await;
-    assert_eq!(native_stage.status, StatusCode::OK);
-
-    let staged: StagedCommit = serde_json::from_value(native_stage.body).expect("stage response");
-
-    let mut native_headers = BTreeMap::new();
-    native_headers.insert("Idempotency-Key", Uuid::now_v7().to_string());
-    let native_commit = send_json(
-        &router,
-        Method::POST,
-        &format!("{native_prefix}/delta/tables/{}/commits", native_table.id),
-        tenant,
-        workspace,
-        json!({
-            "read_version": -1,
-            "staged_path": staged.staged_path,
-            "staged_version": staged.staged_version
-        }),
-        Some(native_headers),
-    )
-    .await;
-    assert_eq!(native_commit.status, StatusCode::OK);
-    let committed: NativeCommit =
-        serde_json::from_value(native_commit.body).expect("native commit response");
+    let committed =
+        commit_through_native_api(&router, tenant, workspace, &native_table.id, -1).await;
     assert_eq!(committed.version, 0);
 }
 

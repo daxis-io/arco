@@ -353,7 +353,15 @@ pub(super) async fn load_stream_root(
             message: "event_stream_table_schema_mismatch".to_string(),
         });
     }
-    DeltaRoot::resolve(state, ctx, &table)
+    if arco_catalog::managed_delta::has_placement(&scoped_storage(state, ctx)?, binding.table_id)
+        .await
+        .map_err(|_| unavailable())?
+    {
+        return Err(UnityCatalogError::Conflict {
+            message: "event_stream_analytical_placement_unsupported".to_string(),
+        });
+    }
+    DeltaRoot::resolve(state, ctx, &table, false)
 }
 
 #[utoipa::path(

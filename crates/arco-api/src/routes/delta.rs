@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use arco_catalog::CatalogAuthority;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
+use arco_catalog::managed_delta::{self, ManagedDeltaAllocation};
+use arco_catalog::{CatalogAuthority, WriteOptions};
 use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
 use arco_uc::is_event_stream_table;
 
@@ -39,6 +40,87 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/delta/tables/:table_id/commits", post(commit_staged))
         .layer(DefaultBodyLimit::max(MAX_DELTA_STAGE_BYTES))
+        .route(
+            "/managed-delta/ensure",
+            post(ensure_managed_delta).layer(DefaultBodyLimit::max(4096)),
+        )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/managed-delta/ensure",
+    tag = "Delta",
+    request_body(content = Object, description = "UUIDv7 operation_id, authenticated owner, and provisioning_fingerprint"),
+    responses(
+        (status = 200, description = "Allocated managed Delta fixture or identical replay"),
+        (status = 400, description = "Invalid allocation intent"),
+        (status = 401, description = "Missing or invalid authentication"),
+        (status = 403, description = "Allocation privilege or managed root denied"),
+        (status = 409, description = "Intent or table incarnation conflict"),
+        (status = 503, description = "Approved analytical storage or governance unavailable"),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn ensure_managed_delta(
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
+    Json(intent): Json<ManagedDeltaAllocation>,
+) -> Result<impl IntoResponse, ApiError> {
+    catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
+    let root = state.managed_delta_storage.as_ref().ok_or_else(|| {
+        ApiError::from_status_and_message(503, "managed_delta_storage_unavailable")
+    })?;
+    if ctx.user_id.as_deref() != Some(&intent.owner) {
+        return Err(ApiError::forbidden(
+            "managed_delta_owner_must_match_principal",
+        ));
+    }
+    let schema_id = format!("{}.{}", managed_delta::CATALOG, managed_delta::SCHEMA);
+    let authorize = || {
+        require_catalog_privilege(
+            &state,
+            &ctx,
+            &schema_id,
+            "SCHEMA",
+            Privilege::CreateTable,
+            "managed_delta_create_table_required",
+        )
+    };
+    authorize().await?;
+    let CatalogAuthority::Legacy { writer, .. } = catalog_authority::resolve(&state, &ctx).await?
+    else {
+        return Err(ApiError::catalog_table_commit_disabled());
+    };
+    let placement = writer
+        .allocate_managed_delta(
+            root,
+            &intent,
+            WriteOptions::default()
+                .with_actor(&intent.owner)
+                .with_request_id(&ctx.request_id),
+        )
+        .await?;
+    authorize().await?;
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "id": placement.table_id,
+            "catalog": managed_delta::CATALOG,
+            "schema": managed_delta::SCHEMA,
+            "table": managed_delta::TABLE,
+            "location": placement.location,
+            "table_type": "MANAGED",
+            "format": "delta",
+            "schema_digest": placement.schema_digest,
+            "properties": {
+                "table_type": "MANAGED",
+                "format": "delta",
+                "owner": placement.allocation.owner,
+                "schema_digest": placement.schema_digest,
+                "provisioning_fingerprint": placement.allocation.provisioning_fingerprint
+            }
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -89,13 +171,12 @@ pub(crate) async fn stage_commit_payload(
     let storage = ctx.scoped_storage(backend)?;
     reject_event_stream_target(&state, &ctx, &storage, table_id).await?;
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
-    let paths = resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id)
+    let table = resolve_delta_table(&authority, table_id)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
-    reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
     require_delta_modify(&state, &ctx, table_id).await?;
 
-    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+    let coordinator = bound_coordinator(&state, &ctx, storage, &table, table_id).await?;
     let staged = coordinator
         .stage_commit_payload(Bytes::from(req.payload))
         .await
@@ -175,12 +256,9 @@ pub(crate) async fn commit_staged(
     };
 
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
-    let paths =
-        resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
-    let committed = if let Some(paths) = paths {
-        reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
+    let committed = if let Some(table) = resolve_delta_table(&authority, table_id).await? {
         require_delta_modify(&state, &ctx, table_id).await?;
-        let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+        let coordinator = bound_coordinator(&state, &ctx, storage, &table, table_id).await?;
         if let Some(replayed) = coordinator.replay_committed(&commit_request).await? {
             replayed
         } else {
@@ -191,6 +269,9 @@ pub(crate) async fn commit_staged(
         require_delta_modify(&state, &ctx, table_id)
             .await
             .map_err(|_| not_found())?;
+        if managed_delta::has_placement(&storage, table_id).await? {
+            return Err(not_found());
+        }
         arco_delta::DeltaCommitCoordinator::new(storage, table_id)
             .replay_finalized_commit(&commit_request)
             .await?
@@ -211,7 +292,26 @@ async fn require_delta_modify(
     ctx: &RequestContext,
     table_id: Uuid,
 ) -> Result<(), ApiError> {
-    let denied = || ApiError::forbidden("delta_modify_required");
+    require_catalog_privilege(
+        state,
+        ctx,
+        &table_id.to_string(),
+        "TABLE",
+        Privilege::Modify,
+        "delta_modify_required",
+    )
+    .await
+}
+
+async fn require_catalog_privilege(
+    state: &AppState,
+    ctx: &RequestContext,
+    object_id: &str,
+    object_type: &str,
+    privilege: Privilege,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let denied = || ApiError::forbidden(reason);
     let principal = ctx.user_id.as_deref().ok_or_else(denied)?;
     let permissions = state
         .catalog_permissions
@@ -225,7 +325,7 @@ async fn require_delta_modify(
             );
             denied()
         })?;
-    let request = AuthzRequest::new(principal, table_id.to_string(), "TABLE", Privilege::Modify)
+    let request = AuthzRequest::new(principal, object_id, object_type, privilege)
         .with_request_id(&ctx.request_id);
     if AuthzDecision::evaluate(&request, &permissions).outcome == DecisionOutcome::Deny {
         return Err(denied());
@@ -272,12 +372,10 @@ async fn reject_stream_table_alias(
     Ok(())
 }
 
-async fn resolve_delta_table_paths(
+async fn resolve_delta_table(
     authority: &CatalogAuthority,
-    tenant: &str,
-    workspace: &str,
     table_id: Uuid,
-) -> Result<Option<DeltaPaths>, ApiError> {
+) -> Result<Option<arco_catalog::writer::Table>, ApiError> {
     let Some(table) = authority
         .get_table_by_id(&table_id.to_string())
         .await
@@ -298,9 +396,39 @@ async fn resolve_delta_table_paths(
         )));
     }
 
-    DeltaPaths::from_table_location(table_id, table.location.as_deref(), tenant, workspace)
-        .map(Some)
-        .map_err(ApiError::from)
+    Ok(Some(table))
+}
+
+async fn bound_coordinator(
+    state: &AppState,
+    ctx: &RequestContext,
+    storage: ScopedStorage,
+    table: &arco_catalog::writer::Table,
+    table_id: Uuid,
+) -> Result<arco_delta::DeltaCommitCoordinator, ApiError> {
+    let analytical = managed_delta::resolve_analytical_storage(
+        state.managed_delta_storage.as_ref(),
+        &storage,
+        table,
+    )
+    .await?;
+    let paths = if analytical.is_some() {
+        DeltaPaths::legacy(table_id)
+    } else {
+        DeltaPaths::from_table_location(
+            table_id,
+            table.location.as_deref(),
+            &ctx.tenant,
+            &ctx.workspace,
+        )?
+    };
+    reject_stream_table_alias(state, ctx, &storage, &paths).await?;
+    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+    Ok(if let Some(analytical) = analytical {
+        coordinator.with_log_storage(analytical)
+    } else {
+        coordinator
+    })
 }
 
 impl From<arco_delta::DeltaError> for ApiError {

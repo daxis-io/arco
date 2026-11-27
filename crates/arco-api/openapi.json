@@ -1112,6 +1112,15 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "pinId",
+            "in": "query",
+            "description": "Arco-issued pin. Use in place of publishedVersion",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1147,6 +1156,16 @@
           },
           "403": {
             "description": "Missing stream binding or table SELECT grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Pin was not found in this Workspace",
             "content": {
               "application/json": {
                 "schema": {
@@ -1291,6 +1310,112 @@
           },
           "503": {
             "description": "Event commit is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/event-streams/{streamId}/pins": {
+      "post": {
+        "tags": [
+          "event-streams"
+        ],
+        "operationId": "create",
+        "parameters": [
+          {
+            "name": "streamId",
+            "in": "path",
+            "description": "Approved Workspace stream ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePin"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Durable pin for one finalized stream version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamPin"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Requested version is invalid or unpublished",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "JWT authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing stream binding or table SELECT grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Stream or pin identity conflicts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Tenant rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Event stream is unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -2504,6 +2629,204 @@
         "security": [
           {
             "taskAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/usage/hourly": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "operationId": "read",
+        "parameters": [
+          {
+            "name": "hour_start_ms",
+            "in": "query",
+            "description": "UTC hour start in milliseconds",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "published_version",
+            "in": "query",
+            "description": "Exact Usage table version",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Continuation offset in the pinned hour and version",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size from 1 to 50, default 25",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One hour from the selected Delta version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsagePage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid hour, page, or version"
+          },
+          "401": {
+            "description": "JWT authentication required"
+          },
+          "403": {
+            "description": "Missing Workspace binding or table SELECT grant"
+          },
+          "409": {
+            "description": "Committed output identity mismatch"
+          },
+          "503": {
+            "description": "Usage owner unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "usage"
+        ],
+        "operationId": "publish",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UsagePublishRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Finalized Delta replacement receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid publication request"
+          },
+          "401": {
+            "description": "JWT authentication required"
+          },
+          "403": {
+            "description": "Missing Workspace binding or table MODIFY grant"
+          },
+          "404": {
+            "description": "Flow run, task, or stream pin unavailable in the Workspace"
+          },
+          "409": {
+            "description": "Attempt, artifact, binding, source version, or destination head conflicts"
+          },
+          "413": {
+            "description": "Materialization exceeds the supported size"
+          },
+          "503": {
+            "description": "Usage owner unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/usage/hourly/receipt": {
+      "get": {
+        "tags": [
+          "usage"
+        ],
+        "operationId": "read_receipt",
+        "parameters": [
+          {
+            "name": "hour_start_ms",
+            "in": "query",
+            "description": "UTC hour start in milliseconds",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "source_delta_version",
+            "in": "query",
+            "description": "Activity table version of the original publication",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Original finalized receipt for the hour and source version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid hour or source version"
+          },
+          "401": {
+            "description": "JWT authentication required"
+          },
+          "403": {
+            "description": "Missing Workspace binding or table SELECT grant"
+          },
+          "404": {
+            "description": "The requested replacement has not finalized"
+          },
+          "503": {
+            "description": "Usage owner unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
           }
         ]
       }
@@ -5426,6 +5749,19 @@
           }
         }
       },
+      "CreatePin": {
+        "type": "object",
+        "properties": {
+          "publishedVersion": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateSchemaRequest": {
         "type": "object",
         "description": "Request to create a schema in a catalog.",
@@ -8105,6 +8441,22 @@
           }
         }
       },
+      "StreamPin": {
+        "type": "object",
+        "required": [
+          "pinId",
+          "publishedVersion"
+        ],
+        "properties": {
+          "pinId": {
+            "type": "string"
+          },
+          "publishedVersion": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "StreamReceipt": {
         "type": "object",
         "required": [
@@ -9047,6 +9399,150 @@
           }
         }
       },
+      "UsagePage": {
+        "type": "object",
+        "required": [
+          "workspace_id",
+          "published_version",
+          "rows"
+        ],
+        "properties": {
+          "next_offset": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "published_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "receipt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/UsageReceipt"
+              }
+            ]
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageRow"
+            }
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        }
+      },
+      "UsagePublishRequest": {
+        "type": "object",
+        "required": [
+          "run_id",
+          "attempt_id"
+        ],
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UsageReceipt": {
+        "type": "object",
+        "required": [
+          "table_id",
+          "table_version",
+          "source_table_id",
+          "source_delta_version",
+          "hour_start_ms",
+          "run_id",
+          "attempt_id"
+        ],
+        "properties": {
+          "attempt_id": {
+            "type": "string"
+          },
+          "hour_start_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "source_delta_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "source_table_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "table_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "table_version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UsageRow": {
+        "type": "object",
+        "required": [
+          "surface_id",
+          "admitted",
+          "admission_denied",
+          "executed",
+          "execution_failed",
+          "delivery_authorized",
+          "delivery_denied"
+        ],
+        "properties": {
+          "admission_denied": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "admitted": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "delivery_authorized": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "delivery_denied": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "executed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "execution_failed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "release_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "surface_id": {
+            "type": "string"
+          }
+        }
+      },
       "WorkerOutcome": {
         "type": "string",
         "description": "Worker-reported task outcome.",
@@ -9118,6 +9614,10 @@
     {
       "name": "event-streams",
       "description": "Workspace-bound typed event streams"
+    },
+    {
+      "name": "usage",
+      "description": "Cataloged hourly Logfood usage"
     }
   ]
 }

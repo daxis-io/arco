@@ -104,6 +104,78 @@ async fn replay_requires_the_bound_commit_root() {
 }
 
 #[tokio::test]
+async fn owner_replacement_rejects_an_alternate_root_before_staging() {
+    let (storage, registered, legacy) = fixture();
+    let owner = DeltaCommitCoordinator::with_paths(storage.clone(), registered.clone());
+    let alternate = DeltaCommitCoordinator::with_paths(storage.clone(), legacy);
+    let key = Uuid::now_v7().to_string();
+    owner
+        .commit_owner_replacement(&key, -1, payload(), Utc::now())
+        .await
+        .expect("publish at the registered root");
+
+    assert!(matches!(
+        alternate.commit_owner_replacement(&Uuid::now_v7().to_string(), 0, payload(), Utc::now()).await,
+        Err(DeltaError::Conflict { message }) if message == "delta_coordinator_root_mismatch"
+    ));
+    let staged = storage
+        .list(&format!("delta/staging/{}/", registered.table_id()))
+        .await
+        .expect("list staged payloads");
+    assert_eq!(
+        staged.len(),
+        1,
+        "the alternate root must not stage a payload"
+    );
+    assert!(matches!(
+        alternate.read_owner_replacement(&key).await,
+        Err(DeltaError::Conflict { message }) if message == "delta_coordinator_root_mismatch"
+    ));
+}
+
+#[tokio::test]
+async fn existing_owner_replacement_can_recover_at_its_legacy_root() {
+    let (storage, registered, _) = fixture();
+    let owner = DeltaCommitCoordinator::with_paths(storage.clone(), registered.clone());
+    let key = Uuid::now_v7().to_string();
+    owner
+        .commit_owner_replacement(&key, -1, payload(), Utc::now())
+        .await
+        .expect("publish at the registered root");
+    let path = registered.coordinator_state();
+    let mut legacy: Value = serde_json::from_slice(&storage.get_raw(&path).await.expect("state"))
+        .expect("decode state");
+    legacy
+        .as_object_mut()
+        .expect("state object")
+        .remove("table_root");
+    let legacy = Bytes::from(legacy.to_string());
+    storage
+        .put_raw(&path, legacy.clone(), WritePrecondition::None)
+        .await
+        .expect("retained unbound history");
+
+    assert_eq!(
+        owner
+            .read_owner_replacement(&key)
+            .await
+            .expect("read legacy receipt"),
+        Some((0, payload()))
+    );
+    assert_eq!(storage.get_raw(&path).await.expect("unbound state"), legacy);
+    assert_eq!(
+        owner
+            .recover_owner_replacement(&key)
+            .await
+            .expect("recover legacy receipt"),
+        Some((0, payload()))
+    );
+    let bound: Value = serde_json::from_slice(&storage.get_raw(&path).await.expect("state"))
+        .expect("decode state");
+    assert_eq!(bound["table_root"], ROOT);
+}
+
+#[tokio::test]
 async fn complete_legacy_history_at_the_registered_root_can_be_bound() {
     let (storage, registered, _) = fixture();
     seed_legacy_history(

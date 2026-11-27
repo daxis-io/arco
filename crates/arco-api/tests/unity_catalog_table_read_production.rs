@@ -47,6 +47,9 @@ use uuid::Uuid;
 #[path = "support/event_streams.rs"]
 mod event_streams;
 
+#[path = "support/usage.rs"]
+mod usage;
+
 const TENANT: &str = "tenant1";
 const WORKSPACE: &str = "workspace1";
 const READER: &str = "user_reader";

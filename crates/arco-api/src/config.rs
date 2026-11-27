@@ -251,6 +251,9 @@ pub struct Config {
     /// Operator-approved event streams in authenticated Workspace scopes.
     #[serde(default)]
     pub event_streams: arco_uc::EventStreamBindings,
+    /// Approved hourly usage destinations and transforms.
+    #[serde(default)]
+    pub usage_bindings: arco_uc::UsageBindings,
 
     /// Optional exact synthetic metastore root bound to `control/v1`.
     ///
@@ -423,6 +426,7 @@ impl Default for Config {
             iceberg: IcebergApiConfig::default(),
             unity_catalog: UnityCatalogApiConfig::default(),
             event_streams: arco_uc::EventStreamBindings::default(),
+            usage_bindings: arco_uc::UsageBindings::default(),
             catalog_control_v1_root: None,
             catalog_control_v1_cursor_key: None,
             audit: AuditConfig::default(),
@@ -644,6 +648,7 @@ impl Config {
     /// - `ARCO_UNITY_CATALOG_TABLE_READS_ENABLED`
     /// - `ARCO_ACTIVITY_TABLE_BINDINGS`
     /// - `ARCO_EVENT_STREAM_BINDINGS`
+    /// - `ARCO_USAGE_TABLE_BINDINGS`
     /// - `ARCO_UNITY_CATALOG_MOUNT_PREFIX`
     /// - `ARCO_CATALOG_CONTROL_V1_TENANT_ID`
     /// - `ARCO_CATALOG_CONTROL_V1_WORKSPACE_ID`
@@ -831,6 +836,11 @@ impl Config {
                 Error::InvalidInput(format!("invalid ARCO_EVENT_STREAM_BINDINGS: {error}"))
             })?;
         }
+        if let Some(bindings) = env_string("ARCO_USAGE_TABLE_BINDINGS") {
+            config.usage_bindings = serde_json::from_str(&bindings).map_err(|error| {
+                Error::InvalidInput(format!("invalid ARCO_USAGE_TABLE_BINDINGS: {error}"))
+            })?;
+        }
         if let Some(prefix) = env_string("ARCO_UNITY_CATALOG_MOUNT_PREFIX") {
             config.unity_catalog.mount_prefix = prefix;
         }
@@ -895,9 +905,14 @@ impl Config {
     }
 
     pub(crate) fn event_stream_bindings(&self) -> Result<arco_uc::EventStreamBindings> {
-        self.event_streams
+        let events = self
+            .event_streams
             .with_activity_tables(&self.unity_catalog.activity_tables)
-            .map_err(Error::InvalidInput)
+            .map_err(Error::InvalidInput)?;
+        self.usage_bindings
+            .validate_sources(&events)
+            .map_err(|message| Error::InvalidInput(message.to_string()))?;
+        Ok(events)
     }
 
     pub(crate) fn event_tables_in_scope<'a>(

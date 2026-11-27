@@ -22,6 +22,7 @@ use crate::types::{
 /// Last version supported by bounded reads that replay from version zero.
 pub const MAX_PINNED_DELTA_VERSION: i64 = 15;
 const MAX_PINNED_COORDINATOR_BYTES: u64 = 16 * 1024;
+const MAX_OWNER_REPLACEMENT_LOG_BYTES: u64 = 64 * 1024;
 // shortcut: inspect up to 64 legacy log entries, use an explicit migration for longer histories.
 const MAX_UNBOUND_ROOT_LOGS: i64 = 64;
 const ROOT_MISMATCH: &str = "delta_coordinator_root_mismatch";
@@ -185,6 +186,123 @@ impl DeltaCommitCoordinator {
         .await
     }
 
+    /// Commits an owner-prepared replacement against the exact head used to select its removals.
+    /// The logical key stays stable while staging is specific to the observed head.
+    ///
+    /// # Errors
+    /// Rejects an invalid key, stale head, changed proposal, or failed storage operation.
+    pub async fn commit_owner_replacement(
+        &self,
+        key: &str,
+        read_version: i64,
+        payload: Bytes,
+        now: DateTime<Utc>,
+    ) -> Result<CommitDeltaResponse> {
+        validate_uuidv7(key)?;
+        if read_version < -1 || payload.len() as u64 > MAX_OWNER_REPLACEMENT_LOG_BYTES {
+            return Err(DeltaError::bad_request(
+                "invalid owner replacement proposal",
+            ));
+        }
+        let staged = self
+            .stage_payload_at(self.replacement_staging_path(key, read_version), payload)
+            .await?;
+        self.commit(
+            CommitDeltaRequest {
+                read_version,
+                staged_path: staged.staged_path,
+                staged_version: staged.staged_version,
+                idempotency_key: key.to_string(),
+            },
+            now,
+        )
+        .await
+    }
+
+    /// Recovers the original replacement log and its finalized version from its retained receipt.
+    ///
+    /// # Errors
+    /// Rejects a changed or missing log, unrelated receipt, or failed finalization.
+    pub async fn recover_owner_replacement(&self, key: &str) -> Result<Option<(i64, Bytes)>> {
+        self.owner_replacement(key, true).await
+    }
+
+    /// Reads an original replacement receipt after its Delta version is finalized.
+    ///
+    /// # Errors
+    /// Rejects an inconsistent receipt or log.
+    pub async fn read_owner_replacement(&self, key: &str) -> Result<Option<(i64, Bytes)>> {
+        self.owner_replacement(key, false).await
+    }
+
+    async fn owner_replacement(&self, key: &str, recover: bool) -> Result<Option<(i64, Bytes)>> {
+        validate_uuidv7(key)?;
+        let Some(record) = self.read_idempotency_record(key).await? else {
+            return Ok(None);
+        };
+        Self::require_record_root(&self.paths, &record)?;
+        let path = &record.delta_log_path;
+        let meta = self
+            .storage
+            .head_raw(path)
+            .await?
+            .filter(|meta| meta.size > 0 && meta.size <= MAX_OWNER_REPLACEMENT_LOG_BYTES)
+            .ok_or_else(|| DeltaError::conflict("owner replacement log is unavailable"))?;
+        let payload = self.storage.get_range(path, 0..meta.size).await?;
+        self.verify_replacement_record(key, record.version, &payload, &record)?;
+        if recover {
+            self.ensure_root_authority().await?;
+            self.finalize_replayed_commit(key, record.version).await?;
+        }
+        if self.finalized_version().await? < record.version {
+            return Ok(None);
+        }
+        Ok(Some((record.version, payload)))
+    }
+
+    /// Verifies the exact replacement log for a selected finalized version.
+    ///
+    /// # Errors
+    /// Rejects an absent receipt or changed log identity.
+    pub async fn verify_owner_replacement(
+        &self,
+        key: &str,
+        version: i64,
+        payload: &[u8],
+    ) -> Result<()> {
+        validate_uuidv7(key)?;
+        let record = self
+            .read_idempotency_record(key)
+            .await?
+            .ok_or_else(|| DeltaError::conflict("owner replacement receipt is absent"))?;
+        Self::require_record_root(&self.paths, &record)?;
+        self.verify_replacement_record(key, version, payload, &record)
+    }
+
+    fn verify_replacement_record(
+        &self,
+        key: &str,
+        version: i64,
+        payload: &[u8],
+        record: &DeltaCommitIdempotencyRecord,
+    ) -> Result<()> {
+        let read_version = version.saturating_sub(1);
+        let path = self.replacement_staging_path(key, read_version);
+        if record.version != version
+            || record.request_hash != request_hash(key, read_version, &path, payload)?
+        {
+            return Err(DeltaError::conflict(
+                "owner replacement log identity changed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn replacement_staging_path(&self, key: &str, read_version: i64) -> String {
+        self.paths
+            .staging_payload(&format!("{key}-at-{read_version}"))
+    }
+
     /// Verifies an owner append's log against its stored receipt for the exact version.
     ///
     /// # Errors
@@ -211,7 +329,12 @@ impl DeltaCommitCoordinator {
 
     async fn stage_idempotent_payload(&self, key: &str, payload: Bytes) -> Result<StagedCommit> {
         validate_uuidv7(key)?;
-        let staged_path = self.paths.staging_payload(key);
+        self.stage_payload_at(self.paths.staging_payload(key), payload)
+            .await
+    }
+
+    async fn stage_payload_at(&self, staged_path: String, payload: Bytes) -> Result<StagedCommit> {
+        self.ensure_root_authority().await?;
         let staged_version = match self
             .storage
             .put_raw(

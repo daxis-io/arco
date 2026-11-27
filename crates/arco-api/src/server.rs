@@ -971,7 +971,8 @@ impl Server {
                 .expect("server configuration must validate before mounting event streams"),
         );
         let events_enabled = !state.config.debug && !event_streams.is_empty();
-        if state.config.unity_catalog.enabled || events_enabled {
+        let usage_enabled = !state.config.debug && !state.config.usage_bindings.is_empty();
+        if state.config.unity_catalog.enabled || events_enabled || usage_enabled {
             // Without an authoritative permission source the UC facade has no
             // compiled permission view to evaluate, so `require_authz` denies
             // every principal (including a METASTORE Manage administrator) and
@@ -984,6 +985,7 @@ impl Server {
                     state.config.storage.bucket.as_deref(),
                 ),
                 activity_events_enabled: events_enabled && event_streams.has_logfood(),
+                usage_bindings: Arc::new(state.config.usage_bindings.clone()),
                 event_streams,
                 ..arco_uc::UnityCatalogConfig::default()
             };
@@ -993,11 +995,19 @@ impl Server {
 
             if events_enabled {
                 let event_service = ServiceBuilder::new()
-                    .layer(auth_layer)
-                    .layer(rate_limit_layer)
+                    .layer(auth_layer.clone())
+                    .layer(rate_limit_layer.clone())
                     .layer(middleware::from_fn(event_stream_context))
                     .service(event_stream_router(uc_state.clone()).into_service::<Body>());
                 router = router.nest_service("/api/v1/event-streams", event_service);
+            }
+            if usage_enabled {
+                let usage = ServiceBuilder::new()
+                    .layer(auth_layer)
+                    .layer(rate_limit_layer)
+                    .layer(middleware::from_fn(event_stream_context))
+                    .service(arco_uc::usage_router(uc_state.clone()).into_service::<Body>());
+                router = router.nest_service("/api/v1/usage", usage);
             }
             if state.config.unity_catalog.enabled {
                 let uc_service = ServiceBuilder::new()

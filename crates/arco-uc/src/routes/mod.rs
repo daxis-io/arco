@@ -14,3 +14,4 @@ pub mod schemas;
 pub mod storage_credentials;
 pub mod table_reads;
 pub mod tables;
+pub(crate) mod usage;

@@ -126,6 +126,19 @@ async fn reject_event_stream_target(
 ) -> UnityCatalogResult<()> {
     if state
         .config
+        .usage_bindings
+        .table_id(&ctx.tenant, &ctx.workspace)
+        == Some(table_id)
+        || crate::is_usage_table(storage, table_id)
+            .await
+            .map_err(|error| map_internal_error("check usage table ownership", error))?
+    {
+        return Err(UnityCatalogError::Forbidden {
+            message: "usage_table_requires_owner_api".to_string(),
+        });
+    }
+    if state
+        .config
         .event_streams
         .table_ids(&ctx.tenant, &ctx.workspace)
         .any(|bound| bound == table_id)

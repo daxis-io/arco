@@ -544,7 +544,8 @@ async fn get_activity(router: &Router, path: &str, token: &str) -> (StatusCode, 
     (status, serde_json::from_slice(&bytes).unwrap())
 }
 
-async fn seed_activity_table(
+/// Registers a governed Logfood stream table for production-router fixtures.
+pub async fn seed_activity_table(
     backend: Arc<dyn StorageBackend>,
     storage_root: &str,
     workspace: &str,

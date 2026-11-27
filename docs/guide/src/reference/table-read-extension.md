@@ -356,6 +356,20 @@ a page, pass its `publishedVersion` and use `nextBeforeVersion` as
 `beforeVersion`. Version 0 represents an empty stream. The watermark measures
 finalized Arco commits. The current write profile commits one event at a time.
 
+### Pin a stream for a Flow run
+
+Send `POST /api/v1/event-streams/{streamId}/pins` with `{}` to pin the
+current published version, or send `{"publishedVersion":16}` to select
+an exact version. Arco returns `pinId` and `publishedVersion`. Repeating
+the request for the same version of the same stream returns the same pin.
+
+Read `GET /api/v1/event-streams/{streamId}/events?pinId=<pin-id>` and
+continue with the same pin and `beforeVersion` from `nextBeforeVersion`.
+Every page checks the reader's current `TABLE SELECT` and storage
+governance. The pin binds the version to the Workspace stream, table,
+schema and storage root. This uses the event reader's page limit and works
+beyond the bounded Delta descriptor's version limit.
+
 ### Turntable query activity
 
 Use `{"profile":"logfood_v1"}` with stream ID `query-activity` and a managed
@@ -371,3 +385,51 @@ nullable. The schema version is 1. The supported stage and outcome pairs are
 `admission` with `admitted` or `denied`, `execution` with `succeeded` or
 `failed`, and `delivery` with `authorized` or `denied`. Delivery records the
 server decision. Turntable owns its investigation grant and capture coverage.
+
+## Hourly Logfood Usage
+
+Register a governed, managed Delta table named `surface_usage_hourly` in
+the same Workspace as `query-activity`. Its column order matches the Flow
+artifact. Use `string` for `workspace_id`, `surface_id`, and `release_id`,
+and `long` for the remaining columns. Only `release_id` is nullable.
+
+```text
+workspace_id, hour_start_ms, surface_id, release_id, source_delta_version,
+admitted, admission_denied, executed, execution_failed, delivery_authorized, delivery_denied
+```
+
+Set `ARCO_USAGE_TABLE_BINDINGS` to a JSON array with `tenant`, `workspace`,
+`table_id`, and `transform_sha256` for each destination. Use the SHA-256 of
+the approved transform and a distinct `query-activity` source table. Apply
+the binding on every writer. Grant the publisher `TABLE MODIFY` and the
+Usage reader `TABLE SELECT` on the destination table.
+
+For a manual materialization, pin `query-activity` and set the execution
+payload for `analytics.surface_usage_hourly` before triggering the Flow run.
+The accepted plan preserves these values for every attempt.
+
+```json
+{"streamPinId":"<pin-id>","hourStartMs":1800000000000,"transformSha256":"<approved-sha256>"}
+```
+
+The worker reads all pages at that pin under its own Activity reader
+credential. Existing plans can still use `inputIdentity` and `inputSha256`.
+After the worker completes, send `POST /api/v1/usage/hourly` with
+`{"run_id":"…","attempt_id":"…"}`. Arco checks the pinned Activity scope
+and version, the approved transform, and the visible, successful attempt
+with its verified Parquet artifact. A single Delta commit selects the new file
+and removes the previous file for that UTC hour. Other hours retain their selected files.
+The receipt includes the source and destination table versions and the Flow
+attempt. Repeat a publication to retrieve its original receipt. A stale
+attempt, an older unpublished source version, or a changed output for a
+published source version returns `409`.
+
+`GET /api/v1/usage/hourly` reads the latest published hour by default. Pass
+`hour_start_ms` and `published_version` to read a specific hour from a fixed
+Delta snapshot. Continue with its `next_offset` and the same hour and version.
+The default page size is 25 and the maximum is 50. Use `GET
+/api/v1/usage/hourly/receipt?hour_start_ms=…&source_delta_version=…` to look up
+an original finalized receipt. The Usage watermark tracks committed
+materializations. The source watermark tracks the Activity rows included in
+the calculation. The initial profile supports up to 4,096 groups per hour and
+an 8 MiB Parquet artifact.

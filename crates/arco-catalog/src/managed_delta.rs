@@ -126,6 +126,30 @@ impl ManagedDeltaStorage {
             DeltaPaths::legacy(table_id).table_root()
         )
     }
+
+    fn scoped_storage(&self, catalog: &ScopedStorage) -> Result<ScopedStorage> {
+        Ok(ScopedStorage::new(
+            Arc::clone(&self.backend),
+            catalog.tenant_id(),
+            catalog.workspace_id(),
+        )?
+        .with_storage_prefix(&self.prefix)?)
+    }
+
+    /// Resolves the temporary object for a storage probe under the current governed root.
+    ///
+    /// # Errors
+    /// Returns errors for unavailable or denied storage governance.
+    pub async fn probe_target(
+        &self,
+        catalog: &ScopedStorage,
+        operation_id: Uuid,
+    ) -> Result<(ScopedStorage, String)> {
+        let path = format!("managed-delta/probes/{operation_id}");
+        let uri = format!("{}{path}", self.workspace_uri(catalog));
+        governed_root(catalog, &uri).await?;
+        Ok((self.scoped_storage(catalog)?, path))
+    }
 }
 
 /// Immutable binding published before its table becomes visible.
@@ -327,11 +351,5 @@ pub async fn resolve_analytical_storage(
         message: "managed_delta_storage_unavailable".to_string(),
     })?;
     placement.verify(catalog, configured, table).await?;
-    let analytical = ScopedStorage::new(
-        Arc::clone(&configured.backend),
-        catalog.tenant_id(),
-        catalog.workspace_id(),
-    )?
-    .with_storage_prefix(&configured.prefix)?;
-    Ok(Some(analytical))
+    configured.scoped_storage(catalog).map(Some)
 }

@@ -45,6 +45,7 @@ use utoipa::{Modify, OpenApi};
         crate::routes::delta::stage_commit_payload,
         crate::routes::delta::commit_staged,
         crate::routes::delta::ensure_managed_delta,
+        crate::routes::delta::probe_managed_delta_storage,
         crate::routes::orchestration::trigger_run,
         crate::routes::orchestration::list_runs,
         crate::routes::orchestration::get_run,

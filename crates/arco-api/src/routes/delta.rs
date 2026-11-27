@@ -21,6 +21,7 @@ use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome
 use arco_catalog::authz::privileges::Privilege;
 use arco_catalog::managed_delta::{self, ManagedDeltaAllocation};
 use arco_catalog::{CatalogAuthority, WriteOptions};
+use arco_core::storage::WritePrecondition;
 use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
 use arco_uc::is_event_stream_table;
 
@@ -30,6 +31,9 @@ use crate::routes::catalog_authority;
 use crate::server::AppState;
 
 const MAX_DELTA_STAGE_BYTES: usize = 5 * 1024 * 1024;
+
+#[cfg(test)]
+mod probe_tests;
 
 /// Creates Delta routes.
 pub fn routes() -> Router<Arc<AppState>> {
@@ -44,6 +48,98 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/managed-delta/ensure",
             post(ensure_managed_delta).layer(DefaultBodyLimit::max(4096)),
         )
+        .route(
+            "/managed-delta/storage",
+            post(probe_managed_delta_storage).layer(DefaultBodyLimit::max(4096)),
+        )
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ManagedDeltaStorageProbeRequest {
+    /// Original `UUIDv7` operation identity.
+    operation_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ManagedDeltaStorageProbeResponse {
+    /// Passed after the scoped write, metadata read, payload read, and cleanup.
+    state: &'static str,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/managed-delta/storage",
+    tag = "Delta",
+    request_body = ManagedDeltaStorageProbeRequest,
+    responses(
+        (status = 200, description = "Analytical storage access verified", body = ManagedDeltaStorageProbeResponse),
+        (status = 400, description = "Invalid operation identity", body = ApiErrorBody),
+        (status = 401, description = "Missing or invalid authentication", body = ApiErrorBody),
+        (status = 403, description = "Allocation privilege or managed root denied", body = ApiErrorBody),
+        (status = 500, description = "Storage access or integrity check failed", body = ApiErrorBody),
+        (status = 503, description = "Storage unavailable or probe contention exhausted retries", body = ApiErrorBody),
+    ),
+    security(("bearerAuth" = []))
+)]
+pub(crate) async fn probe_managed_delta_storage(
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ManagedDeltaStorageProbeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    catalog_authority::reject_table_commit_for_control_v1(&state, &ctx)?;
+    let operation_id = request
+        .operation_id
+        .parse::<Uuid>()
+        .ok()
+        .filter(|id| id.get_version_num() == 7)
+        .ok_or_else(|| ApiError::bad_request("operation_id must be a UUIDv7"))?;
+    require_managed_delta_create_table(&state, &ctx).await?;
+    let root = state.managed_delta_storage.as_ref().ok_or_else(|| {
+        ApiError::from_status_and_message(503, "managed_delta_storage_unavailable")
+    })?;
+    let catalog = ctx.scoped_storage(state.storage_backend()?)?;
+    let (storage, path) = root.probe_target(&catalog, operation_id).await?;
+    let backend_failure = |error: arco_core::Error| {
+        tracing::warn!(%error, "managed Delta storage probe failed");
+        ApiError::internal("managed storage probe failed")
+    };
+    let payload = Bytes::from_static(b"arco-managed-delta-storage-probe-v1");
+
+    for _ in 0..3 {
+        storage
+            .put_raw(&path, payload.clone(), WritePrecondition::DoesNotExist)
+            .await
+            .map_err(backend_failure)?;
+        let observed = async {
+            let Some(meta) = storage.head_raw(&path).await.map_err(backend_failure)? else {
+                return Ok(false);
+            };
+            if meta.size != payload.len() as u64 {
+                return Err(ApiError::internal("managed storage probe size mismatch"));
+            }
+            match storage.get_raw(&path).await {
+                Ok(bytes) if bytes == payload => Ok(true),
+                Ok(_) => Err(ApiError::internal("managed storage probe payload mismatch")),
+                Err(arco_core::Error::NotFound(_)) => Ok(false),
+                Err(error) => Err(backend_failure(error)),
+            }
+        }
+        .await;
+        match observed {
+            // Another request can delete the key while this request is reading it.
+            Ok(false) => {}
+            result => {
+                storage.delete(&path).await.map_err(backend_failure)?;
+                result?;
+                return Ok((
+                    [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    Json(ManagedDeltaStorageProbeResponse { state: "passed" }),
+                ));
+            }
+        }
+    }
+    Err(ApiError::managed_storage_probe_busy())
 }
 
 #[utoipa::path(
@@ -75,18 +171,7 @@ pub(crate) async fn ensure_managed_delta(
             "managed_delta_owner_must_match_principal",
         ));
     }
-    let schema_id = format!("{}.{}", managed_delta::CATALOG, managed_delta::SCHEMA);
-    let authorize = || {
-        require_catalog_privilege(
-            &state,
-            &ctx,
-            &schema_id,
-            "SCHEMA",
-            Privilege::CreateTable,
-            "managed_delta_create_table_required",
-        )
-    };
-    authorize().await?;
+    require_managed_delta_create_table(&state, &ctx).await?;
     let CatalogAuthority::Legacy { writer, .. } = catalog_authority::resolve(&state, &ctx).await?
     else {
         return Err(ApiError::catalog_table_commit_disabled());
@@ -100,7 +185,7 @@ pub(crate) async fn ensure_managed_delta(
                 .with_request_id(&ctx.request_id),
         )
         .await?;
-    authorize().await?;
+    require_managed_delta_create_table(&state, &ctx).await?;
     Ok((
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(serde_json::json!({
@@ -299,6 +384,22 @@ async fn require_delta_modify(
         "TABLE",
         Privilege::Modify,
         "delta_modify_required",
+    )
+    .await
+}
+
+async fn require_managed_delta_create_table(
+    state: &AppState,
+    ctx: &RequestContext,
+) -> Result<(), ApiError> {
+    let schema_id = format!("{}.{}", managed_delta::CATALOG, managed_delta::SCHEMA);
+    require_catalog_privilege(
+        state,
+        ctx,
+        &schema_id,
+        "SCHEMA",
+        Privilege::CreateTable,
+        "managed_delta_create_table_required",
     )
     .await
 }

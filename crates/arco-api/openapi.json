@@ -1601,6 +1601,91 @@
         ]
       }
     },
+    "/api/v1/managed-delta/storage": {
+      "post": {
+        "tags": [
+          "Delta"
+        ],
+        "operationId": "probe_managed_delta_storage",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ManagedDeltaStorageProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Analytical storage access verified",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedDeltaStorageProbeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid operation identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid authentication",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Allocation privilege or managed root denied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Storage access or integrity check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Storage unavailable or probe contention exhausted retries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/namespaces": {
       "get": {
         "tags": [
@@ -6664,6 +6749,31 @@
                 "description": "Filter by tick status."
               }
             ]
+          }
+        }
+      },
+      "ManagedDeltaStorageProbeRequest": {
+        "type": "object",
+        "required": [
+          "operation_id"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "description": "Original `UUIDv7` operation identity."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ManagedDeltaStorageProbeResponse": {
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "description": "Passed after the scoped write, metadata read, payload read, and cleanup."
           }
         }
       },

@@ -164,6 +164,17 @@ impl ApiError {
         Self::new(StatusCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED", message)
     }
 
+    /// Returns bounded backpressure when overlapping probes repeatedly race with cleanup.
+    #[must_use]
+    pub fn managed_storage_probe_busy() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MANAGED_STORAGE_PROBE_BUSY",
+            "Managed storage probe is busy; retry the same operation",
+        )
+        .with_retry_after(1)
+    }
+
     /// Rejects table-format commit coordination for the `control/v1` pilot.
     #[must_use]
     pub fn catalog_table_commit_disabled() -> Self {

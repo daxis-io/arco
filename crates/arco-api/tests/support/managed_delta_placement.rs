@@ -38,6 +38,7 @@ use uuid::Uuid;
 const PREFIX: &str = "approved/managed";
 const ROOT_ID: &str = "approved_managed_delta";
 const ENSURE: &str = "/api/v1/managed-delta/ensure";
+const STORAGE: &str = "/api/v1/managed-delta/storage";
 const PREVIEW: &str = "/api/2.1/unity-catalog/delta/preview/commits";
 const MANAGED_ROOTS: &str = "/api/2.1/unity-catalog/storage-governance/managed-roots";
 
@@ -231,7 +232,7 @@ async fn managed_delta_allocation_replay_does_not_adopt_recreated_table() {
 }
 
 #[tokio::test]
-#[ignore = "requires fresh MinIO catalog and analytical buckets and pinned delta-rs"]
+#[ignore = "requires fresh catalog and analytical S3 buckets and pinned delta-rs"]
 async fn production_managed_delta_allocation_minio() {
     let bucket = std::env::var("ARCO_DELTA_PROOF_BUCKET").unwrap();
     let analytics = std::env::var("ARCO_DELTA_PROOF_ANALYTICAL_BUCKET").unwrap();
@@ -248,11 +249,13 @@ async fn production_managed_delta_allocation_minio() {
     let root_path = format!("{MANAGED_ROOTS}/{}", Uuid::now_v7());
     let (status, approved) = root_request(&router, Method::PUT, &root_path, &token).await;
     assert_eq!(status, StatusCode::CREATED, "{approved}");
+    let data = analytical_scope(&data_backend, TENANT, WORKSPACE);
+    verify_storage_probe(&router, &catalog, &data, &token, evidence).await;
     let request = json!({
         "operation_id": Uuid::now_v7(), "owner": READER,
         "provisioning_fingerprint": "managed-delta-native-proof-v1"
     });
-    let receipt = allocate(&router, &catalog, &token, &root, &request).await;
+    let receipt = allocate(&router, &catalog, &token, &root, &request, evidence).await;
     let table_id = receipt.get("id").and_then(Value::as_str).unwrap();
     let location = receipt.get("location").and_then(Value::as_str).unwrap();
     write_proof_json(
@@ -262,7 +265,6 @@ async fn production_managed_delta_allocation_minio() {
             "method": "POST", "path": ENSURE, "request": request, "status": 200, "response": receipt,
         }),
     );
-    let data = analytical_scope(&data_backend, TENANT, WORKSPACE);
     let pin = verify_two_versions(&router, &catalog, &data, table_id, &token, evidence).await;
     verify_preview(&router, table_id, location, &token, evidence).await;
     let (status, replay) = post_json(&router, ENSURE, &token, request.clone()).await;
@@ -300,7 +302,7 @@ async fn production_managed_delta_allocation_minio() {
         [grant(table_id, "TABLE", "SELECT", LifecycleState::Active)],
     )
     .await;
-    let revocation = revoke_and_probe(&router, &root_path, table_id, &token, &pin).await;
+    let revocation = revoke_and_probe(&router, &root_path, table_id, &token, &pin, &request).await;
     write_proof_json(
         evidence,
         "root-admin.json",
@@ -318,12 +320,54 @@ async fn production_managed_delta_allocation_minio() {
     .await;
 }
 
+async fn verify_storage_probe(
+    router: &Router,
+    catalog: &ScopedStorage,
+    data: &ScopedStorage,
+    token: &str,
+    evidence: &Path,
+) {
+    let operation_id = Uuid::now_v7();
+    let request = json!({"operation_id": operation_id});
+    let key = format!("managed-delta/probes/{operation_id}");
+    let stranded = data
+        .put_raw(
+            &key,
+            Bytes::from_static(b"arco-managed-delta-storage-probe-v1"),
+            WritePrecondition::DoesNotExist,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(stranded, WriteResult::Success { .. }));
+
+    let [first, second]: [_; 2] = tokio::join!(
+        post_json(router, STORAGE, token, request.clone()),
+        post_json(router, STORAGE, token, request.clone()),
+    )
+    .into();
+    for (status, receipt) in [&first, &second] {
+        assert_eq!(*status, StatusCode::OK, "{receipt}");
+        assert_eq!(*receipt, json!({"state": "passed"}));
+    }
+    assert!(data.head_raw(&key).await.unwrap().is_none());
+    assert!(catalog.head_raw(&key).await.unwrap().is_none());
+    write_proof_json(
+        evidence,
+        "storage-probe.json",
+        &json!({
+            "path": STORAGE, "request": request, "recovered_key": key,
+            "responses": [first.1, second.1], "statuses": [first.0.as_u16(), second.0.as_u16()],
+        }),
+    );
+}
+
 async fn revoke_and_probe(
     router: &Router,
     root_path: &str,
     table_id: &str,
     token: &str,
     pin: &Value,
+    allocation: &Value,
 ) -> Value {
     let base = format!("/api/v1/delta/tables/{table_id}/commits");
     let stage = format!("{base}/stage");
@@ -346,6 +390,8 @@ async fn revoke_and_probe(
         (read_path.as_str(), read),
         (stage.as_str(), json!({"payload": "{}"})),
         (base.as_str(), commit),
+        (ENSURE, allocation.clone()),
+        (STORAGE, json!({"operation_id": Uuid::now_v7()})),
     ] {
         let (status, response) = post_json(router, path, token, body).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
@@ -501,13 +547,13 @@ async fn allocate(
     token: &str,
     root: &str,
     request: &Value,
+    evidence: &Path,
 ) -> Value {
     let foreign_owner =
         table_read_rs256_jwt(catalog.tenant_id(), catalog.workspace_id(), "other_owner");
     let (status, error) = post_json(router, ENSURE, &foreign_owner, request.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    let (status, receipt) = post_json(router, ENSURE, token, request.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{receipt}");
+    let (receipt, statuses) = allocate_overlapping(router, token, request).await;
     let table_id = receipt.get("id").and_then(Value::as_str).unwrap();
     let uuid = Uuid::parse_str(table_id).unwrap();
     assert_eq!(uuid.get_version_num(), 7);
@@ -527,6 +573,19 @@ async fn allocate(
     assert_eq!(row.location.as_deref(), Some(location.as_str()));
     assert_eq!(row.format.as_deref(), Some("delta"));
     assert_eq!(row.table_type.as_deref(), Some("MANAGED"));
+    write_proof_json(
+        evidence,
+        &format!(
+            "allocation-overlap-{}-{}.json",
+            catalog.tenant_id(),
+            catalog.workspace_id()
+        ),
+        &json!({
+            "tenant": catalog.tenant_id(), "workspace": catalog.workspace_id(),
+            "statuses": statuses, "table_id": table_id,
+            "location": location, "rows": tables.len(),
+        }),
+    );
     let bytes = catalog
         .get_raw(&format!("delta/placements/{uuid}.json"))
         .await
@@ -545,6 +604,31 @@ async fn allocate(
     )
     .await;
     receipt
+}
+
+async fn allocate_overlapping(router: &Router, token: &str, request: &Value) -> (Value, [u16; 2]) {
+    let [first, second]: [_; 2] = tokio::join!(
+        post_json(router, ENSURE, token, request.clone()),
+        post_json(router, ENSURE, token, request.clone()),
+    )
+    .into();
+    let receipt = if first.0 == StatusCode::OK {
+        first.1.clone()
+    } else {
+        assert_eq!(second.0, StatusCode::OK, "{first:?}, {second:?}");
+        second.1.clone()
+    };
+    let statuses = [first.0.as_u16(), second.0.as_u16()];
+    for (status, response) in [first, second] {
+        if status == StatusCode::OK {
+            assert_eq!(response, receipt);
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            let replay = post_json(router, ENSURE, token, request.clone()).await;
+            assert_eq!(replay, (StatusCode::OK, receipt.clone()));
+        }
+    }
+    (receipt, statuses)
 }
 
 fn data_file(start: i64, amounts: &[i64]) -> Bytes {
@@ -725,7 +809,7 @@ async fn verify_isolation(
     let catalog = seed_scope(catalog_backend, other_tenant, WORKSPACE, Some(root)).await;
     seed_scope(catalog_backend, TENANT, "workspace2", Some(root)).await;
     let token = table_read_rs256_jwt(other_tenant, WORKSPACE, READER);
-    let receipt = allocate(router, &catalog, &token, root, request).await;
+    let receipt = allocate(router, &catalog, &token, root, request, evidence).await;
     let id = receipt.get("id").and_then(Value::as_str).unwrap();
     assert_ne!(id, original_id);
     let describe = extension_path("table-descriptors", original_id);

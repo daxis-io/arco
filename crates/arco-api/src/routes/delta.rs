@@ -56,7 +56,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedDeltaStorageProbeRequest {
-    /// Original UUIDv7 operation identity.
+    /// Original `UUIDv7` operation identity.
     operation_id: String,
 }
 

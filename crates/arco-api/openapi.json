@@ -6760,7 +6760,7 @@
         "properties": {
           "operation_id": {
             "type": "string",
-            "description": "Original UUIDv7 operation identity."
+            "description": "Original `UUIDv7` operation identity."
           }
         },
         "additionalProperties": false

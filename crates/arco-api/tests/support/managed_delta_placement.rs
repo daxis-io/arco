@@ -246,10 +246,11 @@ async fn verify_storage_probe(
         .unwrap();
     assert!(matches!(stranded, WriteResult::Success { .. }));
 
-    let (first, second) = tokio::join!(
+    let [first, second]: [_; 2] = tokio::join!(
         post_json(router, STORAGE, token, request.clone()),
         post_json(router, STORAGE, token, request.clone()),
-    );
+    )
+    .into();
     for (status, receipt) in [&first, &second] {
         assert_eq!(*status, StatusCode::OK, "{receipt}");
         assert_eq!(*receipt, json!({"state": "passed"}));
@@ -410,10 +411,11 @@ async fn allocate(
         table_read_rs256_jwt(catalog.tenant_id(), catalog.workspace_id(), "other_owner");
     let (status, error) = post_json(router, ENSURE, &foreign_owner, request.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{error}");
-    let (first, second) = tokio::join!(
+    let [first, second]: [_; 2] = tokio::join!(
         post_json(router, ENSURE, token, request.clone()),
         post_json(router, ENSURE, token, request.clone()),
-    );
+    )
+    .into();
     let receipt = if first.0 == StatusCode::OK {
         first.1.clone()
     } else {

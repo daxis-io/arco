@@ -198,13 +198,14 @@ async fn managed_delta_storage_probe_recovers_when_overlapping_retry_deletes_bef
         .await?;
 
     tokio::time::timeout(Duration::from_secs(5), async {
-        let (paused, overlapping) =
+        let responses: [_; 2] =
             tokio::try_join!(send_probe(router.clone(), operation_id, "owner"), async {
                 data.paused_after_head.notified().await;
                 assert!(data.data.head(&expected_key).await?.is_some());
                 send_probe(router, operation_id, "owner").await
-            })?;
-        for (status, _, receipt) in [paused, overlapping] {
+            })?
+            .into();
+        for (status, _, receipt) in responses {
             assert_eq!(status, StatusCode::OK, "{receipt}");
             assert_eq!(receipt, json!({"state":"passed"}));
         }

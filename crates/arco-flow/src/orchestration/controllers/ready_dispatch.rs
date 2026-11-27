@@ -183,7 +183,11 @@ impl ReadyDispatchController {
     }
 
     /// Reconciles a single task.
-    fn reconcile_task(&self, task: &TaskRow, state: &FoldState) -> Option<ReadyDispatchAction> {
+    pub(crate) fn reconcile_task(
+        &self,
+        task: &TaskRow,
+        state: &FoldState,
+    ) -> Option<ReadyDispatchAction> {
         // Only process READY tasks
         if task.state != TaskState::Ready {
             return None;
@@ -220,17 +224,23 @@ impl ReadyDispatchController {
             }
         }
 
-        // Generate deterministic attempt_id from dispatch_id for controller idempotency
-        let attempt_id = deterministic_attempt_id(&dispatch_id);
+        Some(self.dispatch_action(task, attempt, dispatch_id))
+    }
 
-        Some(ReadyDispatchAction::EmitDispatchRequested {
+    pub(crate) fn dispatch_action(
+        &self,
+        task: &TaskRow,
+        attempt: u32,
+        dispatch_id: String,
+    ) -> ReadyDispatchAction {
+        ReadyDispatchAction::EmitDispatchRequested {
             run_id: task.run_id.clone(),
             task_key: task.task_key.clone(),
             attempt,
-            attempt_id,
+            attempt_id: deterministic_attempt_id(&dispatch_id),
             worker_queue: self.worker_queue.clone(),
             dispatch_id,
-        })
+        }
     }
 
     /// Generates the idempotency key for a `DispatchRequested` event.

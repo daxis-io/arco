@@ -169,6 +169,14 @@ pub struct Config {
     /// gRPC server port.
     pub grpc_port: u16,
 
+    /// IP address shared by the HTTP and gRPC listeners.
+    #[serde(default = "default_bind_ip")]
+    pub bind_ip: std::net::IpAddr,
+
+    /// Operator-owned configuration file for the exact worker-pull pilot scope.
+    #[serde(default)]
+    pub worker_pull_pilot_path: Option<std::path::PathBuf>,
+
     /// Optional shared secret required to access `/metrics`.
     ///
     /// When set to a non-empty value, callers must provide either:
@@ -409,6 +417,8 @@ impl Default for Config {
         Self {
             http_port: 8080,
             grpc_port: 9090,
+            bind_ip: default_bind_ip(),
+            worker_pull_pilot_path: None,
             metrics_secret: None,
             debug: false,
             posture: Posture::Dev,
@@ -435,6 +445,10 @@ impl Default for Config {
             control_store_operator_group: None,
         }
     }
+}
+
+const fn default_bind_ip() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
 }
 
 /// Exact synthetic tenant/workspace root selected for the `control/v1` pilot.
@@ -605,6 +619,8 @@ impl Config {
     ///
     /// Supported env vars:
     /// - `ARCO_HTTP_PORT`
+    /// - `ARCO_BIND_IP`
+    /// - `ARCO_FLOW_WORKER_PULL_PILOT_PATH`
     /// - `ARCO_GRPC_PORT`
     /// - `ARCO_METRICS_SECRET`
     /// - `ARCO_DEBUG`
@@ -672,6 +688,13 @@ impl Config {
         if let Some(port) = env_u16("ARCO_GRPC_PORT")? {
             config.grpc_port = port;
         }
+        if let Some(ip) = env_string("ARCO_BIND_IP") {
+            config.bind_ip = ip
+                .parse()
+                .map_err(|_| Error::InvalidInput("ARCO_BIND_IP must be an IP address".into()))?;
+        }
+        config.worker_pull_pilot_path =
+            std::env::var_os("ARCO_FLOW_WORKER_PULL_PILOT_PATH").map(std::path::PathBuf::from);
         config.metrics_secret = env_string("ARCO_METRICS_SECRET");
         if let Some(debug) = env_bool("ARCO_DEBUG")? {
             config.debug = debug;

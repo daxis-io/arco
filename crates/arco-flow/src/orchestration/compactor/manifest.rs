@@ -18,6 +18,7 @@ use arco_core::canonical_json::to_canonical_bytes;
 use super::fold::{CatalogRunIndexKey, event_id_from_ledger_path};
 use crate::orchestration::events::OrchestrationEvent;
 use crate::orchestration::ledger::LedgerWriter;
+use crate::orchestration::worker_pull::PullState;
 
 /// Fixed width for immutable orchestration manifest identifiers.
 pub const MANIFEST_ID_WIDTH: usize = 20;
@@ -42,8 +43,11 @@ pub const MANIFEST_SCHEMA_VERSION_LEGACY: u32 = 1;
 /// the tombstone channel (see [`OrchestrationManifest::validate_delete_channel`]).
 pub const MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL: u32 = 2;
 
+/// Manifest schema version that makes the selected revision the worker-pull authority.
+pub const MANIFEST_SCHEMA_VERSION_WORKER_PULL: u32 = 3;
+
 /// Highest manifest schema version this build knows how to reconstruct.
-pub const MANIFEST_SCHEMA_VERSION_MAX: u32 = MANIFEST_SCHEMA_VERSION_DELETE_CHANNEL;
+pub const MANIFEST_SCHEMA_VERSION_MAX: u32 = MANIFEST_SCHEMA_VERSION_WORKER_PULL;
 
 /// Delete-channel understanding level recorded on a base snapshot.
 ///
@@ -152,6 +156,9 @@ pub struct OrchestrationManifest {
     /// Exact event batch whose processing produced this immutable revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_witness: Option<OrchestrationPublicationWitness>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) worker_pull: Option<PullState>,
 }
 
 impl OrchestrationManifest {
@@ -171,7 +178,14 @@ impl OrchestrationManifest {
             l0_count: 0,
             l0_limits: L0Limits::default(),
             publication_witness: None,
+            worker_pull: None,
         }
+    }
+
+    /// Returns true when only the worker-pull authority may mutate this scope.
+    #[must_use]
+    pub const fn uses_worker_pull(&self) -> bool {
+        self.schema_version == MANIFEST_SCHEMA_VERSION_WORKER_PULL
     }
 
     /// Returns true when this manifest declares the delta delete channel.
@@ -238,6 +252,14 @@ impl OrchestrationManifest {
                 self.schema_version
             ));
         }
+        if self.uses_worker_pull() != self.worker_pull.is_some() {
+            return Err("worker-pull manifest authority marker is inconsistent".to_string());
+        }
+        if self.uses_worker_pull()
+            && self.watermarks.last_committed_event_id != self.watermarks.last_visible_event_id
+        {
+            return Err("worker-pull manifest carries a persisted-only watermark".to_string());
+        }
         if !self.declares_delete_channel() {
             return Ok(());
         }
@@ -270,6 +292,24 @@ impl OrchestrationManifest {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn shares_projection(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.base_snapshot.snapshot_id == other.base_snapshot.snapshot_id
+            && self.base_snapshot.delete_channel_version
+                == other.base_snapshot.delete_channel_version
+            && self.base_snapshot.tables == other.base_snapshot.tables
+            && self.l0_deltas.len() == other.l0_deltas.len()
+            && self
+                .l0_deltas
+                .iter()
+                .zip(&other.l0_deltas)
+                .all(|(left, right)| {
+                    left.delta_id == right.delta_id
+                        && left.tables == right.tables
+                        && left.deletions == right.deletions
+                })
     }
 
     /// Checks if L0 compaction should be triggered.
@@ -610,7 +650,7 @@ impl TableArtifact {
 }
 
 /// Paths to Parquet table files within a snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TablePaths {
     /// Path to runs.parquet (relative to storage root).
     #[serde(skip_serializing_if = "Option::is_none")]

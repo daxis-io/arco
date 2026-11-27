@@ -147,6 +147,7 @@ pub struct AppState {
     audit: Arc<AuditEmitter>,
     /// Exact-root catalog authority bindings; unlisted roots remain legacy.
     catalog_authority_bindings: Arc<CatalogAuthorityBindings>,
+    worker_pull_pilot: Option<Arc<crate::worker_pull_pilot::WorkerPullPilot>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -160,6 +161,7 @@ impl std::fmt::Debug for AppState {
             .field("sensor_evaluator", &"<SensorEvaluator>")
             .field("audit", &self.audit)
             .field("catalog_authority_bindings", &"<exact-root bindings>")
+            .field("worker_pull_pilot", &self.worker_pull_pilot.is_some())
             .finish()
     }
 }
@@ -217,6 +219,7 @@ impl AppState {
             sensor_evaluator,
             audit,
             catalog_authority_bindings: Arc::new(CatalogAuthorityBindings::default()),
+            worker_pull_pilot: None,
         }
     }
 
@@ -246,6 +249,10 @@ impl AppState {
     /// Returns an error if the storage backend is not configured (should never happen).
     pub fn storage_backend(&self) -> Result<Arc<dyn arco_core::storage::StorageBackend>> {
         Ok(Arc::clone(&self.storage))
+    }
+
+    pub(crate) fn worker_pull_pilot(&self) -> Option<&crate::worker_pull_pilot::WorkerPullPilot> {
+        self.worker_pull_pilot.as_deref()
     }
 
     /// Returns the sync compactor if configured.
@@ -813,24 +820,28 @@ impl Server {
         &self.config
     }
 
-    #[allow(
-        clippy::expect_used,
-        reason = "serve validates the exact-root binding configuration before constructing state; test_router treats invalid fixture configuration as a test bug"
-    )]
-    fn create_state(&self) -> Arc<AppState> {
-        let bindings = self
-            .config
-            .catalog_authority_bindings()
-            .expect("server configuration must validate before state construction");
-        Arc::new(
-            AppState::new_with_audit(
-                self.config.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&self.sensor_evaluator),
-                self.audit_emitter.clone(),
-            )
-            .with_catalog_authority_bindings(Arc::new(bindings)),
+    fn create_state(&self) -> Result<Arc<AppState>> {
+        let bindings = self.config.catalog_authority_bindings()?;
+        let (storage, worker_pull_pilot) = match self.config.worker_pull_pilot_path.as_deref() {
+            Some(path) => {
+                crate::worker_pull_pilot::validate_api_config(&self.config)?;
+                let (storage, pilot) = crate::worker_pull_pilot::WorkerPullPilot::load(
+                    path,
+                    Arc::clone(&self.storage),
+                )?;
+                (storage, Some(Arc::new(pilot)))
+            }
+            None => (Arc::clone(&self.storage), None),
+        };
+        let mut state = AppState::new_with_audit(
+            self.config.clone(),
+            storage,
+            Arc::clone(&self.sensor_evaluator),
+            self.audit_emitter.clone(),
         )
+        .with_catalog_authority_bindings(Arc::new(bindings));
+        state.worker_pull_pilot = worker_pull_pilot;
+        Ok(Arc::new(state))
     }
 
     /// Creates the router with all routes and middleware.
@@ -883,6 +894,10 @@ impl Server {
                     .route_layer(task_rate_limit_layer)
                     .layer(task_auth_layer),
             );
+
+        if let Some(pilot) = state.worker_pull_pilot() {
+            router = router.nest_service(crate::worker_pull_pilot::MOUNT, pilot.host.router());
+        }
 
         // Operator-only control-store surface (roadmap Phase 4/5: "write APIs
         // behind internal or operator-only access"). Default off: when the
@@ -1177,9 +1192,9 @@ impl Server {
             None
         };
 
-        let state = self.create_state();
-        let http_addr = SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
-        let grpc_addr = SocketAddr::from(([0, 0, 0, 0], self.config.grpc_port));
+        let state = self.create_state()?;
+        let http_addr = SocketAddr::new(self.config.bind_ip, self.config.http_port);
+        let grpc_addr = SocketAddr::new(self.config.bind_ip, self.config.grpc_port);
         let router = self.create_router(Arc::clone(&state), credential_provider);
         let grpc_service = grpc_transactions::service(state);
 
@@ -1236,8 +1251,14 @@ impl Server {
     /// using this server's configured storage backend (default: in-memory).
     /// Credential vending is disabled in test mode.
     #[doc(hidden)]
+    #[allow(
+        clippy::expect_used,
+        reason = "invalid fixture configuration is a test bug"
+    )]
     pub fn test_router(&self) -> Router {
-        let state = self.create_state();
+        let state = self
+            .create_state()
+            .expect("valid test router configuration");
         self.create_router(state, None)
     }
 

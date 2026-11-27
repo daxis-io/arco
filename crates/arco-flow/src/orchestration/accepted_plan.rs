@@ -8,8 +8,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use super::events::{OrchestrationEvent, OrchestrationEventData};
+pub use super::retry_policy::{RETRY_POLICY_LABEL, RIVERS_RETRY_PROFILE};
 use crate::error::{Error, Result};
 
 /// Server-owned run label binding the accepted plan's canonical bytes.
@@ -31,7 +33,7 @@ pub struct AcceptedManifestRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcceptedRunPlan {
-    /// Descriptor format version (currently one).
+    /// Descriptor format, one for legacy plans and two for a bound retry policy.
     pub version: u32,
     /// Immutable deployed manifest, absent for legacy-derived reruns.
     pub manifest: Option<AcceptedManifestRef>,
@@ -53,6 +55,50 @@ fn plan_path(plan_id: &str) -> Result<String> {
 }
 
 impl AcceptedRunPlan {
+    /// Binds the pinned Rivers compatibility policy and final event order before acceptance.
+    ///
+    /// # Errors
+    /// Rejects prebound labels, invalid event identities, and incompatible plans.
+    pub fn with_rivers_retry_policy(mut self) -> Result<Self> {
+        let [run_event, plan_event] = self.events.as_mut_slice() else {
+            return Err(Error::configuration(
+                "accepted plan must contain two events",
+            ));
+        };
+        let OrchestrationEventData::RunTriggered { labels, .. } = &mut run_event.data else {
+            return Err(Error::configuration("accepted plan lacks run event"));
+        };
+        let OrchestrationEventData::PlanCreated { tasks, .. } = &plan_event.data else {
+            return Err(Error::configuration("accepted plan lacks task event"));
+        };
+        if self.version != 1
+            || labels.contains_key(RETRY_POLICY_LABEL)
+            || labels.contains_key(ACCEPTED_PLAN_SHA256_LABEL)
+            || tasks.iter().any(|task| task.max_attempts == 0)
+        {
+            return Err(Error::configuration(
+                "incompatible Rivers retry policy binding",
+            ));
+        }
+        let run_event_id = run_event
+            .event_id
+            .parse::<Ulid>()
+            .map_err(|_| Error::configuration("Rivers plan requires server event identities"))?;
+        plan_event
+            .event_id
+            .parse::<Ulid>()
+            .map_err(|_| Error::configuration("Rivers plan requires server event identities"))?;
+        if plan_event.event_id <= run_event.event_id {
+            let next = u128::from(run_event_id)
+                .checked_add(1)
+                .ok_or_else(|| Error::configuration("accepted event identity overflow"))?;
+            plan_event.event_id = Ulid::from(next).to_string();
+        }
+        labels.insert(RETRY_POLICY_LABEL.into(), RIVERS_RETRY_PROFILE.into());
+        self.version = 2;
+        Ok(self)
+    }
+
     /// Persists the plan before reserving a run key or publishing run events.
     ///
     /// # Errors
@@ -95,7 +141,7 @@ impl AcceptedRunPlan {
                 "accepted plan must contain two events",
             ));
         };
-        if self.version != 1
+        if !matches!(self.version, 1 | 2)
             || self.events.len() != 2
             || self.events.iter().any(|e| {
                 e.tenant_id != storage.tenant_id() || e.workspace_id != storage.workspace_id()
@@ -108,6 +154,7 @@ impl AcceptedRunPlan {
         let OrchestrationEventData::RunTriggered {
             run_id: run,
             plan_id: plan,
+            labels,
             ..
         } = &run_event.data
         else {
@@ -121,6 +168,16 @@ impl AcceptedRunPlan {
         else {
             return Err(Error::configuration("accepted plan lacks task event"));
         };
+        if self.version == 2
+            && (labels.get(RETRY_POLICY_LABEL).map(String::as_str) != Some(RIVERS_RETRY_PROFILE)
+                || labels.contains_key(ACCEPTED_PLAN_SHA256_LABEL)
+                || tasks.iter().any(|task| task.max_attempts == 0)
+                || run_event.event_id.parse::<Ulid>().is_err()
+                || plan_event.event_id.parse::<Ulid>().is_err()
+                || run_event.event_id >= plan_event.event_id)
+        {
+            return Err(Error::configuration("unsupported accepted retry policy"));
+        }
         if run != run_id
             || plan != plan_id
             || planned_run != run_id

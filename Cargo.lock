@@ -369,6 +369,7 @@ dependencies = [
  "proptest",
  "prost-types 0.13.5",
  "reqwest",
+ "rivers-retry",
  "rustls",
  "serde",
  "serde_json",
@@ -4280,6 +4281,14 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rivers-retry"
+version = "0.0.0+d7cbc206"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

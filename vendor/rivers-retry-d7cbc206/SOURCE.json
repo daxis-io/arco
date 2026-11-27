@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/ion-elgreco/rivers",
+  "revision": "d7cbc2065554093b0ddddc40cd0fc3174d79324c",
+  "files": {
+    "rust/rivers-core/src/execution/retry.rs": "68128802d76c05ce5190be896509588fe3ba08e4616a922c18fdbaffb0926fed",
+    "rust/rivers-core/src/execution/compute.rs": "0e130b8432460344fc1d3acf4fd5c92f746d61f0f84a9f6ce41da4fd15ce6582"
+  },
+  "changes": "upstream files copied verbatim; lib.rs only preserves their module paths",
+  "toolchain_scope": "Rust 1.88 qualification applies only to this extracted module, not the Rivers workspace"
+}

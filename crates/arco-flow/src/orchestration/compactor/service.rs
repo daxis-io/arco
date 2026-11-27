@@ -31,6 +31,7 @@
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::{TryStreamExt, stream::FuturesOrdered};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use ulid::Ulid;
@@ -46,8 +47,9 @@ use metrics::{counter, gauge, histogram};
 
 use crate::error::{Error, Result};
 use crate::metrics::{labels as metric_labels, names as metric_names};
-use crate::orchestration::events::OrchestrationEvent;
+use crate::orchestration::events::{OrchestrationEvent, OrchestrationEventData};
 use crate::orchestration::ledger::LedgerWriter;
+use crate::orchestration::worker_pull::{PULL_RECHECK, PullUpdate};
 use crate::paths::{
     orchestration_base_snapshot_dir, orchestration_compaction_lock_path, orchestration_l0_dir,
     orchestration_manifest_pointer_path, orchestration_manifest_snapshot_path,
@@ -84,6 +86,7 @@ const TERMINAL_RUN_RETENTION_DAYS_DEFAULT: u32 = 90;
 /// Environment variable overriding the terminal-run retention window, in days.
 const TERMINAL_RUN_RETENTION_DAYS_ENV: &str = "ARCO_ORCH_TERMINAL_RUN_RETENTION_DAYS";
 const COMPACTION_PUBLISH_RETRY_DELAYS_MS: [u64; 3] = [0, 5, 25];
+const WORKER_PULL_L0_READ_CONCURRENCY: usize = 4;
 
 /// Rollout phase of the L0 delta tombstone (delete) channel.
 ///
@@ -426,8 +429,7 @@ impl MicroCompactor {
     /// Returns an error if the manifest or Parquet files cannot be read.
     pub async fn load_state(&self) -> Result<(OrchestrationManifest, FoldState)> {
         let (manifest, _, _, _) = self.read_manifest_with_version().await?;
-        let mut state = self.load_current_state(&manifest).await?;
-        state.tenant_secret.clone_from(&self.tenant_secret);
+        let state = self.load_manifest_projection(&manifest).await?;
         Ok((manifest, state))
     }
 
@@ -479,7 +481,8 @@ impl MicroCompactor {
     ///
     /// Returns an error if storage reads/writes or Parquet encoding fail.
     pub async fn compact_events(&self, event_paths: Vec<String>) -> Result<CompactionResult> {
-        self.compact_events_internal(event_paths, None, None).await
+        self.compact_events_internal(event_paths, None, None, None, None)
+            .await
     }
 
     /// Rebuilds orchestration projection state from an explicit ledger manifest.
@@ -563,8 +566,14 @@ impl MicroCompactor {
         let event_paths = rebuild_manifest
             .event_paths_after_watermark(&manifest.watermarks)
             .map_err(|message| Error::Core(arco_core::Error::InvalidInput(message)))?;
-        self.compact_events_internal(event_paths, Some(fencing_token), Some(lock_path))
-            .await
+        self.compact_events_internal(
+            event_paths,
+            Some(fencing_token),
+            Some(lock_path),
+            None,
+            None,
+        )
+        .await
     }
 
     /// Fenced compaction path for callers that hold the orchestration lock.
@@ -582,17 +591,49 @@ impl MicroCompactor {
         fencing_token: u64,
         lock_path: &str,
     ) -> Result<CompactionResult> {
-        self.compact_events_internal(event_paths, Some(fencing_token), Some(lock_path))
-            .await
+        self.compact_events_internal(
+            event_paths,
+            Some(fencing_token),
+            Some(lock_path),
+            None,
+            None,
+        )
+        .await
     }
 
-    #[tracing::instrument(skip(self, event_paths), fields(event_count = event_paths.len()))]
+    pub(crate) async fn compact_worker_pull(
+        &self,
+        update: &PullUpdate<'_>,
+        fence: u64,
+        capture_projection: bool,
+    ) -> Result<(CompactionResult, Option<(OrchestrationManifest, FoldState)>)> {
+        if self.durability_mode != DurabilityMode::Visible || !self.tombstone_mode.emits() {
+            return Err(Error::configuration(
+                "worker pull requires visible compaction with deletions",
+            ));
+        }
+        let mut projection = None;
+        let result = self
+            .compact_events_internal(
+                Vec::new(),
+                Some(fence),
+                Some(orchestration_compaction_lock_path()),
+                Some(update),
+                capture_projection.then_some(&mut projection),
+            )
+            .await?;
+        Ok((result, projection))
+    }
+
+    #[tracing::instrument(skip(self, event_paths, pull, projection), fields(event_count = event_paths.len()))]
     #[allow(clippy::too_many_lines)]
     async fn compact_events_internal(
         &self,
         event_paths: Vec<String>,
         fencing_token: Option<u64>,
         lock_path: Option<&str>,
+        pull: Option<&PullUpdate<'_>>,
+        projection: Option<&mut Option<(OrchestrationManifest, FoldState)>>,
     ) -> Result<CompactionResult> {
         let ack_started = Instant::now();
         'retry: for retry_attempt in 0..=COMPACTION_PUBLISH_RETRY_DELAYS_MS.len() {
@@ -621,10 +662,43 @@ impl MicroCompactor {
                     ),
                 }));
             }
+            if let Some(update) = pull {
+                let observed = pointer_version
+                    .as_ref()
+                    .map(|_| manifest.revision_ulid.as_str());
+                if !manifest.uses_worker_pull()
+                    && (observed.is_some()
+                        || self
+                            .storage
+                            .head_raw(arco_core::FlowPaths::orchestration_manifest_path())
+                            .await?
+                            .is_some())
+                {
+                    return Err(Error::configuration(
+                        "worker pull requires a fresh exclusive workspace",
+                    ));
+                }
+                if observed != update.expected_revision.as_deref() {
+                    return Err(pull_recheck());
+                }
+                if let Some((predecessor, _)) = update.preloaded_projection
+                    && (!manifest.uses_worker_pull()
+                        || manifest.manifest_id != predecessor.manifest_id
+                        || manifest.revision_ulid != predecessor.revision_ulid
+                        || manifest.epoch != predecessor.epoch
+                        || !manifest.shares_projection(predecessor))
+                {
+                    return Err(pull_recheck());
+                }
+            } else if manifest.uses_worker_pull() {
+                return Err(Error::configuration(
+                    "worker pull owns compaction for this workspace",
+                ));
+            }
             let mut visible_pointer_version = pointer_version.clone().unwrap_or_default();
             let previous_manifest = manifest.clone();
 
-            if event_paths.is_empty() {
+            if event_paths.is_empty() && pull.is_none() {
                 let mut visibility_status = CompactionVisibility::Visible;
                 let mut repair_pending = false;
                 if pointer_version.is_none() {
@@ -637,6 +711,7 @@ impl MicroCompactor {
                             previous_pointer_bytes.as_ref(),
                             fencing_token,
                             lock_path,
+                            None,
                         )
                         .await
                     {
@@ -691,13 +766,25 @@ impl MicroCompactor {
                 });
             }
 
-            // Load current fold state from base + L0 deltas
-            let mut state = self.load_current_state(&manifest).await?;
+            // The pull decision loaded this exact selected projection under the fence.
+            let mut state =
+                if let Some((_, fold)) = pull.and_then(|update| update.preloaded_projection) {
+                    fold.clone()
+                } else {
+                    self.load_current_state(&manifest).await?
+                };
             state.tenant_secret.clone_from(&self.tenant_secret);
             let base_state = state.clone();
 
             // Process events
             let mut events = Vec::new();
+            if let Some(update) = pull {
+                for event in &update.events {
+                    let path = LedgerWriter::event_path(event);
+                    self.validate_event_scope(&path, event)?;
+                    events.push((path, event.clone()));
+                }
+            }
             let mut seen_event_paths = BTreeSet::new();
             for path in &event_paths {
                 if !seen_event_paths.insert(path) {
@@ -740,7 +827,20 @@ impl MicroCompactor {
                         &self.retention_limits,
                     );
                 }
-                state.fold_event(event);
+                let rivers_retry = match (&event.data, pull) {
+                    (
+                        OrchestrationEventData::TaskCompletionRecorded { run_id, .. },
+                        Some(update),
+                    ) => update.state.uses_rivers_retry(run_id),
+                    _ => false,
+                };
+                state.fold_event_with_rivers_retry(event, rivers_retry);
+                if pull.is_some()
+                    && matches!(event.data, OrchestrationEventData::TaskHeartbeat { .. })
+                {
+                    // This profile orders renewal through the selected lease and exact inline fact.
+                    state.idempotency_keys.remove(&event.idempotency_key);
+                }
             }
 
             // Compute delta state (rows changed by this batch) and the
@@ -912,8 +1012,17 @@ impl MicroCompactor {
 
             let watermark_changed =
                 update_watermarks(&mut manifest, &events, &last_event, self.durability_mode);
-            let manifest_changed = storage_changed || watermark_changed;
-            if manifest_changed {
+            let manifest_changed = storage_changed || watermark_changed || pull.is_some();
+            if let Some(update) = pull {
+                manifest.schema_version = super::manifest::MANIFEST_SCHEMA_VERSION_WORKER_PULL;
+                let mut authority = update.state.clone();
+                // Only the pointer-selected manifest admits inline facts. Raw ledger listings
+                // cannot discover, replay, or grant authority from an abandoned proposal.
+                authority.events.clone_from(&update.events);
+                manifest.worker_pull = Some(authority);
+                manifest.publication_witness = None;
+                manifest.watermarks.last_processed_file = None;
+            } else if manifest_changed {
                 let witnessed_events = events
                     .iter()
                     .map(|(_, event)| event.clone())
@@ -927,8 +1036,16 @@ impl MicroCompactor {
             let mut visibility_status = CompactionVisibility::Visible;
             let mut repair_pending = false;
             let manifest_revision = if manifest_changed {
-                manifest.manifest_id =
-                    next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?;
+                manifest.manifest_id = if pull.is_some() {
+                    // One proposal per lock acquisition, including after an abandoned snapshot.
+                    fencing_token
+                        .map(super::manifest::format_manifest_id)
+                        .ok_or_else(|| {
+                            Error::configuration("worker-pull compaction requires a fence")
+                        })?
+                } else {
+                    next_manifest_id(&manifest.manifest_id).map_err(Error::serialization)?
+                };
                 manifest.previous_manifest_path = previous_pointer
                     .as_ref()
                     .map(|pointer| pointer.manifest_path.clone());
@@ -950,6 +1067,7 @@ impl MicroCompactor {
                         previous_pointer_bytes.as_ref(),
                         fencing_token,
                         lock_path,
+                        pull,
                     )
                     .await
                 {
@@ -961,6 +1079,9 @@ impl MicroCompactor {
                         }
                     }
                     Err(publish_error) => {
+                        if pull.is_some() && publish_error.retry_reason().is_some() {
+                            return Err(pull_recheck());
+                        }
                         if let (Some(delay_ms), Some(retry_reason)) = (
                             should_retry_publish_error(&publish_error, retry_attempt),
                             publish_error.retry_reason(),
@@ -998,10 +1119,18 @@ impl MicroCompactor {
                 "success",
             );
 
+            let manifest_id = if let Some(projection) = projection {
+                state.rebuild_dependency_graph();
+                let manifest_id = manifest.manifest_id.clone();
+                *projection = Some((manifest, state));
+                manifest_id
+            } else {
+                manifest.manifest_id
+            };
             return Ok(CompactionResult {
                 events_processed: u32::try_from(events.len()).unwrap_or(u32::MAX),
                 delta_id,
-                manifest_id: manifest.manifest_id,
+                manifest_id,
                 manifest_revision,
                 pointer_version: visible_pointer_version,
                 visibility_status,
@@ -1092,6 +1221,16 @@ impl MicroCompactor {
                     message: format!("failed to parse manifest: {e}"),
                 })?;
 
+            if manifest.uses_worker_pull()
+                && (manifest.manifest_id != pointer.manifest_id
+                    || manifest.epoch != pointer.epoch
+                    || pointer.manifest_path
+                        != orchestration_manifest_snapshot_path(&pointer.manifest_id))
+            {
+                return Err(Error::serialization(
+                    "worker-pull pointer and selected manifest diverged",
+                ));
+            }
             manifest.manifest_id.clone_from(&pointer.manifest_id);
             manifest.epoch = manifest.epoch.max(pointer.epoch);
 
@@ -1172,6 +1311,38 @@ impl MicroCompactor {
             .map_err(|e| Error::serialization(format!("failed to parse pinned manifest: {e}")))
     }
 
+    pub(crate) async fn selected_worker_pull_manifest(
+        &self,
+    ) -> Result<Option<OrchestrationManifest>> {
+        let (manifest, _, pointer, _) = self.read_manifest_with_version().await?;
+        Ok((pointer.is_some() && manifest.uses_worker_pull()).then_some(manifest))
+    }
+
+    pub(crate) async fn read_worker_pull_manifest(
+        &self,
+        published: &CompactionResult,
+    ) -> Result<Option<OrchestrationManifest>> {
+        let (selected, version, _, _) = self.read_manifest_with_version().await?;
+        if published.visibility_status != CompactionVisibility::Visible
+            || version.as_deref() != Some(published.pointer_version.as_str())
+            || selected.manifest_id != published.manifest_id
+            || selected.revision_ulid != published.manifest_revision
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(selected))
+    }
+
+    pub(crate) async fn load_manifest_projection(
+        &self,
+        manifest: &OrchestrationManifest,
+    ) -> Result<FoldState> {
+        let mut state = self.load_current_state(manifest).await?;
+        state.tenant_secret.clone_from(&self.tenant_secret);
+        Ok(state)
+    }
+
     async fn load_current_manifest_only(&self) -> Result<OrchestrationManifest> {
         let (manifest, _, _, _) = self.read_manifest_with_version().await?;
         Ok(manifest)
@@ -1192,16 +1363,25 @@ impl MicroCompactor {
             FoldState::new()
         };
 
-        // Apply L0 deltas in order: upserts first, then the delta's tombstones,
-        // so deletions recorded by newer folds win over older row copies.
-        for delta in &manifest.l0_deltas {
-            let delta_state = self
-                .load_delta_state(&delta.delta_id, &delta.tables)
-                .await?;
+        // Read immutable deltas ahead while applying each delta in manifest order.
+        let concurrency = if manifest.uses_worker_pull() {
+            WORKER_PULL_L0_READ_CONCURRENCY
+        } else {
+            1
+        };
+        let mut deltas = manifest.l0_deltas.iter();
+        let mut reads: FuturesOrdered<_> = deltas
+            .by_ref()
+            .take(concurrency)
+            .map(|delta| self.load_delta_projection(delta))
+            .collect();
+        while let Some((delta_state, deletions)) = reads.try_next().await? {
             state = merge_states(state, delta_state);
-            if let Some(ref deletions_artifact) = delta.deletions {
-                let deletions = self.load_delta_deletions(deletions_artifact).await?;
+            if let Some(deletions) = deletions {
                 apply_deletions(&mut state, &deletions);
+            }
+            if let Some(delta) = deltas.next() {
+                reads.push_back(self.load_delta_projection(delta));
             }
         }
 
@@ -1392,6 +1572,21 @@ impl MicroCompactor {
     async fn load_delta_state(&self, delta_id: &str, tables: &TablePaths) -> Result<FoldState> {
         // Same logic as snapshot loading
         self.load_snapshot_state(delta_id, tables).await
+    }
+
+    async fn load_delta_projection(
+        &self,
+        delta: &L0Delta,
+    ) -> Result<(FoldState, Option<DeltaDeletions>)> {
+        let rows = self
+            .load_delta_state(&delta.delta_id, &delta.tables)
+            .await?;
+        let deletions = if let Some(artifact) = &delta.deletions {
+            Some(self.load_delta_deletions(artifact).await?)
+        } else {
+            None
+        };
+        Ok((rows, deletions))
     }
 
     /// Writes fold state to L0 delta Parquet files.
@@ -1688,6 +1883,7 @@ impl MicroCompactor {
         previous_pointer_bytes: Option<&Bytes>,
         fencing_token: Option<u64>,
         lock_path: Option<&str>,
+        pull: Option<&PullUpdate<'_>>,
     ) -> std::result::Result<PublishOutcome, PublishManifestError> {
         let snapshot_path = orchestration_manifest_snapshot_path(&manifest.manifest_id);
         let manifest_json =
@@ -1748,7 +1944,22 @@ impl MicroCompactor {
             current_pointer_version,
             None,
             durability,
-            async { Ok(()) },
+            async {
+                if let Some(update) = pull {
+                    self.validate_fencing_lock(fencing_token, lock_path)
+                        .await
+                        .map_err(|error| arco_core::Error::storage(error.to_string()))?;
+                    if update
+                        .valid_before
+                        .is_some_and(|deadline| (update.clock)() >= deadline)
+                    {
+                        return Err(arco_core::Error::PreconditionFailed {
+                            message: PULL_RECHECK.into(),
+                        });
+                    }
+                }
+                Ok(())
+            },
         )
         .await
         {
@@ -1785,6 +1996,12 @@ impl MicroCompactor {
             Err(error) => Err(PublishManifestError::Other(Error::from(error))),
         }
     }
+}
+
+fn pull_recheck() -> Error {
+    Error::Core(arco_core::Error::PreconditionFailed {
+        message: PULL_RECHECK.into(),
+    })
 }
 
 fn parse_root_read_token(read_token: &str) -> Result<&str> {
@@ -3280,7 +3497,7 @@ mod tests {
         manifest.l0_limits.max_rows = u32::MAX;
         manifest.l0_limits.max_age_seconds = u32::MAX;
         compactor
-            .publish_manifest(&manifest, None, None, None, None, None, None)
+            .publish_manifest(&manifest, None, None, None, None, None, None, None)
             .await?;
 
         let event_paths = write_basic_compaction_events(&storage).await?;
@@ -4066,6 +4283,7 @@ mod tests {
                 None,
                 Some(1),
                 Some(orchestration_compaction_lock_path()),
+                None,
             )
             .await
             .expect_err("missing fencing lock must reject publication");
@@ -4088,7 +4306,7 @@ mod tests {
         let mut manifest = OrchestrationManifest::new("01HQXYZ123REV");
         manifest.manifest_id = "00000000000000000000".to_string();
         compactor
-            .publish_manifest(&manifest, None, None, None, None, None, None)
+            .publish_manifest(&manifest, None, None, None, None, None, None, None)
             .await?;
 
         let (_current, version, pointer, pointer_bytes) =
@@ -4110,6 +4328,7 @@ mod tests {
                 Some(&pointer_bytes),
                 None,
                 None,
+                None,
             )
             .await?;
 
@@ -4122,6 +4341,7 @@ mod tests {
                 Some(&version),
                 Some(&pointer),
                 Some(&pointer_bytes),
+                None,
                 None,
                 None,
             )
@@ -4145,7 +4365,7 @@ mod tests {
         base.manifest_id = "00000000000000000000".to_string();
         base.epoch = 5;
         let base_outcome = persisted_a
-            .publish_manifest(&base, None, None, None, None, None, None)
+            .publish_manifest(&base, None, None, None, None, None, None, None)
             .await?;
         let PublishOutcome::Visible {
             pointer_version: base_pointer_version,
@@ -4173,6 +4393,7 @@ mod tests {
                 Some(&stale_pointer_bytes),
                 None,
                 None,
+                None,
             )
             .await?;
         let PublishOutcome::Visible {
@@ -4194,6 +4415,7 @@ mod tests {
                 Some(&stale_version),
                 Some(&stale_pointer),
                 Some(&stale_pointer_bytes),
+                None,
                 None,
                 None,
             )
@@ -4943,7 +5165,7 @@ mod tests {
         manifest.l0_limits.max_rows = u32::MAX;
         manifest.l0_limits.max_age_seconds = u32::MAX;
         compactor
-            .publish_manifest(&manifest, None, None, None, None, None, None)
+            .publish_manifest(&manifest, None, None, None, None, None, None, None)
             .await?;
 
         let old_timestamp = Utc::now() - chrono::Duration::days(40);

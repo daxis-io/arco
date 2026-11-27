@@ -528,58 +528,7 @@ async fn keyed_recovery_uses_one_bound_plan_across_both_publication_boundaries()
         assert_eq!(reply["created"], false);
         let (_, run) = call(&restarted, Method::GET, &path, &jwt, None, Value::Null).await;
         assert_eq!(run["runId"], reservation.run_id);
-        let plan = fixture
-            .backend
-            .inner
-            .get(&format!(
-                "{scope}/accepted_plans/{}.json",
-                reservation.plan_id
-            ))
-            .await
-            .unwrap();
-        let sha = hex::encode(Sha256::digest(&plan));
-        assert_eq!(
-            reservation.accepted_plan_sha256.as_deref(),
-            Some(sha.as_str())
-        );
-        let plan: arco_flow::orchestration::accepted_plan::AcceptedRunPlan =
-            serde_json::from_slice(&plan).unwrap();
-        assert_eq!(plan.version, 2);
-        let [run, planned] = plan.events.as_slice() else {
-            panic!("two accepted events");
-        };
-        assert_eq!(run.event_id, reservation.event_id);
-        assert_eq!(Some(&planned.event_id), reservation.plan_event_id.as_ref());
-        let arco_flow::orchestration::events::OrchestrationEventData::RunTriggered {
-            labels, ..
-        } = &run.data
-        else {
-            panic!("run trigger");
-        };
-        assert_eq!(labels["arco.retry_policy"], "rivers-d7cbc206-compat-v1");
-        let arco_flow::orchestration::events::OrchestrationEventData::PlanCreated { tasks, .. } =
-            &planned.data
-        else {
-            panic!("plan created");
-        };
-        assert_eq!(
-            (tasks[0].max_attempts, tasks[0].heartbeat_timeout_sec),
-            (2, 60)
-        );
-        assert!(!tasks[0].requires_visible_output);
-        let objects = fixture.backend.inner.list("").await.unwrap();
-        assert!(
-            objects
-                .iter()
-                .all(|meta| meta.path.starts_with(&format!("{PREFIX}/"))
-                    && !meta.path.contains("/ledger/orchestration/"))
-        );
-        assert!(
-            objects
-                .iter()
-                .any(|meta| meta.path
-                    == format!("{PREFIX}/{}", orchestration_compaction_lock_path()))
-        );
+        assert_recovered_plan_storage(&fixture, &scope, &reservation).await;
         if fault == 2 {
             fixture
                 .backend
@@ -606,6 +555,63 @@ async fn keyed_recovery_uses_one_bound_plan_across_both_publication_boundaries()
             );
         }
     }
+}
+
+async fn assert_recovered_plan_storage(
+    fixture: &Fixture,
+    scope: &str,
+    reservation: &RunKeyReservation,
+) {
+    let plan = fixture
+        .backend
+        .inner
+        .get(&format!(
+            "{scope}/accepted_plans/{}.json",
+            reservation.plan_id
+        ))
+        .await
+        .unwrap();
+    let sha = hex::encode(Sha256::digest(&plan));
+    assert_eq!(
+        reservation.accepted_plan_sha256.as_deref(),
+        Some(sha.as_str())
+    );
+    let plan: arco_flow::orchestration::accepted_plan::AcceptedRunPlan =
+        serde_json::from_slice(&plan).unwrap();
+    assert_eq!(plan.version, 2);
+    let [run, planned] = plan.events.as_slice() else {
+        panic!("two accepted events");
+    };
+    assert_eq!(run.event_id, reservation.event_id);
+    assert_eq!(Some(&planned.event_id), reservation.plan_event_id.as_ref());
+    let arco_flow::orchestration::events::OrchestrationEventData::RunTriggered { labels, .. } =
+        &run.data
+    else {
+        panic!("run trigger");
+    };
+    assert_eq!(labels["arco.retry_policy"], "rivers-d7cbc206-compat-v1");
+    let arco_flow::orchestration::events::OrchestrationEventData::PlanCreated { tasks, .. } =
+        &planned.data
+    else {
+        panic!("plan created");
+    };
+    assert_eq!(
+        (tasks[0].max_attempts, tasks[0].heartbeat_timeout_sec),
+        (2, 60)
+    );
+    assert!(!tasks[0].requires_visible_output);
+    let objects = fixture.backend.inner.list("").await.unwrap();
+    assert!(
+        objects
+            .iter()
+            .all(|meta| meta.path.starts_with(&format!("{PREFIX}/"))
+                && !meta.path.contains("/ledger/orchestration/"))
+    );
+    assert!(
+        objects
+            .iter()
+            .any(|meta| meta.path == format!("{PREFIX}/{}", orchestration_compaction_lock_path()))
+    );
 }
 
 #[tokio::test]
@@ -685,19 +691,7 @@ async fn pilot_rejects_unkeyed_and_legacy_writes_before_creating_objects() {
         StatusCode::CONFLICT
     );
     assert_eq!(fixture.backend.inner.list("").await.unwrap().len(), objects);
-    assert_eq!(
-        call(
-            &router,
-            Method::POST,
-            RUNS,
-            &jwt,
-            Some("same-key"),
-            json!({"selection": ["proof/alpha"]})
-        )
-        .await
-        .0,
-        StatusCode::CREATED
-    );
+    submit(&router, &jwt, "same-key", &["proof/alpha"]).await;
     assert_eq!(
         call(
             &router,

@@ -195,6 +195,35 @@ against the returned bytes, including on the first descriptor request.
 Historical coordinator state without these log digests, data files without
 committed digests, and custom roots lack the identity this profile requires.
 
+### Approve an analytical root and allocate a table
+
+Set `ARCO_MANAGED_DELTA_ROOT` to the approved S3 bucket and nonempty prefix.
+Arco derives the workspace path from authenticated tenant and workspace
+claims and stores approval in the metastore. The approval endpoints require
+current `MANAGE` on the metastore.
+
+- Send `PUT /api/2.1/unity-catalog/storage-governance/managed-roots/{root_id}`
+  with a canonical UUIDv7 and an empty body. A new approval returns 201 and
+  the managed root record. Identical retries return 200 with the same
+  record. Each workspace can have one active managed root.
+- Send `DELETE` to the same path to revoke the exact root incarnation. The
+  response returns the record with lifecycle state `deleted`. The call also
+  works after the analytical root configuration is removed. Use a fresh root
+  ID for a new approval. Tables bound to the revoked root stay blocked.
+
+Both operations publish the current storage-governance projection before
+returning success. A retry also repairs publication after a committed event
+whose publication failed.
+
+The first allocation profile uses `POST /api/v1/managed-delta/ensure` to
+create `turntable.verification.managed_delta_fixture` with non-null BIGINT
+columns `id` and `amount`. Send the same `operation_id` (UUIDv7), `owner`
+(authenticated principal), and `provisioning_fingerprint` on retry. The
+owner needs `CREATE_TABLE` on the schema. Keep the returned table ID and
+exact location. Native stage and commit require `MODIFY`, and the reads
+below require `SELECT`. The catalog retains placement and coordinator
+state while the approved analytical prefix holds the Delta log and data.
+
 ### Describe and read
 
 1. POST `/api/2.1/unity-catalog/extensions/table-descriptors/{table_id}` with

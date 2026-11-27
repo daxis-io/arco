@@ -113,11 +113,16 @@ impl ManagedDeltaStorage {
         self.root.canonical_uri()
     }
 
+    /// Returns the approved analytical prefix for the supplied catalog scope.
+    #[must_use]
+    pub fn workspace_uri(&self, storage: &ScopedStorage) -> String {
+        format!("{}{}/", self.root_uri(), storage.scope().prefix())
+    }
+
     fn table_uri(&self, storage: &ScopedStorage, table_id: Uuid) -> String {
         format!(
-            "{}{}/{}/",
-            self.root_uri(),
-            storage.scope().prefix(),
+            "{}{}/",
+            self.workspace_uri(storage),
             DeltaPaths::legacy(table_id).table_root()
         )
     }

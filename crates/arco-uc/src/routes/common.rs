@@ -5,6 +5,8 @@ use std::sync::Arc;
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
+use arco_catalog::metastore::ledger::MetastoreLedger;
+use arco_catalog::metastore::replay::MetastoreState;
 use arco_catalog::write_options::WriteOptions;
 use arco_catalog::{
     CatalogAuthority, CatalogAuthorityKind, CatalogError, StateScope, Tier1Compactor,
@@ -192,6 +194,28 @@ pub(crate) fn scoped_storage(
     ctx: &UnityCatalogRequestContext,
 ) -> Result<ScopedStorage, UnityCatalogError> {
     ctx.scoped_storage(state.storage.clone())
+}
+
+pub(crate) async fn governance_mutation_view(
+    ledger: &MetastoreLedger,
+) -> Result<(MetastoreState, u64), UnityCatalogError> {
+    let watermark = ledger.latest_watermark().await.map_err(map_catalog_error)?;
+    let metastore = ledger.replay().await.map_err(map_catalog_error)?;
+    if metastore.ledger_watermark.as_deref()
+        != watermark.as_ref().map(|head| head.event_id.as_str())
+    {
+        return Err(UnityCatalogError::Conflict {
+            message: "storage_governance_changed_retry".to_string(),
+        });
+    }
+    // Mutations validated against the same cut contend on one sequence reservation.
+    let sequence = watermark
+        .map_or(0, |head| head.sequence)
+        .checked_add(1)
+        .ok_or_else(|| UnityCatalogError::Conflict {
+            message: "storage_governance_sequence_exhausted".to_string(),
+        })?;
+    Ok((metastore, sequence))
 }
 
 /// Publishes the metastore projection at the current ledger watermark.

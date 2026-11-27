@@ -62,6 +62,7 @@ impl Default for DeltaCommitCoordinatorConfig {
 #[derive(Clone)]
 pub struct DeltaCommitCoordinator {
     storage: ScopedStorage,
+    log_storage: ScopedStorage,
     paths: DeltaPaths,
     config: DeltaCommitCoordinatorConfig,
 }
@@ -88,10 +89,26 @@ impl DeltaCommitCoordinator {
     #[must_use]
     pub fn with_paths(storage: ScopedStorage, paths: DeltaPaths) -> Self {
         Self {
+            log_storage: storage.clone(),
             storage,
             paths,
             config: DeltaCommitCoordinatorConfig::default(),
         }
+    }
+
+    /// Selects the separate analytical storage for this table's immutable log.
+    ///
+    /// Coordinator state, idempotency records and staged intents stay in catalog storage.
+    /// # Errors
+    /// Returns an error when the supplied storage belongs to another authority scope.
+    pub fn with_log_storage(mut self, log_storage: ScopedStorage) -> Result<Self> {
+        if log_storage.scope() != self.storage.scope() {
+            return Err(DeltaError::bad_request(
+                "Delta log and coordinator scopes differ",
+            ));
+        }
+        self.log_storage = log_storage;
+        Ok(self)
     }
 
     /// Sets coordinator configuration.
@@ -571,7 +588,7 @@ impl DeltaCommitCoordinator {
         let delta_log_path = self.paths.delta_log_json(reserved.version)?;
 
         let write = self
-            .storage
+            .log_storage
             .put_raw(
                 &delta_log_path,
                 payload.clone(),
@@ -605,13 +622,13 @@ impl DeltaCommitCoordinator {
         let expected_size = u64::try_from(payload.len())
             .map_err(|_| DeltaError::conflict("invalid Delta log size"))?;
         if self
-            .storage
+            .log_storage
             .head_raw(path)
             .await?
             .is_none_or(|meta| meta.size != expected_size)
             || (!payload.is_empty()
                 && self
-                    .storage
+                    .log_storage
                     .get_range(path, 0..expected_size)
                     .await?
                     .as_ref()
@@ -728,7 +745,7 @@ impl DeltaCommitCoordinator {
             }
             let legacy = DeltaPaths::legacy(self.paths.table_id());
             let page = self
-                .storage
+                .log_storage
                 .list_page_meta(&legacy.delta_log_prefix(), None, 1)
                 .await?;
             if !page.objects.is_empty() || page.next_start_after.is_some() {
@@ -738,7 +755,7 @@ impl DeltaCommitCoordinator {
         // The latest log alone cannot show that earlier commits used this root.
         for version in 0..=latest {
             let path = self.paths.delta_log_json(version)?;
-            if self.storage.head_raw(&path).await?.is_none() {
+            if self.log_storage.head_raw(&path).await?.is_none() {
                 return Err(DeltaError::conflict(ROOT_MIGRATION_REQUIRED));
             }
         }
@@ -763,7 +780,7 @@ impl DeltaCommitCoordinator {
 
             let delta_log_path = self.paths.delta_log_json(inflight.version)?;
 
-            let commit_exists = self.storage.head_raw(&delta_log_path).await?.is_some();
+            let commit_exists = self.log_storage.head_raw(&delta_log_path).await?.is_some();
 
             if commit_exists || now_ms >= inflight.expires_at_ms {
                 let payload = self
@@ -775,7 +792,7 @@ impl DeltaCommitCoordinator {
                 } else {
                     // Attempt to materialize the inflight commit from its staged payload.
                     let write = self
-                        .storage
+                        .log_storage
                         .put_raw(
                             &delta_log_path,
                             payload.clone(),

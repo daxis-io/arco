@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use arco_api::config::Config;
 use arco_api::server::Server;
+use arco_core::flow_paths::ManagedDeltaRoot;
 use arco_core::observability::{LogFormat, init_logging};
 use arco_core::storage::{MemoryBackend, StorageBackend};
 use arco_storage::from_bucket;
@@ -47,7 +48,19 @@ async fn main() -> Result<()> {
         Arc::new(MemoryBackend::new())
     };
 
-    let server = Server::with_storage_backend(config, storage);
+    let managed_delta_storage = config
+        .managed_delta_root
+        .as_deref()
+        .map(|uri| {
+            let root = ManagedDeltaRoot::parse(uri)?;
+            let backend = from_bucket(root.bucket_uri())?;
+            Ok::<_, arco_core::Error>(arco_uc::ManagedDeltaStorage::new(root, backend))
+        })
+        .transpose()?;
+    let mut server = Server::with_storage_backend(config, storage);
+    if let Some(binding) = managed_delta_storage {
+        server = server.with_managed_delta_storage(binding);
+    }
     server.serve().await?;
     Ok(())
 }

@@ -35,4 +35,4 @@ pub use router::{event_stream_router, unity_catalog_router, usage_router};
 pub use routes::delta::config::SUPPORTED_PROTOCOL_VERSIONS as SUPPORTED_UC_DELTA_PROTOCOL_VERSIONS;
 pub use routes::event_streams::EventStreamApiDoc;
 pub use routes::usage::{UsageApiDoc, UsageBindings, is_usage_table};
-pub use state::{UnityCatalogConfig, UnityCatalogState};
+pub use state::{ManagedDeltaStorage, UnityCatalogConfig, UnityCatalogState};

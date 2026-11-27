@@ -5,16 +5,76 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use arco_catalog::CatalogAuthorityBindings;
 use arco_catalog::authz::compiler::CompiledPermissionSet;
 use arco_catalog::metastore::publish::PublishedStorageGovernanceCache;
+use arco_catalog::{CatalogAuthorityBindings, Table};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::event_streams::EventStreamBindings;
 use crate::permissions::CompiledPermissionSource;
 use arco_core::audit::AuditEmitter;
+use arco_core::flow_paths::{MANAGED_DELTA_ROOT_PROPERTY, ManagedDeltaRoot};
 use arco_core::storage::StorageBackend;
+use arco_core::{Error, Result, ScopedStorage};
+
+/// Operator-approved storage for Arco-allocated managed Delta data and logs.
+pub struct ManagedDeltaStorage {
+    root: ManagedDeltaRoot,
+    backend: Arc<dyn StorageBackend>,
+}
+
+impl ManagedDeltaStorage {
+    /// Binds the approved URI to a backend constructed for its bucket.
+    #[must_use]
+    pub fn new(root: ManagedDeltaRoot, backend: Arc<dyn StorageBackend>) -> Self {
+        Self { root, backend }
+    }
+
+    /// Returns the approved root used for allocation.
+    #[must_use]
+    pub fn root(&self) -> &ManagedDeltaRoot {
+        &self.root
+    }
+
+    /// Resolves storage for an allocated table after verifying its persisted placement.
+    ///
+    /// Legacy registrations return `None` and keep their existing storage mapping.
+    /// # Errors
+    /// Fails closed when the exact configured root, scope, or table URI differs.
+    pub fn for_table(
+        configured: Option<&Self>,
+        catalog: &ScopedStorage,
+        table: &Table,
+        id: Uuid,
+    ) -> Result<Option<ScopedStorage>> {
+        let Some(persisted_root) = table
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get(MANAGED_DELTA_ROOT_PROPERTY))
+        else {
+            return Ok(None);
+        };
+        let mismatch = || Error::PreconditionFailed {
+            message: "allocated managed Delta root does not match the configured storage binding"
+                .to_string(),
+        };
+        let binding = configured.ok_or_else(mismatch)?;
+        let tenant = catalog.tenant_id();
+        let workspace = catalog.workspace_id();
+        let location = binding.root.table_location(tenant, workspace, id)?;
+        if persisted_root != binding.root.as_uri()
+            || table.location.as_deref() != Some(location.as_str())
+            || table.table_type.as_deref() != Some("MANAGED")
+            || table.format.as_deref() != Some("delta")
+        {
+            return Err(mismatch());
+        }
+        ScopedStorage::new(Arc::clone(&binding.backend), tenant, workspace)?
+            .with_bucket_prefix(binding.root.prefix())
+            .map(Some)
+    }
+}
 
 /// Operator-approved activity tables keyed by `tenant/workspace`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,6 +113,8 @@ pub struct UnityCatalogConfig {
 pub struct UnityCatalogState {
     /// The storage backend for reading/writing UC facade state.
     pub storage: Arc<dyn StorageBackend>,
+    /// Approved analytical storage for allocated Delta tables.
+    pub managed_delta_storage: Option<Arc<ManagedDeltaStorage>>,
     /// Server-side configuration.
     pub config: UnityCatalogConfig,
     /// Optional statically supplied compiled permission view.
@@ -81,6 +143,7 @@ impl UnityCatalogState {
     pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             storage,
+            managed_delta_storage: None,
             config: UnityCatalogConfig::default(),
             compiled_permissions: None,
             permission_source: None,
@@ -95,6 +158,7 @@ impl UnityCatalogState {
     pub fn with_config(storage: Arc<dyn StorageBackend>, config: UnityCatalogConfig) -> Self {
         Self {
             storage,
+            managed_delta_storage: None,
             config,
             compiled_permissions: None,
             permission_source: None,

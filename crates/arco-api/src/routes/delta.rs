@@ -21,7 +21,7 @@ use arco_catalog::CatalogAuthority;
 use arco_catalog::authz::decision::{AuthzDecision, AuthzRequest, DecisionOutcome};
 use arco_catalog::authz::privileges::Privilege;
 use arco_core::{DeltaPaths, ScopedStorage, TableFormat};
-use arco_uc::is_event_stream_table;
+use arco_uc::{ManagedDeltaStorage, is_event_stream_table};
 
 use crate::context::RequestContext;
 use crate::error::{ApiError, ApiErrorBody};
@@ -89,13 +89,19 @@ pub(crate) async fn stage_commit_payload(
     let storage = ctx.scoped_storage(backend)?;
     reject_event_stream_target(&state, &ctx, &storage, table_id).await?;
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
-    let paths = resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
+    let (paths, log_storage) = resolve_delta_table_paths(
+        &authority,
+        state.managed_delta_storage.as_deref(),
+        &storage,
+        table_id,
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found(format!("table not found: {table_id}")))?;
     reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
     require_delta_modify(&state, &ctx, table_id).await?;
 
-    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+    let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths)
+        .with_log_storage(log_storage)?;
     let staged = coordinator
         .stage_commit_payload(Bytes::from(req.payload))
         .await
@@ -175,12 +181,18 @@ pub(crate) async fn commit_staged(
     };
 
     let authority = catalog_authority::resolve_read(&state, &ctx)?;
-    let paths =
-        resolve_delta_table_paths(&authority, &ctx.tenant, &ctx.workspace, table_id).await?;
-    let committed = if let Some(paths) = paths {
+    let target = resolve_delta_table_paths(
+        &authority,
+        state.managed_delta_storage.as_deref(),
+        &storage,
+        table_id,
+    )
+    .await?;
+    let committed = if let Some((paths, log_storage)) = target {
         reject_stream_table_alias(&state, &ctx, &storage, &paths).await?;
         require_delta_modify(&state, &ctx, table_id).await?;
-        let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths);
+        let coordinator = arco_delta::DeltaCommitCoordinator::with_paths(storage, paths)
+            .with_log_storage(log_storage)?;
         if let Some(replayed) = coordinator.replay_committed(&commit_request).await? {
             replayed
         } else {
@@ -274,10 +286,10 @@ async fn reject_stream_table_alias(
 
 async fn resolve_delta_table_paths(
     authority: &CatalogAuthority,
-    tenant: &str,
-    workspace: &str,
+    configured: Option<&ManagedDeltaStorage>,
+    catalog_storage: &ScopedStorage,
     table_id: Uuid,
-) -> Result<Option<DeltaPaths>, ApiError> {
+) -> Result<Option<(DeltaPaths, ScopedStorage)>, ApiError> {
     let Some(table) = authority
         .get_table_by_id(&table_id.to_string())
         .await
@@ -298,9 +310,18 @@ async fn resolve_delta_table_paths(
         )));
     }
 
-    DeltaPaths::from_table_location(table_id, table.location.as_deref(), tenant, workspace)
-        .map(Some)
-        .map_err(ApiError::from)
+    if let Some(log_storage) =
+        ManagedDeltaStorage::for_table(configured, catalog_storage, &table, table_id)?
+    {
+        return Ok(Some((DeltaPaths::legacy(table_id), log_storage)));
+    }
+    let paths = DeltaPaths::from_table_location(
+        table_id,
+        table.location.as_deref(),
+        catalog_storage.tenant_id(),
+        catalog_storage.workspace_id(),
+    )?;
+    Ok(Some((paths, catalog_storage.clone())))
 }
 
 impl From<arco_delta::DeltaError> for ApiError {

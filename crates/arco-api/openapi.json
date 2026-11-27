@@ -1557,6 +1557,83 @@
         ]
       }
     },
+    "/api/v1/managed-delta/ensure": {
+      "post": {
+        "tags": [
+          "catalogs"
+        ],
+        "summary": "Allocates a managed Delta table for a principal with schema CREATE_TABLE.",
+        "description": "# Errors\nReturns an error on denied allocation, invalid intent, or catalog failure.",
+        "operationId": "ensure",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AllocateManagedDeltaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Arco-owned placement allocated or replayed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedDeltaAllocationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid intent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Schema CREATE_TABLE required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Allocation unavailable or schema absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Operation or name conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/api/v1/namespaces": {
       "get": {
         "tags": [
@@ -4934,6 +5011,55 @@
           }
         }
       },
+      "AllocateManagedDeltaRequest": {
+        "type": "object",
+        "description": "Owner intent for a table in an existing schema.",
+        "required": [
+          "operation_id",
+          "catalog",
+          "schema",
+          "name",
+          "provisioning_fingerprint",
+          "columns"
+        ],
+        "properties": {
+          "catalog": {
+            "type": "string",
+            "description": "Existing catalog."
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnDefinition"
+            },
+            "description": "Columns in schema order."
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional table description."
+          },
+          "name": {
+            "type": "string",
+            "description": "Logical table name."
+          },
+          "operation_id": {
+            "type": "string",
+            "description": "`UUIDv7` reused for identical retries."
+          },
+          "provisioning_fingerprint": {
+            "type": "string",
+            "description": "Fingerprint of the client's provisioning intent."
+          },
+          "schema": {
+            "type": "string",
+            "description": "Existing schema."
+          }
+        },
+        "additionalProperties": false
+      },
       "ApiErrorBody": {
         "type": "object",
         "description": "Standard JSON error response body.",
@@ -6620,6 +6746,60 @@
                 "description": "Filter by tick status."
               }
             ]
+          }
+        }
+      },
+      "ManagedDeltaAllocationResponse": {
+        "type": "object",
+        "description": "Catalog-verified placement returned to the owner.",
+        "required": [
+          "id",
+          "catalog",
+          "schema",
+          "name",
+          "location",
+          "table_type",
+          "format",
+          "properties"
+        ],
+        "properties": {
+          "catalog": {
+            "type": "string",
+            "description": "Catalog of the allocated table."
+          },
+          "format": {
+            "type": "string",
+            "description": "Always `delta` for this operation."
+          },
+          "id": {
+            "type": "string",
+            "description": "Arco-selected table UUID."
+          },
+          "location": {
+            "type": "string",
+            "description": "Approved analytical storage URI."
+          },
+          "name": {
+            "type": "string",
+            "description": "Table name."
+          },
+          "properties": {
+            "type": "object",
+            "description": "Persisted root, owner, schema digest and provisioning fingerprint.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "schema": {
+            "type": "string",
+            "description": "Schema of the allocated table."
+          },
+          "table_type": {
+            "type": "string",
+            "description": "Always `MANAGED` for this operation."
           }
         }
       },

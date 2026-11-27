@@ -167,3 +167,34 @@ Before a new public route is merged, reviewers should be able to identify:
 | Errors | Responses use stable codes, request IDs, retryability, and safe messages |
 | Visibility | Sensitive fields have ordinary, owner, and admin response tests |
 | Compatibility | Public operations have compatibility labels; route groups use a group label only when every operation shares it; unsupported behavior is documented |
+## Arco-owned managed Delta placement
+
+Set `ARCO_MANAGED_DELTA_ROOT` to an approved S3 bucket and optional key
+prefix. The existing `ARCO_STORAGE_BUCKET` keeps catalog state and Delta
+coordinator, idempotency and staging records. The analytical root keeps
+materialized Delta files and committed transaction logs.
+
+`POST /api/v1/managed-delta/ensure` accepts an authenticated workspace
+principal with `CREATE_TABLE` on the existing schema. The body supplies
+`operation_id` (canonical UUIDv7), `catalog`, `schema`, `name`,
+`provisioning_fingerprint`, `columns` and an optional `description`.
+The authenticated principal becomes the recorded owner. Any supplied
+`Idempotency-Key` header must equal `operation_id`.
+
+The result contains Arco's allocated ID, the exact S3 URI, `MANAGED` and
+`delta`, plus the owner, schema digest and provisioning fingerprint.
+The URI ends in `tenant=<tenant>/workspace=<workspace>/tables/<table-id>`
+under the approved root. Exact retries replay the allocated ID. Changing
+intent under the same operation conflicts. An in-progress conflict can be
+retried with the same operation and body. Install table grants through the
+metastore before starting table reads or writes. Native and UC writers
+both require current table `MODIFY`. The `control/v1` catalog pilot
+continues to fence this format operation.
+
+The UC preview GET accepts inclusive `start_version` and `end_version`.
+Its effective unbackfilled interval can contain up to 100 versions and
+8 MiB of total log data. A larger interval returns `400` and can be split
+into narrower requests. The reported head is the finalized coordinator
+version. An absent committed log or history without an authoritative
+coordinator returns a repair conflict. An owner must reconcile historical
+log-only data before coordinated use.

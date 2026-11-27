@@ -42,6 +42,7 @@ use async_trait::async_trait;
 pub struct ScopedStorage {
     backend: Arc<dyn StorageBackend>,
     scope: AuthorityScope,
+    bucket_prefix: Option<Arc<String>>,
     // Metastore roots retain the caller's execution context for legacy consumers.
     // Durable paths and event validation use `scope`, not this workspace context.
     workspace_context: String,
@@ -109,6 +110,7 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::workspace(tenant_id, workspace_context.clone())?,
+            bucket_prefix: None,
             workspace_context,
         })
     }
@@ -130,6 +132,7 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: AuthorityScope::from_metastore_scope(scope),
+            bucket_prefix: None,
             workspace_context: scope.workspace_id().to_string(),
         })
     }
@@ -153,8 +156,23 @@ impl ScopedStorage {
         Ok(Self {
             backend,
             scope: scope.clone(),
+            bucket_prefix: None,
             workspace_context: workspace_context.into(),
         })
+    }
+
+    /// Places a scoped backend beneath an operator-controlled bucket prefix.
+    /// # Errors
+    /// Returns an error if the prefix is unsafe.
+    pub fn with_bucket_prefix(mut self, prefix: &str) -> Result<Self> {
+        Self::validate_path(prefix)?;
+        if !prefix.is_empty() && prefix.split('/').any(str::is_empty) {
+            return Err(Error::InvalidInput(
+                "bucket prefix has an empty path segment".to_string(),
+            ));
+        }
+        self.bucket_prefix = (!prefix.is_empty()).then(|| Arc::new(prefix.to_string()));
+        Ok(self)
     }
 
     /// Validates a relative path for traversal and encoding attacks.
@@ -234,7 +252,11 @@ impl ScopedStorage {
     // === Path Construction ===
 
     fn scope_prefix(&self) -> String {
-        self.scope.prefix()
+        let scope = self.scope.prefix();
+        match &self.bucket_prefix {
+            Some(prefix) => format!("{prefix}/{scope}"),
+            None => scope,
+        }
     }
 
     fn scoped_path(&self, path: &str) -> String {

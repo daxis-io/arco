@@ -47,6 +47,9 @@ use uuid::Uuid;
 #[path = "support/event_streams.rs"]
 mod event_streams;
 
+#[path = "support/managed_delta_allocation.rs"]
+mod managed_delta_allocation;
+
 #[path = "support/usage.rs"]
 mod usage;
 

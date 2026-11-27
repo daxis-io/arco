@@ -8,6 +8,82 @@ use chrono::NaiveDate;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
+/// Catalog property written by Arco's managed Delta allocator.
+pub const MANAGED_DELTA_ROOT_PROPERTY: &str = "arco.managed_delta_root";
+
+/// Trusted S3 bucket and optional key prefix for Arco-allocated Delta tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDeltaRoot {
+    uri: String,
+    bucket_uri: String,
+    prefix: String,
+}
+
+impl ManagedDeltaRoot {
+    /// Parses a canonical S3 root supplied by the deployment operator.
+    /// # Errors
+    /// Returns a validation error if the bucket or prefix is unsafe.
+    pub fn parse(uri: &str) -> Result<Self> {
+        let invalid = || Error::Validation {
+            message: "managed Delta root must be an S3 bucket and safe key prefix".to_string(),
+        };
+        let uri = uri.trim_end_matches('/');
+        let path = uri.strip_prefix("s3://").ok_or_else(invalid)?;
+        let (bucket, prefix) = path.split_once('/').unwrap_or((path, ""));
+        if !(3..=63).contains(&bucket.len())
+            || !bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-".contains(&b))
+            || !bucket.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !bucket.ends_with(|c: char| c.is_ascii_alphanumeric())
+        {
+            return Err(invalid());
+        }
+        if !prefix.is_empty()
+            && prefix.split('/').any(|part| {
+                part.is_empty()
+                    || matches!(part, "." | "..")
+                    || !part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            uri: uri.to_string(),
+            bucket_uri: format!("s3://{bucket}"),
+            prefix: prefix.to_string(),
+        })
+    }
+
+    /// The full approved URI, without a trailing slash.
+    #[must_use]
+    pub fn as_uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The provider configuration for the analytical bucket.
+    #[must_use]
+    pub fn bucket_uri(&self) -> &str {
+        &self.bucket_uri
+    }
+
+    /// The key prefix preceding the workspace scope.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Derives the only permitted data and log location for an allocated table.
+    /// # Errors
+    /// Returns an error if the workspace scope is invalid.
+    pub fn table_location(&self, tenant: &str, workspace: &str, table_id: Uuid) -> Result<String> {
+        let scope = crate::authority_root::AuthorityScope::workspace(tenant, workspace)?;
+        Ok(format!("{}/{}/tables/{table_id}", self.uri, scope.prefix()))
+    }
+}
+
 /// Typed flow/orchestration path API.
 pub struct FlowPaths;
 

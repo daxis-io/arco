@@ -103,7 +103,14 @@ async fn disclose_snapshot(
     .await?;
     let governance = DeltaGovernance::new(&authorization, ctx, &root.uri)?;
     let storage = scoped_storage(state, ctx)?;
-    let snapshot = load_snapshot(&storage, &root.paths, &governance, version).await?;
+    let snapshot = load_snapshot(
+        &storage,
+        root.log_storage.as_ref().unwrap_or(&storage),
+        &root.paths,
+        &governance,
+        version,
+    )
+    .await?;
     let manifest = snapshot
         .objects
         .iter()
@@ -178,6 +185,7 @@ async fn disclose_snapshot(
 pub(in crate::routes) struct DeltaRoot {
     pub(in crate::routes) paths: DeltaPaths,
     pub(in crate::routes) uri: String,
+    log_storage: Option<ScopedStorage>,
 }
 
 impl DeltaRoot {
@@ -202,10 +210,38 @@ impl DeltaRoot {
                         | "arco.dataset.units"
                         | "arco.dataset.loaded_at"
                         | "arco.dataset.source_data_cutoff"
+                        | "arco.managed_delta_root"
+                        | "arco.managed_delta_owner"
+                        | "arco.managed_delta_schema_sha256"
+                        | "arco.managed_delta_provisioning_fingerprint"
                 )
             })
         }) {
             return Err(bad_request("delta_read_unsupported_table_properties"));
+        }
+        let id = Uuid::parse_str(&table.id)
+            .map_err(|_| bad_request("delta_read_invalid_table_id_or_version"))?;
+        let paths = DeltaPaths::legacy(id);
+        if let Some(log_storage) = crate::state::ManagedDeltaStorage::for_table(
+            state.managed_delta_storage.as_deref(),
+            &scoped_storage(state, ctx)?,
+            table,
+            id,
+        )
+        .map_err(|_| bad_request("delta_read_location_not_mapped"))?
+        {
+            let uri = format!(
+                "{}/",
+                table
+                    .location
+                    .as_deref()
+                    .ok_or_else(|| { bad_request("delta_read_location_not_mapped") })?
+            );
+            return Ok(Self {
+                paths,
+                uri,
+                log_storage: Some(log_storage),
+            });
         }
         let bucket = state
             .config
@@ -215,9 +251,6 @@ impl DeltaRoot {
             .ok_or_else(|| UnityCatalogError::ServiceUnavailable {
                 message: "delta_read_storage_mapping_unavailable".to_string(),
             })?;
-        let id = Uuid::parse_str(&table.id)
-            .map_err(|_| bad_request("delta_read_invalid_table_id_or_version"))?;
-        let paths = DeltaPaths::legacy(id);
         let uri = format!(
             "{bucket}/tenant={}/workspace={}/{}/",
             ctx.tenant,
@@ -234,7 +267,11 @@ impl DeltaRoot {
                 return Err(bad_request("delta_read_location_not_mapped"));
             }
         }
-        Ok(Self { paths, uri })
+        Ok(Self {
+            paths,
+            uri,
+            log_storage: None,
+        })
     }
 }
 
@@ -299,12 +336,13 @@ struct Snapshot {
 }
 
 async fn load_snapshot(
+    catalog: &ScopedStorage,
     storage: &ScopedStorage,
     paths: &DeltaPaths,
     governance: &DeltaGovernance<'_>,
     version: i64,
 ) -> UnityCatalogResult<Snapshot> {
-    let digests = DeltaCommitCoordinator::with_paths(storage.clone(), paths.clone())
+    let digests = DeltaCommitCoordinator::with_paths(catalog.clone(), paths.clone())
         .pinned_log_digests(version)
         .await
         .map_err(coordinator_error)?;

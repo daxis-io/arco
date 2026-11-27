@@ -212,6 +212,10 @@ pub struct Config {
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Approved S3 bucket and key prefix for owner-allocated Delta tables.
+    #[serde(default)]
+    pub managed_delta_root: Option<String>,
+
     /// Compactor base URL for sync compaction (e.g., `<http://compactor:8081>`).
     #[serde(default)]
     pub compactor_url: Option<String>,
@@ -417,6 +421,7 @@ impl Default for Config {
             task_token: TaskTokenConfig::default(),
             rate_limit: RateLimitConfig::default(),
             storage: StorageConfig::default(),
+            managed_delta_root: None,
             compactor_url: None,
             compactor_auth: CompactorAuthConfig::default(),
             orchestration_compactor_url: None,
@@ -626,6 +631,7 @@ impl Config {
     /// - `ARCO_TASK_TOKEN_AUDIENCE`
     /// - `ARCO_TASK_TOKEN_TTL_SECS`
     /// - `ARCO_STORAGE_BUCKET`
+    /// - `ARCO_MANAGED_DELTA_ROOT`
     /// - `ARCO_COMPACTOR_URL`
     /// - `ARCO_COMPACTOR_AUTH_MODE` (`none` | `static_bearer` | `gcp_id_token`)
     /// - `ARCO_COMPACTOR_AUTH_STATIC_BEARER_TOKEN`
@@ -750,6 +756,7 @@ impl Config {
         if let Some(bucket) = env_string("ARCO_STORAGE_BUCKET") {
             config.storage.bucket = Some(bucket);
         }
+        config.managed_delta_root = env_string("ARCO_MANAGED_DELTA_ROOT");
         if let Some(url) = env_string("ARCO_COMPACTOR_URL") {
             config.compactor_url = Some(url);
         }

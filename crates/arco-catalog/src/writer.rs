@@ -38,6 +38,7 @@ use arco_core::control_plane_transactions::{
     ControlPlaneHandleMutationRef, ControlPlaneHandleRecord, ControlPlaneHandleScope,
     ControlPlaneHandleStatus,
 };
+use arco_core::flow_paths::{MANAGED_DELTA_ROOT_PROPERTY, ManagedDeltaRoot};
 use arco_core::storage::StorageBackend;
 use arco_core::sync_compact::SyncCompactRequest;
 use arco_core::{
@@ -51,7 +52,7 @@ use crate::event_writer::EventWriter;
 use crate::idempotency::{
     CatalogIdempotencyMarker, CatalogOperation, DEFAULT_STALE_TIMEOUT, IdempotencyCheck,
     IdempotencyStore, IdempotencyStoreImpl, ObjectVersion, canonical_request_hash,
-    check_idempotency,
+    check_idempotency, validate_uuidv7,
 };
 use crate::lock::DistributedLock;
 use crate::manifest::SnapshotInfo;
@@ -156,6 +157,36 @@ pub struct Schema {
     pub created_at: i64,
     /// Last update timestamp (milliseconds since epoch).
     pub updated_at: i64,
+}
+
+fn registration_columns(columns: &[ColumnDefinition]) -> serde_json::Value {
+    serde_json::Value::Array(
+        columns
+            .iter()
+            .map(|column| {
+                serde_json::json!({
+                    "name": column.name,
+                    "data_type": column.data_type,
+                    "is_nullable": column.is_nullable,
+                    "ordinal": column.ordinal,
+                    "description": column.description,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn validate_managed_delta_patch(table: &TableRecord, patch: &TablePatch) -> Result<()> {
+    if (patch.location.is_some() || patch.format.is_some())
+        && decode_uc_properties(table.properties_json.clone())?
+            .is_some_and(|properties| properties.contains_key(MANAGED_DELTA_ROOT_PROPERTY))
+    {
+        return Err(CatalogError::PreconditionFailed {
+            message: "allocated managed Delta format and storage placement are immutable"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Backward-compatible alias for the legacy namespace terminology.
@@ -441,6 +472,21 @@ pub struct RegisterTableInSchemaRequest {
     /// Optional UC properties.
     pub properties: Option<BTreeMap<String, String>>,
     /// Column definitions.
+    pub columns: Vec<ColumnDefinition>,
+}
+
+/// Owner intent for an Arco-allocated Delta table.
+#[derive(Debug, Clone)]
+pub struct ManagedDeltaAllocationRequest {
+    /// Name in the selected catalog schema.
+    pub name: String,
+    /// Optional description.
+    pub description: Option<String>,
+    /// Authenticated owner principal.
+    pub owner: String,
+    /// Stable caller fingerprint for the provisioning intent.
+    pub provisioning_fingerprint: String,
+    /// Ordered schema assigned to the table.
     pub columns: Vec<ColumnDefinition>,
 }
 
@@ -1893,11 +1939,16 @@ impl CatalogWriter {
         version: &ObjectVersion,
     ) -> Result<Option<Table>> {
         let (reserved_id, reserved_name) = Self::reserved_idempotency_entity(marker)?;
-        let Some(table) =
-            crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone())
+        let reader =
+            crate::reader::CatalogReader::new_with_scope(self.storage.clone(), self.scope.clone());
+        let table = if marker.operation == CatalogOperation::AllocateManagedDeltaTable {
+            reader.get_table_by_id(reserved_id).await?
+        } else {
+            reader
                 .get_table_in_schema(catalog, schema, reserved_name)
                 .await?
-        else {
+        };
+        let Some(table) = table else {
             return Ok(None);
         };
         if table.id != reserved_id {
@@ -5366,6 +5417,94 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<Table> {
+        if req
+            .properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key(MANAGED_DELTA_ROOT_PROPERTY))
+        {
+            return Err(CatalogError::Validation {
+                message: "managed Delta root is reserved for Arco allocation".to_string(),
+            });
+        }
+        self.register_table_with_placement(catalog, schema, req, opts, None)
+            .await
+    }
+
+    /// Reserves one identity and publishes its managed Delta placement.
+    ///
+    /// # Errors
+    /// Fails on an invalid operation key or owner intent, stale/conflicting
+    /// reservations, missing schema, or catalog storage and publication failures.
+    pub async fn allocate_managed_delta(
+        &self,
+        catalog: &str,
+        schema: &str,
+        req: ManagedDeltaAllocationRequest,
+        root: &ManagedDeltaRoot,
+        opts: WriteOptions,
+    ) -> Result<Table> {
+        let key = opts
+            .idempotency_key
+            .as_ref()
+            .ok_or_else(|| CatalogError::Validation {
+                message: "managed Delta allocation requires a UUIDv7 idempotency key".to_string(),
+            })?;
+        validate_uuidv7(key.as_str()).map_err(|error| CatalogError::Validation {
+            message: error.to_string(),
+        })?;
+        if req.name.trim().is_empty()
+            || req.owner.trim().is_empty()
+            || req.provisioning_fingerprint.trim().is_empty()
+            || req.columns.is_empty()
+        {
+            return Err(CatalogError::Validation {
+                message:
+                    "managed Delta allocation requires name, owner, provisioning fingerprint and schema"
+                        .to_string(),
+            });
+        }
+        let schema_digest = Self::idempotency_request_hash(&registration_columns(&req.columns))?;
+        self.register_table_with_placement(
+            catalog,
+            schema,
+            RegisterTableInSchemaRequest {
+                name: req.name,
+                description: req.description,
+                location: None,
+                format: Some("delta".to_string()),
+                table_type: Some("MANAGED".to_string()),
+                properties: Some(BTreeMap::from([
+                    (
+                        MANAGED_DELTA_ROOT_PROPERTY.to_string(),
+                        root.as_uri().to_string(),
+                    ),
+                    ("arco.managed_delta_owner".to_string(), req.owner),
+                    (
+                        "arco.managed_delta_schema_sha256".to_string(),
+                        schema_digest,
+                    ),
+                    (
+                        "arco.managed_delta_provisioning_fingerprint".to_string(),
+                        req.provisioning_fingerprint,
+                    ),
+                ])),
+                columns: req.columns,
+            },
+            opts,
+            Some(root),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn register_table_with_placement(
+        &self,
+        catalog: &str,
+        schema: &str,
+        req: RegisterTableInSchemaRequest,
+        opts: WriteOptions,
+        managed_root: Option<&ManagedDeltaRoot>,
+    ) -> Result<Table> {
         let request_hash = Self::idempotency_request_hash(&serde_json::json!({
             "catalog": catalog,
             "schema": schema,
@@ -5375,20 +5514,18 @@ impl CatalogWriter {
             "format": req.format.clone(),
             "table_type": req.table_type.clone(),
             "properties": req.properties.clone(),
-            "columns": req.columns.iter().map(|column| serde_json::json!({
-                "name": column.name.clone(),
-                "data_type": column.data_type.clone(),
-                "is_nullable": column.is_nullable,
-                "ordinal": column.ordinal,
-                "description": column.description.clone(),
-            })).collect::<Vec<_>>(),
+            "columns": registration_columns(&req.columns),
             "if_match": opts.if_match.map(|version| version.as_u64()),
         }))?;
         let idempotency_store = self.idempotency_store();
         let mut idempotency = match check_idempotency(
             &idempotency_store,
             opts.idempotency_key.as_ref().map(IdempotencyKey::as_str),
-            CatalogOperation::RegisterTableInSchema,
+            if managed_root.is_some() {
+                CatalogOperation::AllocateManagedDeltaTable
+            } else {
+                CatalogOperation::RegisterTableInSchema
+            },
             &request_hash,
             DEFAULT_STALE_TIMEOUT,
         )
@@ -5408,7 +5545,22 @@ impl CatalogWriter {
                         .await?,
                 )
             }
-            IdempotencyCheck::Replay { entity_name, .. } => {
+            IdempotencyCheck::Replay {
+                entity_id,
+                entity_name,
+            } => {
+                if managed_root.is_some() {
+                    return crate::reader::CatalogReader::new_with_scope(
+                        self.storage.clone(),
+                        self.scope.clone(),
+                    )
+                    .get_table_by_id(&entity_id)
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound {
+                        entity: "managed Delta allocation".to_string(),
+                        name: entity_id,
+                    });
+                }
                 return self
                     .replay_table_by_name(catalog, schema, &entity_name)
                     .await;
@@ -5533,12 +5685,26 @@ impl CatalogWriter {
             let table_format = normalize_new_table_format(req.format.as_deref())?;
             let table_format_kind =
                 TableFormat::parse(&table_format).map_err(CatalogError::from)?;
-            let table_location = normalize_table_location_for_write(
-                table_format_kind,
-                req.location.clone(),
-                self.storage.tenant_id(),
-                self.storage.workspace_id(),
-            )?;
+            let table_location = match managed_root {
+                Some(root) => {
+                    let id = table_id.parse::<Uuid>().map_err(|error| {
+                        CatalogError::InvariantViolation {
+                            message: format!("reserved managed Delta table ID is invalid: {error}"),
+                        }
+                    })?;
+                    Some(root.table_location(
+                        self.storage.tenant_id(),
+                        self.storage.workspace_id(),
+                        id,
+                    )?)
+                }
+                None => normalize_table_location_for_write(
+                    table_format_kind,
+                    req.location.clone(),
+                    self.storage.tenant_id(),
+                    self.storage.workspace_id(),
+                )?,
+            };
 
             let table = Table {
                 id: table_id.clone(),
@@ -5629,6 +5795,15 @@ impl CatalogWriter {
         req: RegisterTableInSchemaRequest,
         opts: WriteOptions,
     ) -> Result<CatalogTransactionCommit> {
+        if req
+            .properties
+            .as_ref()
+            .is_some_and(|properties| properties.contains_key(MANAGED_DELTA_ROOT_PROPERTY))
+        {
+            return Err(CatalogError::Validation {
+                message: "managed Delta root is reserved for Arco allocation".to_string(),
+            });
+        }
         if opts.transaction_identity.is_some()
             && (req.table_type.is_some() || req.properties.is_some())
         {
@@ -5931,6 +6106,11 @@ impl CatalogWriter {
             }
         };
 
+        if let Err(error) = validate_managed_delta_patch(table_rec, &patch) {
+            guard.release().await?;
+            return Err(error);
+        }
+
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
 
@@ -6102,6 +6282,11 @@ impl CatalogWriter {
                 });
             }
         };
+
+        if let Err(error) = validate_managed_delta_patch(table_rec, &patch) {
+            guard.release().await?;
+            return Err(error);
+        }
 
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
@@ -6314,6 +6499,11 @@ impl CatalogWriter {
                 });
             }
         };
+
+        if let Err(error) = validate_managed_delta_patch(table_rec, &patch) {
+            guard.release().await?;
+            return Err(error);
+        }
 
         let now = Utc::now().timestamp_millis();
         table_rec.updated_at = now;
@@ -8686,6 +8876,97 @@ mod tests {
             traversal_location,
             CatalogError::Validation { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_allocation_keeps_one_server_identity_and_rejects_changed_intent() {
+        let writer = setup();
+        writer.initialize().await.expect("initialize");
+        writer
+            .create_catalog("analytics", None, WriteOptions::default())
+            .await
+            .expect("catalog");
+        writer
+            .create_schema("analytics", "sales", None, WriteOptions::default())
+            .await
+            .expect("schema");
+        let root = ManagedDeltaRoot::parse("s3://analytical/approved").expect("root");
+        let key = Uuid::now_v7();
+        let options = WriteOptions::default().with_idempotency_key(key.to_string());
+        let request = ManagedDeltaAllocationRequest {
+            name: "orders".to_string(),
+            description: None,
+            owner: "owner1".to_string(),
+            provisioning_fingerprint: "first-intent".to_string(),
+            columns: vec![ColumnDefinition {
+                name: "order_id".to_string(),
+                data_type: "STRING".to_string(),
+                is_nullable: false,
+                ordinal: 0,
+                description: None,
+            }],
+        };
+        let allocate = || {
+            writer.allocate_managed_delta(
+                "analytics",
+                "sales",
+                request.clone(),
+                &root,
+                options.clone(),
+            )
+        };
+        let (first, second) = tokio::join!(allocate(), allocate());
+        let replay = writer
+            .allocate_managed_delta(
+                "analytics",
+                "sales",
+                request.clone(),
+                &root,
+                options.clone(),
+            )
+            .await
+            .expect("replay");
+        let mut successful = 0;
+        for outcome in [first, second] {
+            match outcome {
+                Ok(table) => {
+                    assert_eq!(table.id, replay.id);
+                    successful += 1;
+                }
+                Err(error) => assert!(error.to_string().contains("still in progress"), "{error}"),
+            }
+        }
+        assert!(successful > 0);
+        let id = replay.id.parse::<Uuid>().expect("server table ID");
+        assert_ne!(id, key);
+        let location = root
+            .table_location(
+                writer.storage.tenant_id(),
+                writer.storage.workspace_id(),
+                id,
+            )
+            .expect("location");
+        assert_eq!(replay.location.as_deref(), Some(location.as_str()));
+        assert_eq!(replay.table_type.as_deref(), Some("MANAGED"));
+        assert_eq!(replay.format.as_deref(), Some("delta"));
+        assert_eq!(
+            replay.properties.as_ref().expect("properties")["arco.managed_delta_owner"],
+            "owner1"
+        );
+        let tables = CatalogReader::new(writer.storage.clone())
+            .list_tables_in_schema("analytics", "sales")
+            .await
+            .expect("allocated tables");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].id, replay.id);
+        let mut changed = request;
+        changed.owner = "owner2".to_string();
+        assert!(
+            writer
+                .allocate_managed_delta("analytics", "sales", changed, &root, options)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
